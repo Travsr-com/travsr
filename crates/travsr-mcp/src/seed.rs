@@ -99,6 +99,20 @@ fn anchor_emit_cut() -> f32 {
         .unwrap_or(0.15)
 }
 
+/// #709: byte-trigram Jaccard floor for the per-token typo correction. A query
+/// token that resolves to nothing exactly is corrected to a real symbol only
+/// when a UNIQUE leaf name clears this similarity, `htpresponse` → `HttpResponse`
+/// is 0.727, a comfortable margin above the default. Kept strict (and env-tunable
+/// for bench sweeps) so near-miss salad words do not ground; the cross-encoder
+/// reranker is the downstream precision backstop.
+fn fuzzy_correct_jaccard() -> f64 {
+    std::env::var("TRAVSR_FUZZY_CORRECT_JACCARD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&x: &f64| x > 0.0 && x <= 1.0)
+        .unwrap_or(0.7)
+}
+
 /// RRF k constant — controls how sharply the top ranks dominate.
 fn rrf_k() -> f32 {
     std::env::var("TRAVSR_RRF_K")
@@ -1483,16 +1497,25 @@ fn rerank_doc_text(embed_text: &str) -> String {
 /// caller (`build_seed_set`) uses this both to decide whether to run rerank
 /// inference at all (unused when bypassing) and to gate
 /// [`classify_confidence`].
-fn compute_g1_bypass(
-    terms: &[ResolvedTerm],
-    exact_anchor_ids: &std::collections::HashSet<NodeId>,
-) -> bool {
-    g1_bypass_decision(
-        terms,
-        exact_anchor_ids,
-        rare_anchor_max(),
-        g1_subject_idf_share(),
-    )
+fn compute_g1_bypass(terms: &[ResolvedTerm], anchors: &TrustedAnchors<'_>) -> bool {
+    g1_bypass_decision(terms, anchors, rare_anchor_max(), g1_subject_idf_share())
+}
+
+/// The anchor-provenance sets the G1 decision trusts, grouped rather than
+/// threaded as separate positional parameters.
+///
+/// Each provenance is a named field, so adding a third one (alias or synonym
+/// resolution, say) is a field rather than another positional `HashSet` to
+/// re-thread through every call site. There is deliberately no `Default` and no
+/// constructor that fills a set in for you: a new field then fails to compile at
+/// every construction site until it has been considered, where positional
+/// parameters would happily let a site keep passing an empty set and silently
+/// stop trusting a whole class of anchor.
+struct TrustedAnchors<'a> {
+    /// Nodes emitted as exact lexical anchors.
+    exact: &'a std::collections::HashSet<NodeId>,
+    /// Nodes emitted by a #709 unique strict typo correction.
+    corrected: &'a std::collections::HashSet<NodeId>,
 }
 
 /// Pure core of [`compute_g1_bypass`] (RFC-021 G1 + RFC-022 D4). Split out so the
@@ -1513,14 +1536,22 @@ fn compute_g1_bypass(
 /// the reranker/recall path instead of a false deterministic Exact (RC-4).
 fn g1_bypass_decision(
     terms: &[ResolvedTerm],
-    exact_anchor_ids: &std::collections::HashSet<NodeId>,
+    anchors: &TrustedAnchors<'_>,
     rare_max: usize,
     subject_share: f32,
 ) -> bool {
+    // #709: a unique strict typo correction is deterministic lexical evidence, so
+    // its emitted anchor counts as a rare (subject) anchor regardless of the
+    // corrected symbol's own frequency, the query literally names that one
+    // symbol, just misspelt. Still gated by the same subject-share test below, so
+    // a correction that is only an incidental fragment of a larger query does not
+    // trigger the deterministic bypass.
     let is_rare_anchor = |t: &ResolvedTerm| {
         t.resolved
-            && t.symbol_freq <= rare_max
-            && t.top_node.is_some_and(|n| exact_anchor_ids.contains(&n))
+            && t.top_node.is_some_and(|n| {
+                anchors.exact.contains(&n)
+                    && (t.symbol_freq <= rare_max || anchors.corrected.contains(&n))
+            })
     };
     if !terms.iter().any(&is_rare_anchor) {
         return false;
@@ -2117,35 +2148,125 @@ pub(crate) fn build_seed_set(
     let idf_min = idf_coverage_min();
     let mut specific_token_anchor_ids: std::collections::HashSet<NodeId> =
         std::collections::HashSet::new();
+    // #709: anchor nodes emitted from a unique strict typo correction. These are
+    // deterministic lexical evidence (a UNIQUE, high-Jaccard match to one real
+    // symbol), so, like a rare exact anchor, they may drive the g1 bypass and
+    // are shielded from the NL cross-encoder, which does not rate a misspelt
+    // query against a code symbol. Precision is bounded upstream by the strict,
+    // uniqueness-gated correction and the g1 subject-share test, not the reranker.
+    let mut corrected_anchor_ids: std::collections::HashSet<NodeId> =
+        std::collections::HashSet::new();
 
-    for token in &content_tokens {
-        let exact_nodes = store.search_nodes_by_name(token).unwrap_or_default();
+    // Boundary predicate reused for both the direct token and a #709 correction:
+    // a token counts as resolved only when it appears as a whole word segment (or
+    // contiguous run of segments) in the candidate's signature or path, not just
+    // as a substring of a longer word (#478 RFC-023 §6.2: an unguarded substring
+    // hit read "wal" as resolved via "walker.ts").
+    let boundary = |tok: &str, n: &CoreNode| -> bool {
+        travsr_core::ident::contains_token(tok, &n.vname.signature)
+            || travsr_core::ident::contains_token(tok, &n.vname.path)
+    };
+    // Resolve every token by name first, then correct all the misses in one
+    // call. `fuzzy_correct_symbols` costs one distinct-signature scan whatever
+    // the token count, so batching keeps a query carrying several unresolved
+    // tokens at a single scan rather than one scan per token on this hot path.
+    let by_token: Vec<(String, Vec<CoreNode>, bool)> = content_tokens
+        .iter()
+        .map(|token| {
+            let nodes = store.search_nodes_by_name(token).unwrap_or_default();
+            let has_direct = nodes.iter().any(|n| boundary(token, n));
+            (token.clone(), nodes, has_direct)
+        })
+        .collect();
+    let missed: Vec<&str> = by_token
+        .iter()
+        .filter(|(_, _, has_direct)| !has_direct)
+        .map(|(token, _, _)| token.as_str())
+        .collect();
+    let corrections = if missed.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        store
+            .fuzzy_correct_symbols(&missed, fuzzy_correct_jaccard())
+            .unwrap_or_default()
+    };
+
+    for (token, direct_nodes, has_direct) in by_token {
+        let token = &token;
+
+        // #709: when a token resolves to nothing by name, accept a UNIQUE strong
+        // trigram correction to a real symbol so a typo (`htpresponse`) grounds
+        // through the anchor path instead of abstaining. The correction reuses the
+        // corrected symbol's own name for frequency/IDF (so `HttpResponse` is
+        // measured, not the unindexed typo) and, being deliberate and unique, is
+        // always emitted as an anchor below, the cross-encoder reranker is the
+        // precision backstop. Only fires on the exact-miss cold branch.
+        let (exact_nodes, resolve_token, corrected): (Vec<CoreNode>, String, bool) = if has_direct {
+            (direct_nodes, token.clone(), false)
+        } else if let Some(fix) = corrections.get(token) {
+            let fixed_nodes = store.search_nodes_by_name(fix).unwrap_or_default();
+            if fixed_nodes.iter().any(|n| boundary(fix, n)) {
+                (fixed_nodes, fix.clone(), true)
+            } else {
+                (direct_nodes, token.clone(), false)
+            }
+        } else {
+            (direct_nodes, token.clone(), false)
+        };
+
         // #478: absent from the vocabulary (unknown token, or < 3 bytes so
         // never indexed) is treated as maximally generic, matching the
         // previous `unwrap_or(n_total)` failure behaviour. A token we cannot
         // measure must never be *promoted* to a rare anchor.
         let freq = store
-            .symbol_frequency(token)
+            .symbol_frequency(&resolve_token)
             .ok()
             .flatten()
             .unwrap_or(n_total);
-        // #478 RFC-023 §6.2: `resolved` used to be true from an unguarded
-        // substring hit (`search_nodes_by_name` matches on path too, so "wal"
-        // read as resolved via a hit on "walker.ts"). Require the token to
-        // appear as a whole word segment (or contiguous run of segments) in
-        // the candidate's signature or path before counting it as resolved —
-        // otherwise correcting symbol_frequency's df (22 -> 1) alone would
-        // make an unresolved token look *more* specific (IDF 0.660 -> 0.925)
-        // with nothing anchoring it.
         let boundary_matched: Vec<&CoreNode> = exact_nodes
             .iter()
-            .filter(|n| {
-                travsr_core::ident::contains_token(token, &n.vname.signature)
-                    || travsr_core::ident::contains_token(token, &n.vname.path)
-            })
+            .filter(|n| boundary(&resolve_token, n))
             .collect();
         let resolved = !boundary_matched.is_empty();
-        let top_node = boundary_matched.first().map(|n| n.id);
+
+        // #709: the corrected anchor deliberately bypasses the *budget* gates
+        // below (the IDF emit cut and the per-path cap) because a unique strict
+        // correction is deliberate lexical evidence that must seed and must
+        // become this term's `top_node` for the g1 rare-anchor linkage. It must
+        // still clear the same *correctness* gates the ordinary loop applies,
+        // which is what this shares with it: anchor-noise, RBAC, and the
+        // signature-only `contains_token`. That last one matters most. The
+        // `boundary` predicate above accepts a signature OR path match, so
+        // taking the first boundary match unfiltered could pin a protected,
+        // gate-bypassing anchor on a symbol that merely lives in a file named
+        // after the corrected token rather than being that symbol. Candidates
+        // are kind-ordered first for the same reason as the ordinary loop, so
+        // the correction anchors to a definition rather than to whichever
+        // import FTS happened to rank first.
+        let corrected_pick: Option<&CoreNode> = if corrected {
+            let ordered: Vec<&CoreNode> = if anchor_kind_priority {
+                order_anchor_candidates(&exact_nodes, anchor_reorder_window)
+            } else {
+                exact_nodes.iter().take(MAX_ANCHORS_PER_TOKEN).collect()
+            };
+            ordered.into_iter().find(|node| {
+                !is_anchor_noise(node)
+                    && filter.allow(node.id, node.id, Some(node.vname.corpus.as_str()))
+                    && travsr_core::ident::contains_token(&resolve_token, &node.vname.signature)
+            })
+        } else {
+            None
+        };
+
+        // A corrected term's `top_node` is the node it will actually emit, not
+        // the raw first boundary match: `g1_bypass_decision` requires the two to
+        // agree, so a correction whose candidates all fail the gates above must
+        // report no top node rather than one it never anchored.
+        let top_node = if corrected {
+            corrected_pick.map(|n| n.id)
+        } else {
+            boundary_matched.first().map(|n| n.id)
+        };
 
         let idf_w = idf_weight(freq, n_total);
 
@@ -2161,6 +2282,25 @@ pub(crate) fn build_seed_set(
             top_node,
             anchors_emitted: 0,
         });
+
+        // #709: a unique strict typo correction emits exactly one protected
+        // anchor, the correction target, bypassing the generic IDF/path-cap
+        // gates so the corrected symbol is guaranteed to seed and to be the term's
+        // `top_node` (which the g1 rare-anchor linkage requires). Recorded in
+        // `corrected_anchor_ids` so the g1 bypass shields it from the NL reranker.
+        if corrected {
+            if let Some(node) = corrected_pick {
+                let w = idf_w * kind_boost(&node.kind, &node.vname.language);
+                anchor_raw.push((node.id, w));
+                specific_token_anchor_ids.insert(node.id);
+                corrected_anchor_ids.insert(node.id);
+                *anchor_path_counts
+                    .entry(node.vname.path.clone())
+                    .or_insert(0) += 1;
+                terms[term_idx].anchors_emitted = 1;
+            }
+            continue;
+        }
 
         // Only emit high-IDF tokens as anchors (suppresses generic "queue", "run" etc.)
         if idf_w < anchor_emit_cut() {
@@ -2202,7 +2342,9 @@ pub(crate) fn build_seed_set(
             // PascalCase-aware (unlike the old punctuation-only boundary check),
             // so "sqlite" now correctly anchors to `fn:SqliteStore.exec_ddl` while
             // "works" still does not anchor to "provideWorkspaceChatContext".
-            if !travsr_core::ident::contains_token(token, &node.vname.signature) {
+            // #709: use the (possibly corrected) resolve_token so a typo's
+            // corrected symbol name gates its own anchors.
+            if !travsr_core::ident::contains_token(&resolve_token, &node.vname.signature) {
                 continue;
             }
             let path_count = anchor_path_counts
@@ -2251,7 +2393,13 @@ pub(crate) fn build_seed_set(
     // first — that is exactly the failure mode it exists to prevent.
     let early_exact_ids: std::collections::HashSet<NodeId> =
         anchor_raw.iter().map(|&(id, _)| id).collect();
-    let g1_bypass = compute_g1_bypass(&terms, &early_exact_ids);
+    let g1_bypass = compute_g1_bypass(
+        &terms,
+        &TrustedAnchors {
+            exact: &early_exact_ids,
+            corrected: &corrected_anchor_ids,
+        },
+    );
 
     // Count only tokens that resolve to specific-enough anchors (IDF ≥ threshold).
     // Generic tokens like "map" or "get" match hundreds of unrelated nodes and must
@@ -3368,7 +3516,15 @@ mod tests {
         // A lone rare exact anchor owns 100% of the query IDF → bypass (literal lookup).
         let anchors: std::collections::HashSet<NodeId> = [NodeId(7)].into_iter().collect();
         let terms = vec![rt("getwarningsforpod", 1, 0.95, Some(NodeId(7)))];
-        assert!(g1_bypass_decision(&terms, &anchors, 3, 0.55));
+        assert!(g1_bypass_decision(
+            &terms,
+            &TrustedAnchors {
+                exact: &anchors,
+                corrected: &std::collections::HashSet::new()
+            },
+            3,
+            0.55
+        ));
     }
 
     #[test]
@@ -3381,7 +3537,15 @@ mod tests {
             rt("sqlitestore", 2, 0.9, Some(NodeId(1))),
             rt("search_nodes_by_name", 1, 0.92, Some(NodeId(2))),
         ];
-        assert!(g1_bypass_decision(&terms, &anchors, 3, 0.55));
+        assert!(g1_bypass_decision(
+            &terms,
+            &TrustedAnchors {
+                exact: &anchors,
+                corrected: &std::collections::HashSet::new()
+            },
+            3,
+            0.55
+        ));
     }
 
     #[test]
@@ -3398,7 +3562,15 @@ mod tests {
             rt("token", 400, 0.35, None),
             rt("budget", 300, 0.4, None),
         ];
-        assert!(!g1_bypass_decision(&terms, &anchors, 3, 0.55));
+        assert!(!g1_bypass_decision(
+            &terms,
+            &TrustedAnchors {
+                exact: &anchors,
+                corrected: &std::collections::HashSet::new()
+            },
+            3,
+            0.55
+        ));
     }
 
     #[test]
@@ -3407,7 +3579,78 @@ mod tests {
         // (filtered as noise / not a signature component) can never bypass.
         let anchors: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
         let terms = vec![rt("checkout", 2, 0.9, Some(NodeId(5)))];
-        assert!(!g1_bypass_decision(&terms, &anchors, 3, 0.55));
+        assert!(!g1_bypass_decision(
+            &terms,
+            &TrustedAnchors {
+                exact: &anchors,
+                corrected: &std::collections::HashSet::new()
+            },
+            3,
+            0.55
+        ));
+    }
+
+    #[test]
+    fn g1_bypass_fires_on_corrected_anchor_despite_non_rare_frequency() {
+        // #709: a unique strict typo correction owns the whole query IDF and is
+        // the query's subject even though the corrected symbol is not "rare"
+        // (freq 5 > rare_max 3). Its emitted anchor is in corrected_anchor_ids, so
+        // g1 fires and the NL reranker cannot veto the misspelt-but-deterministic
+        // lookup. Mirrors the `htpresponse` → `HttpResponse` grounding.
+        let anchors: std::collections::HashSet<NodeId> = [NodeId(7)].into_iter().collect();
+        let corrected: std::collections::HashSet<NodeId> = [NodeId(7)].into_iter().collect();
+        let terms = vec![rt("htpresponse", 5, 0.74, Some(NodeId(7)))];
+        assert!(
+            g1_bypass_decision(
+                &terms,
+                &TrustedAnchors {
+                    exact: &anchors,
+                    corrected: &corrected
+                },
+                3,
+                0.55
+            ),
+            "corrected anchor must drive the g1 bypass"
+        );
+        // Without the correction flag the same non-rare anchor must NOT bypass.
+        assert!(
+            !g1_bypass_decision(
+                &terms,
+                &TrustedAnchors {
+                    exact: &anchors,
+                    corrected: &std::collections::HashSet::new()
+                },
+                3,
+                0.55
+            ),
+            "a non-rare, uncorrected anchor must not bypass"
+        );
+    }
+
+    #[test]
+    fn g1_bypass_corrected_still_needs_subject_share() {
+        // A correction that is only an incidental fragment of a larger query does
+        // NOT trigger the bypass, the subject-share test still applies, so a
+        // corrected word buried in conceptual filler flows to the reranker path.
+        let anchors: std::collections::HashSet<NodeId> = [NodeId(9)].into_iter().collect();
+        let corrected: std::collections::HashSet<NodeId> = [NodeId(9)].into_iter().collect();
+        let terms = vec![
+            rt("how", 4000, 0.05, None),
+            rt("does", 4000, 0.05, None),
+            rt("the", 4000, 0.05, None),
+            rt("htpresponse", 5, 0.30, Some(NodeId(9))),
+            rt("renderer", 300, 0.40, None),
+            rt("stream", 300, 0.40, None),
+        ];
+        assert!(!g1_bypass_decision(
+            &terms,
+            &TrustedAnchors {
+                exact: &anchors,
+                corrected: &corrected
+            },
+            3,
+            0.55
+        ));
     }
 
     // ── RFC-022 D2: rerank-weighted PPR multiplier ───────────────────────────
@@ -5013,7 +5256,13 @@ mod tests {
             anchors_emitted: 0,
         }];
         let exact_anchor_ids: std::collections::HashSet<NodeId> = [NodeId(1)].into_iter().collect();
-        let g1_bypass = compute_g1_bypass(&terms, &exact_anchor_ids);
+        let g1_bypass = compute_g1_bypass(
+            &terms,
+            &TrustedAnchors {
+                exact: &exact_anchor_ids,
+                corrected: &std::collections::HashSet::new(),
+            },
+        );
         assert!(
             g1_bypass,
             "rare term tied to its own exact anchor must bypass"
@@ -5062,7 +5311,13 @@ mod tests {
             anchors_emitted: 0,
         }];
         let exact_anchor_ids: std::collections::HashSet<NodeId> = [NodeId(1)].into_iter().collect();
-        let g1_bypass = compute_g1_bypass(&terms, &exact_anchor_ids);
+        let g1_bypass = compute_g1_bypass(
+            &terms,
+            &TrustedAnchors {
+                exact: &exact_anchor_ids,
+                corrected: &std::collections::HashSet::new(),
+            },
+        );
         assert!(!g1_bypass, "a common exact anchor must not bypass");
         let c = classify_confidence(
             &terms,
@@ -5110,7 +5365,13 @@ mod tests {
             },
         ];
         let exact_anchor_ids: std::collections::HashSet<NodeId> = [NodeId(1)].into_iter().collect();
-        let g1_bypass = compute_g1_bypass(&terms, &exact_anchor_ids);
+        let g1_bypass = compute_g1_bypass(
+            &terms,
+            &TrustedAnchors {
+                exact: &exact_anchor_ids,
+                corrected: &std::collections::HashSet::new(),
+            },
+        );
         assert!(
             !g1_bypass,
             "rarity on an unrelated resolved term must not launder a common anchor into a bypass"
@@ -5255,6 +5516,67 @@ mod tests {
             "later token's genuine match must not be starved by an earlier \
              token filling the shared path budget; seeds present: {:?}",
             seed_set.seeds.iter().map(|s| s.node).collect::<Vec<_>>()
+        );
+    }
+
+    /// A corrected token's protected anchor bypasses the IDF emit cut and the
+    /// per-path cap by design, so whatever it emits skips the gates that would
+    /// normally drop it. That makes the signature check load-bearing: the
+    /// `boundary` predicate accepts a signature OR a path match, so the
+    /// correction's candidate list can contain a node that merely lives in a
+    /// file named after the corrected symbol. Emitting that node would hand a
+    /// path-only coincidence the full protection of a deliberate correction.
+    #[test]
+    fn build_seed_set_corrected_anchor_requires_a_signature_match() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        // The correction target's signature is QUALIFIED (`method:Views.HttpResponse`),
+        // so `search_nodes_by_name` scores it in the loose `ELSE 40` tier rather
+        // than the `%:Name` tier, exactly tying it with the path-only match. The
+        // tie is then broken by the hashed `NodeId` rowid, so which of the two
+        // leads the candidate list is effectively arbitrary per symbol. This
+        // fixture picks a decoy name that wins that tie, which is what makes the
+        // signature filter load-bearing here rather than merely defensive.
+        let decoy = Node::new(
+            VName::new("corpus", "", "HttpResponse.py", "python", "fn:helper0"),
+            "function",
+        );
+        let real = Node::new(
+            VName::new(
+                "corpus",
+                "",
+                "app/api/views/renderers.py",
+                "python",
+                "method:Views.HttpResponse",
+            ),
+            "method",
+        );
+        store.put_node(&decoy).unwrap();
+        store.put_node(&real).unwrap();
+
+        // "htpresponse" resolves to nothing by name, so it takes the #709
+        // correction branch and grounds to `HttpResponse`.
+        let seed_set = build_seed_set(
+            &store,
+            "htpresponse",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        let seed_ids: std::collections::HashSet<NodeId> =
+            seed_set.seeds.iter().map(|s| s.node).collect();
+        assert!(
+            !seed_ids.contains(&decoy.id),
+            "a path-only match must not be emitted as the protected corrected \
+             anchor; seeds present: {seed_ids:?}"
+        );
+        assert!(
+            seed_ids.contains(&real.id),
+            "the signature match is the correction target and must seed; \
+             seeds present: {seed_ids:?}"
         );
     }
 

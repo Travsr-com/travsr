@@ -376,6 +376,7 @@ fn extract_file_call_edges(
                     unresolved.push(UnresolvedCall {
                         src: caller_id,
                         callee_sig: format!("fn:{callee_name}"),
+                        alt_callee_sig: None,
                         hint_crate: None,
                         caller_line: occ_line,
                         is_method_call: true,
@@ -403,6 +404,7 @@ fn extract_file_call_edges(
                                 unresolved.push(UnresolvedCall {
                                     src: caller_id,
                                     callee_sig: format!("method:{qual}.{callee_name}"),
+                                    alt_callee_sig: None,
                                     hint_crate: None,
                                     caller_line: occ_line,
                                     is_method_call: false,
@@ -416,6 +418,7 @@ fn extract_file_call_edges(
                                 unresolved.push(UnresolvedCall {
                                     src: caller_id,
                                     callee_sig: format!("fn:{callee_name}"),
+                                    alt_callee_sig: None,
                                     hint_crate: Some(qual.clone()),
                                     caller_line: occ_line,
                                     is_method_call: false,
@@ -429,6 +432,7 @@ fn extract_file_call_edges(
                                 unresolved.push(UnresolvedCall {
                                     src: caller_id,
                                     callee_sig: format!("fn:{callee_name}"),
+                                    alt_callee_sig: None,
                                     hint_crate: None,
                                     caller_line: occ_line,
                                     is_method_call: false,
@@ -445,6 +449,7 @@ fn extract_file_call_edges(
                     unresolved.push(UnresolvedCall {
                         src: caller_id,
                         callee_sig: format!("fn:{callee_name}"),
+                        alt_callee_sig: None,
                         hint_crate: None,
                         caller_line: occ_line,
                         is_method_call: false,
@@ -541,6 +546,7 @@ fn extract_macro_calls(
             out.push(UnresolvedCall {
                 src: caller_id,
                 callee_sig,
+                alt_callee_sig: None,
                 hint_crate: None,
                 caller_line: occ_line,
                 is_method_call,

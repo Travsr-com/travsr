@@ -1942,9 +1942,12 @@ fn call_target_reachable(caller_path: &str, candidate_path: &str, crates: &Crate
 /// from `"fn:Session.filter"` or `"method:Type.method"`. Shared by the E7
 /// LSIF per-callee suppression key and the native leaf-uniqueness resolver
 /// below, so both sides agree on what "the same callee" means.
+///
+/// The splitting rule itself lives in [`travsr_core::ident::leaf_of`], which
+/// the store's fuzzy symbol correction uses too. This owned-`String` wrapper
+/// stays because every caller below needs an owned key.
 fn leaf_of(sig: &str) -> String {
-    let body = sig.split_once(':').map(|(_, r)| r).unwrap_or(sig);
-    body.rsplit('.').next().unwrap_or(body).to_string()
+    travsr_core::ident::leaf_of(sig).to_string()
 }
 
 /// E7 (#I2): build the `(caller_path, caller_line, callee_leaf)` suppression
@@ -2026,6 +2029,9 @@ fn resolve_unresolved_calls(
 
     let sigs: Vec<String> = {
         let mut s: Vec<String> = unresolved.iter().map(|u| u.callee_sig.clone()).collect();
+        // Alternates go in the same batch, or the exact fallback below could
+        // never fire: `by_sig` only ever holds what this query asked for.
+        s.extend(unresolved.iter().filter_map(|u| u.alt_callee_sig.clone()));
         s.sort_unstable();
         s.dedup();
         s
@@ -2281,6 +2287,20 @@ fn resolve_unresolved_calls(
         } else {
             match by_sig.get(u.callee_sig.as_str()) {
                 Some(m) => m.clone(),
+                // #716 review: a second *exact* name for a call site whose kind
+                // the extractor could not determine. Python's bare `Foo()` is
+                // emitted as `class:Foo` on the PEP 8 convention, but a
+                // PascalCase free function is legal, so `fn:Foo` is carried
+                // alongside. Tried exactly and only here, before the leaf pool:
+                // the aim is to find the other real definition, not to widen the
+                // net, and a miss on both must still fail closed.
+                None if u
+                    .alt_callee_sig
+                    .as_deref()
+                    .is_some_and(|alt| by_sig.contains_key(alt)) =>
+                {
+                    by_sig[u.alt_callee_sig.as_deref().unwrap_or_default()].clone()
+                }
                 None => {
                     // #604 (non-method paths): the leaf fallback exists only to
                     // resolve a name whose type we could NOT determine. Two
@@ -4157,6 +4177,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:get".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 42,
             is_method_call: true,
@@ -4215,6 +4236,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:helper".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
             is_method_call: false,
@@ -4274,6 +4296,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:helper".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 3,
             is_method_call: false,
@@ -4295,6 +4318,86 @@ mod tests {
         assert_eq!(edges[0].src, caller.id);
         assert_eq!(edges[0].dst, callee.id);
         assert_eq!(sites, vec![(caller.id, callee.id, 3)]);
+    }
+
+    #[test]
+    fn python_phase_b_records_class_and_method_occurrences() {
+        // #709 (Bug 1 + Bug 2 regression guard): native Python Phase B must
+        // record occurrence sites for BOTH a method call (`resp.render()`) and
+        // a class/constructor reference (`HttpResponse(...)`) with zero external
+        // tools, i.e. without the optional travsr-lsif-py emitter. Before the
+        // #709 fix the constructor was emitted as `fn:HttpResponse`, never
+        // resolved to the `class:HttpResponse` node, and every class reference
+        // vanished on any machine without Node.js.
+        use travsr_core::{Node, VName};
+
+        let dir = std::env::temp_dir().join(format!("e2e_py709_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("http.py"),
+            b"class HttpResponse:\n    def render(self):\n        return self\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("views.py"),
+            b"def index(request):\n    resp = HttpResponse(\"hi\")\n    return resp.render()\n",
+        )
+        .unwrap();
+
+        // Phase A nodes the resolver looks references up against. VNames must
+        // match exactly what the extractor derives (corpus "c", python) so the
+        // caller/target node ids line up.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let class_node = Node::new(
+            VName::new("c", "", "http.py", "python", "class:HttpResponse"),
+            "class",
+        );
+        let render_node = Node::new(
+            VName::new("c", "", "http.py", "python", "method:HttpResponse.render"),
+            "method",
+        );
+        let index_node = Node::new(
+            VName::new("c", "", "views.py", "python", "fn:index"),
+            "function",
+        );
+        store.put_node(&class_node).unwrap();
+        store.put_node(&render_node).unwrap();
+        store.put_node(&index_node).unwrap();
+
+        // Real extractor over the on-disk fixture, no hand-rolled shortcut.
+        let (pb_nodes, pb_edges, unresolved) =
+            travsr_indexer::phase_b_native_python("c", &dir, None).unwrap();
+
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &pb_nodes,
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
+
+        // Class reference: `HttpResponse(...)` in views.py → class:HttpResponse.
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.src == index_node.id && e.dst == class_node.id),
+            "constructor call must resolve to class:HttpResponse: {edges:?}"
+        );
+        assert!(
+            sites
+                .iter()
+                .any(|(s, d, _)| *s == index_node.id && *d == class_node.id),
+            "constructor call must record an occurrence site for find_references: {sites:?}"
+        );
+        // Method reference: `resp.render()` → method:HttpResponse.render.
+        assert!(
+            sites
+                .iter()
+                .any(|(s, d, _)| *s == index_node.id && *d == render_node.id),
+            "method call must record an occurrence site: {sites:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -4324,6 +4427,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:run".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9,
             is_method_call: false,
@@ -4372,6 +4476,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:filter".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 5,
             is_method_call: true,
@@ -4425,6 +4530,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:filter".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 12,
             is_method_call: true,
@@ -4496,6 +4602,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:filter".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
             is_method_call: true,
@@ -4560,6 +4667,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:stdin".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9773,
             is_method_call: true,
@@ -4620,6 +4728,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:filter".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 3,
             is_method_call: true,
@@ -4677,6 +4786,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:filter".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 8,
             is_method_call: true,
@@ -4737,6 +4847,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:stderr".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 12,
             is_method_call: false,
@@ -4791,6 +4902,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "method:Connection.open".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 45,
             is_method_call: false,
@@ -4841,6 +4953,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "method:SqliteStore.open".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
             is_method_call: false,
@@ -4893,6 +5006,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:filter".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 8,
             is_method_call: true,
@@ -4954,6 +5068,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:get_nodes".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 4,
             is_method_call: true,
@@ -5029,6 +5144,7 @@ mod tests {
         let call_at = |line: u32| travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:filter".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: line,
             is_method_call: true,
@@ -5122,6 +5238,7 @@ mod tests {
             travsr_core::UnresolvedCall {
                 src: caller.id,
                 callee_sig: "fn:filter".to_string(),
+                alt_callee_sig: None,
                 hint_crate: None,
                 caller_line: 8,
                 is_method_call: true,
@@ -5130,6 +5247,7 @@ mod tests {
             travsr_core::UnresolvedCall {
                 src: caller.id,
                 callee_sig: "fn:count".to_string(),
+                alt_callee_sig: None,
                 hint_crate: None,
                 caller_line: 8,
                 is_method_call: true,
@@ -5173,6 +5291,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:helper".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 4,
             is_method_call: false,
@@ -5232,6 +5351,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:helper".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 4,
             is_method_call: true,
@@ -5284,6 +5404,7 @@ mod tests {
         let unresolved = vec![travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:run".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 5,
             is_method_call: true,
@@ -5325,6 +5446,7 @@ mod tests {
         let call = travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:helper".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 2,
             is_method_call: false,

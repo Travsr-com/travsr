@@ -133,6 +133,21 @@ pub fn contains_token(token: &str, text: &str) -> bool {
     false
 }
 
+/// Leaf identifier of a `kind:Qualified.Name` signature: the segment after the
+/// last `.` of the body (`method:HttpResponse.render` -> `render`), or the whole
+/// body when unqualified (`class:HttpResponse` -> `HttpResponse`, `fn:index` ->
+/// `index`).
+///
+/// Lives here, in the one crate both sides already depend on, because the
+/// daemon's leaf-uniqueness call resolver and the store's fuzzy symbol
+/// correction must agree on what counts as "the same callee". They previously
+/// carried byte-identical private copies; a future change to the splitting
+/// rules would have silently applied to only one of them.
+pub fn leaf_of(sig: &str) -> &str {
+    let body = sig.split_once(':').map(|(_, r)| r).unwrap_or(sig);
+    body.rsplit('.').next().unwrap_or(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +295,21 @@ mod tests {
         // the acronym-segmentation follow-up has a failing-by-design anchor
         // to flip.
         assert!(!contains_token("http", "HTTPServer"));
+    }
+
+    #[test]
+    fn leaf_of_splits_kind_prefix_and_qualifier() {
+        assert_eq!(leaf_of("method:HttpResponse.render"), "render");
+        assert_eq!(leaf_of("fn:Session.filter"), "filter");
+        // Unqualified body: the whole body is the leaf.
+        assert_eq!(leaf_of("class:HttpResponse"), "HttpResponse");
+        assert_eq!(leaf_of("fn:index"), "index");
+        // Deeply qualified: only the last segment.
+        assert_eq!(leaf_of("fn:a.b.c.d"), "d");
+        // No kind prefix at all.
+        assert_eq!(leaf_of("bare_name"), "bare_name");
+        // The kind prefix is stripped before the qualifier split, so a dot in
+        // the prefix position cannot be mistaken for a qualifier boundary.
+        assert_eq!(leaf_of("fn:"), "");
     }
 }
