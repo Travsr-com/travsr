@@ -137,14 +137,14 @@ fn spawn_or_skip_ra(
             );
         }
         SandboxStatus::Unavailable { reason } => {
-            tracing::error!(
-                repo = %repo_root.display(),
-                reason,
-                "rust-analyzer sandbox unavailable — install bubblewrap for isolation"
-            );
             if should_skip_unsandboxed(&status, cfg.allow_unsandboxed) {
+                // UX-002: the sandbox being unavailable is a degradation, not an
+                // error — the run still succeeds with structural edges. Keep it at
+                // WARN and fold the "install bubblewrap" detail into the single
+                // SKIPPED line so only one line reaches the user.
                 tracing::warn!(
                     repo = %repo_root.display(),
+                    reason,
                     "rust-analyzer LSIF SKIPPED — sandbox unavailable and \
                      --allow-unsandboxed-lsif not set; Rust semantic edges degraded \
                      to tree-sitter/native structural edges. Install bubblewrap, or \
@@ -154,10 +154,13 @@ fn spawn_or_skip_ra(
                 return Ok(None);
             }
             // allow_unsandboxed=true: operator opted in. Emit the unconfined-spawn
-            // audit-trail error HERE (R6 fix) — not at config-construction time —
-            // so it never fires spuriously when the sandbox is Active.
-            tracing::error!(
+            // audit-trail line HERE (R6 fix) — not at config-construction time —
+            // so it never fires spuriously when the sandbox is Active. UX-002:
+            // this is a user-requested, acknowledged opt-in — expected behavior —
+            // so it is a WARN (audit trail), not a red ERROR.
+            tracing::warn!(
                 repo = %repo_root.display(),
+                reason,
                 "rust-analyzer will run UNCONFINED — TRAVSR_ALLOW_UNSANDBOXED_LSIF \
                  opt-in acknowledged. Ensure this repository is fully trusted."
             );
@@ -200,8 +203,15 @@ fn spawn_or_skip_ra(
 
 #[cfg(test)]
 mod tests {
+    use crate::sandbox::SandboxConfig;
+    // `spawn_or_skip_ra` and `SandboxStatus` are only exercised by the
+    // fail-closed regression test, which is `#[cfg(unix)]` (it relies on Unix
+    // file permissions). Gate the imports the same way so a Windows build does
+    // not warn about them being unused.
+    #[cfg(unix)]
     use super::spawn_or_skip_ra;
-    use crate::sandbox::{SandboxConfig, SandboxStatus};
+    #[cfg(unix)]
+    use crate::sandbox::SandboxStatus;
 
     #[test]
     fn run_ra_lsif_returns_none_when_ra_missing() {

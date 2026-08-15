@@ -9,7 +9,13 @@
 // Previously: N × model_weights + N × SQLite caches → OOM at N = 8 on 8 GB.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+// `Command` (unqualified) is only referenced from the Unix/macOS process-control
+// paths (`kill`, `sysctl`, `vm_stat`); the cross-platform spawn sites use the
+// fully-qualified `std::process::Command`. Gate the import to Unix so a Windows
+// build does not warn about it being unused.
+#[cfg(unix)]
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -1339,6 +1345,17 @@ fn resolve_backend_for_reindex(db_path: &Path) -> anyhow::Result<(PathBuf, PathB
              Run `travsr embed init` first."
         )),
     }
+}
+
+/// Preflight the reindex backend without doing any work.
+///
+/// UX-015: `travsr embed reindex` used to print "Preparing embed text..." and
+/// "Reindexing (N workers)..." — implying work had started and workers were
+/// spawned — before discovering there is no backend to reindex with. The CLI
+/// calls this first so it can fail fast with the actionable `travsr embed init`
+/// message (or the below-floor remedy) before emitting any progress output.
+pub fn ensure_reindex_backend_ready(db_path: &Path) -> anyhow::Result<()> {
+    resolve_backend_for_reindex(db_path).map(|_| ())
 }
 
 /// Blocking reindex — called from `travsr embed reindex` (CLI path).

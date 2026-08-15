@@ -328,17 +328,38 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
         return;
     }
 
-    let skipped = stats.files_skipped_unchanged + stats.files_skipped_ignored;
-    let skipped_note = if skipped > 0 {
-        format!(" ({} skipped)", commas(skipped))
-    } else {
+    // UX-006: split the two kinds of skip so the counts reconcile with the
+    // progress denominator. The bar counts indexable files (indexed + unchanged),
+    // while `ignored` files never enter the bar at all. Bundling both into one
+    // "N skipped" number made three unrelated totals (bar total, indexed, and
+    // indexed+skipped) that added up to nothing. Naming them lets the reader see
+    // `indexed + unchanged = bar total`, with `ignored` accounted separately.
+    let mut skip_parts: Vec<String> = Vec::new();
+    if stats.files_skipped_unchanged > 0 {
+        skip_parts.push(format!(
+            "{} unchanged",
+            commas(stats.files_skipped_unchanged)
+        ));
+    }
+    if stats.files_skipped_ignored > 0 {
+        skip_parts.push(format!("{} ignored", commas(stats.files_skipped_ignored)));
+    }
+    let skipped_note = if skip_parts.is_empty() {
         String::new()
+    } else {
+        format!(" ({})", skip_parts.join(", "))
     };
+    // UX-003: the counts written this pass are a *delta*, not the graph total, so
+    // "0 nodes · 6,028 edges" looked self-contradictory and matched neither the
+    // real graph nor `travsr status`. Show `+delta/total` for both so the pass
+    // change and the resulting totals (which `status` reports) are both explicit.
     println!(
-        "  {node} indexed {} files{skipped_note} · {} nodes · {} edges · {dur}",
+        "  {node} indexed {} files{skipped_note} · +{}/{} nodes · +{}/{} edges · {dur}",
         commas(stats.files_indexed),
         commas(stats.nodes_written.max(0) as u64),
+        commas(stats.total_nodes),
         commas(stats.edges_written),
+        commas(stats.total_edges),
     );
 
     match &stats.phase_b_report {
@@ -602,12 +623,25 @@ pub fn fmt_dur(d: Duration) -> String {
     }
 }
 
-/// Rough ETA from average throughput so far. `None` once done or at start.
+/// Minimum samples + elapsed window before an ETA is trustworthy. UX-005:
+/// extrapolating from the first tick (1 file in 4 s) produced a 46-minute ETA on
+/// a job that finished in 13 s, inviting a premature Ctrl-C. Withhold the
+/// estimate until throughput has stabilised.
+const ETA_WARMUP_FILES: u64 = 8;
+const ETA_WARMUP_SECS: f64 = 2.0;
+
+/// Rough ETA from average throughput so far. `None` once done, at start, or
+/// still inside the warm-up window (see [`ETA_WARMUP_FILES`]).
 fn eta(start: Instant, done: u64, total: u64) -> Option<Duration> {
     if done == 0 || done >= total {
         return None;
     }
     let secs = start.elapsed().as_secs_f64();
+    // Warm-up floor: too few samples or too short a window still gives a wild
+    // extrapolation. Hold the ETA back and show only elapsed until then.
+    if done < ETA_WARMUP_FILES || secs < ETA_WARMUP_SECS {
+        return None;
+    }
     let rate = done as f64 / secs; // files/sec
     if rate <= 0.0 {
         return None;
@@ -643,6 +677,21 @@ mod tests {
         assert!(eta(start, 0, 100).is_none());
         assert!(eta(start, 100, 100).is_none());
         assert!(eta(start, 150, 100).is_none());
+    }
+
+    #[test]
+    fn eta_withheld_during_warmup() {
+        // UX-005: a fresh start with only a handful of files done must not emit an
+        // ETA — the sample count is below the warm-up floor.
+        let start = Instant::now();
+        assert!(
+            eta(start, 1, 566).is_none(),
+            "one file in must be inside the warm-up window"
+        );
+        assert!(
+            eta(start, ETA_WARMUP_FILES - 1, 566).is_none(),
+            "still under the file floor => no ETA"
+        );
     }
 
     #[test]

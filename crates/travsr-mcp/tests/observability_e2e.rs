@@ -176,12 +176,16 @@ fn registry_key_for(fake_home: &Path, repo_dir: &Path) -> String {
     let repo_dir = repo_dir
         .canonicalize()
         .unwrap_or_else(|_| repo_dir.to_path_buf());
+    // UX-018: registration now strips that `\\?\` verbatim prefix before storing
+    // the key and db path, so normalize the comparison target the same way — the
+    // canonicalized path still carries the prefix and would otherwise not match.
     let repo_dir_str = repo_dir.to_string_lossy();
+    let repo_dir_norm = travsr_store::registry::strip_verbatim_prefix(&repo_dir_str);
     repos
         .iter()
         .find(|(_, v)| {
             v.as_str()
-                .map(|s| s.contains(repo_dir_str.trim_end_matches('/')))
+                .map(|s| s.contains(repo_dir_norm.trim_end_matches('/')))
                 .unwrap_or(false)
         })
         .map(|(k, _)| k.clone())

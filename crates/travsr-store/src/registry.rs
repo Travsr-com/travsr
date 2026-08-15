@@ -14,6 +14,23 @@ pub fn registry_path() -> PathBuf {
     home_dir().join(".travsr").join("registry.json")
 }
 
+/// Strip the Windows extended-length / verbatim path prefix (`\\?\`) that
+/// `std::fs::canonicalize` prepends on Windows, so registry keys and displayed
+/// paths read as normal paths (UX-018). Verbatim UNC (`\\?\UNC\server\share`)
+/// is rewritten back to its `\\server\share` form. No-op on any path without the
+/// prefix, so it is safe to call unconditionally on every platform (a POSIX path
+/// never carries it).
+pub fn strip_verbatim_prefix(p: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = p.strip_prefix(r"\\?\") {
+        Cow::Borrowed(rest)
+    } else {
+        Cow::Borrowed(p)
+    }
+}
+
 /// SEC (#507, Windows): mirror the Unix owner-only restriction via `icacls`,
 /// following the daemon's graph.db pattern. `/inheritance:r` strips all
 /// inherited ACEs; `/grant:r` re-grants to the current user only —
@@ -111,8 +128,14 @@ pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
         .context("opening registry.lock")?;
     fs2::FileExt::lock_exclusive(&lock_file).context("acquiring registry.lock")?;
 
+    // UX-018: normalize away the Windows `\\?\` verbatim prefix so the registry
+    // key and stored db path are clean, consistent paths (never a mix of a
+    // prefixed and a bare entry for the same repo).
+    let repo_name = strip_verbatim_prefix(repo_name).into_owned();
+    let db_path = PathBuf::from(strip_verbatim_prefix(&db_path.to_string_lossy()).into_owned());
+
     let mut repos = read_registry(&reg_path).unwrap_or_default();
-    repos.insert(repo_name.to_string(), db_path.to_path_buf());
+    repos.insert(repo_name, db_path);
     write_registry_atomic(&reg_path, &repos)?;
 
     // Explicit unlock is not needed — lock_file drops at end of scope.
@@ -269,6 +292,26 @@ mod tests {
         std::env::set_var("HOME", tmp.path());
         f(tmp.path());
         std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_handles_all_forms() {
+        // Plain drive-letter verbatim path → prefix removed.
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\D:\com.travsr\travsr"),
+            r"D:\com.travsr\travsr"
+        );
+        // Verbatim UNC → rewritten to the normal `\\server\share` form.
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\proj"),
+            r"\\server\share\proj"
+        );
+        // No prefix (including POSIX paths) → returned untouched.
+        assert_eq!(
+            strip_verbatim_prefix(r"D:\already\clean"),
+            r"D:\already\clean"
+        );
+        assert_eq!(strip_verbatim_prefix("/home/user/proj"), "/home/user/proj");
     }
 
     #[test]

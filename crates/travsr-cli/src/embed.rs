@@ -259,7 +259,9 @@ fn resolve_graph_db(db_override: Option<PathBuf>) -> Result<PathBuf> {
             // Callers (reindex/reconfigure/gc/calibrate) mutate this db, so
             // resolve the worktree's own index, never the main worktree (#586).
             let repo_root = crate::repo::find_git_root_for_write(&cwd)?;
-            let p = repo_root.join(".travsr/graph.db");
+            // UX-016: build the path component-by-component so it never mixes
+            // separators (`...\.travsr/graph.db`) when displayed on Windows.
+            let p = repo_root.join(".travsr").join("graph.db");
             anyhow::ensure!(
                 p.exists(),
                 "graph.db not found at {}\n  Run `travsr init` first.",
@@ -1034,6 +1036,10 @@ fn run_reindex_locked(
     phase1: Option<u32>,
     overrides: &travsr_plugin_host::EmbedOverrides,
 ) -> Result<()> {
+    // UX-015: fail fast when there is no backend to reindex with, before any
+    // "Preparing…" / "Reindexing (N workers)…" output implies work is underway.
+    travsr_plugin_host::ensure_reindex_backend_ready(db_path)?;
+
     // C2: an absolute -j above the physical core count oversubscribes — warn but
     // honour it (the user asked explicitly). Best-effort core count.
     if let Some(j) = overrides.max_workers {

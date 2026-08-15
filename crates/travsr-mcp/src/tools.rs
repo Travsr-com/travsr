@@ -1111,13 +1111,17 @@ pub fn find_pattern(
     // Wrap with the larger find-output limit (not the 4 KiB scalar cap) so a
     // capped 500-match list and its truncation notice survive intact.
     wrap_envelope(&sanitize_mcp_body_with_limit(
-        &find_pattern_body(store, pattern, scope, fixed),
+        &find_pattern_raw(store, pattern, scope, fixed),
         FIND_OUTPUT_LIMIT,
     ))
 }
 
-/// Raw (unsanitized) body for `find_pattern`, shared by the global aggregator.
-fn find_pattern_body(
+/// Raw (unsanitized) body for `find_pattern`, shared by the global aggregator
+/// and the CLI. Callers that hand the result to a model must wrap it in the
+/// `<travsr-data>` envelope and sanitize it (see `find_pattern`); the CLI, which
+/// prints straight to a human terminal, uses this raw form so source text is not
+/// HTML-entity escaped (`->` staying `->`, not `-&gt;`).
+pub fn find_pattern_raw(
     store: &SqliteStore,
     pattern: &str,
     scope: Option<&str>,
@@ -1755,7 +1759,7 @@ pub fn find_pattern_global(
     repo: Option<&str>,
     fixed: bool,
 ) -> String {
-    // #517 DD-7: same exemption as `find_pattern_body` — see
+    // #517 DD-7: same exemption as `find_pattern_raw` — see
     // `validate_mcp_pattern_arg`'s doc comment.
     if let Err(reason) = validate_mcp_pattern_arg(pattern) {
         tracing::warn!("find_pattern_global rejected invalid pattern: {reason}");
@@ -1770,7 +1774,7 @@ pub fn find_pattern_global(
     // Aggregate raw per-repo bodies (not the wrapped form) so there is a single
     // envelope + one large-limit sanitize over the whole result.
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = find_pattern_body(store, pattern, scope, fixed);
+        let result = find_pattern_raw(store, pattern, scope, fixed);
         if result.is_empty() || single {
             result
         } else {

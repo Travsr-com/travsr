@@ -60,6 +60,12 @@ enum Command {
         /// Use this in CI or scripts that query call edges immediately after init.
         #[arg(long)]
         semantic: bool,
+        /// Force a full rebuild, bypassing the incremental "up to date" skip.
+        /// Re-parses every file even when nothing changed on disk — use it after
+        /// changing a flag that affects semantic output (e.g. --allow-unsandboxed-lsif)
+        /// which the per-file change detection does not otherwise pick up.
+        #[arg(long, visible_alias = "rebuild")]
+        force: bool,
         /// Allow rust-analyzer to run UNCONFINED when the OS sandbox (bubblewrap
         /// on Linux, sandbox-exec on macOS) is unavailable. Without this flag,
         /// the rust-analyzer LSIF pass is skipped entirely on sandbox-less hosts
@@ -125,7 +131,14 @@ enum Command {
         format: explain::OutputFormat,
     },
     /// Enumerate every use site (path:line) of a symbol across the repo.
-    #[command(alias = "refs")]
+    // UX-008: accept the MCP tool name (`find_references`) so users moving
+    // between the docs/MCP surface and the CLI find the same command. Both the
+    // underscore (MCP) and hyphen (CLI-convention) spellings resolve.
+    #[command(
+        visible_alias = "refs",
+        alias = "find_references",
+        alias = "find-references"
+    )]
     References {
         /// Symbol to enumerate references of (bare name or full signature).
         symbol: String,
@@ -137,6 +150,8 @@ enum Command {
         format: references::OutputFormat,
     },
     /// Graph-scoped textual search (git grep) over a bounded file set.
+    // UX-008: accept the MCP tool name `find_pattern`.
+    #[command(visible_alias = "find_pattern", alias = "find-pattern")]
     Pattern {
         /// POSIX ERE pattern to search for (use --fixed for a literal string).
         pattern: String,
@@ -151,6 +166,22 @@ enum Command {
         format: pattern::OutputFormat,
     },
     /// Show the dependency graph for a symbol or file as a tree or DOT.
+    // UX-008: the graph command is the CLI home of the MCP graph-traversal tools
+    // (`get_dependencies`, `get_callers`, `get_blast_radius`, `get_graph_json`) —
+    // which the CLI expresses via `--direction deps|callers|both`. Accept those
+    // MCP names as aliases so `travsr get_callers <sym>` resolves instead of
+    // erroring with "unrecognized subcommand"; add `--direction callers` to
+    // narrow it. Both underscore and hyphen spellings work.
+    #[command(
+        visible_alias = "get_dependencies",
+        alias = "get-dependencies",
+        alias = "get_callers",
+        alias = "get-callers",
+        alias = "get_blast_radius",
+        alias = "get-blast-radius",
+        alias = "get_graph_json",
+        alias = "get-graph-json"
+    )]
     Graph {
         /// Symbol or file name to start from. Mutually exclusive with --all.
         query: Option<String>,
@@ -360,6 +391,12 @@ async fn main() {
         std::process::exit(1);
     }));
 
+    // UX-019: publish the product version (this binary's `CARGO_PKG_VERSION`,
+    // 0.11.0) so the daemon's session-start log reports the same number as
+    // `travsr --version` instead of its own workspace crate version (0.7.0). The
+    // background daemon is a re-exec of this same binary, so it runs this too.
+    travsr_daemon::set_build_version(env!("CARGO_PKG_VERSION"));
+
     // Parse CLI args BEFORE initialising any subsystems.
     // Clap exits immediately for --version and --help via process::exit, so
     // init_tracing() (which may start the OTLP exporter or its background
@@ -555,8 +592,9 @@ async fn run(cli: Cli) -> Result<()> {
             json,
             jobs,
             semantic,
+            force,
             allow_unsandboxed_lsif,
-        } => init::run(quiet, json, jobs, semantic, allow_unsandboxed_lsif)?,
+        } => init::run(quiet, json, jobs, semantic, force, allow_unsandboxed_lsif)?,
         Command::Daemon { action } => {
             let cwd = std::env::current_dir()?;
             // The daemon indexes/watches the resolved root: bind it to the

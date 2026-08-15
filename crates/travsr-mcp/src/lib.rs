@@ -29,7 +29,7 @@ pub use sse::{router as sse_router, AppState};
 // Re-exported for the `travsr refs` / `travsr pattern` CLI subcommands (#299),
 // which run the same occurrence-store read as the MCP tools against a locally
 // opened store. The rest of `tools` stays private (MCP-only surface).
-pub use tools::{find_pattern, find_references};
+pub use tools::{find_pattern, find_pattern_raw, find_references};
 // #645 WS-B: the CLI `status` surface reuses this exact classifier so the CLI
 // and MCP notes never disagree about an index/HEAD mismatch.
 pub use tools::head_index_mismatch_note;

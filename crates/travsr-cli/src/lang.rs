@@ -238,6 +238,13 @@ fn cmd_list(json: bool) -> Result<()> {
             None
         };
 
+        // UX-013: built-in language plugins (rust, typescript, python, dart) ship
+        // inside the travsr binary and their semantic analysis works without any
+        // `travsr lang install` step — registration in lang.toml is only for the
+        // external-tool languages. So a built-in that is ready must read as active,
+        // never "on PATH, not registered — run travsr lang install", which falsely
+        // told users their built-in semantic support was not set up.
+        let active_eligible = registered || entry.builtin;
         let status = if entry.sandbox == SandboxRequirement::RequiresElevated && !approved {
             "needs security approval (travsr lang install — run interactively)".to_string()
         } else if wrapper_only {
@@ -252,7 +259,7 @@ fn cmd_list(json: bool) -> Result<()> {
                 entry.command,
                 hint,
             )
-        } else if registered && fully_ready && !sandbox_ok && !entry.builtin {
+        } else if active_eligible && fully_ready && !sandbox_ok && !entry.builtin {
             #[cfg(target_os = "linux")]
             let hint = "install bubblewrap: sudo apt-get install bubblewrap";
             #[cfg(target_os = "macos")]
@@ -260,7 +267,7 @@ fn cmd_list(json: bool) -> Result<()> {
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let hint = "sandbox not available on this platform";
             format!("disabled (sandbox unavailable — {hint})")
-        } else if registered && fully_ready {
+        } else if active_eligible && fully_ready {
             let phase_b_note = if entry.builtin
                 && !entry.native_phase_b
                 && !tool_on_path
@@ -273,8 +280,9 @@ fn cmd_list(json: bool) -> Result<()> {
             } else {
                 String::new()
             };
+            let kind = if entry.builtin { "built-in · " } else { "" };
             format!(
-                "\u{2713} active{}{}",
+                "\u{2713} {kind}active{}{}",
                 phase_b_note,
                 expiry_warning.as_deref().unwrap_or("")
             )
@@ -1016,7 +1024,11 @@ fn cmd_add(language: &str, corpus: Option<&str>) -> Result<()> {
 
 fn cmd_remove(language: &str) -> Result<()> {
     if lookup(language).is_none() {
-        anyhow::bail!("Unknown language '{language}'.");
+        // UX-014: match `install`'s unknown-language error — point the user at the
+        // list so both failure paths are equally actionable.
+        anyhow::bail!(
+            "Unknown language '{language}'. Run `travsr lang list` to see available languages."
+        );
     }
     let mut config = load_config().unwrap_or_default();
     if config.unregister(language) {
@@ -1195,9 +1207,26 @@ pub(crate) fn detect_languages_in(dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-/// Public accessor so init.rs can check which detected languages are unregistered.
-pub(crate) fn load_lang_config() -> Option<LangConfig> {
-    load_config()
+/// Languages detected in `repo_root` that genuinely still need a
+/// `travsr lang install` step for semantic (call/reference) indexing.
+///
+/// UX-001/UX-013: built-in languages (rust, typescript, python, dart) ship in
+/// the binary and their semantic analysis already works, so they must never
+/// appear in the `init` "not set up" nudge — otherwise the summary reports a
+/// language as both *enabled* and *not set up* in the same breath. This returns
+/// only detected languages that are non-built-in and not yet registered.
+pub(crate) fn languages_needing_setup(repo_root: &std::path::Path) -> Vec<String> {
+    let config = load_config();
+    detect_languages_in(repo_root)
+        .into_iter()
+        .filter(|l| {
+            // Skip built-ins — they work without registration.
+            if lookup(l).map(|e| e.builtin).unwrap_or(false) {
+                return false;
+            }
+            config.as_ref().map(|c| !c.is_registered(l)).unwrap_or(true)
+        })
+        .collect()
 }
 
 // ── async helper ──────────────────────────────────────────────────────────────

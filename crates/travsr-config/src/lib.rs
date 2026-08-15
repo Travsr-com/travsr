@@ -502,6 +502,47 @@ pub fn set(key: &str, value: &str, scope: Scope) -> Result<()> {
     write_table_atomic(&path, &table)
 }
 
+/// Remove a key's override from the chosen scope's `config.toml`, so it falls
+/// back to the next-lower layer (repo → global → env → default). Returns `true`
+/// if the key was present and removed, `false` if it was not set in that scope.
+/// An emptied section is pruned so no `[section]` husk is left behind. Rejects
+/// unknown keys with the same message as [`set`]; never panics.
+pub fn unset(key: &str, scope: Scope) -> Result<bool> {
+    // Validate the key exists in the registry, matching `set`/`get` behavior.
+    spec(key).with_context(|| unknown_key_msg(key))?;
+
+    let path = match scope {
+        Scope::Global => global_path().context("cannot locate home directory for global config")?,
+        Scope::Repo(root) => repo_path(&root),
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let mut table = load_table(&path);
+    let removed = table_unset(&mut table, key);
+    if removed {
+        write_table_atomic(&path, &table)?;
+    }
+    Ok(removed)
+}
+
+/// Remove a dotted `section.name` from a table, pruning the section if it becomes
+/// empty. Returns whether anything was removed.
+fn table_unset(table: &mut toml::Table, key: &str) -> bool {
+    let Some((section, name)) = key.split_once('.') else {
+        return false;
+    };
+    let Some(entry) = table.get_mut(section).and_then(|e| e.as_table_mut()) else {
+        return false;
+    };
+    let removed = entry.remove(name).is_some();
+    if entry.is_empty() {
+        table.remove(section);
+    }
+    removed
+}
+
 /// Serialize a table and write it atomically (temp file + rename) so a crashed
 /// or concurrent write never leaves a half-written config.
 fn write_table_atomic(path: &Path, table: &toml::Table) -> Result<()> {
@@ -738,5 +779,25 @@ mod tests {
         table_set(&mut t, "embed.priority", toml::Value::String("low".into())).expect("set2");
         assert_eq!(table_get(&t, "embed.capacity").as_deref(), Some("40"));
         assert_eq!(table_get(&t, "embed.priority").as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn table_unset_removes_key_and_prunes_empty_section() {
+        let mut t = toml::Table::new();
+        table_set(&mut t, "embed.capacity", toml::Value::Integer(40)).expect("set1");
+        table_set(&mut t, "embed.priority", toml::Value::String("low".into())).expect("set2");
+
+        // Removing one key leaves the sibling and the section intact.
+        assert!(table_unset(&mut t, "embed.capacity"));
+        assert!(table_get(&t, "embed.capacity").is_none());
+        assert_eq!(table_get(&t, "embed.priority").as_deref(), Some("low"));
+        assert!(t.contains_key("embed"));
+
+        // Removing the last key prunes the now-empty section husk.
+        assert!(table_unset(&mut t, "embed.priority"));
+        assert!(!t.contains_key("embed"));
+
+        // Removing an absent key is a no-op that reports false.
+        assert!(!table_unset(&mut t, "embed.capacity"));
     }
 }
