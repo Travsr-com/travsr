@@ -131,18 +131,47 @@ fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // UX-007: one line, not one `travsr lang install <lang>` line per language.
-    // `lang install` takes a single language, so for multiple we point at
-    // `lang detect` (the interactive multi-install flow); for one, name it.
-    if let [only] = unregistered.as_slice() {
+    // #588: split what can be set up here from what has no build for this
+    // platform. Offering `travsr lang install <lang>` for the second group was
+    // the reported bug — the command was printed, the prompt was shown, and
+    // every accepted language ended in a 404 from an asset that never existed.
+    let (offerable, unavailable): (Vec<_>, Vec<_>) = unregistered.iter().partition(|l| {
+        travsr_plugin_host::phase_b::catalog::lookup(l)
+            .map(|e| crate::lang::wrapper_unavailable_target(e).is_none())
+            .unwrap_or(true)
+    });
+
+    if !offerable.is_empty() {
         println!(
-            "tip: {only} found in this repo but semantic (call/reference) indexing is not set up — run: travsr lang install {only}"
+            "tip: {} found in this repo but semantic (call/reference) indexing is not set up:",
+            offerable
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-    } else {
+        for lang in &offerable {
+            println!("       travsr lang install {lang}");
+        }
+    }
+
+    if !unavailable.is_empty() {
+        // Stated, not silently dropped: structural indexing did cover these
+        // files, and the user should know which part is missing and why.
         println!(
-            "tip: {} found in this repo but semantic (call/reference) indexing is not set up — run: travsr lang detect",
-            unregistered.join(", ")
+            "note: {} found in this repo, but no semantic analyzer is published for \
+             this platform yet — structural indexing covers them, call/reference \
+             analysis does not.",
+            unavailable
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
+    }
+
+    if offerable.is_empty() {
+        return Ok(());
     }
 
     if std::io::stdin().is_terminal() {

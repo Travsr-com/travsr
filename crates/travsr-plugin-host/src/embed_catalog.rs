@@ -614,6 +614,18 @@ pub fn write_model_descriptor(model_dir: &Path, b: &EmbedBackend) -> anyhow::Res
         query_prefix: &'a str,
         n_inputs: u32,
         truncate_dim: u32,
+        /// The sidecar's `family` (travsr-embed #6): which engines can execute
+        /// this graph at all. Not cosmetic — `tract` runs standard BERT only, so
+        /// a ModernBERT or nomic-bert model has to reach an ORT-capable engine,
+        /// and the sidecar picks the engine from this tag. Without it the sidecar
+        /// assumes `"bert"`, hands a non-BERT graph to tract, and fails at graph
+        /// load partway through a reindex — the failure travsr-embed #6 exists to
+        /// prevent.
+        ///
+        /// Skipped when the catalog entry has no `arch`, so the sidecar applies
+        /// its own default instead of receiving an empty string it rejects.
+        #[serde(skip_serializing_if = "str::is_empty")]
+        family: &'a str,
     }
     let content = toml::to_string(&Descriptor {
         dim: b.dim,
@@ -621,6 +633,7 @@ pub fn write_model_descriptor(model_dir: &Path, b: &EmbedBackend) -> anyhow::Res
         query_prefix: &b.query_prefix,
         n_inputs: b.n_inputs,
         truncate_dim: b.truncate_dim,
+        family: &b.arch,
     })
     .context("serialize model descriptor")?;
     let path = model_dir.join("model.toml");
@@ -2427,5 +2440,74 @@ mod tests {
             "second run must find nothing left to reclaim, got {second:?}"
         );
         assert_eq!(model_counts(&db).get("arctic-embed-m-v1.5"), Some(&5));
+    }
+
+    // ── model.toml descriptor: the sidecar contract ──────────────────────────
+
+    fn backend_with_arch(arch: &str) -> EmbedBackend {
+        EmbedBackend {
+            id: "test-model".into(),
+            description: String::new(),
+            dim: 768,
+            params_m: 109,
+            mteb: 65.0,
+            ram_mb: 450,
+            init_secs: 47,
+            binary_name: "travsr-embed".into(),
+            github_repo: "Travsr-com/travsr-embed".into(),
+            version_fallback: "v1.0.0".into(),
+            pooling: "cls".into(),
+            query_prefix: "q: ".into(),
+            n_inputs: 2,
+            truncate_dim: 0,
+            arch: arch.into(),
+            model_files: vec![],
+        }
+    }
+
+    /// The catalog's `arch` must reach the sidecar as `family`. Without it the
+    /// sidecar assumes "bert" and hands a non-BERT graph to tract, which fails at
+    /// graph load partway through a reindex (travsr-embed #6).
+    #[test]
+    fn descriptor_carries_arch_as_family() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_descriptor(dir.path(), &backend_with_arch("modernbert")).unwrap();
+        let toml = std::fs::read_to_string(dir.path().join("model.toml")).unwrap();
+        assert!(toml.contains(r#"family = "modernbert""#), "{toml}");
+        // The rest of the contract must survive the addition.
+        assert!(toml.contains("dim = 768"), "{toml}");
+        assert!(toml.contains(r#"pooling = "cls""#), "{toml}");
+        assert!(toml.contains("n_inputs = 2"), "{toml}");
+    }
+
+    /// An entry with no `arch` must omit the key entirely rather than write an
+    /// empty string: the sidecar defaults absent to "bert" but rejects "".
+    #[test]
+    fn descriptor_omits_family_when_arch_is_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_descriptor(dir.path(), &backend_with_arch("")).unwrap();
+        let toml = std::fs::read_to_string(dir.path().join("model.toml")).unwrap();
+        assert!(!toml.contains("family"), "{toml}");
+    }
+
+    /// Every bundled entry must declare an arch, or its model.toml silently
+    /// defaults to bert — fine today, wrong the moment a non-BERT model lands.
+    ///
+    /// Parses the bundled TOML directly rather than calling `backends()`, which
+    /// merges `~/.travsr/embed_catalog.toml` on top. `arch` is `#[serde(default)]`,
+    /// so a developer whose override entry omits it would see this test fail and
+    /// blame the bundled catalog for something in their home directory.
+    #[test]
+    fn bundled_catalog_entries_all_declare_arch() {
+        #[derive(serde::Deserialize)]
+        struct Bundled {
+            backend: Vec<EmbedBackend>,
+        }
+        let parsed: Bundled =
+            toml::from_str(include_str!("embed_catalog.toml")).expect("bundled catalog must parse");
+        assert!(!parsed.backend.is_empty(), "bundled catalog is empty");
+        for b in &parsed.backend {
+            assert!(!b.arch.trim().is_empty(), "{} has no arch", b.id);
+        }
     }
 }

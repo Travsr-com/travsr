@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 use clap::Subcommand;
 use std::path::PathBuf;
 use travsr_plugin_host::phase_b::catalog::{
-    lookup, SandboxRequirement, ScipBinarySpec, ScipInstall, ZipBinarySpec, CATALOG,
+    lookup, PhaseBEntry, SandboxRequirement, ScipBinarySpec, ScipInstall, ZipBinarySpec, CATALOG,
 };
 use travsr_plugin_host::sandbox::policy::validate_permitted_host;
 
@@ -132,6 +132,49 @@ pub fn run(cmd: LangCommand) -> Result<()> {
     }
 }
 
+// ── platform availability (#588) ──────────────────────────────────────────────
+
+/// The host target triple this wrapper's release asset would be named for, or
+/// `None` on a platform travsr has no triple for.
+fn host_target() -> Option<&'static str> {
+    crate::install::current_target().ok()
+}
+
+/// The host target when this entry needs a travsr-lang wrapper that the release
+/// matrix does not publish for it, else `None`.
+///
+/// #588: `current_target()` returning a triple was being read as "the wrapper
+/// exists for this triple". It does not follow — Windows had a triple and zero
+/// published assets — so every `lang install` on Windows offered a setup flow
+/// that ended in a raw 404. Anything that offers, lists or performs a wrapper
+/// install asks this first and states the limitation instead.
+/// Reported only when the wrapper is not already present: a user who built one
+/// themselves and put it on PATH has a working setup, and telling them it is
+/// unavailable would be its own false statement. The gate is about what can be
+/// *downloaded*, not about what can run.
+pub(crate) fn wrapper_unavailable_target(entry: &PhaseBEntry) -> Option<&'static str> {
+    let bin = entry.provider_binary?;
+    let target = host_target()?;
+    if crate::install::wrapper_available(bin, target) || tool_available(bin) {
+        return None;
+    }
+    Some(target)
+}
+
+/// The line shown wherever an unavailable language surfaces: the honest
+/// capability statement plus whatever manual path the catalog records.
+fn unavailable_status(entry: &PhaseBEntry, target: &str) -> String {
+    let hint = if entry.underlying_tool_hint.is_empty() {
+        String::new()
+    } else {
+        format!(" — manual setup: {}", entry.underlying_tool_hint)
+    };
+    format!(
+        "not available on {target} yet ({} ships no prebuilt binary for this platform){hint}",
+        entry.provider_binary.unwrap_or(entry.command)
+    )
+}
+
 // ── list ──────────────────────────────────────────────────────────────────────
 
 fn json_str(s: &str) -> String {
@@ -175,8 +218,13 @@ fn cmd_list(json: bool) -> Result<()> {
                 ScipInstall::Command(_) => "Command",
                 ScipInstall::Manual => "Manual",
             };
+            // #588: `installed:false` alone cannot distinguish "run the install
+            // command" from "no build exists for this platform". Consumers that
+            // surface an install prompt (the VS Code extension included) need
+            // that difference, so it is stated rather than implied.
+            let unavailable_on = wrapper_unavailable_target(entry);
             entries.push(format!(
-                r#"{{"language":{},"package":{},"sandbox":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"elevatedHosts":{}}}"#,
+                r#"{{"language":{},"package":{},"sandbox":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{}}}"#,
                 json_str(entry.language),
                 json_str(package),
                 json_str(sandbox),
@@ -188,6 +236,8 @@ fn cmd_list(json: bool) -> Result<()> {
                 json_str(entry.install_hint),
                 json_str(entry.underlying_tool_hint),
                 json_arr(entry.elevated_hosts),
+                unavailable_on.is_none(),
+                unavailable_on.map_or("null".to_string(), json_str),
             ));
         }
         println!("[{}]", entries.join(",\n"));
@@ -245,7 +295,13 @@ fn cmd_list(json: bool) -> Result<()> {
         // never "on PATH, not registered — run travsr lang install", which falsely
         // told users their built-in semantic support was not set up.
         let active_eligible = registered || entry.builtin;
-        let status = if entry.sandbox == SandboxRequirement::RequiresElevated && !approved {
+        // #588: checked before every other branch. A language whose wrapper is
+        // not published for this host cannot become active here no matter what
+        // else is true, and "not installed — travsr lang install <lang>" would
+        // be an instruction that cannot succeed.
+        let status = if let Some(target) = wrapper_unavailable_target(entry) {
+            unavailable_status(entry, target)
+        } else if entry.sandbox == SandboxRequirement::RequiresElevated && !approved {
             "needs security approval (travsr lang install — run interactively)".to_string()
         } else if wrapper_only {
             let hint = if entry.underlying_tool_hint.is_empty() {
@@ -337,6 +393,21 @@ fn cmd_install(
         )
     })?;
 
+    // #588: state the platform gap before anything else — before the approval
+    // prompt, before registering the language, before any network work. Nothing
+    // downstream can succeed, and the previous behaviour (walk the whole flow,
+    // then fail on a 404 from an asset that was never published) told the user
+    // nothing about why.
+    if let Some(target) = wrapper_unavailable_target(entry) {
+        anyhow::bail!(
+            "'{language}' is {}\n\
+             \n\
+             Structural indexing (symbols, definitions, repo map) still works on \
+             this platform — only call/reference analysis needs this binary.",
+            unavailable_status(entry, target)
+        );
+    }
+
     // RequiresElevated: a security approval must be on record before install.
     // ADR-017 Rule 1 is the internal policy behind this check — never surface
     // the ADR name in user output; use plain language instead.
@@ -425,11 +496,7 @@ fn cmd_install(
                 }
 
                 if !crate::install::path_contains_travsr_bin() {
-                    println!(
-                        "\nhint: add ~/.travsr/bin to your PATH:\n\n\
-                         \texport PATH=\"$HOME/.travsr/bin:$PATH\"\n\n\
-                         Add this line to your ~/.zshrc or ~/.bashrc to make it permanent.\n"
-                    );
+                    println!("\n{}", crate::install::path_hint());
                 }
 
                 true
@@ -700,11 +767,7 @@ fn install_scip_github_binary(
                 path.display()
             );
             if !crate::install::path_contains_travsr_bin() {
-                println!(
-                    "\nhint: add ~/.travsr/bin to your PATH:\n\n\
-                     \texport PATH=\"$HOME/.travsr/bin:$PATH\"\n\n\
-                     Add this to your ~/.zshrc or ~/.bashrc to make it permanent.\n"
-                );
+                println!("\n{}", crate::install::path_hint());
             }
         }
         Err(e) => {
@@ -792,11 +855,7 @@ fn install_zip_binary(
         wrapper.display()
     );
     if !crate::install::path_contains_travsr_bin() {
-        println!(
-            "\nhint: add ~/.travsr/bin to your PATH:\n\n\
-             \texport PATH=\"$HOME/.travsr/bin:$PATH\"\n\n\
-             Add this to your ~/.zshrc or ~/.bashrc to make it permanent.\n"
-        );
+        println!("\n{}", crate::install::path_hint());
     }
 
     Ok(())
@@ -830,12 +889,16 @@ fn cmd_detect() -> Result<()> {
         let provider_ready = entry.provider_binary.map_or(true, tool_available);
         let fully_ready = entry.builtin || (provider_ready && tool_available(entry.command));
 
-        let status = if registered && fully_ready {
-            "\u{2713} already active"
+        let status = if let Some(target) = wrapper_unavailable_target(entry) {
+            // #588: shown in the numbered menu so a doomed choice is visible
+            // before it is made, not after a 404.
+            format!("not available on {target} yet")
+        } else if registered && fully_ready {
+            "\u{2713} already active".to_string()
         } else if registered {
-            "registered (analyzer binary missing)"
+            "registered (analyzer binary missing)".to_string()
         } else {
-            "not installed"
+            "not installed".to_string()
         };
 
         println!(
