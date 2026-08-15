@@ -340,7 +340,7 @@ fn cpp_constructs_resolve_end_to_end() {
         &[
             Probe {
                 symbol: "draw",
-                site: "main.cpp:6",
+                site: "main.cpp:5",
                 construct: "out-of-line member (the #698 shape)",
                 gap: None,
             },
@@ -352,52 +352,49 @@ fn cpp_constructs_resolve_end_to_end() {
                 // unambiguous while `.h` was parsed as C, which flattened the
                 // class and lost `Shape.area` altogether.
                 symbol: "method:Widget.area",
-                site: "main.cpp:7",
+                site: "main.cpp:6",
                 construct: "virtual override, out-of-line",
                 gap: None,
             },
             Probe {
                 symbol: "inlineSize",
-                site: "main.cpp:8",
+                site: "main.cpp:7",
                 construct: "inline member defined in the header",
                 gap: None,
             },
             Probe {
                 symbol: "build_default",
-                site: "main.cpp:12",
+                site: "main.cpp:11",
                 construct: "free function in a nested namespace",
                 gap: None,
             },
             Probe {
                 symbol: "instances",
-                site: "main.cpp:13",
+                site: "main.cpp:12",
                 construct: "static member function",
                 gap: None,
             },
             Probe {
                 symbol: "twice",
-                site: "main.cpp:14",
+                site: "main.cpp:13",
                 construct: "function template",
                 gap: None,
             },
             Probe {
                 symbol: "unwrap",
-                site: "main.cpp:16",
+                site: "main.cpp:15",
                 construct: "class template, out-of-class member",
-                gap: Some(
-                    "scip-clang emits Box#, Box#Box<T> and Box#value_ but no Box#unwrap, so there \
-                     is no occurrence to attribute",
-                ),
+                gap: None,
             },
             Probe {
                 symbol: "describe",
-                site: "main.cpp:17",
+                site: "main.cpp:16",
                 construct: "inherited base-class method",
                 gap: None,
             },
             Probe {
                 symbol: "label_of",
-                site: "main.cpp:18",
+                site: "main.cpp:17",
                 construct: "free function taking a base reference",
                 gap: None,
             },

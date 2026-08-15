@@ -1,4 +1,3 @@
-#include <cstdio>
 #include "widget.h"
 
 int main() {
@@ -16,7 +15,11 @@ int main() {
     int u = b.unwrap();
     int d = w.describe();
     int lbl = app::ui::label_of(w);
-    std::printf("%d %d %d %d %d %d %d %d %d %d %d\n",
-                drawn, area, inl, r1, r2, def, n, t, u, d, lbl);
+    // Consumed rather than printed: a system header would need
+    // include paths this fixture's hand-written compdb does not
+    // carry, and scip-clang then emits partial output for the whole
+    // translation unit rather than failing loudly.
+    int sink = drawn + area + inl + r1 + r2 + def + n + t + u + d + lbl;
+    (void)sink;
     return 0;
 }
