@@ -4275,8 +4275,8 @@ LIMIT ?4",
     /// (`widget.h` declares `Widget::draw`, `widget.cpp` defines it) are the
     /// motivating shape.
     ///
-    /// Deliberately has **no line constraint** — a declaration's line says
-    /// nothing about its definition's — and instead guards on uniqueness:
+    /// Deliberately has **no line constraint**, since a declaration's line says
+    /// nothing about its definition's, and instead guards on uniqueness:
     /// more than one candidate means the name is ambiguous in this repo, and
     /// merging would attribute calls to the wrong function. Two same-named
     /// `static` functions in different translation units are different

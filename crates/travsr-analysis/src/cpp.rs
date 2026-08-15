@@ -60,7 +60,9 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 /// - `//` comments and `bool`, which are C99 and later.
 ///
 /// False negatives are the safe direction: a C++ header with none of these is
-/// declaration-only and parses acceptably as C, which is today's behaviour.
+/// declaration-only and parses acceptably as C, which is today's behaviour. A
+/// false positive is not, so every marker is anchored on a boundary rather
+/// than matching a bare substring.
 pub fn header_is_cxx(source: &str) -> bool {
     // Scope resolution is impossible in C and appears in almost any C++ header
     // that declares something qualified.
@@ -76,12 +78,38 @@ pub fn header_is_cxx(source: &str) -> bool {
         "private:",
         "protected:",
         "virtual ",
-        "operator",
         "friend ",
         "constexpr ",
         "nullptr",
     ];
-    MARKERS.iter().any(|m| source.contains(m))
+    if MARKERS.iter().any(|m| source.contains(m)) {
+        return true;
+    }
+    // `operator` needs a real word boundary on both sides, which a substring
+    // match cannot give (#708 review). A bare `contains("operator")` matched
+    // ordinary C like `int apply_operator(...)`; anchoring only the right side
+    // still matched it, and anchoring only the left side still matched
+    // `enum operator_type`. Both sides, or the overload keyword is
+    // indistinguishable from an identifier that happens to contain it.
+    contains_keyword(source, "operator")
+}
+
+/// Whether `word` appears in `source` as a whole identifier, rather than as a
+/// substring of a longer one.
+///
+/// A C identifier continues through ASCII alphanumerics and `_`, so a match is
+/// a keyword only when neither neighbour can continue it: `operator+=` and
+/// `operator()` qualify, `apply_operator` and `operator_type` do not.
+fn contains_keyword(source: &str, word: &str) -> bool {
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let bytes = source.as_bytes();
+    let w = word.as_bytes();
+    source.match_indices(word).any(|(i, _)| {
+        let before_ok = i == 0 || !is_ident(bytes[i - 1]);
+        let after = i + w.len();
+        let after_ok = after >= bytes.len() || !is_ident(bytes[after]);
+        before_ok && after_ok
+    })
 }
 
 /// Parse a C++ source file into graph nodes and edges.
@@ -93,6 +121,55 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #708 review: `"operator"` was an unanchored substring, so ordinary C
+    /// identifiers that merely contain it sent the header to the C++ grammar.
+    /// A false positive, which is the direction this heuristic exists to avoid.
+    #[test]
+    fn c_identifiers_containing_operator_are_not_cxx() {
+        for c_header in [
+            "enum operator_type { OP_ADD, OP_SUB };\n",
+            "int apply_operator(int a, int b);\n",
+            "static const char *bitwise_operator_table[8];\n",
+            "void unary_operator_apply(struct expr *e);\n",
+        ] {
+            assert!(
+                !header_is_cxx(c_header),
+                "plain C misclassified as C++: {c_header:?}"
+            );
+        }
+    }
+
+    /// The real C++ spellings must still be caught, or the anchoring traded one
+    /// bug for another.
+    #[test]
+    fn real_operator_declarations_are_cxx() {
+        for cxx in [
+            "Widget& operator+=(int by);\n",
+            "bool operator==(const Widget &a, const Widget &b);\n",
+            "int operator()(int x) const;\n",
+        ] {
+            assert!(header_is_cxx(cxx), "missed a real operator decl: {cxx:?}");
+        }
+    }
+
+    /// A C header that says nothing C++-shaped stays C, which is the safe
+    /// direction and the pre-existing behaviour.
+    #[test]
+    fn a_plain_c_header_stays_c() {
+        assert!(!header_is_cxx(
+            "#ifndef H\n#define H\nstruct Point { int x; };\nint add(int a, int b);\n#endif\n"
+        ));
+    }
+
+    /// A C header written to be included from C++ must not be misread as C++:
+    /// those guards are how a C header declares itself portable.
+    #[test]
+    fn extern_c_guards_do_not_make_a_header_cxx() {
+        assert!(!header_is_cxx(
+            "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint add(int, int);\n#ifdef __cplusplus\n}\n#endif\n"
+        ));
+    }
 
     #[test]
     fn parse_empty_file() {
