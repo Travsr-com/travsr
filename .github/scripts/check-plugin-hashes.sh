@@ -43,7 +43,17 @@ while IFS='=' read -r crate recorded_hash; do
     # locale is not C generated a lock file this gate then rejected, with a misleading
     # "source changed but plugin_version not bumped" error naming a bump that would not
     # help. Must stay identical to the `sort` in update-plugin-hashes.sh.
-    actual_hash=$(find "$src_dir" -type f -name "*.rs" | LC_ALL=C sort | while IFS= read -r f; do cat -- "$f"; done | $SHA256 | awk '{print $1}')
+    #
+    # `tr -d '\r'` normalises line endings for exactly the same reason: the hash
+    # must not depend on whose machine computed it. Git for Windows defaults to
+    # core.autocrlf=true, so a Windows checkout holds CRLF in the working tree
+    # while CI (Linux) holds LF — the same commit hashes differently, and running
+    # update-plugin-hashes.sh there rewrites EVERY crate's entry, including
+    # crates the contributor never touched, producing a lock file this gate then
+    # rejects wholesale. Stripping CR is a no-op on LF content, so the recorded
+    # hashes are unchanged; Rust source carries a raw CR only as a line ending
+    # (a literal carriage return is written `\r`).
+    actual_hash=$(find "$src_dir" -type f -name "*.rs" | LC_ALL=C sort | while IFS= read -r f; do cat -- "$f"; done | tr -d '\r' | $SHA256 | awk '{print $1}')
 
     if [[ "$actual_hash" != "$recorded_hash" ]]; then
         echo "ERROR: $crate source changed but plugin_version not bumped"
