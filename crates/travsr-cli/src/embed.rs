@@ -434,7 +434,27 @@ fn cmd_init(
         }
     }
 
+    // RFC-025 Point B, Leg 1: if the on-disk sidecar is below the version floor,
+    // `install_backend_with_progress` already printed the WARN + remedy. The post-
+    // install reindex would hard-refuse at Point A, so skip it and leave the user
+    // in a usable state (prior embeddings stay searchable) rather than aborting
+    // `init`. The hard refuse remains where it belongs: `embed reindex`/spawn.
+    let below_floor = embed_bin_dir().ok().is_some_and(|d| {
+        let p = d.join(backend.binary_filename());
+        p.exists() && !travsr_plugin_host::floor_status(backend, &p, None).is_usable()
+    });
+
     match db_path {
+        Some(_) if below_floor => {
+            println!(
+                "\n  {} skipping reindex: the installed sidecar is below the required version.",
+                pal.dim("\u{2139}")
+            );
+            println!(
+                "  {} existing embeddings remain searchable; run `travsr embed init --reinstall` to update and reindex.",
+                pal.dim("\u{2139}")
+            );
+        }
         Some(ref p) => reindex_after_init(backend, p, &overrides)?,
         None => {
             println!("\n  {} {} installed", pal.green("\u{25cf}"), backend.id);
@@ -567,13 +587,29 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
 
     if dest.exists() && !reinstall {
         println!("  {} {} ready", pal.green("\u{25cf}"), backend.binary_name);
+        // RFC-025 Point B: the binary is present but presence is monotonic and
+        // never re-checks the release it was pinned to on install day. Surface a
+        // below-floor WARN (offline) and a newer-release advisory (best-effort)
+        // here, so a stale sidecar is caught at init instead of at the next
+        // reindex. Never fails init.
+        crate::install::advise_installed_sidecar(backend, &dest, "travsr embed init --reinstall");
     } else {
         let target = crate::install::current_target().context("determining install target")?;
         let repo = backend.github_repo.to_string();
-        let version = crate::lang::run_async(async move {
-            crate::install::fetch_latest_version_for_repo(&repo).await
-        })
-        .unwrap_or_else(|_| backend.version_fallback.to_string());
+        // RFC-025 G3: resolve the download tag through the same shared resolver
+        // the Phase B family uses (embed is never hash-pinned, and `embed init`
+        // has no `--version` override), instead of a bespoke inline fetch.
+        let version = crate::lang::resolve_install_tag(
+            false,
+            &backend.version_fallback,
+            None,
+            &backend.binary_name,
+            move || {
+                crate::lang::run_async(async move {
+                    crate::install::fetch_latest_version_for_repo(&repo).await
+                })
+            },
+        )?;
 
         let bin_name = backend.binary_name.to_string();
         let repo2 = backend.github_repo.to_string();
@@ -1997,6 +2033,10 @@ fn cmd_status() -> Result<()> {
         println!("hint: embedding is running in the background via the daemon.");
         println!("      Run `travsr embed status` again in a few minutes to see progress.");
     }
+
+    // RFC-025 §8: sidecar version health (installed vs required vs latest).
+    println!();
+    crate::sidecar_health::print_block();
 
     Ok(())
 }
