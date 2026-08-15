@@ -1,11 +1,11 @@
-//! `travsr connect` — wire detected AI coding tools to the Travsr MCP server and
+//! `travsr connect`: wire detected AI coding tools to the Travsr MCP server and
 //! drop an always-on "use Travsr first" rules file for each. Also invoked by
 //! `travsr init` (RFC-026).
 //!
 //! Two co-equal outputs per detected tool:
 //!   1. register `travsr mcp --stdio` in the tool's MCP config, and
 //!   2. write an always-on rules/instructions file directing the agent to query
-//!      Travsr before grep/find. Wiring alone does not change agent behavior — the
+//!      Travsr before grep/find. Wiring alone does not change agent behavior, the
 //!      rules are what make the agent actually use Travsr.
 //!
 //! Safety (RFC-026): generated files are local and git-ignored by default (never
@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 const MD_BEGIN: &str = "<!-- travsr:begin -->";
 const MD_END: &str = "<!-- travsr:end -->";
 const GI_BEGIN: &str =
-    "# travsr:begin (generated AI-tool config — `travsr connect --remove` to undo)";
+    "# travsr:begin (generated AI-tool config, `travsr connect --remove` to undo)";
 const GI_END: &str = "# travsr:end";
 
 /// Options controlling a connect run. `auto()` is the zero-config path used by
@@ -88,22 +88,51 @@ impl McpCommand {
 
 const GUIDE_TITLE: &str = "Use Travsr first for all code questions";
 
+/// The directive itself. Kept deliberately short: this text is prepended to every
+/// agent turn, so each line has to earn its tokens. It maps questions to tools
+/// rather than listing signatures, because the agent already receives the full
+/// schemas from `tools/list`, what it lacks is the routing.
+///
+/// Mirrors the tool set advertised by `travsr-mcp`'s `tools_list`. When a tool is
+/// added or renamed there, update this table.
 fn guide_body() -> String {
-    "This repository has a Travsr code graph served over MCP. For ANY question \
-about code structure (definitions, callers, dependencies, impact/blast radius, \
-call paths, or repo overview) ALWAYS query Travsr's MCP tools BEFORE \
-grep/find/ripgrep or reading whole files. Travsr is the token-efficient, \
-hallucination-free path.
+    "This repository is indexed by Travsr, a code graph served over MCP. For ANY \
+question about where code lives or how it connects (definitions, call sites, \
+imports, change impact, call paths, repo structure), query Travsr BEFORE \
+grep/find/ripgrep or reading whole files. Travsr answers from the graph, so it is \
+token-cheap and does not invent structure that is not there.
 
-- search_symbol(name)         find a definition
-- get_callers(symbol)         who calls this
-- get_dependencies(file)      what this depends on
-- get_blast_radius(file)      what a change here affects
-- get_execution_path(a, b)    how a reaches b
-- get_repo_map(repo)          high-level structure
-- get_context(query, budget)  full PPR + knapsack retrieval
+Pick the tool by the question:
 
-Only fall back to text search when Travsr returns nothing or is unavailable."
+| question                          | tool                                        |
+| --------------------------------- | ------------------------------------------- |
+| where is X defined?               | search_symbol(name, repo)                   |
+| what does X actually look like?   | get_snippets(symbols, repo)                 |
+| who calls X?                      | get_callers(symbol, repo)                   |
+| every use site of X?              | find_references(symbol, repo)               |
+| what does this file import?       | get_dependencies(file, transitive)          |
+| what breaks if I change this?     | get_blast_radius(file)                      |
+| how does A reach B?               | get_execution_path(source, sink)            |
+| what is in this repo?             | get_repo_map(repo)                          |
+| open-ended \"how does X work?\"     | get_context(query, repo, include_snippets)  |
+| text or regex search              | find_pattern(pattern, repo, scope)          |
+| which repos are indexed?          | repos_list()                                |
+| is the index fresh?               | get_index_status(), get_graph_health()      |
+
+Rules:
+
+1. Pass `repo` on every call. The server can hold several repos at once, and \
+   omitting it fans the query out across all of them. `repos_list()` names them.
+2. Start open-ended questions with get_context, not with a file read. Set \
+   include_snippets=true and it returns the source inline, so there is no \
+   follow-up read at all.
+3. Prefer find_pattern over your own grep: it is the same regex search already \
+   scoped to the indexed file set, and `scope` narrows it further to a path \
+   prefix or to files-importing(<symbol>).
+4. Read a whole file only after Travsr has told you which file, and only when \
+   you need something the graph does not carry.
+5. Fall back to plain text search when Travsr returns nothing, or when it \
+   reports the index is unavailable or stale."
         .to_string()
 }
 
@@ -121,6 +150,34 @@ fn cursor_mdc() -> String {
     )
 }
 
+/// Zed loads exactly one project instruction file: the first that exists from
+/// this list, and it stops there.
+///
+/// That makes creating `.rules` unconditionally a destructive act. `.rules` sits
+/// at the top, so writing one into a repo whose rules live in `CLAUDE.md` moves
+/// Zed off `CLAUDE.md` entirely, and the user silently loses every rule they had
+/// in exchange for ours. So we append our block to the file Zed already reads,
+/// and fall back to creating `.rules` only when the repo has none of them.
+const ZED_INSTRUCTION_FILES: [&str; 9] = [
+    ".rules",
+    ".cursorrules",
+    ".windsurfrules",
+    ".clinerules",
+    ".github/copilot-instructions.md",
+    "AGENT.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+];
+
+fn zed_instruction_file(repo: &Path) -> PathBuf {
+    ZED_INSTRUCTION_FILES
+        .iter()
+        .map(|f| repo.join(f))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| repo.join(".rules"))
+}
+
 // ---------------------------------------------------------------------------
 // Tools.
 // ---------------------------------------------------------------------------
@@ -130,6 +187,9 @@ enum Tool {
     ClaudeCode,
     Cursor,
     VsCodeCopilot,
+    GeminiCli,
+    Antigravity,
+    Codex,
     Windsurf,
     Zed,
 }
@@ -138,9 +198,9 @@ enum Tool {
 /// just print a snippet (never auto-write into a repo for a tool only known from a
 /// global/home marker).
 enum Detection {
-    /// Project-local marker present — safe to write project-scoped config.
+    /// Project-local marker present, safe to write project-scoped config.
     Auto,
-    /// Only a global marker (or no project MCP file) — print a snippet instead.
+    /// Only a global marker (or no project MCP file), print a snippet instead.
     Print,
     /// Not present.
     None,
@@ -159,8 +219,8 @@ struct Planned {
     content: Content,
     /// Whether to git-ignore this file by default. True only for dedicated MCP
     /// config files (the committed-server RCE-on-clone vector). Shared files the
-    /// user owns and commits — `CLAUDE.md`, `copilot-instructions.md`, Zed's
-    /// general `settings.json`, rules files — are never git-ignored.
+    /// user owns and commits (`CLAUDE.md`, `copilot-instructions.md`, Zed's
+    /// general `settings.json`, rules files) are never git-ignored.
     gitignore: bool,
 }
 
@@ -173,10 +233,13 @@ enum Outcome {
 }
 
 impl Tool {
-    const ALL: [Tool; 5] = [
+    const ALL: [Tool; 8] = [
         Tool::ClaudeCode,
         Tool::Cursor,
         Tool::VsCodeCopilot,
+        Tool::GeminiCli,
+        Tool::Antigravity,
+        Tool::Codex,
         Tool::Windsurf,
         Tool::Zed,
     ];
@@ -186,6 +249,9 @@ impl Tool {
             Tool::ClaudeCode => "claude-code",
             Tool::Cursor => "cursor",
             Tool::VsCodeCopilot => "vscode-copilot",
+            Tool::GeminiCli => "gemini-cli",
+            Tool::Antigravity => "antigravity",
+            Tool::Codex => "codex",
             Tool::Windsurf => "windsurf",
             Tool::Zed => "zed",
         }
@@ -212,7 +278,7 @@ impl Tool {
                     Detection::None
                 }
             }
-            // Bare `.vscode/` is in most repos without Copilot — only auto-write
+            // Bare `.vscode/` is in most repos without Copilot, so only auto-write
             // when an mcp.json already exists; otherwise print.
             Tool::VsCodeCopilot => {
                 if has(repo.join(".vscode/mcp.json")) {
@@ -223,9 +289,52 @@ impl Tool {
                     Detection::None
                 }
             }
-            // Windsurf MCP config is global-only; never auto-write the home dir.
+            // Look for `settings.json` by name, never a bare `.gemini/`. Antigravity
+            // also lives under `~/.gemini` (its own config is
+            // `~/.gemini/config/mcp_config.json`), so the directory alone is not
+            // evidence of Gemini CLI, and treating it as such told Antigravity users
+            // to edit a file their tool never reads. `GEMINI.md` is likewise shared
+            // between the two and cannot identify either.
+            Tool::GeminiCli => {
+                if has(repo.join(".gemini/settings.json")) {
+                    Detection::Auto
+                } else if home.is_some_and(|h| has(h.join(".gemini/settings.json"))) {
+                    Detection::Print
+                } else {
+                    Detection::None
+                }
+            }
+            // Antigravity reads GEMINI.md / AGENTS.md for rules, but its MCP servers
+            // live in a global `~/.gemini/config/mcp_config.json` (see `note`).
+            Tool::Antigravity => {
+                if has(repo.join(".antigravitycli")) || has(repo.join(".antigravity")) {
+                    Detection::Auto
+                } else if home.is_some_and(|h| {
+                    has(h.join(".gemini/antigravity")) || has(h.join(".antigravity"))
+                }) {
+                    Detection::Print
+                } else {
+                    Detection::None
+                }
+            }
+            // Codex keeps its MCP servers in a global TOML we do not edit, so an
+            // auto-detect here writes the AGENTS.md rules only (see `note`).
+            Tool::Codex => {
+                if has(repo.join(".codex")) || has(repo.join("AGENTS.md")) {
+                    Detection::Auto
+                } else if home.is_some_and(|h| has(h.join(".codex"))) {
+                    Detection::Print
+                } else {
+                    Detection::None
+                }
+            }
+            // Windsurf keeps MCP config in the home dir, which we never write, but
+            // rules are project-scoped, so a project marker is still worth an
+            // auto-write (plus the `note` telling the user about the MCP half).
             Tool::Windsurf => {
-                if home.is_some_and(|h| has(h.join(".codeium/windsurf"))) {
+                if has(repo.join(".windsurf")) {
+                    Detection::Auto
+                } else if home.is_some_and(|h| has(h.join(".codeium/windsurf"))) {
                     Detection::Print
                 } else {
                     Detection::None
@@ -271,7 +380,10 @@ impl Tool {
                     path: repo.join(".cursor/mcp.json"),
                     content: Content::JsonServer {
                         top_key: "mcpServers",
-                        entry: flat,
+                        // Cursor documents `type` as required for a local server,
+                        // the same as VS Code. Omitting it is not a tolerated
+                        // default, so the flat shape does not work here.
+                        entry: json!({ "type": "stdio", "command": cmd.command, "args": cmd.args }),
                     },
                     gitignore: true,
                 },
@@ -299,36 +411,114 @@ impl Tool {
                     gitignore: false,
                 },
             ],
-            Tool::Zed => vec![
+            Tool::GeminiCli => vec![
                 Planned {
-                    // Shared general settings file — not git-ignored.
-                    path: repo.join(".zed/settings.json"),
+                    path: repo.join(".gemini/settings.json"),
                     content: Content::JsonServer {
-                        top_key: "context_servers",
+                        top_key: "mcpServers",
                         entry: flat,
                     },
-                    gitignore: false,
+                    // Gemini's project settings.json is a general config file the
+                    // user owns, but it is also where the server definition lands,
+                    // so it takes the same local-only treatment as an mcp.json.
+                    gitignore: true,
                 },
                 Planned {
-                    path: repo.join(".rules"),
+                    path: repo.join("GEMINI.md"),
                     content: Content::ManagedMd {
                         body: markdown_rules(),
                     },
                     gitignore: false,
                 },
             ],
-            // Global-only; handled via `snippet()` not `plan()`.
-            Tool::Windsurf => vec![],
+            // GEMINI.md only: Antigravity's MCP servers live in the global
+            // ~/.gemini/config/mcp_config.json. `note` prints that step.
+            Tool::Antigravity => vec![Planned {
+                path: repo.join("GEMINI.md"),
+                content: Content::ManagedMd {
+                    body: markdown_rules(),
+                },
+                gitignore: false,
+            }],
+            // AGENTS.md only: Codex reads MCP servers from ~/.codex/config.toml,
+            // a global TOML outside this repo. `note` prints that step.
+            Tool::Codex => vec![Planned {
+                path: repo.join("AGENTS.md"),
+                content: Content::ManagedMd {
+                    body: markdown_rules(),
+                },
+                gitignore: false,
+            }],
+            // Rules only, for the same reason as Codex: Windsurf's MCP config is
+            // ~/.codeium/windsurf/mcp_config.json.
+            Tool::Windsurf => vec![Planned {
+                path: repo.join(".windsurf/rules/travsr.md"),
+                content: Content::Owned {
+                    text: markdown_rules(),
+                },
+                gitignore: false,
+            }],
+            Tool::Zed => vec![
+                Planned {
+                    // Shared general settings file, not git-ignored.
+                    path: repo.join(".zed/settings.json"),
+                    content: Content::JsonServer {
+                        top_key: "context_servers",
+                        // Zed's documented shape is flat, not the nested
+                        // {command: {path, args}} form the RFC left open.
+                        entry: flat,
+                    },
+                    gitignore: false,
+                },
+                Planned {
+                    path: zed_instruction_file(repo),
+                    content: Content::ManagedMd {
+                        body: markdown_rules(),
+                    },
+                    gitignore: false,
+                },
+            ],
+        }
+    }
+
+    /// Extra manual step printed after an auto-write, for tools whose MCP config
+    /// lives in a global file this command does not touch. Without it the user
+    /// gets the rules half of the wiring and no server, with no hint why.
+    fn note(&self, cmd: &McpCommand) -> Option<String> {
+        match self {
+            Tool::Antigravity => Some(format!(
+                "  rules only. Antigravity reads MCP servers from \
+                 ~/.gemini/config/mcp_config.json:\n{}",
+                indent(&mcp_servers_json(cmd))
+            )),
+            Tool::Codex => Some(format!(
+                "  rules only. Codex reads MCP servers from ~/.codex/config.toml \
+                 (or .codex/config.toml in this repo), add:\n    \
+                 [mcp_servers.travsr]\n    command = \"{}\"\n    args = [\"mcp\", \"--stdio\"]",
+                cmd.command
+            )),
+            Tool::Windsurf => Some(format!(
+                "  rules only. Add the server to ~/.codeium/windsurf/mcp_config.json:\n{}",
+                indent(&mcp_servers_json(cmd))
+            )),
+            _ => None,
         }
     }
 
     /// Snippet printed when only a global marker is present.
     fn snippet(&self, repo: &Path, cmd: &McpCommand) -> String {
-        let server = serde_json::to_string_pretty(
-            &json!({ "mcpServers": { "travsr": { "command": cmd.command, "args": cmd.args } } }),
-        )
-        .unwrap_or_default();
+        let server = indent(&mcp_servers_json(cmd));
         match self {
+            Tool::Antigravity => format!(
+                "  add to ~/.gemini/config/mcp_config.json:\n{server}\n  \
+                 and put the Travsr guidance in {}/GEMINI.md",
+                repo.display()
+            ),
+            Tool::Codex => format!(
+                "  add [mcp_servers.travsr] to ~/.codex/config.toml, and put the Travsr \
+                 guidance in {}/AGENTS.md",
+                repo.display()
+            ),
             Tool::Windsurf => format!(
                 "  add to ~/.codeium/windsurf/mcp_config.json:\n{server}\n  \
                  and create {}/.windsurf/rules/travsr.md with the Travsr guidance",
@@ -339,6 +529,20 @@ impl Tool {
     }
 }
 
+fn mcp_servers_json(cmd: &McpCommand) -> String {
+    serde_json::to_string_pretty(
+        &json!({ "mcpServers": { "travsr": { "command": cmd.command, "args": cmd.args } } }),
+    )
+    .unwrap_or_default()
+}
+
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|l| format!("    {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ---------------------------------------------------------------------------
 // File operations.
 // ---------------------------------------------------------------------------
@@ -346,7 +550,7 @@ impl Tool {
 /// Atomically replace `path` with `content`: write a sibling temp file, then
 /// rename over the target. Because these helpers do read-modify-write of the
 /// user's own files (CLAUDE.md, an existing mcp.json), a crash mid-write must
-/// never truncate the original — same temp+rename pattern as `install.rs`.
+/// never truncate the original. Same temp+rename pattern as `install.rs`.
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -458,7 +662,7 @@ fn upsert_block(path: &Path, begin: &str, end: &str, body: &str) -> Result<Outco
         write_atomic(path, &new)?;
         return Ok(Outcome::Written);
     }
-    // Exactly one balanced pair — replace the region.
+    // Exactly one balanced pair, replace the region.
     let (Some(start), Some(estart)) = (text.find(begin), text.find(end)) else {
         return Ok(Outcome::Skipped("markers in unexpected order".into()));
     };
@@ -509,7 +713,7 @@ fn remove_block(path: &Path, begin: &str, end: &str) -> Result<Outcome> {
         format!("{head}\n{tail}")
     };
     if new.trim().is_empty() {
-        // Whole file was our block — remove it.
+        // Whole file was our block, remove it.
         std::fs::remove_file(path).ok();
         return Ok(Outcome::Removed);
     }
@@ -639,10 +843,15 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                         Err(e) => say!("  error {disp}: {e}"),
                     }
                 }
+                if !opts.remove {
+                    if let Some(note) = tool.note(&cmd) {
+                        say!("{note}");
+                    }
+                }
             }
             Detection::Print => {
                 detected = true;
-                say!("{} detected (global) — add manually:", tool.id());
+                say!("{} detected (global), add manually:", tool.id());
                 say!("{}", tool.snippet(repo_root, &cmd));
             }
             Detection::None => {}
@@ -651,8 +860,8 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
 
     if !detected {
         say!(
-            "tip: no AI coding tool detected — run `travsr connect` after installing \
-             Claude Code, Cursor, Copilot, Windsurf, or Zed"
+            "tip: no AI coding tool detected. Run `travsr connect` after installing \
+             Claude Code, Cursor, Copilot, Gemini CLI, Codex, Windsurf, or Zed"
         );
         return Ok(());
     }
@@ -670,7 +879,7 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
 
     if !opts.remove && !cmd.on_path() {
         say!(
-            "note: `travsr` is not on PATH; configs use an absolute path. Add \
+            "note: `travsr` is not on PATH, so configs use an absolute path. Add \
              ~/.travsr/bin to PATH so the wiring survives moves."
         );
     }
@@ -805,7 +1014,7 @@ mod tests {
     fn managed_block_appends_with_separator_and_is_idempotent() {
         let dir = tempdir().unwrap();
         let p = dir.path().join(".rules");
-        // No trailing newline — must not glue the block onto the last line.
+        // No trailing newline, must not glue the block onto the last line.
         std::fs::write(&p, "last line").unwrap();
         upsert_block(&p, MD_BEGIN, MD_END, "body").unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
@@ -859,6 +1068,97 @@ mod tests {
         ));
     }
 
+    /// Each tool's config shape, checked against that tool's own documentation.
+    /// These are the schemas the adapters were wrong about at least once, so the
+    /// table is written out in full rather than left to per-tool assertions.
+    #[test]
+    fn server_entries_match_each_tool_documented_schema() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        // (tool, top-level key, requires an explicit `type: "stdio"`)
+        let expected = [
+            // Verified live: `claude mcp list` loads this file and connects.
+            (Tool::ClaudeCode, "mcpServers", false),
+            // Cursor documents `type` as required for a local server.
+            (Tool::Cursor, "mcpServers", true),
+            // Verified against VS Code 1.109's own bundle: `servers` + `inputs`.
+            (Tool::VsCodeCopilot, "servers", true),
+            (Tool::GeminiCli, "mcpServers", false),
+            // Zed's documented shape is flat, not {command: {path, args}}.
+            (Tool::Zed, "context_servers", false),
+        ];
+        for (tool, top_key, needs_type) in expected {
+            let plan = tool.plan(repo, &cmd());
+            let (key, entry) = plan
+                .iter()
+                .find_map(|p| match &p.content {
+                    Content::JsonServer { top_key, entry } => Some((*top_key, entry)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{} plans no server entry", tool.id()));
+            assert_eq!(key, top_key, "wrong top-level key for {}", tool.id());
+            assert_eq!(
+                entry.get("type").is_some(),
+                needs_type,
+                "wrong `type` presence for {}",
+                tool.id()
+            );
+            assert_eq!(entry["command"], "travsr");
+            assert_eq!(entry["args"][0], "mcp");
+        }
+    }
+
+    /// Antigravity and Gemini CLI both live under `~/.gemini`, and a bare
+    /// directory check cannot tell them apart. This is the case that shipped
+    /// wrong: a machine with Antigravity and no Gemini CLI was told to edit
+    /// Gemini CLI's config.
+    #[test]
+    fn antigravity_is_not_mistaken_for_gemini_cli() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        // Exactly the layout Antigravity leaves behind: ~/.gemini exists, but
+        // there is no ~/.gemini/settings.json.
+        std::fs::create_dir_all(home.join(".gemini/antigravity")).unwrap();
+        std::fs::create_dir_all(home.join(".gemini/config")).unwrap();
+
+        let empty = tempdir().unwrap();
+        let repo = empty.path();
+        assert!(
+            matches!(Tool::GeminiCli.detect(repo, Some(home)), Detection::None),
+            "an Antigravity-only ~/.gemini must not read as Gemini CLI"
+        );
+        assert!(matches!(
+            Tool::Antigravity.detect(repo, Some(home)),
+            Detection::Print
+        ));
+
+        // A real Gemini CLI install writes settings.json, and that does count.
+        std::fs::write(home.join(".gemini/settings.json"), "{}").unwrap();
+        assert!(matches!(
+            Tool::GeminiCli.detect(repo, Some(home)),
+            Detection::Print
+        ));
+    }
+
+    /// Zed reads the FIRST match from its instruction-file list and stops. If a
+    /// repo keeps its rules in CLAUDE.md, creating `.rules` (which outranks it)
+    /// silently swaps every rule the user had for ours.
+    #[test]
+    fn zed_appends_to_the_file_it_already_reads() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        // Nothing present: `.rules` is the right thing to create.
+        assert_eq!(zed_instruction_file(repo), repo.join(".rules"));
+
+        // CLAUDE.md present: append there instead of shadowing it.
+        std::fs::write(repo.join("CLAUDE.md"), "# house rules\n").unwrap();
+        assert_eq!(zed_instruction_file(repo), repo.join("CLAUDE.md"));
+
+        // A higher-priority file wins once it exists.
+        std::fs::write(repo.join("AGENTS.md"), "").unwrap();
+        assert_eq!(zed_instruction_file(repo), repo.join("AGENTS.md"));
+    }
+
     #[test]
     fn copilot_entry_has_stdio_type() {
         let dir = tempdir().unwrap();
@@ -875,21 +1175,133 @@ mod tests {
     }
 
     #[test]
-    fn only_dedicated_mcp_files_are_gitignored() {
+    fn only_mcp_server_files_are_gitignored() {
         let dir = tempdir().unwrap();
         let repo = dir.path();
         for tool in Tool::ALL {
             for p in tool.plan(repo, &cmd()) {
+                // A file is git-ignored exactly when it carries the server
+                // definition (the RCE-on-clone vector). Every rules file, and
+                // Zed's shared settings.json, stays committable.
+                let carries_server =
+                    matches!(p.content, Content::JsonServer { .. }) && tool != Tool::Zed;
                 let name = p.path.file_name().unwrap().to_string_lossy().into_owned();
-                let is_dedicated_mcp = matches!(name.as_str(), "mcp.json" | ".mcp.json");
-                // CLAUDE.md, copilot-instructions.md, .rules, Zed settings.json,
-                // and the cursor .mdc must never be git-ignored.
                 assert_eq!(
-                    p.gitignore, is_dedicated_mcp,
+                    p.gitignore, carries_server,
                     "wrong gitignore policy for {name}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_tool_writes_a_rules_file() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        for tool in Tool::ALL {
+            let plan = tool.plan(repo, &cmd());
+            let has_rules = plan
+                .iter()
+                .any(|p| matches!(p.content, Content::ManagedMd { .. } | Content::Owned { .. }));
+            assert!(
+                has_rules,
+                "{} wires MCP but never tells the agent to use it",
+                tool.id()
+            );
+        }
+    }
+
+    #[test]
+    fn rules_only_tools_explain_the_missing_mcp_step() {
+        // Codex and Windsurf keep MCP servers in a global file we do not write.
+        // Without a note the user gets rules and no server, with no clue why.
+        for tool in [Tool::Codex, Tool::Windsurf] {
+            assert!(
+                tool.note(&cmd()).is_some(),
+                "{} needs a manual-MCP note",
+                tool.id()
+            );
+        }
+        assert!(Tool::ClaudeCode.note(&cmd()).is_none());
+    }
+
+    #[test]
+    fn detection_uses_markers_that_identify_one_tool() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        assert!(matches!(
+            Tool::GeminiCli.detect(repo, None),
+            Detection::None
+        ));
+        assert!(matches!(Tool::Codex.detect(repo, None), Detection::None));
+        assert!(matches!(
+            Tool::Antigravity.detect(repo, None),
+            Detection::None
+        ));
+
+        // AGENTS.md is Codex's documented instruction file, and nothing else in
+        // this list claims it as a project marker.
+        std::fs::write(repo.join("AGENTS.md"), "").unwrap();
+        assert!(matches!(Tool::Codex.detect(repo, None), Detection::Auto));
+
+        // GEMINI.md is read by BOTH Gemini CLI and Antigravity, so on its own it
+        // identifies neither. Gemini CLI needs its settings.json; Antigravity
+        // needs its own project dir.
+        std::fs::write(repo.join("GEMINI.md"), "").unwrap();
+        assert!(matches!(
+            Tool::GeminiCli.detect(repo, None),
+            Detection::None
+        ));
+        assert!(matches!(
+            Tool::Antigravity.detect(repo, None),
+            Detection::None
+        ));
+
+        std::fs::create_dir_all(repo.join(".gemini")).unwrap();
+        std::fs::write(repo.join(".gemini/settings.json"), "{}").unwrap();
+        assert!(matches!(
+            Tool::GeminiCli.detect(repo, None),
+            Detection::Auto
+        ));
+
+        std::fs::create_dir_all(repo.join(".antigravitycli")).unwrap();
+        assert!(matches!(
+            Tool::Antigravity.detect(repo, None),
+            Detection::Auto
+        ));
+    }
+
+    #[test]
+    fn guide_names_only_tools_the_mcp_server_exposes() {
+        // Guard against the directive drifting past travsr-mcp's tools_list: a
+        // rule telling the agent to call a tool that does not exist is worse
+        // than no rule.
+        let body = guide_body();
+        for tool in [
+            "search_symbol",
+            "get_snippets",
+            "get_callers",
+            "find_references",
+            "get_dependencies",
+            "get_blast_radius",
+            "get_execution_path",
+            "get_repo_map",
+            "get_context",
+            "find_pattern",
+            "repos_list",
+        ] {
+            assert!(body.contains(tool), "guidance is missing {tool}");
+        }
+        // Retired or never-shipped names must not reappear.
+        assert!(!body.contains("get_graph("));
+    }
+
+    #[test]
+    fn guide_tells_the_agent_to_scope_by_repo() {
+        // The server can serve several repos at once; an unscoped call returns
+        // cross-repo noise, which is the top cause of bad answers.
+        assert!(guide_body().contains("repo"));
+        assert!(guide_body().contains("repos_list"));
     }
 
     #[test]
