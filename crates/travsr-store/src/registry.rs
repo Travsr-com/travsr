@@ -40,12 +40,19 @@ pub fn strip_verbatim_prefix(p: &str) -> std::borrow::Cow<'_, str> {
 /// basename makes the column read consistently regardless of how old the entry
 /// is. Falls back to the cleaned full path when the key has no final component
 /// (e.g. a bare drive root), so it never returns an empty string.
+///
+/// Splits on both `/` and `\` explicitly rather than via `Path::file_name`,
+/// because a registry key is a Windows path even when this runs on Unix (the
+/// registry file is portable and the tests exercise Windows paths on every OS),
+/// and `Path::file_name` only treats `/` as a separator off Windows.
 pub fn display_name(key: &str) -> String {
     let cleaned = strip_verbatim_prefix(key).into_owned();
-    Path::new(&cleaned)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
+    cleaned
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
         .filter(|s| !s.is_empty())
+        .map(str::to_owned)
         .unwrap_or(cleaned)
 }
 
@@ -206,13 +213,13 @@ pub fn unregister(repo_name: &str) -> anyhow::Result<bool> {
 /// Remove a repo entry by full registry key **or** its display basename (UX-018).
 ///
 /// Because `repos` now shows the basename as the Name (not the full path), a user
-/// or the VS Code webview removes by whatever the list showed them. Resolution
-/// order, most specific first, so an exact path can always target one entry:
-///   1. exact registry key,
-///   2. verbatim-stripped key (the cleaned path the list displays),
-///   3. display basename — only when it matches exactly one entry.
-/// A basename that collides across several repos returns [`UnregisterResult::Ambiguous`]
-/// with their full paths so the caller can re-run with a path. Non-fatal.
+/// or the VS Code webview removes by whatever the list showed them. Resolution is
+/// tried most-specific first, so an exact path can always target one entry: the
+/// exact registry key, then the verbatim-stripped key (the cleaned path the list
+/// displays), then the display basename — the last only when it matches exactly
+/// one entry. A basename that collides across several repos returns
+/// [`UnregisterResult::Ambiguous`] with their full paths so the caller can re-run
+/// with a path. Non-fatal.
 pub fn unregister_resolving(name: &str) -> anyhow::Result<UnregisterResult> {
     let reg_path = registry_path();
     let mut repos = match read_registry(&reg_path) {
