@@ -96,10 +96,16 @@ fn main_worktree_root(worktree_dir: &Path) -> Option<PathBuf> {
     // `resolve_repo_root` would fall back to treating the linked worktree as the
     // repo root, which has no index. The user sees "not initialized". That is the
     // #302 regression this function exists to prevent.
-    let common = PathBuf::from(crate::git_bounded::git_stdout_bounded(
+    //
+    // The answer is a path, so it is decoded as one rather than as text. A
+    // lossy decode here would corrupt a common dir that contains non-UTF-8
+    // bytes into U+FFFD, `root.join(".git").is_dir()` would then miss against
+    // the real filesystem, and this would return `None` for exactly the same
+    // "not initialized" outcome by a different route.
+    let common = crate::git_bounded::git_path_bounded(
         Some(worktree_dir),
         ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?);
+    )?;
     // `--git-common-dir` is `<main>/.git`; its parent is the main worktree.
     let root = common.parent()?.to_path_buf();
     // Guard against submodule gitlinks (`.git/modules/<name>`): only accept a

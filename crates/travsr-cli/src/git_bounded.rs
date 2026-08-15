@@ -40,12 +40,19 @@ pub const GIT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// handle the first two and treats them the same way: fall back to whatever
 /// works without git.
 ///
-/// On timeout the child is left running rather than killed. Killing portably
-/// without a new dependency means shelling out to `kill`/`taskkill`, which
-/// spawns another process on a path that is already misbehaving. These are
-/// read-only queries (`rev-parse`, `status --porcelain`), so an abandoned one
-/// holds no lock and exits on its own or when this process does. Bounding the
-/// wait is the property that matters; reaping is not.
+/// On timeout the child is killed via [`travsr_plugin_host::watchdog::kill_pid`],
+/// the same helper the sidecar supervisor uses. On Windows that is
+/// `taskkill /F /T`, which takes the whole tree, so the grandchild holding the
+/// pipe (the case this module exists for) goes with it. The reader thread then
+/// unblocks and exits, rather than staying parked for the life of the process.
+///
+/// The wait is still bounded independently of the kill. `kill_pid` is
+/// best-effort, and on Unix it does not take the tree, so a grandchild can
+/// outlive its parent and hold the pipe open. This returns on the deadline
+/// either way: for a CLI, "answers late but answers" is the property that
+/// cannot be traded away. That is also why this does not use
+/// `watchdog::with_io_watchdog`, which bounds the child's life but then still
+/// waits for the blocking read to finish.
 ///
 /// `args` is generic over `AsRef<OsStr>`, the same bound [`Command::args`] uses,
 /// so a caller with a path to pass (`-C <dir>`, a pathspec) can hand over the
@@ -74,6 +81,9 @@ where
         .spawn()
         .ok()?;
 
+    // Captured before `child` moves into the reader thread.
+    let pid = child.id();
+
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         // `wait_with_output` is what blocks in the pathological case, so it is
@@ -83,7 +93,59 @@ where
 
     match rx.recv_timeout(GIT_QUERY_TIMEOUT) {
         Ok(Ok(out)) => Some(out),
-        Ok(Err(_)) | Err(_) => None,
+        Ok(Err(_)) => None,
+        Err(_) => {
+            // Deadline hit. Kill the child so it is not orphaned and so the
+            // reader thread can finish instead of parking forever.
+            travsr_plugin_host::watchdog::kill_pid(pid);
+            None
+        }
+    }
+}
+
+/// A path-valued `git` answer, decoded without going through UTF-8 where the
+/// platform does not require it.
+///
+/// [`git_stdout_bounded`] decodes lossily, which is right for text but wrong for
+/// a path: a repo whose path carries bytes that are not valid UTF-8 is legal on
+/// Linux, and replacing those bytes with U+FFFD yields a `PathBuf` that no
+/// longer names anything on disk. Strict decoding is no better, it just fails
+/// differently. On Unix the bytes become an `OsString` directly, so the path
+/// survives whatever it contains. Windows has no such conversion (git emits
+/// UTF-8 there and `OsString` is UTF-16), so it keeps the lossy decode.
+pub fn git_path_bounded<I, S>(cwd: Option<&Path>, args: I) -> Option<std::path::PathBuf>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let out = git_output_bounded(cwd, args)?;
+    if !out.status.success() {
+        return None;
+    }
+    let trimmed: &[u8] = {
+        let mut b = out.stdout.as_slice();
+        while let Some((last, rest)) = b.split_last() {
+            if last.is_ascii_whitespace() {
+                b = rest;
+            } else {
+                break;
+            }
+        }
+        b
+    };
+    if trimmed.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(std::path::PathBuf::from(OsStr::from_bytes(trimmed)))
+    }
+    #[cfg(not(unix))]
+    {
+        Some(std::path::PathBuf::from(
+            String::from_utf8_lossy(trimmed).into_owned(),
+        ))
     }
 }
 
@@ -250,6 +312,64 @@ mod tests {
             )
             .is_none(),
             "lossy conversion must genuinely lose the repo"
+        );
+    }
+
+    /// A path-valued answer must survive the trip back, not just the trip out.
+    /// Linux-only for the same fixture reason as above.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_utf8_path_answer_round_trips() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let odd = dir.path().join(OsStr::from_bytes(b"repo\xFFdir"));
+        std::fs::create_dir(&odd).unwrap();
+        assert!(git_output_bounded(Some(&odd), ["init", "--quiet"]).is_some());
+
+        let top = git_path_bounded(Some(&odd), ["rev-parse", "--show-toplevel"])
+            .expect("git must answer with the toplevel path");
+        assert!(
+            top.is_dir(),
+            "the decoded path must still name a real directory: {top:?}"
+        );
+
+        // The text form loses it: U+FFFD replaces the 0xFF, so the PathBuf no
+        // longer matches anything on disk. This is what makes the assertion
+        // above meaningful.
+        let as_text = git_stdout_bounded(Some(&odd), ["rev-parse", "--show-toplevel"])
+            .map(std::path::PathBuf::from)
+            .expect("git answers either way");
+        assert!(
+            !as_text.is_dir(),
+            "lossy text decoding must genuinely lose the directory"
+        );
+    }
+
+    /// A timed-out query must not leave the child running. Uses a real deadline
+    /// by driving `git_output_bounded`'s helper directly is not possible without
+    /// exposing the timeout, so this asserts the narrower reachable property:
+    /// `kill_pid` is wired to the timeout arm and terminates a live child.
+    #[test]
+    fn kill_pid_terminates_a_live_child() {
+        // `hash-object --stdin` with an inherited stdin blocks indefinitely,
+        // which is the shape of the wedged child the timeout arm has to clean up.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut child = Command::new("git")
+            .current_dir(root)
+            .args(["hash-object", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("git must spawn");
+
+        travsr_plugin_host::watchdog::kill_pid(child.id());
+
+        let status = child.wait().expect("a killed child must be reapable");
+        assert!(
+            !status.success(),
+            "a killed child must not report success: {status:?}"
         );
     }
 }

@@ -21,7 +21,7 @@ mod stderr_ring;
 pub mod supervisor;
 pub mod transport;
 pub mod trust;
-mod watchdog;
+pub mod watchdog;
 
 pub use dispatcher::Dispatcher;
 pub use embed_catalog::{
