@@ -6092,12 +6092,12 @@ impl SqliteStore {
     ///
     /// When a query token matched no symbol by name/substring, look for the one
     /// symbol whose leaf name (the segment after the last `.`/`:` of a signature)
-    /// is a very close byte-trigram match — so a typo (`htpresponse`) can still
+    /// is a very close byte-trigram match, so a typo (`htpresponse`) can still
     /// ground to the real symbol (`HttpResponse`) through the normal anchor path
     /// instead of abstaining. Returns the matched symbol's leaf name in its
     /// original case (so the caller's segmenter and `symbol_frequency` see the
     /// real camelCase identifier), or `None` when nothing clears `min_jaccard` or
-    /// the best match is ambiguous — a second *distinct* name sits within
+    /// the best match is ambiguous, a second *distinct* name sits within
     /// `AMBIGUITY_MARGIN` of the leader. Deliberately conservative: this is the
     /// exact-miss cold path and a false correction is worse than no correction;
     /// the cross-encoder reranker is the downstream precision backstop.
@@ -6111,7 +6111,7 @@ impl SqliteStore {
         min_jaccard: f64,
     ) -> Result<Option<String>, StoreError> {
         /// A correction only stands when the runner-up distinct name is at least
-        /// this far behind — otherwise the typo is ambiguous and we ground nothing.
+        /// this far behind, otherwise the typo is ambiguous and we ground nothing.
         const AMBIGUITY_MARGIN: f64 = 0.05;
 
         (|| -> AnyResult<Option<String>> {

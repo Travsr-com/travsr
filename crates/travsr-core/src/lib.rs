@@ -858,6 +858,20 @@ pub struct UnresolvedCall {
     pub src: NodeId,
     /// Signature of the callee to resolve, e.g. `"fn:ppr_weighted"`.
     pub callee_sig: String,
+    /// A second exact signature to try when `callee_sig` misses, for a call
+    /// site whose shape is genuinely ambiguous between two node kinds.
+    ///
+    /// Python's bare `Foo()` is the motivating case (#709): PEP 8 says an
+    /// uppercase initial means a class, so it is emitted as `class:Foo`, but a
+    /// PascalCase free function (`def Field(...)`) is legal and common. The
+    /// extractor cannot tell them apart, and `travsr-analysis` may not consult
+    /// the store to find out, so it names both and lets the resolver decide on
+    /// evidence.
+    ///
+    /// Tried **exactly**, never through the leaf pool: the point is to find the
+    /// other real definition, not to widen the net (#716 review).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_callee_sig: Option<String>,
     /// Last path segment of the qualifying crate/module for `call.scoped`, e.g.
     /// `"travsr_retrieval"` from `travsr_retrieval::ppr_weighted(...)`.
     /// `None` for bare `call.fn` identifiers — resolver uses name-only lookup.
@@ -1913,6 +1927,7 @@ mod tests {
         let u = UnresolvedCall {
             src: NodeId(1),
             callee_sig: "fn:filter".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 42,
             is_method_call: true,
@@ -1931,6 +1946,7 @@ mod tests {
         let u = UnresolvedCall {
             src: NodeId(1),
             callee_sig: "fn:filter".to_string(),
+            alt_callee_sig: None,
             hint_crate: None,
             caller_line: 42,
             is_method_call: true,

@@ -1296,7 +1296,7 @@ fn fuzzy_correct_symbol_resolves_documented_typo() {
 #[test]
 fn fuzzy_correct_symbol_is_none_for_unrelated_token() {
     // A token that is not a near-miss of any symbol must not be "corrected" into
-    // one — that would ground a query the index cannot support.
+    // one, which would ground a query the index cannot support.
     let mut store = open();
     put(&mut store, &node("http.py", "class:HttpResponse", "class"));
 

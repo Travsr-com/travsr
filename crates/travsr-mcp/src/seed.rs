@@ -101,7 +101,7 @@ fn anchor_emit_cut() -> f32 {
 
 /// #709: byte-trigram Jaccard floor for the per-token typo correction. A query
 /// token that resolves to nothing exactly is corrected to a real symbol only
-/// when a UNIQUE leaf name clears this similarity — `htpresponse` → `HttpResponse`
+/// when a UNIQUE leaf name clears this similarity, `htpresponse` → `HttpResponse`
 /// is 0.727, a comfortable margin above the default. Kept strict (and env-tunable
 /// for bench sweeps) so near-miss salad words do not ground; the cross-encoder
 /// reranker is the downstream precision backstop.
@@ -1536,7 +1536,7 @@ fn g1_bypass_decision(
 ) -> bool {
     // #709: a unique strict typo correction is deterministic lexical evidence, so
     // its emitted anchor counts as a rare (subject) anchor regardless of the
-    // corrected symbol's own frequency — the query literally names that one
+    // corrected symbol's own frequency, the query literally names that one
     // symbol, just misspelt. Still gated by the same subject-share test below, so
     // a correction that is only an incidental fragment of a larger query does not
     // trigger the deterministic bypass.
@@ -2144,7 +2144,7 @@ pub(crate) fn build_seed_set(
         std::collections::HashSet::new();
     // #709: anchor nodes emitted from a unique strict typo correction. These are
     // deterministic lexical evidence (a UNIQUE, high-Jaccard match to one real
-    // symbol), so — like a rare exact anchor — they may drive the g1 bypass and
+    // symbol), so, like a rare exact anchor, they may drive the g1 bypass and
     // are shielded from the NL cross-encoder, which does not rate a misspelt
     // query against a code symbol. Precision is bounded upstream by the strict,
     // uniqueness-gated correction and the g1 subject-share test, not the reranker.
@@ -2153,7 +2153,7 @@ pub(crate) fn build_seed_set(
 
     // Boundary predicate reused for both the direct token and a #709 correction:
     // a token counts as resolved only when it appears as a whole word segment (or
-    // contiguous run of segments) in the candidate's signature or path — not just
+    // contiguous run of segments) in the candidate's signature or path, not just
     // as a substring of a longer word (#478 RFC-023 §6.2: an unguarded substring
     // hit read "wal" as resolved via "walker.ts").
     let boundary = |tok: &str, n: &CoreNode| -> bool {
@@ -2169,7 +2169,7 @@ pub(crate) fn build_seed_set(
         // through the anchor path instead of abstaining. The correction reuses the
         // corrected symbol's own name for frequency/IDF (so `HttpResponse` is
         // measured, not the unindexed typo) and, being deliberate and unique, is
-        // always emitted as an anchor below — the cross-encoder reranker is the
+        // always emitted as an anchor below, the cross-encoder reranker is the
         // precision backstop. Only fires on the exact-miss cold branch.
         let (exact_nodes, resolve_token, corrected): (Vec<CoreNode>, String, bool) = if has_direct {
             (direct_nodes, token.clone(), false)
@@ -2220,7 +2220,7 @@ pub(crate) fn build_seed_set(
         });
 
         // #709: a unique strict typo correction emits exactly one protected
-        // anchor — the correction target — bypassing the generic IDF/path-cap
+        // anchor, the correction target, bypassing the generic IDF/path-cap
         // gates so the corrected symbol is guaranteed to seed and to be the term's
         // `top_node` (which the g1 rare-anchor linkage requires). Recorded in
         // `corrected_anchor_ids` so the g1 bypass shields it from the NL reranker.
@@ -3540,7 +3540,7 @@ mod tests {
     #[test]
     fn g1_bypass_corrected_still_needs_subject_share() {
         // A correction that is only an incidental fragment of a larger query does
-        // NOT trigger the bypass — the subject-share test still applies, so a
+        // NOT trigger the bypass, the subject-share test still applies, so a
         // corrected word buried in conceptual filler flows to the reranker path.
         let anchors: std::collections::HashSet<NodeId> = [NodeId(9)].into_iter().collect();
         let corrected: std::collections::HashSet<NodeId> = [NodeId(9)].into_iter().collect();
