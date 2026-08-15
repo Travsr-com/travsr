@@ -44,6 +44,7 @@ pub fn toolchain_access(language: &str) -> ToolchainAccess {
         "php" => php_access(),
         "csharp" => csharp_access(),
         "ruby" => ruby_access(),
+        "objectivec" => objc_access(),
         "swift" => swift_access(),
         "rust" => rust_access(),
         "typescript" | "javascript" => typescript_access(),
@@ -456,6 +457,34 @@ fn ruby_access() -> ToolchainAccess {
         read_paths,
         write_paths: vec![],
         env,
+    }
+}
+
+/// `travsr-lang-objectivec` parses `.m`/`.mm` in-process via libclang. Beyond the
+/// toolchain under `/Library/Developer` (already granted by the base macOS
+/// profile), libclang reads additional system support files under `/Library`
+/// *outside* `/Library/Developer` while resolving Objective-C system frameworks.
+/// Denying those makes every translation unit fail to parse, so the emitter
+/// returns an empty index and the whole language silently yields zero symbols
+/// (observed: 0 nodes sandboxed vs 13 unsandboxed on the same corpus; bisecting
+/// the profile showed a `/Library` read grant is the difference, and
+/// `/Library/Developer` alone is insufficient).
+///
+/// Grant read on `/Library` and the active SDK (via `xcrun --show-sdk-path`,
+/// which points into `/Applications/Xcode.app` when a full Xcode is selected).
+/// Read-only, in the same class as the base profile's existing `/System` and
+/// `/usr` read grants — ADR-017's threat model targets writes, network, and
+/// exfiltration, not reads of shared system directories.
+fn objc_access() -> ToolchainAccess {
+    let mut read_paths = vec![PathBuf::from("/Library")];
+    if let Some(sdk) = run_cmd_stdout("xcrun", &["--show-sdk-path"]).map(PathBuf::from) {
+        tracing::debug!(path = %sdk.display(), exists = sdk.exists(), "objc_access: Xcode SDK grant (read)");
+        read_paths.push(sdk);
+    }
+    ToolchainAccess {
+        read_paths,
+        write_paths: vec![],
+        env: vec![],
     }
 }
 
