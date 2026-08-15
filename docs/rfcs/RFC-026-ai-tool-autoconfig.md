@@ -1,7 +1,16 @@
-# RFC-018: AI Tool Auto-Configuration on `travsr init`
+# RFC-026: AI Tool Auto-Configuration on `travsr init`
 
 **Date:** 2026-06-07
-**Status:** Proposed (pending principal-security-engineer sign-off — see Security)
+**Status:** Proposed (pending principal-security-engineer sign-off, see Security)
+
+> Renumbered from RFC-018 and moved out of `docs/adrs/`. This RFC took the 018
+> slot first (2026-06-07), but `docs/rfcs/RFC-018-embedding-plugin-architecture.md`
+> later claimed the same number and shipped, so 018 now points at implemented
+> code from CI config, four sibling RFCs, and five crates. Renumbering the
+> implemented one would break all of that; renumbering this one, still
+> unimplemented at the time, cost three references. `docs/rfcs/` is the
+> canonical home for RFCs, so the file moved there rather than staying beside
+> the ADRs.
 
 ## Context
 
@@ -94,33 +103,89 @@ args `["mcp", "--stdio"]`. Shared helpers:
 
   ```
   # Use Travsr first for all code questions
-  This repo has a Travsr code graph served over MCP. For ANY question about code
-  structure — definitions, callers, dependencies, impact/blast radius, call paths,
-  or repo overview — ALWAYS query Travsr's MCP tools BEFORE grep/find/ripgrep or
-  reading whole files. Travsr is the token-efficient, hallucination-free path.
-  - search_symbol(name)        — find a definition
-  - get_callers(symbol)        — who calls this
-  - get_dependencies(file)     — what this depends on
-  - get_blast_radius(file)     — what a change here affects
-  - get_execution_path(a, b)   — how a reaches b
-  - get_repo_map(repo)         — high-level structure
-  - get_context(query, budget) — full PPR + knapsack retrieval
-  Only fall back to text search when Travsr returns nothing or is unavailable.
+  This repository is indexed by Travsr, a code graph served over MCP. For ANY
+  question about where code lives or how it connects (definitions, call sites,
+  imports, change impact, call paths, repo structure), query Travsr BEFORE
+  grep/find/ripgrep or reading whole files.
+
+  A question-to-tool table covering search_symbol, get_snippets, get_callers,
+  find_references, get_dependencies, get_blast_radius, get_execution_path,
+  get_repo_map, get_context, find_pattern, and the index-health tools,
+  followed by five rules: this session is bound to one repo, so no tool takes a
+  `repo` argument; open with get_context (include_snippets=true) rather than a
+  file read; prefer find_pattern over raw grep; read a whole file only once
+  Travsr has named it; fall back to text search only when Travsr returns nothing
+  or reports a stale index.
   ```
+
+  The signatures in the table are the **single-repo** ones, because the command
+  we write is `travsr mcp --stdio` with no `--global`. That server serves the
+  single-repo `tools_list`, where every schema is closed
+  (`additionalProperties: false`) and only `get_snippets` even declares `repo`,
+  its own description scoping it to global mode. Guidance written against the
+  multi-repo surface would put a rejected argument on every call the agent makes,
+  so the two tool lists must not be conflated. `repos_list` is likewise omitted:
+  it exists to discover names for a `repo` argument this mode does not take.
+
+  The table is the routing the agent lacks. It is not a copy of the tool
+  schemas, which the agent already receives from `tools/list`. The exact wording
+  lives in `guide_body()` in `crates/travsr-cli/src/connect.rs`. Unit tests pin
+  the tool names against the set `travsr-mcp` serves, assert the directive never
+  promises a `repo` argument, and assert the wired args stay `["mcp", "--stdio"]`,
+  so neither half of that pairing can drift without the other.
 
   Adapters that support priority/always-on flags set them (Cursor
   `alwaysApply: true`; the directive lives in the tool's auto-loaded instruction
   file) so "always use Travsr" is enforced on every turn, not just when convenient.
 
-Initial adapters:
+Adapters. **Confidence** records how the shape was established, because the first
+draft of this table was written from memory and three entries were wrong:
+`live` = the tool itself loaded the generated file, `bundle` = read out of the
+installed application, `docs` = vendor documentation.
 
-| Tool | Detect marker (project-first) | MCP config | Server entry | Rules file |
-|------|-------------------------------|-----------|--------------|-----------|
-| Claude Code | `.claude/` or `CLAUDE.md` | `.mcp.json` → `mcpServers.travsr` | `{command, args}` | `CLAUDE.md` managed block |
-| Cursor | `.cursor/` | `.cursor/mcp.json` → `mcpServers.travsr` | `{command, args}` | `.cursor/rules/travsr.mdc` **with `---\nalwaysApply: true\n---` frontmatter** |
-| VS Code Copilot | existing `.vscode/mcp.json` (else print-snippet) | `.vscode/mcp.json` → `servers.travsr` | `{"type":"stdio", command, args}` | `.github/copilot-instructions.md` managed block |
-| Windsurf | `~/.codeium/windsurf/` | **print only** `~/.codeium/windsurf/mcp_config.json` → `mcpServers` | `{command, args}` | `.windsurf/rules/travsr.md` (preferred over legacy `.windsurfrules`) |
-| Zed | `.zed/` | `.zed/settings.json` → `context_servers.travsr` | Zed-pinned shape (verify flat `{command,args}` vs nested `{command:{path,args}}` against target version) | `.rules` managed block |
+| Tool | Detect marker (project-first) | MCP config | Server entry | Rules file | Confidence |
+|------|-------------------------------|-----------|--------------|-----------|-----------|
+| Claude Code | `.claude/` or `CLAUDE.md` | `.mcp.json` → `mcpServers.travsr` | `{command, args}` | `CLAUDE.md` managed block | **live** |
+| Cursor | `.cursor/` | `.cursor/mcp.json` → `mcpServers.travsr` | `{"type":"stdio", command, args}` | `.cursor/rules/travsr.mdc` **with `---\nalwaysApply: true\n---` frontmatter** | docs |
+| VS Code Copilot | existing `.vscode/mcp.json` (else print-snippet) | `.vscode/mcp.json` → `servers.travsr` | `{"type":"stdio", command, args}` | `.github/copilot-instructions.md` managed block | **bundle** |
+| Gemini CLI | `.gemini/settings.json` | `.gemini/settings.json` → `mcpServers.travsr` | `{command, args}` | `GEMINI.md` managed block | docs |
+| Antigravity | `.antigravitycli/` or `.antigravity/` | **note only** `~/.gemini/config/mcp_config.json` → `mcpServers` | `{command, args, env?}` | `GEMINI.md` managed block | **bundle** |
+| Codex | `.codex/` or `AGENTS.md` | **note only** `~/.codex/config.toml` or `.codex/config.toml` → `[mcp_servers.travsr]` | TOML, not written by us | `AGENTS.md` managed block | docs |
+| Windsurf | `.windsurf/` (else `~/.codeium/windsurf/`) | **note only** `~/.codeium/windsurf/mcp_config.json` → `mcpServers` | `{command, args}` | `.windsurf/rules/travsr.md` (preferred over legacy `.windsurfrules`) | docs |
+| Zed | `.zed/` | `.zed/settings.json` → `context_servers.travsr` | flat `{command, args, env?}` | first existing of Zed's instruction list, else `.rules` | docs |
+
+Zed's server shape was left as an open question in the first draft (flat
+`{command,args}` versus nested `{command:{path,args}}`). It is **flat**. The
+question is closed.
+
+Antigravity, Codex and Windsurf keep their MCP servers in a global file
+(`~/.gemini/config/mcp_config.json`, `~/.codex/config.toml`,
+`~/.codeium/windsurf/mcp_config.json`) that this command does not write, so a
+project marker earns the rules file only. Each prints a **note** naming the
+remaining manual step, because rules with no server behind them is the one
+failure mode a user cannot diagnose from the output alone.
+
+### Two markers that cannot identify a tool
+
+`GEMINI.md` is read by both Gemini CLI and Antigravity, and `~/.gemini/` holds
+Antigravity's config as well as Gemini CLI's. Neither identifies either tool.
+Gemini CLI is detected by `settings.json` **by name**; Antigravity by its own
+`.antigravitycli/`. Detecting on the shared directory sent Antigravity users
+instructions for a file their tool never reads.
+
+### Zed's instruction file is a first-match list
+
+Zed loads exactly one project instruction file: the first that exists from
+`.rules`, `.cursorrules`, `.windsurfrules`, `.clinerules`,
+`.github/copilot-instructions.md`, `AGENT.md`, `AGENTS.md`, `CLAUDE.md`,
+`GEMINI.md`. Because `.rules` outranks the rest, creating one in a repo whose
+rules live in `CLAUDE.md` moves Zed off `CLAUDE.md` and silently replaces every
+rule the user wrote with ours. The adapter therefore appends its block to the
+file Zed already reads, and creates `.rules` only when the repo has none.
+
+`AGENTS.md` is shared across several tools. Writing a managed block there rather
+than owning the file keeps that convention intact, and is the same reason the
+Zed adapter appends rather than creates.
 
 Detection uses **project-local markers** to decide auto-write; a tool known only
 from a global marker (`~/.claude/`, `~/.cursor/`) is reported as print-snippet,
@@ -151,6 +216,35 @@ principal-security-engineer sign-off before leaving Proposed**.
 - **Instruction-poisoning containment** — the guidance text is static and minimal;
   the managed-block writer refuses malformed/duplicate markers so a crafted host
   file cannot trick it into deleting or preserving attacker content.
+
+### Standing exception: Zed's server entry is committable
+
+"No committed MCP configs by default" is not absolute, and the one exception
+belongs here rather than only in a code comment.
+
+Zed keeps context servers in `.zed/settings.json`, its **general** project
+settings file, alongside editor preferences the user wrote and expects to commit.
+Git-ignoring that file to protect one key would take the rest of their settings
+out of version control with it, so the adapter writes `context_servers.travsr`
+there and leaves the file tracked. `only_mcp_server_files_are_gitignored` encodes
+the exception explicitly so it cannot be reintroduced by accident.
+
+The consequence is real and should be weighed at sign-off: for a Zed repo, the
+travsr server definition is committed, and anyone cloning gets a server entry
+that auto-loads under whatever consent model their Zed build applies. The
+mitigating difference from the vector described above is that the command is the
+bare `travsr` rather than an attacker-chosen executable, so the exposure is
+"a cloner runs their own travsr" rather than arbitrary code.
+
+Gemini CLI's `.gemini/settings.json` is the same class of file and is resolved
+the **opposite** way (git-ignored). The asymmetry is deliberate but weakly
+grounded: Gemini's project settings file is far more often travsr-only in
+practice, while Zed's routinely carries unrelated user config. Note also that
+git-ignoring a path git already tracks does nothing, so for a repo that already
+commits `.gemini/settings.json` the Gemini treatment silently degrades to the Zed
+one. `travsr connect` now detects that case and warns instead of printing the
+local-only claim. **Open question for sign-off: should both be committable with a
+warning, both ignored, or the split kept as-is?**
 
 ## Alternatives Considered
 

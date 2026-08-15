@@ -1,5 +1,31 @@
 use std::path::{Path, PathBuf};
 
+/// Canonical string form of a repo root, for identity comparison and hashing.
+///
+/// Falls back to the raw path when canonicalization fails (the directory may
+/// not exist yet in tests). On Windows the result is lowercased, so `C:\` and
+/// `c:\` are the same repo.
+///
+/// Shared rather than inlined into [`ControlAddr::for_repo`] because
+/// `ReportLspDiagnostics` compares repo roots directly (#698 review, P1): a
+/// second, independent notion of "same repo" would be free to drift from the
+/// one the socket name is derived from, and a mismatch there means a report is
+/// silently dropped or silently accepted by the wrong daemon.
+pub fn normalize_repo_root(repo_root: &Path) -> String {
+    let canonical: PathBuf = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let s = canonical.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        s.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        s
+    }
+}
+
 /// Stable control-plane address derived from a repo root path.
 ///
 /// Computed as `blake3(canonical_path)[..8]` encoded as 16 lowercase hex chars.
@@ -17,17 +43,7 @@ impl ControlAddr {
     /// does not yet exist in tests). On Windows, the path is lowercased before
     /// hashing so that drive-letter casing differences produce the same address.
     pub fn for_repo(repo_root: &Path) -> Self {
-        let canonical: PathBuf = repo_root
-            .canonicalize()
-            .unwrap_or_else(|_| repo_root.to_path_buf());
-
-        let path_str = canonical.to_string_lossy();
-
-        // On Windows, lowercase before hashing so C:\ and c:\ produce the same addr.
-        #[cfg(windows)]
-        let hash = blake3::hash(path_str.to_lowercase().as_bytes());
-        #[cfg(not(windows))]
-        let hash = blake3::hash(path_str.as_bytes());
+        let hash = blake3::hash(normalize_repo_root(repo_root).as_bytes());
         let hex: String =
             hash.as_bytes()[..8]
                 .iter()

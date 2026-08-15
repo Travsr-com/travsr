@@ -17,8 +17,9 @@
 ## Quickstart
 
 ```bash
-# 1. Install
-npm install -g @travsr.com/travsr
+# 1. Install (either one)
+curl -fsSL https://travsr.com/install.sh | sh   # shell installer, no Node needed
+npm install -g @travsr.com/travsr               # npm
 
 # 2. Initialize your repo (requires git)
 cd your-project
@@ -28,6 +29,16 @@ travsr init       # indexes TypeScript files → .travsr/graph.db
 
 # 3. Connect to Claude Desktop (set once, works for all repos)
 ```
+
+The shell installer supports `--version <tag>` to install a specific release
+instead of latest stable (e.g. `sh -s -- --version v0.11.0`), `--system`
+(installs to `/usr/local/bin`, e.g.
+`curl -fsSL https://travsr.com/install.sh | sh -s -- --system`, since a piped
+script can only take flags via `sh -s --`), and `TRAVSR_INSTALL_DIR` to
+override the default `~/.local/bin`. If `travsr.com` is unreachable, use the
+GitHub fallback URL:
+`https://github.com/Travsr-com/travsr/releases/latest/download/install.sh`.
+See [SECURITY.md](SECURITY.md) for what the script verifies before installing.
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):

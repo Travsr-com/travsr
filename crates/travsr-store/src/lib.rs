@@ -4364,6 +4364,68 @@ LIMIT ?4",
         Ok(id.map(i64_to_node_id))
     }
 
+    /// The single tree-sitter node anywhere in `corpus` matching one of
+    /// `signatures`, or `None` when there is not exactly one.
+    ///
+    /// Last-resort partner to [`find_ts_node_for_unification`], for the case
+    /// where a definition and its declaration live in *different files*. The
+    /// same-file matcher cannot see across that split, and the cross-file
+    /// rescue in `scip_unifier` only helps when the same symbol already
+    /// unified somewhere, which never happens when the declaration is the only
+    /// Phase A node: C and C++ out-of-line member definitions
+    /// (`widget.h` declares `Widget::draw`, `widget.cpp` defines it) are the
+    /// motivating shape.
+    ///
+    /// Deliberately has **no line constraint**, since a declaration's line says
+    /// nothing about its definition's, and instead guards on uniqueness:
+    /// more than one candidate means the name is ambiguous in this repo, and
+    /// merging would attribute calls to the wrong function. Two same-named
+    /// `static` functions in different translation units are different
+    /// functions in C, and they produce two rows here, so this refuses rather
+    /// than guessing. Refusing leaves the pre-existing orphan behaviour
+    /// untouched, so this can only ever add correct unifications.
+    pub fn find_unique_ts_node_across_files(
+        &self,
+        corpus: &str,
+        signatures: &[String],
+    ) -> anyhow::Result<Option<NodeId>> {
+        if signatures.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = (2..signatures.len() + 2)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        // LIMIT 2: enough to tell "exactly one" from "more than one" without
+        // reading a whole repo's worth of homonyms.
+        let sql = format!(
+            "SELECT id FROM nodes \
+             WHERE corpus = ?1 AND signature IN ({placeholders}) AND line IS NOT NULL \
+             LIMIT 2"
+        );
+
+        let mut bind: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(signatures.len() + 1);
+        bind.push(&corpus);
+        for sig in signatures {
+            bind.push(sig);
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .context("find_unique_ts_node_across_files: prepare")?;
+        let ids: Vec<i64> = stmt
+            .query_map(bind.as_slice(), |row| row.get(0))
+            .context("find_unique_ts_node_across_files: query")?
+            .collect::<Result<Vec<_>, _>>()
+            .context("find_unique_ts_node_across_files: collect")?;
+
+        Ok(match ids.as_slice() {
+            [only] => Some(i64_to_node_id(*only)),
+            _ => None,
+        })
+    }
+
     /// All definition node ids at `(corpus, path)` — tree-sitter and SCIP —
     /// ordered by line.  Used by the CLI to surface function-level callers
     /// when a query resolves to a file node (RFC-014 #317: a file's callers

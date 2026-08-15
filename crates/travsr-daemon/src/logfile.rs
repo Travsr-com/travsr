@@ -31,6 +31,7 @@
 //! sidecar.version.checked  sidecar.version.below_floor
 //! sidecar.version.stale    sidecar.version.unreadable
 //! sidecar.version.probe_timeout
+//! editor.attached          editor.detached
 //! ```
 //!
 //! The `sidecar.version.*` keys (RFC-025) report the external-binary version
@@ -44,6 +45,16 @@
 //! fires when a bounded `--version` probe is killed for exceeding its deadline
 //! and the sidecar degrades to usable rather than being refused. The daemon
 //! emits `stale` from a local cache only and never fetches (local-first).
+//!
+//! `editor.attached` / `editor.detached` (#688) are the editor plane's only
+//! log entries, and the reason it has exactly two is worth stating: an editor
+//! arriving or leaving is a lifecycle fact, the same kind as a daemon starting.
+//! What it reports in between is a value that changes on every keystroke,
+//! which belongs in the plane the reports build (`travsr daemon lsp`) and not
+//! in a narrative log. Writing each report here buried the daemon's own story
+//! under someone's typing, which is how the rule above — worth adding where
+//! something happened that a reader would count or chart, not to the running
+//! commentary in between — reads when applied to an external producer.
 //!
 //! The keys keep the codebase's own vocabulary (`phase_b`, `lsif`, `kcore`)
 //! because they are identifiers, matched exactly by whatever reads them, and a

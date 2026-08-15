@@ -25,9 +25,17 @@
  *   render         — new graph data
  *   renderPeek     — source lines for the peek panel
  *   freshness      — graph stats (nodeCount, state) for the status bar
+ *   diagnosticsOverlay — live LSP diagnostics per node (#688)
  */
 
 import * as vscode from "vscode";
+import {
+  detachSession,
+  reportLspDiagnostics,
+  REPORT_TTL_SECS,
+  type FileDiagnostics,
+  type LspDiagnosticsReport,
+} from "./daemonIpc";
 import type { McpClient } from "./mcp";
 
 // ── Public types (consumed by commands.ts) ────────────────────────────────
@@ -53,6 +61,91 @@ export interface GraphData {
   nodes: GraphNode[];
   edges: GraphEdge[];
 }
+
+// ── Diagnostics overlay (#688) ────────────────────────────────────────────
+
+/** Worst severity found for a node. Info and Hint are deliberately ignored. */
+export type NodeDiagnosticSeverity = "error" | "warning";
+
+export interface NodeDiagnostic {
+  severity: NodeDiagnosticSeverity;
+  count: number;
+}
+
+/**
+ * One diagnostic, as the detail panel lists it. The badge answers "is this
+ * broken"; this answers "broken how, and where", which is the thing a reader
+ * can act on.
+ *
+ * `line` is 1-based, matching the graph's own `line` and what
+ * `goToDefinition` expects, rather than the 0-based `Range` it comes from.
+ */
+export interface NodeDiagnosticItem {
+  severity: NodeDiagnosticSeverity;
+  line: number;
+  message: string;
+  /** Producer (`ts`, `eslint`, …) when the provider set one. */
+  source?: string;
+}
+
+/**
+ * Cap on listed diagnostics per file. A generated or badly broken file can
+ * hold thousands, and the panel is a place to start reading, not a second
+ * Problems view. The overflow is counted, never silently dropped.
+ */
+export const MAX_DIAGNOSTIC_ITEMS_PER_FILE = 50;
+
+/** Cap on a single diagnostic message. Long type errors run to kilobytes. */
+export const MAX_DIAGNOSTIC_MESSAGE_CHARS = 300;
+
+export interface DiagnosticsOverlay {
+  /** Node id → worst severity + count. Clean nodes are absent, not zeroed. */
+  byNode: Record<string, NodeDiagnostic>;
+  /**
+   * Graph file path → the individual diagnostics in it, worst first.
+   *
+   * Keyed by file rather than by node id because attribution is file-scoped
+   * (see `scope`): a graph routinely holds dozens of symbols from one file,
+   * and keying by node would copy the same list under each of them. The
+   * webview maps a node to its list through the node's own `path`.
+   *
+   * Message text lives here and only here. It never reaches the daemon's
+   * editor plane (`broken`), which stays counts-only: that plane is queried
+   * over a socket and persisted in another process, while this one is posted
+   * to a webview in the same extension host that already holds the text.
+   */
+  itemsByFile: Record<string, NodeDiagnosticItem[]>;
+  /**
+   * Graph file path → how many diagnostics were dropped by
+   * `MAX_DIAGNOSTIC_ITEMS_PER_FILE`. Absent when nothing was dropped.
+   */
+  itemsTruncated: Record<string, number>;
+  /**
+   * Attribution granularity. `"file"` means a diagnostic anywhere in a file
+   * badges every node from that file, because `get_graph_json` emits `line`
+   * but no `end_line`, so there is no symbol span to test a range against.
+   * Symbol-level attribution is the follow-up (#688 Option A).
+   */
+  scope: "file";
+  /**
+   * Graph file paths no provider has published diagnostics for. Absence of
+   * diagnostics is not evidence of correctness — a file whose language has no
+   * extension installed looks identical to a clean one — so the panel says
+   * "not diagnosed" rather than implying "clean".
+   */
+  unknownCoverage: string[];
+  /**
+   * Files with something wrong, for the daemon's editor plane. Per file rather
+   * than aggregated, because "which files are broken" composes with the graph
+   * and "how many errors" does not.
+   */
+  broken: FileDiagnostics[];
+  /** Distinct files across the rendered nodes. */
+  filesSeen: number;
+}
+
+/** Debounce window for diagnostics recomputation. */
+export const DIAGNOSTICS_DEBOUNCE_MS = 200;
 
 // ── Message protocol ──────────────────────────────────────────────────────
 
@@ -92,6 +185,188 @@ function resolveWorkspacePath(path: string): vscode.Uri | null {
   return uri;
 }
 
+// ── Diagnostics helpers (#688) ────────────────────────────────────────────
+
+/** Error and warning tallies for one file. Info and Hint are ignored. */
+function tally(diags: readonly vscode.Diagnostic[]): {
+  errors: number;
+  warnings: number;
+} {
+  let errors = 0;
+  let warnings = 0;
+  for (const d of diags) {
+    if (d.severity === vscode.DiagnosticSeverity.Error) errors++;
+    else if (d.severity === vscode.DiagnosticSeverity.Warning) warnings++;
+  }
+  return { errors, warnings };
+}
+
+/**
+ * Reduce a tally to the one badge worth drawing: errors outrank warnings, and
+ * the count is of the winning severity only (a file with 2 errors and 9
+ * warnings reads "2 errors", not "11 problems"). Null when there is nothing at
+ * either level, so callers omit the node rather than post a zero.
+ */
+function worstDiagnostic(t: {
+  errors: number;
+  warnings: number;
+}): NodeDiagnostic | null {
+  if (t.errors > 0) return { severity: "error", count: t.errors };
+  if (t.warnings > 0) return { severity: "warning", count: t.warnings };
+  return null;
+}
+/**
+ * The listable diagnostics of one file, errors first and then by line.
+ *
+ * Same severity policy as the badge: Info and Hint are dropped, so the list
+ * and the ring can never disagree about whether a file is a problem. Sorting
+ * puts errors first because a reader scanning the panel wants the thing that
+ * breaks the build before the thing that lints.
+ */
+function listItems(diags: readonly vscode.Diagnostic[]): NodeDiagnosticItem[] {
+  const items: NodeDiagnosticItem[] = [];
+  for (const d of diags) {
+    const severity: NodeDiagnosticSeverity | null =
+      d.severity === vscode.DiagnosticSeverity.Error
+        ? "error"
+        : d.severity === vscode.DiagnosticSeverity.Warning
+          ? "warning"
+          : null;
+    if (!severity) continue;
+    const message = d.message.replace(/\s+/g, " ").trim();
+    items.push({
+      severity,
+      // `Range` is 0-based; every consumer here (the graph's `line`,
+      // `goToDefinition`) is 1-based.
+      line: d.range.start.line + 1,
+      message:
+        message.length > MAX_DIAGNOSTIC_MESSAGE_CHARS
+          ? message.slice(0, MAX_DIAGNOSTIC_MESSAGE_CHARS - 1) + "…"
+          : message,
+      ...(d.source ? { source: d.source } : {}),
+    });
+  }
+  items.sort((a, b) =>
+    a.severity === b.severity
+      ? a.line - b.line
+      : a.severity === "error"
+        ? -1
+        : 1
+  );
+  return items;
+}
+
+/**
+ * Workspace `fsPath`s of `nodes`, for deciding whether a diagnostic change is
+ * about this graph at all (#698 review, P2).
+ *
+ * Resolved through `resolveWorkspacePath`, the same gate the overlay uses, so
+ * a node the overlay would drop cannot make the listener wake up either.
+ */
+export function resolvedFsPaths(nodes: GraphNode[]): Set<string> {
+  const out = new Set<string>();
+  for (const node of nodes) {
+    if (!node.path) continue;
+    const uri = resolveWorkspacePath(node.path);
+    if (uri) out.add(uri.fsPath);
+  }
+  return out;
+}
+
+/**
+ * Map the diagnostics VS Code already holds onto the nodes currently rendered.
+ *
+ * Reads `vscode.languages.getDiagnostics` only — Travsr spawns no language
+ * server and hosts none. Diagnostics are looked up once per distinct file, not
+ * once per node, because a graph routinely holds dozens of symbols from the
+ * same file.
+ *
+ * Nodes whose path escapes the workspace are dropped by `resolveWorkspacePath`
+ * and never appear in the result.
+ */
+export function computeDiagnosticsOverlay(
+  nodes: GraphNode[]
+): DiagnosticsOverlay {
+  // A URI appears in the global list once some provider has published for it,
+  // even if it published an empty array. That is the only signal available for
+  // "was this file looked at at all" — getDiagnostics(uri) returns [] both for
+  // a clean file and for one nothing has ever diagnosed.
+  const published = new Set(
+    vscode.languages.getDiagnostics().map(([uri]) => uri.fsPath)
+  );
+
+  const byNode: Record<string, NodeDiagnostic> = {};
+  const unknownCoverage: string[] = [];
+  const broken: FileDiagnostics[] = [];
+  const itemsByFile: Record<string, NodeDiagnosticItem[]> = {};
+  const itemsTruncated: Record<string, number> = {};
+  const perFile = new Map<string, NodeDiagnostic | null>();
+
+  for (const node of nodes) {
+    if (!node.path) continue;
+    if (!perFile.has(node.path)) {
+      const uri = resolveWorkspacePath(node.path);
+      if (!uri) {
+        perFile.set(node.path, null);
+      } else {
+        if (!published.has(uri.fsPath)) unknownCoverage.push(node.path);
+        const diags = vscode.languages.getDiagnostics(uri);
+        const t = tally(diags);
+        if (t.errors > 0 || t.warnings > 0) {
+          broken.push({ path: node.path, errors: t.errors, warnings: t.warnings });
+          const items = listItems(diags);
+          if (items.length > MAX_DIAGNOSTIC_ITEMS_PER_FILE) {
+            itemsTruncated[node.path] =
+              items.length - MAX_DIAGNOSTIC_ITEMS_PER_FILE;
+          }
+          itemsByFile[node.path] = items.slice(
+            0,
+            MAX_DIAGNOSTIC_ITEMS_PER_FILE
+          );
+        }
+        perFile.set(node.path, worstDiagnostic(t));
+      }
+    }
+    const worst = perFile.get(node.path);
+    if (worst) byNode[node.id] = worst;
+  }
+
+  return {
+    byNode,
+    itemsByFile,
+    itemsTruncated,
+    scope: "file",
+    unknownCoverage,
+    broken,
+    filesSeen: perFile.size,
+  };
+}
+
+/**
+ * Collapse a burst of calls into one deferred call. Diagnostics fire per
+ * keystroke once several servers are running; recomputing the whole overlay
+ * on each would burn the extension host for frames nobody sees.
+ */
+export function makeDebouncer(
+  fn: () => void,
+  ms: number
+): { schedule(): void; dispose(): void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return {
+    schedule(): void {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = undefined;
+        fn();
+      }, ms);
+    },
+    dispose(): void {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+    },
+  };
+}
+
 // ── Nonce helper ──────────────────────────────────────────────────────────
 
 function getNonce(): string {
@@ -118,6 +393,25 @@ export class GraphPanel {
 
   private readonly panel: vscode.WebviewPanel;
   private disposables: vscode.Disposable[] = [];
+  /** Nodes in the graph as currently rendered — the overlay's input set. */
+  private renderedNodes: GraphNode[] = [];
+  /** Last report sent to the daemon, so an unchanged one is not resent. */
+  private lastReportedDiagnostics = "";
+  /** Last overlay posted to the webview, so an unchanged one is not reposted. */
+  private lastPostedOverlay = "";
+  /** Last report sent, replayed by the lease renewal without recomputing. */
+  private lastReport: LspDiagnosticsReport | undefined;
+  /**
+   * Workspace `fsPath`s of the rendered nodes, so a diagnostic change outside
+   * the graph can be ignored without recomputing anything (#698 review, P2).
+   */
+  private renderedFsPaths: Set<string> = new Set();
+  /** Lease renewal timer; see the constructor. Cleared in `dispose`. */
+  private leaseRenewal: ReturnType<typeof setInterval> | undefined;
+  private readonly diagnosticsDebouncer = makeDebouncer(
+    () => this.postDiagnosticsOverlay(),
+    DIAGNOSTICS_DEBOUNCE_MS
+  );
 
   private constructor(
     private readonly client: McpClient,
@@ -142,6 +436,36 @@ export class GraphPanel {
       (msg: WebviewMessage) => this.handleMessage(msg),
       null,
       this.disposables
+    );
+
+    // #688: the language servers the user already runs are the only source of
+    // live correctness data. Tied to the panel so it dies with it.
+    //
+    // Filtered on `e.uris` (#698 review, P2): a change anywhere in the
+    // workspace used to schedule a full recompute, and the recompute calls the
+    // argument-less `getDiagnostics()`, whose cost tracks total workspace
+    // breakage rather than graph size. A noisy linter in another editor group
+    // then rebuilt the Problems list every 200ms for an overlay that never
+    // changed. A newly-diagnosed file still appears in `e.uris`, so
+    // `unknownCoverage` stays correct.
+    vscode.languages.onDidChangeDiagnostics(
+      (e) => {
+        if (!e.uris.some((u) => this.renderedFsPaths.has(u.fsPath))) return;
+        this.diagnosticsDebouncer.schedule();
+      },
+      null,
+      this.disposables
+    );
+
+    // #698 review P2: the lease is renewed on a timer, not by change. Reports
+    // are skipped when the reduction is identical, so a window whose
+    // diagnostics settle stops renewing and is dropped at `REPORT_TTL_SECS`,
+    // leaving `travsr daemon lsp` saying "no editor attached" while the panel
+    // is open and current. Renewing at a third of the lease tolerates two
+    // missed ticks.
+    this.leaseRenewal = setInterval(
+      () => this.renewLease(),
+      (REPORT_TTL_SECS * 1000) / 3
     );
   }
 
@@ -208,6 +532,9 @@ export class GraphPanel {
       pathPrefix,
       ...(reqId !== undefined ? { reqId } : {}),
     });
+
+    this.renderedNodes = data.nodes ?? [];
+    this.postDiagnosticsOverlay(true);
   }
 
   /**
@@ -218,6 +545,76 @@ export class GraphPanel {
     this.panel.reveal(vscode.ViewColumn.One);
     this.panel.title = `Travsr: ${query}`;
     void this.panel.webview.postMessage({ command: "render", data, query });
+    this.renderedNodes = data.nodes ?? [];
+    this.postDiagnosticsOverlay(true);
+  }
+
+  /**
+   * Recompute the overlay for the rendered node set and push it. Cheap enough
+   * to run un-debounced on re-render (the node set just changed and the old
+   * overlay is addressed to node ids that may no longer exist); the debounce
+   * exists for the keystroke-driven path.
+   */
+  /**
+   * Renew the daemon lease without touching the webview.
+   *
+   * The lease and the overlay are different concerns on different clocks: the
+   * lease has to be refreshed on a timer whether or not anything changed,
+   * while the webview should only be told when something did. Routing the
+   * renewal through `postDiagnosticsOverlay(true)` conflated them, so every
+   * renewal tick reposted a byte-identical overlay and `refreshOpenDetailProblems`
+   * rebuilt the Problems list, destroying a text selection the reader was in
+   * the middle of making (#698 review, P3). A smaller version of the P2 above,
+   * on a five-minute period instead of 200ms, and the only remaining path to it.
+   */
+  private renewLease(): void {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root || !this.lastReport) return;
+    void reportLspDiagnostics(root, this.lastReport);
+  }
+
+  private postDiagnosticsOverlay(force = false): void {
+    // No early return on an empty node set (#698 review, P3): the webview
+    // keeps the previous graph's badge and Problems data until it is told
+    // otherwise, so a query that matches nothing would leave "3 errors" over
+    // an empty canvas. `computeDiagnosticsOverlay([])` is trivially cheap and
+    // returns exactly the empty state the webview should be shown.
+    const overlay = computeDiagnosticsOverlay(this.renderedNodes);
+    this.renderedFsPaths = resolvedFsPaths(this.renderedNodes);
+
+    // Deduped like the daemon report below (#698 review, P2): an unchanged
+    // overlay still made the webview replace the Problems list, which destroys
+    // a text selection the reader may be in the middle of making.
+    const overlayKey = JSON.stringify(overlay);
+    if (force || overlayKey !== this.lastPostedOverlay) {
+      this.lastPostedOverlay = overlayKey;
+      void this.panel.webview.postMessage({
+        command: "diagnosticsOverlay",
+        ...overlay,
+      });
+    }
+
+    // #688: mirror the reduction into the daemon log at DEBUG. Fire and
+    // forget — `reportLspDiagnostics` swallows every failure, so a stopped
+    // daemon or an older one costs nothing here.
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) return;
+
+    const report = {
+      files: overlay.broken,
+      seen: overlay.filesSeen,
+      undiagnosed: overlay.unknownCoverage.length,
+    };
+
+    // Renewing an unchanged view is not free of meaning — the lease depends on
+    // it — but a keystroke that changes nothing does not need to say so twice.
+    // `force` marks the render path, which is user-driven and rare, so the
+    // lease is renewed whenever the user actually looks at the graph.
+    const key = JSON.stringify(report);
+    if (!force && key === this.lastReportedDiagnostics) return;
+    this.lastReportedDiagnostics = key;
+    this.lastReport = report;
+    void reportLspDiagnostics(root, report);
   }
 
   private handleMessage(msg: WebviewMessage): void {
@@ -353,6 +750,12 @@ export class GraphPanel {
 
   dispose(): void {
     GraphPanel.current = undefined;
+    this.diagnosticsDebouncer.dispose();
+    if (this.leaseRenewal) clearInterval(this.leaseRenewal);
+    // Withdraw this window's view rather than leave it asserting what it saw
+    // for the rest of the lease.
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (root) void detachSession(root);
     this.panel.dispose();
     for (const d of this.disposables) {
       d.dispose();
@@ -472,12 +875,6 @@ export function buildHtmlContent(
   </div>
 </div>
 
-<!-- ── Node search overlay ──────────────────────────────────────────────── -->
-<div id="node-search" style="display:none" role="search" aria-label="Search nodes">
-  <input id="node-search-input" type="text" placeholder="Search nodes…" autocomplete="off" spellcheck="false">
-  <ul id="node-search-results" role="listbox"></ul>
-</div>
-
 <!-- ── Breadcrumb nav (P3 repo-map LOD) ─────────────────────────────────── -->
 <nav id="breadcrumb" aria-label="Graph navigation level">
   <!-- Populated by graph.js renderBreadcrumb() -->
@@ -485,6 +882,9 @@ export function buildHtmlContent(
 
 <!-- ── Disambiguation bar (multiple implementations of same symbol) ─────── -->
 <div id="disambig-bar" role="navigation" aria-label="Implementation selector"></div>
+<!-- Hover popup for truncated implementation chips. Outside the bar because
+     the chip row clips on both axes once it scrolls. -->
+<div id="db-tip" role="tooltip" aria-hidden="true"></div>
 
 <!-- ── Blast bar ────────────────────────────────────────────────────────── -->
 <div id="blastbar" style="display:none" role="status" aria-live="polite">
@@ -503,6 +903,14 @@ export function buildHtmlContent(
   </div>
   <canvas id="bgfx" aria-hidden="true"></canvas>
   <div id="cy" role="application" aria-label="Code dependency graph"></div>
+
+  <!-- Node search overlay. Inside #main so it is positioned against the canvas
+       rather than the window: the toolbar above wraps to two rows on a narrow
+       panel, and a window-anchored overlay landed on top of it. -->
+  <div id="node-search" style="display:none" role="search" aria-label="Search nodes">
+    <input id="node-search-input" type="text" placeholder="Search nodes…" autocomplete="off" spellcheck="false">
+    <ul id="node-search-results" role="listbox"></ul>
+  </div>
 
   <!-- Tile-map for repo-map LOD overview (P3) — hidden until mode='overview' -->
   <div id="tilemap" role="grid" aria-label="Repository package overview">
@@ -551,6 +959,7 @@ export function buildHtmlContent(
   <span id="fresh"><span class="dot-pulse" aria-hidden="true"></span><span id="freshText">connecting…</span></span>
   <span id="statusGraph">—</span>
   <span id="noiseBadge" style="display:none" aria-live="polite"></span>
+  <span id="diagBadge" style="display:none" aria-live="polite"></span>
   <div class="legend" aria-label="Node type legend">
     <span class="lg"><span class="dot ring" style="border-color:#86df86" aria-hidden="true"></span>function</span>
     <span class="lg"><span class="dot ring" style="border-color:#fcd053" aria-hidden="true"></span>class · var</span>

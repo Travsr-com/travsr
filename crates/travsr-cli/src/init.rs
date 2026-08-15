@@ -10,6 +10,7 @@ pub fn run(
     semantic: bool,
     force: bool,
     allow_unsandboxed_lsif: bool,
+    no_connect: bool,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     // Write command: index the worktree we are standing in, never redirect to
@@ -53,6 +54,10 @@ pub fn run(
             "ghost_prune_aborted": stats.ghost_prune_aborted,
         });
         println!("{summary}");
+        // stdout carries the machine-readable summary, so the connect report goes
+        // to stderr. It must not be dropped: these writes land in tracked,
+        // user-authored files, and RFC-026 promises they stay visible.
+        maybe_connect(&repo_root, no_connect, crate::connect::Report::Stderr);
         return Ok(());
     }
 
@@ -71,7 +76,7 @@ pub fn run(
         // an already-running daemon never forks a doomed child.
         let exe = std::env::current_exe().context("finding current exe path")?;
         matches!(
-            crate::daemon_client::spawn_background_daemon(&repo_root, &exe),
+            crate::daemon_client::spawn_background_daemon(&repo_root, &exe, false),
             SpawnOutcome::Started | SpawnOutcome::Starting | SpawnOutcome::AlreadyRunning
         )
     } else {
@@ -103,7 +108,28 @@ pub fn run(
         hint_embed_missing();
     }
 
+    maybe_connect(
+        &repo_root,
+        no_connect,
+        if quiet {
+            crate::connect::Report::Silent
+        } else {
+            crate::connect::Report::Stdout
+        },
+    );
+
     Ok(())
+}
+
+/// Detect AI coding tools and wire them to Travsr (RFC-026). Non-fatal: wiring
+/// is a convenience, so a failure here must never fail `travsr init`.
+fn maybe_connect(repo_root: &std::path::Path, no_connect: bool, report: crate::connect::Report) {
+    if no_connect {
+        return;
+    }
+    let mut opts = crate::connect::ConnectOpts::auto();
+    opts.report = report;
+    let _ = crate::connect::run(repo_root, &opts);
 }
 
 /// Print a tip when no embed backend is active so users know about semantic search.

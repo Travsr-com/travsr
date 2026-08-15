@@ -7162,6 +7162,7 @@ mod tests {
             &cache,
             &phase_b_scheduler,
             &index_tx,
+            &std::sync::Mutex::new(EditorPlane::default()),
         );
         assert!(resp.ok, "control message must succeed: {resp:?}");
 
@@ -7589,6 +7590,224 @@ mod tests {
         );
     }
 
+    /// #698 review P1: discovery cannot tell which daemon owns which socket,
+    /// so the client broadcasts and identity is settled here. A report naming
+    /// another repo must be dropped: its paths are keys into a different
+    /// graph, and accepting it makes `travsr daemon lsp` quote files this repo
+    /// does not have.
+    #[test]
+    fn a_report_for_another_repo_is_rejected_not_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        let store = std::sync::Mutex::new(store);
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let sessions = std::sync::Mutex::new(EditorPlane::default());
+
+        let mine = tmp.path().join("repo-a");
+        let theirs = tmp.path().join("repo-b");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+
+        let report = |root: &std::path::Path| {
+            serde_json::to_string(&travsr_ipc::ControlMessage::ReportLspDiagnostics {
+                repo_root: root.to_string_lossy().into_owned(),
+                session: "w1".to_string(),
+                ttl_secs: 900,
+                files: vec![travsr_ipc::message::FileDiagnostics {
+                    path: "src/a.ts".to_string(),
+                    errors: 2,
+                    warnings: 0,
+                }],
+                seen: 1,
+                undiagnosed: 0,
+            })
+            .unwrap()
+        };
+
+        let (resp, _) = handle_control_message(
+            &report(&theirs),
+            &mine,
+            &store,
+            &read_store,
+            &cache,
+            &phase_b_scheduler,
+            &index_tx,
+            &sessions,
+        );
+        assert!(!resp.ok, "a foreign report must be refused: {resp:?}");
+        {
+            let plane = sessions.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                plane.sessions.is_empty(),
+                "a foreign report must not create a session"
+            );
+            // Counted rather than silently dropped (#698 review, P3): the
+            // client cannot observe the refusal, so a persistent mismatch is
+            // undiagnosable unless the daemon keeps a tally someone can read.
+            // Keyed on the normalized root, so two spellings of one directory
+            // cannot become two entries (#698 review, P2).
+            assert_eq!(
+                plane.refused.get(&travsr_ipc::normalize_repo_root(&theirs)),
+                Some(&1),
+                "a refused report must be countable: {:?}",
+                plane.refused
+            );
+        }
+
+        // The same report for this repo is accepted, so the check rejects by
+        // identity rather than rejecting everything.
+        let (resp, _) = handle_control_message(
+            &report(&mine),
+            &mine,
+            &store,
+            &read_store,
+            &cache,
+            &phase_b_scheduler,
+            &index_tx,
+            &sessions,
+        );
+        assert!(resp.ok, "an own-repo report must be accepted: {resp:?}");
+        assert_eq!(
+            sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .sessions
+                .len(),
+            1
+        );
+    }
+
+    /// #698 review P2: the refusal tally takes a caller-supplied string as a
+    /// map key, so it needs the same bound the sessions map has. The control
+    /// socket is reachable by any process running as this user and this
+    /// variant is parsed before any other limit applies.
+    #[test]
+    fn the_refusal_tally_is_bounded_and_keyed_on_the_normalized_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        let store = std::sync::Mutex::new(store);
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let sessions = std::sync::Mutex::new(EditorPlane::default());
+        let mine = tmp.path().join("mine");
+        std::fs::create_dir_all(&mine).unwrap();
+
+        let report = |root: &str| {
+            serde_json::to_string(&travsr_ipc::ControlMessage::ReportLspDiagnostics {
+                repo_root: root.to_string(),
+                session: "w".to_string(),
+                ttl_secs: 900,
+                files: vec![],
+                seen: 0,
+                undiagnosed: 0,
+            })
+            .unwrap()
+        };
+        let call = |line: String| {
+            handle_control_message(
+                &line,
+                &mine,
+                &store,
+                &read_store,
+                &cache,
+                &phase_b_scheduler,
+                &index_tx,
+                &sessions,
+            );
+        };
+
+        // Far more distinct roots than the cap allows.
+        for i in 0..(MAX_REFUSED_ROOTS * 3) {
+            call(report(&format!("/nowhere/repo-{i}")));
+        }
+
+        let plane = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            plane.refused.len() <= MAX_REFUSED_ROOTS,
+            "an unbounded map keyed on caller input is how a daemon dies: {} entries",
+            plane.refused.len()
+        );
+        assert!(
+            plane.refused_overflow > 0,
+            "refusals past the cap must still be counted, not dropped"
+        );
+    }
+
+    /// Two spellings of one directory must not read as two different repos:
+    /// that is the exact confusion the tally exists to remove.
+    #[test]
+    fn trailing_slash_and_plain_root_collapse_to_one_refusal_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        let store = std::sync::Mutex::new(store);
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let sessions = std::sync::Mutex::new(EditorPlane::default());
+
+        let mine = tmp.path().join("mine");
+        let theirs = tmp.path().join("theirs");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+
+        let report = |root: String| {
+            serde_json::to_string(&travsr_ipc::ControlMessage::ReportLspDiagnostics {
+                repo_root: root,
+                session: "w".to_string(),
+                ttl_secs: 900,
+                files: vec![],
+                seen: 0,
+                undiagnosed: 0,
+            })
+            .unwrap()
+        };
+        for spelling in [
+            theirs.to_string_lossy().into_owned(),
+            format!("{}/", theirs.to_string_lossy()),
+        ] {
+            handle_control_message(
+                &report(spelling),
+                &mine,
+                &store,
+                &read_store,
+                &cache,
+                &phase_b_scheduler,
+                &index_tx,
+                &sessions,
+            );
+        }
+
+        let plane = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            plane.refused.len(),
+            1,
+            "one directory, one entry: {:?}",
+            plane.refused
+        );
+        assert_eq!(plane.refused.values().sum::<usize>(), 2);
+    }
+
     #[test]
     fn reindex_commit_errors_without_stamping_when_git_unavailable() {
         // #405: when neither the commit diff nor the tracked-file fallback can be
@@ -7624,6 +7843,7 @@ mod tests {
             &cache,
             &phase_b_scheduler,
             &index_tx,
+            &std::sync::Mutex::new(EditorPlane::default()),
         );
         assert!(
             !resp.ok,
@@ -7683,6 +7903,7 @@ mod tests {
             &cache,
             &phase_b_scheduler,
             &index_tx,
+            &std::sync::Mutex::new(EditorPlane::default()),
         );
         assert!(resp.ok, "control message must succeed: {resp:?}");
 
@@ -8130,6 +8351,10 @@ impl Daemon {
         // store. Keyed on (tool, args, last_commit, phase_b_commit), so commits
         // and background Phase B refreshes invalidate it structurally.
         let query_cache = Arc::new(Mutex::new(query_cache::QueryCache::new(256)));
+        // #688: last diagnostics overlay reported by the editor. Daemon
+        // lifetime only, so `travsr daemon lsp` after a restart correctly
+        // reports that nothing has been received yet.
+        let lsp_sessions = Arc::new(Mutex::new(EditorPlane::default()));
 
         // #318 O3: debounced, single-flight background Phase B refresh. A commit
         // arms it; the event loop's phase_b_tick claims a run once the debounce
@@ -8293,6 +8518,7 @@ impl Daemon {
             let sd_win = Arc::clone(&pipe_shutdown);
             let cache_win = Arc::clone(&query_cache);
             let sched_win = Arc::clone(&phase_b_scheduler);
+            let lsp_sessions_win = Arc::clone(&lsp_sessions);
             let index_tx_win = index_tx.clone();
             let pipe_name_accept = pipe_name.clone();
             tokio::spawn(async move {
@@ -8322,6 +8548,7 @@ impl Daemon {
                     let sd = Arc::clone(&sd_win);
                     let cache = Arc::clone(&cache_win);
                     let sched = Arc::clone(&sched_win);
+                    let lsp_sessions_conn = Arc::clone(&lsp_sessions_win);
                     let index_tx_conn = index_tx_win.clone();
                     tokio::spawn(async move {
                         let (reader, mut writer) = tokio::io::split(server);
@@ -8337,6 +8564,7 @@ impl Daemon {
                                         &cache,
                                         &sched,
                                         &index_tx_conn,
+                                        &lsp_sessions_conn,
                                     )
                                 })
                                 .await
@@ -8397,6 +8625,7 @@ impl Daemon {
                         let sd_notify = Arc::clone(&sock_shutdown);
                         let cache = Arc::clone(&query_cache);
                         let sched = Arc::clone(&phase_b_scheduler);
+                        let lsp_sessions_conn = Arc::clone(&lsp_sessions);
                         let index_tx_conn = index_tx.clone();
                         tokio::spawn(async move {
                             let (reader, mut writer) = conn.into_split();
@@ -8415,6 +8644,7 @@ impl Daemon {
                                             &cache,
                                             &sched,
                                             &index_tx_conn,
+                                            &lsp_sessions_conn,
                                         )
                                     })
                                     .await
@@ -8739,12 +8969,109 @@ fn normalize_nl_query_args(tool: &str, mut args: serde_json::Value) -> serde_jso
     args
 }
 
+/// Everything the editor plane holds, under one lock.
+///
+/// The refusal tally lives beside the sessions rather than in its own mutex
+/// because the two are always touched together and a second lock would only
+/// add an ordering to get wrong.
+#[derive(Debug, Default)]
+pub struct EditorPlane {
+    pub sessions: std::collections::HashMap<String, EditorSession>,
+    /// Reported repo root → how many reports naming it were refused.
+    ///
+    /// A refused report is otherwise silent on both ends: the daemon does not
+    /// log it (correctly, at a per-keystroke rate) and the client is
+    /// fire-and-forget, so `send` reports success when the *write* succeeded
+    /// even if every daemon on the machine dropped the report. A persistent
+    /// mismatch — a multi-root workspace whose first folder is not this repo,
+    /// or a window opened on a subdirectory — then reads exactly like "no
+    /// editor attached", which is also what a closed panel and an uninstalled
+    /// extension look like. Counting makes the drop self-explaining without
+    /// costing a log line (#698 review, P3).
+    /// Distinct roots retained. Past this the identity of the root has stopped
+    /// being the useful part and the fact that reports are being refused at
+    /// all is, so further roots fold into `refused_overflow` rather than
+    /// growing the map (#698 review, P2).
+    ///
+    /// Bounded for the same reason `MAX_EDITOR_SESSIONS` is: the control
+    /// socket is reachable by any process running as this user, and this
+    /// variant is parsed before any other limit applies, so an unbounded map
+    /// keyed on a caller-supplied string is a way to grow the daemon without
+    /// limit. The key is the *normalized* root, so `/repo`, `/repo/` and a
+    /// symlinked spelling collapse to one entry instead of three.
+    pub refused: std::collections::HashMap<String, usize>,
+    /// Refusals whose root arrived after `MAX_REFUSED_ROOTS` was reached.
+    pub refused_overflow: usize,
+}
+
+/// Distinct refused roots retained per daemon lifetime. Small because the
+/// message it feeds is diagnostic: a handful of roots names the problem, and a
+/// wall of them is noise.
+pub const MAX_REFUSED_ROOTS: usize = 16;
+
+/// #688: what one editor window currently sees as broken.
+///
+/// Held only in memory and only while its lease is alive. Nothing here is ever
+/// written to the graph: the graph must stay reproducible from the repository,
+/// and this depends on which extensions a developer installed and on unsaved
+/// buffers. Two planes, each true about its own thing.
+#[derive(Debug, Clone)]
+pub struct EditorSession {
+    /// Repo-relative path → (errors, warnings). Only broken files are present.
+    pub files: std::collections::HashMap<String, (usize, usize)>,
+    /// Files the editor examined for this report.
+    pub seen: usize,
+    /// Of `seen`, how many no provider reported on, so are unknown not clean.
+    pub undiagnosed: usize,
+    /// When this report stops being believable.
+    ///
+    /// `Instant`, not `SystemTime` (#698 review, P3): a lease measures elapsed
+    /// time, and `SystemTime` is not monotonic on any platform the daemon runs
+    /// on. An NTP step, a laptop suspend/resume, or a manual clock change
+    /// moves it, which expires every live session at once (forwards) or pins a
+    /// closed window's view well past its lease (backwards). `Instant` is
+    /// monotonic everywhere: QPC on Windows, `CLOCK_MONOTONIC` on Linux,
+    /// `mach_absolute_time` on macOS. It also makes the derived JSON fields
+    /// total rather than fallible, so no arm has to guess with `unwrap_or(0)`.
+    pub expires_at: std::time::Instant,
+    pub updated_at: std::time::Instant,
+}
+
+/// Editors tracked at once. An editor is a person's open window, so the real
+/// number is one or two; the cap exists because this plane is fed from outside
+/// the daemon and unbounded external input is how a daemon dies.
+const MAX_EDITOR_SESSIONS: usize = 8;
+/// Broken files retained per session. Past this the answer is "the build is
+/// broken", which no longer needs a file list.
+const MAX_FILES_PER_SESSION: usize = 500;
+/// Ceiling on a caller-supplied lease, so a bad or hostile client cannot pin a
+/// stale view in memory for a week.
+const MAX_LEASE_SECS: u64 = 3600;
+
+/// Live sessions, expired ones dropped.
+///
+/// Expiry is evaluated on read rather than on a timer: there is no work to do
+/// when a lease ends, only a fact to stop asserting, and a reader is the only
+/// one who can be misled by it.
+fn live_editor_sessions(
+    sessions: &std::collections::HashMap<String, EditorSession>,
+) -> Vec<(&String, &EditorSession)> {
+    let now = std::time::Instant::now();
+    let mut live: Vec<_> = sessions
+        .iter()
+        .filter(|(_, s)| s.expires_at > now)
+        .collect();
+    live.sort_by_key(|(_, s)| std::cmp::Reverse(s.updated_at));
+    live
+}
+
 /// Returns `(response, should_shutdown)`.
 ///
 /// Called from the Unix domain-socket accept loop and the Windows Named Pipe
 /// accept loop. Gated to the two supported control-plane platforms so the
 /// compiler does not emit dead_code on exotic targets.
 #[cfg(any(unix, windows))]
+#[allow(clippy::too_many_arguments)]
 fn handle_control_message(
     line: &str,
     repo_root: &std::path::Path,
@@ -8753,6 +9080,7 @@ fn handle_control_message(
     cache: &std::sync::Mutex<query_cache::QueryCache>,
     phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
     index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
+    lsp_sessions: &std::sync::Mutex<EditorPlane>,
 ) -> (travsr_ipc::ControlResponse, bool) {
     use travsr_ipc::{ControlMessage, ControlResponse};
 
@@ -8829,6 +9157,172 @@ fn handle_control_message(
             drop(s);
             enqueue_dirty_callers(dirty, repo_root, index_tx);
             (ControlResponse::ok(None), false)
+        }
+        Ok(ControlMessage::ReportLspDiagnostics {
+            repo_root: reported_root,
+            session,
+            ttl_secs,
+            files,
+            seen,
+            undiagnosed,
+        }) => {
+            // #698 review P1: the client cannot tell which daemon owns which
+            // socket, so it sends to every candidate and identity is settled
+            // here. A report for another repo is dropped rather than answered:
+            // its paths are keys into a different graph, and accepting it
+            // would make `travsr daemon lsp` quote files this repo does not
+            // have. Normalized through the same helper the socket name is
+            // derived from, so the two cannot disagree about identity.
+            let reported = travsr_ipc::normalize_repo_root(std::path::Path::new(&reported_root));
+            if reported != travsr_ipc::normalize_repo_root(repo_root) {
+                // Counted, not logged: at a per-keystroke rate a log line would
+                // be noise, but a silent drop leaves a persistent mismatch with
+                // no thread to pull. `travsr daemon lsp` surfaces the tally.
+                //
+                // Keyed on the normalized root, the same form the comparison
+                // above uses, so the printed message cannot read "named X but
+                // this daemon serves X" for a symlinked or trailing-slash
+                // spelling of one directory, which is the exact case the tally
+                // exists to explain. Capped so a caller cannot grow the map
+                // without limit (#698 review, P2).
+                let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+                if plane.refused.len() < MAX_REFUSED_ROOTS || plane.refused.contains_key(&reported)
+                {
+                    *plane.refused.entry(reported).or_insert(0) += 1;
+                } else {
+                    plane.refused_overflow += 1;
+                }
+                return (
+                    ControlResponse::err("report is for a different repo".to_string()),
+                    false,
+                );
+            }
+
+            let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let sessions = &mut plane.sessions;
+            let now = std::time::Instant::now();
+
+            // ttl 0 is an explicit detach: the window is closing and says so,
+            // rather than leaving its view to rot until the lease runs out.
+            if ttl_secs == 0 {
+                if sessions.remove(&session).is_some() {
+                    tracing::info!(
+                        event = "editor.detached",
+                        session = %session,
+                        "editor detached"
+                    );
+                }
+                return (ControlResponse::ok(None), false);
+            }
+
+            // Attach and detach are lifecycle facts and belong in the log. The
+            // reports in between are a value that changes, which is what the
+            // plane is for; logging each one would bury the daemon's own story
+            // under an editor's typing.
+            let known = sessions.contains_key(&session);
+            if !known {
+                if sessions.len() >= MAX_EDITOR_SESSIONS {
+                    // Drop the least recently updated rather than reject the
+                    // newcomer: the stalest view is the least likely to be true.
+                    if let Some(oldest) = sessions
+                        .iter()
+                        .min_by_key(|(_, s)| s.updated_at)
+                        .map(|(k, _)| k.clone())
+                    {
+                        sessions.remove(&oldest);
+                        tracing::info!(
+                            event = "editor.detached",
+                            session = %oldest,
+                            reason = "evicted",
+                            "editor evicted, session cap reached"
+                        );
+                    }
+                }
+                tracing::info!(
+                    event = "editor.attached",
+                    session = %session,
+                    "editor attached"
+                );
+            }
+
+            let mut map = std::collections::HashMap::new();
+            for f in files.into_iter().take(MAX_FILES_PER_SESSION) {
+                map.insert(f.path, (f.errors, f.warnings));
+            }
+            let lease = std::time::Duration::from_secs(ttl_secs.min(MAX_LEASE_SECS));
+            sessions.insert(
+                session,
+                EditorSession {
+                    files: map,
+                    seen,
+                    undiagnosed,
+                    expires_at: now + lease,
+                    updated_at: now,
+                },
+            );
+            (ControlResponse::ok(None), false)
+        }
+        Ok(ControlMessage::LspStatus) => {
+            let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+            // Reading is the only moment an expired lease can mislead anyone,
+            // so it is also where they are cleared.
+            let now = std::time::Instant::now();
+            plane.sessions.retain(|_, s| s.expires_at > now);
+
+            // Reported roots this daemon refused, so a caller seeing "no editor
+            // attached" can tell "nothing reported" from "everything reported
+            // named a repo I do not serve".
+            let mut refused: Vec<_> = plane
+                .refused
+                .iter()
+                .map(|(root, n)| serde_json::json!({ "repo_root": root, "count": n }))
+                .collect();
+            refused.sort_by(|a, b| a["repo_root"].as_str().cmp(&b["repo_root"].as_str()));
+
+            let live = live_editor_sessions(&plane.sessions);
+            let payload = serde_json::json!({
+                "editors": live.len(),
+                // Normalized, matching the keys above: an unnormalized pair
+                // could print two spellings of one directory as if they were
+                // different repos.
+                "served_repo_root": travsr_ipc::normalize_repo_root(repo_root),
+                "refused": refused,
+                "refused_overflow": plane.refused_overflow,
+                "sessions": live
+                    .iter()
+                    .map(|(id, s)| {
+                        let mut broken: Vec<_> = s
+                            .files
+                            .iter()
+                            .map(|(path, (errors, warnings))| {
+                                serde_json::json!({
+                                    "path": path,
+                                    "errors": errors,
+                                    "warnings": warnings,
+                                })
+                            })
+                            .collect();
+                        // Stable order so repeated calls do not shuffle, since
+                        // a HashMap iterates differently every time.
+                        broken.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+                        serde_json::json!({
+                            "session": id,
+                            "seen": s.seen,
+                            "undiagnosed": s.undiagnosed,
+                            // Total, not fallible: `Instant` arithmetic cannot
+                            // run backwards, so there is no error case to
+                            // guess at with `unwrap_or(0)` (#698 review, P3).
+                            "age_secs": now.duration_since(s.updated_at).as_secs(),
+                            "expires_in_secs": s
+                                .expires_at
+                                .saturating_duration_since(now)
+                                .as_secs(),
+                            "broken": broken,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            });
+            (ControlResponse::query_result(payload), false)
         }
         Ok(ControlMessage::Status) => {
             let s = read_store.lock().unwrap_or_else(|e| e.into_inner());

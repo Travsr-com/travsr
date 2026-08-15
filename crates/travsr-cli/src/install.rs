@@ -51,9 +51,10 @@ pub fn current_target() -> Result<&'static str> {
 //
 // Conflating them is what produced the bug: `current_target()` returning a
 // triple was read as proof a build existed for it, so a naming rule silently
-// doubled as a capability claim. Kept apart, the `.exe` rule can be correct and
-// fully tested for a platform no release ships yet, while the installer still
-// refuses to ask for it.
+// doubled as a capability claim. Kept apart, the `.exe` rule could be correct
+// and fully tested while no release shipped Windows and the installer still
+// refused to ask for it — which is what let (2) flip to true for Windows in one
+// line once travsr-lang v0.4.0 published the assets.
 //
 // (2) is the contract with `.github/workflows/release.yml` in
 // Travsr-com/travsr-lang, and the `wrapper_release_drift` test below checks it
@@ -63,19 +64,21 @@ pub fn current_target() -> Result<&'static str> {
 /// Target triples a *published* travsr-lang release contains wrappers for.
 ///
 /// Not the same as the targets the release workflow can build: a target belongs
-/// here only once a tag has actually shipped it. Travsr-com/travsr-lang#15 adds
-/// the `x86_64-pc-windows-msvc` leg, so Windows joins this list in the commit
-/// after the first tag containing those assets, and `wrapper_release_drift` is
-/// what proves the claim rather than a reviewer taking it on faith.
+/// here only once a tag has actually shipped it. Travsr-com/travsr-lang#15 added
+/// the `x86_64-pc-windows-msvc` leg and travsr-lang v0.4.0 is the first tag to
+/// carry those assets, so Windows joins the list here; `wrapper_release_drift`
+/// is what proves the claim rather than a reviewer taking it on faith.
 ///
-/// Until then Windows takes the honest path from #588: `lang list`, `lang
-/// detect` and `init` report "not available on x86_64-pc-windows-msvc yet"
-/// rather than offering an install that 404s.
+/// A target leaving this list is a supported move, not a rollback hack: drop it
+/// and #588's honest path takes over again — `lang list`, `lang detect` and
+/// `init` report "not available on <triple> yet" instead of offering an install
+/// that 404s.
 pub const WRAPPER_RELEASE_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
 ];
 
 /// Wrappers built by a macOS-only release job. `travsr-lang-objectivec` links
@@ -101,8 +104,9 @@ pub fn exe_suffix_for_target(target: &str) -> &'static str {
 /// Pure naming, with no opinion on whether such an asset exists — that is
 /// [`wrapper_available`]. Total rather than `Option` so the `.exe` rule stays
 /// verifiable for a target that is built but not yet published; folding the two
-/// together would mean the only test able to cover Windows naming was one that
-/// first had to claim Windows was shipped.
+/// together would mean naming for such a target could only be tested by a test
+/// that first had to claim the target was shipped. Windows was exactly that
+/// case until travsr-lang v0.4.0, and the next new target will be too.
 pub fn wrapper_asset_name(binary_name: &str, target: &str) -> String {
     format!("{binary_name}-{target}{}", exe_suffix_for_target(target))
 }
@@ -1113,22 +1117,19 @@ mod tests {
     }
 
     #[test]
-    fn windows_is_named_correctly_but_not_yet_claimed_as_published() {
-        // The two halves of #588, and the reason they are separate functions.
-        // travsr-lang#15 adds the Windows build; until a tag ships it, naming
-        // is right and availability is false, so users get the honest
-        // "not available yet" instead of a 404.
-        //
-        // When that tag lands, add the triple to WRAPPER_RELEASE_TARGETS and
-        // delete this test. `wrapper_release_drift` then proves the claim.
+    fn windows_is_both_named_correctly_and_claimed_as_published() {
+        // The two halves of #588 now agree for Windows: travsr-lang v0.4.0 ships
+        // the `.exe` assets, so the naming rule and the availability claim both
+        // hold. `wrapper_release_drift` is what proves the second half against
+        // the live release; this only pins that the triple stayed claimed.
         let target = "x86_64-pc-windows-msvc";
         assert_eq!(
             wrapper_asset_name("travsr-lang-go", target),
             "travsr-lang-go-x86_64-pc-windows-msvc.exe"
         );
         assert!(
-            !wrapper_available("travsr-lang-go", target),
-            "no published release carries Windows wrappers yet"
+            wrapper_available("travsr-lang-go", target),
+            "travsr-lang v0.4.0 publishes Windows wrappers"
         );
     }
 
@@ -1179,12 +1180,9 @@ mod tests {
     fn the_installed_file_carries_the_same_suffix_as_the_asset() {
         // Write side and read side have to agree: `resolve_executable` tries
         // `<name>.exe` first on Windows, and a bare file there is never found.
-        // Covers Windows explicitly rather than only the published targets,
-        // since that is the pairing the bug broke.
-        for target in WRAPPER_RELEASE_TARGETS
-            .iter()
-            .chain(["x86_64-pc-windows-msvc"].iter())
-        {
+        // Windows is a published target now, so iterating the list covers the
+        // pairing the bug broke without naming the triple separately.
+        for target in WRAPPER_RELEASE_TARGETS {
             let asset = wrapper_asset_name("travsr-lang-go", target);
             let installed = wrapper_install_filename("travsr-lang-go", target);
             assert_eq!(
@@ -1197,9 +1195,10 @@ mod tests {
 
     #[test]
     fn the_windows_install_path_carries_dot_exe() {
-        // The on-disk name under ~/.travsr/bin, asserted on the rule so it holds
-        // while Windows is built but unpublished. `resolve_executable` probes
-        // `<name>.exe` first on Windows, so a bare file there is never found.
+        // The on-disk name under ~/.travsr/bin, asserted on the rule rather than
+        // on availability so it holds regardless of what a release ships.
+        // `resolve_executable` probes `<name>.exe` first on Windows, so a bare
+        // file there is never found.
         assert_eq!(
             wrapper_install_filename("travsr-lang-java", "x86_64-pc-windows-msvc"),
             "travsr-lang-java.exe"
