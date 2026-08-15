@@ -40,6 +40,12 @@ pub struct PhaseBOutcome {
     /// Languages whose analyzer was found and spawned but died or errored
     /// mid-invoke.
     pub crashed: Vec<String>,
+    /// #712: languages whose analyzer ran cleanly but produced zero nodes even
+    /// though the language is present in the repo. A build-free tool that
+    /// silently indexes nothing (e.g. scip-ruby spawned without an input path)
+    /// would otherwise read as success. User-actionable: rebuild / check the
+    /// tool. Not a crash — the sidecar completed, it just emitted nothing.
+    pub produced_no_nodes: Vec<String>,
     /// Languages whose sidecar binary responded with a mismatched protocol
     /// version. User-actionable: `travsr lang install <lang>` to upgrade.
     pub version_mismatch: Vec<(String, u32, u32)>,
@@ -978,6 +984,13 @@ impl PluginIndexer {
 
         for r in lang_results {
             if r.ran {
+                // #712: Phase B only invokes languages present in the repo, so a
+                // clean run that yields no nodes means the analyzer indexed
+                // nothing despite having source files — surface it instead of
+                // recording a silent zero-node "success".
+                if r.nodes.is_empty() {
+                    outcome.produced_no_nodes.push(r.lang.clone());
+                }
                 outcome.ran.push(r.lang);
             } else if let Some((expected, got)) = r.version_mismatch {
                 outcome.version_mismatch.push((r.lang, expected, got));

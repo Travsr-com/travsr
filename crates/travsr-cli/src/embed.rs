@@ -2359,6 +2359,34 @@ fn embed_model_dir(backend_id: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// #712: whether the `travsr-embed` sidecar binary is present in `~/.travsr/bin`.
+/// Read-only file existence check — no probe.
+fn embed_binary_installed() -> bool {
+    let Some(bin_dir) = dirs::home_dir().map(|h| h.join(".travsr").join("bin")) else {
+        return false;
+    };
+    travsr_plugin_host::embed_backends()
+        .into_iter()
+        .any(|b| bin_dir.join(b.binary_filename()).exists())
+}
+
+/// #712 F: prompt the user to turn on embeddings when the sidecar is installed
+/// but no backend is active. Without this the semantic path (`ask`/`get_context`)
+/// silently runs without embeddings and `travsr status` gave no hint that a
+/// one-command fix (`travsr embed init`) was waiting. Silent when embeddings are
+/// already active, or when the binary is not installed (init's install tip and
+/// `travsr embed init` cover that case).
+pub fn hint_activate_if_installed() {
+    if travsr_plugin_host::active_backend_id().is_some() {
+        return;
+    }
+    if embed_binary_installed() {
+        println!(
+            "tip: embeddings are installed but not enabled — run `travsr embed init` to turn on semantic search"
+        );
+    }
+}
+
 // ── config ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]

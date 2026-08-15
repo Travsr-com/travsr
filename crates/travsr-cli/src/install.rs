@@ -402,6 +402,17 @@ pub async fn download_scip_binary(
 
     replace_file(&tmp, &dest)?;
 
+    // #712: record the resolved release version next to the binary. Tools whose
+    // own `--version` is unreliable (scip-java's coursier launcher reports a
+    // meaningless `0.0.0`) are read from this `<bin>.version` file by
+    // `sidecar_version::read_version`, so `travsr status` shows the version that
+    // was actually installed rather than the launcher's sentinel.
+    if let Some(ver) = travsr_plugin_host::sidecar_version::parse_sidecar_version(tag) {
+        if let Some(vpath) = travsr_plugin_host::sidecar_version::version_sidecar_path(&dest) {
+            let _ = std::fs::write(&vpath, ver.to_string());
+        }
+    }
+
     Ok(dest)
 }
 

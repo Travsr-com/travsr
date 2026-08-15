@@ -2363,6 +2363,44 @@ pub fn get_lang_status(store: &SqliteStore, file: &str) -> String {
     get_lang_status_raw(store, file)
 }
 
+/// #712: whether a binary named `name` resolves on this machine — either in
+/// travsr's managed `~/.travsr/bin` or on `PATH`. Mirrors the CLI's
+/// `tool_available` so the two surfaces agree on what "installed" means.
+fn bin_resolvable(name: &str) -> bool {
+    fn present(dir: &std::path::Path, name: &str) -> bool {
+        if dir.join(name).is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        if dir.join(format!("{name}.exe")).is_file() {
+            return true;
+        }
+        false
+    }
+    if let Some(home) = dirs::home_dir() {
+        if present(&home.join(".travsr").join("bin"), name) {
+            return true;
+        }
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|d| present(&d, name)))
+        .unwrap_or(false)
+}
+
+/// #712: whether the Phase B analyzer for `lang` is installed (provider wrapper
+/// and underlying tool both resolvable). Mirrors `travsr lang list`'s install
+/// detection so `get_lang_status` never tells the user to install a tool that
+/// `lang list` already reports as active — it has simply produced no edges yet.
+fn analyzer_installed(lang: &str) -> bool {
+    let Some(entry) = travsr_plugin_host::phase_b::catalog::lookup(lang) else {
+        return false;
+    };
+    if entry.builtin {
+        return true;
+    }
+    entry.provider_binary.map_or(true, bin_resolvable) && bin_resolvable(entry.command)
+}
+
 fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
     let ext = std::path::Path::new(file)
         .extension()
@@ -2385,6 +2423,12 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
         ""
     } else if meta.builtin {
         meta.underlying_tool_hint
+    } else if analyzer_installed(meta.language) {
+        // #712: the analyzer is installed but has produced no call edges yet
+        // (Phase B not run, or it ran and yielded nothing). Advise a rebuild
+        // rather than a reinstall so the hint agrees with `travsr lang list`,
+        // which already reports this analyzer as active.
+        "travsr init --semantic --force"
     } else {
         meta.install_hint
     };

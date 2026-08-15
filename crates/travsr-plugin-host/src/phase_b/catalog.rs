@@ -430,7 +430,11 @@ pub static CATALOG: &[PhaseBEntry] = &[
         language: "ruby",
         npm_package: Some("@travsr-plugin/ruby"),
         command: "scip-ruby",
-        args: &["--index-file-path", "{output}", "{root}"],
+        // #712: scip-ruby has no `--index-file-path` option (the flag is
+        // `--index-file`), and it requires a positional folder/file to index
+        // ({root}). The wrong flag made this direct-scip fallback exit 1 and
+        // write nothing whenever the travsr-lang-ruby wrapper was absent.
+        args: &["--index-file", "{output}", "{root}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "travsr lang install ruby  (experimental)",

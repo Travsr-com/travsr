@@ -3592,30 +3592,62 @@ LIMIT ?4",
             Self::put_node_fts_words(&tx, node)
                 .context("write_phase_b_batch: put_node_fts_words")?;
         }
-        for edge in edges {
-            // E1: label edges with their true provenance (SCIP relationships vs
-            // native tree-sitter leaf-name resolution) instead of hardcoding
-            // 'lsif'. Precedence-preserving: a compiler provenance ('lsif'/
-            // 'scip') already on the row is never demoted by a later write
-            // (ADR-002), so a heuristic 'tree-sitter' write cannot overwrite it.
-            tx.execute(
-                "INSERT INTO edges(src, dst, kind, provenance, confidence) \
-                 VALUES(?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(src, dst, kind) DO UPDATE SET \
-                 provenance = CASE \
-                   WHEN excluded.provenance IN ('lsif','scip') THEN excluded.provenance \
-                   WHEN edges.provenance IN ('lsif','scip') THEN edges.provenance \
-                   ELSE excluded.provenance END, \
-                 confidence = excluded.confidence",
-                params![
-                    node_id_to_i64(edge.src),
-                    node_id_to_i64(edge.dst),
-                    edge.kind.as_str(),
-                    provenance,
-                    edge.confidence.map(|c| c as i64),
-                ],
-            )
-            .context("write_phase_b_batch: insert edge")?;
+        // #712: never write a half-edge. An incomplete or partial sidecar result
+        // can reference a node it never emitted (or one that a crashed language
+        // owns); inserting an edge to a non-existent endpoint creates an orphan
+        // that `travsr fsck` later flags. Validate both endpoints against this
+        // batch's freshly written nodes and the existing store, dropping any edge
+        // that would dangle. Fail open on a query error so a transient read
+        // problem never silently discards a legitimate edge.
+        {
+            let batch_ids: std::collections::HashSet<i64> =
+                nodes.iter().map(|n| node_id_to_i64(n.id)).collect();
+            let mut exists_stmt = tx
+                .prepare_cached("SELECT 1 FROM nodes WHERE id = ?1")
+                .context("write_phase_b_batch: prepare node-exists")?;
+            let mut dropped = 0usize;
+            for edge in edges {
+                let src = node_id_to_i64(edge.src);
+                let dst = node_id_to_i64(edge.dst);
+                let src_ok =
+                    batch_ids.contains(&src) || exists_stmt.exists(params![src]).unwrap_or(true);
+                let dst_ok =
+                    batch_ids.contains(&dst) || exists_stmt.exists(params![dst]).unwrap_or(true);
+                if !src_ok || !dst_ok {
+                    dropped += 1;
+                    continue;
+                }
+                // E1: label edges with their true provenance (SCIP relationships
+                // vs native tree-sitter leaf-name resolution) instead of
+                // hardcoding 'lsif'. Precedence-preserving: a compiler provenance
+                // ('lsif'/'scip') already on the row is never demoted by a later
+                // write (ADR-002), so a heuristic 'tree-sitter' write cannot
+                // overwrite it.
+                tx.execute(
+                    "INSERT INTO edges(src, dst, kind, provenance, confidence) \
+                     VALUES(?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT(src, dst, kind) DO UPDATE SET \
+                     provenance = CASE \
+                       WHEN excluded.provenance IN ('lsif','scip') THEN excluded.provenance \
+                       WHEN edges.provenance IN ('lsif','scip') THEN edges.provenance \
+                       ELSE excluded.provenance END, \
+                     confidence = excluded.confidence",
+                    params![
+                        src,
+                        dst,
+                        edge.kind.as_str(),
+                        provenance,
+                        edge.confidence.map(|c| c as i64),
+                    ],
+                )
+                .context("write_phase_b_batch: insert edge")?;
+            }
+            if dropped > 0 {
+                tracing::warn!(
+                    dropped,
+                    "write_phase_b_batch: skipped edges with a missing endpoint (incomplete sidecar result)"
+                );
+            }
         }
         tx.commit().context("write_phase_b_batch: commit")
     }

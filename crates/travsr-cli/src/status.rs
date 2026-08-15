@@ -29,18 +29,44 @@ use crate::repo::find_git_root;
 /// missing. Telling the user to commit is a dead end there: there is nothing
 /// to stage. Recovery is `travsr init`, or any later commit that fires the
 /// hook.
-fn phase_b_state(payload: &StatusPayload) -> &'static str {
+fn phase_b_state(payload: &StatusPayload) -> String {
     match payload.phase_b_commit.as_deref() {
         Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => {
             if payload.phase_b_dirty {
-                "stale (run travsr init to refresh)"
+                "stale (run travsr init to refresh)".to_string()
             } else {
-                "complete"
+                // #712: the marker now advances even when a language crashed, so
+                // the healthy languages are complete and queryable at HEAD. Name
+                // any crashed language rather than reporting a flat "complete"
+                // that contradicts the per-language reality and the crash
+                // warning printed below.
+                let crashed = crashed_langs(payload);
+                if crashed.is_empty() {
+                    "complete".to_string()
+                } else {
+                    format!("partial (crashed: {})", crashed.join(", "))
+                }
             }
         }
-        Some(pb) if !pb.is_empty() => "pending",
-        _ => "not run",
+        Some(pb) if !pb.is_empty() => "pending".to_string(),
+        _ => "not run".to_string(),
     }
+}
+
+/// #712: languages whose Phase B sidecar crashed on the last run, parsed from the
+/// `phase_b_warnings` meta (`crashed:<lang>` entries). Used to downgrade the
+/// `semantic:` field from `complete` to `partial (crashed: …)` so it agrees with
+/// the crash warning and the per-language outcome.
+fn crashed_langs(payload: &StatusPayload) -> Vec<String> {
+    payload
+        .phase_b_warnings
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|w| w.strip_prefix("crashed:"))
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// #645 WS-B: the caller's live short HEAD, read at `cwd` (before the worktree
@@ -152,8 +178,12 @@ pub fn run() -> anyhow::Result<()> {
             for warn in warnings.split(',') {
                 let parts: Vec<&str> = warn.splitn(2, ':').collect();
                 match parts.as_slice() {
+                    // #712: point at the force path. A plain `travsr init
+                    // --semantic` re-runs on top of the existing graph, which a
+                    // no-op Phase A can make look like it did nothing; `--force`
+                    // purges and rebuilds so the retry is unambiguous.
                     ["crashed", lang] => eprintln!(
-                        "warning: semantic analyzer for '{lang}' crashed — re-run `travsr init --semantic` to retry"
+                        "warning: semantic analyzer for '{lang}' crashed — fix the tool (e.g. `travsr lang install {lang}`), then re-run `travsr init --semantic --force` to rebuild"
                     ),
                     ["version_mismatch", rest] => {
                         let v: Vec<&str> = rest.splitn(3, ':').collect();
@@ -165,6 +195,12 @@ pub fn run() -> anyhow::Result<()> {
                     }
                     ["needs_approval", lang] => eprintln!(
                         "warning: '{lang}' requires elevated sandbox approval — run `travsr lang approve {lang}`"
+                    ),
+                    // #712: analyzer ran but produced no nodes over the repo's
+                    // source files of this language — a silent zero-node result,
+                    // not a crash. Point at the tool and a rebuild.
+                    ["zero_nodes", lang] => eprintln!(
+                        "warning: semantic analyzer for '{lang}' produced no symbols despite '{lang}' sources in the repo — check `travsr lang install {lang}`, then re-run `travsr init --semantic --force`"
                     ),
                     // #449: languages present in the repo whose Phase B sidecar
                     // never ran, previously a silent skip that left the user
@@ -228,6 +264,10 @@ pub fn run() -> anyhow::Result<()> {
     // the local cache is warm. Prints nothing when no sidecar is installed.
     crate::sidecar_health::print_block();
 
+    // #712 F: the embed sidecar can be installed while no backend is active, so
+    // the semantic path silently runs without embeddings. Nudge to enable it.
+    crate::embed::hint_activate_if_installed();
+
     Ok(())
 }
 
@@ -279,5 +319,31 @@ mod tests {
     #[test]
     fn phase_b_reports_not_run_before_the_first_run() {
         assert_eq!(phase_b_state(&payload("abc", "", true)), "not run");
+    }
+
+    #[test]
+    fn phase_b_reports_partial_when_a_language_crashed_but_markers_agree() {
+        // #712: the marker advances on a partial run (healthy languages are
+        // queryable at HEAD), so the field must name the crashed language rather
+        // than claiming a flat "complete".
+        let mut p = payload("abc", "abc", false);
+        p.phase_b_warnings = Some("crashed:objectivec,skipped_no_analyzer:php".into());
+        assert_eq!(phase_b_state(&p), "partial (crashed: objectivec)");
+    }
+
+    #[test]
+    fn phase_b_partial_names_every_crashed_language() {
+        let mut p = payload("abc", "abc", false);
+        p.phase_b_warnings = Some("crashed:objectivec,crashed:swift".into());
+        assert_eq!(phase_b_state(&p), "partial (crashed: objectivec, swift)");
+    }
+
+    #[test]
+    fn phase_b_non_crash_warnings_do_not_downgrade_complete() {
+        // Skip classes (no analyzer, needs approval, …) are not crashes and must
+        // not turn a clean "complete" into "partial".
+        let mut p = payload("abc", "abc", false);
+        p.phase_b_warnings = Some("skipped_no_analyzer:php,needs_approval:go".into());
+        assert_eq!(phase_b_state(&p), "complete");
     }
 }

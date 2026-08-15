@@ -274,7 +274,44 @@ fn read_version(bin: &Path, live: Option<&str>) -> ProbeOutcome {
             return ProbeOutcome::Parsed(s);
         }
     }
-    probe_version_bounded(bin, VERSION_PROBE_TIMEOUT)
+    // #712: some tools do not report a usable version from `--version`. scip-java
+    // is a coursier launcher whose `--version` prints `0.0.0` even when a specific
+    // tagged release was installed (the version is only in the downloaded asset
+    // name, `scip-java-<tag>`). `travsr lang install` records the resolved version
+    // in a `<bin>.version` sidecar file; prefer it so status shows the real one.
+    if let Some(s) = read_version_file(bin) {
+        return ProbeOutcome::Parsed(s);
+    }
+    match probe_version_bounded(bin, VERSION_PROBE_TIMEOUT) {
+        // A probed `0.0.0` is the "unset" sentinel these launchers emit, never a
+        // real release. Report it as unreadable rather than a bogus `0.0.0 ok`
+        // that misrepresents an installed tool (#712).
+        ProbeOutcome::Parsed(s) if s == Semver::new(0, 0, 0) => ProbeOutcome::Unreadable,
+        other => other,
+    }
+}
+
+/// #712: read a `<bin>.version` sidecar file written by `travsr lang install`
+/// (and the embed installer), holding the resolved release tag for a tool whose
+/// own `--version` is unreliable. Returns the parsed version, or `None` when the
+/// file is absent or unparseable.
+fn read_version_file(bin: &Path) -> Option<Semver> {
+    let name = bin.file_name()?;
+    let mut fname = name.to_os_string();
+    fname.push(".version");
+    let path = bin.with_file_name(fname);
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_sidecar_version(&text)
+}
+
+/// #712: the path of the `<bin>.version` sidecar file for a given installed
+/// binary. Exposed so the installer writes the exact file `read_version_file`
+/// reads. Returns `None` only for a path with no file name.
+pub fn version_sidecar_path(bin: &Path) -> Option<std::path::PathBuf> {
+    let name = bin.file_name()?;
+    let mut fname = name.to_os_string();
+    fname.push(".version");
+    Some(bin.with_file_name(fname))
 }
 
 /// Read the installed version of a sidecar binary. Strictly local, no network,
