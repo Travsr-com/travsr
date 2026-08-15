@@ -11,8 +11,8 @@ const pkg = require('../package.json');
 const VERSION = pkg.version;
 const BIN_DIR = path.join(__dirname, '..', 'bin');
 
-// #576: must stay in lockstep with the release workflow matrix and the
-// vscode TARGET_MAP; checked in CI by .github/scripts/check-target-maps.mjs.
+// #576/#691: must stay in lockstep with the release workflow matrix, the
+// vscode TARGET_MAP, and install.sh; checked in CI by .github/scripts/check-target-maps.mjs.
 const TARGETS = {
   'linux-x64':   'x86_64-unknown-linux-gnu',
   'linux-arm64': 'aarch64-unknown-linux-gnu',
