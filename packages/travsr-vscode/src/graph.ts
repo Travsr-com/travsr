@@ -34,6 +34,7 @@ import {
   reportLspDiagnostics,
   REPORT_TTL_SECS,
   type FileDiagnostics,
+  type LspDiagnosticsReport,
 } from "./daemonIpc";
 import type { McpClient } from "./mcp";
 
@@ -398,6 +399,8 @@ export class GraphPanel {
   private lastReportedDiagnostics = "";
   /** Last overlay posted to the webview, so an unchanged one is not reposted. */
   private lastPostedOverlay = "";
+  /** Last report sent, replayed by the lease renewal without recomputing. */
+  private lastReport: LspDiagnosticsReport | undefined;
   /**
    * Workspace `fsPath`s of the rendered nodes, so a diagnostic change outside
    * the graph can be ignored without recomputing anything (#698 review, P2).
@@ -461,7 +464,7 @@ export class GraphPanel {
     // is open and current. Renewing at a third of the lease tolerates two
     // missed ticks.
     this.leaseRenewal = setInterval(
-      () => this.postDiagnosticsOverlay(true),
+      () => this.renewLease(),
       (REPORT_TTL_SECS * 1000) / 3
     );
   }
@@ -552,6 +555,24 @@ export class GraphPanel {
    * overlay is addressed to node ids that may no longer exist); the debounce
    * exists for the keystroke-driven path.
    */
+  /**
+   * Renew the daemon lease without touching the webview.
+   *
+   * The lease and the overlay are different concerns on different clocks: the
+   * lease has to be refreshed on a timer whether or not anything changed,
+   * while the webview should only be told when something did. Routing the
+   * renewal through `postDiagnosticsOverlay(true)` conflated them, so every
+   * renewal tick reposted a byte-identical overlay and `refreshOpenDetailProblems`
+   * rebuilt the Problems list, destroying a text selection the reader was in
+   * the middle of making (#698 review, P3). A smaller version of the P2 above,
+   * on a five-minute period instead of 200ms, and the only remaining path to it.
+   */
+  private renewLease(): void {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root || !this.lastReport) return;
+    void reportLspDiagnostics(root, this.lastReport);
+  }
+
   private postDiagnosticsOverlay(force = false): void {
     // No early return on an empty node set (#698 review, P3): the webview
     // keeps the previous graph's badge and Problems data until it is told
@@ -592,6 +613,7 @@ export class GraphPanel {
     const key = JSON.stringify(report);
     if (!force && key === this.lastReportedDiagnostics) return;
     this.lastReportedDiagnostics = key;
+    this.lastReport = report;
     void reportLspDiagnostics(root, report);
   }
 

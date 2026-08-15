@@ -612,6 +612,36 @@ suite("GraphPanel: #698 review fixes", () => {
   });
 
   // P2: the lease is renewed on a timer, not by diagnostics changing.
+  test("the lease renewal does not repost to the webview", () => {
+    // `force` used to mean both "renew the lease" and "bypass the webview
+    // dedupe", so every renewal tick rebuilt the Problems list and destroyed a
+    // text selection the reader was making. Five minutes apart instead of
+    // 200ms, but the same mechanism as the dedupe this pass added.
+    const src = fs.readFileSync(
+      path.join(__dirname, "..", "..", "graph.js"),
+      "utf8"
+    );
+    // The method definition, not the call inside setInterval.
+    const fn = src.indexOf("renewLease() {");
+    assert.ok(fn > 0, "renewal must be its own method");
+    const body = src.slice(fn, src.indexOf("\n    }", fn));
+
+    assert.ok(
+      !body.includes("postMessage"),
+      "renewing a lease must not push anything to the webview"
+    );
+    assert.ok(
+      body.includes("reportLspDiagnostics"),
+      "renewal is the daemon half only"
+    );
+    // And the timer must point at it, not back at the overlay path.
+    const timer = src.slice(src.indexOf("leaseRenewal = setInterval"));
+    assert.ok(
+      timer.slice(0, 200).includes("renewLease"),
+      "the interval must call the renewal, not the overlay post"
+    );
+  });
+
   test("the panel renews its lease on an interval and clears it on dispose", () => {
     const src = fs.readFileSync(
       path.join(__dirname, "..", "..", "graph.js"),

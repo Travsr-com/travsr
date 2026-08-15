@@ -7023,7 +7023,7 @@ mod tests {
             &cache,
             &phase_b_scheduler,
             &index_tx,
-            &std::sync::Mutex::new(std::collections::HashMap::new()),
+            &std::sync::Mutex::new(EditorPlane::default()),
         );
         assert!(resp.ok, "control message must succeed: {resp:?}");
 
@@ -7470,7 +7470,7 @@ mod tests {
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
         let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
-        let sessions = std::sync::Mutex::new(std::collections::HashMap::new());
+        let sessions = std::sync::Mutex::new(EditorPlane::default());
 
         let mine = tmp.path().join("repo-a");
         let theirs = tmp.path().join("repo-b");
@@ -7504,13 +7504,22 @@ mod tests {
             &sessions,
         );
         assert!(!resp.ok, "a foreign report must be refused: {resp:?}");
-        assert!(
-            sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty(),
-            "a foreign report must not create a session"
-        );
+        {
+            let plane = sessions.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                plane.sessions.is_empty(),
+                "a foreign report must not create a session"
+            );
+            // Counted rather than silently dropped (#698 review, P3): the
+            // client cannot observe the refusal, so a persistent mismatch is
+            // undiagnosable unless the daemon keeps a tally someone can read.
+            assert_eq!(
+                plane.refused.get(&theirs.to_string_lossy().into_owned()),
+                Some(&1),
+                "a refused report must be countable: {:?}",
+                plane.refused
+            );
+        }
 
         // The same report for this repo is accepted, so the check rejects by
         // identity rather than rejecting everything.
@@ -7525,7 +7534,14 @@ mod tests {
             &sessions,
         );
         assert!(resp.ok, "an own-repo report must be accepted: {resp:?}");
-        assert_eq!(sessions.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+        assert_eq!(
+            sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .sessions
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -7563,7 +7579,7 @@ mod tests {
             &cache,
             &phase_b_scheduler,
             &index_tx,
-            &std::sync::Mutex::new(std::collections::HashMap::new()),
+            &std::sync::Mutex::new(EditorPlane::default()),
         );
         assert!(
             !resp.ok,
@@ -7623,7 +7639,7 @@ mod tests {
             &cache,
             &phase_b_scheduler,
             &index_tx,
-            &std::sync::Mutex::new(std::collections::HashMap::new()),
+            &std::sync::Mutex::new(EditorPlane::default()),
         );
         assert!(resp.ok, "control message must succeed: {resp:?}");
 
@@ -8074,9 +8090,7 @@ impl Daemon {
         // #688: last diagnostics overlay reported by the editor. Daemon
         // lifetime only, so `travsr daemon lsp` after a restart correctly
         // reports that nothing has been received yet.
-        let lsp_sessions = Arc::new(Mutex::new(
-            std::collections::HashMap::<String, EditorSession>::new(),
-        ));
+        let lsp_sessions = Arc::new(Mutex::new(EditorPlane::default()));
 
         // #318 O3: debounced, single-flight background Phase B refresh. A commit
         // arms it; the event loop's phase_b_tick claims a run once the debounce
@@ -8697,6 +8711,28 @@ fn normalize_nl_query_args(tool: &str, mut args: serde_json::Value) -> serde_jso
 /// written to the graph: the graph must stay reproducible from the repository,
 /// and this depends on which extensions a developer installed and on unsaved
 /// buffers. Two planes, each true about its own thing.
+/// Everything the editor plane holds, under one lock.
+///
+/// The refusal tally lives beside the sessions rather than in its own mutex
+/// because the two are always touched together and a second lock would only
+/// add an ordering to get wrong.
+#[derive(Debug, Default)]
+pub struct EditorPlane {
+    pub sessions: std::collections::HashMap<String, EditorSession>,
+    /// Reported repo root → how many reports naming it were refused.
+    ///
+    /// A refused report is otherwise silent on both ends: the daemon does not
+    /// log it (correctly, at a per-keystroke rate) and the client is
+    /// fire-and-forget, so `send` reports success when the *write* succeeded
+    /// even if every daemon on the machine dropped the report. A persistent
+    /// mismatch — a multi-root workspace whose first folder is not this repo,
+    /// or a window opened on a subdirectory — then reads exactly like "no
+    /// editor attached", which is also what a closed panel and an uninstalled
+    /// extension look like. Counting makes the drop self-explaining without
+    /// costing a log line (#698 review, P3).
+    pub refused: std::collections::HashMap<String, usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EditorSession {
     /// Repo-relative path → (errors, warnings). Only broken files are present.
@@ -8762,7 +8798,7 @@ fn handle_control_message(
     cache: &std::sync::Mutex<query_cache::QueryCache>,
     phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
     index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
-    lsp_sessions: &std::sync::Mutex<std::collections::HashMap<String, EditorSession>>,
+    lsp_sessions: &std::sync::Mutex<EditorPlane>,
 ) -> (travsr_ipc::ControlResponse, bool) {
     use travsr_ipc::{ControlMessage, ControlResponse};
 
@@ -8858,13 +8894,19 @@ fn handle_control_message(
             if travsr_ipc::normalize_repo_root(std::path::Path::new(&reported_root))
                 != travsr_ipc::normalize_repo_root(repo_root)
             {
+                // Counted, not logged: at a per-keystroke rate a log line would
+                // be noise, but a silent drop leaves a persistent mismatch with
+                // no thread to pull. `travsr daemon lsp` surfaces the tally.
+                let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+                *plane.refused.entry(reported_root.clone()).or_insert(0) += 1;
                 return (
                     ControlResponse::err("report is for a different repo".to_string()),
                     false,
                 );
             }
 
-            let mut sessions = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let sessions = &mut plane.sessions;
             let now = std::time::Instant::now();
 
             // ttl 0 is an explicit detach: the window is closing and says so,
@@ -8928,15 +8970,27 @@ fn handle_control_message(
             (ControlResponse::ok(None), false)
         }
         Ok(ControlMessage::LspStatus) => {
-            let mut sessions = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
             // Reading is the only moment an expired lease can mislead anyone,
             // so it is also where they are cleared.
             let now = std::time::Instant::now();
-            sessions.retain(|_, s| s.expires_at > now);
+            plane.sessions.retain(|_, s| s.expires_at > now);
 
-            let live = live_editor_sessions(&sessions);
+            // Reported roots this daemon refused, so a caller seeing "no editor
+            // attached" can tell "nothing reported" from "everything reported
+            // named a repo I do not serve".
+            let mut refused: Vec<_> = plane
+                .refused
+                .iter()
+                .map(|(root, n)| serde_json::json!({ "repo_root": root, "count": n }))
+                .collect();
+            refused.sort_by(|a, b| a["repo_root"].as_str().cmp(&b["repo_root"].as_str()));
+
+            let live = live_editor_sessions(&plane.sessions);
             let payload = serde_json::json!({
                 "editors": live.len(),
+                "served_repo_root": repo_root.to_string_lossy(),
+                "refused": refused,
                 "sessions": live
                     .iter()
                     .map(|(id, s)| {

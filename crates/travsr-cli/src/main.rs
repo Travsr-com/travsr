@@ -326,6 +326,44 @@ enum DaemonAction {
     },
 }
 
+/// Report any reports this daemon refused because they named a different repo.
+///
+/// Without this a persistent root mismatch is indistinguishable from every
+/// other reason the plane is empty: a closed panel, an uninstalled extension,
+/// an expired lease. The client cannot tell either, because it is
+/// fire-and-forget and a write that lands on a daemon which then drops the
+/// report still looks like a success (#698 review, P3).
+///
+/// Prints nothing when there is nothing to say, so the common case is
+/// unchanged.
+fn print_refused_reports(v: &serde_json::Value) {
+    let Some(refused) = v.get("refused").and_then(|r| r.as_array()) else {
+        return;
+    };
+    if refused.is_empty() {
+        return;
+    }
+    let served = v
+        .get("served_repo_root")
+        .and_then(|s| s.as_str())
+        .unwrap_or("this repo");
+    for entry in refused {
+        let root = entry
+            .get("repo_root")
+            .and_then(|s| s.as_str())
+            .unwrap_or("?");
+        let count = entry.get("count").and_then(|n| n.as_u64()).unwrap_or(0);
+        println!(
+            "{count} report{} refused: named {root}, but this daemon serves {served}",
+            if count == 1 { " was" } else { "s were" }
+        );
+    }
+    println!(
+        "An editor reports the first workspace folder, so a multi-root window \
+         or one opened on a subdirectory names a root no daemon owns."
+    );
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // Hidden subcommand: __plugin <lang>
@@ -725,8 +763,10 @@ async fn run(cli: Cli) -> Result<()> {
                                         "The VS Code extension attaches when a graph panel \
                                          renders, and its view expires once the window closes."
                                     );
+                                    print_refused_reports(&v);
                                 }
                                 Some(list) => {
+                                    print_refused_reports(&v);
                                     println!(
                                         "{} editor{} attached",
                                         list.len(),
