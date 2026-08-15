@@ -646,7 +646,7 @@ async fn run(cli: Cli) -> Result<()> {
                     dry_run: print,
                     remove,
                     commit,
-                    quiet: false,
+                    report: connect::Report::Stdout,
                 },
             )?;
         }

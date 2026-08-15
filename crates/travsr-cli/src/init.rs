@@ -54,9 +54,10 @@ pub fn run(
             "ghost_prune_aborted": stats.ghost_prune_aborted,
         });
         println!("{summary}");
-        // Still wire the AI tools, but silently: this branch owns stdout and a
-        // connect report would make the summary unparseable.
-        maybe_connect(&repo_root, no_connect, true);
+        // stdout carries the machine-readable summary, so the connect report goes
+        // to stderr. It must not be dropped: these writes land in tracked,
+        // user-authored files, and RFC-026 promises they stay visible.
+        maybe_connect(&repo_root, no_connect, crate::connect::Report::Stderr);
         return Ok(());
     }
 
@@ -107,19 +108,27 @@ pub fn run(
         hint_embed_missing();
     }
 
-    maybe_connect(&repo_root, no_connect, quiet);
+    maybe_connect(
+        &repo_root,
+        no_connect,
+        if quiet {
+            crate::connect::Report::Silent
+        } else {
+            crate::connect::Report::Stdout
+        },
+    );
 
     Ok(())
 }
 
 /// Detect AI coding tools and wire them to Travsr (RFC-026). Non-fatal: wiring
 /// is a convenience, so a failure here must never fail `travsr init`.
-fn maybe_connect(repo_root: &std::path::Path, no_connect: bool, quiet: bool) {
+fn maybe_connect(repo_root: &std::path::Path, no_connect: bool, report: crate::connect::Report) {
     if no_connect {
         return;
     }
     let mut opts = crate::connect::ConnectOpts::auto();
-    opts.quiet = quiet;
+    opts.report = report;
     let _ = crate::connect::run(repo_root, &opts);
 }
 

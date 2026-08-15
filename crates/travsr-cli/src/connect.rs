@@ -25,6 +25,25 @@ const GI_BEGIN: &str =
     "# travsr:begin (generated AI-tool config, `travsr connect --remove` to undo)";
 const GI_END: &str = "# travsr:end";
 
+/// Where a run's report goes.
+///
+/// This is not cosmetic. Connect writes into tracked, user-authored files
+/// (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.github/copilot-instructions.md`)
+/// which are deliberately not git-ignored, so a plain `travsr init` leaves the
+/// working tree dirty. RFC-026 promises the wiring is "non-fatal, but visible";
+/// dropping the report entirely because stdout is busy would keep the writes and
+/// lose the visibility.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Report {
+    /// Interactive run: report on stdout.
+    Stdout,
+    /// `travsr init --json`: stdout carries the machine-readable summary, so the
+    /// report goes to stderr instead of being discarded.
+    Stderr,
+    /// `travsr init --quiet`: the user asked for silence explicitly.
+    Silent,
+}
+
 /// Options controlling a connect run. `auto()` is the zero-config path used by
 /// `travsr init`.
 pub struct ConnectOpts {
@@ -36,9 +55,8 @@ pub struct ConnectOpts {
     pub remove: bool,
     /// Do NOT git-ignore the generated files (opt in to committing them).
     pub commit: bool,
-    /// Do the wiring without printing a report. Used by `travsr init --quiet`
-    /// and `--json`, where the report would be noise or would corrupt stdout.
-    pub quiet: bool,
+    /// Where the report goes. Never affects what is written.
+    pub report: Report,
 }
 
 impl ConnectOpts {
@@ -48,7 +66,7 @@ impl ConnectOpts {
             dry_run: false,
             remove: false,
             commit: false,
-            quiet: false,
+            report: Report::Stdout,
         }
     }
 }
@@ -322,8 +340,16 @@ impl Tool {
             }
             // Codex keeps its MCP servers in a global TOML we do not edit, so an
             // auto-detect here writes the AGENTS.md rules only (see `note`).
+            //
+            // `AGENTS.md` is NOT a marker: it is a cross-tool convention, read by
+            // Zed (it is in ZED_INSTRUCTION_FILES above) among others. Treating it
+            // as evidence of Codex reports `codex (configured)` in any repo that
+            // adopted the convention, and prints a note telling the user to edit
+            // `~/.codex/config.toml` for a tool they do not have. That is the same
+            // shared-file-as-marker error that made an Antigravity-only `~/.gemini`
+            // read as Gemini CLI. `.codex/` identifies exactly one tool.
             Tool::Codex => {
-                if has(repo.join(".codex")) || has(repo.join("AGENTS.md")) {
+                if has(repo.join(".codex")) {
                     Detection::Auto
                 } else if home.is_some_and(|h| has(h.join(".codex"))) {
                     Detection::Print
@@ -550,11 +576,23 @@ fn indent(text: &str) -> String {
 // File operations.
 // ---------------------------------------------------------------------------
 
-/// Atomically replace `path` with `content`: write a sibling temp file, then
-/// rename over the target. Because these helpers do read-modify-write of the
+/// Atomically replace `path` with `content`: write a sibling temp file, fsync it,
+/// then rename over the target. Because these helpers do read-modify-write of the
 /// user's own files (CLAUDE.md, an existing mcp.json), a crash mid-write must
 /// never truncate the original. Same temp+rename pattern as `install.rs`.
+///
+/// The fsync is what makes that claim true across a power loss rather than only
+/// against concurrent readers: rename is atomic in the directory entry, but
+/// without flushing the temp file first a crash can leave the renamed name
+/// pointing at zero bytes on several filesystems. The parent directory is synced
+/// too, best-effort, so the rename itself survives.
+///
+/// When the target already exists its mode is carried over. The temp file is
+/// created under the process umask, so replacing a `0600` `CLAUDE.md` without
+/// this would silently widen it to `0644`.
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    use std::io::Write as _;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -567,10 +605,39 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
         Some(dir) => dir.join(format!(".{file_name}.tmp.{}", std::process::id())),
         None => path.with_extension("tmp"),
     };
-    std::fs::write(&tmp, content).with_context(|| format!("writing temp {}", tmp.display()))?;
+
+    let write = || -> Result<()> {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating temp {}", tmp.display()))?;
+        f.write_all(content.as_bytes())
+            .with_context(|| format!("writing temp {}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if let Ok(meta) = std::fs::metadata(path) {
+                let mode = meta.permissions().mode();
+                let _ = f.set_permissions(std::fs::Permissions::from_mode(mode));
+            }
+        }
+        f.sync_all()
+            .with_context(|| format!("syncing temp {}", tmp.display()))?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("renaming into {}", path.display()));
+    }
+    // Best-effort: makes the rename itself durable. Not all platforms allow
+    // opening a directory, and a failure here does not invalidate the write.
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
     }
     Ok(())
 }
@@ -742,13 +809,23 @@ fn execute(p: &Planned, remove: bool) -> Result<Outcome> {
         }
         Content::Owned { text } => {
             if remove {
-                if p.path.exists() {
-                    std::fs::remove_file(&p.path)
-                        .with_context(|| format!("removing {}", p.path.display()))?;
-                    Ok(Outcome::Removed)
-                } else {
-                    Ok(Outcome::Absent)
+                if !p.path.exists() {
+                    return Ok(Outcome::Absent);
                 }
+                // Only delete a file we still fully own. A user who tuned the
+                // generated rule has content we did not write, and discarding it
+                // silently is the destructive edit every other path in this
+                // module refuses to make (strict-JSON-or-skip, malformed markers).
+                let current = std::fs::read_to_string(&p.path)
+                    .with_context(|| format!("reading {}", p.path.display()))?;
+                if current != *text {
+                    return Ok(Outcome::Skipped(
+                        "edited since travsr generated it (left untouched)".into(),
+                    ));
+                }
+                std::fs::remove_file(&p.path)
+                    .with_context(|| format!("removing {}", p.path.display()))?;
+                Ok(Outcome::Removed)
             } else if p.path.exists()
                 && std::fs::read_to_string(&p.path).ok().as_deref() == Some(text)
             {
@@ -783,38 +860,101 @@ fn block_entries(path: &Path, begin: &str, end: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Repo-root-anchored form of a generated entry.
+///
+/// Git treats a pattern containing no slash as matching at **any** depth, so a
+/// bare `.mcp.json` would also ignore `vendor/thing/.mcp.json`, while
+/// `.cursor/mcp.json` is already anchored to the `.gitignore`'s directory. That
+/// left the block's entries meaning two different things. A leading `/` anchors
+/// every one of them to the repo root.
+fn anchored(rel: &str) -> String {
+    format!("/{}", rel.trim_start_matches('/'))
+}
+
+/// Which of `rels` git already tracks.
+///
+/// `.gitignore` has no effect on a tracked path, so an entry for one is inert:
+/// the travsr server definition stays in the index and goes out with the next
+/// commit. Reporting "generated files are local-only" in that case states the
+/// opposite of what git will do.
+fn tracked(repo: &Path, rels: &[String]) -> Vec<String> {
+    if rels.is_empty() {
+        return Vec::new();
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .args(rels.iter().map(|r| r.trim_start_matches('/')))
+        .output();
+    // `--error-unmatch` makes git exit non-zero when any path is untracked, but
+    // it still lists the tracked ones on stdout, which is what we read.
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    let listed: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| anchored(l.trim()))
+        .collect();
+    rels.iter()
+        .filter(|r| listed.contains(&anchored(r)))
+        .cloned()
+        .collect()
+}
+
 /// Maintain a `.gitignore` block listing the generated repo-relative paths.
 ///
 /// The block accumulates across runs instead of being replaced, because a run
 /// does not see every tool: `--tool cursor` plans only Cursor's files, so
 /// rewriting the block from that run alone would drop `.mcp.json` out of it and
 /// silently make a still-present MCP server definition committable, which is the
-/// RCE-on-clone vector this block exists to close. `remove` subtracts only the
-/// paths this run actually unwired, and deletes the block once nothing is left.
-fn ensure_gitignored(
-    repo: &Path,
-    add: &[String],
-    drop: &[String],
-    remove: bool,
-) -> Result<Outcome> {
+/// RCE-on-clone vector this block exists to close.
+///
+/// `add` and `drop` are applied in one pass so every caller goes through the
+/// same path: a remove run drops what it unwired, and a `--commit` run drops
+/// what it is opting in to committing. The block is deleted once nothing is left.
+fn ensure_gitignored(repo: &Path, add: &[String], drop: &[String]) -> Result<Outcome> {
     let path = repo.join(".gitignore");
-    let mut entries = block_entries(&path, GI_BEGIN, GI_END)?;
-    if remove {
-        entries.retain(|e| !drop.contains(e));
-        if entries.is_empty() {
-            return remove_block(&path, GI_BEGIN, GI_END);
+    // Normalise on read so a block written before anchoring migrates in place
+    // rather than gaining a second entry for the same file.
+    let mut entries: Vec<String> = block_entries(&path, GI_BEGIN, GI_END)?
+        .iter()
+        .map(|e| anchored(e))
+        .collect();
+    let drop: Vec<String> = drop.iter().map(|d| anchored(d)).collect();
+    entries.retain(|e| !drop.contains(e));
+    for a in add.iter().map(|a| anchored(a)) {
+        if !entries.contains(&a) {
+            entries.push(a);
         }
-    } else {
-        if add.is_empty() {
-            return Ok(Outcome::Absent);
+    }
+    if entries.is_empty() {
+        return remove_block(&path, GI_BEGIN, GI_END);
+    }
+    upsert_block(&path, GI_BEGIN, GI_END, &entries.join("\n"))
+}
+
+/// Markdown-block paths claimed by more than one auto-detected tool, mapped to
+/// the ids of every tool that claims them. Used to keep a `--tool X --remove`
+/// from stripping a block another detected tool still relies on.
+fn shared_md_paths(
+    repo: &Path,
+    home: Option<&Path>,
+    cmd: &McpCommand,
+) -> std::collections::HashMap<PathBuf, Vec<&'static str>> {
+    let mut claims: std::collections::HashMap<PathBuf, Vec<&'static str>> = Default::default();
+    for tool in Tool::ALL {
+        if !matches!(tool.detect(repo, home), Detection::Auto) {
+            continue;
         }
-        for a in add {
-            if !entries.contains(a) {
-                entries.push(a.clone());
+        for planned in tool.plan(repo, cmd) {
+            if matches!(planned.content, Content::ManagedMd { .. }) {
+                claims.entry(planned.path).or_default().push(tool.id());
             }
         }
     }
-    upsert_block(&path, GI_BEGIN, GI_END, &entries.join("\n"))
+    claims.retain(|_, ids| ids.len() > 1);
+    claims
 }
 
 fn rel(repo: &Path, path: &Path) -> Option<String> {
@@ -835,11 +975,13 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
     let cmd = McpCommand::resolve();
     let verb = if opts.remove { "removed" } else { "configured" };
 
-    // `--quiet` suppresses the report, never the wiring.
+    // The report sink never affects what is written.
     macro_rules! say {
         ($($arg:tt)*) => {
-            if !opts.quiet {
-                println!($($arg)*);
+            match opts.report {
+                Report::Stdout => println!($($arg)*),
+                Report::Stderr => eprintln!($($arg)*),
+                Report::Silent => {}
             }
         };
     }
@@ -850,6 +992,15 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
     // every other tool's entry standing.
     let mut gitignore: Vec<String> = Vec::new();
     let mut unignore: Vec<String> = Vec::new();
+
+    // Markdown blocks that more than one detected tool relies on. Several
+    // adapters share a target file (GEMINI.md is planned by both Gemini CLI and
+    // Antigravity; Zed resolves to whichever instruction file already exists, so
+    // it lands on CLAUDE.md next to Claude Code) and they all use the same
+    // markers. A `--tool X --remove` that stripped such a block would unwire a
+    // tool it was never asked to touch, and because the file is often nothing but
+    // our block, delete that file outright.
+    let shared = shared_md_paths(repo_root, home.as_deref(), &cmd);
 
     for tool in Tool::ALL {
         if let Some(only) = &opts.only {
@@ -864,11 +1015,39 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                 for planned in tool.plan(repo_root, &cmd) {
                     let disp = rel(repo_root, &planned.path)
                         .unwrap_or_else(|| planned.path.display().to_string());
+
+                    // A filtered remove must leave co-owned blocks alone. With no
+                    // filter every claimant is in this run, so the block is ours
+                    // to take.
+                    if opts.remove && opts.only.is_some() {
+                        if let Some(others) = shared.get(&planned.path) {
+                            let remaining: Vec<&str> = others
+                                .iter()
+                                .filter(|id| Some(**id) != opts.only.as_deref())
+                                .copied()
+                                .collect();
+                            if !remaining.is_empty() {
+                                say!(
+                                    "  skipped {disp}: shared with {} (run without --tool to remove)",
+                                    remaining.join(", ")
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
                     if opts.dry_run {
-                        say!("  would write {disp}");
+                        say!(
+                            "  would {} {disp}",
+                            if opts.remove { "remove" } else { "write" }
+                        );
                         if planned.gitignore {
                             if let Some(r) = rel(repo_root, &planned.path) {
-                                gitignore.push(r);
+                                if opts.remove || opts.commit {
+                                    unignore.push(r);
+                                } else {
+                                    gitignore.push(r);
+                                }
                             }
                         }
                         continue;
@@ -890,6 +1069,12 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                                         if matches!(outcome, Outcome::Removed | Outcome::Absent) {
                                             unignore.push(r);
                                         }
+                                    } else if opts.commit {
+                                        // --commit opts in to committing these
+                                        // files. Leaving an entry a previous
+                                        // default run added would keep them
+                                        // ignored and make the opt-in a no-op.
+                                        unignore.push(r);
                                     } else if matches!(
                                         outcome,
                                         Outcome::Written | Outcome::Unchanged
@@ -926,18 +1111,41 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         return Ok(());
     }
 
-    // `--commit` opts out of *adding* ignore entries; it must not also block
-    // cleaning up entries for files we just unwired, or `--commit --remove`
-    // leaves the block pointing at paths that no longer carry a server.
-    if !opts.dry_run && (!opts.commit || opts.remove) {
-        match ensure_gitignored(repo_root, &gitignore, &unignore, opts.remove) {
-            Ok(Outcome::Written) => say!(
+    // Files git already tracks cannot be un-shared by a .gitignore entry, so say
+    // so rather than printing the local-only claim over a server definition that
+    // is heading into the next commit.
+    let already_tracked = if opts.remove || opts.commit {
+        Vec::new()
+    } else {
+        tracked(repo_root, &gitignore)
+    };
+
+    if opts.dry_run {
+        for r in &gitignore {
+            say!("  would ignore {}", anchored(r));
+        }
+        for r in &unignore {
+            say!("  would un-ignore {}", anchored(r));
+        }
+    } else {
+        match ensure_gitignored(repo_root, &gitignore, &unignore) {
+            Ok(Outcome::Written) if already_tracked.is_empty() => say!(
                 "  {} .gitignore (generated files are local-only)",
                 label(&Outcome::Written)
             ),
+            Ok(Outcome::Written) => say!("  {} .gitignore", label(&Outcome::Written)),
             Ok(Outcome::Removed) => say!("  {} .gitignore", label(&Outcome::Removed)),
             _ => {}
         }
+    }
+
+    for r in &already_tracked {
+        say!(
+            "warning: {r} is tracked by git, so .gitignore cannot keep it local. The \
+             travsr server definition in it will be committed and will auto-load for \
+             anyone who clones. `git rm --cached {r}` to untrack it, or re-run with \
+             --commit to accept sharing it.",
+        );
     }
 
     if !opts.remove && !cmd.on_path() {
@@ -1266,16 +1474,116 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = dir.path();
 
-        ensure_gitignored(repo, &[".mcp.json".into()], &[], false).unwrap();
-        ensure_gitignored(repo, &[".cursor/mcp.json".into()], &[], false).unwrap();
+        ensure_gitignored(repo, &[".mcp.json".into()], &[]).unwrap();
+        ensure_gitignored(repo, &[".cursor/mcp.json".into()], &[]).unwrap();
 
         let entries = block_entries(&repo.join(".gitignore"), GI_BEGIN, GI_END).unwrap();
-        assert_eq!(entries, vec![".mcp.json", ".cursor/mcp.json"]);
+        assert_eq!(entries, vec!["/.mcp.json", "/.cursor/mcp.json"]);
 
         // Re-adding an entry already present must not duplicate it.
-        ensure_gitignored(repo, &[".mcp.json".into()], &[], false).unwrap();
+        ensure_gitignored(repo, &[".mcp.json".into()], &[]).unwrap();
         let entries = block_entries(&repo.join(".gitignore"), GI_BEGIN, GI_END).unwrap();
-        assert_eq!(entries, vec![".mcp.json", ".cursor/mcp.json"]);
+        assert_eq!(entries, vec!["/.mcp.json", "/.cursor/mcp.json"]);
+    }
+
+    /// Several adapters target the same markdown file with the same markers.
+    /// A `--tool X --remove` that stripped a co-owned block would unwire a tool
+    /// it was never asked to touch, and since such a file is often nothing but
+    /// our block, delete the file outright.
+    #[test]
+    fn shared_markdown_blocks_are_claimed_by_every_owner() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        // Gemini CLI and Antigravity both write their rules into GEMINI.md.
+        std::fs::create_dir_all(repo.join(".gemini")).unwrap();
+        std::fs::write(repo.join(".gemini/settings.json"), "{}").unwrap();
+        std::fs::create_dir_all(repo.join(".antigravitycli")).unwrap();
+
+        let shared = shared_md_paths(repo, None, &cmd());
+        let owners = shared
+            .get(&repo.join("GEMINI.md"))
+            .expect("GEMINI.md is claimed by two detected tools");
+        assert!(owners.contains(&"gemini-cli"), "owners: {owners:?}");
+        assert!(owners.contains(&"antigravity"), "owners: {owners:?}");
+
+        // A file only one tool claims is not shared.
+        assert!(!shared.contains_key(&repo.join(".cursor/rules/travsr.mdc")));
+    }
+
+    /// `.gitignore` cannot un-share a path git already tracks, so the entry is
+    /// inert and the "local-only" claim would be false.
+    #[test]
+    fn tracked_paths_are_detected() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        std::fs::write(repo.join(".mcp.json"), "{}").unwrap();
+        std::fs::write(repo.join("untracked.json"), "{}").unwrap();
+        assert!(git(&["add", ".mcp.json"]));
+
+        let found = tracked(
+            repo,
+            &[".mcp.json".to_string(), "untracked.json".to_string()],
+        );
+        assert_eq!(found, vec![".mcp.json"]);
+    }
+
+    /// A user who tuned a generated rule file has content travsr did not write.
+    /// Deleting it on `--remove` is the destructive edit every other path in
+    /// this module refuses to make.
+    #[test]
+    fn remove_keeps_an_edited_owned_file() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join(".windsurf/rules/travsr.md");
+        let planned = Planned {
+            path: p.clone(),
+            content: Content::Owned {
+                text: markdown_rules(),
+            },
+            gitignore: false,
+        };
+        execute(&planned, false).unwrap();
+        assert!(p.exists());
+
+        // Untouched: removal owns it and takes it.
+        assert!(matches!(execute(&planned, true).unwrap(), Outcome::Removed));
+        assert!(!p.exists());
+
+        // Edited: removal must decline and say why.
+        execute(&planned, false).unwrap();
+        std::fs::write(&p, format!("{}\n\nmy own note\n", markdown_rules())).unwrap();
+        assert!(matches!(
+            execute(&planned, true).unwrap(),
+            Outcome::Skipped(_)
+        ));
+        assert!(p.exists(), "an edited rules file must survive --remove");
+    }
+
+    /// Replacing a file must not widen its permissions: the temp file is created
+    /// under the process umask, so a `0600` CLAUDE.md would come back `0644`.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("CLAUDE.md");
+        write_atomic(&p, "v1").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomic(&p, "v2").unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "write_atomic widened the file mode");
     }
 
     /// `--tool cursor --remove` unwires Cursor only. Claude Code's `.mcp.json` is
@@ -1287,22 +1595,16 @@ mod tests {
         let gi = repo.join(".gitignore");
         std::fs::write(&gi, "target/\n").unwrap();
 
-        ensure_gitignored(
-            repo,
-            &[".mcp.json".into(), ".cursor/mcp.json".into()],
-            &[],
-            false,
-        )
-        .unwrap();
-        ensure_gitignored(repo, &[], &[".cursor/mcp.json".into()], true).unwrap();
+        ensure_gitignored(repo, &[".mcp.json".into(), ".cursor/mcp.json".into()], &[]).unwrap();
+        ensure_gitignored(repo, &[], &[".cursor/mcp.json".into()]).unwrap();
 
         let entries = block_entries(&gi, GI_BEGIN, GI_END).unwrap();
-        assert_eq!(entries, vec![".mcp.json"]);
+        assert_eq!(entries, vec!["/.mcp.json"]);
         // The user's own rules are untouched throughout.
         assert!(std::fs::read_to_string(&gi).unwrap().contains("target/"));
 
         // Removing the last entry takes the whole block with it.
-        ensure_gitignored(repo, &[], &[".mcp.json".into()], true).unwrap();
+        ensure_gitignored(repo, &[], &[".mcp.json".into()]).unwrap();
         let text = std::fs::read_to_string(&gi).unwrap();
         assert!(!text.contains(GI_BEGIN), "empty block should be removed");
         assert!(text.contains("target/"));
@@ -1327,16 +1629,38 @@ mod tests {
 
     #[test]
     fn rules_only_tools_explain_the_missing_mcp_step() {
-        // Codex and Windsurf keep MCP servers in a global file we do not write.
-        // Without a note the user gets rules and no server, with no clue why.
-        for tool in [Tool::Codex, Tool::Windsurf] {
-            assert!(
-                tool.note(&cmd()).is_some(),
-                "{} needs a manual-MCP note",
-                tool.id()
-            );
+        // Derived from `plan()`, not hardcoded: a rules-only adapter keeps its
+        // MCP servers in a global file we do not write, so without a note the
+        // user gets rules and no server with no clue why. Listing the tools by
+        // hand meant Antigravity landed as the third such adapter without ever
+        // being covered, so the invariant is stated over Tool::ALL instead.
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        let mut rules_only = Vec::new();
+        for tool in Tool::ALL {
+            let writes_server = tool
+                .plan(repo, &cmd())
+                .iter()
+                .any(|p| matches!(p.content, Content::JsonServer { .. }));
+            if writes_server {
+                assert!(
+                    tool.note(&cmd()).is_none(),
+                    "{} writes a server, so it should not claim to be rules-only",
+                    tool.id()
+                );
+            } else {
+                rules_only.push(tool.id());
+                assert!(
+                    tool.note(&cmd()).is_some(),
+                    "{} writes no server and needs a manual-MCP note",
+                    tool.id()
+                );
+            }
         }
-        assert!(Tool::ClaudeCode.note(&cmd()).is_none());
+        assert!(
+            rules_only.len() >= 3,
+            "expected Antigravity, Codex and Windsurf to be rules-only, got {rules_only:?}"
+        );
     }
 
     #[test]
@@ -1353,9 +1677,17 @@ mod tests {
             Detection::None
         ));
 
-        // AGENTS.md is Codex's documented instruction file, and nothing else in
-        // this list claims it as a project marker.
+        // AGENTS.md is a cross-tool convention, not a Codex marker: Zed reads it
+        // too (it is in ZED_INSTRUCTION_FILES), so on its own it identifies no
+        // one. Treating it as evidence reported `codex (configured)` in any repo
+        // that adopted the convention and told the user to edit
+        // ~/.codex/config.toml for a tool they do not have. Same shared-file
+        // error as GEMINI.md below.
         std::fs::write(repo.join("AGENTS.md"), "").unwrap();
+        assert!(matches!(Tool::Codex.detect(repo, None), Detection::None));
+
+        // `.codex/` identifies exactly one tool, so that is the marker.
+        std::fs::create_dir_all(repo.join(".codex")).unwrap();
         assert!(matches!(Tool::Codex.detect(repo, None), Detection::Auto));
 
         // GEMINI.md is read by BOTH Gemini CLI and Antigravity, so on its own it
@@ -1387,26 +1719,101 @@ mod tests {
 
     #[test]
     fn guide_names_only_tools_the_mcp_server_exposes() {
-        // Guard against the directive drifting past travsr-mcp's tools_list: a
-        // rule telling the agent to call a tool that does not exist is worse
-        // than no rule.
-        let body = guide_body();
-        for tool in [
-            "search_symbol",
-            "get_snippets",
-            "get_callers",
-            "find_references",
-            "get_dependencies",
-            "get_blast_radius",
-            "get_execution_path",
-            "get_repo_map",
-            "get_context",
-            "find_pattern",
-        ] {
-            assert!(body.contains(tool), "guidance is missing {tool}");
+        // A real pin, not a mirror: the names are read out of the generated
+        // guidance and checked against the payload `travsr mcp --stdio` actually
+        // serves. A rename on the server side fails here, which a hardcoded list
+        // could never catch, and a rule telling the agent to call a tool that
+        // does not exist is worse than no rule.
+        let served: Vec<String> = travsr_mcp::stdio_tools_list()["tools"]
+            .as_array()
+            .expect("tools/list payload has a `tools` array")
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+
+        let named = guide_table_tools(&guide_body());
+        assert!(
+            named.len() >= 10,
+            "table parse recovered too few tools, it has probably broken: {named:?}"
+        );
+        for name in &named {
+            assert!(
+                served.contains(name),
+                "guidance routes to `{name}`, which `travsr mcp --stdio` does not serve"
+            );
         }
-        // Retired or never-shipped names must not reappear.
-        assert!(!body.contains("get_graph("));
+    }
+
+    /// `docs/ai-tool-prompt.md` tells an agent that is unsure which mode it is
+    /// talking to how to find out, and names `get_callers` as the discriminator.
+    /// The first attempt at that advice said "`repo` is present in exactly one of
+    /// them", which is false: `get_snippets` declares `repo` in the single-repo
+    /// schema too, scoped to global mode by its description only. An agent
+    /// applying the rule to that tool would conclude it was in global mode and
+    /// start passing `repo` everywhere, which is the bug the guidance exists to
+    /// prevent. Pin the discriminator that actually holds.
+    #[test]
+    fn get_callers_discriminates_the_two_server_modes() {
+        let schema = |list: serde_json::Value, tool: &str| -> Vec<String> {
+            list["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == tool)
+                .unwrap_or_else(|| panic!("{tool} is not served"))["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        };
+
+        let stdio = schema(travsr_mcp::stdio_tools_list(), "get_callers");
+        let global = schema(travsr_mcp::global_tools_list(), "get_callers");
+        assert!(
+            !stdio.contains(&"repo".to_string()),
+            "get_callers gained `repo` in single-repo mode, the documented \
+             discriminator no longer works: {stdio:?}"
+        );
+        assert!(
+            global.contains(&"repo".to_string()),
+            "get_callers lost `repo` in global mode: {global:?}"
+        );
+
+        // And the reason the naive "present in exactly one" rule fails.
+        assert!(
+            schema(travsr_mcp::stdio_tools_list(), "get_snippets").contains(&"repo".to_string()),
+            "get_snippets no longer declares `repo` in single-repo mode, so the \
+             warning against using it as a discriminator can be dropped"
+        );
+    }
+
+    /// Tool names the routing table tells the agent to call: every identifier
+    /// immediately followed by `(` in the table's second column. Reading them
+    /// back out of the generated text is what makes the pin above real.
+    fn guide_table_tools(body: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        for line in body.lines().filter(|l| l.trim_start().starts_with('|')) {
+            let Some(cell) = line.split('|').nth(2) else {
+                continue;
+            };
+            let chars: Vec<char> = cell.chars().collect();
+            for (i, c) in chars.iter().enumerate() {
+                if *c != '(' {
+                    continue;
+                }
+                let start = chars[..i]
+                    .iter()
+                    .rposition(|c| !(c.is_alphanumeric() || *c == '_'))
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                let name: String = chars[start..i].iter().collect();
+                if !name.is_empty() && !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
     }
 
     /// `plan()` wires `travsr mcp --stdio` with no `--global`, which is
