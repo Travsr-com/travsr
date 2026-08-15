@@ -1,6 +1,6 @@
 //! `travsr connect` — wire detected AI coding tools to the Travsr MCP server and
 //! drop an always-on "use Travsr first" rules file for each. Also invoked by
-//! `travsr init` (RFC-018).
+//! `travsr init` (RFC-026).
 //!
 //! Two co-equal outputs per detected tool:
 //!   1. register `travsr mcp --stdio` in the tool's MCP config, and
@@ -8,8 +8,8 @@
 //!      Travsr before grep/find. Wiring alone does not change agent behavior — the
 //!      rules are what make the agent actually use Travsr.
 //!
-//! Safety (RFC-018): generated files are local and git-ignored by default (never
-//! committed — a committed MCP server definition is an RCE-on-clone vector); the
+//! Safety (RFC-026): generated files are local and git-ignored by default (never
+//! committed, since a committed MCP server definition is an RCE-on-clone vector); the
 //! server command is the bare `travsr` when it is on PATH (no absolute-path /
 //! username leak); existing non-strict-JSON configs are skipped, never clobbered;
 //! markdown rules use a single balanced managed block. All failures are non-fatal.

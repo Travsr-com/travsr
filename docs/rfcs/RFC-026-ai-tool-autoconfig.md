@@ -1,7 +1,16 @@
-# RFC-018: AI Tool Auto-Configuration on `travsr init`
+# RFC-026: AI Tool Auto-Configuration on `travsr init`
 
 **Date:** 2026-06-07
-**Status:** Proposed (pending principal-security-engineer sign-off — see Security)
+**Status:** Proposed (pending principal-security-engineer sign-off, see Security)
+
+> Renumbered from RFC-018 and moved out of `docs/adrs/`. This RFC took the 018
+> slot first (2026-06-07), but `docs/rfcs/RFC-018-embedding-plugin-architecture.md`
+> later claimed the same number and shipped, so 018 now points at implemented
+> code from CI config, four sibling RFCs, and five crates. Renumbering the
+> implemented one would break all of that; renumbering this one, still
+> unimplemented at the time, cost three references. `docs/rfcs/` is the
+> canonical home for RFCs, so the file moved there rather than staying beside
+> the ADRs.
 
 ## Context
 
