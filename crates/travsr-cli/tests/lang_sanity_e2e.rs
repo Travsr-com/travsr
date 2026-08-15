@@ -23,6 +23,13 @@ fn travsr() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_travsr"))
 }
 
+/// Guards the corpus trust grant, which mutates the global
+/// `~/.travsr/lang.toml` shared by every test in this binary.
+fn trust_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 fn fixture_dir(lang: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/lang-sanity")
@@ -105,6 +112,18 @@ fn indexed_repo(lang: &str) -> tempfile::TempDir {
     let init_text =
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     if let Some(corpus) = corpus_from_hint(&init_text) {
+        // Serialized because the grant is a read-modify-write of the *global*
+        // `~/.travsr/lang.toml`: two tests granting at once can lose one
+        // another's `trusted_corpora` entry, and the loser then indexes with
+        // no semantic data and reports its language as broken.
+        //
+        // Held here rather than left to `--test-threads=1` on the command
+        // line. A suite that only works with a flag people have to remember
+        // fails intermittently for whoever forgets, and an intermittently red
+        // suite gets ignored, which costs more than the lost parallelism.
+        let _guard = trust_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let granted = Command::new(travsr())
             .args(["lang", "add", lang, "--corpus", &corpus])
             .current_dir(root)

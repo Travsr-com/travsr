@@ -1,5 +1,33 @@
 # Language sanity fixtures
 
+## Running it
+
+```
+cargo test -p travsr-cli --test lang_sanity_e2e
+```
+
+Safe to run in parallel or with `--test-threads=1`; the corpus trust grant is
+serialized internally because it mutates the global `~/.travsr/lang.toml`.
+
+Takes ~100s, most of it scip-clang on the C and C++ fixtures. Each test builds
+a throwaway git repo in a temp dir, indexes it with the binary under test, and
+deletes it afterwards, so runs never touch your real index.
+
+Prerequisites are per language, and a missing one **skips with a reason rather
+than failing**:
+
+```
+travsr lang install c
+travsr lang install cpp
+```
+
+TypeScript and JavaScript need nothing installed. Not wired into CI on purpose:
+C/C++ need a provider on the runner, so a green CI run would otherwise imply
+coverage that was skipped. See `docs/plans/language-sanity-plan.md` §8.
+
+The runner is `crates/travsr-cli/tests/lang_sanity_e2e.rs`; this directory is
+only the data it feeds.
+
 One mini-repo per language, each with a **cross-file call** so Phase B has a
 real edge to resolve rather than a single file that only exercises the grammar.
 
