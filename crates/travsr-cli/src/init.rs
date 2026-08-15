@@ -71,7 +71,7 @@ pub fn run(
         // an already-running daemon never forks a doomed child.
         let exe = std::env::current_exe().context("finding current exe path")?;
         matches!(
-            crate::daemon_client::spawn_background_daemon(&repo_root, &exe),
+            crate::daemon_client::spawn_background_daemon(&repo_root, &exe, false),
             SpawnOutcome::Started | SpawnOutcome::Starting | SpawnOutcome::AlreadyRunning
         )
     } else {

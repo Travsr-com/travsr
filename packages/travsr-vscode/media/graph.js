@@ -16,6 +16,8 @@ const C = {
   vr:    '#fcd053',   // gold-300
   noise: '#4d4d4d',   // ch-500
   pkg:   '#ffb970',   // orange-300  — directory / package tiles
+  err:   '#f4645a',   // red-400     — diagnostics: error
+  warn:  '#fcd053',   // gold-300    — diagnostics: warning
 };
 function nodeColor(kind) {
   return ({ function: C.fn, class: C.cls, file: C.file, interface: C.iface, var: C.vr, pkg: C.pkg, ghost: '#5a5a5a' })[kind] || '#8f7a6c';
@@ -94,6 +96,17 @@ const cy = cytoscape({
     { selector: 'node.softdim', style: { opacity: 0.22 }},
     { selector: 'node:selected', style: {
         'background-opacity': 0.42, 'border-width': 3, 'border-color': '#ffffff',
+    }},
+    // ── Live LSP diagnostics (#688) ──────────────────────────────────────────
+    // Drawn as an outline rather than a border override so the kind-coloured
+    // border survives: a broken function must still read as a function. Static
+    // by design — this is information, not decoration, so it does not pulse and
+    // is not gated on the fx toggle.
+    { selector: 'node.diag-warn', style: {
+        'outline-width': 2.5, 'outline-color': C.warn, 'outline-opacity': 0.85, 'outline-offset': 2,
+    }},
+    { selector: 'node.diag-error', style: {
+        'outline-width': 3, 'outline-color': C.err, 'outline-opacity': 0.95, 'outline-offset': 2,
     }},
     { selector: 'node.hub', style: { 'border-width': 3.5, 'border-style': 'double' }},
     { selector: 'node.wave-1', style: { 'background-opacity': 0.44 }},
@@ -341,32 +354,96 @@ function renderDisambigBar() {
   }
   bar.style.display = 'flex';
 
+  // When every implementation lives in the same file, the path is repeated on
+  // every chip and distinguishes nothing — it is pure width. Drop it and let
+  // the file be stated once, in the label.
+  const paths = new Set(roots.map(r => r.path || ''));
+  const sharedPath = paths.size === 1 ? [...paths][0] : null;
+
   function chipLabel(r) {
     const base = shortLabel(r.label, r.id);
+    if (sharedPath !== null) return base;
     const parts = (r.path || '').split('/');
     const sub   = parts.length >= 2 ? parts.slice(-2).join('/') : (parts[0] || '');
     return sub ? base + ' · ' + sub : base;
   }
 
   const allActive = _disambigRoot === null;
+  // No `title`: the native tooltip is slow, truncates long paths, and would
+  // fight the popup. The full text travels in data attributes instead, and
+  // aria-label keeps the accessible name.
   const chipsHtml = [
-    `<span class="db-chip db-all${allActive ? ' active' : ''}" data-root="" title="Show all implementations">all</span>`,
+    `<span class="db-chip db-all${allActive ? ' active' : ''}" data-root="" aria-label="Show all implementations">all</span>`,
     ...roots.map(r => {
       const lbl = escHtml(chipLabel(r));
       const active = _disambigRoot === r.id ? ' active' : '';
-      return `<span class="db-chip${active}" data-root="${escHtml(r.id)}" title="${escHtml(r.id)}">${lbl}</span>`;
+      const sym = shortLabel(r.label, r.id);
+      return `<span class="db-chip${active}" data-root="${escHtml(r.id)}"` +
+        ` data-sym="${escHtml(sym)}" data-path="${escHtml(r.path || '')}"` +
+        ` aria-label="${escHtml(sym)}">${lbl}</span>`;
     }),
   ].join('');
 
-  bar.innerHTML = `<span class="db-label">implementations</span><div class="db-chips">${chipsHtml}</div>`;
+  // The label carries the shared file so the chips do not have to, and the
+  // count so the row reads as complete even when it is scrolled.
+  const shortShared = sharedPath ? sharedPath.split('/').slice(-2).join('/') : '';
+  const label = shortShared
+    ? `${roots.length} in ${escHtml(shortShared)}`
+    : `${roots.length} implementations`;
+
+  // One scrolling row, always. The overflow is the scrollbar's to carry.
+  bar.innerHTML =
+    `<span class="db-label">${label}</span>` +
+    `<div class="db-chips">${chipsHtml}</div>`;
 
   bar.querySelectorAll('.db-chip').forEach(chip => {
     chip.addEventListener('click', () => {
       _disambigRoot = chip.dataset.root || null;
+      hideChipTip();
       renderDisambigBar();
       renderGraph(_disambigRoot || undefined);
     });
+    chip.addEventListener('mouseenter', () => showChipTip(chip));
+    chip.addEventListener('mouseleave', hideChipTip);
   });
+  // Scrolling moves the chip out from under a popup anchored to where it was.
+  const chipsBox = bar.querySelector('.db-chips');
+  if (chipsBox) chipsBox.addEventListener('scroll', hideChipTip);
+}
+
+// ── Implementation chip popup ─────────────────────────────────────────────────
+// Chips truncate, and the whole point of the bar is telling near-identical
+// symbols apart, which is impossible from `G..`. The popup carries the full
+// symbol and its path.
+function showChipTip(chip) {
+  const tip = document.getElementById('db-tip');
+  if (!tip || !chip.dataset.sym) return;
+
+  tip.innerHTML =
+    `<div class="tip-sym">${escHtml(chip.dataset.sym)}</div>` +
+    (chip.dataset.path ? `<div class="tip-path">${escHtml(chip.dataset.path)}</div>` : '');
+  tip.style.display = 'block';
+  tip.setAttribute('aria-hidden', 'false');
+
+  // Measure after it is displayed, then clamp into the viewport so a chip at
+  // the far right of a scrolled row does not push the popup off screen.
+  const c = chip.getBoundingClientRect();
+  const t = tip.getBoundingClientRect();
+  const left = Math.max(8, Math.min(c.left, window.innerWidth - t.width - 8));
+  // Below the chip normally; above it when there is no room underneath.
+  const below = c.bottom + 6;
+  const top = below + t.height > window.innerHeight - 8
+    ? Math.max(8, c.top - t.height - 6)
+    : below;
+  tip.style.left = left + 'px';
+  tip.style.top = top + 'px';
+}
+
+function hideChipTip() {
+  const tip = document.getElementById('db-tip');
+  if (!tip) return;
+  tip.style.display = 'none';
+  tip.setAttribute('aria-hidden', 'true');
 }
 
 // ── Build Cytoscape elements from filtered data ────────────────────────────────
@@ -628,6 +705,11 @@ function renderGraph(bloomOriginId) {
     noiseBadge.style.display = 'none';
   }
 
+  // #688: renderGraph rebuilds the element set, so any diagnostic classes from
+  // the previous pass are gone. Repaint from the last overlay the host sent —
+  // client-side re-filters (depth, noise, vars) re-render without a round trip.
+  paintDiagnostics();
+
   updateHint();
   updateStatusBar();
 }
@@ -645,6 +727,153 @@ function updateHint() {
     hintEl.innerHTML = '<b>Rings layout:</b> concentric by hop distance, callers in left hemisphere. ' +
       '<b>Click</b> a node for details · <b>⊗ blast</b> shows impact rings.';
   }
+}
+
+// ── Live LSP diagnostics overlay (#688) ───────────────────────────────────────
+// The host reads vscode.languages.getDiagnostics and posts the reduction; this
+// side only paints. `_diagByNode` is the last overlay received, kept so a
+// client-side re-render can repaint without asking the host again.
+let _diagByNode = {};
+let _diagUnknown = [];
+// Per-file diagnostic lists, for the detail panel's Problems section. Keyed by
+// graph path because attribution is file-scoped, so every node from one file
+// shares one list.
+let _diagItemsByFile = {};
+let _diagTruncated = {};
+
+function applyDiagnosticsOverlay(byNode, unknownCoverage, itemsByFile, itemsTruncated) {
+  _diagByNode = byNode || {};
+  _diagUnknown = unknownCoverage || [];
+  _diagItemsByFile = itemsByFile || {};
+  _diagTruncated = itemsTruncated || {};
+  paintDiagnostics();
+  updateDiagBadge();
+  refreshOpenDetailProblems();
+  refreshOpenPeekDiagnostics();
+}
+
+// ── Problems section of the detail panel ──────────────────────────────────────
+// The ring says a node's file is broken; this says how, and clicking a row
+// opens that file at that diagnostic's own line rather than the node's.
+
+/** Build the Problems section for `path`, or '' when there is nothing to say. */
+function diagProblemsHtml(path) {
+  if (!path) return '';
+  const items = _diagItemsByFile[path] || [];
+  // A file no provider has published for is unknown, not clean. Saying nothing
+  // here would let the absence read as a pass.
+  if (items.length === 0) {
+    if (_diagUnknown.indexOf(path) === -1) return '';
+    return '<div class="d-section"><div class="d-title">Problems</div>' +
+      '<div class="diag-none-note">No diagnostic provider has reported on this file, ' +
+      'so it is not diagnosed rather than clean.</div></div>';
+  }
+
+  const dropped = _diagTruncated[path] || 0;
+  const errors = items.filter(i => i.severity === 'error').length;
+  const warnings = items.length - errors;
+  const counts = [];
+  if (errors > 0) counts.push(errors + (errors === 1 ? ' error' : ' errors'));
+  if (warnings > 0) counts.push(warnings + (warnings === 1 ? ' warning' : ' warnings'));
+
+  const rows = items.map(i =>
+    '<button class="diag-item ' + (i.severity === 'error' ? 'is-err' : 'is-warn') + '"' +
+      ' data-diag-line="' + i.line + '"' +
+      ' title="' + escHtml(i.message) + '\nGo to line ' + i.line + '">' +
+      '<span class="diag-item-icon">' + (i.severity === 'error' ? '⊗' : '⚠') + '</span>' +
+      '<span class="diag-item-line">' + i.line + '</span>' +
+      '<span class="diag-item-msg">' + escHtml(i.message) + '</span>' +
+      (i.source ? '<span class="diag-item-src">' + escHtml(i.source) + '</span>' : '') +
+    '</button>'
+  ).join('');
+
+  return '<div class="d-section"><div class="d-title">Problems (' + counts.join(', ') + ')</div>' +
+    '<div class="diag-list">' + rows + '</div>' +
+    (dropped > 0
+      ? '<div class="diag-none-note">and ' + dropped + ' more, not listed</div>'
+      : '') +
+    '<div class="diag-none-note">Counts are per file, not per symbol.</div>' +
+  '</div>';
+}
+
+/** Wire the Problems rows of an already-rendered detail panel. */
+function wireDiagProblems(detailEl, path) {
+  detailEl.querySelectorAll('[data-diag-line]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      vscode.postMessage({
+        command: 'goToDefinition',
+        path: path,
+        line: Number(btn.getAttribute('data-diag-line')) || 1,
+      });
+    });
+  });
+}
+
+/**
+ * Repaint the Problems section of the open detail panel when a new overlay
+ * lands, so the list tracks the editor while the panel stays open. Only this
+ * section is replaced: rebuilding the whole panel would drop scroll position
+ * and the peek state on every keystroke.
+ */
+function refreshOpenDetailProblems() {
+  const detailEl = document.getElementById('detail');
+  if (!detailEl || !detailEl.classList.contains('open')) return;
+  const host = detailEl.querySelector('[data-diag-host]');
+  if (!host) return;
+  const path = host.getAttribute('data-diag-host');
+  // The list has its own scrollbar, and overlays land on every keystroke, so
+  // rebuilding it would scroll the reader back to the top as they type.
+  const prev = host.querySelector('.diag-list');
+  const scroll = prev ? prev.scrollTop : 0;
+  host.innerHTML = diagProblemsHtml(path);
+  const next = host.querySelector('.diag-list');
+  if (next) next.scrollTop = scroll;
+  wireDiagProblems(host, path);
+}
+
+function paintDiagnostics() {
+  cy.batch(() => {
+    cy.nodes('.diag-error, .diag-warn').removeClass('diag-error diag-warn');
+    for (const id in _diagByNode) {
+      const el = cy.getElementById(id);
+      if (!el || el.empty()) continue;
+      el.addClass(_diagByNode[id].severity === 'error' ? 'diag-error' : 'diag-warn');
+    }
+  });
+}
+
+function updateDiagBadge() {
+  const badge = document.getElementById('diagBadge');
+  if (!badge) return;
+
+  let errors = 0, warnings = 0;
+  for (const id in _diagByNode) {
+    const d = _diagByNode[id];
+    if (d.severity === 'error') errors += d.count; else warnings += d.count;
+  }
+
+  const parts = [];
+  if (errors > 0) parts.push('⊗ ' + errors + (errors === 1 ? ' error' : ' errors'));
+  if (warnings > 0) parts.push('⚠ ' + warnings + (warnings === 1 ? ' warning' : ' warnings'));
+  // Absence of diagnostics is not a clean bill of health: a file whose language
+  // has no extension installed reports nothing at all. Say which it is.
+  if (_diagUnknown.length > 0) {
+    parts.push(_diagUnknown.length + ' not diagnosed');
+  }
+
+  if (parts.length === 0) {
+    badge.style.display = 'none';
+    badge.removeAttribute('title');
+    return;
+  }
+  badge.textContent = parts.join(' · ');
+  badge.className = errors > 0 ? 'diag-err' : warnings > 0 ? 'diag-warn' : 'diag-none';
+  badge.style.display = 'inline';
+  badge.title = _diagUnknown.length > 0
+    ? 'Counts are per file, not per symbol.\nNo diagnostic provider has reported on:\n' +
+      _diagUnknown.slice(0, 10).join('\n') +
+      (_diagUnknown.length > 10 ? '\n…and ' + (_diagUnknown.length - 10) + ' more' : '')
+    : 'Counts are per file, not per symbol.';
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -722,6 +951,10 @@ window.addEventListener('message', event => {
 
   if (msg.command === 'renderPeek') {
     renderPeekPanel(msg.path, msg.line, msg.lines || []);
+  }
+
+  if (msg.command === 'diagnosticsOverlay') {
+    applyDiagnosticsOverlay(msg.byNode, msg.unknownCoverage, msg.itemsByFile, msg.itemsTruncated);
   }
 });
 
@@ -996,6 +1229,9 @@ function showDetail(n) {
       '<div class="d-row"><span class="d-key">token cost</span><span class="d-val gold">' + tok + '</span></div>' +
     '</div>' +
     (edgeItems ? '<div class="d-section"><div class="d-title">Edges (' + n.connectedEdges().length + ')</div><ul>' + edgeItems + '</ul></div>' : '') +
+    // Problems sits above Actions and inside its own host element, so a new
+    // overlay can replace just this part without rebuilding the panel.
+    '<div data-diag-host="' + escHtml(d.path || '') + '">' + diagProblemsHtml(d.path) + '</div>' +
     '<div class="d-section"><div class="d-title">Actions</div>' +
       (d.path && d.line ? '<button class="btn-action" data-act="peek">↗ Definition peek</button>' : '') +
       (d.path ? '<button class="btn-action" data-act="goto">↗ Go to definition</button>' : '') +
@@ -1005,6 +1241,7 @@ function showDetail(n) {
     '</div>';
 
   // Wire actions — CSP blocks onclick= in innerHTML; must use addEventListener.
+  wireDiagProblems(detailEl, d.path);
   const _peek = detailEl.querySelector('[data-act="peek"]');
   if (_peek) _peek.addEventListener('click', () => peekNode(d.path, d.line || 0));
   const _goto = detailEl.querySelector('[data-act="goto"]');
@@ -1278,15 +1515,129 @@ function peekNode(path, line) {
   };
 }
 
+// Last peek, kept so a new diagnostics overlay can re-mark the open panel
+// without asking the host to read the file again.
+let _lastPeek = null;
+
+/**
+ * Worst severity and messages per line, for the file being peeked.
+ * Errors outrank warnings on a line that has both.
+ */
+function diagByLineFor(path) {
+  const out = {};
+  (_diagItemsByFile[path] || []).forEach(i => {
+    const cur = out[i.line];
+    if (!cur) {
+      out[i.line] = { severity: i.severity, messages: [i.message] };
+      return;
+    }
+    cur.messages.push(i.message);
+    if (i.severity === 'error') cur.severity = 'error';
+  });
+  return out;
+}
+
+/**
+ * How many of a file's problems fall outside the peeked window.
+ *
+ * Counted against the *uncapped* total: `_diagItemsByFile` is clamped to
+ * MAX_DIAGNOSTIC_ITEMS_PER_FILE by the host, with the remainder in
+ * `_diagTruncated`, and leaving that remainder out here would under-report
+ * exactly on the files that have the most wrong with them.
+ */
+function peekOutsideCount(path, byLine, shownLines) {
+  const total = (_diagItemsByFile[path] || []).length + (_diagTruncated[path] || 0);
+  let inside = 0;
+  shownLines.forEach(no => {
+    if (byLine[no]) inside += byLine[no].messages.length;
+  });
+  return Math.max(0, total - inside);
+}
+
+/**
+ * Apply diagnostics to the rows already in the peek body.
+ *
+ * Marks in place rather than re-rendering: overlays land on every keystroke
+ * (debounced), and rebuilding `peekBody.innerHTML` would throw away the
+ * reader's scroll position each time. Every row carries a `.pk-mark` slot and
+ * a `data-line` from the start, so marking one never reflows the code either.
+ */
+function markPeekDiagnostics(path, defLine) {
+  const body = document.getElementById('peekBody');
+  if (!body) return;
+  const byLine = diagByLineFor(path);
+  const shown = [];
+
+  body.querySelectorAll('.pk-ln').forEach(row => {
+    const no = Number(row.getAttribute('data-line'));
+    shown.push(no);
+    const dg = byLine[no];
+    row.classList.remove('pk-err', 'pk-warn');
+    const mark = row.querySelector('.pk-mark');
+    if (!dg) {
+      if (mark) { mark.textContent = ''; mark.removeAttribute('title'); }
+      return;
+    }
+    row.classList.add(dg.severity === 'error' ? 'pk-err' : 'pk-warn');
+    if (mark) {
+      mark.textContent = dg.severity === 'error' ? '⊗' : '⚠';
+      mark.title = dg.messages.join('\n');
+    }
+  });
+
+  // A problem outside the peeked window would otherwise be invisible here, and
+  // the panel would read as though the rest of the file were fine.
+  const outside = peekOutsideCount(path, byLine, shown);
+  const note = document.getElementById('peekOutside');
+  if (note) {
+    note.textContent = outside > 0
+      ? outside + (outside === 1 ? ' more problem' : ' more problems') +
+        ' in this file, outside the lines shown'
+      : '';
+  }
+}
+
 function renderPeekPanel(path, defLine, lines) {
+  _lastPeek = { path: path, defLine: defLine };
   document.getElementById('peekPath').textContent = path + ':' + defLine;
-  const pre = lines.map(({ no, text }) => {
-    const hl = no === defLine;
-    const escaped = escHtml(text);
-    return '<div class="pk-ln' + (hl ? ' hl' : '') + '"><span class="no">' + no + '</span><span class="code">' + escaped + '</span></div>';
-  }).join('');
-  document.getElementById('peekBody').innerHTML = '<pre>' + pre + '</pre>';
+
+  const pre = lines.map(({ no, text }) =>
+    '<div class="pk-ln' + (no === defLine ? ' hl' : '') + '" data-line="' + no + '">' +
+      '<span class="pk-mark"></span>' +
+      '<span class="no">' + no + '</span>' +
+      '<span class="code">' + escHtml(text) + '</span>' +
+    '</div>'
+  ).join('');
+
+  const body = document.getElementById('peekBody');
+  body.innerHTML = '<pre>' + pre + '</pre><div class="pk-outside" id="peekOutside"></div>';
   document.getElementById('peek').classList.add('open');
+
+  // #688: the same diagnostics the rings and the Problems list use, on the
+  // source itself. A ring says the file is broken; this says which line.
+  markPeekDiagnostics(path, defLine);
+
+  // Delegated, and bound once per render rather than per row: marking happens
+  // again on every overlay, so a per-row listener would have to be rebound
+  // each time and would not survive a row that becomes marked later.
+  body.onclick = e => {
+    const row = e.target.closest ? e.target.closest('.pk-ln') : null;
+    if (!row) return;
+    if (!row.classList.contains('pk-err') && !row.classList.contains('pk-warn')) return;
+    vscode.postMessage({
+      command: 'goToDefinition',
+      path: path,
+      line: Number(row.getAttribute('data-line')) || defLine,
+    });
+  };
+}
+
+/** Re-mark an open peek when a new overlay lands, so it tracks the editor. */
+function refreshOpenPeekDiagnostics() {
+  if (!_lastPeek) return;
+  const peek = document.getElementById('peek');
+  if (!peek || !peek.classList.contains('open')) return;
+  markPeekDiagnostics(_lastPeek.path, _lastPeek.defLine);
 }
 
 function closePeek() {
@@ -1697,10 +2048,22 @@ requestAnimationFrame(fxLoop);
     else if (e.key === 'Escape') closeSearch();
   });
 
-  // Cmd+F / Ctrl+F to open search
+  // Cmd+F / Ctrl+F toggles, because that is what the same key does in every
+  // other find UI. Opening only meant a stray Cmd+F left an overlay the user
+  // had to know Escape to dismiss.
   document.addEventListener('keydown', e => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'f') { e.preventDefault(); openSearch(); }
+    if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
+      e.preventDefault();
+      overlay.style.display === 'none' ? openSearch() : closeSearch();
+    }
   });
+
+  // Start closed, explicitly. The markup ships `display:none`, but the panel
+  // is created with retainContextWhenHidden, so this DOM can outlive the view
+  // that opened the overlay and come back with it still up. Asserting the
+  // closed state here means the overlay is only ever open because someone
+  // asked for it in this session.
+  closeSearch();
 
   // Click outside to close
   document.addEventListener('mousedown', e => {

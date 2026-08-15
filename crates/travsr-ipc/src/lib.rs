@@ -21,6 +21,6 @@ pub mod unix;
 #[cfg(windows)]
 pub mod windows;
 
-pub use addr::ControlAddr;
+pub use addr::{normalize_repo_root, ControlAddr};
 pub use message::{ControlMessage, ControlResponse, QUERY_PROTOCOL_VERSION};
 pub use transport::ControlTransport;

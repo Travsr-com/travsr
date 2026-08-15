@@ -62,9 +62,18 @@ pub(crate) fn daemon_lock_held(repo_root: &Path) -> bool {
 /// then confirm the outcome. Race-free front door used by `daemon start`,
 /// `daemon restart`, and `travsr init` so no entry point ever spawns a doomed
 /// child against a running daemon.
-pub(crate) fn spawn_background_daemon(repo_root: &Path, exe: &Path) -> SpawnOutcome {
+pub(crate) fn spawn_background_daemon(repo_root: &Path, exe: &Path, verbose: bool) -> SpawnOutcome {
     if daemon_lock_held(repo_root) {
         return SpawnOutcome::AlreadyRunning;
+    }
+    // #688: `--verbose` reaches the child as RUST_LOG, and an explicit RUST_LOG
+    // from the caller wins because it is more specific than a boolean can be.
+    // Set on this process rather than on the command: the spawn below is split
+    // per platform and the Windows path goes through a helper that takes no
+    // environment, while a child inherits ours on both. This process exits as
+    // soon as the daemon is up, so nothing else observes the change.
+    if verbose && std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", "debug");
     }
     // #592: clear any breadcrumb from a previous failed start so we only observe
     // THIS start's outcome.
