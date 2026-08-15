@@ -1543,6 +1543,53 @@ mod tests {
         }
     }
 
+    /// Protocol consistency: what `initialize` advertises and what the
+    /// dispatcher actually answers must agree, in both directions.
+    ///
+    /// #717 (ISS-005, ISS-006) reported `resources/list` and `prompts/list` as
+    /// missing handlers. They are absent on purpose: travsr serves its graph
+    /// through tools and exposes no MCP resources at all, and prompts sit
+    /// behind the default-off `mcp-sampling` feature pending a security
+    /// review. A client that reads `initialize` never calls either here.
+    ///
+    /// Asserted against the dispatcher rather than the source, because what a
+    /// client experiences is the response, and an endpoint that answers while
+    /// its capability is unadvertised is a feature leaking past its flag.
+    #[test]
+    fn unadvertised_capabilities_have_no_live_endpoint() {
+        let caps = server_capabilities();
+        let call = |method: &str| -> serde_json::Value {
+            let req = RpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(serde_json::json!(1)),
+                method: method.into(),
+                params: None,
+            };
+            let resp = handle_request_global(req).expect("a request must get a response");
+            serde_json::from_str(&resp).unwrap()
+        };
+
+        // Resources: never advertised, never answered.
+        assert!(
+            caps.get("resources").is_none(),
+            "no resources capability is advertised"
+        );
+        assert_eq!(
+            call("resources/list")["error"]["code"],
+            serde_json::json!(METHOD_NOT_FOUND),
+            "an unadvertised capability must not have an endpoint behind it"
+        );
+
+        // Prompts: advertised and answered together, or neither.
+        let prompts_advertised = caps["prompts"].is_object();
+        let prompts_answered = call("prompts/list").get("result").is_some();
+        assert_eq!(
+            prompts_advertised, prompts_answered,
+            "prompts capability and endpoint must agree (advertised={prompts_advertised}, \
+             answered={prompts_answered})"
+        );
+    }
+
     #[test]
     fn initialize_advertises_capabilities() {
         let caps = server_capabilities();

@@ -232,6 +232,42 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #717: `head_at` runs on every `travsr status`, and it used an unbounded
+    /// `Command::output()`. These pin the two answers it must give without
+    /// hanging for either: a real repo reports a short SHA, a directory that is
+    /// not a repo reports nothing.
+    #[test]
+    fn head_at_reports_a_sha_inside_a_repo_and_none_outside() {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sha = head_at(here).expect("this crate lives in a git repo");
+        assert!(!sha.is_empty(), "a short SHA, not an empty string");
+        assert!(!sha.contains('\n'), "arrives trimmed: {sha:?}");
+        assert!(
+            sha.chars().all(|c| c.is_ascii_hexdigit()),
+            "a short SHA is hex: {sha:?}"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            head_at(tmp.path()).is_none(),
+            "outside a repo there is no HEAD, and asking must not hang"
+        );
+    }
+
+    /// The bound is what stops a wedged git holding the CLI forever, so the
+    /// happy path must not be anywhere near it.
+    #[test]
+    fn head_at_is_far_inside_its_deadline() {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let started = std::time::Instant::now();
+        let _ = head_at(here);
+        assert!(
+            started.elapsed() * 4 < crate::git_bounded::GIT_QUERY_TIMEOUT,
+            "a warm rev-parse should finish in a small fraction of the deadline, took {:?}",
+            started.elapsed()
+        );
+    }
     use super::*;
 
     fn payload(last: &str, phase_b: &str, dirty: bool) -> StatusPayload {
