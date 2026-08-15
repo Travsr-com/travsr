@@ -44,20 +44,38 @@ pub fn current_target() -> Result<&'static str> {
 // asked for an asset that had never been published and every language ended in
 // a raw 404 — a setup flow offered to users that could not succeed.
 //
-// These three items are the contract with `.github/workflows/release.yml` in
-// Travsr-com/travsr-lang. Anything not derivable from them must not be
-// requested: `wrapper_asset_name` returns `None`, and the caller states the
-// limitation instead of downloading. The `wrapper_release_drift` test below
-// checks these names against the live release inventory (in the
-// lang-release-drift workflow) so the two cannot drift apart silently again.
+// Two separate questions, deliberately kept apart:
+//
+//   1. What is the asset for this target *called*?     `wrapper_asset_name`
+//   2. Does a published release actually *contain* it? `wrapper_available`
+//
+// Conflating them is what produced the bug: `current_target()` returning a
+// triple was read as proof a build existed for it, so a naming rule silently
+// doubled as a capability claim. Kept apart, the `.exe` rule can be correct and
+// fully tested for a platform no release ships yet, while the installer still
+// refuses to ask for it.
+//
+// (2) is the contract with `.github/workflows/release.yml` in
+// Travsr-com/travsr-lang, and the `wrapper_release_drift` test below checks it
+// against the live release inventory (in the lang-release-drift workflow) so
+// the two cannot drift apart silently again.
 
-/// Target triples the travsr-lang release workflow builds wrappers for.
+/// Target triples a *published* travsr-lang release contains wrappers for.
+///
+/// Not the same as the targets the release workflow can build: a target belongs
+/// here only once a tag has actually shipped it. Travsr-com/travsr-lang#15 adds
+/// the `x86_64-pc-windows-msvc` leg, so Windows joins this list in the commit
+/// after the first tag containing those assets, and `wrapper_release_drift` is
+/// what proves the claim rather than a reviewer taking it on faith.
+///
+/// Until then Windows takes the honest path from #588: `lang list`, `lang
+/// detect` and `init` report "not available on x86_64-pc-windows-msvc yet"
+/// rather than offering an install that 404s.
 pub const WRAPPER_RELEASE_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
-    "x86_64-pc-windows-msvc",
 ];
 
 /// Wrappers built by a macOS-only release job. `travsr-lang-objectivec` links
@@ -78,28 +96,25 @@ pub fn exe_suffix_for_target(target: &str) -> &'static str {
     }
 }
 
-/// Release asset filename of the travsr-lang wrapper `binary_name` for `target`,
-/// or `None` when the release matrix publishes no such asset.
+/// What the travsr-lang release asset for `binary_name` on `target` is *named*.
 ///
-/// `None` is a capability statement, not an error: the caller is expected to say
-/// "not available on this platform yet" rather than request a URL that 404s.
-pub fn wrapper_asset_name(binary_name: &str, target: &str) -> Option<String> {
-    if !WRAPPER_RELEASE_TARGETS.contains(&target) {
-        return None;
-    }
-    if MACOS_ONLY_WRAPPERS.contains(&binary_name) && !target.ends_with("-apple-darwin") {
-        return None;
-    }
-    Some(format!(
-        "{binary_name}-{target}{}",
-        exe_suffix_for_target(target)
-    ))
+/// Pure naming, with no opinion on whether such an asset exists — that is
+/// [`wrapper_available`]. Total rather than `Option` so the `.exe` rule stays
+/// verifiable for a target that is built but not yet published; folding the two
+/// together would mean the only test able to cover Windows naming was one that
+/// first had to claim Windows was shipped.
+pub fn wrapper_asset_name(binary_name: &str, target: &str) -> String {
+    format!("{binary_name}-{target}{}", exe_suffix_for_target(target))
 }
 
-/// True when the travsr-lang release ships `binary_name` for `target`.
-/// Used by `lang list` / `lang install` to gate the interactive setup offer.
+/// True when a *published* travsr-lang release contains `binary_name` for
+/// `target`. Gates the setup offer in `lang list` / `lang install` and the
+/// download itself; `false` means state the limitation, not fail.
 pub fn wrapper_available(binary_name: &str, target: &str) -> bool {
-    wrapper_asset_name(binary_name, target).is_some()
+    if !WRAPPER_RELEASE_TARGETS.contains(&target) {
+        return false;
+    }
+    !(MACOS_ONLY_WRAPPERS.contains(&binary_name) && !target.ends_with("-apple-darwin"))
 }
 
 /// On-disk name of an installed wrapper under `~/.travsr/bin/`.
@@ -520,22 +535,24 @@ async fn fetch_verified(
 /// `base` is a parameter rather than a read of `TRAVSR_LANG_RELEASES_BASE` so
 /// the URL shape stays testable; the caller supplies the env-derived value.
 ///
-/// Errors from a target the release matrix does claim, but where the tag itself
-/// has no such asset (a partial or older release), are rewritten to name the
-/// version and platform. `fetch_verified` is shared with the SCIP download
-/// paths, so its own message stays generic; the context is re-attached here,
-/// where `version` and `target` are in scope, and by downcasting the typed
-/// [`AssetNotFound`] cause rather than by matching on its wording.
+/// A 404 here means the tag genuinely lacks an asset the release is expected to
+/// carry (a partial or older release), so the message names the version and
+/// platform. `fetch_verified` is shared with the SCIP download paths, so its own
+/// message stays generic; the context is re-attached here, where `version` and
+/// `target` are in scope, by downcasting the typed [`AssetNotFound`] cause
+/// rather than matching on its wording.
+///
+/// No availability gate in this function: it fetches whatever asset it is asked
+/// for. [`download_and_install_wrapper`] is the entry point that decides whether
+/// asking is reasonable. Keeping the split here is what lets the tests drive a
+/// Windows URL through the real HTTP path while the release is still catching up.
 async fn fetch_and_verify_binary(
     base: &str,
     version: &str,
     binary_name: &str,
     target: &str,
 ) -> Result<Vec<u8>> {
-    let asset = wrapper_asset_name(binary_name, target).ok_or_else(|| WrapperUnavailable {
-        binary_name: binary_name.to_string(),
-        target: target.to_string(),
-    })?;
+    let asset = wrapper_asset_name(binary_name, target);
     let bin_url = format!("{base}/download/{version}/{asset}");
 
     let client = reqwest::Client::builder()
@@ -578,8 +595,10 @@ pub async fn download_and_install_wrapper(
     binary_name: &str,
     target: &str,
 ) -> Result<PathBuf> {
-    // #588: refuse before any network work when the release matrix has nothing
-    // for this host, so the user reads a capability statement instead of a 404.
+    // #588: refuse before any network work when no published release carries
+    // this wrapper for this host, so the user reads a capability statement
+    // instead of a 404. This is the only place the gate is applied on the
+    // download path; everything below assumes the asset should exist.
     if !wrapper_available(binary_name, target) {
         return Err(WrapperUnavailable {
             binary_name: binary_name.to_string(),
@@ -1069,23 +1088,43 @@ mod tests {
     #[test]
     fn the_windows_wrapper_asset_carries_exe() {
         // The exact name travsr-lang's release workflow packages. If these two
-        // ever disagree, `lang install` 404s on Windows again — which is the
-        // whole of #588.
+        // ever disagree, `lang install` 404s on Windows again, which is the
+        // whole of #588. Asserted on the naming rule itself, so it holds while
+        // Windows is built but not yet published.
         assert_eq!(
-            wrapper_asset_name("travsr-lang-java", "x86_64-pc-windows-msvc").unwrap(),
+            wrapper_asset_name("travsr-lang-java", "x86_64-pc-windows-msvc"),
             "travsr-lang-java-x86_64-pc-windows-msvc.exe"
         );
         assert_eq!(
-            wrapper_asset_name("travsr-lang-java", "aarch64-apple-darwin").unwrap(),
+            wrapper_asset_name("travsr-lang-java", "aarch64-apple-darwin"),
             "travsr-lang-java-aarch64-apple-darwin"
         );
     }
 
     #[test]
-    fn a_target_the_release_does_not_build_has_no_asset_name() {
+    fn windows_is_named_correctly_but_not_yet_claimed_as_published() {
+        // The two halves of #588, and the reason they are separate functions.
+        // travsr-lang#15 adds the Windows build; until a tag ships it, naming
+        // is right and availability is false, so users get the honest
+        // "not available yet" instead of a 404.
+        //
+        // When that tag lands, add the triple to WRAPPER_RELEASE_TARGETS and
+        // delete this test. `wrapper_release_drift` then proves the claim.
+        let target = "x86_64-pc-windows-msvc";
+        assert_eq!(
+            wrapper_asset_name("travsr-lang-go", target),
+            "travsr-lang-go-x86_64-pc-windows-msvc.exe"
+        );
+        assert!(
+            !wrapper_available("travsr-lang-go", target),
+            "no published release carries Windows wrappers yet"
+        );
+    }
+
+    #[test]
+    fn a_target_no_release_job_produces_is_never_available() {
         // A triple `current_target()` could plausibly grow, but which no
         // release job produces. Asking for it must be refusable, not a URL.
-        assert!(wrapper_asset_name("travsr-lang-go", "aarch64-pc-windows-msvc").is_none());
         assert!(!wrapper_available(
             "travsr-lang-go",
             "aarch64-pc-windows-msvc"
@@ -1129,8 +1168,13 @@ mod tests {
     fn the_installed_file_carries_the_same_suffix_as_the_asset() {
         // Write side and read side have to agree: `resolve_executable` tries
         // `<name>.exe` first on Windows, and a bare file there is never found.
-        for target in WRAPPER_RELEASE_TARGETS {
-            let asset = wrapper_asset_name("travsr-lang-go", target).unwrap();
+        // Covers Windows explicitly rather than only the published targets,
+        // since that is the pairing the bug broke.
+        for target in WRAPPER_RELEASE_TARGETS
+            .iter()
+            .chain(["x86_64-pc-windows-msvc"].iter())
+        {
+            let asset = wrapper_asset_name("travsr-lang-go", target);
             let installed = wrapper_install_filename("travsr-lang-go", target);
             assert_eq!(
                 asset.ends_with(".exe"),
@@ -1141,15 +1185,37 @@ mod tests {
     }
 
     #[test]
-    fn installing_a_wrapper_on_windows_writes_a_dot_exe_path() {
-        let Ok(path) = skip_download_install("travsr-lang-java", "x86_64-pc-windows-msvc") else {
-            // Only a missing home directory can fail the skip-download path.
-            return;
-        };
+    fn the_windows_install_path_carries_dot_exe() {
+        // The on-disk name under ~/.travsr/bin, asserted on the rule so it holds
+        // while Windows is built but unpublished. `resolve_executable` probes
+        // `<name>.exe` first on Windows, so a bare file there is never found.
         assert_eq!(
-            path.file_name().unwrap().to_string_lossy(),
+            wrapper_install_filename("travsr-lang-java", "x86_64-pc-windows-msvc"),
             "travsr-lang-java.exe"
         );
+        assert_eq!(
+            wrapper_install_filename("travsr-lang-java", "x86_64-unknown-linux-gnu"),
+            "travsr-lang-java"
+        );
+    }
+
+    #[test]
+    fn the_install_entry_point_returns_the_suffixed_dest_path() {
+        // Drives `download_and_install_wrapper` itself rather than the naming
+        // helper, so the two cannot agree in isolation and disagree in use.
+        match skip_download_install("travsr-lang-java", "x86_64-unknown-linux-gnu") {
+            Ok(path) => assert_eq!(
+                path.file_name().unwrap().to_string_lossy(),
+                "travsr-lang-java"
+            ),
+            // A missing home directory is the only tolerable failure; anything
+            // else means the install path itself broke and must not pass
+            // silently (the vacuous-test trap this file has hit before).
+            Err(e) => assert!(
+                e.to_string().contains("home directory"),
+                "unexpected failure from the skip-download path: {e}"
+            ),
+        }
     }
 
     /// #588 / #576: the two halves of this contract live in different repos, so
@@ -1200,9 +1266,10 @@ mod tests {
                 continue; // builtin — no wrapper asset to publish
             };
             for target in WRAPPER_RELEASE_TARGETS {
-                let Some(asset) = wrapper_asset_name(bin, target) else {
-                    continue; // deliberately not shipped here; nothing to check
-                };
+                if !wrapper_available(bin, target) {
+                    continue; // deliberately not claimed here; nothing to check
+                }
+                let asset = wrapper_asset_name(bin, target);
                 // The sidecar is as load-bearing as the binary: a download with
                 // no `.sha256` is refused rather than installed unverified.
                 for name in [asset.clone(), format!("{asset}.sha256")] {
@@ -1228,12 +1295,16 @@ mod tests {
         // No `TRAVSR_SKIP_DOWNLOAD`, no fixture server, no releases-base
         // override: reaching the network at all would fail this test by
         // hanging or by reporting a transport error instead of this one.
+        //
+        // objectivec on Linux, not Windows: this pairing stays refused once
+        // travsr-lang ships Windows wrappers, so the test keeps testing the
+        // gate rather than quietly becoming a no-op at the next release.
         let rt = tokio::runtime::Runtime::new().unwrap();
         let err = rt
             .block_on(download_and_install_wrapper(
                 "v0.3.0",
                 "travsr-lang-objectivec",
-                "x86_64-pc-windows-msvc",
+                "x86_64-unknown-linux-gnu",
             ))
             .unwrap_err();
         assert!(
@@ -1241,7 +1312,7 @@ mod tests {
             "expected a typed WrapperUnavailable, got: {err:#}"
         );
         let msg = err.to_string();
-        assert!(msg.contains("x86_64-pc-windows-msvc"), "{msg}");
+        assert!(msg.contains("x86_64-unknown-linux-gnu"), "{msg}");
         assert!(msg.contains("not available"), "{msg}");
     }
 
@@ -1828,19 +1899,25 @@ mod download_tests {
     }
 
     #[tokio::test]
-    async fn a_wrapper_with_no_asset_in_the_matrix_never_reaches_the_network() {
-        // `serve(vec![])` would 404; this must fail before the request, with
-        // the typed cause, so `lang install` can state the capability gap
-        // instead of reporting a transport-level failure.
-        let base = serve(vec![]);
+    async fn the_fetch_path_itself_applies_no_availability_gate() {
+        // The gate lives at `download_and_install_wrapper`, tested in `tests`.
+        // Here the point is the opposite: this function fetches whatever it is
+        // asked for, which is what lets the Windows URL shape above be exercised
+        // through the real HTTP path before any release publishes it. If a gate
+        // were ever added here, that coverage would silently disappear.
+        let body = b"objc for a target no release builds".to_vec();
+        let asset = format!("travsr-lang-objectivec-{WINDOWS_TARGET}.exe");
+        let path = format!("/download/{VERSION}/{asset}");
+        let sha = format!("{}  {asset}\n", hex_encode_sha256(&body)).into_bytes();
+        let base = serve(vec![
+            route(&path, 200, body.clone()),
+            route(&format!("{path}.sha256"), 200, sha),
+        ]);
 
-        let err = fetch_and_verify_binary(&base, VERSION, "travsr-lang-objectivec", WINDOWS_TARGET)
+        let got = fetch_and_verify_binary(&base, VERSION, "travsr-lang-objectivec", WINDOWS_TARGET)
             .await
-            .unwrap_err();
-        assert!(
-            err.downcast_ref::<super::WrapperUnavailable>().is_some(),
-            "expected WrapperUnavailable, got: {err:#}"
-        );
+            .expect("fetch must not second-guess the caller's target");
+        assert_eq!(got, body);
     }
 
     #[tokio::test]
