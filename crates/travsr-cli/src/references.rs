@@ -21,15 +21,14 @@ pub enum OutputFormat {
 /// `None` when git is unavailable or the dir is not a repo — the mismatch note
 /// then correctly never fires. Mirrors `status::head_at`.
 fn head_at(cwd: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!head.is_empty()).then_some(head)
+    // Bounded: an unbounded `output()` here can never return on Windows when a
+    // git child or grandchild inherits the pipe (#717 triage, same mechanism as
+    // #503 / #572). A HEAD that does not arrive is the same as no HEAD, which
+    // this function already handles.
+    crate::git_bounded::git_stdout_bounded(
+        None,
+        &["-C", &cwd.to_string_lossy(), "rev-parse", "--short", "HEAD"],
+    )
 }
 
 /// Extract the content between `<travsr-data>` and `</travsr-data>`. Mirrors

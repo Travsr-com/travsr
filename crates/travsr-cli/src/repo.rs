@@ -85,16 +85,20 @@ fn resolve_repo_root(start: &Path, mode: WorktreeMode) -> anyhow::Result<PathBuf
 /// unavailable, too old for `--path-format`, or the common dir does not point
 /// at a real main worktree (e.g. a submodule gitlink under `.git/modules`).
 fn main_worktree_root(worktree_dir: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree_dir)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let common = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+    // Bounded (#717 triage): this runs while resolving the repo root, before
+    // anything is printed, so a git call that never returns here is a CLI that
+    // hangs with no output at all. `None` already means "fall back to the
+    // worktree dir", which is the right answer for a query that did not land.
+    let common = PathBuf::from(crate::git_bounded::git_stdout_bounded(
+        None,
+        &[
+            "-C",
+            &worktree_dir.to_string_lossy(),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+    )?);
     // `--git-common-dir` is `<main>/.git`; its parent is the main worktree.
     let root = common.parent()?.to_path_buf();
     // Guard against submodule gitlinks (`.git/modules/<name>`): only accept a
