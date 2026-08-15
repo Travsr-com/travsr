@@ -78,7 +78,9 @@ pub fn unify_all(
     let mut sym_to_ts: HashMap<&str, NodeId> = HashMap::new();
     // Def nodes whose own file carried no matching tree-sitter node — revisited
     // below to see whether the symbol unified in some other file.
-    let mut unmatched: Vec<(NodeId, &str)> = Vec::new();
+    // Carries the candidate signatures too, so the cross-file rung below can
+    // re-query without re-parsing the SCIP descriptor.
+    let mut unmatched: Vec<(NodeId, &str, Vec<String>)> = Vec::new();
 
     for node in nodes {
         let scip_sym = travsr_indexer::scip_unifier::scip_symbol_from_sig(&node.vname.signature);
@@ -130,7 +132,7 @@ pub fn unify_all(
                 }
                 tracing::trace!(symbol = %scip_sym, ?ts_id, "G1: unified");
             }
-            Ok(None) => unmatched.push((node.id, scip_sym)),
+            Ok(None) => unmatched.push((node.id, scip_sym, candidates)),
             Err(e) => tracing::warn!(symbol = %scip_sym, "G1: DB lookup: {e:#}"),
         }
     }
@@ -140,7 +142,9 @@ pub fn unify_all(
     // C/C++ header/source). Alias it onto that node so it is dropped as a
     // duplicate and its edges/refs rewrite onto the real node, and credit its
     // symbol as unified so the miss-rate does not penalize the benign twin.
-    for (node_id, sym) in unmatched {
+    for (node_id, sym, candidates) in unmatched {
+        // Rung 1: the symbol unified in another file, so this occurrence is
+        // the benign twin.
         if let Some(&ts_id) = sym_to_ts.get(sym) {
             aliases.push((sym.to_string(), ts_id));
             alias_map.insert(node_id, ts_id);
@@ -149,6 +153,35 @@ pub fn unify_all(
             if attempted_syms.contains(sym) {
                 unified_syms.insert(sym);
             }
+            continue;
+        }
+
+        // Rung 2: the declaration is the *only* Phase A node and it lives in
+        // another file, so rung 1 has nothing to key on. This is the C/C++
+        // out-of-line member definition: `widget.h` declares `Widget::draw`,
+        // `widget.cpp` defines it, and Phase A anchored the header. Without
+        // this the SCIP definition survives as an orphan and takes every
+        // ref/call edge with it, so `travsr references draw` answers zero
+        // while the edges exist and point somewhere unreachable.
+        //
+        // Guarded on uniqueness rather than on position: a declaration's line
+        // says nothing about its definition's, and more than one candidate
+        // means the name is ambiguous in this repo (two same-named `static`
+        // functions in different translation units are different functions).
+        // Ambiguity refuses, which is exactly today's behaviour, so this rung
+        // can only add correct unifications.
+        match store.find_unique_ts_node_across_files(corpus, &candidates) {
+            Ok(Some(ts_id)) => {
+                aliases.push((sym.to_string(), ts_id));
+                alias_map.insert(node_id, ts_id);
+                sym_to_ts.entry(sym).or_insert(ts_id);
+                if attempted_syms.contains(sym) {
+                    unified_syms.insert(sym);
+                }
+                tracing::trace!(symbol = %sym, ?ts_id, "G1: unified across files");
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(symbol = %sym, "G1: cross-file lookup: {e:#}"),
         }
     }
 

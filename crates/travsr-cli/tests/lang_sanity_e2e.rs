@@ -251,35 +251,23 @@ fn javascript_commonjs_resolves_a_cross_file_call() {
     assert_cross_file_reference("javascript", "sumLegacy", "legacy.cjs:5");
 }
 
-/// C++ out-of-line member definitions do not unify, so their call edges land on
-/// unreachable nodes.
+/// C++ out-of-line member definitions, the shape that had no working path
+/// through unification until the cross-file rung was added.
 ///
-/// `#[ignore]` because it is a real, reproducible product defect rather than a
-/// flaky test: making the suite red on every run would get the suite muted,
-/// which is worse than recording the failure precisely. Run with
-/// `cargo test -p travsr-cli --test lang_sanity_e2e -- --ignored` to confirm it
-/// still reproduces, and delete the attribute when the unifier handles the
-/// header/implementation split.
+/// This is the regression guard for that fix, so it is worth stating what was
+/// wrong. `app::Widget::draw` is *declared* in `widget.h:9` and *defined* in
+/// `widget.cpp:7`. Phase A anchors its node on the declaration; scip-clang
+/// anchors its definition on the implementation. The same-file matcher cannot
+/// see across that, and the cross-file rescue only fires when the same symbol
+/// already unified somewhere, which it never had. So the store kept both
+/// `fn:draw` and an orphan `scip:...app/Widget#draw(...)`, all 12 ref/call
+/// edges pointed at the orphan, and `travsr references draw` answered zero
+/// while `travsr status` said "semantic: complete" — the answer present in the
+/// graph and unreachable from every query a user can type.
 ///
-/// Measured on the `cpp` fixture:
-///
-/// - Phase A anchors `fn:draw` at the *declaration*, `widget.h:9`.
-/// - scip-clang anchors the *definition* at `widget.cpp:7`.
-/// - Unification is positional, so the two never meet, and the store ends up
-///   with both `fn:draw` and an orphan
-///   `scip:widget.cpp:cxx . . $ app/Widget#draw(...)`.
-/// - All 12 ref/call edges point at the orphan. `travsr references draw`
-///   resolves to `fn:draw` and reports 0 uses, while `travsr status` says
-///   "semantic: complete".
-///
-/// The answer is in the graph and unreachable from every user-facing query.
-/// The daemon records it as `scip_unification_misses:3/7`, which is the signal
-/// that this is not fixture-specific.
-///
-/// C passes the same test because its function is defined in the `.c` file that
-/// Phase A anchors to; the split only bites for out-of-line member definitions.
+/// C never hit it because its function is defined in the `.c` file Phase A
+/// anchors to, which is why a C-only test would have looked green.
 #[test]
-#[ignore = "known defect: C++ out-of-line member definitions do not unify with Phase A nodes"]
 fn cpp_resolves_a_cross_file_call() {
     assert_cross_file_reference("cpp", "draw", "main.cpp:6");
 }
