@@ -1,0 +1,12 @@
+[
+  {
+    "directory": "__FIXTURE_DIR__",
+    "file": "__FIXTURE_DIR__/widget.cpp",
+    "arguments": ["clang++", "-std=c++17", "-c", "-I", "__FIXTURE_DIR__", "widget.cpp"]
+  },
+  {
+    "directory": "__FIXTURE_DIR__",
+    "file": "__FIXTURE_DIR__/main.cpp",
+    "arguments": ["clang++", "-std=c++17", "-c", "-I", "__FIXTURE_DIR__", "main.cpp"]
+  }
+]
