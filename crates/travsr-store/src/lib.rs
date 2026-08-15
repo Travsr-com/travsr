@@ -6088,6 +6088,92 @@ impl SqliteStore {
         Ok(candidates)
     }
 
+    /// #709: strict single-token typo correction over symbol *leaf names*.
+    ///
+    /// When a query token matched no symbol by name/substring, look for the one
+    /// symbol whose leaf name (the segment after the last `.`/`:` of a signature)
+    /// is a very close byte-trigram match — so a typo (`htpresponse`) can still
+    /// ground to the real symbol (`HttpResponse`) through the normal anchor path
+    /// instead of abstaining. Returns the matched symbol's leaf name in its
+    /// original case (so the caller's segmenter and `symbol_frequency` see the
+    /// real camelCase identifier), or `None` when nothing clears `min_jaccard` or
+    /// the best match is ambiguous — a second *distinct* name sits within
+    /// `AMBIGUITY_MARGIN` of the leader. Deliberately conservative: this is the
+    /// exact-miss cold path and a false correction is worse than no correction;
+    /// the cross-encoder reranker is the downstream precision backstop.
+    ///
+    /// Cost: O(V) distinct-signature scan (bounded by `LIMIT`), mirroring
+    /// [`Self::expand_query`]. SymSpell / an FST index can replace this for
+    /// scale-out without changing the signature.
+    pub fn fuzzy_correct_symbol(
+        &self,
+        token: &str,
+        min_jaccard: f64,
+    ) -> Result<Option<String>, StoreError> {
+        /// A correction only stands when the runner-up distinct name is at least
+        /// this far behind — otherwise the typo is ambiguous and we ground nothing.
+        const AMBIGUITY_MARGIN: f64 = 0.05;
+
+        (|| -> AnyResult<Option<String>> {
+            // Trigram Jaccard is unstable on very short tokens; skip them so a
+            // 3-4 char query fragment cannot ground to an unrelated symbol.
+            if token.len() < 5 {
+                return Ok(None);
+            }
+            let tok_lower = token.to_ascii_lowercase();
+
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT signature FROM nodes LIMIT 200000")
+                .context("preparing fuzzy_correct_symbol scan")?;
+            let sigs: Vec<String> = stmt
+                .query_map([], |row| row.get(0))
+                .context("executing fuzzy_correct_symbol scan")?
+                .collect::<Result<_, _>>()
+                .context("collecting fuzzy_correct_symbol signatures")?;
+
+            // Best Jaccard per distinct lowercased leaf name; keep an original-case
+            // exemplar to return. A name equal to the token would already have
+            // resolved exactly, so a correction is always a *different* name.
+            let mut by_name: std::collections::HashMap<String, (f64, String)> =
+                std::collections::HashMap::new();
+            for sig in &sigs {
+                let leaf = leaf_of_signature(sig);
+                let leaf_lower = leaf.to_ascii_lowercase();
+                if leaf_lower == tok_lower {
+                    return Ok(None);
+                }
+                let j = byte_trigram_jaccard(&tok_lower, &leaf_lower);
+                if j < min_jaccard {
+                    continue;
+                }
+                by_name
+                    .entry(leaf_lower)
+                    .and_modify(|e| {
+                        if j > e.0 {
+                            *e = (j, leaf.to_string());
+                        }
+                    })
+                    .or_insert_with(|| (j, leaf.to_string()));
+            }
+
+            let mut cands: Vec<(f64, String)> = by_name.into_values().collect();
+            cands.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            let Some((best_j, best_leaf)) = cands.first().cloned() else {
+                return Ok(None);
+            };
+            let ambiguous = cands
+                .get(1)
+                .is_some_and(|(second_j, _)| best_j - second_j < AMBIGUITY_MARGIN);
+            Ok((!ambiguous).then_some(best_leaf))
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Increment `fts_vocab` refcounts for every token in `tokens_str` (space-separated).
     /// Skips tokens shorter than 3 bytes (FTS5 trigram minimum).
     fn vocab_increment(conn: &Connection, tokens_str: &str) -> AnyResult<()> {
@@ -7038,6 +7124,15 @@ fn i64_to_node_id(v: i64) -> NodeId {
 /// Jaccard similarity on byte-level trigrams of two strings.
 /// Used by `expand_query` (L2-A) to find vocabulary-grounded candidates.
 /// Returns 0.0 for strings shorter than 3 bytes.
+/// Leaf identifier of a signature: the segment after the last `.` of the body
+/// (`method:HttpResponse.render` → `render`), or the whole body when unqualified
+/// (`class:HttpResponse` → `HttpResponse`, `fn:index` → `index`). Mirrors the
+/// daemon's `leaf_of`, kept local so the store has no dependency on it.
+fn leaf_of_signature(sig: &str) -> &str {
+    let body = sig.split_once(':').map(|(_, r)| r).unwrap_or(sig);
+    body.rsplit('.').next().unwrap_or(body)
+}
+
 fn byte_trigram_jaccard(a: &str, b: &str) -> f64 {
     let ab = a.as_bytes();
     let bb = b.as_bytes();

@@ -1273,3 +1273,54 @@ fn test_exact_only_respects_language_filter() {
     assert!(sigs_lang_exact.contains("fn:ClassD::method"));
     assert!(!sigs_lang_exact.contains("struct:ClassDConfigurationManager"));
 }
+
+// ── #709: strict single-token typo correction ────────────────────────────────
+
+#[test]
+fn fuzzy_correct_symbol_resolves_documented_typo() {
+    // The literal repro from issue #709: `htpresponse` (a dropped 't') must
+    // correct to the real `HttpResponse` symbol so a typo grounds instead of
+    // abstaining. Returns the original-case leaf so downstream segmentation and
+    // symbol_frequency see the real camelCase identifier.
+    let mut store = open();
+    put(&mut store, &node("http.py", "class:HttpResponse", "class"));
+    put(
+        &mut store,
+        &node("http.py", "method:HttpResponse.render", "method"),
+    );
+
+    let fix = store.fuzzy_correct_symbol("htpresponse", 0.7).unwrap();
+    assert_eq!(fix.as_deref(), Some("HttpResponse"));
+}
+
+#[test]
+fn fuzzy_correct_symbol_is_none_for_unrelated_token() {
+    // A token that is not a near-miss of any symbol must not be "corrected" into
+    // one — that would ground a query the index cannot support.
+    let mut store = open();
+    put(&mut store, &node("http.py", "class:HttpResponse", "class"));
+
+    let fix = store.fuzzy_correct_symbol("database", 0.7).unwrap();
+    assert_eq!(fix, None);
+}
+
+#[test]
+fn fuzzy_correct_symbol_abstains_on_ambiguous_typo() {
+    // When a typo sits within the ambiguity margin of two DISTINCT names, it is
+    // ambiguous and must ground nothing (fail-closed).
+    let mut store = open();
+    put(&mut store, &node("a.rs", "fn:configure", "function"));
+    put(&mut store, &node("b.rs", "fn:configared", "function"));
+
+    // `configered` is a near-equal trigram match to both distinct names.
+    let fix = store.fuzzy_correct_symbol("configered", 0.5).unwrap();
+    assert_eq!(fix, None, "ambiguous typo must not resolve: {fix:?}");
+}
+
+#[test]
+fn fuzzy_correct_symbol_skips_short_tokens() {
+    // Trigram Jaccard is unstable on very short tokens; they never correct.
+    let mut store = open();
+    put(&mut store, &node("a.rs", "fn:cat", "function"));
+    assert_eq!(store.fuzzy_correct_symbol("cot", 0.5).unwrap(), None);
+}

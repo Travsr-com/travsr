@@ -4298,6 +4298,86 @@ mod tests {
     }
 
     #[test]
+    fn python_phase_b_records_class_and_method_occurrences() {
+        // #709 (Bug 1 + Bug 2 regression guard): native Python Phase B must
+        // record occurrence sites for BOTH a method call (`resp.render()`) and
+        // a class/constructor reference (`HttpResponse(...)`) with zero external
+        // tools — i.e. without the optional travsr-lsif-py emitter. Before the
+        // #709 fix the constructor was emitted as `fn:HttpResponse`, never
+        // resolved to the `class:HttpResponse` node, and every class reference
+        // vanished on any machine without Node.js.
+        use travsr_core::{Node, VName};
+
+        let dir = std::env::temp_dir().join(format!("e2e_py709_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("http.py"),
+            b"class HttpResponse:\n    def render(self):\n        return self\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("views.py"),
+            b"def index(request):\n    resp = HttpResponse(\"hi\")\n    return resp.render()\n",
+        )
+        .unwrap();
+
+        // Phase A nodes the resolver looks references up against. VNames must
+        // match exactly what the extractor derives (corpus "c", python) so the
+        // caller/target node ids line up.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let class_node = Node::new(
+            VName::new("c", "", "http.py", "python", "class:HttpResponse"),
+            "class",
+        );
+        let render_node = Node::new(
+            VName::new("c", "", "http.py", "python", "method:HttpResponse.render"),
+            "method",
+        );
+        let index_node = Node::new(
+            VName::new("c", "", "views.py", "python", "fn:index"),
+            "function",
+        );
+        store.put_node(&class_node).unwrap();
+        store.put_node(&render_node).unwrap();
+        store.put_node(&index_node).unwrap();
+
+        // Real extractor over the on-disk fixture — no hand-rolled shortcut.
+        let (pb_nodes, pb_edges, unresolved) =
+            travsr_indexer::phase_b_native_python("c", &dir, None).unwrap();
+
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &pb_nodes,
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
+
+        // Class reference: `HttpResponse(...)` in views.py → class:HttpResponse.
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.src == index_node.id && e.dst == class_node.id),
+            "constructor call must resolve to class:HttpResponse: {edges:?}"
+        );
+        assert!(
+            sites
+                .iter()
+                .any(|(s, d, _)| *s == index_node.id && *d == class_node.id),
+            "constructor call must record an occurrence site for find_references: {sites:?}"
+        );
+        // Method reference: `resp.render()` → method:HttpResponse.render.
+        assert!(
+            sites
+                .iter()
+                .any(|(s, d, _)| *s == index_node.id && *d == render_node.id),
+            "method call must record an occurrence site: {sites:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_no_call_edges_into_tests_from_src() {
         // #521 F2: a `src/` caller resolving onto a `tests/` target must be
         // rejected. Integration tests are a separate compilation unit —
