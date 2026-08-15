@@ -1795,19 +1795,29 @@ impl SqliteStore {
                         counts.nodes_upserted += 1;
                     }
                     for edge in &file.edges {
-                        tx.execute(
-                            "INSERT INTO edges(src,dst,kind,provenance,confidence) \
-                             VALUES(?1,?2,?3,'tree-sitter',?4) \
-                             ON CONFLICT(src,dst,kind) DO NOTHING",
-                            params![
-                                node_id_to_i64(edge.src),
-                                node_id_to_i64(edge.dst),
-                                edge.kind.as_str(),
-                                edge.confidence.map(|c| c as i64),
-                            ],
-                        )
-                        .context("inserting edge in batch")?;
-                        counts.edges_upserted += 1;
+                        // UX-9: this file's nodes are inserted just above and every
+                        // other file's nodes already live in `nodes` (incremental
+                        // path runs against a populated store), so guard both
+                        // endpoints here too — a parser edge to an un-emitted node
+                        // (e.g. Ruby `class ::Hash` reopening) must not persist a
+                        // dangling half-edge. `execute` returns 0 when the guard
+                        // rejects it, keeping `edges_upserted` honest.
+                        let inserted = tx
+                            .execute(
+                                "INSERT INTO edges(src,dst,kind,provenance,confidence) \
+                                 SELECT ?1,?2,?3,'tree-sitter',?4 \
+                                 WHERE EXISTS(SELECT 1 FROM nodes n WHERE n.id = ?1) \
+                                   AND EXISTS(SELECT 1 FROM nodes n WHERE n.id = ?2) \
+                                 ON CONFLICT(src,dst,kind) DO NOTHING",
+                                params![
+                                    node_id_to_i64(edge.src),
+                                    node_id_to_i64(edge.dst),
+                                    edge.kind.as_str(),
+                                    edge.confidence.map(|c| c as i64),
+                                ],
+                            )
+                            .context("inserting edge in batch")?;
+                        counts.edges_upserted += inserted as u64;
                     }
                 }
 
@@ -3541,6 +3551,49 @@ LIMIT ?4",
         Ok(())
     }
 
+    /// PR #715: batch-check which of `ids` already exist in `nodes`, one query per
+    /// chunk rather than a `SELECT 1` per id, for the Phase B half-edge guard.
+    ///
+    /// Returns `(present, prefetch_ok)`: the subset of `ids` found in the store,
+    /// and whether every chunk query succeeded. On any query error the caller
+    /// treats all endpoints as present (fail-open) so a transient read never drops
+    /// a legitimate edge — the same contract the previous per-row `unwrap_or(true)`
+    /// held. Chunked under SQLite's default 999 bound-variable ceiling.
+    fn prefetch_existing_node_ids(
+        conn: &rusqlite::Connection,
+        ids: &std::collections::HashSet<i64>,
+    ) -> (std::collections::HashSet<i64>, bool) {
+        let mut present = std::collections::HashSet::with_capacity(ids.len());
+        if ids.is_empty() {
+            return (present, true);
+        }
+        const CHUNK: usize = 900;
+        let all: Vec<i64> = ids.iter().copied().collect();
+        for chunk in all.chunks(CHUNK) {
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT id FROM nodes WHERE id IN ({placeholders})");
+            let found = (|| -> anyhow::Result<Vec<i64>> {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                        r.get::<_, i64>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })();
+            match found {
+                Ok(rows) => present.extend(rows),
+                // Fail open: a query error means "cannot prove absence", so the
+                // caller keeps every edge rather than dropping a real one.
+                Err(_) => return (present, false),
+            }
+        }
+        (present, true)
+    }
+
     /// Write Phase B (SCIP/LSIF semantic) nodes and edges in a single transaction.
     ///
     /// Semantics match repeated `put_node` + `put_edge_lsif` calls but in one
@@ -3592,30 +3645,78 @@ LIMIT ?4",
             Self::put_node_fts_words(&tx, node)
                 .context("write_phase_b_batch: put_node_fts_words")?;
         }
-        for edge in edges {
-            // E1: label edges with their true provenance (SCIP relationships vs
-            // native tree-sitter leaf-name resolution) instead of hardcoding
-            // 'lsif'. Precedence-preserving: a compiler provenance ('lsif'/
-            // 'scip') already on the row is never demoted by a later write
-            // (ADR-002), so a heuristic 'tree-sitter' write cannot overwrite it.
-            tx.execute(
-                "INSERT INTO edges(src, dst, kind, provenance, confidence) \
-                 VALUES(?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(src, dst, kind) DO UPDATE SET \
-                 provenance = CASE \
-                   WHEN excluded.provenance IN ('lsif','scip') THEN excluded.provenance \
-                   WHEN edges.provenance IN ('lsif','scip') THEN edges.provenance \
-                   ELSE excluded.provenance END, \
-                 confidence = excluded.confidence",
-                params![
-                    node_id_to_i64(edge.src),
-                    node_id_to_i64(edge.dst),
-                    edge.kind.as_str(),
-                    provenance,
-                    edge.confidence.map(|c| c as i64),
-                ],
-            )
-            .context("write_phase_b_batch: insert edge")?;
+        // #712: never write a half-edge. An incomplete or partial sidecar result
+        // can reference a node it never emitted (or one that a crashed language
+        // owns); inserting an edge to a non-existent endpoint creates an orphan
+        // that `travsr fsck` later flags. Validate both endpoints against this
+        // batch's freshly written nodes and the existing store, dropping any edge
+        // that would dangle. Fail open on a query error so a transient read
+        // problem never silently discards a legitimate edge.
+        {
+            let batch_ids: std::collections::HashSet<i64> =
+                nodes.iter().map(|n| node_id_to_i64(n.id)).collect();
+            // PR #715 perf: validate endpoints against the existing store with a
+            // single batched prefetch (one query per ~900 ids) instead of a
+            // `SELECT 1` per edge inside the write transaction — Phase B batches on
+            // a large repo make the per-row round trip the dominant cost. Only
+            // endpoints NOT already in this batch need a lookup. The half-edge
+            // guard and its fail-open contract are unchanged: `prefetch_ok == false`
+            // (a query error) treats every endpoint as present, so a transient read
+            // problem never silently discards a legitimate edge.
+            let mut needed: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            for edge in edges {
+                let src = node_id_to_i64(edge.src);
+                let dst = node_id_to_i64(edge.dst);
+                if !batch_ids.contains(&src) {
+                    needed.insert(src);
+                }
+                if !batch_ids.contains(&dst) {
+                    needed.insert(dst);
+                }
+            }
+            let (present, prefetch_ok) = Self::prefetch_existing_node_ids(&tx, &needed);
+            let endpoint_present = |id: i64| -> bool {
+                batch_ids.contains(&id) || !prefetch_ok || present.contains(&id)
+            };
+            let mut dropped = 0usize;
+            for edge in edges {
+                let src = node_id_to_i64(edge.src);
+                let dst = node_id_to_i64(edge.dst);
+                if !endpoint_present(src) || !endpoint_present(dst) {
+                    dropped += 1;
+                    continue;
+                }
+                // E1: label edges with their true provenance (SCIP relationships
+                // vs native tree-sitter leaf-name resolution) instead of
+                // hardcoding 'lsif'. Precedence-preserving: a compiler provenance
+                // ('lsif'/'scip') already on the row is never demoted by a later
+                // write (ADR-002), so a heuristic 'tree-sitter' write cannot
+                // overwrite it.
+                tx.execute(
+                    "INSERT INTO edges(src, dst, kind, provenance, confidence) \
+                     VALUES(?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT(src, dst, kind) DO UPDATE SET \
+                     provenance = CASE \
+                       WHEN excluded.provenance IN ('lsif','scip') THEN excluded.provenance \
+                       WHEN edges.provenance IN ('lsif','scip') THEN edges.provenance \
+                       ELSE excluded.provenance END, \
+                     confidence = excluded.confidence",
+                    params![
+                        src,
+                        dst,
+                        edge.kind.as_str(),
+                        provenance,
+                        edge.confidence.map(|c| c as i64),
+                    ],
+                )
+                .context("write_phase_b_batch: insert edge")?;
+            }
+            if dropped > 0 {
+                tracing::warn!(
+                    dropped,
+                    "write_phase_b_batch: skipped edges with a missing endpoint (incomplete sidecar result)"
+                );
+            }
         }
         tx.commit().context("write_phase_b_batch: commit")
     }
@@ -4839,11 +4940,39 @@ impl SqliteStore {
                 )
                 .context("inserting nodes from staging")?;
 
+            // UX-9: nodes are promoted above in this same transaction, so at this
+            // point every legitimate endpoint (this batch's nodes + all pre-existing
+            // nodes) is present in `nodes`. Drop any staged edge whose endpoint is
+            // absent so a parser that emits a `defines` edge from a container node it
+            // never emitted (observed: Ruby `class ::Hash` reopening, whose container
+            // signature did not round-trip) cannot promote a dangling half-edge.
+            // This makes "no orphan edges" a store invariant at the staging boundary
+            // rather than a per-writer promise; cross-file `ref/call` edges are
+            // unaffected because their targets are already in `nodes` by promotion
+            // time (the reason the bulk path stages edges in the first place).
+            let orphan_edges: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM edges_stage e \
+                       WHERE NOT EXISTS(SELECT 1 FROM nodes n WHERE n.id = e.src) \
+                          OR NOT EXISTS(SELECT 1 FROM nodes n WHERE n.id = e.dst)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if orphan_edges > 0 {
+                tracing::warn!(
+                    orphan_edges,
+                    "staging flush: dropped tree-sitter edges with a missing endpoint (parser emitted an edge to an un-emitted node)"
+                );
+            }
             let edges_written = tx
                 .execute(
                     "INSERT INTO edges(src,dst,kind,provenance,confidence) \
                        SELECT src,dst,kind,provenance,MAX(confidence) \
-                       FROM edges_stage GROUP BY src,dst,kind \
+                       FROM edges_stage e \
+                       WHERE EXISTS(SELECT 1 FROM nodes n WHERE n.id = e.src) \
+                         AND EXISTS(SELECT 1 FROM nodes n WHERE n.id = e.dst) \
+                       GROUP BY src,dst,kind \
                        ON CONFLICT(src,dst,kind) DO NOTHING",
                     [],
                 )
@@ -8846,6 +8975,48 @@ mod tests {
             .unwrap();
         let edges = store.all_edges().unwrap();
         assert_eq!(edges[0].3, "lsif", "tree-sitter batch must not demote lsif");
+    }
+
+    #[test]
+    fn write_phase_b_batch_drops_half_edges_and_keeps_resolvable_ones() {
+        // #712 half-edge guard + PR #715 batched-endpoint prefetch. An edge whose
+        // endpoint the sidecar never emitted (nor exists in the store) must be
+        // dropped; edges resolvable within the batch OR against a pre-existing
+        // store node must survive. The pre-existing node exercises the prefetch
+        // path (an endpoint not present in this batch).
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let existing = sample_node("fn:existing");
+        store.put_node(&existing).unwrap();
+
+        let a = sample_node("fn:a");
+        let b = sample_node("fn:b");
+        let ghost = sample_node("fn:ghost"); // referenced but never emitted
+
+        let good_intra = Edge::new(a.id, b.id, EdgeKind::RefCall); // both in batch
+        let good_to_existing = Edge::new(a.id, existing.id, EdgeKind::RefCall); // dst in store
+        let half = Edge::new(a.id, ghost.id, EdgeKind::RefCall); // dst nowhere
+
+        store
+            .write_phase_b_batch(
+                &[a.clone(), b.clone()],
+                &[good_intra, good_to_existing, half],
+                "scip",
+            )
+            .unwrap();
+
+        let edges = store.all_edges().unwrap();
+        assert_eq!(
+            edges.len(),
+            2,
+            "the half-edge to a missing endpoint must be dropped: {edges:?}"
+        );
+        let dsts: std::collections::HashSet<NodeId> = edges.iter().map(|e| e.1).collect();
+        assert!(dsts.contains(&b.id), "intra-batch edge kept");
+        assert!(
+            dsts.contains(&existing.id),
+            "edge to pre-existing store node kept"
+        );
+        assert!(!dsts.contains(&ghost.id), "ghost-endpoint edge dropped");
     }
 
     #[test]

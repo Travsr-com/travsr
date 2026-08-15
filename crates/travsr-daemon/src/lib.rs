@@ -140,6 +140,10 @@ pub struct PhaseBReport {
     pub skipped_needs_approval: Vec<String>,
     /// Languages whose analyzer spawned but died or errored mid-invoke.
     pub crashed: Vec<String>,
+    /// #712: languages whose analyzer ran cleanly but produced zero nodes despite
+    /// the language being present in the repo. Shown to the user so a build-free
+    /// tool that silently indexed nothing is not mistaken for success.
+    pub produced_no_nodes: Vec<String>,
     /// Languages whose sidecar responded with a mismatched protocol version.
     /// Shown to the user with a `travsr lang install <lang>` call-to-action.
     /// Tuple: (language, expected_version, got_version).
@@ -1749,16 +1753,19 @@ pub fn init_repo_with_progress(
     // suppressed the stamp on clean re-runs (PR #207).
     if let Ok(sha) = read_head_commit_sha(repo_root) {
         let _ = store.set_meta("last_commit", &sha);
-        // C4: phase_b_commit is stamped only when Phase B ran inline AND no
-        // language crashed. A partial result should not suppress the next
-        // background refresh, which might recover the crashed language.
-        // On the deferred path we leave it absent so the daemon's phase_b_tick
-        // auto-arms the scheduler when it opens the store.
-        let phase_b_clean = phase_b_report
+        // #712 (supersedes C4): stamp phase_b_commit when Phase B ran inline and
+        // made progress — either every language was clean, or at least one
+        // produced results while another crashed. A partial result marks the
+        // healthy languages complete and queryable at HEAD; the crashed language
+        // is surfaced via `phase_b_warnings`, not by pinning the whole repo's
+        // marker behind HEAD forever. Only a total failure (nothing ran) leaves
+        // the marker absent so the background scheduler retries. On the deferred
+        // path we also leave it absent so `phase_b_tick` auto-arms the scheduler.
+        let phase_b_made_progress = phase_b_report
             .as_ref()
-            .map(|r| r.crashed.is_empty())
+            .map(|r| r.crashed.is_empty() || !r.ran.is_empty())
             .unwrap_or(false);
-        if run_phase_b_inline && phase_b_clean {
+        if run_phase_b_inline && phase_b_made_progress {
             let _ = store.set_meta("phase_b_commit", &sha);
         }
     }
@@ -2680,6 +2687,12 @@ fn write_phase_b_results(
     for lang in &pb_outcome.crashed {
         warnings.push(format!("crashed:{lang}"));
     }
+    // #712: a language whose analyzer ran but produced no nodes over its source
+    // files. Surfaced so a silent zero-node "success" (e.g. scip-ruby invoked
+    // without an input path) is visible and actionable in `travsr status`.
+    for lang in &pb_outcome.produced_no_nodes {
+        warnings.push(format!("zero_nodes:{lang}"));
+    }
     for (lang, expected, got) in &pb_outcome.version_mismatch {
         warnings.push(format!("version_mismatch:{lang}:{expected}:{got}"));
     }
@@ -2742,6 +2755,7 @@ fn write_phase_b_results(
         skipped_no_compdb: pb_outcome.skipped_no_compdb,
         skipped_needs_approval: pb_outcome.skipped_needs_approval,
         crashed: pb_outcome.crashed,
+        produced_no_nodes: pb_outcome.produced_no_nodes,
         version_mismatch: pb_outcome.version_mismatch,
     };
     (report, alias_map)
@@ -3316,22 +3330,36 @@ fn run_background_phase_b_inner(
         tracing::warn!("reconciling edge languages: {e:#}");
     }
 
-    // C4: only advance phase_b_commit when no language crashed. A partial result
-    // should not suppress the next background refresh so crashed languages can
-    // be retried once the user installs the missing tool or clears disk space.
-    if report.crashed.is_empty() {
+    // #712 (supersedes C4): a single crashing language must not hold the whole
+    // repo's semantic layer behind HEAD forever. Advance the completion marker
+    // whenever ANY language produced results (or the LSIF pass did): those
+    // languages are now complete and queryable at HEAD, and the crashed language
+    // is recorded in `phase_b_warnings` (stamped by write_phase_b_results) so
+    // `travsr status` reports `partial (crashed: <lang>)` and the query tools
+    // stop emitting the "building in the background" note that previously never
+    // resolved. The marker is left behind ONLY when a language crashed AND nothing
+    // else made progress (`!crashed.is_empty()` with both `ran` and `lsif_edges`
+    // empty), so the all-crash retry cap can keep trying that broken sidecar until
+    // its tool is fixed. The no-op case — nothing ran and nothing crashed, e.g. no
+    // analyzer is installed for any language in this repo — stamps the marker,
+    // because there is nothing to wait for. A persistently crashing language is
+    // retried on the next commit or an explicit `travsr reindex --semantic
+    // --force`, not on an endless background loop.
+    let made_progress =
+        report.crashed.is_empty() || !report.ran.is_empty() || !lsif_edges.is_empty();
+    if made_progress {
         let _ = s.set_meta("phase_b_commit", &target_sha);
-        // #583: the semantic layer now matches the working tree again. Left set
-        // on a crash so the next tick retries, same as `phase_b_commit`.
+        // #583: the semantic layer now matches the working tree again.
         let _ = s.set_meta("phase_b_dirty", "0");
     }
 
     let outcome = if report.crashed.is_empty() {
         phase_b_sched::RunOutcome::Success
-    } else if !report.ran.is_empty() || !lsif_edges.is_empty() {
-        // phase_b_commit stayed behind (C4) so the tick will re-arm; the
-        // scheduler's partial-crash back-off throttles the retries so they
-        // cannot thrash graph.db and the warm query cache (#464 follow-up).
+    } else if made_progress {
+        // Healthy languages advanced to HEAD, so the next scheduler tick early-
+        // returns (last_commit == phase_b_commit) instead of re-running: the
+        // loop settles after one back-off cycle rather than retrying a
+        // persistently broken sidecar forever (#464 follow-up, #712).
         phase_b_sched::RunOutcome::Partial
     } else {
         phase_b_sched::RunOutcome::AllCrashed

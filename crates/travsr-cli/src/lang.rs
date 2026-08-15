@@ -508,7 +508,13 @@ fn cmd_install(
     // Builtins are bundled in the travsr binary — no external tool needed.
     let mut tool_ready = if entry.builtin {
         true
-    } else if wrapper_installed && !tool_available(entry.command) {
+    } else if wrapper_installed && (reinstall || !tool_available(entry.command)) {
+        // UX-4: `--reinstall` must re-run the underlying SCIP tool install even when
+        // it is already on PATH, not just the wrapper. Otherwise a user following the
+        // documented remedy (`travsr lang install <lang> --reinstall`) to refresh a
+        // tool whose `--version` is unreliable — scip-java, whose coursier launcher
+        // reports the `0.0.0` sentinel — never re-downloads it and so never writes the
+        // `<bin>.version` file that makes it visible/version-checked in `travsr status`.
         let interactive = !no_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin());
         install_scip_tool(entry, interactive, yes, override_version)?
     } else {
@@ -766,6 +772,17 @@ fn install_scip_github_binary(
                 spec.install_name,
                 path.display()
             );
+            // UX-4: some SCIP launchers (scip-java's coursier wrapper) report the
+            // `0.0.0` "unset" sentinel from `--version`, so `travsr status` can only
+            // show a real version via the `<bin>.version` fallback file. Nothing was
+            // writing it, so scip-java installed but was silently omitted from the
+            // sidecars block. Record the resolved release tag now — the version we
+            // just downloaded — so the tool is visible and floor-checked.
+            if let Some(vpath) = travsr_plugin_host::sidecar_version::version_sidecar_path(&path) {
+                if let Err(e) = std::fs::write(&vpath, format!("{tag}\n")) {
+                    tracing::debug!(path = %vpath.display(), error = %e, "could not write version sidecar file");
+                }
+            }
             if !crate::install::path_contains_travsr_bin() {
                 println!("\n{}", crate::install::path_hint());
             }

@@ -1,5 +1,6 @@
 use crate::sandbox::policy::SandboxUnavailable;
 use crate::sandbox::StdioCfg;
+use crate::stderr_ring::StderrRing;
 use std::io::{BufReader, BufWriter};
 use std::sync::{Arc, Mutex};
 use travsr_error::IndexError;
@@ -82,7 +83,7 @@ pub struct Sidecar {
     #[allow(dead_code)]
     plugin_version: String,
     /// None for stub instances (P5-S1 compatibility).
-    #[allow(dead_code)] // held for process lifetime; drop kills the subprocess
+    #[allow(dead_code)] // held for process lifetime; `Drop for Sidecar` kills and reaps it
     _child: Option<Mutex<crate::sandbox::SandboxedChild>>,
     /// OS PID of the sidecar subprocess. Captured at spawn so the I/O watchdog
     /// can SIGTERM the child on timeout without locking `_child` (#388).
@@ -92,6 +93,11 @@ pub struct Sidecar {
     health: Mutex<PluginHealth>,
     /// Per-invocation scratch tmpdir (ADR-017 Rule 1 — read-write, cleaned up on drop).
     _scratch: Option<tempfile::TempDir>,
+    /// Bounded ring draining the sidecar's own stderr so a Phase B analyzer that
+    /// fails silently (e.g. libclang denied a sandbox read and every translation
+    /// unit fails to parse, yielding an empty index) is diagnosable via tracing
+    /// instead of swallowed. Empty for stub instances.
+    stderr_ring: StderrRing,
 }
 
 impl Sidecar {
@@ -113,6 +119,7 @@ impl Sidecar {
             io: None,
             health: Mutex::new(PluginHealth::Disabled("stub sidecar".into())),
             _scratch: None,
+            stderr_ring: StderrRing::spawn_empty(),
         }
     }
 
@@ -156,12 +163,19 @@ impl Sidecar {
         spawner
             .stdin(StdioCfg::Pipe)
             .stdout(StdioCfg::Pipe)
-            .stderr(StdioCfg::Null);
+            .stderr(StdioCfg::Pipe);
 
         let mut child = spawner.spawn().map_err(|e| IndexError::Parse {
             file: format!("plugin:{lang}"),
             message: format!("spawn failed: {e}"),
         })?;
+
+        // Drain the sidecar's stderr into a bounded ring so its own diagnostics
+        // are recoverable on failure/empty-index instead of being discarded.
+        let stderr_ring = match child.take_stderr() {
+            Some(stderr) => StderrRing::spawn(stderr),
+            None => StderrRing::spawn_empty(),
+        };
 
         let (raw_stdin, raw_stdout) =
             child.take_ipc_streams().ok_or_else(|| IndexError::Parse {
@@ -198,7 +212,17 @@ impl Sidecar {
                     message: e.to_string(),
                 })
             },
-        )?;
+        )
+        .map_err(|e| {
+            // A sidecar that dies during startup (dyld/link failure, panic before
+            // the handshake write) leaves only an EOF here; echo its stderr so the
+            // real cause is visible instead of a bare "failed to fill whole buffer".
+            let tail = stderr_ring.tail();
+            if !tail.is_empty() {
+                tracing::warn!(lang = %lang, stderr = %tail, "Phase B: sidecar failed during handshake");
+            }
+            e
+        })?;
 
         let plugin_version = match hs {
             PluginResponse::Handshake(h) => {
@@ -232,6 +256,7 @@ impl Sidecar {
             io: Some(Mutex::new((writer, reader))),
             health: Mutex::new(PluginHealth::Ok),
             _scratch: Some(scratch),
+            stderr_ring,
         })
     }
 
@@ -290,8 +315,37 @@ impl Sidecar {
     }
 
     fn mark_crashed(&self) {
+        // Surface the sidecar's own last words — a libclang/parse/link failure it
+        // printed before dying is otherwise lost, leaving only a generic crash.
+        let tail = self.stderr_ring.tail();
+        if tail.is_empty() {
+            tracing::warn!(lang = %self.language, "Phase B: sidecar crashed (no stderr captured)");
+        } else {
+            tracing::warn!(lang = %self.language, stderr = %tail, "Phase B: sidecar crashed");
+        }
         if let Ok(mut h) = self.health.lock() {
             *h = PluginHealth::Disabled(format!("plugin {} crashed", self.language));
+        }
+    }
+}
+
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        // #715: kill and reap the child before any field drops. `stderr_ring`'s
+        // Drop joins its reader thread, which only returns once the child's
+        // stderr write end is closed, i.e. once the child is dead. On a normal
+        // teardown a well-behaved sidecar exits on stdin EOF and the join is
+        // instant, but a watchdog-timed-out invoke can drop this while the child
+        // is still busy in a long parse and has not reached its stdin read; the
+        // join would then block for as long as that takes. Explicitly killing
+        // here (the Drop body runs before any field is dropped) guarantees the
+        // ring's EOF assumption instead of relying on it incidentally, mirroring
+        // `EmbedSidecar::drop`. `wait` reaps the child so it is not left a zombie.
+        if let Some(child) = &self._child {
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
         }
     }
 }
@@ -380,7 +434,25 @@ impl Transport for Sidecar {
         };
 
         match decoded {
-            Ok(PluginResponse::Invoke(resp)) => Ok(resp),
+            Ok(PluginResponse::Invoke(resp)) => {
+                // A clean handshake + invoke that nonetheless yields zero nodes is
+                // the exact shape of a silent analyzer failure (e.g. libclang
+                // denied a sandbox read → every TU fails to parse → empty index).
+                // Echo the sidecar's own stderr at debug so the cause is
+                // recoverable rather than surfacing only as a generic zero-node
+                // warning with a misdirecting remedy.
+                if resp.nodes.is_empty() {
+                    let tail = self.stderr_ring.tail();
+                    if !tail.is_empty() {
+                        tracing::debug!(
+                            lang = %self.language,
+                            stderr = %tail,
+                            "Phase B: sidecar returned zero nodes; sidecar stderr follows"
+                        );
+                    }
+                }
+                Ok(resp)
+            }
             Ok(PluginResponse::Error(e)) => Err(IndexError::Parse {
                 file: e.file,
                 message: e.message,

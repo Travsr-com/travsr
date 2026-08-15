@@ -89,6 +89,19 @@ impl SandboxedChild {
             SandboxedChild::AppContainer(ac) => ac.take_ipc_streams(),
         }
     }
+
+    /// Take the child's piped stderr, if it was spawned with `StdioCfg::Pipe`.
+    /// Used to drain a Phase B sidecar's own diagnostics into a bounded ring so
+    /// a libclang/parse failure that yields a silent empty index is surfaced via
+    /// tracing instead of being swallowed. `None` for the Windows AppContainer
+    /// path (stderr handled by the container) and for stub children.
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        match self {
+            SandboxedChild::Standard(child) => child.stderr.take(),
+            #[cfg(target_os = "windows")]
+            SandboxedChild::AppContainer(_) => None,
+        }
+    }
 }
 
 /// Result of `build_sandboxed_command`. Configure stdio, then call `spawn`.

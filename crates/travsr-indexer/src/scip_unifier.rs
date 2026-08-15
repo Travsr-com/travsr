@@ -106,7 +106,8 @@ pub fn scip_name_kind(symbol: &str) -> Option<ScipName<'_>> {
 fn split_container(s: &str) -> (Option<&str>, &str) {
     match s.rsplit_once('#') {
         Some((pre, name)) => {
-            let container = strip_backticks(pre.rsplit('#').next().unwrap_or(pre));
+            let container =
+                unwrap_meta_container(strip_backticks(pre.rsplit('#').next().unwrap_or(pre)));
             (
                 (!container.is_empty()).then_some(container),
                 strip_backticks(name),
@@ -114,6 +115,32 @@ fn split_container(s: &str) -> (Option<&str>, &str) {
         }
         None => (None, strip_backticks(s)),
     }
+}
+
+/// Unwrap scip-ruby's Sorbet meta-class container notation to the bare name.
+///
+/// scip-ruby encodes a class method's enclosing scope as the *singleton class*
+/// of the type: `def self.is_supported?` inside `class EnsureBundleExecAction`
+/// becomes the descriptor `…#`<Class:EnsureBundleExecAction>`#is_supported?().`.
+/// Phase A's Ruby parser names the enclosing scope plainly
+/// (`method:EnsureBundleExecAction.is_supported?`), so without unwrapping, the
+/// derived candidate `method:<Class:EnsureBundleExecAction>.is_supported?` never
+/// matches and the SCIP definition orphans as a duplicate node that silently
+/// steals the method's call edges (the twin the tree-sitter node never sees).
+/// `<Class:Name>` / `<Module:Name>` → `Name`; anything else (RSpec `<describe
+/// '...'>` DSL blocks, which have no Phase A twin) passes through unchanged.
+fn unwrap_meta_container(s: &str) -> &str {
+    if let Some(inner) = s.strip_prefix('<').and_then(|i| i.strip_suffix('>')) {
+        if let Some((tag, name)) = inner.split_once(':') {
+            if matches!(tag, "Class" | "Module")
+                && !name.is_empty()
+                && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                return name;
+            }
+        }
+    }
+    s
 }
 
 /// Strip ONE pair of surrounding backticks from a SCIP escaped identifier.
@@ -453,6 +480,39 @@ mod tests {
         );
         // Unknown/non-def kinds fall through.
         assert_eq!(native_name_kind("fn:describe", "file"), None);
+    }
+
+    #[test]
+    fn ruby_singleton_class_method_unwraps_to_bare_container() {
+        // scip-ruby wraps a class method's scope in the Sorbet singleton-class
+        // notation `<Class:Name>`. It must reduce to `Name` so the derived
+        // candidate `method:EnsureBundleExecAction.is_supported?` matches the
+        // Phase A tree-sitter node instead of orphaning a duplicate twin.
+        let p = scip_name_kind(
+            "scip-ruby gem fastlane 0.0.0 Fastlane#Actions#`<Class:EnsureBundleExecAction>`#`is_supported?`().",
+        )
+        .unwrap();
+        assert_eq!(p.container, Some("EnsureBundleExecAction"));
+        assert_eq!(p.name, "is_supported?");
+        assert_eq!(p.kind, "function");
+        assert!(candidate_signatures(&p)
+            .contains(&"method:EnsureBundleExecAction.is_supported?".to_string()));
+    }
+
+    #[test]
+    fn rspec_describe_block_container_is_not_unwrapped() {
+        // RSpec DSL descriptors (`<describe 'Fastlane'>`) have no Phase A twin;
+        // the meta-unwrap must leave them untouched (space/quotes disqualify).
+        assert_eq!(
+            unwrap_meta_container("<describe 'Fastlane'>"),
+            "<describe 'Fastlane'>"
+        );
+        assert_eq!(unwrap_meta_container("<Class:Helper>"), "Helper");
+        assert_eq!(
+            unwrap_meta_container("<Module:FastlaneCore>"),
+            "FastlaneCore"
+        );
+        assert_eq!(unwrap_meta_container("Helper"), "Helper");
     }
 
     #[test]
