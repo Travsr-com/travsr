@@ -6,6 +6,7 @@ mod ask;
 #[cfg(windows)]
 mod autostart;
 mod config;
+mod connect;
 mod daemon_client;
 mod embed;
 mod explain;
@@ -76,6 +77,24 @@ enum Command {
         /// tsconfig, etc.) — it must be an explicit, per-invocation decision.
         #[arg(long)]
         allow_unsandboxed_lsif: bool,
+        /// Skip auto-detecting AI coding tools and wiring them to Travsr.
+        #[arg(long)]
+        no_connect: bool,
+    },
+    /// Detect AI coding tools and wire them to the Travsr MCP server + rules.
+    Connect {
+        /// Only configure this tool id (run `travsr connect --print` to see the ids).
+        #[arg(long)]
+        tool: Option<String>,
+        /// Show what would change without writing anything.
+        #[arg(long)]
+        print: bool,
+        /// Remove previously generated Travsr config.
+        #[arg(long)]
+        remove: bool,
+        /// Do not git-ignore generated files (opt in to committing them).
+        #[arg(long)]
+        commit: bool,
     },
     /// Start the Travsr daemon (git hook + file watcher + MCP server).
     Daemon {
@@ -653,7 +672,40 @@ async fn run(cli: Cli) -> Result<()> {
             semantic,
             force,
             allow_unsandboxed_lsif,
-        } => init::run(quiet, json, jobs, semantic, force, allow_unsandboxed_lsif)?,
+            no_connect,
+        } => init::run(
+            quiet,
+            json,
+            jobs,
+            semantic,
+            force,
+            allow_unsandboxed_lsif,
+            no_connect,
+        )?,
+        Command::Connect {
+            tool,
+            print,
+            remove,
+            commit,
+        } => {
+            let cwd = std::env::current_dir()?;
+            // Write command: `connect` creates files in the resolved root, so it
+            // must stay in the worktree we are standing in. The read resolver
+            // redirects a linked worktree to the main worktree (issue #302),
+            // which would drop this checkout's AI config into a different one.
+            // `travsr init` already wires connect through the write resolver.
+            let repo_root = repo::find_git_root_for_write(&cwd)?;
+            connect::run(
+                &repo_root,
+                &connect::ConnectOpts {
+                    only: tool,
+                    dry_run: print,
+                    remove,
+                    commit,
+                    report: connect::Report::Stdout,
+                },
+            )?;
+        }
         Command::Daemon { action } => {
             let cwd = std::env::current_dir()?;
             // The daemon indexes/watches the resolved root: bind it to the
