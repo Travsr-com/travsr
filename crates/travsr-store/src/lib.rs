@@ -1795,19 +1795,29 @@ impl SqliteStore {
                         counts.nodes_upserted += 1;
                     }
                     for edge in &file.edges {
-                        tx.execute(
-                            "INSERT INTO edges(src,dst,kind,provenance,confidence) \
-                             VALUES(?1,?2,?3,'tree-sitter',?4) \
-                             ON CONFLICT(src,dst,kind) DO NOTHING",
-                            params![
-                                node_id_to_i64(edge.src),
-                                node_id_to_i64(edge.dst),
-                                edge.kind.as_str(),
-                                edge.confidence.map(|c| c as i64),
-                            ],
-                        )
-                        .context("inserting edge in batch")?;
-                        counts.edges_upserted += 1;
+                        // UX-9: this file's nodes are inserted just above and every
+                        // other file's nodes already live in `nodes` (incremental
+                        // path runs against a populated store), so guard both
+                        // endpoints here too — a parser edge to an un-emitted node
+                        // (e.g. Ruby `class ::Hash` reopening) must not persist a
+                        // dangling half-edge. `execute` returns 0 when the guard
+                        // rejects it, keeping `edges_upserted` honest.
+                        let inserted = tx
+                            .execute(
+                                "INSERT INTO edges(src,dst,kind,provenance,confidence) \
+                                 SELECT ?1,?2,?3,'tree-sitter',?4 \
+                                 WHERE EXISTS(SELECT 1 FROM nodes n WHERE n.id = ?1) \
+                                   AND EXISTS(SELECT 1 FROM nodes n WHERE n.id = ?2) \
+                                 ON CONFLICT(src,dst,kind) DO NOTHING",
+                                params![
+                                    node_id_to_i64(edge.src),
+                                    node_id_to_i64(edge.dst),
+                                    edge.kind.as_str(),
+                                    edge.confidence.map(|c| c as i64),
+                                ],
+                            )
+                            .context("inserting edge in batch")?;
+                        counts.edges_upserted += inserted as u64;
                     }
                 }
 
@@ -4868,11 +4878,39 @@ impl SqliteStore {
                 )
                 .context("inserting nodes from staging")?;
 
+            // UX-9: nodes are promoted above in this same transaction, so at this
+            // point every legitimate endpoint (this batch's nodes + all pre-existing
+            // nodes) is present in `nodes`. Drop any staged edge whose endpoint is
+            // absent so a parser that emits a `defines` edge from a container node it
+            // never emitted (observed: Ruby `class ::Hash` reopening, whose container
+            // signature did not round-trip) cannot promote a dangling half-edge.
+            // This makes "no orphan edges" a store invariant at the staging boundary
+            // rather than a per-writer promise; cross-file `ref/call` edges are
+            // unaffected because their targets are already in `nodes` by promotion
+            // time (the reason the bulk path stages edges in the first place).
+            let orphan_edges: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM edges_stage e \
+                       WHERE NOT EXISTS(SELECT 1 FROM nodes n WHERE n.id = e.src) \
+                          OR NOT EXISTS(SELECT 1 FROM nodes n WHERE n.id = e.dst)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if orphan_edges > 0 {
+                tracing::warn!(
+                    orphan_edges,
+                    "staging flush: dropped tree-sitter edges with a missing endpoint (parser emitted an edge to an un-emitted node)"
+                );
+            }
             let edges_written = tx
                 .execute(
                     "INSERT INTO edges(src,dst,kind,provenance,confidence) \
                        SELECT src,dst,kind,provenance,MAX(confidence) \
-                       FROM edges_stage GROUP BY src,dst,kind \
+                       FROM edges_stage e \
+                       WHERE EXISTS(SELECT 1 FROM nodes n WHERE n.id = e.src) \
+                         AND EXISTS(SELECT 1 FROM nodes n WHERE n.id = e.dst) \
+                       GROUP BY src,dst,kind \
                        ON CONFLICT(src,dst,kind) DO NOTHING",
                     [],
                 )
