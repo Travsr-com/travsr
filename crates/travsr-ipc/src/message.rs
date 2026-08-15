@@ -71,6 +71,22 @@ pub enum ControlMessage {
     /// Daemons older than this variant answer with a parse error, which the
     /// extension ignores: a report is never worth surfacing to a user.
     ReportLspDiagnostics {
+        /// Absolute workspace root this report describes.
+        ///
+        /// Delivery cannot be trusted to pick the right daemon, so the report
+        /// says who it is for and the daemon drops anything that is not its
+        /// own (#698 review, P1). Discovery enumerates a *namespace*, not a
+        /// repo: on Windows every daemon's pipe matches `travsr-*`, and on
+        /// Unix the #592 runtime-directory fallback holds `daemon-<hex>.sock`
+        /// for every repo of that user, with the hex opaque to the client.
+        /// Without this field the first daemon that accepted the connection
+        /// kept the report, so one repo's diagnostics could be answered under
+        /// another repo's graph.
+        ///
+        /// Compared after the same normalization [`ControlAddr::for_repo`]
+        /// applies (canonicalize, and lowercase on Windows), so the two agree
+        /// on identity by construction.
+        repo_root: String,
         /// Stable for the lifetime of one editor window.
         session: String,
         /// How long this report stays valid. `0` detaches the session now.
@@ -178,16 +194,19 @@ mod tests {
     // this test is edited, that file has to change with it.
     #[test]
     fn report_lsp_diagnostics_wire_shape_matches_the_extension() {
-        let line = r#"{"op":"report-lsp-diagnostics","session":"vscode-1-abc","ttl_secs":900,
+        let line = r#"{"op":"report-lsp-diagnostics","repo_root":"/home/alice/proj",
+            "session":"vscode-1-abc","ttl_secs":900,
             "files":[{"path":"src/a.ts","errors":2,"warnings":1}],"seen":3,"undiagnosed":1}"#;
         match serde_json::from_str::<ControlMessage>(line).expect("extension line must parse") {
             ControlMessage::ReportLspDiagnostics {
+                repo_root,
                 session,
                 ttl_secs,
                 files,
                 seen,
                 undiagnosed,
             } => {
+                assert_eq!(repo_root, "/home/alice/proj");
                 assert_eq!(session, "vscode-1-abc");
                 assert_eq!(ttl_secs, 900);
                 assert_eq!(seen, 3);
@@ -204,7 +223,7 @@ mod tests {
     // rather than being treated as "unset" and defaulted to something alive.
     #[test]
     fn a_zero_lease_parses_as_a_zero_lease() {
-        let line = r#"{"op":"report-lsp-diagnostics","session":"s","ttl_secs":0,
+        let line = r#"{"op":"report-lsp-diagnostics","repo_root":"/r","session":"s","ttl_secs":0,
             "files":[],"seen":0,"undiagnosed":0}"#;
         match serde_json::from_str::<ControlMessage>(line).expect("detach must parse") {
             ControlMessage::ReportLspDiagnostics { ttl_secs, .. } => assert_eq!(ttl_secs, 0),

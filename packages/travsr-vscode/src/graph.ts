@@ -32,6 +32,7 @@ import * as vscode from "vscode";
 import {
   detachSession,
   reportLspDiagnostics,
+  REPORT_TTL_SECS,
   type FileDiagnostics,
 } from "./daemonIpc";
 import type { McpClient } from "./mcp";
@@ -255,6 +256,23 @@ function listItems(diags: readonly vscode.Diagnostic[]): NodeDiagnosticItem[] {
 }
 
 /**
+ * Workspace `fsPath`s of `nodes`, for deciding whether a diagnostic change is
+ * about this graph at all (#698 review, P2).
+ *
+ * Resolved through `resolveWorkspacePath`, the same gate the overlay uses, so
+ * a node the overlay would drop cannot make the listener wake up either.
+ */
+export function resolvedFsPaths(nodes: GraphNode[]): Set<string> {
+  const out = new Set<string>();
+  for (const node of nodes) {
+    if (!node.path) continue;
+    const uri = resolveWorkspacePath(node.path);
+    if (uri) out.add(uri.fsPath);
+  }
+  return out;
+}
+
+/**
  * Map the diagnostics VS Code already holds onto the nodes currently rendered.
  *
  * Reads `vscode.languages.getDiagnostics` only — Travsr spawns no language
@@ -378,6 +396,15 @@ export class GraphPanel {
   private renderedNodes: GraphNode[] = [];
   /** Last report sent to the daemon, so an unchanged one is not resent. */
   private lastReportedDiagnostics = "";
+  /** Last overlay posted to the webview, so an unchanged one is not reposted. */
+  private lastPostedOverlay = "";
+  /**
+   * Workspace `fsPath`s of the rendered nodes, so a diagnostic change outside
+   * the graph can be ignored without recomputing anything (#698 review, P2).
+   */
+  private renderedFsPaths: Set<string> = new Set();
+  /** Lease renewal timer; see the constructor. Cleared in `dispose`. */
+  private leaseRenewal: ReturnType<typeof setInterval> | undefined;
   private readonly diagnosticsDebouncer = makeDebouncer(
     () => this.postDiagnosticsOverlay(),
     DIAGNOSTICS_DEBOUNCE_MS
@@ -410,10 +437,32 @@ export class GraphPanel {
 
     // #688: the language servers the user already runs are the only source of
     // live correctness data. Tied to the panel so it dies with it.
+    //
+    // Filtered on `e.uris` (#698 review, P2): a change anywhere in the
+    // workspace used to schedule a full recompute, and the recompute calls the
+    // argument-less `getDiagnostics()`, whose cost tracks total workspace
+    // breakage rather than graph size. A noisy linter in another editor group
+    // then rebuilt the Problems list every 200ms for an overlay that never
+    // changed. A newly-diagnosed file still appears in `e.uris`, so
+    // `unknownCoverage` stays correct.
     vscode.languages.onDidChangeDiagnostics(
-      () => this.diagnosticsDebouncer.schedule(),
+      (e) => {
+        if (!e.uris.some((u) => this.renderedFsPaths.has(u.fsPath))) return;
+        this.diagnosticsDebouncer.schedule();
+      },
       null,
       this.disposables
+    );
+
+    // #698 review P2: the lease is renewed on a timer, not by change. Reports
+    // are skipped when the reduction is identical, so a window whose
+    // diagnostics settle stops renewing and is dropped at `REPORT_TTL_SECS`,
+    // leaving `travsr daemon lsp` saying "no editor attached" while the panel
+    // is open and current. Renewing at a third of the lease tolerates two
+    // missed ticks.
+    this.leaseRenewal = setInterval(
+      () => this.postDiagnosticsOverlay(true),
+      (REPORT_TTL_SECS * 1000) / 3
     );
   }
 
@@ -504,12 +553,25 @@ export class GraphPanel {
    * exists for the keystroke-driven path.
    */
   private postDiagnosticsOverlay(force = false): void {
-    if (this.renderedNodes.length === 0) return;
+    // No early return on an empty node set (#698 review, P3): the webview
+    // keeps the previous graph's badge and Problems data until it is told
+    // otherwise, so a query that matches nothing would leave "3 errors" over
+    // an empty canvas. `computeDiagnosticsOverlay([])` is trivially cheap and
+    // returns exactly the empty state the webview should be shown.
     const overlay = computeDiagnosticsOverlay(this.renderedNodes);
-    void this.panel.webview.postMessage({
-      command: "diagnosticsOverlay",
-      ...overlay,
-    });
+    this.renderedFsPaths = resolvedFsPaths(this.renderedNodes);
+
+    // Deduped like the daemon report below (#698 review, P2): an unchanged
+    // overlay still made the webview replace the Problems list, which destroys
+    // a text selection the reader may be in the middle of making.
+    const overlayKey = JSON.stringify(overlay);
+    if (force || overlayKey !== this.lastPostedOverlay) {
+      this.lastPostedOverlay = overlayKey;
+      void this.panel.webview.postMessage({
+        command: "diagnosticsOverlay",
+        ...overlay,
+      });
+    }
 
     // #688: mirror the reduction into the daemon log at DEBUG. Fire and
     // forget — `reportLspDiagnostics` swallows every failure, so a stopped
@@ -667,6 +729,7 @@ export class GraphPanel {
   dispose(): void {
     GraphPanel.current = undefined;
     this.diagnosticsDebouncer.dispose();
+    if (this.leaseRenewal) clearInterval(this.leaseRenewal);
     // Withdraw this window's view rather than leave it asserting what it saw
     // for the rest of the lease.
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;

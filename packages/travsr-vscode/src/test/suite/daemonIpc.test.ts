@@ -184,3 +184,42 @@ suite("daemonIpc: reporting (#688)", function () {
     }
   });
 });
+
+suite("daemonIpc: #698 review P1", () => {
+  // Discovery enumerates a namespace, not a repo, so delivery cannot be
+  // "first to accept". Every report names the repo it is for and the daemon
+  // drops foreign ones; broadcasting is what makes that correct.
+  test("every report carries the repo root it describes", () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, "..", "..", "daemonIpc.js"),
+      "utf8"
+    );
+    const reports = src.split('op: "report-lsp-diagnostics"').length - 1;
+    const roots = src.split("repo_root:").length - 1;
+
+    assert.ok(reports >= 2, "both report and detach send this op");
+    assert.strictEqual(
+      roots,
+      reports,
+      "every send of that op must name its repo, detach included"
+    );
+  });
+
+  test("delivery goes to every candidate, not the first that accepts", () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, "..", "..", "daemonIpc.js"),
+      "utf8"
+    );
+    const fn = src.indexOf("async function send(");
+    const body = src.slice(fn, src.indexOf("\n}", fn));
+
+    assert.ok(
+      !/return true;/.test(body),
+      "short-circuiting on the first accept is what misrouted reports"
+    );
+    assert.ok(
+      body.includes("Promise.all"),
+      "candidates are tried concurrently, or each pays a connect timeout"
+    );
+  });
+});

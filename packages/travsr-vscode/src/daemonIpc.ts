@@ -140,13 +140,30 @@ function sendLine(socketPath: string, line: string): Promise<boolean> {
   });
 }
 
-/** Send one control message to whichever candidate socket answers first. */
+/**
+ * Send one control message to every candidate socket, not just the first that
+ * answers.
+ *
+ * Discovery enumerates a namespace rather than a repo: the Windows pipe filter
+ * matches every travsr daemon on the machine, and the #592 runtime-directory
+ * fallback holds one opaque `daemon-<hex>.sock` per repo of this user. There is
+ * no blake3 in TypeScript to tell them apart, so "first to accept" delivered a
+ * report to whichever daemon happened to answer, which could be another repo's
+ * (#698 review, P1).
+ *
+ * Identity is settled at the far end instead: every payload carries
+ * `repo_root`, and a daemon that does not own it drops the report. Broadcasting
+ * is therefore safe, and it is what makes delivery correct rather than
+ * first-come. Resolves true if at least one candidate accepted the bytes, which
+ * is all a fire-and-forget client can observe.
+ */
 async function send(repoRoot: string, payload: object): Promise<boolean> {
   const line = JSON.stringify(payload) + "\n";
-  for (const candidate of candidateSocketPaths(repoRoot)) {
-    if (await sendLine(candidate, line)) return true;
-  }
-  return false;
+  const candidates = candidateSocketPaths(repoRoot);
+  // Concurrent rather than sequential: with the first-match short-circuit gone
+  // this would otherwise pay every candidate's connect timeout in series.
+  const results = await Promise.all(candidates.map((c) => sendLine(c, line)));
+  return results.some(Boolean);
 }
 
 /**
@@ -162,6 +179,7 @@ export async function reportLspDiagnostics(
 ): Promise<boolean> {
   return send(repoRoot, {
     op: "report-lsp-diagnostics",
+    repo_root: repoRoot,
     session: SESSION_ID,
     ttl_secs: REPORT_TTL_SECS,
     ...report,
@@ -177,6 +195,7 @@ export async function reportLspDiagnostics(
 export async function detachSession(repoRoot: string): Promise<boolean> {
   return send(repoRoot, {
     op: "report-lsp-diagnostics",
+    repo_root: repoRoot,
     session: SESSION_ID,
     ttl_secs: 0,
     files: [],

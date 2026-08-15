@@ -7,6 +7,7 @@ import {
   buildHtmlContent,
   computeDiagnosticsOverlay,
   makeDebouncer,
+  resolvedFsPaths,
   MAX_DIAGNOSTIC_ITEMS_PER_FILE,
   MAX_DIAGNOSTIC_MESSAGE_CHARS,
   type GraphNode,
@@ -553,6 +554,75 @@ suite("GraphPanel: diagnostics overlay (#688)", () => {
 
     await new Promise((r) => setTimeout(r, 60));
     assert.strictEqual(calls, 0, "a disposed panel must not post after teardown");
+  });
+});
+
+suite("GraphPanel: #698 review fixes", () => {
+  // P2: a diagnostic change outside the rendered graph must not wake the
+  // overlay. The listener tests the change's uris against this set.
+  test("only the graph's own files are in the watched path set", () => {
+    const inGraph = resolvedFsPaths([
+      node("n1", "src/sample.ts"),
+      node("n2", "src/sample.ts"),
+      node("n3", "src/mcp.ts"),
+    ]);
+
+    assert.strictEqual(inGraph.size, 2, "one entry per distinct file");
+    const other = resolvedFsPaths([node("x", "src/unrelated-elsewhere.ts")]);
+    assert.ok(
+      ![...other].some((p) => inGraph.has(p)),
+      "a file outside the graph must not match"
+    );
+  });
+
+  test("a node outside the workspace never enters the watched set", () => {
+    // Same gate the overlay applies, so the listener cannot wake on a path
+    // the overlay would refuse to read.
+    assert.strictEqual(resolvedFsPaths([node("escape", "/etc/passwd")]).size, 0);
+  });
+
+  test("a node with no path contributes nothing", () => {
+    assert.strictEqual(resolvedFsPaths([node("bare", "")]).size, 0);
+  });
+
+  // P3: an empty graph must clear the overlay rather than leave the previous
+  // graph's badge and Problems list on screen.
+  test("an empty node set produces an empty overlay, not a stale one", () => {
+    const overlay = computeDiagnosticsOverlay([]);
+
+    assert.deepStrictEqual(overlay.byNode, {});
+    assert.deepStrictEqual(overlay.itemsByFile, {});
+    assert.deepStrictEqual(overlay.unknownCoverage, []);
+    assert.strictEqual(overlay.filesSeen, 0);
+  });
+
+  test("the panel posts the overlay even when the graph is empty", () => {
+    // The guard that returned early on an empty node set is what stranded the
+    // old badge; pin that it is gone.
+    const src = fs.readFileSync(
+      path.join(__dirname, "..", "..", "graph.js"),
+      "utf8"
+    );
+    const fn = src.indexOf("postDiagnosticsOverlay(force = false)");
+    const body = src.slice(fn, fn + 900);
+    assert.ok(
+      !body.includes("this.renderedNodes.length === 0"),
+      "an empty graph must still be told it is empty"
+    );
+  });
+
+  // P2: the lease is renewed on a timer, not by diagnostics changing.
+  test("the panel renews its lease on an interval and clears it on dispose", () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, "..", "..", "graph.js"),
+      "utf8"
+    );
+    assert.ok(src.includes("leaseRenewal"), "a renewal timer must exist");
+    assert.ok(src.includes("setInterval"), "renewal is time-based");
+    assert.ok(
+      src.includes("clearInterval"),
+      "the timer must be cleared, or it outlives the panel"
+    );
   });
 });
 

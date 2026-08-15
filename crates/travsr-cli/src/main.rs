@@ -699,6 +699,22 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 DaemonAction::Lsp => {
                     match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::LspStatus) {
+                        // A daemon that predates this variant cannot parse the
+                        // message and answers `ok: false` with no `result`
+                        // (`daemon_client.rs` documents that response shape).
+                        // That reached the arm below as `sessions: None` and
+                        // was reported as "no editor attached", which is a
+                        // claim about the editor when the fact is about the
+                        // daemon's version, and sent people hunting through
+                        // extension settings for a problem that did not exist
+                        // (#698 review, P3).
+                        Ok(resp) if !resp.ok => {
+                            println!("daemon: running, but it does not support the editor plane");
+                            println!(
+                                "It was started before this feature existed. Restart it with \
+                                 `travsr daemon restart`."
+                            );
+                        }
                         Ok(resp) => {
                             let v = resp.result.unwrap_or(serde_json::Value::Null);
                             let sessions = v.get("sessions").and_then(|s| s.as_array()).cloned();

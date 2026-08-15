@@ -7451,6 +7451,83 @@ mod tests {
         );
     }
 
+    /// #698 review P1: discovery cannot tell which daemon owns which socket,
+    /// so the client broadcasts and identity is settled here. A report naming
+    /// another repo must be dropped: its paths are keys into a different
+    /// graph, and accepting it makes `travsr daemon lsp` quote files this repo
+    /// does not have.
+    #[test]
+    fn a_report_for_another_repo_is_rejected_not_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        let store = std::sync::Mutex::new(store);
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let sessions = std::sync::Mutex::new(std::collections::HashMap::new());
+
+        let mine = tmp.path().join("repo-a");
+        let theirs = tmp.path().join("repo-b");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+
+        let report = |root: &std::path::Path| {
+            serde_json::to_string(&travsr_ipc::ControlMessage::ReportLspDiagnostics {
+                repo_root: root.to_string_lossy().into_owned(),
+                session: "w1".to_string(),
+                ttl_secs: 900,
+                files: vec![travsr_ipc::message::FileDiagnostics {
+                    path: "src/a.ts".to_string(),
+                    errors: 2,
+                    warnings: 0,
+                }],
+                seen: 1,
+                undiagnosed: 0,
+            })
+            .unwrap()
+        };
+
+        let (resp, _) = handle_control_message(
+            &report(&theirs),
+            &mine,
+            &store,
+            &read_store,
+            &cache,
+            &phase_b_scheduler,
+            &index_tx,
+            &sessions,
+        );
+        assert!(!resp.ok, "a foreign report must be refused: {resp:?}");
+        assert!(
+            sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "a foreign report must not create a session"
+        );
+
+        // The same report for this repo is accepted, so the check rejects by
+        // identity rather than rejecting everything.
+        let (resp, _) = handle_control_message(
+            &report(&mine),
+            &mine,
+            &store,
+            &read_store,
+            &cache,
+            &phase_b_scheduler,
+            &index_tx,
+            &sessions,
+        );
+        assert!(resp.ok, "an own-repo report must be accepted: {resp:?}");
+        assert_eq!(sessions.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+    }
+
     #[test]
     fn reindex_commit_errors_without_stamping_when_git_unavailable() {
         // #405: when neither the commit diff nor the tracked-file fallback can be
@@ -8629,8 +8706,17 @@ pub struct EditorSession {
     /// Of `seen`, how many no provider reported on, so are unknown not clean.
     pub undiagnosed: usize,
     /// When this report stops being believable.
-    pub expires_at: std::time::SystemTime,
-    pub updated_at: std::time::SystemTime,
+    ///
+    /// `Instant`, not `SystemTime` (#698 review, P3): a lease measures elapsed
+    /// time, and `SystemTime` is not monotonic on any platform the daemon runs
+    /// on. An NTP step, a laptop suspend/resume, or a manual clock change
+    /// moves it, which expires every live session at once (forwards) or pins a
+    /// closed window's view well past its lease (backwards). `Instant` is
+    /// monotonic everywhere: QPC on Windows, `CLOCK_MONOTONIC` on Linux,
+    /// `mach_absolute_time` on macOS. It also makes the derived JSON fields
+    /// total rather than fallible, so no arm has to guess with `unwrap_or(0)`.
+    pub expires_at: std::time::Instant,
+    pub updated_at: std::time::Instant,
 }
 
 /// Editors tracked at once. An editor is a person's open window, so the real
@@ -8652,7 +8738,7 @@ const MAX_LEASE_SECS: u64 = 3600;
 fn live_editor_sessions(
     sessions: &std::collections::HashMap<String, EditorSession>,
 ) -> Vec<(&String, &EditorSession)> {
-    let now = std::time::SystemTime::now();
+    let now = std::time::Instant::now();
     let mut live: Vec<_> = sessions
         .iter()
         .filter(|(_, s)| s.expires_at > now)
@@ -8755,14 +8841,31 @@ fn handle_control_message(
             (ControlResponse::ok(None), false)
         }
         Ok(ControlMessage::ReportLspDiagnostics {
+            repo_root: reported_root,
             session,
             ttl_secs,
             files,
             seen,
             undiagnosed,
         }) => {
+            // #698 review P1: the client cannot tell which daemon owns which
+            // socket, so it sends to every candidate and identity is settled
+            // here. A report for another repo is dropped rather than answered:
+            // its paths are keys into a different graph, and accepting it
+            // would make `travsr daemon lsp` quote files this repo does not
+            // have. Normalized through the same helper the socket name is
+            // derived from, so the two cannot disagree about identity.
+            if travsr_ipc::normalize_repo_root(std::path::Path::new(&reported_root))
+                != travsr_ipc::normalize_repo_root(repo_root)
+            {
+                return (
+                    ControlResponse::err("report is for a different repo".to_string()),
+                    false,
+                );
+            }
+
             let mut sessions = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
-            let now = std::time::SystemTime::now();
+            let now = std::time::Instant::now();
 
             // ttl 0 is an explicit detach: the window is closing and says so,
             // rather than leaving its view to rot until the lease runs out.
@@ -8828,7 +8931,7 @@ fn handle_control_message(
             let mut sessions = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
             // Reading is the only moment an expired lease can mislead anyone,
             // so it is also where they are cleared.
-            let now = std::time::SystemTime::now();
+            let now = std::time::Instant::now();
             sessions.retain(|_, s| s.expires_at > now);
 
             let live = live_editor_sessions(&sessions);
@@ -8855,12 +8958,14 @@ fn handle_control_message(
                             "session": id,
                             "seen": s.seen,
                             "undiagnosed": s.undiagnosed,
-                            "age_secs": s.updated_at.elapsed().map(|d| d.as_secs()).unwrap_or(0),
+                            // Total, not fallible: `Instant` arithmetic cannot
+                            // run backwards, so there is no error case to
+                            // guess at with `unwrap_or(0)` (#698 review, P3).
+                            "age_secs": now.duration_since(s.updated_at).as_secs(),
                             "expires_in_secs": s
                                 .expires_at
-                                .duration_since(now)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0),
+                                .saturating_duration_since(now)
+                                .as_secs(),
                             "broken": broken,
                         })
                     })
