@@ -455,10 +455,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Keep this pattern identical to the one in install.sh (search for
+          # certificate-identity-regexp there) and to SECURITY.md's manual
+          # verification command. A pipeline gate must never be looser than the
+          # client it publishes for, or a bundle this job accepts is one the
+          # installer rejects, and the failure surfaces on a user's machine
+          # instead of here. The ref pattern mirrors on.push.tags above; only
+          # the tag-triggered build job signs, and promote reuses those bundles.
           for t in dist/*.tar.gz; do
             cosign verify-blob --bundle "${t}.bundle" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              --certificate-identity-regexp 'https://github.com/Travsr-com/travsr/.github/workflows/release.yml' \
+              --certificate-identity-regexp '^https://github\.com/Travsr-com/travsr/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$' \
               "$t"
           done
 

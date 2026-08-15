@@ -269,7 +269,10 @@ const npmMissing = setDiff(R, N);
 const shellWindows = installShText
   .split("\n")
   .map((line, i) => ({ line, no: i + 1 }))
-  .filter(({ line }) => !line.trim().startsWith("#") && /windows/i.test(line));
+  // Match the triple's infix rather than the bare word, so prose such as an
+  // error message saying "no Windows build" does not hard-fail CI while every
+  // real *-windows-* triple still does.
+  .filter(({ line }) => !line.trim().startsWith("#") && /-windows-/i.test(line));
 const shellExtra = setDiff(S, P);
 const shellMissing = setDiff(P, S);
 

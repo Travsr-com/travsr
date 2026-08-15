@@ -82,7 +82,7 @@ curl -LO "https://github.com/Travsr-com/travsr/releases/download/v${VERSION}/tra
 cosign verify-blob \
   --bundle "travsr-v${VERSION}-${TARGET}.tar.gz.bundle" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --certificate-identity-regexp "https://github.com/Travsr-com/travsr/.github/workflows/release.yml" \
+  --certificate-identity-regexp '^https://github\.com/Travsr-com/travsr/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$' \
   "travsr-v${VERSION}-${TARGET}.tar.gz"
 ```
 

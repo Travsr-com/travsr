@@ -240,11 +240,27 @@ jobs:
 
       # Pins to a fixed older release to prove --version actually installs the
       # requested tag rather than silently falling back to latest (#691).
+      # The pin MUST stay a release that is not `latest`, otherwise "installed
+      # the pinned tag" and "ignored the flag and took latest" are byte-identical
+      # and this step passes either way. The guard below fails loudly if a future
+      # release ever makes v0.10.0 the latest again.
       - name: Install a pinned older version via --version
         run: |
           export TRAVSR_INSTALL_DIR="$RUNNER_TEMP/pinned"
-          cat install.sh | sh -s -- --version v0.11.0
-          [ "$("$RUNNER_TEMP/pinned/travsr" --version)" = "travsr 0.11.0" ]
+          latest=$(curl -fsSLI --proto '=https' --proto-redir '=https' -o /dev/null \
+            -w '%{url_effective}' https://github.com/Travsr-com/travsr/releases/latest)
+          [ "${latest##*/}" != "v0.10.0" ] || { echo "pin v0.10.0 is now latest; repin this test"; exit 1; }
+          cat install.sh | sh -s -- --version v0.10.0
+          [ "$("$RUNNER_TEMP/pinned/travsr" --version)" = "travsr 0.10.0" ]
+
+      # --version "" must fail rather than silently install latest (#691).
+      - name: Reject an empty --version value
+        run: |
+          export TRAVSR_INSTALL_DIR="$RUNNER_TEMP/empty-version"
+          if cat install.sh | sh -s -- --version ""; then
+            echo "install.sh accepted an empty --version and did not fail"; exit 1
+          fi
+          [ ! -e "$RUNNER_TEMP/empty-version/travsr" ]
 
   install-sh-alpine:
     name: "install.sh (alpine musl)"

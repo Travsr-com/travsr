@@ -123,7 +123,8 @@ download_and_verify() {
       err "could not download ${tarball_name} from the latest release (${tag})"
     fi
   fi
-  curl -fsSL --proto '=https' --proto-redir '=https' -o "$tmp/SHA256SUMS" "${base_url}/SHA256SUMS"
+  curl -fsSL --proto '=https' --proto-redir '=https' -o "$tmp/SHA256SUMS" "${base_url}/SHA256SUMS" ||
+    err "could not download SHA256SUMS for release ${tag}; refusing to install unverified"
 
   if command -v sha256sum >/dev/null 2>&1; then
     actual_hash=$(sha256sum "$tmp/${tarball_name}" | awk '{print $1}')
@@ -210,6 +211,11 @@ main() {
     case "$1" in
       --version)
         [ $# -ge 2 ] || err "--version requires an argument, e.g. --version v0.11.0"
+        # An empty value must fail rather than fall through to the latest-release
+        # path: the realistic source is --version "$VAR" in automation with VAR
+        # unset, and silently turning a pinned install into a floating one is the
+        # exact failure mode pinning exists to prevent.
+        [ -n "$2" ] || err "--version requires a non-empty release tag, e.g. --version v0.11.0"
         version="$2"
         shift
         ;;
