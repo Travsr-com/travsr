@@ -700,7 +700,7 @@ const MAX_REFERENCE_SITES: usize = 500;
 const FIND_OUTPUT_LIMIT: usize = 512_000;
 
 /// Resolution outcome for a `find_references` symbol argument.
-enum RefTarget {
+pub(crate) enum RefTarget {
     /// Exactly one definition — enumerate its references.
     Unique(CoreNode),
     /// Multiple definitions and no disambiguating `path` — return the list so the
@@ -806,8 +806,13 @@ fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -
     candidates
 }
 
-/// Helper to map `resolve_symbol_nodes` candidates to a `RefTarget` for find_references.
-fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&str>) -> RefTarget {
+/// Helper to map `resolve_symbol_nodes` candidates to a `RefTarget` for
+/// find_references and `travsr graph` ambiguity resolution (#565 / RFC-002).
+pub(crate) fn resolve_reference_targets(
+    store: &SqliteStore,
+    symbol: &str,
+    path: Option<&str>,
+) -> RefTarget {
     let mut candidates = resolve_symbol_nodes(store, symbol, path);
 
     // C/C++ split a symbol into a header declaration and a source definition
@@ -2432,7 +2437,7 @@ pub fn get_lang_status_global(
 ///
 /// Returns matching symbols formatted as:
 ///   `fn:charge (function) — src/payment.ts`
-pub fn search_symbol(store: &SqliteStore, name: &str) -> String {
+pub fn search_symbol(store: &SqliteStore, name: &str, exact: bool) -> String {
     if let Err(reason) = validate_mcp_arg(name) {
         tracing::warn!("search_symbol rejected invalid arg: {reason}");
         return String::new();
@@ -2442,7 +2447,7 @@ pub fn search_symbol(store: &SqliteStore, name: &str) -> String {
     // repos), but stripping "in rust" from "knapsack in rust" prevents the
     // FTS from matching unrelated files that contain "rust" as a token.
     let (stripped, lang_filter) = infer_language_from_query(name);
-    let raw = search_symbol_raw(store, stripped.as_str(), lang_filter);
+    let raw = search_symbol_raw(store, stripped.as_str(), lang_filter, exact);
     let content = if raw.is_empty() {
         format!("No symbols matching '{name}' found in the graph.")
     } else {
@@ -2518,13 +2523,18 @@ fn infer_language_from_query(query: &str) -> (String, Option<&'static str>) {
     (query.to_owned(), None)
 }
 
-fn search_symbol_raw(store: &SqliteStore, name: &str, lang_filter: Option<&str>) -> String {
+fn search_symbol_raw(
+    store: &SqliteStore,
+    name: &str,
+    lang_filter: Option<&str>,
+    exact: bool,
+) -> String {
     // Cap results: prevents self-DoS from wildcard queries (e.g. "a") and limits
     // accidental bulk exfiltration. The store LIKE query has no SQL LIMIT yet —
     // this Rust-side cap is the guard until that is added at the store layer.
     const MAX_SEARCH_RESULTS: usize = 50;
 
-    let nodes = match store.search_nodes_fuzzy_filtered(name, lang_filter) {
+    let nodes = match store.search_nodes_fuzzy_filtered(name, lang_filter, exact) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("search_symbol error: {e}");
@@ -2537,7 +2547,7 @@ fn search_symbol_raw(store: &SqliteStore, name: &str, lang_filter: Option<&str>)
     // stripping them from the query then filtering by language produces false
     // "no matches" for queries like "C parser" or "go routine".
     let nodes = if nodes.is_empty() && lang_filter.is_some() {
-        match store.search_nodes_fuzzy_filtered(name, None) {
+        match store.search_nodes_fuzzy_filtered(name, None, exact) {
             Ok(n) => n,
             Err(_) => nodes,
         }
@@ -2565,6 +2575,7 @@ pub fn search_symbol_global(
     repos: &HashMap<String, PathBuf>,
     name: &str,
     repo: Option<&str>,
+    exact: bool,
 ) -> String {
     if let Err(reason) = validate_mcp_arg(name) {
         tracing::warn!("search_symbol_global rejected invalid arg: {reason}");
@@ -2577,7 +2588,7 @@ pub fn search_symbol_global(
     let raw = if repo.is_some() {
         // Single-repo path: SEC + stale filtering handled by collect_global.
         collect_global(repos, repo, |store, repo_name, single| {
-            let result = search_symbol_raw(store, search_term, lang_filter);
+            let result = search_symbol_raw(store, search_term, lang_filter, exact);
             if result.is_empty() || single {
                 result
             } else {
@@ -2605,7 +2616,7 @@ pub fn search_symbol_global(
         for (repo_name, db_path) in &candidates {
             match SqliteStore::open_read_only(db_path) {
                 Ok(store) => {
-                    let result = search_symbol_raw(&store, search_term, lang_filter);
+                    let result = search_symbol_raw(&store, search_term, lang_filter, exact);
                     if !result.is_empty() {
                         let count = result.lines().count();
                         let text = if single {
@@ -6479,6 +6490,32 @@ fn get_graph_json_raw(
         node_ids_out.contains(src) && node_ids_out.contains(tgt)
     });
 
+    // #565 / RFC-002 consistency: surface the SAME ambiguity signal the CLI /
+    // daemon `graph_query` path emits, computed via the SAME resolver, so an
+    // agent calling get_graph_json can tell a query resolved to multiple distinct
+    // definitions (and re-query with a narrower symbol / path) rather than
+    // silently receiving a merged multi-root graph. Additive envelope field —
+    // first-party consumers (the graph panel) read only `nodes`/`edges`.
+    let ambiguous_candidates: Vec<serde_json::Value> =
+        if kind_filter.is_empty() && !query.is_empty() {
+            match resolve_reference_targets(store, query, None) {
+                RefTarget::Ambiguous(list) => list
+                    .iter()
+                    .map(|n| {
+                        serde_json::json!({
+                            "signature": n.vname.signature,
+                            "kind": n.kind,
+                            "path": n.vname.path,
+                            "line": n.line,
+                        })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
     // Additive envelope fields (#318 O5/O6) — first-party consumers read only
     // `nodes`/`edges`; the global merge likewise ignores extra keys.
     let mut out = serde_json::json!({
@@ -6486,6 +6523,10 @@ fn get_graph_json_raw(
         "edges": edges_out,
         "coverage": coverage,
     });
+    if !ambiguous_candidates.is_empty() {
+        out["ambiguous"] = serde_json::json!(true);
+        out["candidates"] = serde_json::Value::Array(ambiguous_candidates);
+    }
     if token_budget > 0 {
         out["token_budget"] = serde_json::json!(token_budget);
         out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
@@ -6742,7 +6783,7 @@ mod tests {
     #[test]
     fn search_symbol_no_match_returns_explicit_message() {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
-        let result = search_symbol(&store, "NonExistentSymbol");
+        let result = search_symbol(&store, "NonExistentSymbol", false);
         assert!(
             result.contains("No symbols matching 'NonExistentSymbol' found in the graph."),
             "no-match should return explicit not-found message, got: {result}"
@@ -6756,10 +6797,66 @@ mod tests {
         // Create an empty file-backed store (no nodes).
         drop(travsr_store::SqliteStore::open(&db_path).unwrap());
         let repos: HashMap<String, PathBuf> = [("myrepo".to_string(), db_path)].into();
-        let result = search_symbol_global(&repos, "NonExistentSymbol", None);
+        let result = search_symbol_global(&repos, "NonExistentSymbol", None, false);
         assert!(
             result.contains("No symbols matching 'NonExistentSymbol' found in the graph."),
             "global no-match should return explicit not-found message, got: {result}"
+        );
+    }
+
+    #[test]
+    fn search_symbol_global_exact_mode_filters_substrings() {
+        use travsr_core::{Node, VName};
+        // The global dispatch surface (stdio-global + SSE) must thread `exact`
+        // through to the store the same way the single-repo path does. Guards
+        // against a future refactor dropping the flag on the global variant.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store
+                .put_node(&Node::new(
+                    VName::new("", "", "src/ClassD.rs", "rust", "struct:ClassD"),
+                    "struct",
+                ))
+                .unwrap();
+            store
+                .put_node(&Node::new(
+                    VName::new("", "", "src/ClassD.rs", "rust", "fn:ClassD::method"),
+                    "function",
+                ))
+                .unwrap();
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "",
+                        "",
+                        "src/ClassDConfig.rs",
+                        "rust",
+                        "struct:ClassDConfigurationManager",
+                    ),
+                    "struct",
+                ))
+                .unwrap();
+        }
+        let repos: HashMap<String, PathBuf> = [("myrepo".to_string(), db_path)].into();
+
+        // exact=false: the pure-substring match is still returned.
+        let res_all = search_symbol_global(&repos, "ClassD", Some("myrepo"), false);
+        assert!(res_all.contains("struct:ClassD"), "got: {res_all}");
+        assert!(res_all.contains("fn:ClassD::method"), "got: {res_all}");
+        assert!(
+            res_all.contains("struct:ClassDConfigurationManager"),
+            "global exact=false must keep substring match, got: {res_all}"
+        );
+
+        // exact=true: substring noise is dropped, boundary/exact kept.
+        let res_exact = search_symbol_global(&repos, "ClassD", Some("myrepo"), true);
+        assert!(res_exact.contains("struct:ClassD"), "got: {res_exact}");
+        assert!(res_exact.contains("fn:ClassD::method"), "got: {res_exact}");
+        assert!(
+            !res_exact.contains("struct:ClassDConfigurationManager"),
+            "global exact=true must drop substring match, got: {res_exact}"
         );
     }
 
@@ -6838,7 +6935,7 @@ mod tests {
         )
         .with_line(42);
         store.put_node(&n).unwrap();
-        let result = search_symbol(&store, "bar");
+        let result = search_symbol(&store, "bar", false);
         assert!(
             result.contains("src/foo.rs:42"),
             "search_symbol must emit path:line, got: {result}"
@@ -6854,7 +6951,7 @@ mod tests {
             "function",
         );
         store.put_node(&n).unwrap();
-        let result = search_symbol(&store, "baz");
+        let result = search_symbol(&store, "baz", false);
         assert!(
             result.contains("src/foo.rs"),
             "path must still appear: {result}"
@@ -6934,7 +7031,7 @@ mod tests {
         store.put_node(&ts_node).unwrap();
 
         // "auth handler typescript" should return only the TypeScript node.
-        let result = search_symbol_raw(&store, "auth", Some("typescript"));
+        let result = search_symbol_raw(&store, "auth", Some("typescript"), false);
         assert!(
             result.contains("src/auth.ts"),
             "expected typescript node: {result}"
@@ -6960,7 +7057,7 @@ mod tests {
         store.put_node(&rs_node).unwrap();
         store.put_node(&ts_node).unwrap();
 
-        let result = search_symbol_raw(&store, "auth", None);
+        let result = search_symbol_raw(&store, "auth", None, false);
         assert!(
             result.contains("auth.rs"),
             "rust node must appear: {result}"
@@ -6969,6 +7066,46 @@ mod tests {
             result.contains("auth.ts"),
             "typescript node must appear: {result}"
         );
+    }
+
+    #[test]
+    fn search_symbol_exact_mode_filters_substrings() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let n1 = Node::new(
+            VName::new("", "", "src/ClassD.rs", "rust", "struct:ClassD"),
+            "struct",
+        );
+        let n2 = Node::new(
+            VName::new("", "", "src/ClassD.rs", "rust", "fn:ClassD::method"),
+            "function",
+        );
+        let n3 = Node::new(
+            VName::new(
+                "",
+                "",
+                "src/ClassDConfig.rs",
+                "rust",
+                "struct:ClassDConfigurationManager",
+            ),
+            "struct",
+        );
+
+        store.put_node(&n1).unwrap();
+        store.put_node(&n2).unwrap();
+        store.put_node(&n3).unwrap();
+
+        // exact=false returns all 3
+        let res_all = search_symbol(&store, "ClassD", false);
+        assert!(res_all.contains("struct:ClassD"));
+        assert!(res_all.contains("fn:ClassD::method"));
+        assert!(res_all.contains("struct:ClassDConfigurationManager"));
+
+        // exact=true returns only exact/word-boundary
+        let res_exact = search_symbol(&store, "ClassD", true);
+        assert!(res_exact.contains("struct:ClassD"));
+        assert!(res_exact.contains("fn:ClassD::method"));
+        assert!(!res_exact.contains("struct:ClassDConfigurationManager"));
     }
 
     #[test]
@@ -8567,6 +8704,7 @@ mod tests {
             &store,
             &crate::query::GraphQueryArgs {
                 query: "fn:seed".to_string(),
+                path: None,
                 depth: 2,
                 direction: crate::query::QueryDirection::Deps,
                 edge_mode: crate::query::QueryEdgeMode::All,
@@ -11026,6 +11164,54 @@ mod snippet_tests {
         store.put_node(&cousin).unwrap();
         let raw = get_graph_json(&store, &graph_params("fn:docs_section"));
         assert_eq!(root_count(&raw), 1, "exactly one root expected; got: {raw}");
+    }
+
+    /// #565 / RFC-002 consistency: a query resolving to multiple distinct
+    /// definitions must carry the additive `ambiguous`/`candidates` signal, so an
+    /// agent calling get_graph_json gets the same disambiguation cue the CLI does.
+    #[test]
+    fn get_graph_json_flags_ambiguous_definitions() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "src/a.ts", "typescript", "fn:overloaded"),
+                "function",
+            ))
+            .unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "src/b.ts", "typescript", "fn:overloaded"),
+                "function",
+            ))
+            .unwrap();
+        let raw = get_graph_json(&store, &graph_params("fn:overloaded"));
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["ambiguous"], true, "must flag ambiguity; got: {raw}");
+        let cands = v["candidates"].as_array().expect("candidates array");
+        assert_eq!(cands.len(), 2);
+        assert!(cands.iter().all(|c| c["signature"] == "fn:overloaded"));
+    }
+
+    /// The ambiguity fields are additive: a uniquely-resolving query omits them
+    /// entirely so existing first-party consumers see an unchanged envelope.
+    #[test]
+    fn get_graph_json_no_ambiguous_flag_when_unique() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "src/a.ts", "typescript", "fn:solo"),
+                "function",
+            ))
+            .unwrap();
+        let raw = get_graph_json(&store, &graph_params("fn:solo"));
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            v.get("ambiguous").is_none(),
+            "unique query must not flag ambiguity; got: {raw}"
+        );
+        assert!(v.get("candidates").is_none());
     }
 
     /// With no exact match at either tier, the substring set must survive as

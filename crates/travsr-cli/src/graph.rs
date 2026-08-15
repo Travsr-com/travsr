@@ -66,6 +66,7 @@ impl From<EdgeMode> for QueryEdgeMode {
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     query_str: &str,
+    path: Option<String>,
     depth: u8,
     direction: Direction,
     format: Format,
@@ -83,6 +84,7 @@ pub fn run(
 
     let args = GraphQueryArgs {
         query: query_str.to_string(),
+        path: path.clone(),
         depth,
         direction: direction.into(),
         edge_mode: edge_mode.into(),
@@ -110,9 +112,58 @@ pub fn run(
             }
         };
 
+    if let Some(candidates) = &payload.candidates {
+        let count = candidates.len();
+        let limit = travsr_mcp::AMBIGUOUS_DISPLAY_LIMIT;
+        // The store caps the candidate set (Tier 1 at NODE_EXACT_LOOKUP_LIMIT,
+        // Tier 2 at NODE_NAME_SEARCH_LIMIT), so once we get back more than we
+        // display, `count` is a lower bound, not the true total — hence "at
+        // least {count}" rather than a definite count (#565 / RFC-002).
+        let truncated = count > limit;
+
+        // `graph --format json` is the AI/tooling surface, and disambiguation is
+        // exactly the case where an agent needs to read the options and re-query
+        // with a `--path`. Emit the candidates as JSON on stdout (still a non-zero
+        // exit) so "ambiguous, here are the choices" is machine-distinguishable
+        // from "the command failed". `truncated` marks `count` as a lower bound.
+        if matches!(format, Format::Json) {
+            let out = serde_json::json!({
+                "status": "ambiguous",
+                "count": count,
+                "truncated": truncated,
+                "candidates": candidates,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            anyhow::bail!("ambiguous symbol query");
+        }
+
+        if truncated {
+            eprintln!(
+                "'{query_str}' is ambiguous — showing {limit} of at least {count} definitions. \
+                 Re-run with a `--path` hint to pick one:"
+            );
+        } else {
+            eprintln!(
+                "'{query_str}' is ambiguous — {count} definitions. Re-run with a `--path` hint to pick one:"
+            );
+        }
+        for n in candidates.iter().take(limit) {
+            let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+            eprintln!("  {} ({}) — {}{}", n.signature, n.kind, n.path, loc);
+        }
+        if truncated {
+            eprintln!("[truncated: additional filtering/narrowing is required]");
+        }
+        anyhow::bail!("ambiguous symbol query");
+    }
+
     if payload.seed.is_none() {
-        println!("no symbols matching '{query_str}'");
-        return Ok(());
+        if let Some(p) = path {
+            anyhow::bail!("no matching definition found for '{query_str}' in path '{p}'");
+        } else {
+            println!("no symbols matching '{query_str}'");
+            return Ok(());
+        }
     }
 
     // C3: a manifest/config file has no inbound edges — no source file depends on

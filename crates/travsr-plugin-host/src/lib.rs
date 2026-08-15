@@ -16,6 +16,7 @@ pub mod plugins;
 pub mod registry;
 pub mod resolver;
 pub mod sandbox;
+pub mod sidecar_version;
 mod stderr_ring;
 pub mod supervisor;
 pub mod transport;
@@ -43,6 +44,10 @@ pub use phase_b::{
 };
 pub use registry::probe_sandbox;
 pub use sandbox::policy::{SandboxPolicy, SandboxUnavailable};
+pub use sidecar_version::{
+    below_floor_message, floor_status, installed_version, read_cached_latest, unreadable_message,
+    write_cached_latest, FloorStatus, Semver, SidecarSpec,
+};
 pub use transport::{InProcess, PluginHealth, Sidecar, Transport};
 
 /// Native Windows process-liveness probe (`OpenProcess` +

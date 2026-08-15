@@ -23,6 +23,7 @@ mod repo;
 mod repos;
 mod rerank;
 mod serve;
+mod sidecar_health;
 mod status;
 mod synonym;
 
@@ -153,6 +154,9 @@ enum Command {
     Graph {
         /// Symbol or file name to start from. Mutually exclusive with --all.
         query: Option<String>,
+        /// Exact path of the definition file to resolve ambiguity.
+        #[arg(long)]
+        path: Option<String>,
         /// Dump the entire indexed repository graph.
         #[arg(long)]
         all: bool,
@@ -923,6 +927,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => pattern::run(&pattern, scope, fixed, format)?,
         Command::Graph {
             query,
+            path,
             all,
             depth,
             direction,
@@ -933,9 +938,16 @@ async fn run(cli: Cli) -> Result<()> {
         } => match (all, query.as_deref()) {
             (true, Some(_)) => anyhow::bail!("--all and a query are mutually exclusive"),
             (true, None) => graph::run_all(format, budget)?,
-            (false, Some(q)) => {
-                graph::run(q, depth, direction, format, edges, include_noise, budget)?
-            }
+            (false, Some(q)) => graph::run(
+                q,
+                path,
+                depth,
+                direction,
+                format,
+                edges,
+                include_noise,
+                budget,
+            )?,
             (false, None) => anyhow::bail!("provide a symbol/file query or pass --all"),
         },
         Command::HookRun {
@@ -1886,6 +1898,67 @@ pub(crate) fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, dela
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC-025 §5.5 honesty test (b): a declared floor may never sit above what
+    /// users can actually install. For every catalog spec with a real floor
+    /// (`min_version > 0.0.0`), the latest released tag must be `>= min_version`.
+    ///
+    /// Network test, skippable offline: any fetch failure (no network, rate
+    /// limit) skips that spec rather than failing, so CI without egress is green.
+    #[test]
+    fn declared_floor_never_exceeds_latest_release() {
+        use travsr_plugin_host::sidecar_version::{Semver, SidecarSpec};
+
+        let mut checked = 0usize;
+        let mut check = |spec: &dyn SidecarSpec| {
+            let floor = spec.min_version();
+            if floor == Semver::ZERO {
+                return; // no active floor -> trivially satisfied
+            }
+            let repo = spec.github_repo().to_string();
+            let Ok(tag) = crate::lang::run_async(async move {
+                crate::install::fetch_latest_version_for_repo(&repo).await
+            }) else {
+                eprintln!(
+                    "skipping floor<=latest for {} (fetch failed - offline?)",
+                    spec.install_name()
+                );
+                return;
+            };
+            let Some(latest) = Semver::parse(&tag) else {
+                eprintln!(
+                    "skipping {}: latest tag '{tag}' unparseable",
+                    spec.install_name()
+                );
+                return;
+            };
+            assert!(
+                floor <= latest,
+                "{}: declared floor {floor} is above the latest release {latest} - users cannot satisfy it",
+                spec.install_name(),
+            );
+            checked += 1;
+        };
+
+        for b in travsr_plugin_host::embed_backends() {
+            check(b);
+        }
+        // Phase B specs all declare Semver::ZERO today, so they are skipped by
+        // the guard above; the loop keeps the test correct if a floor is added.
+        for e in travsr_plugin_host::phase_b::catalog::CATALOG {
+            use travsr_plugin_host::phase_b::catalog::ScipInstall;
+            match &e.scip_install {
+                ScipInstall::GithubBinary(s) => check(s),
+                ScipInstall::ZipBinary(z) => check(z),
+                _ => {}
+            }
+        }
+
+        // Not an assertion on `checked` > 0: fully offline CI legitimately checks
+        // nothing. The value is that when the network IS present, a floor set
+        // above the latest release fails loudly.
+        let _ = checked;
+    }
 
     #[test]
     fn daemon_is_running_returns_false_when_no_daemon() {
