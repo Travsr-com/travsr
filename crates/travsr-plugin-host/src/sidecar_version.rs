@@ -278,15 +278,24 @@ fn read_version(bin: &Path, live: Option<&str>) -> ProbeOutcome {
     // is a coursier launcher whose `--version` prints `0.0.0` even when a specific
     // tagged release was installed (the version is only in the downloaded asset
     // name, `scip-java-<tag>`). `travsr lang install` records the resolved version
-    // in a `<bin>.version` sidecar file; prefer it so status shows the real one.
-    if let Some(s) = read_version_file(bin) {
-        return ProbeOutcome::Parsed(s);
-    }
+    // in a `<bin>.version` sidecar file; consult it ONLY when the live probe emits
+    // that `0.0.0` "unset" sentinel.
+    //
+    // Deliberately not consulted for any other outcome (PR #715 review): the file
+    // is written once at install time and never re-checked against the binary, so
+    // preferring it wholesale would let it go stale the moment the binary changes
+    // by any other path (package manager, manual download, symlink swap). A stale
+    // file naming a NEWER version than a below-floor binary would then pass the
+    // RFC-025 floor gate that exists precisely to catch it (#701). Consulting it
+    // only on the sentinel keeps the honest `--version` of every other tool
+    // authoritative, and the file can never assert freshness the probe contradicts.
     match probe_version_bounded(bin, VERSION_PROBE_TIMEOUT) {
-        // A probed `0.0.0` is the "unset" sentinel these launchers emit, never a
-        // real release. Report it as unreadable rather than a bogus `0.0.0 ok`
-        // that misrepresents an installed tool (#712).
-        ProbeOutcome::Parsed(s) if s == Semver::new(0, 0, 0) => ProbeOutcome::Unreadable,
+        // The coursier launcher's "unset" sentinel: fall back to what the installer
+        // recorded, and treat a missing/unparseable file as unreadable rather than
+        // reporting a bogus `0.0.0 ok` that misrepresents an installed tool (#712).
+        ProbeOutcome::Parsed(s) if s == Semver::new(0, 0, 0) => {
+            read_version_file(bin).map_or(ProbeOutcome::Unreadable, ProbeOutcome::Parsed)
+        }
         other => other,
     }
 }
@@ -295,6 +304,12 @@ fn read_version(bin: &Path, live: Option<&str>) -> ProbeOutcome {
 /// (and the embed installer), holding the resolved release tag for a tool whose
 /// own `--version` is unreliable. Returns the parsed version, or `None` when the
 /// file is absent or unparseable.
+///
+/// Consulted by [`read_version`] ONLY when the live `--version` probe returns the
+/// `0.0.0` "unset" sentinel (the scip-java coursier launcher). It is never
+/// preferred over an honest probe, because it is written once at install time and
+/// never re-validated against the binary — see the narrowing note in
+/// [`read_version`].
 fn read_version_file(bin: &Path) -> Option<Semver> {
     let name = bin.file_name()?;
     let mut fname = name.to_os_string();
@@ -853,6 +868,56 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(10),
             "probe must be bounded by its deadline, took {elapsed:?}"
+        );
+    }
+
+    /// PR #715: the `<bin>.version` installer file must NOT override an honest
+    /// `--version`, only the `0.0.0` coursier sentinel. A stale file naming a
+    /// newer version than a below-floor binary would otherwise pass the floor gate
+    /// it exists to catch (#701). Exercised through `read_version` (live=None
+    /// forces the probe) with a real script binary + a sidecar file on disk.
+    #[cfg(unix)]
+    #[test]
+    fn version_file_consulted_only_on_the_sentinel() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let write_bin = |name: &str, version_line: &str| {
+            let bin = dir.path().join(name);
+            let mut f = std::fs::File::create(&bin).unwrap();
+            writeln!(f, "#!/bin/sh\necho '{version_line}'").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            bin
+        };
+        let write_side = |bin: &Path, tag: &str| {
+            std::fs::write(version_sidecar_path(bin).unwrap(), tag).unwrap();
+        };
+
+        // Honest probe + a stale sidecar file naming a DIFFERENT (newer) version:
+        // the probe wins, the file is ignored. This is the #701-with-a-lock guard.
+        let honest = write_bin("honest-tool", "honest-tool 1.4.2");
+        write_side(&honest, "v9.9.9");
+        assert!(
+            matches!(read_version(&honest, None), ProbeOutcome::Parsed(v) if v == Semver::new(1, 4, 2)),
+            "an honest --version must not be overridden by the .version file"
+        );
+
+        // Coursier sentinel `0.0.0` + a sidecar file: the file is consulted and
+        // supplies the real resolved release (the scip-java case #712 fixes).
+        let launcher = write_bin("launcher-tool", "launcher-tool 0.0.0");
+        write_side(&launcher, "scip-java-0.12.3");
+        assert!(
+            matches!(read_version(&launcher, None), ProbeOutcome::Parsed(v) if v == Semver::new(0, 12, 3)),
+            "a 0.0.0 sentinel must fall back to the recorded .version file"
+        );
+
+        // Sentinel with NO sidecar file: unreadable, never a bogus `0.0.0 ok`.
+        let bare = write_bin("bare-launcher", "bare-launcher 0.0.0");
+        assert!(
+            matches!(read_version(&bare, None), ProbeOutcome::Unreadable),
+            "a 0.0.0 sentinel with no recorded file must be unreadable"
         );
     }
 

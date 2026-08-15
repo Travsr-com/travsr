@@ -3317,11 +3317,14 @@ fn run_background_phase_b_inner(
     // is recorded in `phase_b_warnings` (stamped by write_phase_b_results) so
     // `travsr status` reports `partial (crashed: <lang>)` and the query tools
     // stop emitting the "building in the background" note that previously never
-    // resolved. Only a total failure (nothing ran at all) leaves the marker
-    // behind, so the all-crash retry cap can keep trying until the missing tools
-    // are installed. A persistently crashing language is retried on the next
-    // commit or an explicit `travsr reindex --semantic --force`, not on an
-    // endless background loop.
+    // resolved. The marker is left behind ONLY when a language crashed AND nothing
+    // else made progress (`!crashed.is_empty()` with both `ran` and `lsif_edges`
+    // empty), so the all-crash retry cap can keep trying that broken sidecar until
+    // its tool is fixed. The no-op case — nothing ran and nothing crashed, e.g. no
+    // analyzer is installed for any language in this repo — stamps the marker,
+    // because there is nothing to wait for. A persistently crashing language is
+    // retried on the next commit or an explicit `travsr reindex --semantic
+    // --force`, not on an endless background loop.
     let made_progress =
         report.crashed.is_empty() || !report.ran.is_empty() || !lsif_edges.is_empty();
     if made_progress {

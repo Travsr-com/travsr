@@ -468,6 +468,43 @@ pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
 }
 
 /// Raw (unsanitized) variant used by global aggregation.
+/// PR #715: whether the last Phase B run for `lang` crashed, per the
+/// `phase_b_warnings` meta (comma-separated `class:lang[:extra]` entries; a crash
+/// is `crashed:<lang>`, the same wording the CLI/`get_index_status` decode).
+///
+/// Since #712 a single crashing sidecar no longer pins the whole repo's
+/// completion marker behind HEAD: healthy languages advance and the query tools
+/// stop emitting the "building in the background" note. The cost is that a
+/// language that crashed *after* emitting some occurrences leaves partial
+/// coverage while the marker reads complete, so `get_callers` / `find_references`
+/// for a symbol in that language can return a confident answer that is silently
+/// short — the reference gate keys on whether the language has *any* occurrences,
+/// not on whether the run that produced them finished. Callers append a one-line
+/// caveat (they do not abstain — a partial answer is still useful) so the note is
+/// attached to exactly the answers that might be incomplete.
+fn phase_b_lang_crashed(store: &SqliteStore, lang: &str) -> bool {
+    store
+        .get_meta("phase_b_warnings")
+        .ok()
+        .flatten()
+        .is_some_and(|warnings| {
+            warnings.split(',').any(|entry| {
+                let mut parts = entry.splitn(3, ':');
+                parts.next() == Some("crashed") && parts.next() == Some(lang)
+            })
+        })
+}
+
+/// The one-line caveat appended to a get_callers / find_references answer when
+/// [`phase_b_lang_crashed`] holds for the target language.
+fn crash_caveat(lang: &str) -> String {
+    format!(
+        "note: semantic analysis for '{lang}' crashed on its last run, so these \
+         results may be incomplete. Run `travsr status` for detail or `travsr init \
+         --semantic --force` to rebuild."
+    )
+}
+
 fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
     use travsr_core::EdgeKind;
 
@@ -548,6 +585,12 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
             "{tag} {} ({}) — {}{}",
             src_node.vname.signature, src_node.kind, src_node.vname.path, loc
         ));
+    }
+    // #715: a crash in this language's last Phase B run leaves partial coverage
+    // while the marker reads complete, so this list may be missing callers in the
+    // un-indexed files. Attach the caveat to the confident (non-empty) answer.
+    if !lines.is_empty() && phase_b_lang_crashed(store, &seed.vname.language) {
+        lines.push(crash_caveat(&seed.vname.language));
     }
     lines.join("\n")
 }
@@ -916,6 +959,11 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
             if total > shown {
                 lines.push(format!("[truncated: showing {shown} of {total} sites]"));
             }
+            // #715: a crashed last run leaves partial coverage under a complete
+            // marker, so this occurrence list may be short.
+            if phase_b_lang_crashed(store, &target.vname.language) {
+                lines.push(crash_caveat(&target.vname.language));
+            }
             lines.join("\n")
         }
         Ok(_) => {
@@ -953,6 +1001,19 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // ref/call edges exist for this node. #299 M1: three very different
         // situations reach here and must not read identically.
         let lang = &target.vname.language;
+        // #715: a crashed last Phase B run for this language leaves partial
+        // coverage under a marker that reads complete, so a zero here is not a
+        // definitive zero regardless of the per-file / language-wide coverage
+        // gates below — those key on whether occurrences exist, not on whether the
+        // run finished. Soften first so a crash is never reported as a clean zero.
+        if phase_b_lang_crashed(store, lang) {
+            return format!(
+                "{header}\n0 recorded reference(s) — not a definitive zero. Semantic \
+                 analysis for '{lang}' crashed on its last run, so its occurrence \
+                 coverage is partial. Run `travsr status` for detail, `travsr init \
+                 --semantic --force` to rebuild, or `find_pattern` for a textual search."
+            );
+        }
         let index_built_for_lang = store.language_has_edge_sites(lang).unwrap_or(false);
         if !index_built_for_lang {
             // The occurrence index was never populated for this language —
@@ -1048,6 +1109,11 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         "{total} caller definition(s) (exact occurrence lines unavailable for this language — showing caller definitions):"
     ));
     lines.extend(sites.into_iter().take(MAX_REFERENCE_SITES));
+    // #715: these structural caller definitions can also be short if the
+    // language's last Phase B run crashed before indexing every file.
+    if phase_b_lang_crashed(store, &target.vname.language) {
+        lines.push(crash_caveat(&target.vname.language));
+    }
     lines.join("\n")
 }
 
@@ -6832,6 +6898,108 @@ mod tests {
         assert_eq!(
             result, "<travsr-data></travsr-data>",
             "absolute path in repo arg must be rejected and return empty envelope"
+        );
+    }
+
+    // ── #715: crashed-language caveat ─────────────────────────────────────────
+
+    /// The `phase_b_warnings` parser matches a whole `crashed:<lang>` entry, not a
+    /// prefix or a different warning class for the same language.
+    #[test]
+    fn phase_b_lang_crashed_matches_exact_class_and_lang() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store
+            .set_meta(
+                "phase_b_warnings",
+                "skipped_no_analyzer:php,crashed:objectivec",
+            )
+            .unwrap();
+        assert!(phase_b_lang_crashed(&store, "objectivec"));
+        // A different warning class for the same language is not a crash.
+        assert!(!phase_b_lang_crashed(&store, "php"));
+        // Not a substring match: `objc` must not match `objectivec`.
+        assert!(!phase_b_lang_crashed(&store, "objc"));
+        // No warnings at all → false.
+        store.set_meta("phase_b_warnings", "").unwrap();
+        assert!(!phase_b_lang_crashed(&store, "objectivec"));
+    }
+
+    /// #715: get_callers must attach the incompleteness caveat when the target
+    /// language crashed on its last Phase B run, and must not otherwise.
+    #[test]
+    fn get_callers_caveats_a_crashed_language() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("c", "", "svc.rs", "rust", "fn:charge"),
+            "function",
+        );
+        let caller = Node::new(
+            VName::new("c", "", "main.rs", "rust", "fn:process"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+
+        // Clean run: a confident caller list, no caveat.
+        let clean = get_callers_raw(&store, "charge");
+        assert!(
+            clean.contains("fn:process"),
+            "caller must be listed: {clean}"
+        );
+        assert!(
+            !clean.contains("crashed on its last run"),
+            "no caveat without a crash: {clean}"
+        );
+
+        // The language crashed: the same answer now carries the caveat.
+        store.set_meta("phase_b_warnings", "crashed:rust").unwrap();
+        let crashed = get_callers_raw(&store, "charge");
+        assert!(
+            crashed.contains("fn:process"),
+            "caller still listed: {crashed}"
+        );
+        assert!(
+            crashed.contains("semantic analysis for 'rust' crashed on its last run"),
+            "a crashed language must carry the incompleteness caveat: {crashed}"
+        );
+    }
+
+    /// #715: find_references' primary occurrence path carries the caveat too, so a
+    /// partial post-crash occurrence list is never presented as authoritative.
+    #[test]
+    fn find_references_caveats_a_crashed_language() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("c", "", "svc.rs", "rust", "fn:charge"),
+            "function",
+        );
+        let caller = Node::new(
+            VName::new("c", "", "main.rs", "rust", "fn:process"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 12)])
+            .unwrap();
+
+        let clean = find_references_raw(&store, "charge", None);
+        assert!(clean.contains("reference(s)"), "sites listed: {clean}");
+        assert!(
+            !clean.contains("crashed on its last run"),
+            "no caveat clean: {clean}"
+        );
+
+        store.set_meta("phase_b_warnings", "crashed:rust").unwrap();
+        let crashed = find_references_raw(&store, "charge", None);
+        assert!(
+            crashed.contains("semantic analysis for 'rust' crashed on its last run"),
+            "crashed language caveat on the occurrence path: {crashed}"
         );
     }
 
