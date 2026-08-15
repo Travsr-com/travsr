@@ -93,8 +93,12 @@ const GUIDE_TITLE: &str = "Use Travsr first for all code questions";
 /// rather than listing signatures, because the agent already receives the full
 /// schemas from `tools/list`, what it lacks is the routing.
 ///
-/// Mirrors the tool set advertised by `travsr-mcp`'s `tools_list`. When a tool is
-/// added or renamed there, update this table.
+/// Mirrors the tool set advertised by `travsr-mcp`'s **single-repo** `tools_list`,
+/// which is what the command we write (`travsr mcp --stdio`, no `--global`)
+/// serves. That session is bound to one `graph.db`, so none of these tools takes
+/// a `repo` argument and every schema is closed (`additionalProperties: false`).
+/// The multi-repo surface behind `travsr mcp --global` is a different tool list.
+/// When a tool is added or renamed in single-repo mode, update this table.
 fn guide_body() -> String {
     "This repository is indexed by Travsr, a code graph served over MCP. For ANY \
 question about where code lives or how it connects (definitions, call sites, \
@@ -106,23 +110,22 @@ Pick the tool by the question:
 
 | question                          | tool                                        |
 | --------------------------------- | ------------------------------------------- |
-| where is X defined?               | search_symbol(name, repo)                   |
-| what does X actually look like?   | get_snippets(symbols, repo)                 |
-| who calls X?                      | get_callers(symbol, repo)                   |
-| every use site of X?              | find_references(symbol, repo)               |
+| where is X defined?               | search_symbol(name, exact)                  |
+| what does X actually look like?   | get_snippets(symbols, mode)                 |
+| who calls X?                      | get_callers(symbol)                         |
+| every use site of X?              | find_references(symbol, path)               |
 | what does this file import?       | get_dependencies(file, transitive)          |
-| what breaks if I change this?     | get_blast_radius(file)                      |
+| what breaks if I change this?     | get_blast_radius(file, analysis)            |
 | how does A reach B?               | get_execution_path(source, sink)            |
-| what is in this repo?             | get_repo_map(repo)                          |
-| open-ended \"how does X work?\"     | get_context(query, repo, include_snippets)  |
-| text or regex search              | find_pattern(pattern, repo, scope)          |
-| which repos are indexed?          | repos_list()                                |
+| what is in this repo?             | get_repo_map()                              |
+| open-ended \"how does X work?\"     | get_context(query, include_snippets)        |
+| text or regex search              | find_pattern(pattern, scope, fixed)         |
 | is the index fresh?               | get_index_status(), get_graph_health()      |
 
 Rules:
 
-1. Pass `repo` on every call. The server can hold several repos at once, and \
-   omitting it fans the query out across all of them. `repos_list()` names them.
+1. This server is bound to this repository alone, so no tool takes a `repo` \
+   argument. Every schema is closed, pass only the arguments named above.
 2. Start open-ended questions with get_context, not with a file read. Set \
    include_snippets=true and it returns the source inline, so there is no \
    follow-up read at all.
@@ -1288,7 +1291,6 @@ mod tests {
             "get_repo_map",
             "get_context",
             "find_pattern",
-            "repos_list",
         ] {
             assert!(body.contains(tool), "guidance is missing {tool}");
         }
@@ -1296,12 +1298,35 @@ mod tests {
         assert!(!body.contains("get_graph("));
     }
 
+    /// `plan()` wires `travsr mcp --stdio` with no `--global`, which is
+    /// single-repo mode. There, exactly one tool (`get_snippets`) even declares
+    /// `repo`, and its own description scopes it to "global / multi-repo mode
+    /// only"; every other schema is closed, so a `repo` argument is not part of
+    /// the contract. Guidance that tells the agent to pass one on every call
+    /// puts a rejected argument on every question it asks.
     #[test]
-    fn guide_tells_the_agent_to_scope_by_repo() {
-        // The server can serve several repos at once; an unscoped call returns
-        // cross-repo noise, which is the top cause of bad answers.
-        assert!(guide_body().contains("repo"));
-        assert!(guide_body().contains("repos_list"));
+    fn guide_does_not_promise_a_repo_argument() {
+        let body = guide_body();
+        for bad in ["(repo", ", repo)", ", repo,"] {
+            assert!(
+                !body.contains(bad),
+                "guidance passes `repo`, which `travsr mcp --stdio` does not take: {bad}"
+            );
+        }
+        // repos_list is a global-registry tool; in a repo-scoped session it
+        // answers a question the agent never needs to ask.
+        assert!(!body.contains("repos_list"));
+    }
+
+    /// The command written into every tool config must stay single-repo. Adding
+    /// `--global` would silently widen a project-scoped config into one that
+    /// serves every repo on the machine, and would invalidate the guidance above.
+    #[test]
+    fn wired_command_is_single_repo_stdio() {
+        assert_eq!(
+            McpCommand::resolve().args,
+            vec!["mcp".to_string(), "--stdio".to_string()]
+        );
     }
 
     #[test]

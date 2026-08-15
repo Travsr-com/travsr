@@ -110,18 +110,29 @@ args `["mcp", "--stdio"]`. Shared helpers:
 
   A question-to-tool table covering search_symbol, get_snippets, get_callers,
   find_references, get_dependencies, get_blast_radius, get_execution_path,
-  get_repo_map, get_context, find_pattern, repos_list, and the index-health
-  tools, followed by five rules: always pass `repo`; open with get_context
-  (include_snippets=true) rather than a file read; prefer find_pattern over raw
-  grep; read a whole file only once Travsr has named it; fall back to text
-  search only when Travsr returns nothing or reports a stale index.
+  get_repo_map, get_context, find_pattern, and the index-health tools,
+  followed by five rules: this session is bound to one repo, so no tool takes a
+  `repo` argument; open with get_context (include_snippets=true) rather than a
+  file read; prefer find_pattern over raw grep; read a whole file only once
+  Travsr has named it; fall back to text search only when Travsr returns nothing
+  or reports a stale index.
   ```
+
+  The signatures in the table are the **single-repo** ones, because the command
+  we write is `travsr mcp --stdio` with no `--global`. That server serves the
+  single-repo `tools_list`, where every schema is closed
+  (`additionalProperties: false`) and only `get_snippets` even declares `repo`,
+  its own description scoping it to global mode. Guidance written against the
+  multi-repo surface would put a rejected argument on every call the agent makes,
+  so the two tool lists must not be conflated. `repos_list` is likewise omitted:
+  it exists to discover names for a `repo` argument this mode does not take.
 
   The table is the routing the agent lacks. It is not a copy of the tool
   schemas, which the agent already receives from `tools/list`. The exact wording
-  lives in `guide_body()` in `crates/travsr-cli/src/connect.rs`, and a unit test
-  pins the tool names in it against the set `travsr-mcp` actually serves, so the
-  directive cannot drift into naming a tool that does not exist.
+  lives in `guide_body()` in `crates/travsr-cli/src/connect.rs`. Unit tests pin
+  the tool names against the set `travsr-mcp` serves, assert the directive never
+  promises a `repo` argument, and assert the wired args stay `["mcp", "--stdio"]`,
+  so neither half of that pairing can drift without the other.
 
   Adapters that support priority/always-on flags set them (Cursor
   `alwaysApply: true`; the directive lives in the tool's auto-loaded instruction
