@@ -59,8 +59,11 @@ and there each tool above gains a `repo` parameter. In that mode, omitting it
 fans the query across all repos and buries the answer in cross-repo noise: call
 repos_list() once at the start of a task, then pass `repo` on every call.
 
-If you are unsure which mode you have, read the tool schemas from tools/list:
-`repo` is present in exactly one of them.
+If you are unsure which mode you have, read the schema of get_callers from
+tools/list. It takes `repo` in global mode and only `symbol` in single-repo
+mode. Do not generalise from get_snippets: it declares `repo` in BOTH schemas
+and rules it out for single-repo in its description rather than its schema, so
+it is the one tool that cannot tell the two modes apart.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WHAT A NODE IS

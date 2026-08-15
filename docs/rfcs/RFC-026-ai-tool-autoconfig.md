@@ -217,6 +217,35 @@ principal-security-engineer sign-off before leaving Proposed**.
   the managed-block writer refuses malformed/duplicate markers so a crafted host
   file cannot trick it into deleting or preserving attacker content.
 
+### Standing exception: Zed's server entry is committable
+
+"No committed MCP configs by default" is not absolute, and the one exception
+belongs here rather than only in a code comment.
+
+Zed keeps context servers in `.zed/settings.json`, its **general** project
+settings file, alongside editor preferences the user wrote and expects to commit.
+Git-ignoring that file to protect one key would take the rest of their settings
+out of version control with it, so the adapter writes `context_servers.travsr`
+there and leaves the file tracked. `only_mcp_server_files_are_gitignored` encodes
+the exception explicitly so it cannot be reintroduced by accident.
+
+The consequence is real and should be weighed at sign-off: for a Zed repo, the
+travsr server definition is committed, and anyone cloning gets a server entry
+that auto-loads under whatever consent model their Zed build applies. The
+mitigating difference from the vector described above is that the command is the
+bare `travsr` rather than an attacker-chosen executable, so the exposure is
+"a cloner runs their own travsr" rather than arbitrary code.
+
+Gemini CLI's `.gemini/settings.json` is the same class of file and is resolved
+the **opposite** way (git-ignored). The asymmetry is deliberate but weakly
+grounded: Gemini's project settings file is far more often travsr-only in
+practice, while Zed's routinely carries unrelated user config. Note also that
+git-ignoring a path git already tracks does nothing, so for a repo that already
+commits `.gemini/settings.json` the Gemini treatment silently degrades to the Zed
+one. `travsr connect` now detects that case and warns instead of printing the
+local-only claim. **Open question for sign-off: should both be committable with a
+warning, both ignored, or the split kept as-is?**
+
 ## Alternatives Considered
 
 **Commit MCP configs by default.** Rejected: being committable is exactly what
