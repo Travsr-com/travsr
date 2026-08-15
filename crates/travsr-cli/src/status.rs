@@ -60,8 +60,17 @@ fn head_at(cwd: &std::path::Path) -> Option<String> {
 
 pub fn run() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
-    let head = head_at(&cwd);
+    // `head_at` and `find_git_root` are independent, bounded git queries on the
+    // same `cwd` (the latter only shells out in the linked-worktree branch, via
+    // `main_worktree_root`). Run concurrently rather than sequentially: with a
+    // wedged git, sequential calls each pay their own `GIT_QUERY_TIMEOUT`, so
+    // this command could stall for up to 2x the bound instead of 1x.
+    let head_handle = {
+        let cwd = cwd.clone();
+        std::thread::spawn(move || head_at(&cwd))
+    };
     let repo_root = find_git_root(&cwd)?;
+    let head = head_handle.join().ok().flatten();
 
     let db_path = repo_root.join(".travsr").join("graph.db");
 

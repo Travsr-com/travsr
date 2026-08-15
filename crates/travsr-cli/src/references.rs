@@ -48,8 +48,18 @@ pub fn run(symbol: &str, path: Option<String>, format: OutputFormat) -> anyhow::
     let cwd = std::env::current_dir().context("getting current directory")?;
     // #661 WS-D: read HEAD at cwd before the worktree redirect so a drifted
     // checkout is compared against the served index below.
-    let head = head_at(&cwd);
+    //
+    // Run concurrently with `find_git_root` below: both are independent,
+    // bounded git queries on `cwd` (the latter only shells out in the
+    // linked-worktree branch, via `main_worktree_root`). Sequentially, a wedged
+    // git would let this command stall for up to 2x `GIT_QUERY_TIMEOUT` instead
+    // of 1x. Mirrors `status::run`.
+    let head_handle = {
+        let cwd = cwd.clone();
+        std::thread::spawn(move || head_at(&cwd))
+    };
     let repo_root = find_git_root(&cwd)?;
+    let head = head_handle.join().ok().flatten();
     let db_path = repo_root.join(".travsr/graph.db");
     if !db_path.exists() {
         anyhow::bail!("not initialized — run `travsr init`");
