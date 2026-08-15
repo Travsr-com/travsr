@@ -1,0 +1,43 @@
+name: lang release drift
+
+# #588 / #576: the CLI constructs travsr-lang wrapper asset names from its own
+# target map; travsr-lang's release workflow decides what actually gets
+# published. Neither repo's CI can see the other, so the two drifted apart
+# unnoticed — the CLI offered Windows wrappers no tag ever shipped, and every
+# `travsr lang install` on Windows ended in a raw 404.
+#
+# This asks the live release what it published and fails if any asset the
+# installer would request is absent.
+
+on:
+  schedule:
+    # Weekly, Monday 06:00 UTC — a release can only drift when one is cut, and
+    # a nightly run would mostly re-prove the same inventory.
+    - cron: '0 6 * * 1'
+  pull_request:
+    paths:
+      - 'crates/travsr-cli/src/install.rs'
+      - 'crates/travsr-plugin-host/src/phase_b/catalog.rs'
+      - '.github/workflows/lang-release-drift.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: CLI asset names vs travsr-lang release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: compare expected wrapper assets against the latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo test -p travsr-cli --bin travsr -- --ignored --exact --nocapture \
+            install::tests::wrapper_release_drift

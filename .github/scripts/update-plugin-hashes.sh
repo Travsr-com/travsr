@@ -35,7 +35,12 @@ trap 'rm -f "$TMP"' EXIT
         # contributor's shell locale; see the matching comment in check-plugin-hashes.sh.
         # Must stay identical to the `sort` there or this script emits a lock file that
         # gate immediately rejects.
-        hash=$(find "$src_dir" -type f -name "*.rs" | LC_ALL=C sort | while IFS= read -r f; do cat -- "$f"; done | $SHA256 | awk '{print $1}')
+        #
+        # `tr -d '\r'` likewise: on Windows (core.autocrlf=true) the working tree is
+        # CRLF while CI is LF, so without it this script rewrites every crate's hash
+        # — including untouched crates — and the gate rejects the whole file. No-op on
+        # LF content; see the fuller note in check-plugin-hashes.sh.
+        hash=$(find "$src_dir" -type f -name "*.rs" | LC_ALL=C sort | while IFS= read -r f; do cat -- "$f"; done | tr -d '\r' | $SHA256 | awk '{print $1}')
         echo "$crate = $hash"
         echo "Updated: $crate = ${hash:0:16}..." >&2
     done
