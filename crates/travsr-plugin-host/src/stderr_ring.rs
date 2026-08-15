@@ -31,7 +31,7 @@ impl StderrRing {
         let buf = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LINES)));
         let buf_w = Arc::clone(&buf);
         let handle = std::thread::Builder::new()
-            .name("embed-stderr".into())
+            .name("sidecar-stderr".into())
             .spawn(move || {
                 let rdr = BufReader::new(stderr);
                 for line in rdr.lines().map_while(Result::ok) {

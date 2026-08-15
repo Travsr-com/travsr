@@ -83,7 +83,7 @@ pub struct Sidecar {
     #[allow(dead_code)]
     plugin_version: String,
     /// None for stub instances (P5-S1 compatibility).
-    #[allow(dead_code)] // held for process lifetime; drop kills the subprocess
+    #[allow(dead_code)] // held for process lifetime; `Drop for Sidecar` kills and reaps it
     _child: Option<Mutex<crate::sandbox::SandboxedChild>>,
     /// OS PID of the sidecar subprocess. Captured at spawn so the I/O watchdog
     /// can SIGTERM the child on timeout without locking `_child` (#388).
@@ -325,6 +325,27 @@ impl Sidecar {
         }
         if let Ok(mut h) = self.health.lock() {
             *h = PluginHealth::Disabled(format!("plugin {} crashed", self.language));
+        }
+    }
+}
+
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        // #715: kill and reap the child before any field drops. `stderr_ring`'s
+        // Drop joins its reader thread, which only returns once the child's
+        // stderr write end is closed, i.e. once the child is dead. On a normal
+        // teardown a well-behaved sidecar exits on stdin EOF and the join is
+        // instant, but a watchdog-timed-out invoke can drop this while the child
+        // is still busy in a long parse and has not reached its stdin read; the
+        // join would then block for as long as that takes. Explicitly killing
+        // here (the Drop body runs before any field is dropped) guarantees the
+        // ring's EOF assumption instead of relying on it incidentally, mirroring
+        // `EmbedSidecar::drop`. `wait` reaps the child so it is not left a zombie.
+        if let Some(child) = &self._child {
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
         }
     }
 }
