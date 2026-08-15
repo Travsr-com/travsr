@@ -204,6 +204,7 @@ fn extract_file_edges(
                         unresolved.push(UnresolvedCall {
                             src: caller_id,
                             callee_sig: format!("fn:{callee_name}"),
+                            alt_callee_sig: None,
                             hint_crate: None,
                             caller_line: occ_line,
                             is_method_call: true,
@@ -216,6 +217,7 @@ fn extract_file_edges(
                         unresolved.push(UnresolvedCall {
                             src: caller_id,
                             callee_sig: format!("class:{callee_name}"),
+                            alt_callee_sig: None,
                             hint_crate: None,
                             caller_line: occ_line,
                             is_method_call: false,
@@ -227,6 +229,7 @@ fn extract_file_edges(
                         unresolved.push(UnresolvedCall {
                             src: caller_id,
                             callee_sig: format!("fn:{callee_name}"),
+                            alt_callee_sig: None,
                             hint_crate: None,
                             caller_line: occ_line,
                             is_method_call: false,

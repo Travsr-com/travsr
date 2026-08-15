@@ -1,7 +1,9 @@
 //! Native Python Phase B — zero external-tool dependencies.
 //!
 //! Sources of edges (tree-sitter only, no spawned processes):
-//!   - `RefCall`          — function and method call sites
+//!   - `RefCall`, function and method call sites, plus constructor calls
+//!     `Foo(...)` recorded as references to `class:Foo` (#709: class references
+//!     no longer depend on the optional travsr-lsif-py emitter)
 //!   - `IsImplementation` — `class Foo(Bar)` inheritance
 //!
 //! When scip-python is available the caller merges SCIP output on top
@@ -185,17 +187,43 @@ fn extract_file_edges(
                         unresolved.push(UnresolvedCall {
                             src: caller_id,
                             callee_sig: format!("fn:{callee_name}"),
+                            alt_callee_sig: None,
                             hint_crate: None,
                             caller_line: occ_line,
                             is_method_call: true,
                             recv_type,
                         });
                     }
-                    // Bare `foo()` — free function; daemon resolves by unique sig.
+                    // Bare `foo()`. Two shapes, split on the PEP-8 capitalisation
+                    // convention so class references survive without the optional
+                    // travsr-lsif-py emitter (#709):
+                    //   - Uppercase-initial `Response(...)` is *probably* a
+                    //     constructor call, i.e. a reference to the class, so
+                    //     `class:{name}` is tried first.
+                    //   - Lowercase `foo()` is a free function; daemon resolves by
+                    //     unique `fn:` sig exactly as before.
+                    //
+                    // PEP 8 is a convention, not a rule, and a PascalCase free
+                    // function (`def Field(*args)`) is legal and common. Emitting
+                    // only `class:Field` for it matched nothing and silently lost
+                    // the edge and the occurrence (#716 review). This crate may
+                    // not consult the store to find out which exists, so both
+                    // names are carried and the resolver picks on evidence: exact
+                    // `class:`, then exact `fn:`, and nothing if neither is real.
                     _ => {
+                        let uppercase = callee_name.starts_with(|c: char| c.is_uppercase());
+                        let (callee_sig, alt_callee_sig) = if uppercase {
+                            (
+                                format!("class:{callee_name}"),
+                                Some(format!("fn:{callee_name}")),
+                            )
+                        } else {
+                            (format!("fn:{callee_name}"), None)
+                        };
                         unresolved.push(UnresolvedCall {
                             src: caller_id,
-                            callee_sig: format!("fn:{callee_name}"),
+                            callee_sig,
+                            alt_callee_sig,
                             hint_crate: None,
                             caller_line: occ_line,
                             is_method_call: false,
@@ -513,6 +541,54 @@ fn walk(root: &Path, dir: &Path, exts: &[&str], out: &mut Vec<(PathBuf, String)>
 mod tests {
     use super::*;
 
+    /// Bare-call tagging carries both candidate names, so a PascalCase free
+    /// function is not silently lost (#716 review).
+    ///
+    /// PEP 8 says an uppercase initial means a class, and that is the right
+    /// first guess, but `def Field(*args)` is legal Python and common in real
+    /// code. Tagging it `class:Field` alone matched nothing, so the call edge
+    /// and its `find_references` occurrence vanished with no error anywhere.
+    /// This crate cannot ask the store which one exists, so it names both and
+    /// the resolver decides on evidence.
+    fn bare_call_sigs(source: &str, callee: &str) -> Option<(String, Option<String>)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.py");
+        std::fs::write(&path, source).unwrap();
+        let (_nodes, _edges, unresolved) = extract_native_phase_b(
+            "corp",
+            dir.path(),
+            Some(&[(path.clone(), source.to_string())]),
+        )
+        .ok()?;
+        unresolved
+            .iter()
+            .find(|u| u.callee_sig.ends_with(&format!(":{callee}")))
+            .map(|u| (u.callee_sig.clone(), u.alt_callee_sig.clone()))
+    }
+
+    #[test]
+    fn an_uppercase_bare_call_carries_both_class_and_fn() {
+        let (sig, alt) = bare_call_sigs("def caller():\n    return Field(1)\n", "Field")
+            .expect("the bare call must be extracted");
+        assert_eq!(sig, "class:Field", "class is the right first guess");
+        assert_eq!(
+            alt.as_deref(),
+            Some("fn:Field"),
+            "a PascalCase free function must remain reachable"
+        );
+    }
+
+    #[test]
+    fn a_lowercase_bare_call_carries_no_alternate() {
+        let (sig, alt) = bare_call_sigs("def caller():\n    return helper(1)\n", "helper")
+            .expect("the bare call must be extracted");
+        assert_eq!(sig, "fn:helper");
+        assert!(
+            alt.is_none(),
+            "lowercase is unambiguous, so there is nothing to fall back to"
+        );
+    }
+
     /// Run the real `CALL_QUERY` + `resolve_receiver_type_py` path end-to-end
     /// against `source`, returning the recovered receiver type for the
     /// `.method_name()` call site. Exercises the exact query/capture wiring the
@@ -633,6 +709,40 @@ def f(x):
     x.method()
 "#;
         assert_eq!(recv_type_for_call(source, "method"), None);
+    }
+
+    #[test]
+    fn constructor_call_emits_class_reference() {
+        // #709: a constructor call `HttpResponse(...)` is a reference to the
+        // class and must be emitted as an `UnresolvedCall` targeting
+        // `class:HttpResponse` (not `fn:HttpResponse`), so class references
+        // resolve natively without the optional travsr-lsif-py emitter.
+        let dir = std::env::temp_dir().join(format!("cls_py_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("views.py");
+        std::fs::write(
+            &file,
+            b"def index(request):\n    resp = HttpResponse(\"hi\")\n    return resp\n",
+        )
+        .unwrap();
+        let files = vec![(file.clone(), "views.py".to_string())];
+        let (_nodes, _edges, unresolved) = extract_native_phase_b("c", &dir, Some(&files)).unwrap();
+        let ctor = unresolved
+            .iter()
+            .find(|u| u.callee_sig == "class:HttpResponse")
+            .expect("HttpResponse(...) emitted as a class reference");
+        assert!(
+            !ctor.is_method_call,
+            "constructor call is a bare (non-method) call"
+        );
+        // Lowercase bare calls remain `fn:` free-function references.
+        assert!(
+            unresolved
+                .iter()
+                .all(|u| u.callee_sig != "class:index" && u.callee_sig != "fn:HttpResponse"),
+            "lowercase names stay fn:, uppercase names stay class: {unresolved:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
