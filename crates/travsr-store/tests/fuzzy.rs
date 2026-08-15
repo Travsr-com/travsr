@@ -1324,3 +1324,74 @@ fn fuzzy_correct_symbol_skips_short_tokens() {
     put(&mut store, &node("a.rs", "fn:cat", "function"));
     assert_eq!(store.fuzzy_correct_symbol("cot", 0.5).unwrap(), None);
 }
+
+#[test]
+fn fuzzy_correct_symbols_batches_without_changing_any_answer() {
+    // The batch form exists to collapse N signature scans into one. It is only a
+    // safe substitution if every token still gets exactly the answer the
+    // single-token form gave it, so assert that equivalence directly rather than
+    // asserting the batch's output in isolation.
+    let mut store = open();
+    put(&mut store, &node("http.py", "class:HttpResponse", "class"));
+    put(
+        &mut store,
+        &node("http.py", "method:HttpResponse.render", "method"),
+    );
+    put(&mut store, &node("a.rs", "fn:configure", "function"));
+    put(&mut store, &node("b.rs", "fn:configared", "function"));
+
+    let tokens = [
+        "htpresponse", // corrects
+        "database",    // no near match
+        "configered",  // ambiguous, must abstain
+        "cot",         // too short to score
+        "render",      // exact leaf, must never be "corrected"
+    ];
+
+    let batch = store.fuzzy_correct_symbols(&tokens, 0.5).unwrap();
+    for tok in tokens {
+        let single = store.fuzzy_correct_symbol(tok, 0.5).unwrap();
+        assert_eq!(
+            batch.get(tok).cloned(),
+            single,
+            "batch and single-token forms disagree on {tok:?}"
+        );
+    }
+    // Pin the substantive answers too, so a regression that broke both forms
+    // identically could not pass the equivalence check above.
+    assert_eq!(
+        batch.get("htpresponse").map(String::as_str),
+        Some("HttpResponse")
+    );
+    assert_eq!(
+        batch.get("configered"),
+        None,
+        "ambiguous token must abstain"
+    );
+    assert_eq!(
+        batch.get("render"),
+        None,
+        "exact leaf must not be corrected"
+    );
+}
+
+#[test]
+fn fuzzy_correct_symbols_scores_each_token_independently() {
+    // Guards the batch loop's per-token accumulator: one token hitting its exact
+    // leaf (which stops its own scoring early) must not suppress a different
+    // token's correction found later in the same scan.
+    let mut store = open();
+    put(&mut store, &node("http.py", "class:HttpResponse", "class"));
+    put(&mut store, &node("a.rs", "fn:configure", "function"));
+
+    let batch = store
+        .fuzzy_correct_symbols(&["configure", "htpresponse"], 0.5)
+        .unwrap();
+
+    assert_eq!(batch.get("configure"), None, "exact leaf must not correct");
+    assert_eq!(
+        batch.get("htpresponse").map(String::as_str),
+        Some("HttpResponse"),
+        "a sibling token's exact hit must not suppress this correction"
+    );
+}

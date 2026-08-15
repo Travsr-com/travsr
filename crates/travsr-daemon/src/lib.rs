@@ -1942,9 +1942,12 @@ fn call_target_reachable(caller_path: &str, candidate_path: &str, crates: &Crate
 /// from `"fn:Session.filter"` or `"method:Type.method"`. Shared by the E7
 /// LSIF per-callee suppression key and the native leaf-uniqueness resolver
 /// below, so both sides agree on what "the same callee" means.
+///
+/// The splitting rule itself lives in [`travsr_core::ident::leaf_of`], which
+/// the store's fuzzy symbol correction uses too. This owned-`String` wrapper
+/// stays because every caller below needs an owned key.
 fn leaf_of(sig: &str) -> String {
-    let body = sig.split_once(':').map(|(_, r)| r).unwrap_or(sig);
-    body.rsplit('.').next().unwrap_or(body).to_string()
+    travsr_core::ident::leaf_of(sig).to_string()
 }
 
 /// E7 (#I2): build the `(caller_path, caller_line, callee_leaf)` suppression

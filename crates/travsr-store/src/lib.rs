@@ -6105,71 +6105,149 @@ impl SqliteStore {
     /// Cost: O(V) distinct-signature scan (bounded by `LIMIT`), mirroring
     /// [`Self::expand_query`]. SymSpell / an FST index can replace this for
     /// scale-out without changing the signature.
+    ///
+    /// Single-token convenience wrapper over [`Self::fuzzy_correct_symbols`].
+    /// Correcting more than one token in a request should call the batch form
+    /// directly, so the scan runs once rather than once per token.
     pub fn fuzzy_correct_symbol(
         &self,
         token: &str,
         min_jaccard: f64,
     ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .fuzzy_correct_symbols(&[token], min_jaccard)?
+            .remove(token))
+    }
+
+    /// Batch form of [`Self::fuzzy_correct_symbol`]: corrects every token in
+    /// `tokens` against a single distinct-signature scan, returning only the
+    /// tokens that produced an unambiguous correction.
+    ///
+    /// The scan, not the per-token trigram comparison, is what this call costs:
+    /// one pass over up to `LIMIT` distinct signatures. Correcting per token
+    /// therefore multiplied full-table scans by the number of unresolved tokens
+    /// on the MCP query-serving path, where a single query can carry several.
+    /// Scoring all tokens inside one pass is the same shape [`Self::expand_query`]
+    /// already uses for vocabulary expansion.
+    ///
+    /// Each token is scored independently and answers exactly as the single-token
+    /// form did, so batching changes cost, not results.
+    pub fn fuzzy_correct_symbols(
+        &self,
+        tokens: &[&str],
+        min_jaccard: f64,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
         /// A correction only stands when the runner-up distinct name is at least
         /// this far behind, otherwise the typo is ambiguous and we ground nothing.
         const AMBIGUITY_MARGIN: f64 = 0.05;
 
-        (|| -> AnyResult<Option<String>> {
+        (|| -> AnyResult<std::collections::HashMap<String, String>> {
             // Trigram Jaccard is unstable on very short tokens; skip them so a
             // 3-4 char query fragment cannot ground to an unrelated symbol.
-            if token.len() < 5 {
-                return Ok(None);
+            // Deduplicated so a token repeated in one query is scored once.
+            let mut lowered: Vec<(&str, String)> = Vec::new();
+            for tok in tokens {
+                if tok.len() < 5 {
+                    continue;
+                }
+                let lower = tok.to_ascii_lowercase();
+                if !lowered.iter().any(|(_, l)| *l == lower) {
+                    lowered.push((*tok, lower));
+                }
             }
-            let tok_lower = token.to_ascii_lowercase();
+            if lowered.is_empty() {
+                return Ok(std::collections::HashMap::new());
+            }
+
+            // Per-token accumulator. `exact` records that some indexed leaf name
+            // equals the token, which means it would have resolved exactly and so
+            // must never be "corrected" to anything.
+            struct Acc {
+                exact: bool,
+                by_name: std::collections::HashMap<String, (f64, String)>,
+            }
+            let mut accs: Vec<Acc> = lowered
+                .iter()
+                .map(|_| Acc {
+                    exact: false,
+                    by_name: std::collections::HashMap::new(),
+                })
+                .collect();
 
             let mut stmt = self
                 .conn
                 .prepare("SELECT DISTINCT signature FROM nodes LIMIT 200000")
                 .context("preparing fuzzy_correct_symbol scan")?;
-            let sigs: Vec<String> = stmt
-                .query_map([], |row| row.get(0))
-                .context("executing fuzzy_correct_symbol scan")?
-                .collect::<Result<_, _>>()
-                .context("collecting fuzzy_correct_symbol signatures")?;
-
-            // Best Jaccard per distinct lowercased leaf name; keep an original-case
-            // exemplar to return. A name equal to the token would already have
-            // resolved exactly, so a correction is always a *different* name.
-            let mut by_name: std::collections::HashMap<String, (f64, String)> =
-                std::collections::HashMap::new();
-            for sig in &sigs {
-                let leaf = leaf_of_signature(sig);
+            let mut rows = stmt
+                .query([])
+                .context("executing fuzzy_correct_symbol scan")?;
+            // Streamed: the previous form collected every signature into a `Vec`
+            // before scoring, holding the whole scan in memory at once.
+            while let Some(row) = rows
+                .next()
+                .context("collecting fuzzy_correct_symbol signatures")?
+            {
+                let sig: String = row.get(0)?;
+                let leaf = travsr_core::ident::leaf_of(&sig);
                 let leaf_lower = leaf.to_ascii_lowercase();
-                if leaf_lower == tok_lower {
-                    return Ok(None);
+                for (i, (_, tok_lower)) in lowered.iter().enumerate() {
+                    if accs[i].exact {
+                        continue;
+                    }
+                    if leaf_lower == *tok_lower {
+                        accs[i].exact = true;
+                        continue;
+                    }
+                    let j = byte_trigram_jaccard(tok_lower, &leaf_lower);
+                    if j < min_jaccard {
+                        continue;
+                    }
+                    // Best Jaccard per distinct lowercased leaf name; keep an
+                    // original-case exemplar to return.
+                    accs[i]
+                        .by_name
+                        .entry(leaf_lower.clone())
+                        .and_modify(|e| {
+                            if j > e.0 {
+                                *e = (j, leaf.to_string());
+                            }
+                        })
+                        .or_insert_with(|| (j, leaf.to_string()));
                 }
-                let j = byte_trigram_jaccard(&tok_lower, &leaf_lower);
-                if j < min_jaccard {
-                    continue;
-                }
-                by_name
-                    .entry(leaf_lower)
-                    .and_modify(|e| {
-                        if j > e.0 {
-                            *e = (j, leaf.to_string());
-                        }
-                    })
-                    .or_insert_with(|| (j, leaf.to_string()));
             }
 
-            let mut cands: Vec<(f64, String)> = by_name.into_values().collect();
-            cands.sort_by(|a, b| {
-                b.0.partial_cmp(&a.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.1.cmp(&b.1))
-            });
-            let Some((best_j, best_leaf)) = cands.first().cloned() else {
-                return Ok(None);
-            };
-            let ambiguous = cands
-                .get(1)
-                .is_some_and(|(second_j, _)| best_j - second_j < AMBIGUITY_MARGIN);
-            Ok((!ambiguous).then_some(best_leaf))
+            let mut out = std::collections::HashMap::new();
+            for (i, (tok, _)) in lowered.iter().enumerate() {
+                if accs[i].exact {
+                    continue;
+                }
+                // Only the leader and the runner-up decide the outcome, so track
+                // them in one pass instead of sorting the whole candidate set.
+                // Ordering matches the previous sort exactly: descending Jaccard,
+                // ties broken by ascending name.
+                let better = |a: &(f64, String), b: &(f64, String)| -> bool {
+                    a.0 > b.0 || (a.0 == b.0 && a.1 < b.1)
+                };
+                let mut best: Option<(f64, String)> = None;
+                let mut second: Option<(f64, String)> = None;
+                for cand in accs[i].by_name.values() {
+                    if best.as_ref().map_or(true, |b| better(cand, b)) {
+                        second = best.take();
+                        best = Some(cand.clone());
+                    } else if second.as_ref().map_or(true, |s| better(cand, s)) {
+                        second = Some(cand.clone());
+                    }
+                }
+                let Some((best_j, best_leaf)) = best else {
+                    continue;
+                };
+                let ambiguous =
+                    second.is_some_and(|(second_j, _)| best_j - second_j < AMBIGUITY_MARGIN);
+                if !ambiguous {
+                    out.insert((*tok).to_string(), best_leaf);
+                }
+            }
+            Ok(out)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
     }
@@ -7124,15 +7202,6 @@ fn i64_to_node_id(v: i64) -> NodeId {
 /// Jaccard similarity on byte-level trigrams of two strings.
 /// Used by `expand_query` (L2-A) to find vocabulary-grounded candidates.
 /// Returns 0.0 for strings shorter than 3 bytes.
-/// Leaf identifier of a signature: the segment after the last `.` of the body
-/// (`method:HttpResponse.render` → `render`), or the whole body when unqualified
-/// (`class:HttpResponse` → `HttpResponse`, `fn:index` → `index`). Mirrors the
-/// daemon's `leaf_of`, kept local so the store has no dependency on it.
-fn leaf_of_signature(sig: &str) -> &str {
-    let body = sig.split_once(':').map(|(_, r)| r).unwrap_or(sig);
-    body.rsplit('.').next().unwrap_or(body)
-}
-
 fn byte_trigram_jaccard(a: &str, b: &str) -> f64 {
     let ab = a.as_bytes();
     let bb = b.as_bytes();
