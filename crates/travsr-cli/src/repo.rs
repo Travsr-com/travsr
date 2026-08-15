@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use travsr_store::registry;
@@ -89,14 +90,19 @@ fn main_worktree_root(worktree_dir: &Path) -> Option<PathBuf> {
     // anything is printed, so a git call that never returns here is a CLI that
     // hangs with no output at all. `None` already means "fall back to the
     // worktree dir", which is the right answer for a query that did not land.
+    // `worktree_dir` goes through as a raw `OsStr`, never `to_string_lossy`: a
+    // path with non-UTF-8 bytes is legal, and mangling it into U+FFFD would make
+    // git fail to resolve a worktree that exists, silently dropping back to the
+    // linked worktree as the repo root (which has no index) and reporting "not
+    // initialized". That is the #302 regression this function exists to prevent.
     let common = PathBuf::from(crate::git_bounded::git_stdout_bounded(
         None,
-        &[
-            "-C",
-            &worktree_dir.to_string_lossy(),
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
+        [
+            OsStr::new("-C"),
+            worktree_dir.as_os_str(),
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--git-common-dir"),
         ],
     )?);
     // `--git-common-dir` is `<main>/.git`; its parent is the main worktree.

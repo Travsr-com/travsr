@@ -19,6 +19,7 @@
 //! unavailable, and callers already have a "git could not answer" path because
 //! git may legitimately be missing.
 
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -45,7 +46,19 @@ pub const GIT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// read-only queries (`rev-parse`, `status --porcelain`), so an abandoned one
 /// holds no lock and exits on its own or when this process does. Bounding the
 /// wait is the property that matters; reaping is not.
-pub fn git_output_bounded(cwd: Option<&Path>, args: &[&str]) -> Option<Output> {
+///
+/// `args` is generic over `AsRef<OsStr>`, the same bound [`Command::args`] uses,
+/// so a caller with a path to pass (`-C <dir>`, a pathspec) can hand over the
+/// raw `OsStr` rather than lossy-converting it to a `String` first. A path
+/// containing bytes that are not valid UTF-8 is legal on Linux and macOS, and
+/// an unpaired surrogate is reachable on Windows; `to_string_lossy` would
+/// replace those bytes with U+FFFD and git would then fail to resolve a path
+/// that exists.
+pub fn git_output_bounded<I, S>(cwd: Option<&Path>, args: I) -> Option<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut cmd = Command::new("git");
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -78,12 +91,23 @@ pub fn git_output_bounded(cwd: Option<&Path>, args: &[&str]) -> Option<Output> {
 ///
 /// The shape almost every caller wants: a one-line answer from `rev-parse` and
 /// friends, with a non-zero exit treated the same as no answer.
-pub fn git_stdout_bounded(cwd: Option<&Path>, args: &[&str]) -> Option<String> {
+///
+/// Stdout is decoded lossily. `None` here means "git had no answer", and a byte
+/// sequence that is not valid UTF-8 is an answer, just one that cannot be
+/// represented exactly. Strict decoding would fold the two cases together, so a
+/// caller reading something that can legitimately carry arbitrary bytes (a path,
+/// a commit subject) would silently see "unavailable" for a value git returned
+/// perfectly well.
+pub fn git_stdout_bounded<I, S>(cwd: Option<&Path>, args: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let out = git_output_bounded(cwd, args)?;
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8(out.stdout).ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
     let trimmed = text.trim();
     if trimmed.is_empty() {
         None
@@ -134,5 +158,90 @@ mod tests {
             "a stdin-reading command must not consume the deadline"
         );
         assert!(out.is_some(), "null stdin gives it EOF rather than a wait");
+    }
+
+    /// Stdout that is not valid UTF-8 must come back lossily decoded, not as
+    /// `None`. `None` is reserved for "git had no answer"; conflating the two
+    /// makes a real answer look like an unavailable one.
+    #[test]
+    fn non_utf8_stdout_is_decoded_lossily_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            git_output_bounded(Some(dir.path()), ["init", "--quiet"]).is_some(),
+            "temp repo must initialise"
+        );
+
+        // A blob whose content is not valid UTF-8. 0xFF is never a legal UTF-8
+        // byte, so `String::from_utf8` on this fails outright.
+        let blob = dir.path().join("raw.bin");
+        std::fs::write(&blob, [0x61, 0xFF, 0x62]).unwrap();
+        let sha = git_stdout_bounded(
+            Some(dir.path()),
+            [
+                OsStr::new("hash-object"),
+                OsStr::new("-w"),
+                blob.as_os_str(),
+            ],
+        )
+        .expect("hash-object must answer");
+
+        let content = git_stdout_bounded(Some(dir.path()), ["cat-file", "blob", &sha]);
+        assert_eq!(
+            content.as_deref(),
+            Some("a\u{FFFD}b"),
+            "non-UTF-8 stdout must decode lossily rather than becoming None"
+        );
+    }
+
+    /// A path carrying bytes that are not valid UTF-8 must reach git intact.
+    ///
+    /// Linux-only, because that is where such a path can actually be created.
+    /// macOS rejects the filename at the filesystem layer (APFS and HFS+ both
+    /// enforce valid UTF-8, so `create_dir` fails with EILSEQ), and Windows
+    /// reaches the same mangling through unpaired surrogates rather than raw
+    /// bytes. The defect being guarded is not Linux-specific; only the fixture
+    /// is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_utf8_path_argument_is_not_mangled() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // 0xFF is a legal byte in a Unix filename and never legal in UTF-8.
+        let odd = dir.path().join(OsStr::from_bytes(b"work\xFFtree"));
+        std::fs::create_dir(&odd).unwrap();
+        assert!(
+            git_output_bounded(Some(&odd), ["init", "--quiet"]).is_some(),
+            "temp repo must initialise"
+        );
+
+        // Passed as an argument, which is the path that used to go through
+        // `to_string_lossy`. Lossy conversion replaces 0xFF with U+FFFD, and git
+        // then cannot resolve the directory.
+        let top = git_stdout_bounded(
+            None,
+            [
+                OsStr::new("-C"),
+                odd.as_os_str(),
+                OsStr::new("rev-parse"),
+                OsStr::new("--show-toplevel"),
+            ],
+        );
+        assert!(
+            top.is_some(),
+            "git must resolve a repo whose path is not valid UTF-8"
+        );
+
+        // The same call with the lossy conversion the reviewer flagged: it must
+        // fail, which is what makes the assertion above meaningful rather than
+        // accidentally passing.
+        let lossy = git_stdout_bounded(
+            None,
+            ["-C", &odd.to_string_lossy(), "rev-parse", "--show-toplevel"],
+        );
+        assert!(
+            lossy.is_none(),
+            "the lossy form must genuinely fail, otherwise this test proves nothing"
+        );
     }
 }
