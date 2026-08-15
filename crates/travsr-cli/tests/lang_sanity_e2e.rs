@@ -222,25 +222,6 @@ fn references(root: &Path, symbol: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Assert that `symbol` resolves and that `expected_site` is among its uses.
-///
-/// Checks the call site, not just a non-zero count: a symbol can accumulate
-/// references from its own file while the cross-file edge, the one Phase B
-/// exists for, is missing entirely.
-fn assert_cross_file_reference(lang: &str, symbol: &str, expected_site: &str) {
-    if !provider_active(lang) {
-        eprintln!("SKIP {lang}: Phase B provider not active (travsr lang install {lang})");
-        return;
-    }
-    let repo = indexed_repo(lang);
-    let refs = references(repo.path(), symbol);
-    assert!(
-        refs.contains(expected_site),
-        "{lang}: `{symbol}` must report the cross-file call site {expected_site}\n\
-         got:\n{refs}"
-    );
-}
-
 /// One construct under test: the symbol a user would type, and a `path:line`
 /// that must appear among its uses.
 struct Probe {
