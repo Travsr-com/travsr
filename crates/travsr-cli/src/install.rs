@@ -8,7 +8,11 @@
 
 use anyhow::{bail, Context as _, Result};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use travsr_plugin_host::sidecar_version::{
+    below_floor_message, floor_status, unreadable_message, write_cached_latest, FloorStatus,
+    SidecarSpec,
+};
 
 const RELEASES_BASE_ENV: &str = "TRAVSR_LANG_RELEASES_BASE";
 const API_URL_ENV: &str = "TRAVSR_LANG_API_URL";
@@ -80,6 +84,82 @@ pub async fn fetch_latest_version_for_repo(repo: &str) -> Result<String> {
         .as_str()
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow::anyhow!("missing tag_name in releases response for {repo}"))
+}
+
+/// RFC-025 Point B: install-time checks over an *already-present* sidecar binary
+/// (the existence branch of `embed init` / `lang install`, no `--reinstall`).
+///
+/// Two independent, best-effort legs; neither ever fails the caller:
+///
+/// - **Leg 1 (offline).** If the on-disk binary is below the host's behavioral
+///   floor, print a WARN with the reinstall remedy. The *hard* refuse stays at
+///   spawn/reindex (Point A) - init only warns, so the user is left in a
+///   runnable state and the fix is one command away.
+/// - **Leg 2 (network, cached 24h).** Fetch the latest release; if it is newer
+///   than what is installed, print an advisory. Offline -> silent. The fetched
+///   tag is cached in `~/.travsr/.sidecar-latest.json` so the daemon can
+///   re-surface staleness without ever fetching (local-first).
+///
+/// `reinstall_remedy` is the exact command surfaced to the user, e.g.
+/// `"travsr embed init --reinstall"`.
+pub fn advise_installed_sidecar(spec: &dyn SidecarSpec, bin_path: &Path, reinstall_remedy: &str) {
+    let install_name = spec.install_name();
+
+    // One bounded `<bin> --version` probe, read once and reused by both legs
+    // below — the staleness comparison does not re-exec the binary.
+    let status = floor_status(spec, bin_path, None);
+
+    // Leg 1: offline floor check. Only the "below floor" states warn; a spec
+    // with no declared floor whose version is simply unreadable stays quiet.
+    match &status {
+        FloorStatus::BelowFloor {
+            installed,
+            required,
+        } => {
+            eprintln!(
+                "  warning: {}",
+                below_floor_message(install_name, installed, required, reinstall_remedy)
+            );
+        }
+        FloorStatus::Unreadable { required } => {
+            eprintln!(
+                "  warning: {}",
+                unreadable_message(install_name, required, reinstall_remedy)
+            );
+        }
+        // A transient probe timeout at install time is not actionable (degrades
+        // to usable), so it stays quiet, alongside the healthy / no-floor cases.
+        FloorStatus::Ok(_) | FloorStatus::UnreadableNoFloor | FloorStatus::ProbeTimeout { .. } => {}
+    }
+
+    // Leg 2: best-effort staleness advisory. Skipped entirely when downloads are
+    // disabled (tests / air-gapped) so nothing here reaches for the network.
+    if std::env::var_os(SKIP_DOWNLOAD_ENV).is_some() {
+        return;
+    }
+    let repo = spec.github_repo().to_string();
+    let Ok(latest_tag) =
+        crate::lang::run_async(async move { fetch_latest_version_for_repo(&repo).await })
+    else {
+        return; // offline / fetch failed -> silent, never fails the command
+    };
+    write_cached_latest(install_name, &latest_tag);
+
+    // Reuse the version already read by the floor probe above; only the states
+    // that carry a readable version can be compared against `latest`.
+    let installed = match &status {
+        FloorStatus::Ok(v) => *v,
+        FloorStatus::BelowFloor { installed, .. } => *installed,
+        FloorStatus::Unreadable { .. }
+        | FloorStatus::UnreadableNoFloor
+        | FloorStatus::ProbeTimeout { .. } => return,
+    };
+    let Some(latest) = travsr_plugin_host::Semver::parse(&latest_tag) else {
+        return;
+    };
+    if latest > installed {
+        println!("  newer {install_name} v{latest} available - run: {reinstall_remedy}");
+    }
 }
 
 /// Fetches the latest version tag for the travsr-lang releases.

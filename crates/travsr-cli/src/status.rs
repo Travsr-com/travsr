@@ -223,6 +223,11 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
+    // RFC-025 §8: sidecar version health (installed vs required vs latest), with
+    // the exact remedy. Computed offline; the `latest` note is present only when
+    // the local cache is warm. Prints nothing when no sidecar is installed.
+    crate::sidecar_health::print_block();
+
     Ok(())
 }
 
