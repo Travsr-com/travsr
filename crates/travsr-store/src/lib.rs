@@ -16,6 +16,20 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Row cap on [`SqliteStore::lookup_nodes_exact`] (exact-signature Tier 1).
+///
+/// This is intentionally one greater than `travsr-mcp`'s `AMBIGUOUS_DISPLAY_LIMIT`
+/// so a caller can always tell "exactly the display limit" apart from "more than
+/// the display limit" on the exact-lookup path: when this many rows come back, at
+/// least one definition was withheld. `travsr-mcp` guards the `>` relationship at
+/// compile time. If you change this, keep it strictly above that display limit,
+/// or the `travsr graph` ambiguity truncation notice (#565 / RFC-002) silently
+/// stops firing on the Tier-1 path.
+pub const NODE_EXACT_LOOKUP_LIMIT: usize = 21;
+
+/// Row cap on [`SqliteStore::search_nodes_by_name`] (fuzzy simple-name Tier 2).
+pub const NODE_NAME_SEARCH_LIMIT: usize = 100;
+
 /// Type alias for the RFC-018 Step 4 semantic-ANN callback injected by the daemon.
 /// Returns `(NodeId, cosine_similarity_score)` pairs in descending score order.
 pub type EmbedKnnHook =
@@ -2575,12 +2589,12 @@ WHERE (signature LIKE '%' || ?1 || '%'
    OR path LIKE '%' || ?1 || '%')
   AND kind != 'doc-chunk'
 ORDER BY rank ASC, id ASC
-LIMIT 100",
+LIMIT ?2",
                 )
                 .context("preparing search query")?;
 
             let rows = stmt
-                .query_map(params![name], |row| {
+                .query_map(params![name, NODE_NAME_SEARCH_LIMIT as i64], |row| {
                     let id = i64_to_node_id(row.get::<_, i64>(0)?);
                     let vname = VName::new(
                         row.get::<_, String>(1)?,
@@ -2624,8 +2638,8 @@ LIMIT 100",
     ///
     /// Uses the `nodes_signature_idx` index for O(log N) access. When
     /// `path_hint` is `Some`, only rows whose `path` equals or ends with the
-    /// hint are returned, and those rows sort first. Returns at most 20
-    /// non-file nodes.
+    /// hint are returned, and those rows sort first. Returns at most
+    /// [`NODE_EXACT_LOOKUP_LIMIT`] non-file nodes.
     ///
     /// Callers interpret the result length:
     /// - 0  → not found; fall back to fuzzy search
@@ -2678,12 +2692,19 @@ ORDER BY
     ELSE 1
   END ASC,
   id ASC
-LIMIT 20",
+LIMIT ?4",
                 )
                 .context("preparing lookup_nodes_exact query")?;
 
             let rows = stmt
-                .query_map(params![signature, path_hint, like_hint], |row| {
+                .query_map(
+                    params![
+                        signature,
+                        path_hint,
+                        like_hint,
+                        NODE_EXACT_LOOKUP_LIMIT as i64
+                    ],
+                    |row| {
                     let id = i64_to_node_id(row.get::<_, i64>(0)?);
                     let vname = VName::new(
                         row.get::<_, String>(1)?,

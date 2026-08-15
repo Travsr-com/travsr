@@ -67,6 +67,14 @@ pub struct GraphQueryArgs {
 /// The maximum number of ambiguous candidate definitions to display to the user.
 pub const AMBIGUOUS_DISPLAY_LIMIT: usize = 20;
 
+/// The exact-signature store lookup ([`travsr_store::NODE_EXACT_LOOKUP_LIMIT`])
+/// must be able to return at least one more candidate than we display, so the
+/// CLI can tell "exactly the display limit" apart from "more than the display
+/// limit" on the Tier-1 (exact-signature) path and fire the truncation notice
+/// (#565 / RFC-002). Guarded at compile time so the two caps can never silently
+/// re-coincide.
+const _: () = assert!(travsr_store::NODE_EXACT_LOOKUP_LIMIT > AMBIGUOUS_DISPLAY_LIMIT);
+
 /// One graph node, with everything the CLI renderers need.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeEntry {
@@ -793,15 +801,49 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                 None
             }
             crate::tools::RefTarget::None => {
-                if args.path.is_none() {
-                    let matches = store.search_nodes_by_name(&args.query)?;
-                    matches
-                        .iter()
-                        .find(|n| n.kind == "file")
-                        .or_else(|| matches.first())
-                        .cloned()
-                } else {
-                    None
+                // `resolve_reference_targets` filters `kind == "file"`, so a bare
+                // file-name query (`service.ts`) never reaches the symbol ladder.
+                // Detect same-basename file ambiguity here so `travsr graph <file>`
+                // disambiguates consistently with symbols (#565 / RFC-002), while
+                // still honouring an explicit `--path` pin and preserving the
+                // legacy fuzzy-recall fallback for non-file queries like `Payment`.
+                let matches = store.search_nodes_by_name(&args.query)?;
+                let mut file_hits: Vec<travsr_core::Node> = matches
+                    .iter()
+                    .filter(|n| {
+                        n.kind == "file"
+                            && (n.vname.path == args.query
+                                || n.vname.path.ends_with(&format!("/{}", args.query)))
+                    })
+                    .cloned()
+                    .collect();
+                if let Some(p) = args.path.as_deref() {
+                    let boundary = format!("/{p}");
+                    file_hits.retain(|n| n.vname.path == p || n.vname.path.ends_with(&boundary));
+                }
+                file_hits.sort_by_key(|n| n.id.0);
+                file_hits.dedup_by_key(|n| n.id);
+
+                match file_hits.len() {
+                    1 => file_hits.pop(),
+                    n if n >= 2 => {
+                        candidates = Some(file_hits.iter().map(|n| node_entry(n, 0)).collect());
+                        None
+                    }
+                    // No file-name match: keep legacy fuzzy recall, but only when
+                    // no `--path` was given — an explicit path that matched nothing
+                    // is a precise miss, not an invitation to guess a first hit.
+                    _ => {
+                        if args.path.is_none() {
+                            matches
+                                .iter()
+                                .find(|n| n.kind == "file")
+                                .or_else(|| matches.first())
+                                .cloned()
+                        } else {
+                            None
+                        }
+                    }
                 }
             }
         };
@@ -1739,6 +1781,116 @@ mod tests {
         .unwrap();
         assert!(payload_invalid.seed.is_none());
         assert!(payload_invalid.candidates.is_none());
+    }
+
+    /// Tier-1 blocker guard: a full signature with more definitions than the
+    /// exact-lookup store cap must still surface as ambiguous with a candidate
+    /// count that exceeds `AMBIGUOUS_DISPLAY_LIMIT` (so the CLI fires its
+    /// truncation notice), not a set silently trimmed to the display limit
+    /// (#565 / RFC-002).
+    #[test]
+    fn test_graph_query_ambiguous_full_signature_exceeds_display_limit() {
+        use travsr_core::{Node, NodeId, TestRole, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for i in 0..25u64 {
+            store
+                .put_node(&Node {
+                    id: NodeId(200 + i),
+                    vname: VName {
+                        signature: "fn:overloaded".to_string(),
+                        corpus: "test".to_string(),
+                        root: String::new(),
+                        path: format!("src/file_{i}.rs"),
+                        language: "rust".to_string(),
+                    },
+                    kind: "function".to_string(),
+                    package: String::new(),
+                    line: Some(1),
+                    end_line: Some(2),
+                    test_role: TestRole::None,
+                })
+                .unwrap();
+        }
+
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "fn:overloaded".to_string(),
+                path: None,
+                depth: 3,
+                direction: QueryDirection::Deps,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+
+        assert!(payload.seed.is_none());
+        let candidates = payload.candidates.as_ref().unwrap();
+        // Capped at the store's exact-lookup limit, and that cap is strictly
+        // above the display limit so "> display limit" is always detectable.
+        assert_eq!(candidates.len(), travsr_store::NODE_EXACT_LOOKUP_LIMIT);
+        assert!(candidates.len() > AMBIGUOUS_DISPLAY_LIMIT);
+    }
+
+    /// File-name queries: two files sharing a basename must disambiguate like
+    /// symbols (candidates listed, no arbitrary first-pick), and a `--path` pin
+    /// resolves to the unique file (#565 / RFC-002).
+    #[test]
+    fn test_graph_query_ambiguous_file_name() {
+        use travsr_core::{Node, NodeId, TestRole, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for (i, dir) in ["src/a", "src/b"].iter().enumerate() {
+            store
+                .put_node(&Node {
+                    id: NodeId(300 + i as u64),
+                    vname: VName {
+                        signature: format!("{dir}/service.ts"),
+                        corpus: "test".to_string(),
+                        root: String::new(),
+                        path: format!("{dir}/service.ts"),
+                        language: "typescript".to_string(),
+                    },
+                    kind: "file".to_string(),
+                    package: String::new(),
+                    line: None,
+                    end_line: None,
+                    test_role: TestRole::None,
+                })
+                .unwrap();
+        }
+
+        // Bare basename with two matching files: ambiguous, no seed.
+        let ambiguous = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "service.ts".to_string(),
+                path: None,
+                depth: 3,
+                direction: QueryDirection::Deps,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        assert!(ambiguous.seed.is_none());
+        assert_eq!(ambiguous.candidates.as_ref().unwrap().len(), 2);
+
+        // A `--path` pin resolves to the unique file.
+        let pinned = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "service.ts".to_string(),
+                path: Some("src/a/service.ts".to_string()),
+                depth: 3,
+                direction: QueryDirection::Deps,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        assert!(pinned.candidates.is_none());
+        assert_eq!(pinned.seed.as_ref().unwrap().path, "src/a/service.ts");
     }
 
     #[test]

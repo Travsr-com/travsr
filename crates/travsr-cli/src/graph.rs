@@ -115,17 +115,44 @@ pub fn run(
     if let Some(candidates) = &payload.candidates {
         let count = candidates.len();
         let limit = travsr_mcp::AMBIGUOUS_DISPLAY_LIMIT;
-        eprintln!(
-            "'{query_str}' is ambiguous — {count} definitions. Re-run with a `--path` hint to pick one:"
-        );
+        // The store caps the candidate set (Tier 1 at NODE_EXACT_LOOKUP_LIMIT,
+        // Tier 2 at NODE_NAME_SEARCH_LIMIT), so once we get back more than we
+        // display, `count` is a lower bound, not the true total — hence "at
+        // least {count}" rather than a definite count (#565 / RFC-002).
+        let truncated = count > limit;
+
+        // `graph --format json` is the AI/tooling surface, and disambiguation is
+        // exactly the case where an agent needs to read the options and re-query
+        // with a `--path`. Emit the candidates as JSON on stdout (still a non-zero
+        // exit) so "ambiguous, here are the choices" is machine-distinguishable
+        // from "the command failed". `truncated` marks `count` as a lower bound.
+        if matches!(format, Format::Json) {
+            let out = serde_json::json!({
+                "status": "ambiguous",
+                "count": count,
+                "truncated": truncated,
+                "candidates": candidates,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            anyhow::bail!("ambiguous symbol query");
+        }
+
+        if truncated {
+            eprintln!(
+                "'{query_str}' is ambiguous — showing {limit} of at least {count} definitions. \
+                 Re-run with a `--path` hint to pick one:"
+            );
+        } else {
+            eprintln!(
+                "'{query_str}' is ambiguous — {count} definitions. Re-run with a `--path` hint to pick one:"
+            );
+        }
         for n in candidates.iter().take(limit) {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
             eprintln!("  {} ({}) — {}{}", n.signature, n.kind, n.path, loc);
         }
-        if count > limit {
-            eprintln!(
-                "[truncated: showing {limit} of {count} definitions — additional filtering/narrowing is required]"
-            );
+        if truncated {
+            eprintln!("[truncated: additional filtering/narrowing is required]");
         }
         anyhow::bail!("ambiguous symbol query");
     }

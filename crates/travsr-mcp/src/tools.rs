@@ -6484,6 +6484,32 @@ fn get_graph_json_raw(
         node_ids_out.contains(src) && node_ids_out.contains(tgt)
     });
 
+    // #565 / RFC-002 consistency: surface the SAME ambiguity signal the CLI /
+    // daemon `graph_query` path emits, computed via the SAME resolver, so an
+    // agent calling get_graph_json can tell a query resolved to multiple distinct
+    // definitions (and re-query with a narrower symbol / path) rather than
+    // silently receiving a merged multi-root graph. Additive envelope field —
+    // first-party consumers (the graph panel) read only `nodes`/`edges`.
+    let ambiguous_candidates: Vec<serde_json::Value> =
+        if kind_filter.is_empty() && !query.is_empty() {
+            match resolve_reference_targets(store, query, None) {
+                RefTarget::Ambiguous(list) => list
+                    .iter()
+                    .map(|n| {
+                        serde_json::json!({
+                            "signature": n.vname.signature,
+                            "kind": n.kind,
+                            "path": n.vname.path,
+                            "line": n.line,
+                        })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
     // Additive envelope fields (#318 O5/O6) — first-party consumers read only
     // `nodes`/`edges`; the global merge likewise ignores extra keys.
     let mut out = serde_json::json!({
@@ -6491,6 +6517,10 @@ fn get_graph_json_raw(
         "edges": edges_out,
         "coverage": coverage,
     });
+    if !ambiguous_candidates.is_empty() {
+        out["ambiguous"] = serde_json::json!(true);
+        out["candidates"] = serde_json::Value::Array(ambiguous_candidates);
+    }
     if token_budget > 0 {
         out["token_budget"] = serde_json::json!(token_budget);
         out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
@@ -11032,6 +11062,54 @@ mod snippet_tests {
         store.put_node(&cousin).unwrap();
         let raw = get_graph_json(&store, &graph_params("fn:docs_section"));
         assert_eq!(root_count(&raw), 1, "exactly one root expected; got: {raw}");
+    }
+
+    /// #565 / RFC-002 consistency: a query resolving to multiple distinct
+    /// definitions must carry the additive `ambiguous`/`candidates` signal, so an
+    /// agent calling get_graph_json gets the same disambiguation cue the CLI does.
+    #[test]
+    fn get_graph_json_flags_ambiguous_definitions() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "src/a.ts", "typescript", "fn:overloaded"),
+                "function",
+            ))
+            .unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "src/b.ts", "typescript", "fn:overloaded"),
+                "function",
+            ))
+            .unwrap();
+        let raw = get_graph_json(&store, &graph_params("fn:overloaded"));
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["ambiguous"], true, "must flag ambiguity; got: {raw}");
+        let cands = v["candidates"].as_array().expect("candidates array");
+        assert_eq!(cands.len(), 2);
+        assert!(cands.iter().all(|c| c["signature"] == "fn:overloaded"));
+    }
+
+    /// The ambiguity fields are additive: a uniquely-resolving query omits them
+    /// entirely so existing first-party consumers see an unchanged envelope.
+    #[test]
+    fn get_graph_json_no_ambiguous_flag_when_unique() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "src/a.ts", "typescript", "fn:solo"),
+                "function",
+            ))
+            .unwrap();
+        let raw = get_graph_json(&store, &graph_params("fn:solo"));
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            v.get("ambiguous").is_none(),
+            "unique query must not flag ambiguity; got: {raw}"
+        );
+        assert!(v.get("candidates").is_none());
     }
 
     /// With no exact match at either tier, the substring set must survive as
