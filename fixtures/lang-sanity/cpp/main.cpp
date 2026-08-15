@@ -15,8 +15,8 @@ int main() {
     app::ui::Box<int> b(3);
     int u = b.unwrap();
     int d = w.describe();
-    auto lbl = app::ui::label_of(w);
-    std::printf("%d %d %d %d %d %d %d %d %d %d %s\n",
-                drawn, area, inl, r1, r2, def, n, t, u, d, lbl.c_str());
+    int lbl = app::ui::label_of(w);
+    std::printf("%d %d %d %d %d %d %d %d %d %d %d\n",
+                drawn, area, inl, r1, r2, def, n, t, u, d, lbl);
     return 0;
 }

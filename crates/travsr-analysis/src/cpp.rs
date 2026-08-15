@@ -41,6 +41,49 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     get_grammar: || tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
 };
 
+/// Whether a `.h` header is C++ rather than C.
+///
+/// `.h` is genuinely ambiguous and the ecosystem leans C++: LLVM, Google style
+/// and most C++ projects use `.h`, not `.hpp`. Extension alone sends all of
+/// them to the C grammar, which cannot see a class, a namespace or a template,
+/// so a header-declared API is invisible to the graph and its SCIP definitions
+/// have nothing to unify against.
+///
+/// Decided on content, the way clangd and linguist do it, because nothing in
+/// the filename can answer it.
+///
+/// The markers are ones C **cannot** contain. Deliberately excluded:
+///
+/// - `#ifdef __cplusplus` and `extern "C"`, which are how a *C* header
+///   announces it is safe to include from C++. Treating them as C++ markers
+///   would misclassify exactly the headers that took care to be portable.
+/// - `//` comments and `bool`, which are C99 and later.
+///
+/// False negatives are the safe direction: a C++ header with none of these is
+/// declaration-only and parses acceptably as C, which is today's behaviour.
+pub fn header_is_cxx(source: &str) -> bool {
+    // Scope resolution is impossible in C and appears in almost any C++ header
+    // that declares something qualified.
+    if source.contains("::") {
+        return true;
+    }
+    const MARKERS: &[&str] = &[
+        "template<",
+        "template <",
+        "namespace ",
+        "class ",
+        "public:",
+        "private:",
+        "protected:",
+        "virtual ",
+        "operator",
+        "friend ",
+        "constexpr ",
+        "nullptr",
+    ];
+    MARKERS.iter().any(|m| source.contains(m))
+}
+
 /// Parse a C++ source file into graph nodes and edges.
 pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
     let grammar = (CONFIG.get_grammar)();

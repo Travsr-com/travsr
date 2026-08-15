@@ -345,7 +345,13 @@ fn cpp_constructs_resolve_end_to_end() {
                 gap: None,
             },
             Probe {
-                symbol: "area",
+                // Queried by full signature, not the bare name: `area` is
+                // genuinely ambiguous between `Shape.area` (pure virtual) and
+                // `Widget.area` (the override), and travsr correctly asks for
+                // a hint rather than guessing. The bare name only looked
+                // unambiguous while `.h` was parsed as C, which flattened the
+                // class and lost `Shape.area` altogether.
+                symbol: "method:Widget.area",
                 site: "main.cpp:7",
                 construct: "virtual override, out-of-line",
                 gap: None,
@@ -372,16 +378,15 @@ fn cpp_constructs_resolve_end_to_end() {
                 symbol: "twice",
                 site: "main.cpp:14",
                 construct: "function template",
-                gap: Some(
-                    "scip-clang attributes the call to an instantiation, not the template definition",
-                ),
+                gap: None,
             },
             Probe {
                 symbol: "unwrap",
                 site: "main.cpp:16",
                 construct: "class template, out-of-class member",
                 gap: Some(
-                    "template member: the instantiation problem plus the out-of-class split",
+                    "scip-clang emits Box#, Box#Box<T> and Box#value_ but no Box#unwrap, so there \
+                     is no occurrence to attribute",
                 ),
             },
             Probe {
@@ -394,9 +399,7 @@ fn cpp_constructs_resolve_end_to_end() {
                 symbol: "label_of",
                 site: "main.cpp:18",
                 construct: "free function taking a base reference",
-                gap: Some(
-                    "the argument needs a derived-to-base conversion at the call site",
-                ),
+                gap: None,
             },
         ],
     );

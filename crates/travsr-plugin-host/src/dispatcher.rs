@@ -68,6 +68,27 @@ impl Dispatcher {
         package: &str,
     ) -> Result<Option<ParseResponse>, IndexError> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        // `.h` is the one extension two registered languages both have a real
+        // claim to, and the table can only hold one. It holds C, so every C++
+        // project that uses `.h` for headers — LLVM, Google style, most of the
+        // ecosystem — had its headers parsed by a grammar with no class, no
+        // namespace and no template. A header-declared API was invisible to
+        // the graph, and its SCIP definitions had nothing to unify against.
+        //
+        // Nothing in the filename can settle it, so settle it on content, the
+        // way clangd and linguist do. Only `.h` pays the read, and only when a
+        // C++ plugin is actually registered.
+        let (ext, source) = if ext == "h" {
+            match std::fs::read_to_string(path) {
+                Ok(text) if travsr_analysis::cpp::header_is_cxx(&text) => ("hpp", Some(text)),
+                Ok(text) => ("h", Some(text)),
+                // Unreadable or not UTF-8: fall through to the extension table
+                // and let the parser report the failure, as before.
+                Err(_) => ("h", None),
+            }
+        } else {
+            (ext, None)
+        };
         match self.by_ext.get(ext) {
             Some(t) => {
                 let req = ParseRequest {
@@ -75,7 +96,9 @@ impl Dispatcher {
                     vname_path: vname_path.to_string(),
                     corpus: corpus.to_string(),
                     package: package.to_string(),
-                    source: None,
+                    // Reuse the text already read for the sniff rather than
+                    // making the parser open the file a second time.
+                    source: source.map(String::into_bytes),
                 };
                 Ok(Some(t.parse(req)?))
             }

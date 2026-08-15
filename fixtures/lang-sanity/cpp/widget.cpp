@@ -43,8 +43,8 @@ int build_default() {
     return w.draw();
 }
 
-std::string label_of(const Shape &s) {
-    return std::to_string(s.area());
+int label_of(const Shape &s) {
+    return s.area();
 }
 
 }  // namespace ui

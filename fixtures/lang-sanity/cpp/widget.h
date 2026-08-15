@@ -1,8 +1,6 @@
 #ifndef WIDGET_H
 #define WIDGET_H
 
-#include <string>
-
 namespace app {
 namespace ui {
 
@@ -58,7 +56,8 @@ T Box<T>::unwrap() const {
 }
 
 int build_default();
-std::string label_of(const Shape &s);
+/// Takes a base reference: the call site needs a derived-to-base conversion.
+int label_of(const Shape &s);
 
 }  // namespace ui
 }  // namespace app
