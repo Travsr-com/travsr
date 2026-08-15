@@ -596,14 +596,20 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
     // Resolving here also means an invalid TRAVSR_EMBED_ACCEL is now rejected on
     // this path too, instead of being ignored because the binary happened to exist.
     let target = crate::install::current_target().context("determining install target")?;
-    let variant = resolve_accel_variant(&target)?;
+    let variant = resolve_accel_variant(target)?;
 
     // Only `Some(false)` re-downloads: the sidecar answered and said it has no
     // accelerator. `None` means it could not tell us (pre-handshake build), and
     // treating that as "not accelerated" would re-download on every init.
-    let wants_upgrade = variant.is_some() && installed_sidecar_is_accelerated(&dest) == Some(false);
+    //
+    // `installed` is checked first so a fresh install does not spawn a binary that
+    // is not there — `&&` short-circuits, so the probe only runs when there is
+    // something to probe.
+    let installed = dest.exists();
+    let wants_upgrade =
+        installed && variant.is_some() && installed_sidecar_is_accelerated(&dest) == Some(false);
 
-    if dest.exists() && !reinstall && !wants_upgrade {
+    if installed && !reinstall && !wants_upgrade {
         println!("  {} {} ready", pal.green("\u{25cf}"), backend.binary_name);
         // RFC-025 Point B: the binary is present but presence is monotonic and
         // never re-checks the release it was pinned to on install day. Surface a
