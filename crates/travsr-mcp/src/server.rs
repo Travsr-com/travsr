@@ -418,7 +418,7 @@ fn tools_list() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "name": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars). Partial and NL queries are supported." },
-                        "exact": { "type": "boolean", "description": "If true, only return exact or word-boundary matches, filtering out loose substring noise." }
+                        "exact": { "type": "boolean", "description": "If true, drops loose substring matches and keeps only exact, word-boundary, and prefix matches. Use for short or common names to cut noise." }
                     },
                     "required": ["name"],
                     "additionalProperties": false
@@ -1008,7 +1008,7 @@ fn tools_list_global() -> serde_json::Value {
                     "properties": {
                         "name": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars). Partial and NL queries are supported." },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). IMPORTANT: always supply to avoid cross-repo noise; omit only when explicitly searching across multiple repos." },
-                        "exact": { "type": "boolean", "description": "If true, only return exact or word-boundary matches, filtering out loose substring noise." }
+                        "exact": { "type": "boolean", "description": "If true, drops loose substring matches and keeps only exact, word-boundary, and prefix matches. Use for short or common names to cut noise." }
                     },
                     "required": ["name"],
                     "additionalProperties": false
