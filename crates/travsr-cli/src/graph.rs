@@ -91,6 +91,17 @@ pub fn run(
         include_noise,
     };
 
+    // Callers and blast radius ride ref/call edges, so an incomplete Phase B
+    // turns "nothing found" into a wrong answer rather than a small one.
+    //
+    // `deps` does not: it rides Phase A import and `defines` edges, which are
+    // complete whether or not Phase B has run. Warning there told the user their
+    // complete answer might be missing something, which is both wrong and the
+    // fastest way to teach someone to ignore the warning that matters.
+    if !matches!(direction, Direction::Deps) {
+        daemon_client::warn_if_call_graph_degraded(&db_path);
+    }
+
     // Daemon route first (#318 O1), direct read-only open as fallback.
     let payload: GraphPayload =
         match daemon_client::try_query(&repo_root, "graph", serde_json::to_value(&args)?) {
@@ -128,7 +139,37 @@ pub fn run(
         }
     }
 
-    render(payload, format, budget)
+    // C3: a manifest/config file has no inbound edges — no source file depends on
+    // a manifest, so `--direction callers` is legitimately empty. Explain that
+    // instead of leaving the user to wonder, and point at what does work.
+    let manifest_dead_end = matches!(direction, Direction::Callers)
+        && matches!(format, Format::Tree)
+        && payload.tree.is_empty()
+        && payload
+            .seed
+            .as_ref()
+            .is_some_and(|s| s.kind == "file" && is_config_manifest_path(&s.path));
+
+    render(payload, format, budget)?;
+    if manifest_dead_end {
+        eprintln!(
+            "note: manifests are configuration inputs — no source file depends on one, so \
+             callers are empty. Use `--direction deps` to see what this manifest declares."
+        );
+    }
+    Ok(())
+}
+
+/// True when `path` is a dependency/config manifest (data-format extension or a
+/// name-recognized manifest). Used to explain an empty `--direction callers`.
+fn is_config_manifest_path(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if matches!(ext, "json" | "jsonc" | "yaml" | "yml" | "toml" | "xml") {
+        return true;
+    }
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    travsr_core::is_manifest_file(name)
 }
 
 pub fn run_all(format: Format, budget: usize) -> anyhow::Result<()> {
@@ -140,6 +181,7 @@ pub fn run_all(format: Format, budget: usize) -> anyhow::Result<()> {
         anyhow::bail!("not initialized — run `travsr init`");
     }
 
+    daemon_client::warn_if_call_graph_degraded(&db_path);
     // --all dumps are large by construction — always computed locally rather
     // than shipped through the daemon socket.
     let store = daemon_client::open_read_store(&db_path)?;
@@ -188,12 +230,13 @@ fn render(mut payload: GraphPayload, format: Format, budget: usize) -> anyhow::R
 fn print_tree(payload: &GraphPayload) {
     let nodes_by_id: HashMap<u64, &NodeEntry> = payload.nodes.iter().map(|n| (n.id, n)).collect();
     // Children per parent, in BFS discovery order.
-    let mut children: HashMap<u64, Vec<(&str, u64)>> = HashMap::new();
+    let mut children: HashMap<u64, Vec<(&str, u64, bool)>> = HashMap::new();
     for step in &payload.tree {
-        children
-            .entry(step.parent)
-            .or_default()
-            .push((step.edge_kind.as_str(), step.child));
+        children.entry(step.parent).or_default().push((
+            step.edge_kind.as_str(),
+            step.child,
+            step.incoming,
+        ));
     }
     if let Some(seed) = &payload.seed {
         print_tree_level(seed.id, &nodes_by_id, &children, "");
@@ -203,20 +246,24 @@ fn print_tree(payload: &GraphPayload) {
 fn print_tree_level(
     node_id: u64,
     nodes_by_id: &HashMap<u64, &NodeEntry>,
-    children: &HashMap<u64, Vec<(&str, u64)>>,
+    children: &HashMap<u64, Vec<(&str, u64, bool)>>,
     prefix: &str,
 ) {
     let Some(kids) = children.get(&node_id) else {
         return;
     };
-    for (i, (edge_kind, child_id)) in kids.iter().enumerate() {
+    for (i, (edge_kind, child_id, incoming)) in kids.iter().enumerate() {
         let is_last = i == kids.len() - 1;
         let connector = if is_last { "└── " } else { "├── " };
         let extension = if is_last { "    " } else { "│   " };
 
         if let Some(child) = nodes_by_id.get(child_id) {
+            // #564: the arrow renders the stored edge orientation — `→` for an
+            // outgoing edge (parent → child), `←` for an incoming one (the
+            // child calls / contains the parent).
+            let arrow = if *incoming { "←" } else { "→" };
             println!(
-                "{prefix}{connector}{edge_kind} → {} ({})",
+                "{prefix}{connector}{edge_kind} {arrow} {} ({})",
                 child.label, child.kind
             );
             print_tree_level(

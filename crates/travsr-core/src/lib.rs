@@ -258,6 +258,37 @@ impl Language {
     }
 }
 
+/// True when `file_name` is a dependency manifest that `data_format::parse`
+/// handles but whose extension is unmapped or absent, so the extension-based
+/// [`Language::from_extension`] gates would otherwise skip the file entirely.
+///
+/// Recognized by canonical basename (manifests have fixed names). This is the
+/// single source of truth for "is this an extensionless/odd-extension manifest";
+/// every file-enumeration gate (daemon walk, watcher, CLI walk) and the indexer
+/// dispatch route through it via [`is_indexable_path`], so the recognizer set
+/// can never drift between call sites.
+///
+/// Manifests whose extension IS mapped (`package.json`, `Cargo.toml`,
+/// `pyproject.toml`, `composer.json`, `pubspec.yaml`) are already admitted by
+/// `from_extension`; they are dispatched by name inside `data_format::parse` and
+/// do NOT need to be listed here.
+pub fn is_manifest_file(file_name: &str) -> bool {
+    file_name == "go.mod" || file_name.ends_with(".csproj")
+}
+
+/// True when `path` should be indexed at all — either it has a recognized
+/// source/data-format extension ([`Language::from_extension`]) or it is a
+/// name-recognized manifest ([`is_manifest_file`]). Every enumeration gate calls
+/// this so the "what is indexable" decision lives in exactly one place.
+pub fn is_indexable_path(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if Language::from_extension(ext).is_some() {
+        return true;
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    is_manifest_file(name)
+}
+
 /// Canonical list of every [`Language`] variant.
 ///
 /// `Language` is `#[non_exhaustive]`, so the compiler cannot enforce that a
@@ -1310,6 +1341,34 @@ impl Default for SafetyPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_manifest_file_recognizes_extensionless_and_odd_ext_manifests() {
+        assert!(is_manifest_file("go.mod"));
+        assert!(is_manifest_file("App.csproj"));
+        assert!(is_manifest_file("Directory.Build.csproj"));
+        // Not manifests handled by the name recognizer:
+        assert!(!is_manifest_file("go.sum"));
+        assert!(!is_manifest_file("Cargo.toml")); // ext-mapped, dispatched by name
+        assert!(!is_manifest_file("main.go"));
+        assert!(!is_manifest_file(""));
+    }
+
+    #[test]
+    fn is_indexable_path_admits_manifests_extension_and_name_based() {
+        // Extension-mapped source / data-format files.
+        assert!(is_indexable_path(Path::new("src/main.rs")));
+        assert!(is_indexable_path(Path::new("package.json")));
+        assert!(is_indexable_path(Path::new("Cargo.toml")));
+        assert!(is_indexable_path(Path::new("README.md")));
+        // Name-recognized manifests with unmapped/absent extensions.
+        assert!(is_indexable_path(Path::new("go.mod")));
+        assert!(is_indexable_path(Path::new("src/App.csproj")));
+        // Not indexable.
+        assert!(!is_indexable_path(Path::new("go.sum")));
+        assert!(!is_indexable_path(Path::new("notes.txt")));
+        assert!(!is_indexable_path(Path::new("Gemfile")));
+    }
 
     fn sample_vname() -> VName {
         VName::new(

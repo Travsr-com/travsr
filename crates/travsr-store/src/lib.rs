@@ -704,6 +704,31 @@ pub struct ExplainLegs {
     pub embed: Vec<(Node, f32)>,
 }
 
+/// Split a node-count vs map-count difference into two non-negative figures.
+///
+/// `saturating_sub` on a signed type saturates at `i64::MIN`, not at zero — a
+/// detail easy to read past, because on an unsigned type it does clamp at zero,
+/// which is plainly what was intended here. Both backfill gates used it that
+/// way, so whenever the map held more rows than `nodes` (stale entries left by
+/// a delete that ran outside this store instance) the log reported a negative
+/// count of missing rows:
+///
+/// ```text
+/// #478: backfilling nodes_fts_words + is_noise  missing=-299 stale=299
+/// ```
+///
+/// Harmless to the backfill itself, which is driven by a `NOT IN` query rather
+/// than by these numbers, but it points a reader diagnosing an index problem in
+/// exactly the wrong direction.
+fn backfill_counts(node_count: i64, map_count: i64) -> (i64, i64) {
+    // `saturating_sub` still earns its place — it handles overflow — but the
+    // zero clamp has to be explicit on a signed type.
+    (
+        node_count.saturating_sub(map_count).max(0),
+        map_count.saturating_sub(node_count).max(0),
+    )
+}
+
 /// SQLite-backed store. The MVP target — zero setup, single file on disk.
 pub struct SqliteStore {
     conn: Connection,
@@ -2343,6 +2368,59 @@ impl SqliteStore {
             .map(|n| n as u64)
             .context("sweeping orphan edges")
             .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Read-only graph integrity report: the report-only half of `travsr fsck`.
+    ///
+    /// NEVER mutates: no reconcile, no sweep, no writes of any kind. Safe to
+    /// call against a store opened with [`Self::open_read_only`] (§ `query_only`
+    /// PRAGMA would hard-fail any write attempt).
+    ///
+    /// Computes: `node_count`, `edge_count`, the ghost-path set (DB paths
+    /// absent on disk), orphan-edge count, self-referential `ref/call` edge
+    /// count, and the lexical (FTS words) index parity check. Extracted from
+    /// `travsr_daemon::fsck_repo`'s report path (#636) so travsr-mcp (which
+    /// must never depend on travsr-daemon) can answer `get_graph_health`
+    /// without opening the store read-write.
+    ///
+    /// O(F) where F = tracked file count (one `exists()` stat per DB path).
+    pub fn integrity_report(&self, repo_root: &std::path::Path) -> Result<GcReport, StoreError> {
+        let node_count = self.node_count()?;
+        let fts_words_count = self.fts_words_node_count()?;
+        let lexical_index_parity_issue = if node_count == fts_words_count {
+            None
+        } else {
+            Some(format!(
+                "nodes ({node_count}) != nodes_fts_words_map ({fts_words_count}), \
+                 run `travsr init` to re-backfill the lexical word index (#478)"
+            ))
+        };
+
+        let mut report = GcReport {
+            node_count,
+            edge_count: self.edge_count()?,
+            lexical_index_parity_issue,
+            ..GcReport::default()
+        };
+
+        // Ghost detection stats each DB path directly rather than re-walking the
+        // disk (see `travsr_daemon::fsck_repo`'s doc comment for why, #580):
+        // statting the DB paths is symmetric by construction, with no walk
+        // config or filters to drift from the write path.
+        let db_paths: std::collections::HashSet<String> =
+            self.get_all_file_hashes()?.into_keys().collect();
+        let mut ghosts: Vec<String> = Vec::new();
+        for path in &db_paths {
+            if !repo_root.join(path).exists() {
+                ghosts.push(path.clone());
+            }
+        }
+        report.ghost_paths = ghosts;
+
+        report.orphan_edges_detected = self.count_orphans()?;
+        report.self_ref_call_edges_detected = self.count_self_ref_call_edges()?;
+
+        Ok(report)
     }
 
     /// Delete all nodes (and their edges) whose VName path starts with `prefix`.
@@ -4702,9 +4780,9 @@ impl SqliteStore {
         // In that case the JOIN in search_nodes_fuzzy silently skips them;
         // the count-inequality still triggers a no-op backfill pass.
         tracing::info!(
-            missing = node_count.saturating_sub(map_count),
-            stale = map_count.saturating_sub(node_count),
-            "RFC-012 L1: backfilling FTS index for unindexed nodes"
+            missing = backfill_counts(node_count, map_count).0,
+            stale = backfill_counts(node_count, map_count).1,
+            "building the text search index for new symbols"
         );
 
         // Fetch unindexed nodes into a Vec first so the statement is dropped
@@ -4758,7 +4836,7 @@ impl SqliteStore {
         }
         tx.commit().context("committing FTS backfill transaction")?;
 
-        tracing::info!(indexed = nodes.len(), "RFC-012 L1: FTS backfill complete");
+        tracing::info!(indexed = nodes.len(), "text search index updated");
         Ok(())
     }
 
@@ -4787,11 +4865,15 @@ impl SqliteStore {
             return Ok(());
         }
 
-        tracing::info!(
-            missing = node_count.saturating_sub(words_map_count),
-            stale = words_map_count.saturating_sub(node_count),
-            "#478: backfilling nodes_fts_words + is_noise for unindexed nodes"
-        );
+        // DEBUG, not INFO. The gate above is a count comparison, which is
+        // deliberately conservative: stale map rows left by a delete make the
+        // counts differ forever, so this pass runs on every startup and indexes
+        // nothing. It cannot be gated on `missing == 0` instead — with stale
+        // rows present that figure can read zero while nodes really are
+        // unindexed, and the `NOT IN` query below is the only reliable answer.
+        // So the pass stays, and only its *outcome* is announced.
+        let (missing, stale) = backfill_counts(node_count, words_map_count);
+        tracing::debug!(missing, stale, "checking the word index for new symbols");
 
         let nodes: Vec<Node> = {
             let mut stmt = self
@@ -4849,10 +4931,16 @@ impl SqliteStore {
         tx.commit()
             .context("committing FTS word backfill transaction")?;
 
-        tracing::info!(
-            indexed = nodes.len(),
-            "#478: nodes_fts_words + is_noise backfill complete"
-        );
+        // Only a pass that did something is worth a line in the log.
+        if nodes.is_empty() {
+            tracing::debug!("word index already current");
+        } else {
+            tracing::info!(
+                event = "store.fts_words.backfill",
+                indexed = nodes.len(),
+                "word index updated"
+            );
+        }
         Ok(())
     }
 
@@ -6061,10 +6149,7 @@ LIMIT 100",
         tx.commit()
             .context("committing vocab backfill transaction")?;
 
-        tracing::info!(
-            nodes = token_strings.len(),
-            "RFC-012 L2-A: fts_vocab backfill complete"
-        );
+        tracing::info!(nodes = token_strings.len(), "search vocabulary updated");
         Ok(())
     }
 
@@ -6208,7 +6293,7 @@ LIMIT 100",
             }
         }
         tx.commit()?;
-        tracing::info!("RFC-012 A2 F1: seeded fts_synonyms from static defaults");
+        tracing::info!("loaded default search synonyms");
         Ok(())
     }
 
@@ -6958,6 +7043,73 @@ mod tests {
             VName::new("test-corpus", "", path, "markdown", anchor),
             "doc-chunk",
         )
+    }
+
+    // ── #636: SqliteStore::integrity_report ──────────────────────────────────
+
+    #[test]
+    fn integrity_report_clean_graph_is_all_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_node("fn:a");
+        store.put_node(&a).unwrap();
+        store.put_file_hash("src/foo.ts", "deadbeef").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/foo.ts"), b"export function a() {}").unwrap();
+
+        let report = store.integrity_report(tmp.path()).unwrap();
+        assert_eq!(report.node_count, 1);
+        assert_eq!(report.edge_count, 0);
+        assert!(
+            report.ghost_paths.is_empty(),
+            "no file on disk yet: {:?}",
+            report.ghost_paths
+        );
+        assert_eq!(report.orphan_edges_detected, 0);
+        assert_eq!(report.self_ref_call_edges_detected, 0);
+        assert!(report.lexical_index_parity_issue.is_none());
+    }
+
+    #[test]
+    fn integrity_report_detects_ghost_when_tracked_file_missing_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.put_file_hash("src/deleted.ts", "deadbeef").unwrap();
+        // src/deleted.ts is tracked in the DB but never created on disk.
+
+        let report = store.integrity_report(tmp.path()).unwrap();
+        assert_eq!(report.ghost_paths, vec!["src/deleted.ts".to_string()]);
+    }
+
+    #[test]
+    fn integrity_report_does_not_flag_file_present_on_disk_as_ghost() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/present.ts"), b"ok").unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.put_file_hash("src/present.ts", "deadbeef").unwrap();
+
+        let report = store.integrity_report(tmp.path()).unwrap();
+        assert!(report.ghost_paths.is_empty());
+    }
+
+    #[test]
+    fn integrity_report_counts_orphan_edges_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_node("fn:a");
+        let a_id = store.put_node(&a).unwrap();
+        // dst NodeId 999999 has no corresponding node row (an orphan edge).
+        store
+            .put_edge(&Edge::new(a_id, NodeId(999_999), EdgeKind::RefCall))
+            .unwrap();
+
+        let before_nodes = store.node_count().unwrap();
+        let report = store.integrity_report(tmp.path()).unwrap();
+        assert_eq!(report.orphan_edges_detected, 1);
+        // Read-only: never mutates.
+        assert_eq!(store.node_count().unwrap(), before_nodes);
+        assert_eq!(store.edge_count().unwrap(), 1);
     }
 
     /// #376 W1: this filter must stay identical to the sidecar's NODE_ELIGIBLE.
@@ -10180,5 +10332,20 @@ mod tests {
             "one tombstone, one node, two models \u{2014} at_risk counts nodes, and must never \
              exceed the {total} tombstone(s) pruned"
         );
+    }
+
+    /// The exact shape observed on this repo's own index: 10,857 nodes against
+    /// 11,156 map rows, which reported `missing=-299`.
+    #[test]
+    fn backfill_counts_never_report_a_negative() {
+        // Stale map rows outnumber nodes.
+        assert_eq!(super::backfill_counts(10_857, 11_156), (0, 299));
+        // The ordinary direction: rows still to index.
+        assert_eq!(super::backfill_counts(11_156, 10_857), (299, 0));
+        // In sync.
+        assert_eq!(super::backfill_counts(500, 500), (0, 0));
+        // Signed saturating_sub saturates at i64::MIN rather than zero, which
+        // is what produced the negative in the first place.
+        assert_eq!(super::backfill_counts(0, i64::MAX).0, 0);
     }
 }

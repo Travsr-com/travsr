@@ -287,6 +287,37 @@ pub fn skeleton_for_node(node: &Node, repo_root: &Path) -> Option<AstSkeleton> {
     Some(extract_skeleton(decl, &src, node, &lang))
 }
 
+/// Can [`embed_texts_for_file`] ever return text for this node?
+///
+/// Mirrors that function's own filters, and lives next to it so the two cannot
+/// drift. Callers group thousands of nodes by file and pay a file read plus a
+/// tree-sitter parse per group, so a node that is structurally incapable of
+/// producing text must be dropped *before* grouping — otherwise its file is
+/// read and parsed to produce nothing, on every pass, forever. `embed_progress`
+/// in travsr-store carries the same guard for the same reason (#391, #376 W1).
+///
+/// Deliberately conservative: it rejects only the always-unfillable classes.
+/// A node it admits can still yield nothing (grammar-less language, unreadable
+/// file, no declaration found at the recorded row) — those are misses to fix at
+/// the source, not classes to exclude.
+pub fn can_have_embed_text(node: &Node) -> bool {
+    // Markdown: only doc-chunks carry prose. The plain `.md` file node
+    // deliberately gets none, to stay out of the vector index (#376 §3.1).
+    if node.vname.language == "markdown" {
+        return node.kind == "doc-chunk";
+    }
+    // Data formats have no grammar; only the file node gets path-based text.
+    if travsr_core::Language::from_str(node.vname.language.as_str())
+        .is_some_and(|l| l.is_data_format())
+    {
+        return node.kind == "file";
+    }
+    // Code: the skeleton is extracted at a declaration row, so a node with no
+    // recorded line has nothing to anchor to. This is what every code-language
+    // `file` node looks like.
+    node.line.is_some()
+}
+
 /// Batch form of [`skeleton_for_node`]: parse a source file **once** and build
 /// the `embed_text` for every node located in it, at the given richness.
 ///
@@ -492,6 +523,15 @@ fn grammar_for(lang: &Lang, _path: &str) -> tree_sitter::Language {
 
 // ── Declaration finder ────────────────────────────────────────────────────────
 
+/// Node kinds that count as a declaration to anchor a skeleton at.
+///
+/// A node whose recorded line lands on a kind absent from this list silently
+/// gets no `embed_text` at all, so a form that is *indexed* but not listed here
+/// is invisible to semantic retrieval. Each list therefore has to cover the
+/// declaration-only forms of a language, not just the defining ones: a Go
+/// package-level `const`, an ambient `declare function` in a `.d.ts`, a C
+/// prototype in a header. Those three were missing and cost 49 nodes on this
+/// repo alone.
 fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
     match lang {
         Lang::Rust => &[
@@ -507,6 +547,17 @@ fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
         ],
         Lang::TypeScript { .. } => &[
             "function_declaration",
+            // Ambient `declare function` — the only form a `.d.ts` binding
+            // surface has, so without it such a file embeds as nothing.
+            "function_signature",
+            // `const f = (a) => ...` and `const f = function (a) {...}`. The
+            // callable hangs off a declarator rather than being a declaration
+            // of its own, and this is the dominant function form in modern
+            // JS/TS — every `const Component = () => ...`. Without these two
+            // kinds none of them can be anchored, so none of them reach the
+            // vector index at all.
+            "lexical_declaration",
+            "variable_declaration",
             "method_definition",
             "class_declaration",
             "abstract_class_declaration",
@@ -519,6 +570,13 @@ fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
             "function_declaration",
             "method_declaration",
             "type_declaration",
+            // Package-level const/var. The `_spec` kinds carry grouped blocks
+            // (`var ( A = 1 \n B = 2 )`), where each member's recorded line is
+            // its own spec row rather than the declaration's.
+            "const_declaration",
+            "var_declaration",
+            "const_spec",
+            "var_spec",
         ],
         Lang::Java => &[
             "class_declaration",
@@ -535,7 +593,16 @@ fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
             "function_declaration",
             "secondary_constructor",
         ],
-        Lang::C => &["function_definition", "struct_specifier", "enum_specifier"],
+        Lang::C => &[
+            "function_definition",
+            // Header prototypes parse as a bare `declaration`. Broader than the
+            // other entries (a local `int x = 5;` is also a declaration), but a
+            // node recorded at that row previously got no text at all, so the
+            // trade is text-for-nothing, not text-for-worse-text.
+            "declaration",
+            "struct_specifier",
+            "enum_specifier",
+        ],
         Lang::Cpp => &[
             "function_definition",
             "class_specifier",
@@ -556,6 +623,11 @@ fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
         Lang::Swift => &[
             "function_declaration",
             "init_declaration",
+            // `let handler = { (a: Int) -> Int in ... }`: a closure bound to a
+            // name. Without this the node is indexed and gets no text at all,
+            // which is exactly where TypeScript arrows were before they were
+            // anchored.
+            "property_declaration",
             "class_declaration", // covers struct/enum/actor/extension too (declaration_kind field)
             "protocol_declaration",
         ],
@@ -765,7 +837,10 @@ fn extract_typescript(
     let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
-        "function_declaration" | "method_definition" => {
+        // `function_signature` is the ambient `declare function` form. It
+        // carries the same `parameters` and `return_type` fields and simply has
+        // no `body`, so it shares this arm rather than getting a thinner one.
+        "function_declaration" | "function_signature" | "method_definition" => {
             if let Some(p) = decl.child_by_field_name("parameters") {
                 for i in 0..p.named_child_count() {
                     let Some(c) = p.named_child(i as u32) else {
@@ -789,6 +864,46 @@ fn extract_typescript(
             if let Some(body) = decl.child_by_field_name("body") {
                 collect_callees_dfs(body, src, "call_expression", &mut callees);
                 collect_body_comments_dfs(body, src, ck, &mut comments);
+            }
+        }
+        // `const f = (a) => ...`, `let f = async (a) => ...`,
+        // `var f = function (a) {...}`. The declaration itself carries no
+        // signature; the callable bound to the declarator does, so read the
+        // params and return type from there rather than settling for a
+        // name-and-path text.
+        "lexical_declaration" | "variable_declaration" => {
+            let callable = first_descendant_of_kind(decl, "arrow_function")
+                .or_else(|| first_descendant_of_kind(decl, "function_expression"))
+                .or_else(|| first_descendant_of_kind(decl, "function"));
+            if let Some(f) = callable {
+                // An arrow with one untyped parameter has no `parameters` list,
+                // just a bare `parameter`: `const f = a => a`.
+                if let Some(p) = f.child_by_field_name("parameters") {
+                    for i in 0..p.named_child_count() {
+                        let Some(c) = p.named_child(i as u32) else {
+                            continue;
+                        };
+                        if matches!(
+                            c.kind(),
+                            "required_parameter"
+                                | "optional_parameter"
+                                | "rest_pattern"
+                                | "assignment_pattern"
+                        ) {
+                            params.push(node_text(c, src).to_string());
+                        }
+                    }
+                } else if let Some(p) = f.child_by_field_name("parameter") {
+                    params.push(node_text(p, src).to_string());
+                }
+                if let Some(r) = f.child_by_field_name("return_type") {
+                    let raw = node_text(r, src);
+                    return_type = Some(raw.trim_start_matches(':').trim().to_string());
+                }
+                if let Some(body) = f.child_by_field_name("body") {
+                    collect_callees_dfs(body, src, "call_expression", &mut callees);
+                    collect_body_comments_dfs(body, src, ck, &mut comments);
+                }
             }
         }
         "class_declaration" | "abstract_class_declaration" => {
@@ -975,6 +1090,38 @@ fn extract_go(
                     collect_callees_dfs(c, src, "call_expression", &mut callees);
                     collect_body_comments_dfs(c, src, ck, &mut comments);
                     break;
+                }
+            }
+        }
+        // `var handler = func(a int) int { ... }`, and the `const`/`var` forms
+        // generally. The declaration carries only a name; the signature lives on
+        // the function value bound to it, so without descending into the literal
+        // the text is `var: var:handler | module: m.go` and nothing more. Same
+        // shape as a TypeScript arrow bound to a `const`, handled the same way.
+        //
+        // A plain `var x = 3` has no literal to find and keeps the name-only
+        // text, which is all there is to say about it.
+        "var_declaration" | "var_spec" | "const_declaration" | "const_spec" => {
+            if let Some(f) = first_descendant_of_kind(decl, "func_literal") {
+                if let Some(p) = f.child_by_field_name("parameters") {
+                    for i in 0..p.named_child_count() {
+                        let Some(c) = p.named_child(i as u32) else {
+                            continue;
+                        };
+                        if matches!(
+                            c.kind(),
+                            "parameter_declaration" | "variadic_parameter_declaration"
+                        ) {
+                            params.push(node_text(c, src).to_string());
+                        }
+                    }
+                }
+                if let Some(r) = f.child_by_field_name("result") {
+                    return_type = Some(node_text(r, src).to_string());
+                }
+                if let Some(b) = f.child_by_field_name("body") {
+                    collect_callees_dfs(b, src, "call_expression", &mut callees);
+                    collect_body_comments_dfs(b, src, ck, &mut comments);
                 }
             }
         }
@@ -1214,7 +1361,9 @@ fn extract_c(
     let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
-        "function_definition" => {
+        // A header prototype is a `declaration` carrying the same `type` and
+        // `declarator` fields as a definition, minus the `body`.
+        "function_definition" | "declaration" => {
             // Return type is the `type` field
             if let Some(rt) = decl.child_by_field_name("type") {
                 return_type = Some(node_text(rt, src).to_string());
@@ -1472,6 +1621,45 @@ fn extract_swift(
             }
             if let Some(body) = named_child_of_kind(decl, "code_block") {
                 collect_body_comments_dfs(body, src, ck, &mut comments);
+            }
+        }
+        // `let handler = { (a: Int) -> Int in ... }`: the property carries only a
+        // name, and the signature is on the closure bound to it. Read from the
+        // grammar rather than assumed: the closure is a `lambda_literal`, whose
+        // `lambda_function_type` holds `lambda_function_type_parameters` of
+        // `lambda_parameter`, and the return type after them.
+        //
+        // A property with no closure (`let n = 3`, a stored property) finds no
+        // literal and keeps its name-only text, which is all it has.
+        "property_declaration" => {
+            if let Some(lambda) = first_descendant_of_kind(decl, "lambda_literal") {
+                if let Some(ty) = first_descendant_of_kind(lambda, "lambda_function_type") {
+                    if let Some(ps) =
+                        first_descendant_of_kind(ty, "lambda_function_type_parameters")
+                    {
+                        for i in 0..ps.named_child_count() {
+                            let Some(c) = ps.named_child(i as u32) else {
+                                continue;
+                            };
+                            if c.kind() == "lambda_parameter" {
+                                params.push(node_text(c, src).to_string());
+                            }
+                        }
+                    }
+                    // The return type is the type sitting after the parameter
+                    // list inside the function type, so take the last type-ish
+                    // child that is not the parameter list itself.
+                    for i in (0..ty.named_child_count()).rev() {
+                        let Some(c) = ty.named_child(i as u32) else {
+                            continue;
+                        };
+                        if c.kind() != "lambda_function_type_parameters" {
+                            return_type = Some(node_text(c, src).to_string());
+                            break;
+                        }
+                    }
+                }
+                collect_body_comments_dfs(lambda, src, ck, &mut comments);
             }
         }
         "init_declaration" => {
@@ -2104,8 +2292,29 @@ fn strip_comment_marker(s: &str) -> String {
 /// Walk `prev_named_sibling()` from `decl` to collect adjacent doc-comment nodes.
 /// Stops at the first non-comment named sibling. Results are reversed to source order.
 fn collect_doc_comments(decl: TsNode<'_>, src: &[u8], comment_kinds: &[&str]) -> Vec<String> {
+    // Climb out of same-line wrappers first. `export function f() {}` parses as
+    // an `export_statement` containing the `function_declaration`, so the
+    // declaration has no previous sibling at all and the comment is a sibling of
+    // the wrapper. Collecting from the declaration therefore found nothing, and
+    // every *exported* TypeScript symbol lost its doc comment while Go and C
+    // kept theirs.
+    //
+    // Guarded twice so this cannot wander into an enclosing block: only while
+    // the node has no previous sibling of its own, and only into a parent that
+    // begins on the same line.
+    let mut anchor = decl;
+    for _ in 0..3 {
+        if anchor.prev_named_sibling().is_some() {
+            break;
+        }
+        match anchor.parent() {
+            Some(p) if p.start_position().row == anchor.start_position().row => anchor = p,
+            _ => break,
+        }
+    }
+
     let mut docs: Vec<String> = Vec::new();
-    let mut cursor = decl.prev_named_sibling();
+    let mut cursor = anchor.prev_named_sibling();
     while let Some(sib) = cursor {
         if comment_kinds.contains(&sib.kind()) {
             let stripped = strip_comment_marker(node_text(sib, src));
@@ -3174,5 +3383,340 @@ mod tests {
             "only file node emits text; package node skipped"
         );
         assert_eq!(result[0].1, "toml Cargo.toml");
+    }
+
+    // ── can_have_embed_text ──────────────────────────────────────────────────
+
+    /// The class that made the daemon re-read and tree-sitter-parse 476 files
+    /// per tick to write nothing: a code-language `file` node has no line to
+    /// anchor a skeleton at, so the parse always skips it. The predicate and
+    /// the parse have to agree in both directions — reject too much and real
+    /// text is lost, reject too little and the wasted pass comes back.
+    #[test]
+    fn can_have_embed_text_agrees_with_the_parse_on_code_file_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "pub fn handler() {}\n").unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        // A `file` node exactly as indexed: no line.
+        let file_node = Node::new(VName::new("corpus", "", "a.rs", "rust", "file"), "file");
+        let fn_node = make_node("a.rs", "fn:handler", "rust", "function", 1, 1);
+
+        assert!(!can_have_embed_text(&file_node));
+        assert!(can_have_embed_text(&fn_node));
+
+        let only_file = embed_texts_for_file(
+            dir.path(),
+            &canon,
+            "a.rs",
+            &[&file_node],
+            EmbedRichness::Compact,
+        );
+        assert!(
+            only_file.is_empty(),
+            "the parse declines this node, so grouping it in only buys a wasted read + parse"
+        );
+        let with_fn = embed_texts_for_file(
+            dir.path(),
+            &canon,
+            "a.rs",
+            &[&fn_node],
+            EmbedRichness::Compact,
+        );
+        assert_eq!(
+            with_fn.len(),
+            1,
+            "what the predicate admits must be fillable"
+        );
+    }
+
+    /// A blanket `kind = 'file'` exclusion is the tempting fix and it is wrong:
+    /// data-format file nodes are the one file kind that does get text.
+    #[test]
+    fn can_have_embed_text_admits_data_format_file_nodes() {
+        let toml_file = Node::new(
+            VName::new("corpus", "", "Cargo.toml", "toml", "file"),
+            "file",
+        );
+        assert!(can_have_embed_text(&toml_file));
+        let toml_pkg = make_node("Cargo.toml", "pkg:serde@1", "toml", "package", 1, 1);
+        assert!(
+            !can_have_embed_text(&toml_pkg),
+            "package nodes are filled by the pathless pass, not by the parse"
+        );
+    }
+
+    /// Markdown prose lives on doc-chunks; the `.md` file node is kept out of
+    /// the vector index deliberately (#376 §3.1).
+    #[test]
+    fn can_have_embed_text_markdown_only_doc_chunks() {
+        let chunk = Node::new(
+            VName::new("corpus", "", "README.md", "markdown", "doc:intro"),
+            "doc-chunk",
+        );
+        let md_file = Node::new(
+            VName::new("corpus", "", "README.md", "markdown", "file"),
+            "file",
+        );
+        assert!(can_have_embed_text(&chunk));
+        assert!(!can_have_embed_text(&md_file));
+    }
+
+    // ── declaration-only forms ───────────────────────────────────────────────
+    //
+    // Three shapes that are indexed as nodes but produced no embed_text,
+    // because `decl_kinds_for` listed only the *defining* form of each. Found
+    // by the `missed=` field added alongside these tests: 49 nodes reported
+    // fillable, parsed, and written back as nothing.
+
+    /// Helper: text produced for a single node in a single written file.
+    fn embed_text_for(rel: &str, src: &str, node: &Node) -> Vec<(travsr_core::NodeId, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, src).unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        embed_texts_for_file(dir.path(), &canon, rel, &[node], EmbedRichness::Compact)
+    }
+
+    /// Go package-level `const` and `var`. Both are indexed (22 such nodes on
+    /// this repo), and `decl_kinds_for(Go)` had neither declaration form.
+    #[test]
+    fn go_package_level_const_and_var_get_embed_text() {
+        let src = "package simple\n\nconst Version = \"1.0.0\"\n\nvar DefaultTimeout = 30\n";
+        let konst = make_node("simple.go", "var:Version", "go", "var", 3, 3);
+        let var = make_node("simple.go", "var:DefaultTimeout", "go", "var", 5, 5);
+
+        assert_eq!(
+            embed_text_for("simple.go", src, &konst).len(),
+            1,
+            "a package-level const is a declaration worth embedding"
+        );
+        assert_eq!(
+            embed_text_for("simple.go", src, &var).len(),
+            1,
+            "so is a package-level var"
+        );
+    }
+
+    /// Grouped `const (...)` / `var (...)` blocks, where each member's recorded
+    /// line is its own spec row rather than the declaration's. This is why the
+    /// `_spec` kinds are listed alongside the `_declaration` ones: matching on
+    /// the declaration alone would find nothing for members 2..n.
+    #[test]
+    fn go_grouped_const_block_members_each_get_embed_text() {
+        let src = "package k\n\nconst (\n\tAlpha = 1\n\tBeta  = 2\n)\n";
+        let alpha = make_node("k.go", "var:Alpha", "go", "var", 4, 4);
+        let beta = make_node("k.go", "var:Beta", "go", "var", 5, 5);
+
+        assert_eq!(embed_text_for("k.go", src, &alpha).len(), 1);
+        assert_eq!(
+            embed_text_for("k.go", src, &beta).len(),
+            1,
+            "the second member sits on its own spec row, not the declaration's"
+        );
+    }
+
+    /// Ambient declarations in a `.d.ts`: the only form a napi-rs or generated
+    /// binding surface has, so with these missing the whole file embedded as
+    /// nothing (25 such nodes on this repo). The signature carries real params
+    /// and a real return type, so the text has to reach them rather than settle
+    /// for name-and-path.
+    #[test]
+    fn typescript_ambient_declare_function_gets_embed_text() {
+        let src = "/** napi-rs generated binding */\nexport declare function greet(name: string): string;\n";
+        let node = make_node("addon.d.ts", "fn:greet", "typescript", "function", 2, 2);
+        let out = embed_text_for("addon.d.ts", src, &node);
+        assert_eq!(
+            out.len(),
+            1,
+            "`export declare function` is a declaration, not a definition"
+        );
+        assert_eq!(
+            out[0].1,
+            "function: fn:greet | module: addon.d.ts | params: name: string | returns: string \
+             | doc: napi-rs generated binding"
+        );
+    }
+
+    /// Doc comments on *exported* declarations were dropped for every
+    /// TypeScript symbol, while Go and C kept theirs. `export function f() {}`
+    /// wraps the declaration in an `export_statement`, so the declaration has no
+    /// previous sibling and the comment is a sibling of the wrapper.
+    ///
+    /// This is the highest-value text a symbol has, and `export` is how nearly
+    /// every symbol in a TypeScript codebase is declared.
+    #[test]
+    fn typescript_exported_declarations_keep_their_doc_comment() {
+        let cases: Vec<(&str, &str, &str)> = vec![
+            (
+                "exported function",
+                "/** Greets someone by name. */\nexport function greet(name: string): string { return name; }\n",
+                "function: fn:greet | module: a.ts | params: name: string | returns: string | doc: Greets someone by name.",
+            ),
+            (
+                "exported arrow",
+                "/** Median of a list. */\nexport const median = (a: number[]): number => a[0];\n",
+                "function: fn:median | module: a.ts | params: a: number[] | returns: number | doc: Median of a list.",
+            ),
+            (
+                "line comments stack in order",
+                "// first line\n// second line\nexport function f(): void {}\n",
+                "function: fn:f | module: a.ts | returns: void | doc: first line second line",
+            ),
+        ];
+        for (why, src, want) in cases {
+            let line = src.lines().count() as u32;
+            let sig = if src.contains("median") {
+                "fn:median"
+            } else if src.contains("greet") {
+                "fn:greet"
+            } else {
+                "fn:f"
+            };
+            let node = make_node("a.ts", sig, "typescript", "function", line, line);
+            let out = embed_text_for("a.ts", src, &node);
+            assert_eq!(out.len(), 1, "{why}: no text at all");
+            assert_eq!(out[0].1, want, "{why}");
+        }
+    }
+
+    /// The climb out of a wrapper must not reach past it. A function whose
+    /// preceding sibling is another statement has no doc comment, and must not
+    /// inherit a comment attached to whatever encloses it.
+    #[test]
+    fn the_doc_comment_climb_does_not_borrow_from_an_enclosing_scope() {
+        let src = "/** Outer doc. */\nexport function outer(): void {\n  const x = 1;\n  function inner(): void {}\n}\n";
+        let node = make_node("a.ts", "fn:inner", "typescript", "function", 4, 4);
+        let out = embed_text_for("a.ts", src, &node);
+        assert_eq!(out.len(), 1);
+        assert!(
+            !out[0].1.contains("doc:"),
+            "inner has no doc comment of its own and must not take outer's: {}",
+            out[0].1
+        );
+    }
+
+    /// The dominant function form in modern JS/TS, and the one that was wholly
+    /// absent: an arrow bound to a `const`. The callable hangs off a declarator
+    /// rather than being a declaration, so `decl_kinds_for` matched nothing and
+    /// none of them reached the vector index. Found on this repo as 21 `.mjs`
+    /// bench helpers, but on a typical React or Node codebase this is most of
+    /// the functions in the project.
+    #[test]
+    fn typescript_arrow_bound_to_a_const_gets_embed_text_with_its_signature() {
+        let cases: Vec<(&str, &str, &str)> = vec![
+            (
+                "typed arrow keeps params and return type",
+                "const median = (a: number[]): number => a[0];\n",
+                "function: fn:x | module: run.mjs | params: a: number[] | returns: number",
+            ),
+            (
+                "untyped JS arrow still yields its parameter names",
+                "const cOK = (min, got) => got >= min;\n",
+                "function: fn:x | module: run.mjs | params: min, got",
+            ),
+            (
+                // `t => t.trim()` has no parameter *list*, just a bare parameter.
+                "a single unparenthesised parameter is not skipped",
+                "const strip = t => t.trim();\n",
+                "function: fn:x | module: run.mjs | params: t | calls: trim",
+            ),
+            (
+                // The decl sits inside an `export_statement` wrapper.
+                "an exported arrow is reached through the export wrapper",
+                "export const hitOf = (p: string) => p.length;\n",
+                "function: fn:x | module: run.mjs | params: p: string",
+            ),
+            (
+                "async arrows report the Promise they return",
+                "const run = async (cmd: string): Promise<void> => {};\n",
+                "function: fn:x | module: run.mjs | params: cmd: string | returns: Promise<void>",
+            ),
+            (
+                "the older function-expression form works the same way",
+                "const f = function (a: number) { return a; };\n",
+                "function: fn:x | module: run.mjs | params: a: number",
+            ),
+        ];
+
+        for (why, src, want) in cases {
+            let node = make_node("run.mjs", "fn:x", "typescript", "function", 1, 1);
+            let out = embed_text_for("run.mjs", src, &node);
+            assert_eq!(out.len(), 1, "{why}: produced no text at all");
+            assert_eq!(out[0].1, want, "{why}");
+        }
+    }
+
+    /// A C prototype in a header. The definition lives in a `.c` file, but the
+    /// header is what other translation units see.
+    #[test]
+    fn c_header_prototype_gets_embed_text() {
+        let src = "int add(int a, int b);\n";
+        let node = make_node("helpers.h", "fn:add", "c", "function", 1, 1);
+        let out = embed_text_for("helpers.h", src, &node);
+        assert_eq!(
+            out.len(),
+            1,
+            "a header prototype is the only declaration of `add` in this file"
+        );
+        assert_eq!(
+            out[0].1,
+            "function: fn:add | module: helpers.h | params: int a, int b | returns: int"
+        );
+    }
+    /// A function value bound to a name, in the languages where the node is
+    /// indexed. TypeScript arrows were fixed first; the same shape exists in Go
+    /// and Swift, and both were left behind. Swift got no text at all, which is
+    /// exactly where TS arrows were: indexed, and absent from the vector index.
+    ///
+    /// Node names read from the grammar rather than assumed. Go nests the value
+    /// as `var_spec -> expression_list -> func_literal`; Swift as
+    /// `property_declaration -> lambda_literal -> lambda_function_type`.
+    #[test]
+    fn a_function_value_bound_to_a_name_carries_its_signature() {
+        let cases: Vec<(&str, &str, &str, &str, u32, &str)> = vec![
+            (
+                "go: func literal bound to a package-level var",
+                "go",
+                "m.go",
+                "package m\n\nvar handler = func(a int) int { return a }\n",
+                3,
+                "function: fn:x | module: m.go | params: a int | returns: int",
+            ),
+            (
+                "swift: closure bound to a let",
+                "swift",
+                "m.swift",
+                "let handler = { (a: Int) -> Int in a }\n",
+                1,
+                "function: fn:x | module: m.swift | params: a: Int | returns: Int",
+            ),
+        ];
+        for (why, lang, path, src, line, want) in cases {
+            let node = make_node(path, "fn:x", lang, "function", line, line);
+            let out = embed_text_for(path, src, &node);
+            assert_eq!(out.len(), 1, "{why}: produced no text");
+            assert_eq!(out[0].1, want, "{why}");
+        }
+    }
+
+    /// A binding with no function value keeps its name-only text. The descent
+    /// must not invent a signature for `var n = 3`, and must not regress it to
+    /// nothing by failing to find a literal that was never there.
+    #[test]
+    fn a_plain_value_binding_is_left_as_a_name() {
+        for (lang, path, src, line) in [
+            ("go", "m.go", "package m\n\nvar n = 3\n", 3u32),
+            ("swift", "m.swift", "let n = 3\n", 1u32),
+        ] {
+            let node = make_node(path, "fn:x", lang, "function", line, line);
+            let out = embed_text_for(path, src, &node);
+            assert_eq!(out.len(), 1, "{lang}: a plain binding still gets its name");
+            assert!(
+                !out[0].1.contains("params:") && !out[0].1.contains("returns:"),
+                "{lang}: nothing to read a signature from, so none should appear: {}",
+                out[0].1
+            );
+        }
     }
 }

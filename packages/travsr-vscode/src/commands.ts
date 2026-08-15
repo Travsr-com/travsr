@@ -30,6 +30,7 @@ import {
   type LangCount,
   type LangInfo,
 } from "./webviews";
+import type { Diagnostic, LogEntry } from "./webviews";
 
 // ── Pure helpers (unit-testable) ────────────────────────────────────────────
 
@@ -190,6 +191,106 @@ export function timeAgo(ms: number): string {
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h ago`;
   return `${Math.floor(hrs / 24)}d ago`;
+}
+
+/**
+ * Read the tail of the daemon log.
+ *
+ * `daemon.log.<UTC-DATE>` is JSON lines, one object per line. Only the last
+ * `maxBytes` are read, by seeking rather than by loading the file and slicing:
+ * the log is capped at 50 MB across rotations and the newest file is never
+ * pruned even when it alone exceeds that, so reading it whole to show 200 lines
+ * is a bounded-looking call that is not bounded.
+ *
+ * The first line of the window is dropped when the window did not start at byte
+ * zero, because a seek lands mid-line.
+ */
+export function readDaemonLogTail(repoRoot: string, maxLines = 500): LogEntry[] {
+  const dir = path.join(repoRoot, ".travsr");
+  let newest: string;
+  try {
+    const files = fs
+      .readdirSync(dir)
+      .filter((f) => f.startsWith("daemon.log"))
+      .sort(); // ISO date suffix sorts chronologically
+    if (files.length === 0) return [];
+    newest = path.join(dir, files[files.length - 1]);
+  } catch {
+    return [];
+  }
+
+  // Generous enough that maxLines is the binding limit, not the byte window.
+  const MAX_BYTES = 512 * 1024;
+  let text: string;
+  try {
+    const size = fs.statSync(newest).size;
+    const start = Math.max(0, size - MAX_BYTES);
+    const len = size - start;
+    const fd = fs.openSync(newest, "r");
+    try {
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, start);
+      text = buf.toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (start > 0) text = text.slice(text.indexOf("\n") + 1);
+  } catch {
+    return [];
+  }
+
+  return text
+    .split("\n")
+    .filter((l) => l.trim() !== "")
+    .slice(-maxLines)
+    .map(parseLogLine);
+}
+
+/**
+ * One log line as the panel needs it.
+ *
+ * Rotated files written before the log became JSON are still on disk and are
+ * still the only record of what happened then, so a line that does not parse is
+ * carried through as its own text rather than dropped.
+ */
+export function parseLogLine(line: string): LogEntry {
+  try {
+    const e = JSON.parse(line) as {
+      timestamp?: string;
+      level?: string;
+      target?: string;
+      fields?: Record<string, unknown>;
+    };
+    if (typeof e.timestamp === "string" && typeof e.level === "string") {
+      const fields = e.fields ?? {};
+      // `repo` is dropped for the same reason the CLI renderer drops it: the
+      // panel belongs to one repo and the reader opened it from inside that
+      // repo, so restating the path on every line is spent width.
+      const { message, event, repo: _repo, ...rest } = fields as Record<string, unknown>;
+      return {
+        // 24-hour, fixed width. `toLocaleTimeString` defaults to 12-hour with a
+        // meridiem in most locales, which is wider and does not sort by eye.
+        time: new Date(e.timestamp).toTimeString().slice(0, 8),
+        level: e.level,
+        target: shortTarget(e.target ?? ""),
+        message: typeof message === "string" ? message : "",
+        event: typeof event === "string" ? event : undefined,
+        detail: Object.entries(rest)
+          .map(([k, v]) => `${k}=${String(v)}`)
+          .join(" "),
+        iso: e.timestamp,
+        raw: line,
+      };
+    }
+  } catch {
+    // fall through
+  }
+  return { time: "", level: "", target: "", message: line, detail: "", iso: "", raw: line };
+}
+
+/** `travsr_plugin_host::registry` is 29 characters that say "plugin host". */
+function shortTarget(target: string): string {
+  return target.split("::")[0].replace(/^travsr_/, "").replace(/_/g, "-");
 }
 
 /** Build the stats dashboard view from `get_graph_stats` + local graph.db. */
@@ -509,6 +610,8 @@ type PanelMessage =
   | { command: "detectLangs" }
   | { command: "reloadAvailable" }
   | { command: "initRepo" }
+  | { command: "openFile"; path: string }
+  | { command: "refreshLog" }
   | { command: "refresh" };
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
@@ -649,10 +752,64 @@ export function registerShowRepos(client: McpClient): vscode.Disposable {
  * travsr.showGraphStats — read-only metrics dashboard webview.
  */
 export function registerShowGraphStats(client: McpClient): vscode.Disposable {
-  const render = async (): Promise<string> =>
-    buildStatsHtml(buildStatsView(await client.callTool("get_graph_stats")));
+  // Kept so a follow tick can redraw the log without re-running the two
+  // expensive halves of a render. Undefined until the first full pass, so a
+  // log-only refresh before then falls back to doing the work.
+  let lastStats: StatsView | undefined;
+  let lastDiags: Diagnostic[] = [];
+  let logOnly = false;
 
-  const handle = async (_msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
+  const render = async (): Promise<string> => {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const reuse = logOnly && lastStats !== undefined;
+    const stats = reuse ? (lastStats as StatsView) : buildStatsView(await client.callTool("get_graph_stats"));
+    // Read straight from the log file rather than asking the daemon: it works
+    // after a crash, which is when the panel is worth opening. This is the
+    // cheap half, and the only half a follow tick needs.
+    const log = root ? readDaemonLogTail(root) : [];
+    const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
+    // readDiagnostics spawns `travsr status`.
+    const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
+    lastStats = stats;
+    lastDiags = diags;
+    return buildStatsHtml(stats, log, diags);
+  };
+
+  const handle = async (msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
+    if (msg.command === "openFile") {
+      // The log writes absolute paths in some places and repo-relative in
+      // others, so both resolve against the repo root. The result must stay
+      // inside it: the panel renders whatever the log file says, and a log file
+      // is not a trusted input just because it is local. Without this a `path=`
+      // field naming anything on disk becomes a click that opens it.
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (root === undefined) return;
+      const target = path.resolve(root, msg.path);
+      const rel = path.relative(root, target);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) {
+        void vscode.window.showWarningMessage(
+          `Travsr: ${msg.path} is outside the workspace, not opening it`
+        );
+        return;
+      }
+      try {
+        const doc = await vscode.workspace.openTextDocument(target);
+        await vscode.window.showTextDocument(doc, { preview: true });
+      } catch {
+        // The file the log complained about may be the file that is gone.
+        void vscode.window.showWarningMessage(`Travsr: cannot open ${msg.path}`);
+      }
+      return;
+    }
+    if (msg.command === "refreshLog") {
+      logOnly = true;
+      try {
+        await refresh();
+      } finally {
+        logOnly = false;
+      }
+      return;
+    }
     await refresh();
   };
 
@@ -752,6 +909,41 @@ export function registerShowExecutionPath(
     const panel = GraphPanel.show(client, context);
     panel.renderPath(data, `${source} → ${sink}`);
   });
+}
+
+/**
+ * What is wrong with this repo's index, as `travsr status` reports it.
+ *
+ * The CLI already phrases every one of these for a person and names the command
+ * that fixes it, so this parses that rather than reimplementing the mapping in
+ * TypeScript and letting the two drift.
+ *
+ * These are all repo-scoped: an analyzer that crashed, a language with no tool
+ * registered, an approval that was never given. None of them belong to a file,
+ * which is why they are cards here rather than entries in the Problems panel,
+ * which wants a file to attach to.
+ */
+export async function readDiagnostics(binary: string, cwd: string): Promise<Diagnostic[]> {
+  const out = await spawnLangCommand(binary, ["status"], cwd);
+  const found: Diagnostic[] = [];
+  for (const line of out.split("\n")) {
+    const m = /^\s*warning:\s*(.+)$/.exec(line);
+    if (!m) continue;
+    const text = m[1].trim();
+    // The CLI writes the fix in backticks. Lift it out so it can be copied
+    // without the reader having to pick it out of the sentence.
+    const cmd = /`([^`]+)`/.exec(text);
+    const severity: Diagnostic["severity"] = /crashed|failed|not usable/i.test(text)
+      ? "error"
+      : "warn";
+    found.push({
+      severity,
+      title: text.replace(/\s*[-—.]?\s*(re-?run|run)\s+`[^`]+`.*$/i, "").trim(),
+      hint: text,
+      command: cmd ? cmd[1] : undefined,
+    });
+  }
+  return found;
 }
 
 /** Spawn a travsr CLI command and return its combined stdout+stderr. */

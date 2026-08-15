@@ -263,6 +263,7 @@ mod tests {
             nodes: vec![],
             edges: vec![],
             ffi_markers: markers,
+            workspace_dep_markers: vec![],
         }
     }
 

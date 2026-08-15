@@ -198,7 +198,10 @@ context (control characters stripped, prompt-injection vectors neutralised).
 
 In global mode, tools that accept a `file` or `symbol` argument also accept
 an optional `repo` parameter to target a specific registered repo. Omitting
-`repo` searches all registered repos.
+`repo` searches all registered repos, with one exception: the observability
+tools (`get_index_status`, `get_daemon_logs`, `get_graph_health`) never
+aggregate across repos. Supply `repo` when more than one repo is registered,
+or the call returns an ambiguity error naming `repos_list`.
 
 **Query tools** (available in both single-repo and global mode):
 
@@ -216,6 +219,9 @@ an optional `repo` parameter to target a specific registered repo. Omitting
 | `get_snippets(symbol)` | Source snippets for a symbol with file and line context |
 | `get_lang_status` | Phase B indexer status for each language in the repo |
 | `repo_languages` | Languages detected in the indexed repository |
+| `get_index_status` | Index freshness/completeness: staleness, Phase A/B state, semantic readiness |
+| `get_daemon_logs(tail, level)` | Recent daemon log entries, parsed and sanitized (read-only) |
+| `get_graph_health` | Read-only graph integrity report: ghost paths, orphan edges, lexical parity |
 
 **Repo management tools** (global mode):
 

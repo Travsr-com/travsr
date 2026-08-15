@@ -32,6 +32,16 @@ fn head_at(cwd: &std::path::Path) -> Option<String> {
     (!head.is_empty()).then_some(head)
 }
 
+/// Extract the content between `<travsr-data>` and `</travsr-data>`. Mirrors
+/// `pattern::envelope_body`; falls back to the whole string if unwrapped.
+fn envelope_body(output: &str) -> &str {
+    output
+        .strip_prefix("<travsr-data>")
+        .and_then(|s| s.strip_suffix("</travsr-data>"))
+        .map(|s| s.trim_matches('\n'))
+        .unwrap_or(output)
+}
+
 pub fn run(symbol: &str, path: Option<String>, format: OutputFormat) -> anyhow::Result<()> {
     if symbol.trim().is_empty() {
         anyhow::bail!("symbol must not be empty — try: travsr refs PaymentService");
@@ -46,8 +56,13 @@ pub fn run(symbol: &str, path: Option<String>, format: OutputFormat) -> anyhow::
         anyhow::bail!("not initialized — run `travsr init`");
     }
 
+    daemon_client::warn_if_call_graph_degraded(&db_path);
     let store = daemon_client::open_read_store(&db_path)?;
     let output = travsr_mcp::find_references(&store, symbol, path.as_deref());
+    // U4: `find_references` returns the model-facing `<travsr-data>` envelope.
+    // That is noise in CLI output — `ask` and `graph` already strip it — so
+    // present the inner body to the user in both text and JSON here.
+    let body = envelope_body(&output);
 
     match format {
         OutputFormat::Json => {
@@ -56,15 +71,15 @@ pub fn run(symbol: &str, path: Option<String>, format: OutputFormat) -> anyhow::
                 serde_json::json!({
                     "symbol": symbol,
                     "path": path,
-                    "output": output,
+                    "output": body,
                 })
             );
         }
         OutputFormat::Text => {
-            if output.trim().is_empty() {
+            if body.trim().is_empty() {
                 println!("no references found for '{symbol}'");
             } else {
-                println!("{output}");
+                println!("{body}");
             }
         }
     }

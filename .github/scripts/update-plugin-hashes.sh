@@ -31,7 +31,11 @@ trap 'rm -f "$TMP"' EXIT
         # Hash file contents only (not paths) so the hash is identical across macOS and Linux.
         # Use a while-read loop instead of xargs to avoid xargs reading from stdin when find
         # produces no output (which hangs on GNU xargs or produces wrong hash on BSD).
-        hash=$(find "$src_dir" -type f -name "*.rs" | sort | while IFS= read -r f; do cat -- "$f"; done | $SHA256 | awk '{print $1}')
+        # LC_ALL=C pins byte-order collation so the generated hash does not depend on the
+        # contributor's shell locale; see the matching comment in check-plugin-hashes.sh.
+        # Must stay identical to the `sort` there or this script emits a lock file that
+        # gate immediately rejects.
+        hash=$(find "$src_dir" -type f -name "*.rs" | LC_ALL=C sort | while IFS= read -r f; do cat -- "$f"; done | $SHA256 | awk '{print $1}')
         echo "$crate = $hash"
         echo "Updated: $crate = ${hash:0:16}..." >&2
     done

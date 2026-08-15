@@ -7,7 +7,15 @@ use std::path::PathBuf;
 /// version does not match the daemon's falls back to opening the store
 /// directly, so version skew degrades to the slow path instead of
 /// mis-rendering (#318 O1).
-pub const QUERY_PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 (#565 / RFC-002): `travsr graph` ambiguity resolution changed the query
+/// wire schema — `GraphQueryArgs` gained `path`, `GraphPayload` gained
+/// `candidates`, and `NodeEntry` gained `line`. Without a bump a new CLI could
+/// hit an old warm daemon (protocol still v1) that ignores the `path` argument
+/// and returns an arbitrary seed with no `candidates`, silently defeating
+/// disambiguation. The bump forces that skew onto the direct-open path, where
+/// the new CLI runs the ambiguity logic locally.
+pub const QUERY_PROTOCOL_VERSION: u32 = 2;
 
 /// Messages sent to the daemon's control plane.
 ///

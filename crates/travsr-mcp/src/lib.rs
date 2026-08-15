@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+mod observability;
 mod protocol;
 pub mod query;
 mod rerank;
@@ -34,6 +35,11 @@ pub use query::AMBIGUOUS_DISPLAY_LIMIT;
 // #645 WS-B: the CLI `status` surface reuses this exact classifier so the CLI
 // and MCP notes never disagree about an index/HEAD mismatch.
 pub use tools::head_index_mismatch_note;
+// The CLI surfaces the same call-graph completeness note as the MCP tools.
+// Shared rather than reimplemented: the doc on `phase_b_degraded_note` already
+// promised the two would never disagree, and until now only the MCP side used
+// it, so a terminal user got an empty answer with no indication why.
+pub use tools::phase_b_degraded_note;
 // #448: exported solely so `travsr-daemon` can assert its own `SKIP_DIRS` still
 // matches this copy. The dependency edge runs daemon → mcp, so the equality can
 // only be checked from that side; without it a future edit to the daemon's list

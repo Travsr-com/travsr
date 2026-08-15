@@ -35,17 +35,19 @@ pub(crate) enum SpawnOutcome {
 /// open→write window). Because the OS releases an flock when its holder dies,
 /// "held" inherently means "a live process holds it" — no PID-liveness check
 /// needed. If we can take the lock, no daemon holds it and we release immediately.
+///
+/// Opens read-only and NEVER creates the file: an absent lock means no daemon
+/// can possibly hold it, so `false` is the answer without writing anything.
+/// The previous `.create(true)` made this liveness probe create the very file
+/// it was probing, so every non-interactive `travsr init` (CI, pipes,
+/// scripts) left a stale zero-byte `.travsr/daemon.lock` behind, a file the
+/// singleton protocol treats as meaningful, dropped there by something that
+/// only wanted to read it (#636 round-2 review).
 pub(crate) fn daemon_lock_held(repo_root: &Path) -> bool {
     use fs2::FileExt as _;
     let lock_path = repo_root.join(".travsr").join("daemon.lock");
-    // NB: no `.truncate(true)` — never clobber a running daemon's PID content.
-    #[allow(clippy::suspicious_open_options)]
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-    else {
-        return false; // .travsr missing / unopenable → no daemon possible
+    let Ok(file) = std::fs::OpenOptions::new().read(true).open(&lock_path) else {
+        return false; // absent / .travsr missing / unopenable → no daemon possible
     };
     match file.try_lock_exclusive() {
         Ok(()) => {
@@ -64,33 +66,39 @@ pub(crate) fn spawn_background_daemon(repo_root: &Path, exe: &Path) -> SpawnOutc
     if daemon_lock_held(repo_root) {
         return SpawnOutcome::AlreadyRunning;
     }
-    // Re-exec ourselves as the long-lived foreground worker (which re-acquires the
-    // lock — the last-line-of-defense guard for the tight spawn race).
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(["daemon", "start", "--foreground"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // #503: fully detach from the launching console. Without these flags the
-    // daemon stays attached to the parent's console, so Ctrl+C in that
-    // terminal reaches its ctrl_c handler and shuts it down, closing the
-    // terminal kills it via CTRL_CLOSE_EVENT, and the Task Scheduler
-    // autostart path pops a visible console window. DETACHED_PROCESS gives
-    // the child no console at all; CREATE_NEW_PROCESS_GROUP takes it out of
-    // the parent's Ctrl+C signal group.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
     // #592: clear any breadcrumb from a previous failed start so we only observe
     // THIS start's outcome.
     let err_path = repo_root.join(".travsr").join("daemon-start.err");
     let _ = std::fs::remove_file(&err_path);
 
-    let spawned = cmd.spawn();
+    // Re-exec ourselves as the long-lived foreground worker (which re-acquires the
+    // lock — the last-line-of-defense guard for the tight spawn race).
+    #[cfg(unix)]
+    let spawned: std::io::Result<()> = std::process::Command::new(exe)
+        .args(["daemon", "start", "--foreground"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ());
+    // #503/#572: on Windows the daemon must be fully detached from the
+    // launching console (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, or
+    // Ctrl+C / closing the terminal kills it and the Task Scheduler autostart
+    // pops a console window) AND spawned with an explicit handle-inheritance
+    // allowlist. `std::process::Command` forces bInheritHandles=TRUE whenever
+    // stdio is configured, so EVERY inheritable handle in this process leaked
+    // into the long-lived daemon even though its own stdio is null — the
+    // write end of a pipe the shell attached to our stdout, or one a
+    // grandparent (cargo → test harness → travsr) created inheritably and
+    // passed down. Either pins the pipe open so its reader never sees EOF
+    // until the daemon exits. The raw spawn below lists exactly the daemon's
+    // three NUL stdio handles as inheritable and nothing else.
+    #[cfg(windows)]
+    let spawned = travsr_plugin_host::sandbox::windows::spawn_detached_with_inherit_allowlist(
+        exe,
+        &["daemon", "start", "--foreground"],
+    );
+
     if spawned.is_err() {
         return SpawnOutcome::Failed;
     }
@@ -191,6 +199,32 @@ pub fn open_read_store(db_path: &Path) -> anyhow::Result<SqliteStore> {
     }
 }
 
+/// Warn on stderr when the call-graph index cannot answer authoritatively.
+///
+/// The MCP tools have carried this note since #617; the CLI never did. So a
+/// terminal user running `travsr references X` while Phase B was still building
+/// got an empty result and no indication that empty meant "not indexed yet"
+/// rather than "no callers". The agent was told; the human was not.
+///
+/// Deliberately a warning rather than terminal progress output. Once `daemon
+/// start` returns, the daemon is detached and owns no terminal, so nothing can
+/// be pushed while indexing runs. What a user actually needs is not "work is
+/// happening" but "the answer you are reading may be incomplete" — which is
+/// only worth saying at the moment they ask.
+///
+/// Opens its own read-only handle because `travsr ask` answers from the daemon
+/// on the warm path and never opens a store locally at all. Three metadata
+/// reads, so the cost does not justify threading a store through every caller.
+///
+/// Silent on any error: a freshness note is not worth failing a query over.
+pub fn warn_if_call_graph_degraded(db_path: &Path) {
+    if let Ok(store) = open_read_store(db_path) {
+        if let Some(note) = travsr_mcp::phase_b_degraded_note(&store) {
+            eprintln!("warning: {note}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod lock_tests {
     use super::*;
@@ -203,6 +237,51 @@ mod lock_tests {
         // With .travsr present but nobody holding the flock → still not held.
         std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
         assert!(!daemon_lock_held(tmp.path()));
+    }
+
+    /// #636 round-2 review: a liveness probe must not create the file it
+    /// probes. The old `.create(true)` open left a zero-byte
+    /// `.travsr/daemon.lock` behind on every non-interactive `travsr init`.
+    #[test]
+    fn probing_never_creates_the_lock_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let travsr = tmp.path().join(".travsr");
+        std::fs::create_dir_all(&travsr).unwrap();
+
+        assert!(!daemon_lock_held(tmp.path()));
+        assert!(
+            !travsr.join("daemon.lock").exists(),
+            "probing must not create .travsr/daemon.lock"
+        );
+    }
+
+    /// The singleton semantics the probe exists for are unchanged: an
+    /// exclusively locked, already-present lock file still reads as held.
+    #[test]
+    fn lock_held_for_an_existing_exclusively_locked_file() {
+        use fs2::FileExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let travsr = tmp.path().join(".travsr");
+        std::fs::create_dir_all(&travsr).unwrap();
+        std::fs::write(travsr.join("daemon.lock"), b"12345").unwrap();
+
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(travsr.join("daemon.lock"))
+            .unwrap();
+        held.lock_exclusive().unwrap();
+        assert!(daemon_lock_held(tmp.path()));
+
+        fs2::FileExt::unlock(&held).unwrap();
+        drop(held);
+        assert!(!daemon_lock_held(tmp.path()));
+        // Still there, still holding the daemon's PID: the probe never
+        // truncated or clobbered it.
+        assert_eq!(
+            std::fs::read_to_string(travsr.join("daemon.lock")).unwrap(),
+            "12345"
+        );
     }
 
     #[test]
@@ -229,5 +308,53 @@ mod lock_tests {
             !daemon_lock_held(tmp.path()),
             "must report free once released"
         );
+    }
+
+    /// The note is shared with the MCP tools rather than reimplemented, so what
+    /// is worth pinning here is that the CLI classifies the same three states
+    /// the same way — and, just as importantly, stays silent on the fourth.
+    #[test]
+    fn the_cli_and_the_mcp_tools_agree_on_call_graph_completeness() {
+        use travsr_store::SqliteStore;
+
+        let set = |s: &mut SqliteStore, pairs: &[(&str, &str)]| {
+            for (k, v) in pairs {
+                s.set_meta(k, v).unwrap();
+            }
+        };
+
+        // Phase B never ran: init happened, no phase_b marker.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        set(&mut store, &[("last_commit", "abc1234")]);
+        assert!(travsr_mcp::phase_b_degraded_note(&store).is_some());
+
+        // Phase B ran, but HEAD has moved past it.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        set(
+            &mut store,
+            &[("last_commit", "def5678"), ("phase_b_commit", "abc1234")],
+        );
+        assert!(travsr_mcp::phase_b_degraded_note(&store).is_some());
+
+        // Markers agree, but a watcher reindex dropped call edges (#583).
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        set(
+            &mut store,
+            &[
+                ("last_commit", "abc1234"),
+                ("phase_b_commit", "abc1234"),
+                ("phase_b_dirty", "1"),
+            ],
+        );
+        assert!(travsr_mcp::phase_b_degraded_note(&store).is_some());
+
+        // Complete and clean: silent. A note that always fires is noise, and
+        // noise is how the ADR-017 warning made the daemon log unreadable.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        set(
+            &mut store,
+            &[("last_commit", "abc1234"), ("phase_b_commit", "abc1234")],
+        );
+        assert_eq!(travsr_mcp::phase_b_degraded_note(&store), None);
     }
 }

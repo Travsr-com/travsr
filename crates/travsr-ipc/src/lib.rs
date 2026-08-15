@@ -7,7 +7,7 @@
 //! - [`ControlAddr`] — blake3-derived socket/pipe name so hook and daemon always agree
 //! - [`ControlTransport`] — sync client trait for CLI use
 //! - [`unix::UnixTransport`] — Unix domain socket impl
-//! - [`windows::NamedPipeTransport`] — Windows Named Pipe stub (RFC-013)
+//! - [`windows::NamedPipeTransport`] — Windows Named Pipe impl (RFC-013, full since v0.8.0)
 
 #![forbid(unsafe_code)]
 

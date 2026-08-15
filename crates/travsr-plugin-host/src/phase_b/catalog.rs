@@ -643,6 +643,79 @@ pub fn lookup(language: &str) -> Option<&'static PhaseBEntry> {
     CATALOG.iter().find(|e| e.language == language)
 }
 
+// ── RFC-025 SidecarSpec impls ───────────────────────────────────────────────
+//
+// The Phase B family joins the embed sidecar under the one shared version
+// contract. There is no *known* behavioral floor for any scip-* tool or lang
+// wrapper today (unlike embed's #376/#701), so every `min_version()` here is
+// `Semver::ZERO` - the machinery is live and a real floor is one edit away, but
+// no healthy install is ever refused. Per RFC-025 decision 3 a floor is only
+// raised in the same commit that first relies on a tool behavior; until then
+// declaring one would be dishonest.
+
+use crate::sidecar_version::{Semver, SidecarSpec};
+
+/// The GitHub repo the `travsr-lang-*` wrappers are released from.
+const TRAVSR_LANG_REPO: &str = "Travsr-com/travsr-lang";
+
+impl SidecarSpec for ScipBinarySpec {
+    fn install_name(&self) -> &str {
+        self.install_name
+    }
+    fn github_repo(&self) -> &str {
+        self.repo
+    }
+    fn min_version(&self) -> Semver {
+        Semver::ZERO
+    }
+    fn version_fallback(&self) -> &str {
+        self.version_fallback
+    }
+    fn pinned(&self) -> bool {
+        // A vendored hash is only meaningful against one exact asset, so an
+        // entry that carries one is pinned to `version_fallback` (#410 M2).
+        self.sha256_fn.is_some()
+    }
+}
+
+impl SidecarSpec for ZipBinarySpec {
+    fn install_name(&self) -> &str {
+        self.install_name
+    }
+    fn github_repo(&self) -> &str {
+        self.repo
+    }
+    fn min_version(&self) -> Semver {
+        Semver::ZERO
+    }
+    fn version_fallback(&self) -> &str {
+        self.version_fallback
+    }
+    fn pinned(&self) -> bool {
+        self.sha256_fn.is_some()
+    }
+}
+
+impl SidecarSpec for PhaseBEntry {
+    /// The `travsr-lang-*` wrapper is the versioned sidecar for a language.
+    /// Builtins (no wrapper) fall back to the display `command`.
+    fn install_name(&self) -> &str {
+        self.provider_binary.unwrap_or(self.command)
+    }
+    fn github_repo(&self) -> &str {
+        TRAVSR_LANG_REPO
+    }
+    fn min_version(&self) -> Semver {
+        Semver::ZERO
+    }
+    fn version_fallback(&self) -> &str {
+        self.wrapper_version_fallback
+    }
+    fn pinned(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod vendored_hash_tests {
     use super::{kls_sha256, scip_clang_sha256, scip_ruby_sha256, ScipInstall, CATALOG};

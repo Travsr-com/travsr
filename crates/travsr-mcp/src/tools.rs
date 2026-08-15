@@ -217,7 +217,7 @@ fn phase_b_pending(store: &SqliteStore) -> bool {
 /// Mirrors `travsr status`'s freshness classification so the tools and the CLI
 /// never disagree about completeness. Returns the note to append, or `None`
 /// when Phase B is complete for the current commit.
-fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
+pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
     const PENDING: &str = "[note: call-graph index incomplete — Phase B has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
     const STALE: &str = "[note: call-graph edges degraded — a background re-index dropped call edges since the last Phase B run; empty results are not authoritative. Run `travsr init` to rebuild.]";
     let phase_b = store
@@ -258,13 +258,48 @@ pub fn set_launch_cwd(dir: PathBuf) {
     let _ = LAUNCH_CWD.set(dir);
 }
 
+/// Whether two abbreviated git SHAs denote **different** commits.
+///
+/// `git rev-parse --short` is not a fixed width: it honours `core.abbrev`, and
+/// under the default `auto` the length grows with the repository's object
+/// count. So the same commit can be stamped `a1b2c3d` in `last_commit` by one
+/// process and read back as `a1b2c3d4` by another, whenever the repo has grown
+/// since, a global `core.abbrev` is set, or (in global mode) the MCP server
+/// runs under a different `HOME`, and therefore a different gitconfig, than
+/// the daemon did. A plain `!=` then reports drift on an identical commit
+/// (#636 round-4 review).
+///
+/// Compares on the shorter of the two as a prefix, which is exactly how git
+/// itself treats an abbreviation: two abbreviations denote the same commit
+/// when one is a prefix of the other. Case-insensitive, since git accepts
+/// either case in a rev. Returns `None` when either side is empty (unknown),
+/// so callers can keep "unknown" distinct from "differs" rather than
+/// collapsing it to a verdict.
+pub(crate) fn short_shas_differ(a: &str, b: &str) -> Option<bool> {
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    // `starts_with` on the shared prefix length, ASCII-case-insensitively.
+    let differs = !long
+        .as_bytes()
+        .iter()
+        .zip(short.as_bytes())
+        .all(|(l, s)| l.eq_ignore_ascii_case(s));
+    Some(differs)
+}
+
 /// #645 WS-B: build the index/HEAD mismatch note. `head` is the caller's live
 /// `git rev-parse --short HEAD`; `stored` is the index's `last_commit`. Returns
-/// a note naming both, or `None` when they agree or either is unknown — never
+/// a note naming both, or `None` when they agree or either is unknown, never
 /// fabricate a mismatch for a git-less caller. Pure so both the MCP and CLI
 /// surfaces classify identically and it is trivially unit-testable.
+///
+/// Agreement is decided by [`short_shas_differ`], not `==`, so the note does
+/// not fire when the two sides merely abbreviate the same commit to different
+/// widths (#636 round-4 review).
 pub fn head_index_mismatch_note(head: &str, stored: &str) -> Option<String> {
-    if head.is_empty() || stored.is_empty() || head == stored {
+    if head.is_empty() || stored.is_empty() || short_shas_differ(head, stored) == Some(false) {
         return None;
     }
     Some(format!(
@@ -277,7 +312,10 @@ pub fn head_index_mismatch_note(head: &str, stored: &str) -> Option<String> {
 
 /// The caller's short HEAD at `cwd`, or `None` when git is unavailable or `cwd`
 /// is not a repo. Uses `--short` to match the `--short`-stamped `last_commit`.
-fn git_short_head(cwd: &std::path::Path) -> Option<String> {
+///
+/// `pub(crate)`: reused by `observability::index_status_payload` (#636) for
+/// `get_index_status`'s `head_commit` field.
+pub(crate) fn git_short_head(cwd: &std::path::Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--short", "HEAD"])
         .output()
@@ -678,14 +716,10 @@ pub(crate) enum RefTarget {
 /// first (handles full headers like `fn:charge` from `get_context`), then an
 /// exact simple-name match over the FTS candidates. An optional `path` suffix
 /// pins overloaded names to one file.
-pub(crate) fn resolve_reference_targets(
-    store: &SqliteStore,
-    symbol: &str,
-    path: Option<&str>,
-) -> RefTarget {
+fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<CoreNode> {
     // Tier 1: exact signature (+ optional path pin).
     let mut candidates = store.lookup_nodes_exact(symbol, path).unwrap_or_else(|e| {
-        tracing::warn!("find_references lookup_nodes_exact '{symbol}': {e}");
+        tracing::warn!("resolve_symbol_nodes lookup_nodes_exact '{symbol}': {e}");
         Vec::new()
     });
 
@@ -708,7 +742,7 @@ pub(crate) fn resolve_reference_targets(
                 })
                 .collect(),
             Err(e) => {
-                tracing::warn!("find_references search '{symbol}': {e}");
+                tracing::warn!("resolve_symbol_nodes search '{symbol}': {e}");
                 Vec::new()
             }
         };
@@ -726,7 +760,7 @@ pub(crate) fn resolve_reference_targets(
         if let Some((container, member)) = symbol.rsplit_once('.') {
             if !container.is_empty() && !member.is_empty() {
                 let found = store.search_nodes_by_name(member).unwrap_or_else(|e| {
-                    tracing::warn!("find_references dotted search '{member}': {e}");
+                    tracing::warn!("resolve_symbol_nodes dotted search '{member}': {e}");
                     Vec::new()
                 });
                 let matches: Vec<CoreNode> = found
@@ -759,9 +793,7 @@ pub(crate) fn resolve_reference_targets(
         }
     }
 
-    // Apply the path suffix pin if the caller supplied one (Tier 2 didn't use it).
-    // Match on a `/`-boundary so a hint like `tools.rs` pins `src/tools.rs` but
-    // never `src/mytools.rs` — mirroring the store's `LIKE '%/' || hint` pin.
+    // Apply the path suffix pin if the caller supplied one.
     if let Some(p) = path {
         let boundary = format!("/{p}");
         candidates.retain(|n| n.vname.path == p || n.vname.path.ends_with(&boundary));
@@ -770,6 +802,18 @@ pub(crate) fn resolve_reference_targets(
     // Distinct definitions by node id.
     candidates.sort_by_key(|n| n.id.0);
     candidates.dedup_by_key(|n| n.id);
+
+    candidates
+}
+
+/// Helper to map `resolve_symbol_nodes` candidates to a `RefTarget` for
+/// find_references and `travsr graph` ambiguity resolution (#565 / RFC-002).
+pub(crate) fn resolve_reference_targets(
+    store: &SqliteStore,
+    symbol: &str,
+    path: Option<&str>,
+) -> RefTarget {
+    let mut candidates = resolve_symbol_nodes(store, symbol, path);
 
     // C/C++ split a symbol into a header declaration and a source definition
     // (`utils.h` decl + `utils.c` def). They share the simple name, so both
@@ -956,6 +1000,25 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                  {coverage_pct}%). Run `travsr status` to check Phase B, or use \
                  `find_pattern` for a textual search.",
                 target.vname.path
+            );
+        }
+        // WS-3 (C3): a Dart index built without resolved dependencies drops
+        // every cross-package reference, so "no recorded uses" would be a
+        // confident zero the index cannot support even when the file itself was
+        // analysed. Soften it, mirroring the partial-coverage case above.
+        if target.vname.language == "dart"
+            && store
+                .get_meta("dart_deps_unresolved")
+                .ok()
+                .flatten()
+                .is_some_and(|v| !v.is_empty())
+        {
+            return format!(
+                "{header}\n0 recorded reference(s) — not a definitive zero. This \
+                 repo's Dart dependencies are not resolved (no \
+                 `.dart_tool/package_config.json`), so cross-package references \
+                 are not indexed. Run `dart pub get` and re-run `travsr init`, or \
+                 use `find_pattern` for a textual search."
             );
         }
         // Coverage is effectively complete for this language and this symbol has
@@ -4047,8 +4110,8 @@ fn format_node_line(
 /// (vs a per-row badge) and disambiguates the Exact section's non-rerank score.
 fn match_source_header(ms: crate::seed::MatchSource) -> &'static str {
     match ms {
-        crate::seed::MatchSource::Exact => "## exact — literal symbol / FTS match (not reranked)",
-        crate::seed::MatchSource::Semantic => "## semantic — cross-encoder ranked",
+        crate::seed::MatchSource::Exact => "## exact matches — literal symbol / text (not relevance-ranked)",
+        crate::seed::MatchSource::Semantic => "## related — ranked by relevance",
         // #376 Phase 2 (§4.1): no raw cosine printed in this section — see
         // build_docs_section's doc comment for why (doc cosines and code
         // cosines are not commensurable; a printed number invites exactly the
@@ -8827,9 +8890,11 @@ fn get_snippets_body(
 
     // Resolve each token to ≥0 CoreNodes.  All tiers produce nodes with stored
     // path + line/end_line, so snippet_for_node reads the correct file for each.
-    // search_nodes_by_name (O(N) LIKE) is never called — every tier uses the
-    // V19NodesSignatureIdx exact-match index (O(log N)) or direct primary-key
-    // lookup (O(1)).
+    // search_nodes_by_name (O(N) LIKE) is generally avoided for exact-match
+    // tiers (Tiers 0-2), which use the V19NodesSignatureIdx exact-match index
+    // (O(log N)) or direct primary-key lookup (O(1)). However, the bare-signature
+    // tier (Tier 3) calls resolve_symbol_nodes, which can fall through to the O(N)
+    // name search on a bare-name miss.
     let mut resolved: Vec<CoreNode> = Vec::new();
     for tok in &tokens {
         match tok {
@@ -8867,14 +8932,13 @@ fn get_snippets_body(
                 resolved.push(syn);
             }
 
-            // Tier 3: bare signature — exact index, returns up to
+            // Tier 3: bare signature — uses the shared resolution ladder
+            // to support exact matches, plain names, and dotted paths, returning up to
             // MAX_SIGNATURE_MATCHES nodes (each with its own path + line).
-            SymbolToken::BareSig(sig) => match store.lookup_nodes_exact(sig, None) {
-                Ok(nodes) => {
-                    resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
-                }
-                Err(e) => tracing::warn!("get_snippets BareSig lookup '{sig}': {e}"),
-            },
+            SymbolToken::BareSig(sig) => {
+                let nodes = resolve_symbol_nodes(store, sig, None);
+                resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
+            }
         }
     }
 
@@ -9049,19 +9113,30 @@ mod snippet_tests {
         let db_path = root.join(".travsr").join("graph.db");
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let mut store = SqliteStore::open(&db_path).unwrap();
+
+        let mut by_path: std::collections::HashMap<String, Vec<CoreNode>> =
+            std::collections::HashMap::new();
         for n in nodes {
+            by_path
+                .entry(n.vname.path.clone())
+                .or_default()
+                .push(n.clone());
+        }
+
+        for (path, file_nodes) in by_path {
             store
                 .write_file_graphs_batch(
                     &[travsr_store::FileGraph {
-                        nodes: vec![n.clone()],
+                        nodes: file_nodes,
                         edges: vec![],
-                        vname_path: n.vname.path.clone(),
+                        vname_path: path,
                         new_hash: "deadbeef".to_string(),
                     }],
                     false,
                 )
                 .unwrap();
         }
+
         store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
         store
     }
@@ -9081,6 +9156,63 @@ mod snippet_tests {
         assert!(
             result.contains("1 symbols, 1 with snippets"),
             "footer missing"
+        );
+    }
+
+    #[test]
+    fn get_snippets_body_resolves_plain_and_dotted_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.ts");
+        std::fs::write(
+            &src,
+            "class ClassA {\n  enableSupportForFeatureX() {\n    return true;\n  }\n}\n",
+        )
+        .unwrap();
+
+        let class_node = make_fn_node("lib.ts", "class:ClassA", 1, 5);
+        let fn_node = make_fn_node("lib.ts", "method:ClassA.enableSupportForFeatureX", 2, 4);
+        let store = make_store_with_meta(&[class_node, fn_node], dir.path());
+
+        // 1. Exact signature still works
+        let exact = get_snippets_body(
+            &store,
+            "method:ClassA.enableSupportForFeatureX",
+            2000,
+            SnippetMode::Auto,
+        );
+        assert!(
+            exact.contains("enableSupportForFeatureX() {"),
+            "exact sig failed"
+        );
+
+        // 2. Plain function name works
+        let plain = get_snippets_body(&store, "enableSupportForFeatureX", 2000, SnippetMode::Auto);
+        assert!(
+            plain.contains("enableSupportForFeatureX() {"),
+            "plain function name failed"
+        );
+
+        // 3. Bare class name works
+        let class = get_snippets_body(&store, "ClassA", 2000, SnippetMode::Auto);
+        assert!(class.contains("class ClassA"), "bare class name failed");
+
+        // 4. Dotted symbol name works
+        let dotted = get_snippets_body(
+            &store,
+            "ClassA.enableSupportForFeatureX",
+            2000,
+            SnippetMode::Auto,
+        );
+        assert!(
+            dotted.contains("enableSupportForFeatureX() {"),
+            "dotted symbol name failed"
+        );
+
+        // 5. Unknown symbol
+        let unknown = get_snippets_body(&store, "unknownSymbol", 2000, SnippetMode::Auto);
+        assert!(
+            unknown.contains("No symbols matching the provided names found in the graph."),
+            "unknown symbol failed"
         );
     }
 
@@ -10451,6 +10583,36 @@ mod snippet_tests {
         assert!(head_index_mismatch_note("abc123", "").is_none());
     }
 
+    /// #636 round-4 review: `git rev-parse --short` is variable width
+    /// (`core.abbrev`, and `auto` grows with the object count), so the same
+    /// commit can be stamped at one length and read back at another. Comparing
+    /// those as plain strings reported drift on an identical commit.
+    #[test]
+    fn short_shas_of_differing_width_for_the_same_commit_do_not_differ() {
+        // Verified against a real repo: `git rev-parse --short=7` and
+        // `--short=12` on one commit give `f97492f` and `f97492f91ce4`.
+        assert_eq!(short_shas_differ("f97492f", "f97492f91ce4"), Some(false));
+        assert_eq!(short_shas_differ("f97492f91ce4", "f97492f"), Some(false));
+        // Case-insensitive, since git accepts either case in a rev.
+        assert_eq!(short_shas_differ("F97492F", "f97492f91ce4"), Some(false));
+        // And the note built on it stays silent for that pair.
+        assert!(head_index_mismatch_note("f97492f91ce4", "f97492f").is_none());
+    }
+
+    #[test]
+    fn short_shas_that_genuinely_differ_are_still_reported() {
+        assert_eq!(short_shas_differ("aaa1111", "bbb2222"), Some(true));
+        // Divergence beyond the shared prefix length still counts.
+        assert_eq!(short_shas_differ("f97492f", "f97492e91ce4"), Some(true));
+        assert!(head_index_mismatch_note("bbb2222", "aaa1111").is_some());
+    }
+
+    #[test]
+    fn short_shas_differ_is_none_when_either_side_is_unknown() {
+        assert_eq!(short_shas_differ("", "abc123"), None);
+        assert_eq!(short_shas_differ("abc123", ""), None);
+    }
+
     #[test]
     fn head_index_mismatch_note_names_both_shas_on_drift() {
         let note = head_index_mismatch_note("aaa111", "bbb222").expect("must flag mismatch");
@@ -10468,7 +10630,27 @@ mod snippet_tests {
     fn git_short_head_reads_repo_and_is_none_off_repo() {
         // Off a repo (bare tempdir) there is no HEAD to read.
         let empty = tempfile::tempdir().unwrap();
-        assert!(git_short_head(empty.path()).is_none());
+        // Prevent git from walking up and finding parent repos (e.g. in CI or user home).
+        let mut ceiling_paths = Vec::new();
+        let mut current = Some(empty.path());
+        while let Some(p) = current {
+            let p_str = p.to_string_lossy().to_string();
+            ceiling_paths.push(p_str.clone());
+            ceiling_paths.push(p_str.replace("\\", "/"));
+            ceiling_paths.push(p_str.replace("C:", "c:"));
+            ceiling_paths.push(p_str.replace("c:", "C:"));
+            ceiling_paths.push(p_str.replace("C:", "c:").replace("\\", "/"));
+            ceiling_paths.push(p_str.replace("c:", "C:").replace("\\", "/"));
+            current = p.parent();
+        }
+        #[cfg(windows)]
+        let delim = ";";
+        #[cfg(not(windows))]
+        let delim = ":";
+        std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling_paths.join(delim));
+        let res = git_short_head(empty.path());
+        std::env::remove_var("GIT_CEILING_DIRECTORIES");
+        assert!(res.is_none());
     }
 
     /// #645/#661: in global mode the per-repo HEAD must come from that repo's own
@@ -12603,7 +12785,26 @@ mod snippet_tests {
         ]
         .into();
 
+        // Prevent git from walking up and finding parent repos from bad_root
+        let mut ceiling_paths = Vec::new();
+        let mut current = Some(bad_root.as_path());
+        while let Some(p) = current {
+            let p_str = p.to_string_lossy().to_string();
+            ceiling_paths.push(p_str.clone());
+            ceiling_paths.push(p_str.replace("\\", "/"));
+            ceiling_paths.push(p_str.replace("C:", "c:"));
+            ceiling_paths.push(p_str.replace("c:", "C:"));
+            ceiling_paths.push(p_str.replace("C:", "c:").replace("\\", "/"));
+            ceiling_paths.push(p_str.replace("c:", "C:").replace("\\", "/"));
+            current = p.parent();
+        }
+        #[cfg(windows)]
+        let delim = ";";
+        #[cfg(not(windows))]
+        let delim = ":";
+        std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling_paths.join(delim));
         let out = find_pattern_global(&repos, "alpha", None, None, false);
+        std::env::remove_var("GIT_CEILING_DIRECTORIES");
         assert!(
             out.contains("[repo_bad] pattern error"),
             "the failing repo's error must be attributed to it, not silently dropped: {out}"

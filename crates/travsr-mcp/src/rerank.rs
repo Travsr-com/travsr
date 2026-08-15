@@ -341,12 +341,12 @@ fn maybe_autofetch_model() {
     if model_installed() {
         return;
     }
-    tracing::info!("RFC-021 reranker model absent — auto-fetching (background)");
+    tracing::info!("reranker model absent, fetching in the background");
     match install_model_blocking() {
-        Ok(dir) => tracing::info!(dir = %dir.display(), "RFC-021 reranker model auto-fetched"),
+        Ok(dir) => tracing::info!(dir = %dir.display(), "reranker model ready"),
         Err(error) => tracing::warn!(
             %error,
-            "RFC-021 reranker model auto-fetch failed — staying on the lexical gate"
+            "reranker model download failed, continuing without it"
         ),
     }
 }
@@ -368,21 +368,21 @@ fn reranker() -> Option<&'static TractReranker> {
             // lexical gate, matching the `Err` arm (RFC-021 G5/G6 fail-open).
             match catch_unwind(AssertUnwindSafe(|| TractReranker::load(&dir))) {
                 Ok(Ok(r)) => {
-                    tracing::info!(model_dir = %dir.display(), "RFC-021 reranker loaded");
+                    tracing::info!(model_dir = %dir.display(), "reranker loaded");
                     Some(r)
                 }
                 Ok(Err(error)) => {
                     tracing::warn!(
                         %error,
                         model_dir = %dir.display(),
-                        "RFC-021 reranker load failed — falling back to lexical gate"
+                        "reranker failed to load, continuing without it"
                     );
                     None
                 }
                 Err(_) => {
                     tracing::warn!(
                         model_dir = %dir.display(),
-                        "RFC-021 reranker load panicked — falling back to lexical gate"
+                        "reranker crashed while loading, continuing without it"
                     );
                     None
                 }

@@ -404,6 +404,18 @@ mod tests {
     // races on parallel test runners.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Harness ceiling for one emitter-child lifecycle (#574).
+    ///
+    /// Every emitter test funnels its result through a channel and bounds the
+    /// wait so a wedged runner fails instead of hanging the suite. That bound
+    /// is a watchdog, never part of the semantics under test — but the old
+    /// per-test values (10-30s) doubled as an implicit "node starts fast"
+    /// assumption, and a cold windows-latest runner intermittently spent more
+    /// than 10s just spawning node, misreporting an instantly-exiting child as
+    /// "must return: Timeout". Sized far above any plausible spawn cost while
+    /// still bounding a genuine hang; a healthy run never waits this long.
+    const HARNESS_DEADLINE: Duration = Duration::from_secs(120);
+
     /// RAII guard that restores an environment variable to its previous value
     /// on drop, even if the test panics. Prevents env-var leaks from failing
     /// assertions that would otherwise contaminate sibling tests in the same
@@ -606,12 +618,12 @@ mod tests {
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .expect("spawn node");
-            let result = run_with_drain(child, Duration::from_secs(20), "test");
+            let result = run_with_drain(child, HARNESS_DEADLINE, "test");
             let _ = tx.send(result);
         });
 
         let result = rx
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(HARNESS_DEADLINE)
             .expect("run_with_drain must return within watchdog window");
         let (_status, stdout, _stderr) = result.expect("must succeed");
         assert_eq!(stdout.len(), 131072, "full 128 KiB stdout must be drained");
@@ -663,7 +675,7 @@ mod tests {
             .expect("spawn node");
 
         let (status, _out, stderr) =
-            run_with_drain(child, Duration::from_secs(10), "exit3-test").expect("must not err");
+            run_with_drain(child, HARNESS_DEADLINE, "exit3-test").expect("must not err");
         assert!(!status.success());
         assert!(
             stderr.contains("fatal error"),
@@ -698,7 +710,7 @@ mod tests {
         });
 
         let result = rx
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(HARNESS_DEADLINE)
             .expect("must return within watchdog window — deadlock?");
         let dump = result.expect("must succeed");
         assert_eq!(dump.len(), 131072, "all 128 KiB must be returned");
@@ -732,7 +744,7 @@ mod tests {
         });
 
         let result = rx
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(HARNESS_DEADLINE)
             .expect("must return within watchdog window");
         let dump = result.expect("must succeed");
         assert_eq!(dump.len(), 131072, "full stdout must be returned");
@@ -762,9 +774,7 @@ mod tests {
             });
         });
 
-        let result = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("must return");
+        let result = rx.recv_timeout(HARNESS_DEADLINE).expect("must return");
         let dump = result.expect("exit 0 empty stdout must not error");
         assert!(dump.is_empty());
     }
@@ -798,9 +808,7 @@ mod tests {
             });
         });
 
-        let result = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("must return");
+        let result = rx.recv_timeout(HARNESS_DEADLINE).expect("must return");
         let dump = result.expect("lossy conversion must succeed");
         // The ASCII prefix must be intact.
         assert!(
@@ -839,9 +847,7 @@ mod tests {
             });
         });
 
-        let result = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("must return");
+        let result = rx.recv_timeout(HARNESS_DEADLINE).expect("must return");
         assert!(result.is_err(), "non-zero exit must be Err");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -878,7 +884,7 @@ mod tests {
         });
 
         let result = rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(HARNESS_DEADLINE)
             .expect("must return after timeout+slop");
         std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
         assert!(result.is_err(), "timeout must be Err");
@@ -914,7 +920,7 @@ mod tests {
         });
 
         let result = rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(HARNESS_DEADLINE)
             .expect("must return within watchdog window");
         std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
         assert!(result.is_err());
@@ -946,7 +952,7 @@ mod tests {
         });
 
         let result = rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(HARNESS_DEADLINE)
             .expect("must return within watchdog window");
         let dump = result.expect("5 MiB must succeed");
         assert_eq!(dump.len(), 5 * 1024 * 1024);
@@ -977,7 +983,7 @@ mod tests {
         });
 
         let result = rx
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(HARNESS_DEADLINE)
             .expect("must return within watchdog window");
         let dump = result.expect("must succeed").expect("must be Some");
         assert_eq!(dump.len(), 131072);
@@ -1009,7 +1015,7 @@ mod tests {
         });
 
         let result = rx
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(HARNESS_DEADLINE)
             .expect("must return within watchdog window");
         let dump = result.expect("must succeed").expect("must be Some");
         assert_eq!(dump.len(), 131072);

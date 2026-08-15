@@ -261,6 +261,7 @@ pub fn parse_with_config(
         nodes,
         edges,
         ffi_markers: vec![],
+        workspace_dep_markers: vec![],
     })
 }
 

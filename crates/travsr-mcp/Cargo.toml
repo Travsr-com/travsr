@@ -38,6 +38,7 @@ base64 = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 ignore = { workspace = true }
+unicode-segmentation = { workspace = true }
 
 [features]
 default = []
@@ -51,3 +52,7 @@ mcp-sampling = []
 assert_cmd = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+# Test-only since #636 round 2: `observability::daemon_running` no longer
+# takes any file lock (it reads the lock file's PID), so fs2 is needed only
+# by the tests that hold a lock to prove the probe ignores it.
+fs2 = { workspace = true }

@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod hook;
+pub mod logfile;
 mod phase_b_sched;
 mod query_cache;
 mod scip_unifier;
@@ -80,6 +81,10 @@ pub struct InitStats {
 /// tell the user which analyzers ran and which were absent.
 #[derive(Debug, Default, Clone)]
 pub struct PhaseBReport {
+    /// The corpus these outcomes were evaluated against, so the trust hint can
+    /// name the exact `travsr lang add <lang> --corpus <corpus>` invocation
+    /// instead of a placeholder (#414 follow-up). Empty when unknown.
+    pub corpus: String,
     /// Languages for which semantic analysis ran successfully.
     pub ran: Vec<String>,
     /// Languages P1-gated because no source files of that type exist in the
@@ -90,6 +95,10 @@ pub struct PhaseBReport {
     pub skipped_no_analyzer: Vec<String>,
     /// Languages registered in the resolver but not in lang.toml.
     pub skipped_unregistered: Vec<String>,
+    /// Registered non-builtin languages whose corpus lacks a trust grant
+    /// (ADR-017 Rule 3 — #414). Shown to the user with a
+    /// `travsr lang add <lang> --corpus <corpus>` call-to-action.
+    pub skipped_untrusted_corpus: Vec<String>,
     /// Languages that need a `compile_commands.json` at the repo root
     /// (scip-clang, for `c`/`cpp`) but don't have one (L5a).
     pub skipped_no_compdb: Vec<String>,
@@ -138,6 +147,8 @@ pub enum InitProgress {
 struct ParseResult {
     file_graph: FileGraph,
     ffi_markers: Vec<FfiMarker>,
+    /// Cargo workspace dependency markers (A2), resolved in the repo-level pass.
+    workspace_dep_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker>,
     /// `true` when the file was skipped (unchanged hash) — graph is empty.
     unchanged: bool,
 }
@@ -217,7 +228,7 @@ fn index_paths_parallel(
                     let new_hash = match hash_file(abs_path) {
                         Ok(h) => h,
                         Err(e) => {
-                            tracing::warn!(path=%abs_path.display(), err=%e, "hash failed, skipping");
+                            tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %e, "hash failed, skipping");
                             continue;
                         }
                     };
@@ -231,6 +242,7 @@ fn index_paths_parallel(
                                 edges: vec![],
                             },
                             ffi_markers: vec![],
+                            workspace_dep_markers: vec![],
                             unchanged: true,
                         }));
                         continue;
@@ -251,7 +263,7 @@ fn index_paths_parallel(
                     let out = match parsed {
                         Ok(o) => o,
                         Err(e) => {
-                            tracing::warn!(path=%abs_path.display(), err=%e, "parse error, skipping");
+                            tracing::warn!(event = "file.parse_failed", path = %abs_path.display(), err = %e, "parse error, skipping");
                             continue;
                         }
                     };
@@ -284,6 +296,7 @@ fn index_paths_parallel(
                             edges,
                         },
                         ffi_markers: out.ffi_markers,
+                        workspace_dep_markers: out.workspace_dep_markers,
                         unchanged: false,
                     }));
                 }
@@ -297,6 +310,7 @@ fn index_paths_parallel(
         let mut files_skipped_unchanged: u64 = 0;
         let mut batch: Vec<FileGraph> = Vec::with_capacity(BATCH_SIZE);
         let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
+        let mut all_ws_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker> = Vec::new();
 
         for (done, result) in (1_u64..).zip(rx) {
             let pr = result?;
@@ -313,6 +327,7 @@ fn index_paths_parallel(
             }
 
             all_ffi_markers.extend(pr.ffi_markers);
+            all_ws_markers.extend(pr.workspace_dep_markers);
             batch.push(pr.file_graph);
 
             if batch.len() >= BATCH_SIZE {
@@ -347,6 +362,27 @@ fn index_paths_parallel(
                     tracing::warn!(err=%e, "ffi edge write error");
                 }
                 counts.edges_upserted += 1;
+            }
+        }
+
+        // Repo-level Cargo workspace dependency resolution (A2): resolve member
+        // `{ workspace = true }` entries against the root's
+        // `[workspace.dependencies]` versions. Runs once the whole batch is
+        // parsed so the root and all members are visible together.
+        if !all_ws_markers.is_empty() {
+            let indexer = PluginIndexer::new(corpus);
+            let (nodes, edges) = indexer.resolve_workspace_deps(&all_ws_markers);
+            for node in &nodes {
+                match store.put_node(node) {
+                    Ok(_) => counts.nodes_upserted += 1,
+                    Err(e) => tracing::warn!(err=%e, "workspace dep node write error"),
+                }
+            }
+            for edge in &edges {
+                match store.put_edge(edge) {
+                    Ok(_) => counts.edges_upserted += 1,
+                    Err(e) => tracing::warn!(err=%e, "workspace dep edge write error"),
+                }
             }
         }
 
@@ -512,6 +548,15 @@ fn maybe_prompt_large_dep(repo_root: &Path, dir: &str, count: u64, total: u64) -
     exclude
 }
 
+/// File count above which an embed pass announces itself before starting.
+///
+/// An incremental pass touches the handful of files a commit changed and lands
+/// in tens of milliseconds, so announcing it only doubles the most frequent
+/// line in the log. A first pass on a large repo runs for minutes, where a
+/// silent log is indistinguishable from a hung daemon. The threshold sits well
+/// above any incremental pass and well below a whole-repo one.
+const ANNOUNCE_PASS_ABOVE_FILES: usize = 200;
+
 /// Compute and persist `embed_text` for all nodes where it is currently NULL.
 ///
 /// `richness` controls how much context is packed per node — derived from the
@@ -528,11 +573,6 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     if nodes.is_empty() {
         return;
     }
-    tracing::info!(
-        count = nodes.len(),
-        ?richness,
-        "regenerating embed_text (parse-once-per-file, parallel)"
-    );
 
     // Canonicalize the repo root once (skeleton_for_node did it per node).
     let canon_root = repo_root
@@ -547,19 +587,58 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     // Package/external nodes have path="" — collect separately for direct text gen.
     let mut pathless: Vec<&travsr_core::Node> = Vec::new();
     for node in &nodes {
-        if !node.vname.path.is_empty() {
-            by_file
-                .entry(node.vname.path.as_str())
-                .or_default()
-                .push(node);
-        } else {
-            pathless.push(node);
+        if node.vname.path.is_empty() {
+            // Only `package` nodes have a signature to derive text from; `crate`
+            // and `go-pkg` do not, and admitting them here left them queried on
+            // every pass with nothing to write.
+            if node.kind == "package" {
+                pathless.push(node);
+            }
+            continue;
         }
+        // Drop the structurally unfillable before grouping, not inside the
+        // parse: a `file` node cannot produce text, but keeping it here is what
+        // pulled its whole file into the read-and-parse set to yield nothing.
+        if !travsr_analysis::skeleton::can_have_embed_text(node) {
+            continue;
+        }
+        by_file
+            .entry(node.vname.path.as_str())
+            .or_default()
+            .push(node);
     }
     let files: Vec<(&str, Vec<&travsr_core::Node>)> = by_file.into_iter().collect();
-    // NB: do NOT early-return when `files` is empty — pathless package nodes
-    // (path="") are handled below and would otherwise be stranded without
-    // embed_text whenever they are the only nodes missing it.
+    // Gate on `fillable`, never on `files.is_empty()`: pathless package nodes
+    // (path="") are handled below, and keying the return off `files` alone would
+    // strand them without embed_text whenever they are the only nodes missing it.
+    let fillable = files.iter().map(|(_, ns)| ns.len()).sum::<usize>() + pathless.len();
+    if fillable == 0 {
+        // Every node the query returned is unfillable. Running the pass anyway
+        // is what made the log read `count=1009` five times in 90 seconds while
+        // writing nothing, re-reading 5.9 MB across 476 files each time.
+        tracing::debug!(
+            unfillable = nodes.len(),
+            "embed_text: nothing fillable this pass, skipping parse"
+        );
+        return;
+    }
+    // Announce the pass only when it is big enough that silence would read as a
+    // hang. A start line for the common case doubles the volume of the most
+    // frequent line in the log, which is the failure this PR exists to fix; but
+    // the first pass on a large repo runs for minutes, and a log that says
+    // nothing for minutes is its own bug. `unfillable` rides along here rather
+    // than on the routine line: it is a property of the index that barely moves
+    // between passes, so repeating it every tick is noise.
+    if files.len() > ANNOUNCE_PASS_ABOVE_FILES {
+        tracing::info!(
+            count = fillable,
+            unfillable = nodes.len().saturating_sub(fillable),
+            files = files.len(),
+            ?richness,
+            "regenerating embed_text (parse-once-per-file, parallel)"
+        );
+    }
+    let started = std::time::Instant::now();
 
     // Parse + build text in parallel across files (tree-sitter parsing is CPU-bound,
     // so this scales with cores — the reason a single-threaded regen only used 1 CPU).
@@ -597,23 +676,55 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     };
 
     // Generate embed text for pathless package nodes (pkg:foo@v1 → "foo v1").
+    // `pathless` holds only `package` nodes — gated where it is built, so the
+    // `fillable` count above cannot claim a node this loop then skips.
     let mut pairs = pairs;
     for node in &pathless {
-        if node.kind == "package" {
-            let text = node
-                .vname
-                .signature
-                .trim_start_matches("pkg:")
-                .replace(['@', '/', ':'], " ");
-            pairs.push((node.id, text));
-        }
+        let text = node
+            .vname
+            .signature
+            .trim_start_matches("pkg:")
+            .replace(['@', '/', ':'], " ");
+        pairs.push((node.id, text));
     }
 
     // Write path is single-threaded SQLite; batch to keep transactions small.
+    let mut written = 0usize;
     for chunk in pairs.chunks(500) {
-        if let Err(e) = store.write_embed_texts_batch(chunk) {
-            tracing::warn!("update_embed_texts: batch write failed: {e}");
+        match store.write_embed_texts_batch(chunk) {
+            Ok(()) => written += chunk.len(),
+            Err(e) => tracing::warn!("update_embed_texts: batch write failed: {e}"),
         }
+    }
+
+    // `written` is the field that makes a stalled pass legible. A pass that
+    // reports the same `count` on every tick and `written=0` is doing the work
+    // twice for nothing; without this the repetition looked like progress.
+    // One line for the pass, carrying only what changed between passes.
+    // `missed` is the field that makes a stall legible: a pass that writes
+    // nothing while reporting work to do is doing it twice for nothing, and
+    // without this the repetition read as progress. It is omitted when zero so
+    // the healthy line stays short. `saturating_sub` because `written` cannot
+    // exceed `fillable`, but a subtraction that can render as nonsense has no
+    // place in the one output we are asking a reader to trust (cf.
+    // `missing=-299`).
+    let missed = fillable.saturating_sub(written);
+    let elapsed_ms = started.elapsed().as_millis();
+    if missed > 0 {
+        tracing::info!(
+            event = "embed.text.updated",
+            written,
+            missed,
+            elapsed_ms,
+            "embed_text updated"
+        );
+    } else {
+        tracing::info!(
+            event = "embed.text.updated",
+            written,
+            elapsed_ms,
+            "embed_text updated"
+        );
     }
 }
 
@@ -719,15 +830,8 @@ pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
         .and_then(|p| p.parent())
         .ok_or_else(|| anyhow::anyhow!("cannot derive repo_root from db_path"))?;
     // Use the PER-REPO configured model, not the global active.
-    // If this repo has not been configured via `travsr embed init`, skip silently.
-    let active_id = match travsr_plugin_host::repo_backend_id(repo_root) {
-        Some(id) => id,
-        None => return Ok(false),
-    };
-    let backend = match travsr_plugin_host::lookup_embed_backend(&active_id) {
-        Some(b) => b,
-        None => return Ok(false),
-    };
+    let configured = travsr_plugin_host::repo_backend_id(repo_root)
+        .and_then(|id| travsr_plugin_host::lookup_embed_backend(&id).map(|b| (id, b)));
 
     let mut store = travsr_store::SqliteStore::open(db_path)
         .context("opening store for embed_text regeneration")?;
@@ -736,10 +840,30 @@ pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
     // before the `embed_text`-in-FTS change landed. Idempotent (meta-gated), so it
     // is a cheap no-op after the first run and preserves the always-fresh invariant.
     match store.backfill_fts_embed_text() {
-        Ok(n) if n > 0 => tracing::info!(nodes = n, "backfilled embed_text into FTS content"),
+        Ok(n) if n > 0 => tracing::info!(
+            event = "embed.text.fts_backfill",
+            nodes = n,
+            "backfilled embed_text into FTS content"
+        ),
         Ok(_) => {}
         Err(e) => tracing::warn!("embed-text FTS backfill failed: {e}"),
     }
+
+    // No model configured for this repo. Only the *tier* decision below needs
+    // one; generating the text does not, and returning here made this a silent
+    // no-op on every path that goes through it. `travsr embed reindex` printed
+    // "Preparing embed text for ..." and prepared nothing, and `travsr init`
+    // left the same gap. The daemon's own reindex path never had it: it calls
+    // `update_embed_texts` unconditionally with the same `Compact` fallback, so
+    // the two disagreed about whether this work needs a model at all.
+    //
+    // Text with no model still earns its keep: RFC-022 D1 widens FTS content
+    // with `embed_text`, so it feeds lexical retrieval whether or not a vector
+    // ever gets built from it.
+    let Some((active_id, backend)) = configured else {
+        update_embed_texts(&mut store, repo_root, EmbedRichness::Compact);
+        return Ok(false);
+    };
 
     let stored_id = store.get_meta("embed_text_model_id").ok().flatten();
     if stored_id.as_deref() == Some(active_id.as_str()) {
@@ -797,61 +921,37 @@ pub fn fsck_repo(
 
     let corpus = store.get_meta("corpus")?.unwrap_or_default();
 
-    let node_count = store.node_count()?;
-    let fts_words_count = store.fts_words_node_count()?;
-    let lexical_index_parity_issue = if node_count == fts_words_count {
-        None
-    } else {
-        Some(format!(
-            "nodes ({node_count}) != nodes_fts_words_map ({fts_words_count}) — \
-             run `travsr init` to re-backfill the lexical word index (#478)"
-        ))
-    };
-
-    let mut report = travsr_core::GcReport {
-        node_count,
-        edge_count: store.edge_count()?,
-        lexical_index_parity_issue,
-        ..travsr_core::GcReport::default()
-    };
-
-    // Ghost detection stats each DB path directly rather than re-walking the disk.
-    // The DB side (`files`) tracks every indexed file, including hidden dirs and
-    // non-code files (.github/*, .mcp.json, *.yml) that carry a `file` node. A disk
-    // re-walk diverged from that set on two axes: `ignore::WalkBuilder` skips hidden
-    // entries by default, and it was additionally filtered by language extension.
-    // Either divergence flagged existing files as ghosts. Statting the DB paths is
-    // symmetric by construction — a ghost is any DB path whose file is absent on
-    // disk, with no walk config or filters to drift. `.exists()` matches the TOCTOU
-    // re-check inside `reconcile`, and `on_disk` feeds it so the report and the
-    // `--fix` deletion agree exactly.
-    let db_paths: std::collections::HashSet<String> =
-        store.get_all_file_hashes()?.into_keys().collect();
-    let mut on_disk = std::collections::HashSet::<String>::with_capacity(db_paths.len());
-    let mut ghosts: Vec<String> = Vec::new();
-    for path in &db_paths {
-        if repo_root.join(path).exists() {
-            on_disk.insert(path.clone());
-        } else {
-            ghosts.push(path.clone());
-        }
-    }
-    report.ghost_paths = ghosts;
-
-    // Count orphan edges read-only so the default (no-`--fix`) report is honest
-    // about them; `sweep_orphans` below only runs under `fix` (issue #580).
-    report.orphan_edges_detected = store.count_orphans()?;
-
-    // #650: self-referential `ref/call` edges are a false structural edge (the
-    // one failure mode the project's thesis rules out). Counted read-only here;
-    // swept under `--fix` below. New writes are guarded at the choke point
-    // (`write_scip_attributed_batch`), so a non-zero count here means a
-    // pre-guard DB that a reindex or `--fix` will clean.
-    report.self_ref_call_edges_detected = store.count_self_ref_call_edges()?;
+    // #636: the read-only report half (node/edge counts, ghost detection,
+    // orphan/self-ref-edge counts, lexical parity) is extracted onto
+    // `SqliteStore` so `travsr-mcp`'s `get_graph_health` tool can answer it
+    // without depending on travsr-daemon or opening the store read-write.
+    // See `SqliteStore::integrity_report`'s doc comment for why ghosts are
+    // detected by statting DB paths rather than re-walking disk.
+    let report = store.integrity_report(repo_root)?;
 
     if !fix {
         return Ok(report);
     }
+
+    // `reconcile` takes the on-disk set (walked_paths), not the ghost set.
+    // Derive it as `db_paths \ report.ghost_paths` instead of re-statting
+    // every path a second time (#636 review): the removed code built both
+    // sets in a single `.exists()` pass specifically so the report and the
+    // `--fix` deletion agree exactly ("`.exists()` matches the TOCTOU
+    // re-check inside `reconcile`, and `on_disk` feeds it so the report and
+    // the `--fix` deletion agree exactly"). A second independent stat pass
+    // can disagree with `report.ghost_paths` if a file appears or
+    // disappears in between; deriving from the report's own ghost set can't.
+    // `reconcile`'s own TOCTOU re-check is still the safety net against a
+    // file changing between this point and the actual delete.
+    let db_paths: std::collections::HashSet<String> =
+        store.get_all_file_hashes()?.into_keys().collect();
+    let ghost_set: std::collections::HashSet<&str> =
+        report.ghost_paths.iter().map(String::as_str).collect();
+    let on_disk: std::collections::HashSet<String> = db_paths
+        .into_iter()
+        .filter(|path| !ghost_set.contains(path.as_str()))
+        .collect();
 
     let policy = if force {
         travsr_core::SafetyPolicy {
@@ -1174,6 +1274,12 @@ pub fn init_repo_with_progress(
         if let Some(lang) = Language::from_extension(ext) {
             present_languages.insert(lang.as_str().to_string());
             indexable_paths.push(p);
+        } else if travsr_core::is_manifest_file(
+            p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+        ) {
+            // Name-recognized manifest (go.mod, *.csproj): index it even though
+            // its extension is unmapped. No Phase B language to record.
+            indexable_paths.push(p);
         }
     }
     reclassify_objc_headers(&mut present_languages, &indexable_paths);
@@ -1218,6 +1324,11 @@ pub fn init_repo_with_progress(
                 if let Some(lang) = Language::from_extension(ext) {
                     present_languages.insert(lang.as_str().to_string());
                     indexable_paths.push(p);
+                } else if travsr_core::is_manifest_file(
+                    p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+                ) {
+                    // Name-recognized manifest (go.mod, *.csproj): unmapped ext.
+                    indexable_paths.push(p);
                 }
             }
             reclassify_objc_headers(&mut present_languages, &indexable_paths);
@@ -1253,10 +1364,7 @@ pub fn init_repo_with_progress(
                     .any(|skip| c.as_os_str() == *skip)
             })
         })
-        .filter(|e| {
-            Language::from_extension(e.path().extension().and_then(|x| x.to_str()).unwrap_or(""))
-                .is_some()
-        })
+        .filter(|e| travsr_core::is_indexable_path(e.path()))
         .count() as u64;
     let files_skipped_ignored =
         source_files_without_ignore.saturating_sub(indexable_paths.len() as u64);
@@ -1460,6 +1568,8 @@ pub fn init_repo_with_progress(
             );
             let (report, alias_map) =
                 write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+            // WS-2: flag Dart packages indexed without resolved dependencies.
+            record_dart_resolution_state(&mut store, repo_root, present_languages.contains("dart"));
             // E1: edges resolved by native leaf-name heuristics are tree-sitter,
             // not compiler-derived — write them separately with truthful
             // provenance instead of folding them into the SCIP batch as 'lsif'.
@@ -2181,6 +2291,151 @@ fn resolve_unresolved_calls(
 /// (#318 O3, [`run_background_phase_b`]) writes results through the exact same
 /// unification + attribution path as a full init — there is one and only one
 /// place that decides how Phase B nodes/edges/refs land in the store.
+/// WS-2 (Dart production readiness): record whether Dart Phase B ran with
+/// resolved dependencies, so `travsr status` and `find_references` never report
+/// the resulting partial index as a confident zero. Mirrors `rust_lsif_degraded`.
+///
+/// Empty meta = resolved (or no Dart in the repo). A comma-separated package
+/// list = Dart packages missing `.dart_tool/package_config.json` — the user can
+/// restore cross-package references by running `dart pub get` there. We never
+/// run it ourselves (local-first: it mutates the tree and needs the network).
+fn record_dart_resolution_state(store: &mut SqliteStore, repo_root: &Path, dart_present: bool) {
+    let unresolved = if dart_present {
+        travsr_analysis::phase_b_dart::unresolved_dep_packages(repo_root)
+    } else {
+        Vec::new()
+    };
+    let _ = store.set_meta("dart_deps_unresolved", &unresolved.join(","));
+}
+
+/// A2 follow-up: enrich `markers` with the `Provider` markers a member manifest
+/// inherits from its workspace root, so a member-only incremental reindex keeps
+/// inherited deps at the root version instead of the `@workspace` sentinel.
+///
+/// For each member `Cargo.toml` that declared an inherited dependency, walks up
+/// to its workspace root and reads `[workspace.dependencies]`. Only providers
+/// for a name not already present are added, so this never overrides an in-batch
+/// root (root + member reindexed together) and de-duplicates a root shared by
+/// several members. All filesystem work is skipped when every `Consumer` already
+/// has a matching `Provider`.
+fn enrich_workspace_providers(
+    markers: &mut Vec<travsr_analysis::data_format::WorkspaceDepMarker>,
+    member_manifests: &[PathBuf],
+    repo_root: &Path,
+) {
+    use travsr_analysis::data_format::WorkspaceDepMarker;
+
+    if member_manifests.is_empty() {
+        return;
+    }
+    let mut have: std::collections::HashSet<String> = markers
+        .iter()
+        .filter_map(|m| match m {
+            WorkspaceDepMarker::Provider { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let unresolved = markers
+        .iter()
+        .any(|m| matches!(m, WorkspaceDepMarker::Consumer { name, .. } if !have.contains(name)));
+    if !unresolved {
+        return;
+    }
+    let mut added = Vec::new();
+    for member in member_manifests {
+        for pm in
+            travsr_analysis::data_format::workspace_provider_markers_for_member(member, repo_root)
+        {
+            if let WorkspaceDepMarker::Provider { ref name, .. } = pm {
+                if have.insert(name.clone()) {
+                    added.push(pm);
+                }
+            }
+        }
+    }
+    if !added.is_empty() {
+        tracing::debug!(
+            count = added.len(),
+            "A2: enriched workspace providers from root for member-only reindex"
+        );
+        markers.extend(added);
+    }
+}
+
+/// C1: cross-link a language's own dependency node (`crate:serde`, kind
+/// `crate`) to the manifest-derived package node (`pkg:serde@ver`, kind
+/// `package`) when their bare names match, using the existing `ResolvesTo` edge
+/// so bare-name graph queries and traversal see the manifest data alongside the
+/// module graph. Package lookup is scoped to the `crates.io` registry so a
+/// same-named npm/pypi package can never link to a Rust crate. The
+/// `(kind, prefix, corpus)` shape generalises to other ecosystems as their
+/// symbol nodes gain stable dependency names.
+///
+/// Idempotent: `put_edge` dedupes on `(src, dst, kind)`, so re-running on every
+/// Phase B write never accumulates duplicates. Returns the edge count.
+fn cross_link_manifest_deps(store: &mut SqliteStore) -> usize {
+    use std::collections::HashMap;
+
+    let pkg_nodes = match store.nodes_by_kind("package") {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("C1 cross-link: package node scan failed: {e}");
+            return 0;
+        }
+    };
+    let mut pkg_by_name: HashMap<String, Vec<travsr_core::NodeId>> = HashMap::new();
+    for n in &pkg_nodes {
+        if n.vname.corpus != "crates.io" {
+            continue;
+        }
+        if let Some(rest) = n.vname.signature.strip_prefix("pkg:") {
+            let name = rest.rsplit_once('@').map(|(nm, _)| nm).unwrap_or(rest);
+            if !name.is_empty() {
+                pkg_by_name.entry(name.to_string()).or_default().push(n.id);
+            }
+        }
+    }
+    if pkg_by_name.is_empty() {
+        return 0;
+    }
+
+    let crate_nodes = match store.nodes_by_kind("crate") {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("C1 cross-link: crate node scan failed: {e}");
+            return 0;
+        }
+    };
+    let mut linked = 0usize;
+    for n in &crate_nodes {
+        let Some(name) = n.vname.signature.strip_prefix("crate:") else {
+            continue;
+        };
+        if let Some(pkg_ids) = pkg_by_name.get(name) {
+            for &pkg_id in pkg_ids {
+                if n.id == pkg_id {
+                    continue;
+                }
+                match store.put_edge(&travsr_core::Edge::new(
+                    n.id,
+                    pkg_id,
+                    travsr_core::EdgeKind::ResolvesTo,
+                )) {
+                    Ok(_) => linked += 1,
+                    Err(e) => tracing::warn!("C1 cross-link edge write error: {e}"),
+                }
+            }
+        }
+    }
+    if linked > 0 {
+        tracing::info!(
+            count = linked,
+            "C1: cross-linked crate <-> manifest package nodes"
+        );
+    }
+    linked
+}
+
 fn write_phase_b_results(
     store: &mut SqliteStore,
     corpus: &str,
@@ -2194,6 +2449,16 @@ fn write_phase_b_results(
 ) {
     let pb_node_count = pb_nodes.len();
     let pb_edge_count = pb_edges.len();
+    // B: gate the C1 manifest cross-link (two unindexed full `nodes` scans) on
+    // whether this cycle actually wrote any `crate` node. Computed before
+    // `pb_nodes` is consumed below. C1 only creates value when `crate:*` nodes
+    // exist to link: on init every crate node is written this cycle, and on an
+    // incremental Rust change the touched crate's nodes are re-written. CAVEAT: a
+    // manifest-only edit (a new `pkg:` node from Phase A, no crate node this
+    // cycle) will not re-link to a pre-existing crate until the next Rust change
+    // — acceptable for a best-effort surfacing feature, and it avoids paying the
+    // scan on every non-Rust commit (e.g. a Go/k8s repo with zero crate nodes).
+    let cycle_wrote_crate = pb_nodes.iter().any(|n| n.kind == "crate");
     // #299 F2: the alias map (SCIP id → unified TS id) produced by `unify_all`
     // must be returned so the caller can remap `resolved_sites.dst` — those sites
     // were resolved against the pre-unify store and may point at a SCIP node that
@@ -2261,11 +2526,23 @@ fn write_phase_b_results(
     }
     if pb_node_count > 0 || pb_edge_count > 0 {
         tracing::info!(
+            event = "phase_b.indexed",
             nodes = pb_node_count,
             structural_edges = pb_edge_count,
-            "phase B indexing complete"
+            "semantic indexing complete"
         );
     }
+
+    // C1: now that the module graph's `crate:*` nodes are written, cross-link
+    // them to the manifest-derived `pkg:*` package nodes by name so a bare-name
+    // query (`graph serde`) surfaces the manifest dependency alongside the
+    // language's own crate node. Skipped when this cycle wrote no crate node —
+    // see `cycle_wrote_crate` above (avoids two full `nodes` scans per commit
+    // for non-Rust repos and manifest-untouched cycles).
+    if cycle_wrote_crate {
+        cross_link_manifest_deps(store);
+    }
+
     // H3: stamp phase_b_warnings in the meta table so `travsr status` can surface
     // actionable issues without the user having to re-read init output.
     let mut warnings: Vec<String> = Vec::new();
@@ -2284,6 +2561,12 @@ fn write_phase_b_results(
     // `travsr status` can print the exact `travsr lang install <lang>` fix.
     for lang in &pb_outcome.skipped_unregistered {
         warnings.push(format!("skipped_unregistered:{lang}"));
+    }
+    // #414 (ADR-017 Rule 3): a registered language whose corpus has no trust
+    // grant is skipped before spawn — surface the exact `travsr lang add
+    // <lang> --corpus <corpus>` fix.
+    for lang in &pb_outcome.skipped_untrusted_corpus {
+        warnings.push(format!("untrusted_corpus:{lang}"));
     }
     for lang in &pb_outcome.skipped_no_analyzer {
         warnings.push(format!("skipped_no_analyzer:{lang}"));
@@ -2319,10 +2602,12 @@ fn write_phase_b_results(
     }
 
     let report = PhaseBReport {
+        corpus: corpus.to_string(),
         ran: pb_outcome.ran,
         skipped_not_in_repo: pb_outcome.skipped_not_in_repo,
         skipped_no_analyzer: pb_outcome.skipped_no_analyzer,
         skipped_unregistered: pb_outcome.skipped_unregistered,
+        skipped_untrusted_corpus: pb_outcome.skipped_untrusted_corpus,
         skipped_no_compdb: pb_outcome.skipped_no_compdb,
         skipped_needs_approval: pb_outcome.skipped_needs_approval,
         crashed: pb_outcome.crashed,
@@ -2393,6 +2678,11 @@ fn collect_present_languages_and_paths(
             if !lang.is_phase_a_only() {
                 langs.insert(lang.as_str().to_string());
             }
+            paths.push(p);
+        } else if travsr_core::is_manifest_file(
+            p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+        ) {
+            // Name-recognized manifest (go.mod, *.csproj): Phase A only.
             paths.push(p);
         }
     }
@@ -2809,7 +3099,11 @@ fn run_background_phase_b_inner(
         (corpus, last)
     };
 
-    tracing::info!(commit=%target_sha, "background phase B refresh starting");
+    tracing::info!(
+        event = "phase_b.start",
+        commit = %target_sha,
+        "semantic call and reference indexing starting"
+    );
 
     // ── LSIF pass (TypeScript compiler — expensive, runs lock-free) ───────────
     // Collect edges into a Vec first; write them under the store lock below.
@@ -2820,6 +3114,8 @@ fn run_background_phase_b_inner(
     // P6 (#329): single walk yields both present_languages and indexable_paths
     // so Phase B runners skip their own directory walks.
     let (present_languages, indexable_paths) = collect_present_languages_and_paths(repo_root);
+    // WS-2: captured before `present_languages` is moved into PhaseBInputs below.
+    let dart_present = present_languages.contains("dart");
     // R1: reset per-Phase-B skip latch before the run (same as init_repo_with_progress).
     travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
     let indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
@@ -2870,6 +3166,8 @@ fn run_background_phase_b_inner(
 
     let (report, alias_map) =
         write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+    // WS-2: flag Dart packages indexed without resolved dependencies.
+    record_dart_resolution_state(&mut s, repo_root, dart_present);
     // E1: native leaf-name resolved edges are tree-sitter-heuristic — truthful
     // provenance, not the SCIP batch's 'lsif'.
     if let Err(e) = s.write_phase_b_batch(&[], &resolved, "tree-sitter") {
@@ -2911,11 +3209,12 @@ fn run_background_phase_b_inner(
 
     tracing::info!(
         commit = %target_sha,
+        event = "phase_b.complete",
         ran = report.ran.len(),
         lsif_edges = lsif_edges.len(),
         crashed = report.crashed.len(),
         outcome = ?outcome,
-        "background phase B refresh complete"
+        "semantic call and reference indexing complete"
     );
 
     // Re-run k-core while the lock is still held: Phase B edges change the
@@ -2930,7 +3229,7 @@ fn run_background_phase_b_inner(
                 if let Err(e) = s.write_shell_numbers(&pairs) {
                     tracing::warn!("kcore: failed to update shell numbers after phase B: {e}");
                 } else {
-                    tracing::info!("kcore: shell numbers updated after phase B");
+                    tracing::info!(event = "kcore.updated", "graph centrality updated");
                 }
             }
             Err(e) => tracing::warn!("kcore: computation failed after phase B: {e}"),
@@ -2974,6 +3273,73 @@ fn run_background_phase_b_inner(
     }
 
     outcome
+}
+
+/// Bring the graph in line with the whole tracked tree: reindex every tracked
+/// file, then delete what git no longer tracks.
+///
+/// This is the shape a *tree* change needs, as opposed to a commit's delta. A
+/// commit is described exactly by `git diff-tree HEAD`, so the hook reindexes
+/// that and nothing else. A branch checkout and a multi-commit fast-forward are
+/// not described by any single commit's delta: the tip's own diff says nothing
+/// about the files that differ between the two trees, so reindexing it leaves
+/// the rest of the graph describing a tree that is no longer checked out.
+///
+/// Two halves, and both are needed. The reindex updates and adds; it cannot
+/// remove, because `reindex_files` only visits the paths it is given and a file
+/// that vanished is absent from that list by definition. So the prune runs
+/// afterwards, over `db_file_paths − tracked`, which is the same reconcile
+/// `fsck --fix` uses and carries the same mass-delete circuit breaker.
+///
+/// Returns the Tier-0 callers the reindex left dirty, and how many files were
+/// visited.
+pub fn reconcile_tracked_tree(
+    repo_root: &Path,
+    store: &mut SqliteStore,
+) -> anyhow::Result<(travsr_core::DirtySet, usize)> {
+    let mut paths = tracked_files_from_git(repo_root)
+        .context("enumerating tracked files for a whole-tree reconcile")?;
+    // Same ignore rules as init / the watcher / the hook path (#403).
+    let ignore = watcher::build_ignore_matcher(repo_root);
+    paths.retain(|p| !watcher::should_skip_all(p, repo_root, &ignore));
+
+    let dirty = reindex_files(&paths, repo_root, store)?;
+
+    // `walked` must match the stored VName key format exactly — relative to
+    // repo_root, forward slashes — or every tracked file reads as a ghost and
+    // the prune tries to delete the entire graph. Windows load-bearing;
+    // `paths` are absolute PathBufs, rebuilt here the way reindex_files does.
+    let walked: std::collections::HashSet<String> = paths
+        .iter()
+        .map(|p| {
+            p.strip_prefix(repo_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    let corpus = store.get_meta("corpus").ok().flatten().unwrap_or_default();
+    match store.reconcile(
+        &walked,
+        &travsr_core::SafetyPolicy::default(),
+        repo_root,
+        &corpus,
+    ) {
+        Ok(report) if report.aborted => tracing::warn!(
+            reason = report.abort_reason.as_deref().unwrap_or(""),
+            "tree reconcile: ghost prune tripped the mass-delete circuit breaker — \
+             deleted nothing; run `travsr fsck --fix --force` to override"
+        ),
+        Ok(report) if !report.ghost_paths.is_empty() => tracing::info!(
+            event = "tree.reconcile.pruned",
+            pruned = report.ghost_paths.len(),
+            "tree reconcile: pruned files git no longer tracks"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(err = %e, "tree reconcile: ghost prune failed"),
+    }
+
+    Ok((dirty, paths.len()))
 }
 
 /// Re-index a set of changed files into `store`.
@@ -3033,6 +3399,13 @@ pub fn reindex_files(
     // resolution (RFC-005). Resolution runs once after the per-file loop so
     // markers from both sides of each FFI boundary are available.
     let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
+    let mut all_ws_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker> = Vec::new();
+    // A2 follow-up: `Cargo.toml` files in this batch that declare an inherited
+    // (`{ workspace = true }`) dependency. Used after the loop to walk up to the
+    // workspace root and supply the versions the root would provide, so a
+    // member-only incremental reindex keeps inherited deps at the root version
+    // instead of degrading them to the `@workspace` sentinel.
+    let mut member_manifests: Vec<PathBuf> = Vec::new();
     let mut any_changed = false;
     // Accumulate Tier-0 dirty callers across all files in this batch.
     let mut callers_all = travsr_core::DirtySet::default();
@@ -3081,7 +3454,7 @@ pub fn reindex_files(
                 continue;
             }
             Err(err) => {
-                tracing::warn!("skipping {}: {err}", abs_path.display());
+                tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %err, "hash failed, skipping");
                 continue;
             }
         };
@@ -3108,7 +3481,7 @@ pub fn reindex_files(
         let out = match parsed {
             Ok(o) => o,
             Err(err) => {
-                tracing::warn!("parse error for {}: {err}", abs_path.display());
+                tracing::warn!(event = "file.parse_failed", path = %abs_path.display(), err = %err, "parse error, skipping");
                 continue; // keep old graph intact
             }
         };
@@ -3143,6 +3516,18 @@ pub fn reindex_files(
                 any_changed = true;
                 // Collect FFI markers for the repo-level pass (RFC-005).
                 all_ffi_markers.extend(out.ffi_markers);
+                // Collect Cargo workspace dep markers for the A2 repo-level pass.
+                // Record any member manifest with an inherited dep so the A2
+                // block can walk up to its root for the missing versions.
+                if out.workspace_dep_markers.iter().any(|m| {
+                    matches!(
+                        m,
+                        travsr_analysis::data_format::WorkspaceDepMarker::Consumer { .. }
+                    )
+                }) {
+                    member_manifests.push(abs_path.clone());
+                }
+                all_ws_markers.extend(out.workspace_dep_markers);
             }
             Err(e) => tracing::warn!(path = %vname_path, err = %e, "reindex_replace failed"),
         }
@@ -3159,6 +3544,33 @@ pub fn reindex_files(
         for edge in &ffi_edges {
             if let Err(err) = store.put_edge(edge) {
                 tracing::warn!("ffi edge write error: {err}");
+            }
+        }
+    }
+
+    // Cargo workspace dependency resolution (A2) — same single-pass rationale as
+    // FFI above. A member `{ workspace = true }` entry re-indexed alongside its
+    // workspace root gets the root's version.
+    //
+    // A2 follow-up: when a member is re-indexed *alone* (the common incremental
+    // case — edit a member, commit; the root is not in this batch) the root's
+    // `Provider` markers are absent, so the resolver would degrade the edge to
+    // the `@workspace` sentinel. Before resolving, walk up from each member
+    // manifest to its workspace root and synthesize the missing `Provider`
+    // markers from the root's `[workspace.dependencies]`. Only Consumers still
+    // unresolved after this fall back to the sentinel (a genuinely detached
+    // member whose root is not on disk).
+    if !all_ws_markers.is_empty() {
+        enrich_workspace_providers(&mut all_ws_markers, &member_manifests, repo_root);
+        let (nodes, edges) = indexer.resolve_workspace_deps(&all_ws_markers);
+        for node in &nodes {
+            if let Err(err) = store.put_node(node) {
+                tracing::warn!("workspace dep node write error: {err}");
+            }
+        }
+        for edge in &edges {
+            if let Err(err) = store.put_edge(edge) {
+                tracing::warn!("workspace dep edge write error: {err}");
             }
         }
     }
@@ -3199,7 +3611,9 @@ pub fn reindex_files(
         }
 
         // Populate embed_text for newly-indexed nodes (commit-hook path).
-        // Only runs when a model is configured for this repo.
+        // Runs whether or not a model is configured: `richness_from_meta` falls
+        // back to `Compact`, and the text feeds FTS content as well as any
+        // vector built from it later.
         let richness = richness_from_meta(repo_root);
         update_embed_texts(store, repo_root, richness);
     }
@@ -3300,7 +3714,7 @@ fn hex_encode(bytes: &[u8; 32]) -> String {
     })
 }
 
-fn read_head_commit_sha(repo_root: &Path) -> anyhow::Result<String> {
+pub fn read_head_commit_sha(repo_root: &Path) -> anyhow::Result<String> {
     let out = std::process::Command::new("git")
         .args([
             "-C",
@@ -3350,66 +3764,19 @@ fn reconcile_head_drift(
         return false;
     }
     tracing::info!(
+        event = "head.drift.detected",
         stored = %stored,
         head = %head,
         "last_commit does not match live HEAD (history moved during daemon downtime) — reconciling"
     );
-    let mut paths = match tracked_files_from_git(repo_root) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(err = %e, "head reconcile: could not enumerate tracked files — skipped");
-            return false;
-        }
-    };
-    // Same ignore rules as init / the watcher / the hook path (#403).
-    let ignore = watcher::build_ignore_matcher(repo_root);
-    paths.retain(|p| !watcher::should_skip_all(p, repo_root, &ignore));
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-    let dirty = match reindex_files(&paths, repo_root, &mut s) {
-        Ok(d) => d,
+    let (dirty, files) = match reconcile_tracked_tree(repo_root, &mut s) {
+        Ok(r) => r,
         Err(e) => {
             tracing::warn!(err = %e, "head reconcile: reindex failed");
             return false;
         }
     };
-
-    // #645 WS-A: reindex_files only visits paths in `paths`; a file the drift
-    // DELETED is absent from tracked_files_from_git, so nothing prunes its
-    // nodes and they survive as ghosts from the discarded commit. Reuse the
-    // §6.5 reconcile (the same prune `fsck --fix` uses) to remove
-    // db_file_paths − tracked. Run it regardless of `dirty`: deletions are
-    // orthogonal to the reindex delta. `walked` must match the stored VName
-    // key format exactly — relative to repo_root, forward slashes — or every
-    // tracked file reads as a ghost (Windows load-bearing; `paths` are
-    // absolute PathBufs, rebuilt here the same way reindex_files does).
-    let walked: std::collections::HashSet<String> = paths
-        .iter()
-        .map(|p| {
-            p.strip_prefix(repo_root)
-                .unwrap_or(p)
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
-        .collect();
-    let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
-    match s.reconcile(
-        &walked,
-        &travsr_core::SafetyPolicy::default(),
-        repo_root,
-        &corpus,
-    ) {
-        Ok(report) if report.aborted => tracing::warn!(
-            reason = report.abort_reason.as_deref().unwrap_or(""),
-            "head reconcile: ghost prune tripped the mass-delete circuit breaker — \
-             deleted nothing; run `travsr fsck --fix --force` to override"
-        ),
-        Ok(report) if !report.ghost_paths.is_empty() => tracing::info!(
-            pruned = report.ghost_paths.len(),
-            "head reconcile: pruned drift-deleted ghost files"
-        ),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(err = %e, "head reconcile: ghost prune failed"),
-    }
 
     // Same guard as the ReindexCommit path: never claim freshness for a HEAD
     // whose reindex was skipped due to a signature-format mismatch.
@@ -3421,7 +3788,12 @@ fn reconcile_head_drift(
     // Phase A is now aligned with HEAD; the RefCall edge set is not. Arm the
     // debounced whole-project Phase B rebuild, same as the hook path.
     phase_b_scheduler.mark_dirty();
-    tracing::info!(head = %head, files = paths.len(), "head reconcile complete — Phase B rebuild armed");
+    tracing::info!(
+        event = "head.reconcile.complete",
+        head = %head,
+        files,
+        "head reconcile complete — Phase B rebuild armed"
+    );
     true
 }
 
@@ -5334,6 +5706,120 @@ mod tests {
         );
     }
 
+    /// A2 follow-up: reindexing ONLY a workspace member (the common incremental
+    /// case — edit a member, commit; the root is not in the batch) must keep the
+    /// member's inherited `serde = { workspace = true }` edge pointed at the root
+    /// version, not degrade it to the `@workspace` sentinel.
+    #[test]
+    fn member_only_reindex_keeps_inherited_dep_at_root_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        // Workspace root declares the version under [workspace.dependencies].
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/member\"]\n\n\
+             [workspace.dependencies]\nserde = \"1.0.200\"\n",
+        )
+        .unwrap();
+        // Member inherits it with `{ workspace = true }`.
+        let member_dir = tmp.path().join("crates/member");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let member_manifest = member_dir.join("Cargo.toml");
+        std::fs::write(
+            &member_manifest,
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = { workspace = true }\n",
+        )
+        .unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        store.set_meta("corpus", "test").unwrap();
+
+        // Reindex ONLY the member manifest — the root is not in this batch.
+        reindex_files(
+            std::slice::from_ref(&member_manifest),
+            tmp.path(),
+            &mut store,
+        )
+        .unwrap();
+
+        let versioned = travsr_analysis::data_format::cargo_package_node("serde", "1.0.200").id;
+        let sentinel = travsr_analysis::data_format::cargo_package_node("serde", "workspace").id;
+        let edges = store.all_edges().unwrap();
+        assert!(
+            edges.iter().any(|(_, dst, _, _)| *dst == versioned),
+            "member-only reindex must resolve serde to the root version 1.0.200"
+        );
+        assert!(
+            !edges.iter().any(|(_, dst, _, _)| *dst == sentinel),
+            "member-only reindex must NOT degrade serde to the @workspace sentinel"
+        );
+    }
+
+    /// B: the C1 manifest cross-link pass is gated on the Phase B cycle writing
+    /// a `crate` node. A cycle that writes none (e.g. a Go-only repo) must not
+    /// create the `crate -> package` link even when both nodes already exist;
+    /// a cycle that writes a crate node must.
+    #[test]
+    fn cross_link_gated_on_crate_nodes_in_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store =
+            travsr_store::SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+
+        // Pre-seed a manifest package node and a module crate node with matching
+        // bare names, as prior cycles would have written them.
+        let pkg = travsr_analysis::data_format::cargo_package_node("serde", "1.0.200");
+        let crate_node = travsr_core::Node::new(
+            travsr_core::VName::new("test", "", "", "rust", "crate:serde"),
+            "crate",
+        );
+        store.put_node(&pkg).unwrap();
+        store.put_node(&crate_node).unwrap();
+
+        let linked = |store: &travsr_store::SqliteStore| {
+            store
+                .all_edges()
+                .unwrap()
+                .iter()
+                .any(|(src, dst, _, _)| *src == crate_node.id && *dst == pkg.id)
+        };
+
+        // Cycle 1: writes NO crate node -> the gate skips the cross-link scan.
+        write_phase_b_results(
+            &mut store,
+            "test",
+            vec![],
+            vec![],
+            vec![],
+            travsr_plugin_host::PhaseBOutcome::default(),
+        );
+        assert!(
+            !linked(&store),
+            "a cycle with no crate node must not run the cross-link pass"
+        );
+
+        // Cycle 2: writes a crate node -> the gate runs the cross-link pass.
+        write_phase_b_results(
+            &mut store,
+            "test",
+            vec![crate_node.clone()],
+            vec![],
+            vec![],
+            travsr_plugin_host::PhaseBOutcome::default(),
+        );
+        assert!(
+            linked(&store),
+            "a cycle that writes a crate node links crate -> package"
+        );
+    }
+
     /// RFC-002: when the stored signature format version differs from the binary's
     /// version, `reindex_files` must return `Ok(())` without touching the graph.
     /// This is the core correctness guarantee — a version mismatch must never
@@ -6271,6 +6757,64 @@ mod tests {
         assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 
+    /// The silent no-op. With no `.travsr/embed.toml`, this returned before
+    /// touching the store, so `travsr embed reindex` printed "Preparing embed
+    /// text for ..." and prepared nothing, and `travsr init` had the same gap.
+    /// Only the model-*tier* decision needs a configured model; generating the
+    /// text does not, which is why the daemon's own reindex path had always run
+    /// it unconditionally. The two paths disagreed.
+    #[test]
+    fn embed_text_is_generated_with_no_model_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/lib.rs"),
+            "pub fn handler(a: u32) -> u32 { a }\n",
+        )
+        .unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let node = {
+            let mut store = setup_embed_store(tmp.path());
+            let node = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/lib.rs", "rust", "fn:handler"),
+                "function",
+            )
+            .with_line(1)
+            .with_end_line(1);
+            store.put_node(&node).unwrap();
+            assert!(
+                !store.nodes_missing_embed_text().unwrap().is_empty(),
+                "precondition: the node starts with no embed_text"
+            );
+            node
+        };
+
+        assert!(
+            travsr_plugin_host::repo_backend_id(tmp.path()).is_none(),
+            "precondition: this repo has no embed model configured"
+        );
+
+        let regenerated = regenerate_embed_texts_if_stale(&db_path).unwrap();
+        assert!(
+            !regenerated,
+            "no model means no tier change, so nothing was *re*generated"
+        );
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let text = store
+            .get_nodes_embed_text(&[node.id])
+            .unwrap()
+            .into_iter()
+            .next()
+            .map(|(_, t)| t);
+        assert_eq!(
+            text.as_deref(),
+            Some("function: fn:handler | module: src/lib.rs | params: a: u32 | returns: u32"),
+            "the text is generated at the Compact fallback, not skipped"
+        );
+    }
+
     /// #526: hook injection must prefer a repo's own `.travsr/embed.toml`
     /// override over the machine-wide `~/.travsr/embed.toml` default, the
     /// same resolution order `resolve_backend` (travsr-plugin-host) uses.
@@ -6667,6 +7211,62 @@ mod tests {
             s.get_meta("last_commit").unwrap().as_deref(),
             Some("f0f0f0f"),
             "marker must not claim freshness for a skipped reindex"
+        );
+    }
+
+    /// The shape a whole-tree change needs, in one call: everything git tracks
+    /// gets indexed, and everything it no longer tracks gets removed.
+    ///
+    /// The second half is the one that is easy to leave out. `reindex_files`
+    /// only visits the paths handed to it, so a file that vanished from the tree
+    /// is absent from that list by definition and nothing would ever delete its
+    /// nodes. A branch checkout produces exactly that: `travsr ask` keeps
+    /// answering with a path that is not on disk.
+    #[test]
+    fn reconcile_tracked_tree_indexes_what_git_tracks_and_prunes_what_it_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("kept.ts"), "export class Kept { go() {} }").unwrap();
+        std::fs::write(tmp.path().join("gone.ts"), "export class Gone { go() {} }").unwrap();
+        git_commit_all(tmp.path(), "both files");
+
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store =
+            travsr_store::SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+
+        // First pass: both tracked, both indexed.
+        reconcile_tracked_tree(tmp.path(), &mut store).unwrap();
+        let hashes = store.get_all_file_hashes().unwrap();
+        assert!(hashes.contains_key("kept.ts"), "kept.ts should be indexed");
+        assert!(hashes.contains_key("gone.ts"), "gone.ts should be indexed");
+
+        // Now the tree loses a file, the way a branch checkout loses one: it is
+        // gone from disk and gone from `git ls-files`.
+        std::fs::remove_file(tmp.path().join("gone.ts")).unwrap();
+        StdCommand::new("git")
+            .args(["rm", "-q", "--cached", "gone.ts"])
+            .current_dir(tmp.path())
+            .status()
+            .expect("git rm --cached");
+
+        let (_dirty, files) = reconcile_tracked_tree(tmp.path(), &mut store).unwrap();
+
+        let hashes = store.get_all_file_hashes().unwrap();
+        assert!(
+            hashes.contains_key("kept.ts"),
+            "the surviving file must stay indexed"
+        );
+        assert!(
+            !hashes.contains_key("gone.ts"),
+            "a file git no longer tracks must not survive as a ghost: {:?}",
+            hashes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            files >= 1,
+            "the reindex should have visited the tracked set"
         );
     }
 
@@ -7219,14 +7819,52 @@ impl Daemon {
         let travsr_dir = repo_root.join(".travsr");
         std::fs::create_dir_all(&travsr_dir).context("creating .travsr")?;
 
-        let file_appender = tracing_appender::rolling::daily(&travsr_dir, "daemon.log");
-        // Must be held for the daemon's lifetime — dropping flushes and closes daemon.log.
-        let (non_blocking, _appender_guard) = tracing_appender::non_blocking(file_appender);
+        // #347/#348: drop old rotations before opening today's, so a long-lived
+        // install cannot grow `.travsr/` without bound. `rolling::daily` never
+        // deletes anything on its own.
+        let pruned = logfile::prune(
+            &travsr_dir,
+            logfile::LOG_BUDGET_BYTES,
+            logfile::MAX_LOG_FILES,
+        );
+
+        let file_appender = tracing_appender::rolling::daily(&travsr_dir, logfile::LOG_PREFIX);
+        // Must be held for the daemon's lifetime — dropping flushes and closes
+        // the log.
+        //
+        // The default buffer is 128,000 lines, which at INFO during a large
+        // Phase A is tens of megabytes of resident memory sitting in a channel.
+        // Bounded and lossy instead: under pressure the right thing to drop is
+        // log lines, never indexing throughput. `non_blocking` reports what it
+        // discarded, so the loss is visible rather than silent.
+        let (non_blocking, _appender_guard) =
+            tracing_appender::non_blocking::NonBlockingBuilder::default()
+                .buffered_lines_limit(logfile::BUFFERED_LINES)
+                .lossy(true)
+                .finish(file_appender);
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
+        // INFO, not WARN. At WARN the file held nothing a user would want: on
+        // this repo, four days of logs were 136 lines, every one of them the
+        // same repeated warning and not one lifecycle event. `travsr daemon
+        // logs` on top of that would have been a working feature showing
+        // nothing. `RUST_LOG` still overrides in both directions.
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        // JSON lines on disk. One line is one object, so every field is named
+        // and typed rather than recovered by guessing at column positions, and
+        // `jq`, Loki and Datadog all read it as-is. Nobody is asked to read JSON:
+        // `travsr daemon logs` renders it back into columns for people, and
+        // `--json` hands over the raw line for anything that would rather parse.
+        //
+        // `with_current_span` is on because the repo tag `--repo` filters by is
+        // a span field, not an event field, and would be absent otherwise.
+        // `with_span_list` is off: the full ancestry repeats the same few frames
+        // on every line for no added information.
         let file_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_current_span(true)
+            .with_span_list(false)
             .with_writer(non_blocking)
             .with_ansi(false);
         let init_result = if foreground {
@@ -7244,6 +7882,21 @@ impl Daemon {
         if let Err(e) = init_result {
             eprintln!("travsr daemon: could not init file logger: {e}");
         }
+
+        // First event in every session, so a rotated file is interpretable on
+        // its own: which build wrote it, which repo, which process.
+        tracing::info!(
+            event = "daemon.session.start",
+            version = env!("CARGO_PKG_VERSION"),
+            pid = std::process::id(),
+            repo = %repo_root.display(),
+            // No `foreground` field on purpose. A backgrounded daemon is a
+            // re-exec of `daemon start --foreground`, so the flag is true in the
+            // child either way: accurate for the process, and misleading to the
+            // person who ran the background command and is told they did not.
+            pruned_logs = pruned,
+            "daemon starting"
+        );
 
         // Acquire exclusive lockfile — OS releases the lock on process death.
         let lock_path = travsr_dir.join("daemon.lock");
@@ -7400,15 +8053,29 @@ impl Daemon {
         let embed_phase2_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
-        tracing::info!(repo = %repo_root.display(), "travsr daemon started");
+        tracing::info!(
+            event = "daemon.ready",
+            repo = %repo_root.display(),
+            "travsr daemon started"
+        );
         #[cfg(unix)]
-        tracing::info!(transport = "unix", sock = %sock_path.display(), "control socket bound");
+        tracing::info!(
+            event = "daemon.socket.bound",
+            transport = "unix",
+            sock = %sock_path.display(),
+            "control socket bound"
+        );
 
         // Windows Named Pipe setup — resolved address for use in the accept task.
         #[cfg(windows)]
         let pipe_name = travsr_ipc::ControlAddr::for_repo(&repo_root).pipe_name();
         #[cfg(windows)]
-        tracing::info!(transport = "named_pipe", pipe = %pipe_name, "control pipe bound");
+        tracing::info!(
+            event = "daemon.socket.bound",
+            transport = "named_pipe",
+            pipe = %pipe_name,
+            "control pipe bound"
+        );
 
         let repo_root_arc = Arc::new(repo_root.clone());
         // Notify used for socket-initiated shutdown signal.
@@ -7833,7 +8500,7 @@ impl Daemon {
         #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path);
         drop(lock_file);
-        tracing::info!("travsr daemon stopped");
+        tracing::info!(event = "daemon.session.stop", "travsr daemon stopped");
         Ok(())
     }
 }
@@ -8127,6 +8794,7 @@ fn handle_control_message(
             // "work?" and "work ?" share the same cache entry and produce
             // identical embedding vectors. Only applied to NL tools ("ask");
             // symbol-name tools ("graph") are left as-is.
+            let started = std::time::Instant::now();
             let args = normalize_nl_query_args(&tool, args);
             // R5 (#342): use the dedicated read-only connection so this lock
             // does not block the indexer worker from acquiring the write store.
@@ -8175,6 +8843,13 @@ fn handle_control_message(
             if let Some(versions) = versions {
                 let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(cached) = c.get(&tool, &args, &last_commit, &phase_b_commit, versions) {
+                    tracing::info!(
+                        event = "query.served",
+                        tool = %tool,
+                        cached = true,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "query served"
+                    );
                     return (ControlResponse::query_result(cached), false);
                 }
             }
@@ -8191,9 +8866,31 @@ fn handle_control_message(
                             value.clone(),
                         );
                     }
+                    // The line that makes "which query was slow" answerable.
+                    // Without it a successful query logged nothing at all, so
+                    // the `req` correlation id had nothing on the happy path to
+                    // bind to and per-request timing did not exist. `cached`
+                    // distinguishes the two costs, which is usually the first
+                    // thing worth knowing about a slow one.
+                    tracing::info!(
+                        event = "query.served",
+                        tool = %tool,
+                        cached = false,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "query served"
+                    );
                     (ControlResponse::query_result(value), false)
                 }
-                Err(e) => (ControlResponse::err(format!("query failed: {e:#}")), false),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "query.failed",
+                        tool = %tool,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        error = %e,
+                        "query failed"
+                    );
+                    (ControlResponse::err(format!("query failed: {e:#}")), false)
+                }
             }
         }
         Err(e) => (ControlResponse::err(format!("parse error: {e}")), false),

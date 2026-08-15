@@ -153,6 +153,9 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     if !db_path.exists() {
         anyhow::bail!("not initialized — run `travsr init`");
     }
+    // Before either path: `ask` ranks over call edges, so an incomplete Phase B
+    // changes the answer, not just its completeness.
+    daemon_client::warn_if_call_graph_degraded(&db_path);
 
     let payload: AskPayload = match daemon_client::try_query(
         &repo_root,
@@ -238,9 +241,13 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
                 section.truncate(3);
             }
             let rows: Vec<Row> = section.iter().map(|r| to_row(r)).collect();
+            // U3: titles describe WHAT the group is, not the internal mechanism.
+            // The old "semantic — cross-encoder ranked" asserted a reranker pass
+            // that may not have run (e.g. KNN timed out → lexical fallback),
+            // contradicting the degraded note printed below.
             let header = match tag {
-                "exact" => "── exact — literal symbol / FTS match (not reranked) ──",
-                "semantic" => "── semantic — cross-encoder ranked ──",
+                "exact" => "── exact matches — literal symbol / text ──",
+                "semantic" => "── related — ranked by relevance ──",
                 "tests" => "── tests — test entry points & fixtures ──",
                 _ => "── relevant — graph-adjacent context ──",
             };

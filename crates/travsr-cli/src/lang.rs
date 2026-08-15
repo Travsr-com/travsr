@@ -46,6 +46,13 @@ pub enum LangCommand {
         /// Useful for --no-interactive invocations from the VS Code extension.
         #[arg(long)]
         yes: bool,
+        /// Pin the downloaded analysis-tool binary to a specific release tag
+        /// (e.g. --version v0.3.0) instead of the latest release. Applies to
+        /// tools fetched from GitHub Releases; the travsr-lang wrapper still
+        /// tracks latest. Tools with a vendored checksum stay pinned and reject
+        /// a mismatching version.
+        #[arg(long)]
+        version: Option<String>,
     },
     /// Scan the current repo, detect supported languages, and install them.
     Detect,
@@ -98,6 +105,7 @@ pub fn run(cmd: LangCommand) -> Result<()> {
             corpus,
             skip_wrapper,
             yes,
+            version,
         } => {
             match cmd_install(
                 &language,
@@ -106,6 +114,7 @@ pub fn run(cmd: LangCommand) -> Result<()> {
                 corpus.as_deref(),
                 skip_wrapper,
                 yes,
+                version.as_deref(),
             )? {
                 InstallStatus::WrapperOnly => std::process::exit(2),
                 InstallStatus::FullyReady => Ok(()),
@@ -257,7 +266,10 @@ fn cmd_list(json: bool) -> Result<()> {
                 && !tool_on_path
                 && !entry.install_hint.is_empty()
             {
-                format!(" (Phase A only — Phase B needs: {})", entry.install_hint)
+                format!(
+                    " (parsing only, semantic analysis needs: {})",
+                    entry.install_hint
+                )
             } else {
                 String::new()
             };
@@ -290,6 +302,13 @@ fn cmd_list(json: bool) -> Result<()> {
             entry.language, package_col, sandbox_label, status
         );
     }
+
+    // RFC-025 §8: sidecar version health for the installed Phase B tools
+    // (installed vs required vs latest), with the exact remedy. Text output only
+    // — the JSON branch returned above.
+    println!();
+    crate::sidecar_health::print_block();
+
     Ok(())
 }
 
@@ -302,6 +321,7 @@ fn cmd_install(
     corpus: Option<&str>,
     skip_wrapper: bool,
     yes: bool,
+    override_version: Option<&str>,
 ) -> Result<InstallStatus> {
     let entry = lookup(language).ok_or_else(|| {
         anyhow::anyhow!(
@@ -348,6 +368,17 @@ fn cmd_install(
         None => true, // builtin — no external wrapper needed
         Some(bin) if which(bin) && !reinstall => {
             println!("\u{2713} {bin} already installed.");
+            // RFC-025 Point B: presence never re-checks the release the wrapper
+            // was pinned to. Surface a below-floor WARN (offline) and a newer-
+            // release advisory (best-effort) over the installed wrapper. Never
+            // fails install.
+            if let Some(path) = travsr_core::exec::resolve_executable(bin) {
+                crate::install::advise_installed_sidecar(
+                    entry,
+                    &path,
+                    &format!("travsr lang install {language} --reinstall"),
+                );
+            }
             true
         }
         Some(bin) => {
@@ -400,14 +431,26 @@ fn cmd_install(
 
     // Handle the underlying SCIP tool (scip-go, scip-python, etc.).
     // Builtins are bundled in the travsr binary — no external tool needed.
-    let tool_ready = if entry.builtin {
+    let mut tool_ready = if entry.builtin {
         true
     } else if wrapper_installed && !tool_available(entry.command) {
         let interactive = !no_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin());
-        install_scip_tool(entry, interactive, yes)?
+        install_scip_tool(entry, interactive, yes, override_version)?
     } else {
         tool_available(entry.command)
     };
+
+    // RFC-025 Point A parity: if the underlying tool is present but below its
+    // declared floor, refuse it here with the same actionable message shape as
+    // embed, exactly as `tool_available` gates readiness. Every Phase B entry
+    // declares `Semver::ZERO` today (no known behavioral floor), so this never
+    // fires until a floor is raised in the same commit a tool behavior needs it.
+    if tool_ready {
+        if let Some(refusal) = phase_b_tool_floor_refusal(entry) {
+            eprintln!("\u{26A0} {refusal}");
+            tool_ready = false;
+        }
+    }
 
     // Register in config and optionally trust a corpus.
     let mut config = load_config().unwrap_or_default();
@@ -445,7 +488,23 @@ fn install_scip_tool(
     entry: &travsr_plugin_host::phase_b::catalog::PhaseBEntry,
     interactive: bool,
     yes: bool,
+    override_version: Option<&str>,
 ) -> Result<bool> {
+    // --version pins a downloaded GitHub-release asset. Command/Manual installs
+    // resolve their own version (the package manager / the user), so an override
+    // there would be silently ignored — say so rather than pretend it applied.
+    if override_version.is_some()
+        && !matches!(
+            entry.scip_install,
+            ScipInstall::GithubBinary(_) | ScipInstall::ZipBinary(_)
+        )
+    {
+        eprintln!(
+            "warning: --version has no effect for '{}': its analysis tool is not \
+             installed from GitHub Releases. Ignoring the pin.",
+            entry.language
+        );
+    }
     match entry.scip_install {
         ScipInstall::Command(cmd_args) => {
             let do_run = if interactive {
@@ -490,11 +549,11 @@ fn install_scip_tool(
             }
         }
         ScipInstall::GithubBinary(ref spec) => {
-            install_scip_github_binary(entry, spec)?;
+            install_scip_github_binary(entry, spec, override_version)?;
             return Ok(tool_available(entry.command));
         }
         ScipInstall::ZipBinary(ref spec) => {
-            install_zip_binary(entry, spec)?;
+            install_zip_binary(entry, spec, override_version)?;
             return Ok(tool_available(entry.command));
         }
         ScipInstall::Manual => {
@@ -522,11 +581,56 @@ fn install_scip_tool(
     Ok(false)
 }
 
-/// Download a SCIP tool binary from its GitHub releases. Always fetches the
-/// latest version live — `version_fallback` is only used when the API is down.
+/// Resolve which release tag to install.
+///
+/// Precedence: explicit `override_version` → live `releases/latest` →
+/// `version_fallback` (the offline floor, used only when the API is down).
+///
+/// A vendored-hash tool (`pinned == true`, i.e. `sha256_fn: Some`) is locked to
+/// its `version_fallback`: the vendored checksum only matches that one asset
+/// (#410 M2), so an override asking for a different tag is refused rather than
+/// installed unverified. Requesting the pinned version explicitly is allowed.
+///
+/// `fetch_latest` is only invoked on the live path, so callers pay the network
+/// cost only when neither an override nor a pin decides the tag.
+/// Shared tag-resolution for every downloadable sidecar (Phase B scip-* tools
+/// and, via `install_backend_with_progress`, the embed sidecar). Precedence:
+/// explicit `--version` override -> live `releases/latest` -> offline
+/// `version_fallback`. A hash-pinned entry (`pinned`) ignores the network and
+/// stays on `version_fallback` for supply-chain integrity (#410 M2). Folding
+/// embed onto this closes RFC-025 G3 at the fetch layer — one tag resolver, both
+/// families.
+pub(crate) fn resolve_install_tag(
+    pinned: bool,
+    version_fallback: &str,
+    override_version: Option<&str>,
+    install_name: &str,
+    fetch_latest: impl FnOnce() -> anyhow::Result<String>,
+) -> Result<String> {
+    match override_version {
+        Some(v) if pinned && v != version_fallback => anyhow::bail!(
+            "'{install_name}' is pinned to {version_fallback} for supply-chain \
+             integrity (its checksum is vendored for that exact release); \
+             installing a different version ({v}) is not supported."
+        ),
+        Some(v) => Ok(v.to_string()),
+        None if pinned => Ok(version_fallback.to_string()),
+        None => Ok(fetch_latest().unwrap_or_else(|e| {
+            eprintln!(
+                "warning: could not fetch latest {install_name} version ({e:#}), using {version_fallback}"
+            );
+            version_fallback.to_string()
+        })),
+    }
+}
+
+/// Download a SCIP tool binary from its GitHub releases. Fetches the latest
+/// version live by default; `--version` (`override_version`) pins an exact tag
+/// and `version_fallback` is the offline floor. See [`resolve_install_tag`].
 fn install_scip_github_binary(
     entry: &travsr_plugin_host::phase_b::catalog::PhaseBEntry,
     spec: &ScipBinarySpec,
+    override_version: Option<&str>,
 ) -> Result<()> {
     let target = match crate::install::current_target() {
         Ok(t) => t,
@@ -540,25 +644,20 @@ fn install_scip_github_binary(
         }
     };
 
-    // #410 M2: an entry carrying a vendored hash is pinned, because the hash
-    // is only meaningful against one exact asset — resolving `releases/latest`
-    // would move the target out from under it on the next upstream release.
-    // Everything else keeps fetching the latest tag live.
+    // #410 M2: an entry carrying a vendored hash is pinned, because the hash is
+    // only meaningful against one exact asset — a floating `releases/latest` (or
+    // a `--version` override) would move the target out from under it. Everything
+    // else honors the override, else fetches latest, else the offline fallback.
     let repo = spec.repo.to_string();
-    let tag = if spec.sha256_fn.is_some() {
-        spec.version_fallback.to_string()
-    } else {
-        match run_async(async move { crate::install::fetch_latest_version_for_repo(&repo).await }) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!(
-                    "warning: could not fetch latest {} version ({e:#}), using {}",
-                    spec.install_name, spec.version_fallback
-                );
-                spec.version_fallback.to_string()
-            }
-        }
-    };
+    let tag = resolve_install_tag(
+        spec.sha256_fn.is_some(),
+        spec.version_fallback,
+        override_version,
+        spec.install_name,
+        move || {
+            run_async(async move { crate::install::fetch_latest_version_for_repo(&repo).await })
+        },
+    )?;
 
     let asset_name = match (spec.asset_fn)(&tag, target) {
         Some(a) => a,
@@ -617,27 +716,23 @@ fn install_scip_github_binary(
 fn install_zip_binary(
     entry: &travsr_plugin_host::phase_b::catalog::PhaseBEntry,
     spec: &ZipBinarySpec,
+    override_version: Option<&str>,
 ) -> Result<()> {
-    // #410 M2: same rule as the binary path — an entry carrying a vendored
-    // hash is pinned, because the hash only means anything against one exact
-    // asset. This was previously wired on the `GithubBinary` path only, which
-    // left the single `ZipBinary` entry (kotlin-language-server) reading
-    // `releases/latest` and never checking its hash at all.
+    // #410 M2: same rule as the binary path — an entry carrying a vendored hash
+    // is pinned, because the hash only means anything against one exact asset.
+    // This was previously wired on the `GithubBinary` path only, which left the
+    // single `ZipBinary` entry (kotlin-language-server) reading `releases/latest`
+    // and never checking its hash at all.
     let repo = spec.repo.to_string();
-    let tag = if spec.sha256_fn.is_some() {
-        spec.version_fallback.to_string()
-    } else {
-        match run_async(async move { crate::install::fetch_latest_version_for_repo(&repo).await }) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!(
-                    "warning: could not fetch latest {} version ({e:#}), using {}",
-                    spec.install_name, spec.version_fallback
-                );
-                spec.version_fallback.to_string()
-            }
-        }
-    };
+    let tag = resolve_install_tag(
+        spec.sha256_fn.is_some(),
+        spec.version_fallback,
+        override_version,
+        spec.install_name,
+        move || {
+            run_async(async move { crate::install::fetch_latest_version_for_repo(&repo).await })
+        },
+    )?;
 
     let asset_name = (spec.asset_fn)(&tag);
     println!("Downloading {} {} ...", spec.install_name, tag);
@@ -730,7 +825,7 @@ fn cmd_detect() -> Result<()> {
         let status = if registered && fully_ready {
             "\u{2713} already active"
         } else if registered {
-            "registered (SCIP tool missing)"
+            "registered (analyzer binary missing)"
         } else {
             "not installed"
         };
@@ -784,10 +879,10 @@ fn cmd_detect() -> Result<()> {
     println!();
     for lang in &selected {
         println!("── {} ──", lang);
-        match cmd_install(lang, false, false, None, false, false) {
+        match cmd_install(lang, false, false, None, false, false, None) {
             Ok(InstallStatus::FullyReady) => {}
             Ok(InstallStatus::WrapperOnly) => {
-                println!("  \u{26A0} {lang}: wrapper installed but SCIP tool missing")
+                println!("  \u{26A0} {lang}: wrapper installed but the analyzer binary is missing")
             }
             Err(e) => eprintln!("  error: {e:#}"),
         }
@@ -926,7 +1021,7 @@ fn cmd_remove(language: &str) -> Result<()> {
     let mut config = load_config().unwrap_or_default();
     if config.unregister(language) {
         save_config(&config)?;
-        println!("\u{2713} '{language}' Phase B unregistered.");
+        println!("\u{2713} '{language}' semantic analysis unregistered.");
     } else {
         println!("'{language}' was not registered.");
     }
@@ -971,6 +1066,8 @@ fn cmd_approve(
     println!(
         "\u{2713} Security approval recorded for '{language}'.\n\
          Permitted hosts: {}\n\
+         note: the sandbox does not filter traffic per host — this allowlist is\n\
+         only enforced if a host-level firewall or egress proxy backs it.\n\
          Run `travsr lang install {language}` to complete installation.",
         permitted_hosts.join(", ")
     );
@@ -1029,7 +1126,9 @@ fn inline_approval_prompt(
     save_config(&config)?;
 
     println!(
-        "\u{2713} Approval recorded. Permitted hosts: {}\n",
+        "\u{2713} Approval recorded. Permitted hosts: {}\n\
+         note: the sandbox does not filter traffic per host — this allowlist is\n\
+         only enforced if a host-level firewall or egress proxy backs it.\n",
         permitted_hosts.join(", ")
     );
     Ok(())
@@ -1279,6 +1378,56 @@ fn tool_available(name: &str) -> bool {
     travsr_core::exec::resolve_executable_in(extra_dirs, name).is_some()
 }
 
+/// RFC-025 Point A parity for the Phase B family: if the underlying `scip-*` /
+/// zip tool for `entry` is present but below its declared version floor, return
+/// the actionable refuse message (same shape as embed). Returns `None` when the
+/// tool is at/above the floor, when no floor is declared (the state of every
+/// Phase B entry today), or when the tool is absent — the caller then treats it
+/// as usable.
+fn phase_b_tool_floor_refusal(entry: &travsr_plugin_host::PhaseBEntry) -> Option<String> {
+    use travsr_plugin_host::sidecar_version::{
+        below_floor_message, floor_status, unreadable_message, FloorStatus, Semver, SidecarSpec,
+    };
+    let (spec, install_name): (&dyn SidecarSpec, &str) = match &entry.scip_install {
+        ScipInstall::GithubBinary(s) => (s as &dyn SidecarSpec, s.install_name),
+        ScipInstall::ZipBinary(z) => (z as &dyn SidecarSpec, z.install_name),
+        _ => return None,
+    };
+    // No Phase B entry declares a floor today (RFC-025 decision 3: a floor is
+    // only set once a behavior relies on it). With no floor, `floor_status` can
+    // only ever return a usable state, so the probe cannot change any decision -
+    // and running it would exec a PATH-resolved binary inside the trust-boundary
+    // crate purely to learn a version nothing consumes. Skip it entirely until a
+    // real floor exists; this activates the instant one is declared, and keeps
+    // the no-floor family paying nothing (no exec, no probe timeout, no log).
+    if spec.min_version() == Semver::ZERO {
+        return None;
+    }
+    let path = travsr_core::exec::resolve_executable(install_name)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".travsr").join("bin").join(install_name)))
+        .filter(|p| p.exists())?;
+    let remedy = format!("travsr lang install {} --reinstall", entry.language);
+    match floor_status(spec, &path, None) {
+        FloorStatus::BelowFloor {
+            installed,
+            required,
+        } => Some(below_floor_message(
+            install_name,
+            &installed,
+            &required,
+            &remedy,
+        )),
+        FloorStatus::Unreadable { required } => {
+            Some(unreadable_message(install_name, &required, &remedy))
+        }
+        // Usable states (floor met, no floor, or a transient probe timeout that
+        // degrades to usable) do not refuse.
+        FloorStatus::Ok(_) | FloorStatus::UnreadableNoFloor | FloorStatus::ProbeTimeout { .. } => {
+            None
+        }
+    }
+}
+
 fn sandbox_available() -> bool {
     #[cfg(target_os = "linux")]
     return which("bwrap");
@@ -1286,4 +1435,64 @@ fn sandbox_available() -> bool {
     return std::path::Path::new("/usr/bin/sandbox-exec").exists();
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     return false;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_install_tag;
+
+    // A `fetch_latest` that must never run — asserts the live path is skipped
+    // when an override or a pin already decides the tag.
+    fn never_latest() -> anyhow::Result<String> {
+        panic!("fetch_latest must not be called when the tag is already decided");
+    }
+
+    #[test]
+    fn override_wins_for_unpinned_tool() {
+        let tag = resolve_install_tag(false, "v0.3.0", Some("v0.2.1"), "t", never_latest).unwrap();
+        assert_eq!(tag, "v0.2.1");
+    }
+
+    #[test]
+    fn override_matching_pin_is_allowed() {
+        // Requesting exactly the pinned version is a no-op, not a refusal.
+        let tag = resolve_install_tag(true, "v1.0.0", Some("v1.0.0"), "t", never_latest).unwrap();
+        assert_eq!(tag, "v1.0.0");
+    }
+
+    #[test]
+    fn override_mismatch_on_pinned_tool_is_refused() {
+        // A vendored-hash tool must never be floated off its pinned tag (#410 M2).
+        let err = resolve_install_tag(true, "v1.0.0", Some("v2.0.0"), "kls", never_latest)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("pinned"),
+            "message should explain the pin: {err}"
+        );
+        assert!(
+            err.contains("v2.0.0"),
+            "message should name the rejected version: {err}"
+        );
+    }
+
+    #[test]
+    fn no_override_pinned_uses_fallback_without_network() {
+        let tag = resolve_install_tag(true, "v1.0.0", None, "t", never_latest).unwrap();
+        assert_eq!(tag, "v1.0.0");
+    }
+
+    #[test]
+    fn no_override_unpinned_uses_latest() {
+        let tag =
+            resolve_install_tag(false, "v0.3.0", None, "t", || Ok("v0.9.0".to_string())).unwrap();
+        assert_eq!(tag, "v0.9.0");
+    }
+
+    #[test]
+    fn no_override_unpinned_falls_back_when_latest_fails() {
+        let tag = resolve_install_tag(false, "v0.3.0", None, "t", || anyhow::bail!("network down"))
+            .unwrap();
+        assert_eq!(tag, "v0.3.0");
+    }
 }

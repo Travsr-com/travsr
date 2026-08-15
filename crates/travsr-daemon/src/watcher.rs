@@ -21,7 +21,6 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
-use travsr_core::Language;
 
 /// Events the daemon's indexer worker receives from the watcher.
 #[derive(Debug)]
@@ -374,8 +373,10 @@ fn should_skip_upsert(path: &Path) -> bool {
     if !path.is_file() {
         return true;
     }
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    Language::from_extension(ext).is_none()
+    // Skip files that are neither a recognized source/data-format extension nor
+    // a name-recognized manifest (go.mod, *.csproj). Single source of truth so
+    // the watcher and the init walk admit exactly the same files.
+    !travsr_core::is_indexable_path(path)
 }
 
 #[cfg(test)]

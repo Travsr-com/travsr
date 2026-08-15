@@ -75,6 +75,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         nodes: vec![file_node],
         edges: vec![],
         ffi_markers: vec![],
+        workspace_dep_markers: vec![],
     };
 
     let mut parser = Parser::new();
