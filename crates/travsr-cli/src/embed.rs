@@ -659,10 +659,7 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
         );
 
         if !crate::install::path_contains_travsr_bin() {
-            println!(
-                "\n  hint: add ~/.travsr/bin to your PATH:\n\
-                 \n\t  export PATH=\"$HOME/.travsr/bin:$PATH\"\n"
-            );
+            println!("\n{}", crate::install::path_hint());
         }
     }
 
@@ -1242,9 +1239,12 @@ async fn download_embed_binary(
     target: &str,
 ) -> Result<PathBuf> {
     // Windows release assets carry `.exe` (travsr-embed #12); the sha256
-    // sidecar is named after the full asset (`<asset>.exe.sha256`).
-    let win = target.contains("windows");
-    let asset_ext = if win { ".exe" } else { "" };
+    // sidecar is named after the full asset (`<asset>.exe.sha256`). Same rule as
+    // the travsr-lang wrapper lane, so it lives in one place (#588).
+    //
+    // Order matters: the accelerator suffix is part of the asset's stem, the
+    // `.exe` is the extension, so it goes last (#703).
+    let asset_ext = crate::install::exe_suffix_for_target(target);
     let variant = resolve_accel_variant(target)?;
     let suffix = variant.map(|v| v.suffix).unwrap_or("");
     let base_url = format!("{EMBED_RELEASES_BASE}/{github_repo}/releases/download/{version}");
