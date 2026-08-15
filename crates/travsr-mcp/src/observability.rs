@@ -1958,7 +1958,6 @@ mod tests {
         }
 
         let payload = index_status_payload(&store, "repo", None);
-        std::env::remove_var("TRAVSR_LANG_TOML");
 
         let langs = payload["phase_b"]["languages"].as_array().unwrap();
         for entry in langs {
@@ -1992,12 +1991,16 @@ mod tests {
         assert_eq!(rust["state"], "done", "got: {payload}");
         assert_eq!(payload["phase_b"]["state"], "partial", "got: {payload}");
 
-        // Determinism: the payload is a pure function of the store + env.
+        // Determinism: the payload is a pure function of the store + env, so
+        // the second call must run under the same environment as the first —
+        // `TRAVSR_LANG_TOML` is cleared only after this check, not before it.
         let again = index_status_payload(&store, "repo", None);
         assert_eq!(
             payload["phase_b"], again["phase_b"],
             "two consecutive calls must produce identical phase_b payloads"
         );
+
+        std::env::remove_var("TRAVSR_LANG_TOML");
     }
 
     /// "running" stays reachable, but only when a job is genuinely in flight:
