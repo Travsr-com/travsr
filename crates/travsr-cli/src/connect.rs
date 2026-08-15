@@ -761,17 +761,60 @@ fn execute(p: &Planned, remove: bool) -> Result<Outcome> {
     }
 }
 
+/// Entries currently listed inside a managed block, in file order. Empty when the
+/// file, or a well-formed block, is absent.
+fn block_entries(path: &Path, begin: &str, end: &str) -> Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path)?;
+    let (Some(start), Some(estart)) = (text.find(begin), text.find(end)) else {
+        return Ok(Vec::new());
+    };
+    let body_start = start + begin.len();
+    if estart < body_start {
+        return Ok(Vec::new());
+    }
+    Ok(text[body_start..estart]
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Maintain a `.gitignore` block listing the generated repo-relative paths.
-fn ensure_gitignored(repo: &Path, rels: &[String], remove: bool) -> Result<Outcome> {
+///
+/// The block accumulates across runs instead of being replaced, because a run
+/// does not see every tool: `--tool cursor` plans only Cursor's files, so
+/// rewriting the block from that run alone would drop `.mcp.json` out of it and
+/// silently make a still-present MCP server definition committable, which is the
+/// RCE-on-clone vector this block exists to close. `remove` subtracts only the
+/// paths this run actually unwired, and deletes the block once nothing is left.
+fn ensure_gitignored(
+    repo: &Path,
+    add: &[String],
+    drop: &[String],
+    remove: bool,
+) -> Result<Outcome> {
     let path = repo.join(".gitignore");
+    let mut entries = block_entries(&path, GI_BEGIN, GI_END)?;
     if remove {
-        return remove_block(&path, GI_BEGIN, GI_END);
+        entries.retain(|e| !drop.contains(e));
+        if entries.is_empty() {
+            return remove_block(&path, GI_BEGIN, GI_END);
+        }
+    } else {
+        if add.is_empty() {
+            return Ok(Outcome::Absent);
+        }
+        for a in add {
+            if !entries.contains(a) {
+                entries.push(a.clone());
+            }
+        }
     }
-    if rels.is_empty() {
-        return Ok(Outcome::Absent);
-    }
-    let body = rels.join("\n");
-    upsert_block(&path, GI_BEGIN, GI_END, &body)
+    upsert_block(&path, GI_BEGIN, GI_END, &entries.join("\n"))
 }
 
 fn rel(repo: &Path, path: &Path) -> Option<String> {
@@ -802,7 +845,11 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
     }
 
     let mut detected = false;
+    // Paths to add to the .gitignore block, and paths to drop from it. Kept
+    // apart because a remove run must subtract exactly what it unwired and leave
+    // every other tool's entry standing.
     let mut gitignore: Vec<String> = Vec::new();
+    let mut unignore: Vec<String> = Vec::new();
 
     for tool in Tool::ALL {
         if let Some(only) = &opts.only {
@@ -834,11 +881,21 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                                 }
                                 other => say!("  {} {disp}", label(other)),
                             }
-                            if planned.gitignore
-                                && matches!(outcome, Outcome::Written | Outcome::Unchanged)
-                            {
+                            if planned.gitignore {
                                 if let Some(r) = rel(repo_root, &planned.path) {
-                                    gitignore.push(r);
+                                    if opts.remove {
+                                        // Unwired (or never there): the file no
+                                        // longer carries a travsr server, so its
+                                        // ignore entry has nothing left to guard.
+                                        if matches!(outcome, Outcome::Removed | Outcome::Absent) {
+                                            unignore.push(r);
+                                        }
+                                    } else if matches!(
+                                        outcome,
+                                        Outcome::Written | Outcome::Unchanged
+                                    ) {
+                                        gitignore.push(r);
+                                    }
                                 }
                             }
                         }
@@ -869,8 +926,11 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         return Ok(());
     }
 
-    if !opts.dry_run && !opts.commit {
-        match ensure_gitignored(repo_root, &gitignore, opts.remove) {
+    // `--commit` opts out of *adding* ignore entries; it must not also block
+    // cleaning up entries for files we just unwired, or `--commit --remove`
+    // leaves the block pointing at paths that no longer carry a server.
+    if !opts.dry_run && (!opts.commit || opts.remove) {
+        match ensure_gitignored(repo_root, &gitignore, &unignore, opts.remove) {
             Ok(Outcome::Written) => say!(
                 "  {} .gitignore (generated files are local-only)",
                 label(&Outcome::Written)
@@ -1195,6 +1255,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A `--tool X` run plans only X's files. If the ignore block were rewritten
+    /// from that run alone, another tool's still-present `.mcp.json` would fall
+    /// out of it and become committable. A committed server definition is the
+    /// RCE-on-clone vector the block exists to close.
+    #[test]
+    fn gitignore_block_accumulates_across_partial_runs() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+
+        ensure_gitignored(repo, &[".mcp.json".into()], &[], false).unwrap();
+        ensure_gitignored(repo, &[".cursor/mcp.json".into()], &[], false).unwrap();
+
+        let entries = block_entries(&repo.join(".gitignore"), GI_BEGIN, GI_END).unwrap();
+        assert_eq!(entries, vec![".mcp.json", ".cursor/mcp.json"]);
+
+        // Re-adding an entry already present must not duplicate it.
+        ensure_gitignored(repo, &[".mcp.json".into()], &[], false).unwrap();
+        let entries = block_entries(&repo.join(".gitignore"), GI_BEGIN, GI_END).unwrap();
+        assert_eq!(entries, vec![".mcp.json", ".cursor/mcp.json"]);
+    }
+
+    /// `--tool cursor --remove` unwires Cursor only. Claude Code's `.mcp.json` is
+    /// still on disk with a travsr server in it, so its ignore entry must stay.
+    #[test]
+    fn partial_remove_keeps_other_tools_ignored() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        let gi = repo.join(".gitignore");
+        std::fs::write(&gi, "target/\n").unwrap();
+
+        ensure_gitignored(
+            repo,
+            &[".mcp.json".into(), ".cursor/mcp.json".into()],
+            &[],
+            false,
+        )
+        .unwrap();
+        ensure_gitignored(repo, &[], &[".cursor/mcp.json".into()], true).unwrap();
+
+        let entries = block_entries(&gi, GI_BEGIN, GI_END).unwrap();
+        assert_eq!(entries, vec![".mcp.json"]);
+        // The user's own rules are untouched throughout.
+        assert!(std::fs::read_to_string(&gi).unwrap().contains("target/"));
+
+        // Removing the last entry takes the whole block with it.
+        ensure_gitignored(repo, &[], &[".mcp.json".into()], true).unwrap();
+        let text = std::fs::read_to_string(&gi).unwrap();
+        assert!(!text.contains(GI_BEGIN), "empty block should be removed");
+        assert!(text.contains("target/"));
     }
 
     #[test]
