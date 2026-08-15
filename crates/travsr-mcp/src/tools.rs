@@ -6731,6 +6731,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn search_symbol_global_exact_mode_filters_substrings() {
+        use travsr_core::{Node, VName};
+        // The global dispatch surface (stdio-global + SSE) must thread `exact`
+        // through to the store the same way the single-repo path does. Guards
+        // against a future refactor dropping the flag on the global variant.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store
+                .put_node(&Node::new(
+                    VName::new("", "", "src/ClassD.rs", "rust", "struct:ClassD"),
+                    "struct",
+                ))
+                .unwrap();
+            store
+                .put_node(&Node::new(
+                    VName::new("", "", "src/ClassD.rs", "rust", "fn:ClassD::method"),
+                    "function",
+                ))
+                .unwrap();
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "",
+                        "",
+                        "src/ClassDConfig.rs",
+                        "rust",
+                        "struct:ClassDConfigurationManager",
+                    ),
+                    "struct",
+                ))
+                .unwrap();
+        }
+        let repos: HashMap<String, PathBuf> = [("myrepo".to_string(), db_path)].into();
+
+        // exact=false: the pure-substring match is still returned.
+        let res_all = search_symbol_global(&repos, "ClassD", Some("myrepo"), false);
+        assert!(res_all.contains("struct:ClassD"), "got: {res_all}");
+        assert!(res_all.contains("fn:ClassD::method"), "got: {res_all}");
+        assert!(
+            res_all.contains("struct:ClassDConfigurationManager"),
+            "global exact=false must keep substring match, got: {res_all}"
+        );
+
+        // exact=true: substring noise is dropped, boundary/exact kept.
+        let res_exact = search_symbol_global(&repos, "ClassD", Some("myrepo"), true);
+        assert!(res_exact.contains("struct:ClassD"), "got: {res_exact}");
+        assert!(res_exact.contains("fn:ClassD::method"), "got: {res_exact}");
+        assert!(
+            !res_exact.contains("struct:ClassDConfigurationManager"),
+            "global exact=true must drop substring match, got: {res_exact}"
+        );
+    }
+
     // ── search_symbol / get_callers path:line tests ───────────────────────────
 
     #[test]
