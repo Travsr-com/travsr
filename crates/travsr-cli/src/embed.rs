@@ -2376,13 +2376,19 @@ fn embed_binary_installed() -> bool {
 /// one-command fix (`travsr embed init`) was waiting. Silent when embeddings are
 /// already active, or when the binary is not installed (init's install tip and
 /// `travsr embed init` cover that case).
-pub fn hint_activate_if_installed() {
-    if travsr_plugin_host::active_backend_id().is_some() {
+pub fn hint_activate_if_installed(repo_root: &Path) {
+    // UX-5: gate on THIS repo's active backend, not the global default. The old
+    // check read the global `~/.travsr/embed.toml` `active` field, so a user who
+    // had ever run `travsr embed init` in any repo suppressed the tip everywhere —
+    // even in a fresh repo that was never embedded, which then runs
+    // `ask`/`get_context` without repo embeddings, silently. That is exactly the
+    // gap this tip exists to close, so the scope must be the repo, not the machine.
+    if travsr_plugin_host::repo_backend_id(repo_root).is_some() {
         return;
     }
     if embed_binary_installed() {
         println!(
-            "tip: embeddings are installed but not enabled — run `travsr embed init` to turn on semantic search"
+            "tip: embeddings are installed but not enabled for this repo — run `travsr embed init` to turn on semantic search here"
         );
     }
 }

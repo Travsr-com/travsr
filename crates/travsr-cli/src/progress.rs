@@ -348,6 +348,19 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
             commas(stats.total_edges),
         );
         emit_ghost_note();
+        // UX-2: "up to date" reports the Phase A delta only. When Phase B still
+        // re-ran its analyzers (e.g. after `--force`, or a re-run following a
+        // crash) the graph delta can be zero yet the semantic pass did execute —
+        // say so, so the message is not read as "nothing happened".
+        if let Some(report) = &stats.phase_b_report {
+            if !report.ran.is_empty() {
+                println!(
+                    "  {} semantic analysis re-ran for: {} (no graph changes)",
+                    pal.dim("ℹ"),
+                    report.ran.join(", "),
+                );
+            }
+        }
         return;
     }
 
@@ -408,9 +421,30 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
             }
         }
         Some(report) => {
-            if !report.ran.is_empty() {
-                let langs = report.ran.join(", ");
-                println!("  {} semantic analysis enabled for: {langs}", pal.dim("ℹ"),);
+            // UX-8: `ran` includes languages whose analyzer executed but emitted
+            // zero symbols. Calling those "enabled" reads to the user as "working",
+            // so report only the languages that actually produced symbols here, and
+            // call out the ones that ran dry separately (matches the `travsr status`
+            // zero-node warning rather than masking it under "enabled").
+            let produced: Vec<&str> = report
+                .ran
+                .iter()
+                .filter(|l| !report.produced_no_nodes.contains(l))
+                .map(String::as_str)
+                .collect();
+            if !produced.is_empty() {
+                let langs = produced.join(", ");
+                println!(
+                    "  {} semantic analysis produced symbols for: {langs}",
+                    pal.dim("ℹ"),
+                );
+            }
+            if !report.produced_no_nodes.is_empty() {
+                let langs = report.produced_no_nodes.join(", ");
+                println!(
+                    "  {} semantic analyzer ran but produced no symbols for: {langs} — see `travsr status` for why",
+                    pal.orange("⚠"),
+                );
             }
             if !report.skipped_no_analyzer.is_empty() {
                 let langs = report.skipped_no_analyzer.join(", ");

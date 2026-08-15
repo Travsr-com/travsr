@@ -199,8 +199,15 @@ pub fn run() -> anyhow::Result<()> {
                     // #712: analyzer ran but produced no nodes over the repo's
                     // source files of this language — a silent zero-node result,
                     // not a crash. Point at the tool and a rebuild.
+                    // UX-3: the analyzer is installed and active (the zero-node
+                    // warning only fires for a language that ran), so telling the
+                    // user to reinstall misdirects — reinstalling changes nothing.
+                    // The real causes are the sidecar failing to parse/resolve this
+                    // repo's sources (e.g. a sandbox-denied read, a missing SDK, or
+                    // no buildable project). Point at the sidecar's own diagnostics,
+                    // which the host now forwards on stderr.
                     ["zero_nodes", lang] => eprintln!(
-                        "warning: semantic analyzer for '{lang}' produced no symbols despite '{lang}' sources in the repo — check `travsr lang install {lang}`, then re-run `travsr init --semantic --force`"
+                        "warning: semantic analyzer for '{lang}' ran but produced no symbols despite '{lang}' sources in the repo. The analyzer is installed and active, so reinstalling will not help — its sidecar likely could not parse or resolve these sources. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see the sidecar's own diagnostics"
                     ),
                     // #449: languages present in the repo whose Phase B sidecar
                     // never ran, previously a silent skip that left the user
@@ -266,7 +273,7 @@ pub fn run() -> anyhow::Result<()> {
 
     // #712 F: the embed sidecar can be installed while no backend is active, so
     // the semantic path silently runs without embeddings. Nudge to enable it.
-    crate::embed::hint_activate_if_installed();
+    crate::embed::hint_activate_if_installed(&repo_root);
 
     Ok(())
 }
