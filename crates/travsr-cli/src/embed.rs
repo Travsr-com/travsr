@@ -2366,7 +2366,7 @@ fn embed_binary_installed() -> bool {
         return false;
     };
     travsr_plugin_host::embed_backends()
-        .into_iter()
+        .iter()
         .any(|b| bin_dir.join(b.binary_filename()).exists())
 }
 

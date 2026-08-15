@@ -114,7 +114,7 @@ pub fn wrapper_available(binary_name: &str, target: &str) -> bool {
     if !WRAPPER_RELEASE_TARGETS.contains(&target) {
         return false;
     }
-    !(MACOS_ONLY_WRAPPERS.contains(&binary_name) && !target.ends_with("-apple-darwin"))
+    !MACOS_ONLY_WRAPPERS.contains(&binary_name) || target.ends_with("-apple-darwin")
 }
 
 /// On-disk name of an installed wrapper under `~/.travsr/bin/`.
