@@ -177,6 +177,17 @@ pub struct AskPayload {
     /// Empty when embeddings are fully warm and contributing.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub degraded_note: String,
+    /// UX-022: whether the doc index was available to this query path. True only
+    /// when docs are enabled *and* the doc-space KNN hook is armed — which the
+    /// daemon does at startup but the read-only cold path (a bare `travsr ask`
+    /// with no daemon) cannot. The stderr note (UX-010) only fires on grounded
+    /// cold-path results, so on a conceptual/abstained query the degradation was
+    /// otherwise invisible in every format. This field exposes it structurally
+    /// in all formats so a caller knows the answer may be missing a docs section.
+    /// Always serialized (no `skip_serializing_if`) so its absence never has to
+    /// be disambiguated from `false`.
+    #[serde(default)]
+    pub docs_available: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -406,6 +417,12 @@ pub fn ask_query_with_filter(
     // cannot convert an abstention into a confident answer (§4.3).
     let (docs, doc_tokens) = docs_section(store, query, DEFAULT_TOKEN_BUDGET);
 
+    // UX-022: a docs section can only appear when docs are enabled AND the
+    // doc-space KNN hook is armed. The cold path arms the code embed hook but
+    // never the doc hook, so this is false there regardless of the config flag —
+    // exactly the "answer is partial" signal callers need in every format.
+    let docs_available = crate::seed::docs_enabled(store) && store.embed_doc_knn_fn().is_some();
+
     // Abstain when confidence is None — prevents "confident salad" on no-match queries (R1).
     if seed_set.confidence == crate::seed::Confidence::None {
         return Ok(AskPayload {
@@ -417,6 +434,7 @@ pub fn ask_query_with_filter(
             confidence,
             docs,
             degraded_note: degraded_note.clone(),
+            docs_available,
         });
     }
 
@@ -442,6 +460,7 @@ pub fn ask_query_with_filter(
             confidence: confidence.clone(),
             docs: docs.clone(),
             degraded_note: degraded_note.clone(),
+            docs_available,
         });
     }
 
@@ -457,6 +476,7 @@ pub fn ask_query_with_filter(
             confidence: confidence.clone(),
             docs: docs.clone(),
             degraded_note: degraded_note.clone(),
+            docs_available,
         });
     }
 
@@ -582,6 +602,7 @@ pub fn ask_query_with_filter(
         confidence,
         docs,
         degraded_note,
+        docs_available,
     })
 }
 
@@ -1441,10 +1462,18 @@ mod tests {
         let (store, ..) = seeded_store();
         let payload = ask_query(&store, "PaymentService", None).unwrap();
         assert!(payload.docs.is_empty());
+        // UX-022: with the lane off (and no doc hook) the doc index is not
+        // available, and the field is always present so a consumer never has to
+        // tell `false` from "absent".
+        assert!(!payload.docs_available);
         let json = serde_json::to_string(&payload).unwrap();
         assert!(
-            !json.contains("\"docs\""),
+            !json.contains("\"docs\":"),
             "docs key must be omitted when the lane produced nothing: {json}"
+        );
+        assert!(
+            json.contains("\"docs_available\":false"),
+            "docs_available must always serialize as the degradation signal: {json}"
         );
     }
 
@@ -1480,6 +1509,8 @@ mod tests {
         );
         // Docs never enter `rows`, so they cannot displace a code result.
         assert!(payload.rows.iter().all(|r| r.kind != "doc-chunk"));
+        // UX-022: docs enabled + doc hook armed → the doc index is available.
+        assert!(payload.docs_available);
     }
 
     /// §4.3, and the reason the lane is computed *above* the abstain return: a

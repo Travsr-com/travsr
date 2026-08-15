@@ -100,6 +100,14 @@ pub struct InitStats {
     pub total_edges: u64,
     /// Per-language Phase B outcome, populated by the full init path.
     pub phase_b_report: Option<PhaseBReport>,
+    /// UX-023: number of nodes swept because their file no longer exists on disk
+    /// (deleted/moved upstream). Surfaced in the CLI summary — the tracing event
+    /// alone is invisible under the default `error` stderr filter (see UX-002).
+    pub ghosts_pruned: u64,
+    /// UX-023: the ghost sweep tripped the mass-delete circuit breaker and pruned
+    /// nothing. Without surfacing this the failure is silent (the warning no
+    /// longer passes the default filter), so the CLI points at `fsck --fix --force`.
+    pub ghost_prune_aborted: bool,
 }
 
 /// Per-language Phase B outcome, surfaced in [`InitStats`] so the CLI can
@@ -1531,6 +1539,8 @@ pub fn init_repo_with_progress(
     // present) and only does work on a re-init over a changed tree. The default
     // SafetyPolicy's mass-delete circuit breaker still guards against a bad walk
     // wiping the whole graph; if it trips, nothing is deleted and we say so.
+    let mut ghosts_pruned: u64 = 0;
+    let mut ghost_prune_aborted = false;
     {
         let walked: std::collections::HashSet<String> = indexable_paths
             .iter()
@@ -1547,16 +1557,22 @@ pub fn init_repo_with_progress(
             repo_root,
             &corpus,
         ) {
-            Ok(report) if report.aborted => tracing::warn!(
-                reason = report.abort_reason.as_deref().unwrap_or(""),
-                "init reconcile: ghost prune tripped the mass-delete circuit breaker — \
-                 deleted nothing; run `travsr fsck --fix --force` to override"
-            ),
-            Ok(report) if !report.ghost_paths.is_empty() => tracing::info!(
-                event = "init.reconcile.pruned",
-                pruned = report.ghost_paths.len(),
-                "init reconcile: pruned nodes for files no longer on disk"
-            ),
+            Ok(report) if report.aborted => {
+                ghost_prune_aborted = true;
+                tracing::warn!(
+                    reason = report.abort_reason.as_deref().unwrap_or(""),
+                    "init reconcile: ghost prune tripped the mass-delete circuit breaker — \
+                     deleted nothing; run `travsr fsck --fix --force` to override"
+                );
+            }
+            Ok(report) if !report.ghost_paths.is_empty() => {
+                ghosts_pruned = report.ghost_paths.len() as u64;
+                tracing::info!(
+                    event = "init.reconcile.pruned",
+                    pruned = report.ghost_paths.len(),
+                    "init reconcile: pruned nodes for files no longer on disk"
+                );
+            }
             Ok(_) => {}
             Err(e) => tracing::warn!(err = %e, "init reconcile: ghost prune failed (non-fatal)"),
         }
@@ -1779,6 +1795,8 @@ pub fn init_repo_with_progress(
         total_nodes: nodes_after as u64,
         total_edges,
         phase_b_report,
+        ghosts_pruned,
+        ghost_prune_aborted,
     })
 }
 

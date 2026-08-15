@@ -318,6 +318,28 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
     let node = pal.green("●");
     let dur = fmt_dur(elapsed);
 
+    // UX-023: the ghost sweep's result is otherwise only a `tracing` event, which
+    // the default `error` stderr filter hides (UX-002 downgraded these to WARN).
+    // Surface it on stdout — in *both* the up-to-date and normal branches — so a
+    // pruned-ghosts run, or a sweep that tripped the mass-delete breaker and
+    // pruned nothing, is visible in the summary the user actually reads.
+    let emit_ghost_note = || {
+        if stats.ghost_prune_aborted {
+            println!(
+                "  {} ghost sweep skipped — an unusual number of indexed files \
+                 vanished at once, so nothing was pruned; run \
+                 `travsr fsck --fix --force` if that was intentional",
+                pal.orange("⚠"),
+            );
+        } else if stats.ghosts_pruned > 0 {
+            println!(
+                "  {} pruned {} node(s) for files no longer on disk",
+                pal.dim("ℹ"),
+                commas(stats.ghosts_pruned),
+            );
+        }
+    };
+
     if stats.nodes_written == 0 && stats.edges_written == 0 {
         // Re-run with nothing to do — already fresh.
         println!(
@@ -325,6 +347,7 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
             commas(stats.total_nodes),
             commas(stats.total_edges),
         );
+        emit_ghost_note();
         return;
     }
 
@@ -361,6 +384,7 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
         commas(stats.edges_written),
         commas(stats.total_edges),
     );
+    emit_ghost_note();
 
     match &stats.phase_b_report {
         None => {

@@ -48,6 +48,9 @@ pub fn run(
             "elapsed_s": elapsed.as_secs(),
             "phase_b": phase_b,
             "db_path": db_path.display().to_string(),
+            // UX-023: expose the ghost sweep in JSON too, not just the human summary.
+            "ghosts_pruned": stats.ghosts_pruned,
+            "ghost_prune_aborted": stats.ghost_prune_aborted,
         });
         println!("{summary}");
         return Ok(());

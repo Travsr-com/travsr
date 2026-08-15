@@ -18,10 +18,22 @@ struct Row {
 /// -readable output for the VS Code extension.
 pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> {
     if let Some(name) = remove {
-        if registry::unregister(name)? {
-            println!("removed repo '{name}'");
-        } else {
-            println!("no repo named '{name}' in the registry");
+        // UX-018: the list shows the basename as Name, so `--remove` accepts the
+        // basename (or a full path) rather than only the raw registry key.
+        match registry::unregister_resolving(name)? {
+            registry::UnregisterResult::Removed => println!("removed repo '{name}'"),
+            registry::UnregisterResult::NotFound => {
+                println!("no repo named '{name}' in the registry")
+            }
+            registry::UnregisterResult::Ambiguous(paths) => {
+                println!(
+                    "'{name}' matches {} repos — re-run with the full path:",
+                    paths.len()
+                );
+                for p in &paths {
+                    println!("  travsr repos --remove \"{p}\"");
+                }
+            }
         }
         return Ok(());
     }
@@ -47,7 +59,8 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
 
     // UX-018: strip the Windows `\\?\` verbatim prefix from any already-registered
     // entry (new registrations are normalized at write time) so the display is
-    // consistent and never leaks the extended-length path form.
+    // consistent and never leaks the extended-length path form. `Name` is the
+    // repo-root basename (`display_name`); `DB Path` is the cleaned full path.
     let clean = |s: &str| registry::strip_verbatim_prefix(s).into_owned();
 
     if json {
@@ -58,7 +71,7 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
                 .into_iter()
                 .map(|(name, db_path)| {
                     serde_json::json!({
-                        "name": clean(&name),
+                        "name": registry::display_name(&name),
                         "db_path": clean(&db_path.display().to_string()),
                         "exists": db_path.exists(),
                     })
@@ -84,7 +97,7 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
                 "no (stale)".to_string()
             },
             db_path: clean(&db_path.display().to_string()),
-            name: clean(&name),
+            name: registry::display_name(&name),
         })
         .collect();
 

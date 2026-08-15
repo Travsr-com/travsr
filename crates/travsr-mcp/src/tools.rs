@@ -3264,7 +3264,13 @@ pub fn repos_list() -> String {
     rows.iter()
         .map(|(name, db_path)| {
             let exists = if db_path.exists() { "1" } else { "0" };
-            format!("{name}\t{}\t{exists}", db_path.display())
+            // UX-018: emit the basename as the display Name and the verbatim-
+            // stripped full path, matching the CLI `repos` table. `repos_remove`
+            // resolves either back to the registry key.
+            let display = travsr_store::registry::display_name(name);
+            let path = travsr_store::registry::strip_verbatim_prefix(&db_path.to_string_lossy())
+                .into_owned();
+            format!("{display}\t{path}\t{exists}")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -3289,11 +3295,14 @@ pub fn repos_prune() -> String {
     }
 }
 
-/// Remove a single repo by registry-key name. Returns `ok` / `not found`.
+/// Remove a single repo by full registry key or display basename (UX-018).
+/// Returns `ok` / `not found` / `ambiguous: <paths>`.
 pub fn repos_remove(name: &str) -> String {
-    match travsr_store::registry::unregister(name) {
-        Ok(true) => "ok".to_string(),
-        Ok(false) => "not found".to_string(),
+    use travsr_store::registry::UnregisterResult;
+    match travsr_store::registry::unregister_resolving(name) {
+        Ok(UnregisterResult::Removed) => "ok".to_string(),
+        Ok(UnregisterResult::NotFound) => "not found".to_string(),
+        Ok(UnregisterResult::Ambiguous(paths)) => format!("ambiguous: {}", paths.join(", ")),
         Err(e) => {
             tracing::warn!("repos_remove error: {e}");
             "error".to_string()
