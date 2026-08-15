@@ -34,6 +34,7 @@ fn init_repo() -> tempfile::TempDir {
     .unwrap();
     Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .arg("init")
         .assert()
@@ -44,6 +45,7 @@ fn init_repo() -> tempfile::TempDir {
 fn synonym(dir: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
     Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(dir)
         .arg("synonym")
         .args(args)
@@ -141,6 +143,7 @@ fn synonym_outside_initialized_repo_errors() {
     git_init(tmp.path()); // git repo, but no `travsr init`
     let output = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .args(["synonym", "list"])
         .output()

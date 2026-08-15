@@ -33,6 +33,17 @@ pub enum ConfigCommand {
         )]
         now: bool,
     },
+    /// Remove a key's override so it falls back to the default (or lower layer).
+    ///
+    /// Clears the key from the global config unless `--repo` is given. The inverse
+    /// of `set`: a value you set to experiment can be returned to its default.
+    Unset {
+        /// Dotted key, e.g. `docs.max_results`.
+        key: String,
+        /// Remove from this repository's `.travsr/config.toml` instead of the global one.
+        #[arg(long)]
+        repo: bool,
+    },
     /// List every known key with its resolved value and source layer.
     List {
         /// Emit JSON instead of a table.
@@ -50,6 +61,7 @@ pub fn run(cmd: ConfigCommand) -> Result<()> {
             repo,
             now,
         } => cmd_set(&key, &value, repo, now),
+        ConfigCommand::Unset { key, repo } => cmd_unset(&key, repo),
         ConfigCommand::List { json } => cmd_list(json),
     }
 }
@@ -116,6 +128,34 @@ fn cmd_set(key: &str, value: &str, repo: bool, now: bool) -> Result<()> {
             &db_path,
             &travsr_plugin_host::EmbedOverrides::default(),
         )?;
+    }
+    Ok(())
+}
+
+fn cmd_unset(key: &str, repo: bool) -> Result<()> {
+    let scope = if repo {
+        let root = current_repo_root_for_write()
+            .context("--repo requires being inside a git repository (no .travsr found)")?;
+        Scope::Repo(root)
+    } else {
+        Scope::Global
+    };
+    let where_ = if repo { "repo config" } else { "global config" };
+    if travsr_config::unset(key, scope)? {
+        // Show where the key now resolves from, so the user sees the fallback.
+        let status = travsr_config::get(key, current_repo_root().as_deref())?;
+        match status.value {
+            Some(v) => println!(
+                "\u{2713} unset {key} ({where_}) — now {v}  ({})",
+                status.source.label()
+            ),
+            None => println!(
+                "\u{2713} unset {key} ({where_}) — now {}  (default, unset)",
+                status.default_display
+            ),
+        }
+    } else {
+        println!("{key} was not set in the {where_} — nothing to unset");
     }
     Ok(())
 }

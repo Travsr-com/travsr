@@ -39,7 +39,11 @@ pub fn run(fix: bool, json: bool, force: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = resolve_fsck_root(&cwd, fix)?;
 
-    let report = travsr_daemon::fsck_repo(&repo_root, fix, force)?;
+    let mut report = travsr_daemon::fsck_repo(&repo_root, fix, force)?;
+    // Secondary (UX-023): the ghost set came out of a HashSet, so its order
+    // varied between a report run and a `--fix` run. Sort it so successive runs
+    // list identical paths in identical order — in both the text and JSON output.
+    report.ghost_paths.sort();
 
     if json {
         let out = serde_json::to_string_pretty(&report).context("serializing GcReport to JSON")?;

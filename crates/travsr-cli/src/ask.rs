@@ -157,6 +157,7 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     // changes the answer, not just its completeness.
     daemon_client::warn_if_call_graph_degraded(&db_path);
 
+    let mut served_cold_path = false;
     let payload: AskPayload = match daemon_client::try_query(
         &repo_root,
         "ask",
@@ -164,7 +165,7 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     ) {
         Some(p) => p,
         None => {
-            note_cold_path_cannot_render_docs(&repo_root);
+            served_cold_path = true;
             let mut store = daemon_client::open_read_store(&db_path)?;
             // Best-effort: load HNSW embed hook for cold-path KNN. Falls back to
             // FTS-only if the sidecar binary is absent or the index is not built.
@@ -176,6 +177,14 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             query::ask_query(&store, query_str, knn_ref)?
         }
     };
+
+    // UX-010: only nudge about the missing doc index when the cold path actually
+    // produced a grounded answer — a real result a docs section could have
+    // augmented. On an abstention or an empty result (including nonsense queries)
+    // a docs section would not have helped, so the note was pure recurring noise.
+    if served_cold_path && payload.matched && !payload.no_results {
+        note_cold_path_cannot_render_docs(&repo_root);
+    }
 
     if matches!(format, OutputFormat::Json) {
         println!("{}", serde_json::to_string(&payload)?);

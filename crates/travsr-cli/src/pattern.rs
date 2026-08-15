@@ -33,7 +33,11 @@ pub fn run(
     }
 
     let store = daemon_client::open_read_store(&db_path)?;
-    let output = travsr_mcp::find_pattern(&store, pattern, scope.as_deref(), fixed);
+    // UX-009: use the raw (un-enveloped, un-escaped) pattern body. The plain
+    // `find_pattern` returns the model-facing `<travsr-data>` envelope with
+    // source text HTML-entity escaped (`->` → `-&gt;`); that is wrong for a
+    // human terminal. `references` / `graph` already print raw — match them.
+    let output = travsr_mcp::find_pattern_raw(&store, pattern, scope.as_deref(), fixed);
 
     match format {
         OutputFormat::Json => {
@@ -48,11 +52,7 @@ pub fn run(
             );
         }
         OutputFormat::Text => {
-            // #517 D4: `output` is always the `<travsr-data>…</travsr-data>`
-            // envelope, so `output.trim().is_empty()` was unreachable — a
-            // zero-match run produced the 26-byte empty-envelope string, never
-            // an empty one. Check the inner body instead.
-            if envelope_body(&output).trim().is_empty() {
+            if output.trim().is_empty() {
                 println!("no matches for '{pattern}'");
             } else {
                 println!("{output}");
@@ -60,14 +60,4 @@ pub fn run(
         }
     }
     Ok(())
-}
-
-/// Extract the content between `<travsr-data>` and `</travsr-data>`, handling
-/// both the empty form (`<travsr-data></travsr-data>`) and the populated form
-/// (`<travsr-data>\n…\n</travsr-data>`) that `wrap_envelope` produces.
-fn envelope_body(output: &str) -> &str {
-    output
-        .strip_prefix("<travsr-data>")
-        .and_then(|s| s.strip_suffix("</travsr-data>"))
-        .unwrap_or(output)
 }

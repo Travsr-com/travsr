@@ -46,6 +46,7 @@ fn init_repo() -> tempfile::TempDir {
         .expect("git commit");
     Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .arg("init")
         .assert()
@@ -56,6 +57,7 @@ fn init_repo() -> tempfile::TempDir {
 fn pattern_stdout(dir: &Path, args: &[&str]) -> String {
     let out = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(dir)
         .arg("pattern")
         .args(args)

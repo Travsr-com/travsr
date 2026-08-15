@@ -8,6 +8,7 @@ pub fn run(
     json: bool,
     jobs: Option<usize>,
     semantic: bool,
+    force: bool,
     allow_unsandboxed_lsif: bool,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
@@ -22,9 +23,10 @@ pub fn run(
     // Live progress so a long indexing run is not mistaken for a hang (#293).
     // Renders to stderr; the summary below stays on stdout.
     let mut progress = crate::progress::ProgressReporter::new(quiet, json);
-    let stats = travsr_daemon::init_repo_with_progress(&repo_root, jobs, semantic, &mut |ev| {
-        progress.update(ev)
-    })?;
+    let stats =
+        travsr_daemon::init_repo_with_progress(&repo_root, jobs, semantic, force, &mut |ev| {
+            progress.update(ev)
+        })?;
     let elapsed = progress.elapsed();
     progress.finish();
 
@@ -46,6 +48,9 @@ pub fn run(
             "elapsed_s": elapsed.as_secs(),
             "phase_b": phase_b,
             "db_path": db_path.display().to_string(),
+            // UX-023: expose the ghost sweep in JSON too, not just the human summary.
+            "ghosts_pruned": stats.ghosts_pruned,
+            "ghost_prune_aborted": stats.ghost_prune_aborted,
         });
         println!("{summary}");
         return Ok(());
@@ -77,8 +82,12 @@ pub fn run(
 
     crate::progress::print_summary(&stats, elapsed, quiet, daemon_running);
 
-    // Tips are advisory chatter — suppress under --quiet.
-    if !quiet {
+    // UX-007: a no-op re-run (nothing changed) should not reprint the setup
+    // nudges — they are advice for a fresh index, not chatter for every `init`.
+    let no_op = stats.nodes_written == 0 && stats.edges_written == 0;
+
+    // Tips are advisory chatter — suppress under --quiet and on no-op re-runs.
+    if !quiet && !no_op {
         // DEBT-013 closed: hint users whose repo has no commits yet so
         // `travsr status` showing last_commit: (none) is not confusing.
         let check = travsr_store::SqliteStore::open(&db_path)?;
@@ -114,18 +123,10 @@ fn hint_embed_missing() {
 fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
     use std::io::IsTerminal as _;
 
-    let detected = crate::lang::detect_languages_in(repo_root);
-    if detected.is_empty() {
-        return Ok(());
-    }
-
-    let config = crate::lang::load_lang_config();
-    let unregistered: Vec<_> = detected
-        .iter()
-        .filter(|l| config.as_ref().map(|c| !c.is_registered(l)).unwrap_or(true))
-        .cloned()
-        .collect();
-
+    // UX-001/UX-013: only nudge for languages that genuinely still need setup —
+    // built-in languages (rust/typescript/python/dart) are excluded, so we never
+    // tell a user their already-working semantic support is "not set up".
+    let unregistered = crate::lang::languages_needing_setup(repo_root);
     if unregistered.is_empty() {
         return Ok(());
     }

@@ -14,6 +14,60 @@ pub fn registry_path() -> PathBuf {
     home_dir().join(".travsr").join("registry.json")
 }
 
+/// Strip the Windows extended-length / verbatim path prefix (`\\?\`) that
+/// `std::fs::canonicalize` prepends on Windows, so registry keys and displayed
+/// paths read as normal paths (UX-018). Verbatim UNC (`\\?\UNC\server\share`)
+/// is rewritten back to its `\\server\share` form. No-op on any path without the
+/// prefix, so it is safe to call unconditionally on every platform (a POSIX path
+/// never carries it).
+pub fn strip_verbatim_prefix(p: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = p.strip_prefix(r"\\?\") {
+        Cow::Borrowed(rest)
+    } else {
+        Cow::Borrowed(p)
+    }
+}
+
+/// Human-facing display name for a registry entry (UX-018): the repo-root
+/// basename, with the Windows `\\?\` verbatim prefix stripped. Registry *keys*
+/// stay the full canonical repo-root path — unique across `~/proj` vs
+/// `/home/user/proj`, which is what dedup relies on — so this is a display-only
+/// derivation. #705 screenshotted the current repo listed by its full prefixed
+/// path sitting next to a basename-named entry; deriving every Name from the
+/// basename makes the column read consistently regardless of how old the entry
+/// is. Falls back to the cleaned full path when the key has no final component
+/// (e.g. a bare drive root), so it never returns an empty string.
+///
+/// Splits on both `/` and `\` explicitly rather than via `Path::file_name`,
+/// because a registry key is a Windows path even when this runs on Unix (the
+/// registry file is portable and the tests exercise Windows paths on every OS),
+/// and `Path::file_name` only treats `/` as a separator off Windows.
+pub fn display_name(key: &str) -> String {
+    let cleaned = strip_verbatim_prefix(key).into_owned();
+    cleaned
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or(cleaned)
+}
+
+/// Outcome of [`unregister_resolving`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnregisterResult {
+    /// The entry was found and removed.
+    Removed,
+    /// No entry matched by key, cleaned key, or basename.
+    NotFound,
+    /// A basename matched more than one entry; the caller must disambiguate
+    /// with a full path. Carries the colliding entries' cleaned full paths.
+    Ambiguous(Vec<String>),
+}
+
 /// SEC (#507, Windows): mirror the Unix owner-only restriction via `icacls`,
 /// following the daemon's graph.db pattern. `/inheritance:r` strips all
 /// inherited ACEs; `/grant:r` re-grants to the current user only —
@@ -111,8 +165,21 @@ pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
         .context("opening registry.lock")?;
     fs2::FileExt::lock_exclusive(&lock_file).context("acquiring registry.lock")?;
 
+    // UX-018: normalize away the Windows `\\?\` verbatim prefix so the registry
+    // key and stored db path are clean, consistent paths (never a mix of a
+    // prefixed and a bare entry for the same repo).
+    let repo_name = strip_verbatim_prefix(repo_name).into_owned();
+    let db_path = PathBuf::from(strip_verbatim_prefix(&db_path.to_string_lossy()).into_owned());
+
     let mut repos = read_registry(&reg_path).unwrap_or_default();
-    repos.insert(repo_name.to_string(), db_path.to_path_buf());
+    // UX-018: drop any pre-existing entry that only differs from the normalized
+    // key by the Windows `\\?\` verbatim prefix, then re-insert the clean one.
+    // Without this migration a repo first registered by an older build under its
+    // prefixed key would keep *both* the old prefixed key and the new clean key
+    // and show up twice in `repos`. Removing by normalized form and re-inserting
+    // collapses the pair to a single clean entry on the next `init`.
+    repos.retain(|k, _| strip_verbatim_prefix(k).as_ref() != repo_name.as_str());
+    repos.insert(repo_name, db_path);
     write_registry_atomic(&reg_path, &repos)?;
 
     // Explicit unlock is not needed — lock_file drops at end of scope.
@@ -141,6 +208,64 @@ pub fn unregister(repo_name: &str) -> anyhow::Result<bool> {
     }
     write_registry_atomic(&reg_path, &repos)?;
     Ok(true)
+}
+
+/// Remove a repo entry by full registry key **or** its display basename (UX-018).
+///
+/// Because `repos` now shows the basename as the Name (not the full path), a user
+/// or the VS Code webview removes by whatever the list showed them. Resolution is
+/// tried most-specific first, so an exact path can always target one entry: the
+/// exact registry key, then the verbatim-stripped key (the cleaned path the list
+/// displays), then the display basename — the last only when it matches exactly
+/// one entry. A basename that collides across several repos returns
+/// [`UnregisterResult::Ambiguous`] with their full paths so the caller can re-run
+/// with a path. Non-fatal.
+pub fn unregister_resolving(name: &str) -> anyhow::Result<UnregisterResult> {
+    let reg_path = registry_path();
+    let mut repos = match read_registry(&reg_path) {
+        Some(r) => r,
+        None => return Ok(UnregisterResult::NotFound),
+    };
+
+    // 1. Exact key.
+    if repos.remove(name).is_some() {
+        write_registry_atomic(&reg_path, &repos)?;
+        return Ok(UnregisterResult::Removed);
+    }
+
+    // 2. Cleaned (verbatim-stripped) key — what the list actually printed.
+    let target = strip_verbatim_prefix(name).into_owned();
+    let clean_matches: Vec<String> = repos
+        .keys()
+        .filter(|k| strip_verbatim_prefix(k).as_ref() == target.as_str())
+        .cloned()
+        .collect();
+    if clean_matches.len() == 1 {
+        repos.remove(&clean_matches[0]);
+        write_registry_atomic(&reg_path, &repos)?;
+        return Ok(UnregisterResult::Removed);
+    }
+
+    // 3. Display basename — unambiguous only.
+    let base_matches: Vec<String> = repos
+        .keys()
+        .filter(|k| display_name(k) == name)
+        .cloned()
+        .collect();
+    match base_matches.len() {
+        0 => Ok(UnregisterResult::NotFound),
+        1 => {
+            repos.remove(&base_matches[0]);
+            write_registry_atomic(&reg_path, &repos)?;
+            Ok(UnregisterResult::Removed)
+        }
+        _ => Ok(UnregisterResult::Ambiguous(
+            base_matches
+                .iter()
+                .map(|k| strip_verbatim_prefix(k).into_owned())
+                .collect(),
+        )),
+    }
 }
 
 /// Prune stale entries — those whose `graph.db` no longer exists on disk.
@@ -272,6 +397,26 @@ mod tests {
     }
 
     #[test]
+    fn strip_verbatim_prefix_handles_all_forms() {
+        // Plain drive-letter verbatim path → prefix removed.
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\D:\com.travsr\travsr"),
+            r"D:\com.travsr\travsr"
+        );
+        // Verbatim UNC → rewritten to the normal `\\server\share` form.
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\proj"),
+            r"\\server\share\proj"
+        );
+        // No prefix (including POSIX paths) → returned untouched.
+        assert_eq!(
+            strip_verbatim_prefix(r"D:\already\clean"),
+            r"D:\already\clean"
+        );
+        assert_eq!(strip_verbatim_prefix("/home/user/proj"), "/home/user/proj");
+    }
+
+    #[test]
     fn register_creates_registry_on_first_call() {
         with_temp_home(|home| {
             let db = home.join("proj/.travsr/graph.db");
@@ -356,6 +501,78 @@ mod tests {
             register("live", &live_db).unwrap();
             assert!(prune().unwrap().is_empty(), "all live → nothing removed");
             assert_eq!(all_repos().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn display_name_is_the_basename_prefix_stripped() {
+        // UX-018: the Name column derives from the repo-root basename with the
+        // Windows verbatim prefix removed — the exact case #705 screenshotted.
+        assert_eq!(display_name(r"\\?\D:\com.travsr\travsr"), "travsr");
+        assert_eq!(display_name(r"C:\Users\me\demoProj"), "demoProj");
+        assert_eq!(display_name("/home/user/proj"), "proj");
+        // No final component (a bare root) → cleaned full path, never empty.
+        assert!(!display_name(r"\\?\D:\").is_empty());
+    }
+
+    #[test]
+    fn register_migrates_a_pre_existing_verbatim_prefixed_key() {
+        // UX-018: an entry stored by an older build under its `\\?\` key must
+        // collapse to the single clean key on the next registration, not sit
+        // beside a duplicate.
+        with_temp_home(|home| {
+            let db = home.join("proj/.travsr/graph.db");
+            // Simulate the legacy prefixed key already on disk.
+            register(r"\\?\D:\proj", &db).unwrap();
+            // A fresh registration under the normalized key.
+            register(r"D:\proj", &db).unwrap();
+            let repos = all_repos().unwrap();
+            assert_eq!(repos.len(), 1, "prefixed + clean must collapse to one");
+            assert!(repos.contains_key(r"D:\proj"));
+            assert!(!repos.contains_key(r"\\?\D:\proj"));
+        });
+    }
+
+    #[test]
+    fn unregister_resolving_matches_exact_key_and_basename() {
+        with_temp_home(|home| {
+            register(r"D:\com.travsr\travsr", &home.join("t/graph.db")).unwrap();
+            // Removal by basename (what the list now shows) resolves to the key.
+            assert_eq!(
+                unregister_resolving("travsr").unwrap(),
+                UnregisterResult::Removed
+            );
+            assert!(all_repos().unwrap().is_empty());
+
+            // Removal by full key still works.
+            register(r"D:\com.travsr\travsr", &home.join("t/graph.db")).unwrap();
+            assert_eq!(
+                unregister_resolving(r"D:\com.travsr\travsr").unwrap(),
+                UnregisterResult::Removed
+            );
+
+            // Unknown name → NotFound (no registry mutation).
+            assert_eq!(
+                unregister_resolving("nope").unwrap(),
+                UnregisterResult::NotFound
+            );
+        });
+    }
+
+    #[test]
+    fn unregister_resolving_reports_ambiguous_basename() {
+        with_temp_home(|home| {
+            // Two different repos share the basename `travsr`.
+            register(r"D:\a\travsr", &home.join("a/graph.db")).unwrap();
+            register(r"D:\b\travsr", &home.join("b/graph.db")).unwrap();
+            match unregister_resolving("travsr").unwrap() {
+                UnregisterResult::Ambiguous(paths) => {
+                    assert_eq!(paths.len(), 2, "both colliding paths reported");
+                }
+                other => panic!("expected Ambiguous, got {other:?}"),
+            }
+            // Nothing removed on an ambiguous match.
+            assert_eq!(all_repos().unwrap().len(), 2);
         });
     }
 }

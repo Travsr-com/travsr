@@ -27,12 +27,13 @@ pub use dispatcher::Dispatcher;
 pub use embed_catalog::{
     active_backend_id, backends as embed_backends, cancel_sentinel_path,
     derive_num_workers_for_cli, derive_phase1_threshold_for_status, embed_paused,
-    embed_reindex_in_flight, embeddings_by_model, gc_embeddings, lookup as lookup_embed_backend,
-    pause_embed, probe_top1_cosines, repo_backend_id, resolve_governance_for_db, resume_embed,
-    run_parallel_reindex_blocking, run_parallel_reindex_blocking_quiet,
-    spawn_background_reindex_all, spawn_background_reindex_phase1, spawn_background_reindex_phase2,
-    terminate_inflight_reindex, write_model_descriptor, write_repo_backend_id, EmbedBackend,
-    EmbedModelFile, EmbedOpLock, ModelUsage, MAX_EMBED_WORKERS,
+    embed_reindex_in_flight, embeddings_by_model, ensure_reindex_backend_ready, gc_embeddings,
+    lookup as lookup_embed_backend, pause_embed, probe_top1_cosines, repo_backend_id,
+    resolve_governance_for_db, resume_embed, run_parallel_reindex_blocking,
+    run_parallel_reindex_blocking_quiet, spawn_background_reindex_all,
+    spawn_background_reindex_phase1, spawn_background_reindex_phase2, terminate_inflight_reindex,
+    write_model_descriptor, write_repo_backend_id, EmbedBackend, EmbedModelFile, EmbedOpLock,
+    ModelUsage, MAX_EMBED_WORKERS,
 };
 pub use embed_sidecar::{EmbedCapabilities, EmbedError, EmbedSidecar};
 pub use embed_supervisor::{EmbedQueryHook, EmbedSupervisor};
