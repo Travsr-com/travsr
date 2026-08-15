@@ -190,6 +190,16 @@ jobs:
         run: |
           [ "$(tail -n 1 install.sh)" = 'main "$@"' ] || { echo "install.sh must end with main \"\$@\" so a truncated download cannot half-execute (#691)"; exit 1; }
 
+      # The last line alone is necessary but not sufficient: what actually makes
+      # a truncated pipe safe is that nothing above main "$@" runs at top level.
+      # Strip function bodies, then assert no command substitution survives.
+      - name: No top-level command substitution (#691)
+        run: |
+          if awk 'BEGIN{d=0} /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/{d=1;next} /^\}/{d=0;next} d==0' install.sh \
+               | grep -nE '\$\(|`'; then
+            echo "install.sh must not run command substitution at top level (#691)"; exit 1
+          fi
+
       - name: POSIX syntax check
         run: sh -n install.sh && dash -n install.sh
 

@@ -215,6 +215,22 @@ function extractShellTargets(text) {
     values.push(m[2]);
   }
 
+  // valueRe only sees quoted values, and sh does not require the quotes. An
+  // unquoted `target=x86_64-pc-windows-msvc` would contribute nothing to the
+  // extracted set and so trip none of the comparisons below (a partially
+  // blind parser rather than a totally broken one). Reject it outright.
+  const unquoted = lines
+    .slice(startIdx, endIdx + 1)
+    .filter((l) => /\btarget=[^'"\s]/.test(l));
+  if (unquoted.length > 0) {
+    console.error(
+      `ERROR: unquoted target= assignment(s) in the ${rel(INSTALL_SH)} TARGET_MAP block:\n` +
+        unquoted.map((l) => `       ${l.trim()}`).join("\n") +
+        `\n       Quote every value ('x86_64-unknown-linux-gnu') so this check can see it.`
+    );
+    process.exit(1);
+  }
+
   if (values.length === 0) {
     console.error(
       `ERROR: located the TARGET_MAP block in ${rel(INSTALL_SH)} but extracted zero values (parser needs updating)`
@@ -227,7 +243,8 @@ function extractShellTargets(text) {
 const releaseArtifacts = extractReleaseArtifacts(readFileOrFail(RELEASE_YML));
 const vscodeTargets = extractVscodeTargets(readFileOrFail(INSTALLER_TS));
 const npmTargets = extractNpmTargets(readFileOrFail(INSTALL_JS));
-const installShTargets = extractShellTargets(readFileOrFail(INSTALL_SH));
+const installShText = readFileOrFail(INSTALL_SH);
+const installShTargets = extractShellTargets(installShText);
 
 const R = new Set(releaseArtifacts);
 const V = new Set(vscodeTargets);
@@ -246,7 +263,13 @@ const vscodeExtra = setDiff(V, R);
 const npmExtra = setDiff(N, R);
 const vscodeMissing = setDiff(R, V);
 const npmMissing = setDiff(R, N);
-const shellWindows = [...S].filter((t) => /windows/.test(t));
+// Scanned over the whole file, not just the extracted set: a Windows triple
+// added unquoted, or in a case arm outside the TARGET_MAP markers, never
+// reaches S and would slip past the set comparisons below entirely.
+const shellWindows = installShText
+  .split("\n")
+  .map((line, i) => ({ line, no: i + 1 }))
+  .filter(({ line }) => !line.trim().startsWith("#") && /windows/i.test(line));
 const shellExtra = setDiff(S, P);
 const shellMissing = setDiff(P, S);
 
@@ -280,10 +303,10 @@ for (const v of npmMissing) {
       `       but ${rel(INSTALL_JS)} TARGETS cannot consume it.`
   );
 }
-for (const v of shellWindows) {
+for (const { line, no } of shellWindows) {
   failed = true;
   console.error(
-    `ERROR: ${rel(INSTALL_SH)} TARGET_MAP claims '${v}',\n` +
+    `ERROR: ${rel(INSTALL_SH)} line ${no} mentions windows: ${line.trim()}\n` +
       `       but install.sh is POSIX-only and must never claim a Windows triple.`
   );
 }

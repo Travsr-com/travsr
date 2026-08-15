@@ -117,5 +117,5 @@ back to SHA256-only. `install.sh` itself is served over TLS and its integrity
 relies on GitHub release integrity, but it is not part of `SHA256SUMS` and is
 not cosign-signed, so anyone who wants to inspect it before running should
 `curl -fsSL <url> | less` first. `--system` is the only flag that escalates
-privileges, and it does so via `sudo` only after printing the exact command
-it is about to run.
+privileges, and it does so via `sudo` only after printing each privileged
+command verbatim, exactly as it is about to run them.

@@ -82,20 +82,31 @@ detect_target() {
 
 # Resolves $tag: the explicit --version if one was given, otherwise the
 # "latest" release tag via the redirect target of the GitHub releases/latest
-# URL. Validates it looks like a real tag either way. Sets $tag.
+# URL. Validates it looks like a real tag either way, and rejects any
+# character that could escape a path component once $tag is interpolated into
+# a URL or an output filename. Sets $tag.
 resolve_tag() {
   if [ -n "$version" ]; then
     tag="$version"
     case "$tag" in
+      *[!A-Za-z0-9._-]*) err "invalid --version '${tag}': release tags contain only letters, digits, '.', '_' and '-'" ;;
       v[0-9]*) ;;
       *) err "invalid --version '${tag}': expected a release tag like v0.11.0" ;;
     esac
     return
   fi
 
-  url=$(curl -fsSLI --proto '=https' --proto-redir '=https' -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")
+  releases_url="https://github.com/${REPO}/releases"
+  url=$(curl -fsSLI --proto '=https' --proto-redir '=https' -o /dev/null -w '%{url_effective}' "${releases_url}/latest")
+  # --proto-redir pins the redirect scheme but not its host, and $tag is parsed
+  # out of wherever the chain terminates; assert the host and path explicitly.
+  case "$url" in
+    "${releases_url}/tag/"*) ;;
+    *) err "the latest-release redirect ended at an unexpected URL (${url}); refusing to parse a tag from it" ;;
+  esac
   tag=${url##*/}
   case "$tag" in
+    *[!A-Za-z0-9._-]*) err "resolved an unusable release tag ('${tag}') from ${url}" ;;
     v[0-9]*) ;;
     *) err "could not resolve the latest release tag (got '${tag}' from ${url}); the repository may have no releases yet" ;;
   esac
@@ -143,10 +154,15 @@ download_and_verify() {
   if command -v cosign >/dev/null 2>&1; then
     info "cosign found, verifying signature"
     bundle_name="${tarball_name}.bundle"
-    curl -fsSL --proto '=https' --proto-redir '=https' -o "$tmp/${bundle_name}" "${base_url}/${bundle_name}"
+    curl -fsSL --proto '=https' --proto-redir '=https' -o "$tmp/${bundle_name}" "${base_url}/${bundle_name}" ||
+      err "cosign is installed but ${bundle_name} could not be downloaded; refusing to install unverified"
+    # The identity is pinned all the way through the ref, and the ref pattern
+    # mirrors release.yml's `on.push.tags` exactly. Only the tag-triggered build
+    # job ever signs (promote reuses those bundles), so a signature from a
+    # branch, PR, or workflow_dispatch run of this same workflow must not pass.
     if ! cosign verify-blob --bundle "$tmp/${bundle_name}" \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-      --certificate-identity-regexp 'https://github.com/Travsr-com/travsr/.github/workflows/release.yml' \
+      --certificate-identity-regexp '^https://github\.com/Travsr-com/travsr/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$' \
       "$tmp/${tarball_name}"; then
       err "cosign signature verification failed for ${tarball_name}; aborting install"
     fi
@@ -159,19 +175,28 @@ download_and_verify() {
 # Copies the extracted, already-verified binary from $tmp into $dir via a
 # staging name plus atomic rename, so an in-place upgrade never leaves a
 # truncated binary on PATH. Escalates with sudo only for --system on a
-# non-root user, and only after printing the exact command being run.
+# non-root user, and only after printing the exact commands being run.
+# The mode is set on the staging file rather than on the $tmp copy: cp without
+# -p applies the caller's umask to the destination, so a chmod in $tmp does not
+# carry through and a hardened umask would otherwise install 0700 system-wide.
 install_binary() {
   staging="${dir}/.travsr.install.$$"
 
   if [ "$use_system" = yes ] && [ "$(id -u)" != 0 ]; then
     command -v sudo >/dev/null 2>&1 || err "--system requires root or sudo, and sudo was not found on PATH"
-    info "--system requested, elevating with sudo to write ${dir}/travsr"
+    info "--system requested, elevating with sudo to run:"
+    info "  sudo mkdir -p ${dir}"
+    info "  sudo cp ${tmp}/travsr ${staging}"
+    info "  sudo chmod 755 ${staging}"
+    info "  sudo mv -f ${staging} ${dir}/travsr"
     sudo mkdir -p "$dir"
     sudo cp "$tmp/travsr" "$staging"
+    sudo chmod 755 "$staging"
     sudo mv -f "$staging" "${dir}/travsr"
   else
     mkdir -p "$dir"
     cp "$tmp/travsr" "$staging"
+    chmod 755 "$staging"
     mv -f "$staging" "${dir}/travsr"
   fi
 }
@@ -213,19 +238,27 @@ main() {
     [ "$dir" != "/.local/bin" ] || err "HOME is not set and TRAVSR_INSTALL_DIR was not provided; cannot determine an install directory"
   fi
 
-  command -v curl >/dev/null 2>&1 || err "curl is required to install travsr but was not found on PATH"
+  # Preflight every external tool the install path needs, so a minimal image
+  # fails here with a travsr: error rather than mid-run with a bare
+  # "tar: not found" after the download and both verifications have happened.
+  for tool in curl tar mktemp; do
+    command -v "$tool" >/dev/null 2>&1 || err "${tool} is required to install travsr but was not found on PATH"
+  done
 
   resolve_tag
   tarball_name="travsr-${tag}-${target}.tar.gz"
   base_url="https://github.com/${REPO}/releases/download/${tag}"
 
   tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' EXIT INT TERM HUP
+  # A trap handler that does not exit resumes the script after the interrupted
+  # command, so INT/TERM/HUP set an explicit status instead of falling through.
+  trap 'rm -rf "$tmp"' EXIT
+  trap 'rm -rf "$tmp"; exit 130' INT
+  trap 'rm -rf "$tmp"; exit 143' TERM HUP
 
   download_and_verify
 
   tar -xzf "$tmp/${tarball_name}" -C "$tmp" travsr
-  chmod 755 "$tmp/travsr"
 
   install_binary
 
