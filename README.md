@@ -283,17 +283,22 @@ by default, which works everywhere with nothing to set up. Set
 | `off` *(default)* | CPU build |
 | `auto` | picks an accelerated build only where it needs no host setup — currently DirectML on Windows x86_64 |
 | `directml` | Windows x86_64. Any DX12 GPU: Intel, AMD or NVIDIA |
-| `cuda` | Linux x86_64 + NVIDIA. Requires a host CUDA runtime and cuDNN |
+| `cuda` | Linux x86_64 + NVIDIA. Requires a host CUDA runtime, cuDNN and glibc 2.38+ |
 
 ```bash
 TRAVSR_EMBED_ACCEL=auto travsr embed init
 ```
 
+This works whether or not a sidecar is already installed: if the installed one
+has no accelerator, it is reinstalled rather than reported as ready. No
+`--reinstall` needed, and re-running the same command afterwards is a no-op.
+
 `auto` never selects CUDA, because that build needs a host CUDA runtime the
 installer cannot verify. Accelerated builds also install the ONNX Runtime
 libraries they load; if the GPU turns out to be unusable at run time the sidecar
 logs why and falls back to its CPU engine, so a wrong guess costs speed, not
-function. macOS needs none of this — its default build already uses CoreML.
+function. macOS needs none of this — its default build already uses CoreML, and
+Linux aarch64 has no accelerated build at all.
 
 ### travsr graph
 

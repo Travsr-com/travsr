@@ -585,7 +585,25 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
     let bin_dir = embed_bin_dir()?;
     let dest = bin_dir.join(backend.binary_filename());
 
-    if dest.exists() && !reinstall {
+    // Resolved before the presence check, not inside the download, because
+    // presence alone does not mean the RIGHT sidecar is installed. Anyone who has
+    // run `embed init` once and now sets TRAVSR_EMBED_ACCEL takes the branch
+    // below, and without this they would keep the CPU build, see "ready", and get
+    // nothing saying the variable did nothing — the same silent-CPU failure this
+    // module refuses on a 404, on an unknown value, and on a missing runtime
+    // library, arriving through the one door that was not guarded.
+    //
+    // Resolving here also means an invalid TRAVSR_EMBED_ACCEL is now rejected on
+    // this path too, instead of being ignored because the binary happened to exist.
+    let target = crate::install::current_target().context("determining install target")?;
+    let variant = resolve_accel_variant(&target)?;
+
+    // Only `Some(false)` re-downloads: the sidecar answered and said it has no
+    // accelerator. `None` means it could not tell us (pre-handshake build), and
+    // treating that as "not accelerated" would re-download on every init.
+    let wants_upgrade = variant.is_some() && installed_sidecar_is_accelerated(&dest) == Some(false);
+
+    if dest.exists() && !reinstall && !wants_upgrade {
         println!("  {} {} ready", pal.green("\u{25cf}"), backend.binary_name);
         // RFC-025 Point B: the binary is present but presence is monotonic and
         // never re-checks the release it was pinned to on install day. Surface a
@@ -594,7 +612,14 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
         // reindex. Never fails init.
         crate::install::advise_installed_sidecar(backend, &dest, "travsr embed init --reinstall");
     } else {
-        let target = crate::install::current_target().context("determining install target")?;
+        if wants_upgrade {
+            println!(
+                "  {} {} is installed without an accelerator; TRAVSR_EMBED_ACCEL={} requests one — reinstalling",
+                pal.green("\u{25cf}"),
+                backend.binary_name,
+                variant.map(|v| v.name).unwrap_or_default()
+            );
+        }
         let repo = backend.github_repo.to_string();
         // RFC-025 G3: resolve the download tag through the same shared resolver
         // the Phase B family uses (embed is never hash-pinned, and `embed init`
@@ -910,6 +935,12 @@ struct SidecarCapabilities {
     /// which case `families` is not exhaustive.
     #[serde(default)]
     universal_onnx: bool,
+    /// Whether a hardware execution provider was COMPILED IN — not whether this
+    /// host's GPU will be confirmed at run time, which needs a real model load.
+    /// Enough to tell a CPU build from a GPU one, which is all the install path
+    /// needs.
+    #[serde(default)]
+    accelerated_compiled: bool,
 }
 
 /// Refuse a model the installed sidecar provably cannot execute.
@@ -930,36 +961,73 @@ struct SidecarCapabilities {
 /// Only a sidecar that answers clearly, with a finite family list that excludes
 /// this model, is treated as a refusal. A false refusal blocks a working install;
 /// a false pass costs the error we already had.
+/// Ask an installed sidecar what it can do.
+///
+/// `None` for every "it did not tell us" case — a pre-handshake build rejecting
+/// the unknown flag (the same probe contract `--version` uses), a spawn failure,
+/// or output that will not parse. Callers must treat `None` as "assume it is
+/// fine": refusing on silence would block working installs on older sidecars.
+fn read_sidecar_capabilities(sidecar: &Path) -> Option<SidecarCapabilities> {
+    let out = std::process::Command::new(sidecar)
+        .arg("--capabilities")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// Whether an already-installed sidecar was built with an accelerator.
+///
+/// Only `Some(false)` justifies acting: it means the sidecar answered clearly
+/// that it has no GPU engine compiled in. `None` (old build, unparseable) must
+/// not trigger a re-download, or every pre-handshake install would re-download on
+/// each `embed init` that sets TRAVSR_EMBED_ACCEL.
+fn installed_sidecar_is_accelerated(sidecar: &Path) -> Option<bool> {
+    read_sidecar_capabilities(sidecar).map(|c| c.accelerated_compiled)
+}
+
 fn ensure_sidecar_can_run(sidecar: &Path, backend: &EmbedBackend) -> Result<()> {
     let family = backend.arch.trim();
     if family.is_empty() {
         return Ok(());
     }
 
-    let out = match std::process::Command::new(sidecar)
-        .arg("--capabilities")
-        .output()
-    {
-        Ok(o) if o.status.success() => o.stdout,
-        // Non-zero: a pre-handshake sidecar rejecting an unknown flag. Not an
-        // error — that is exactly how the probe detects an older build.
-        _ => return Ok(()),
-    };
-
-    let caps: SidecarCapabilities = match serde_json::from_slice(&out) {
-        Ok(c) => c,
-        Err(_) => return Ok(()),
+    let caps = match read_sidecar_capabilities(sidecar) {
+        Some(c) => c,
+        None => return Ok(()),
     };
 
     if caps.universal_onnx || caps.families.iter().any(|f| f == family) {
         return Ok(());
     }
 
+    // The remedy has to be one this platform can actually perform. An ORT-enabled
+    // sidecar reaches Linux aarch64 through no published asset at all, so telling
+    // a user there to install one is advice with nothing behind it.
+    let remedy = match crate::install::current_target().unwrap_or_default() {
+        "aarch64-unknown-linux-gnu" => {
+            "This platform has no ONNX Runtime sidecar build, so choose a \
+             model whose architecture is listed above."
+                .to_string()
+        }
+        t => format!(
+            "Choose a model whose architecture is listed above, or install a sidecar \
+             with the ONNX Runtime engine: re-run with TRAVSR_EMBED_ACCEL={} (see the \
+             travsr-embed README).",
+            if t.contains("windows") {
+                "directml"
+            } else if t.contains("darwin") {
+                "auto"
+            } else {
+                "cuda"
+            }
+        ),
+    };
+
     bail!(
         "the installed sidecar cannot run '{}' models, which {} needs.\n\
          It supports: {}.\n\
-         Choose a model whose architecture is listed, or install a sidecar build \
-         with the ONNX Runtime engine compiled in (see the travsr-embed README).",
+         {remedy}",
         family,
         backend.id,
         if caps.families.is_empty() {
@@ -989,6 +1057,15 @@ struct AccelVariant {
     suffix: &'static str,
     /// Must land beside the binary or the variant silently runs on CPU. A 404
     /// here fails the install rather than producing a fake GPU install.
+    ///
+    /// These names must stay unique ACROSS variants, not just within one.
+    /// travsr-embed's release job flattens every artifact into a single directory
+    /// (`merge-multiple: true`, `files: dist/**`), so a file is addressed by bare
+    /// basename — `{base_url}/{name}` — and two variants shipping the same
+    /// basename would overwrite each other in the release, leaving this code to
+    /// fetch whichever won. No collision today: `-cuda` ships `.so` files and
+    /// `-directml` ships `.dll` files. A second Windows GPU variant with its own
+    /// `onnxruntime.dll` is where it would bite.
     runtime_files: &'static [&'static str],
     /// Fetched when present, skipped on 404 — providers that only some builds
     /// of ONNX Runtime carry.
@@ -2370,5 +2447,42 @@ mod accel_tests {
             assert!(!v.runtime_files.is_empty(), "{} has none", v.name);
             assert!(v.suffix.starts_with('-'), "{} suffix", v.name);
         }
+    }
+
+    /// The upgrade decision, isolated from the install flow that uses it.
+    ///
+    /// Guards the gap this logic exists to close: `TRAVSR_EMBED_ACCEL` used to be
+    /// read only inside the download path, which an already-installed sidecar
+    /// never reaches — so the variable did nothing, and the user was told the
+    /// sidecar was "ready".
+    fn wants_upgrade(variant_requested: bool, installed_accelerated: Option<bool>) -> bool {
+        variant_requested && installed_accelerated == Some(false)
+    }
+
+    #[test]
+    fn cpu_install_is_upgraded_when_an_accelerator_is_requested() {
+        assert!(wants_upgrade(true, Some(false)));
+    }
+
+    #[test]
+    fn an_already_accelerated_install_is_left_alone() {
+        assert!(!wants_upgrade(true, Some(true)));
+    }
+
+    /// No request means no reinstall, even on a CPU build — `embed init` must stay
+    /// idempotent for everyone who never sets the variable.
+    #[test]
+    fn no_request_never_reinstalls() {
+        assert!(!wants_upgrade(false, Some(false)));
+        assert!(!wants_upgrade(false, Some(true)));
+        assert!(!wants_upgrade(false, None));
+    }
+
+    /// `None` is "the sidecar could not tell us" — a pre-handshake build that
+    /// exits non-zero on `--capabilities`. Treating that as "not accelerated"
+    /// would re-download on every single init for those users.
+    #[test]
+    fn a_sidecar_that_cannot_answer_is_not_reinstalled() {
+        assert!(!wants_upgrade(true, None));
     }
 }

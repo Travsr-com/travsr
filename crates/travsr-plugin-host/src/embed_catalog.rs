@@ -2475,9 +2475,21 @@ mod tests {
 
     /// Every bundled entry must declare an arch, or its model.toml silently
     /// defaults to bert — fine today, wrong the moment a non-BERT model lands.
+    ///
+    /// Parses the bundled TOML directly rather than calling `backends()`, which
+    /// merges `~/.travsr/embed_catalog.toml` on top. `arch` is `#[serde(default)]`,
+    /// so a developer whose override entry omits it would see this test fail and
+    /// blame the bundled catalog for something in their home directory.
     #[test]
     fn bundled_catalog_entries_all_declare_arch() {
-        for b in backends() {
+        #[derive(serde::Deserialize)]
+        struct Bundled {
+            backend: Vec<EmbedBackend>,
+        }
+        let parsed: Bundled =
+            toml::from_str(include_str!("embed_catalog.toml")).expect("bundled catalog must parse");
+        assert!(!parsed.backend.is_empty(), "bundled catalog is empty");
+        for b in &parsed.backend {
             assert!(!b.arch.trim().is_empty(), "{} has no arch", b.id);
         }
     }
