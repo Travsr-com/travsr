@@ -17,6 +17,7 @@ mod rerank;
 mod sanitize;
 mod seed;
 mod server;
+pub use server::{tools_list as stdio_tools_list, tools_list_global as global_tools_list};
 pub mod session;
 pub mod sse;
 mod tools;

@@ -341,7 +341,12 @@ fn handle_tool_call(
     )
 }
 
-fn tools_list() -> serde_json::Value {
+/// The single-repo `tools/list` payload, served by `travsr mcp --stdio`.
+///
+/// Public so consumers that generate agent guidance for this server (see
+/// `travsr connect`) can pin their tool names against what is actually served
+/// instead of hand-maintaining a mirror that drifts on the next rename.
+pub fn tools_list() -> serde_json::Value {
     serde_json::json!({
         "_schemaVersion": "1.1.0",
         "tools": [
@@ -964,7 +969,9 @@ fn handle_tool_call_global(
     )
 }
 
-fn tools_list_global() -> serde_json::Value {
+/// The multi-repo `tools/list` payload, served by `travsr mcp --global`.
+/// Public for the same reason as [`tools_list`].
+pub fn tools_list_global() -> serde_json::Value {
     serde_json::json!({
         "_schemaVersion": "1.1.0",
         "tools": [
