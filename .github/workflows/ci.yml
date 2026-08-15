@@ -228,6 +228,14 @@ jobs:
         run: |
           "$HOME/.local/bin/travsr" --version
 
+      # Pins to a fixed older release to prove --version actually installs the
+      # requested tag rather than silently falling back to latest (#691).
+      - name: Install a pinned older version via --version
+        run: |
+          export TRAVSR_INSTALL_DIR="$RUNNER_TEMP/pinned"
+          cat install.sh | sh -s -- --version v0.11.0
+          [ "$("$RUNNER_TEMP/pinned/travsr" --version)" = "travsr 0.11.0" ]
+
   install-sh-alpine:
     name: "install.sh (alpine musl)"
     runs-on: ubuntu-latest

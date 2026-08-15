@@ -28,6 +28,8 @@ Usage: curl -fsSL https://travsr.com/install.sh | sh -s -- [OPTIONS]
 Installs the travsr CLI binary for this platform.
 
 Options:
+  --version TAG   Install a specific release instead of the latest stable,
+                   e.g. --version v0.11.0. Must be an existing release tag.
   --system        Install to ${SYSTEM_DIR} instead of the default user
                    directory. Escalates with sudo unless already running
                    as root.
@@ -78,9 +80,19 @@ detect_target() {
   # END TARGET_MAP
 }
 
-# Resolves the "latest" release tag via the redirect target of the GitHub
-# releases/latest URL, and validates it looks like a real tag. Sets $tag.
+# Resolves $tag: the explicit --version if one was given, otherwise the
+# "latest" release tag via the redirect target of the GitHub releases/latest
+# URL. Validates it looks like a real tag either way. Sets $tag.
 resolve_tag() {
+  if [ -n "$version" ]; then
+    tag="$version"
+    case "$tag" in
+      v[0-9]*) ;;
+      *) err "invalid --version '${tag}': expected a release tag like v0.11.0" ;;
+    esac
+    return
+  fi
+
   url=$(curl -fsSLI --proto '=https' --proto-redir '=https' -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")
   tag=${url##*/}
   case "$tag" in
@@ -93,7 +105,13 @@ resolve_tag() {
 # unconditionally, then verifies the cosign signature when cosign is on
 # PATH. Aborts on any verification failure; there is no bypass.
 download_and_verify() {
-  curl -fsSL --proto '=https' --proto-redir '=https' -o "$tmp/${tarball_name}" "${base_url}/${tarball_name}"
+  if ! curl -fsSL --proto '=https' --proto-redir '=https' -o "$tmp/${tarball_name}" "${base_url}/${tarball_name}"; then
+    if [ -n "$version" ]; then
+      err "could not download ${tarball_name}; check that release ${tag} exists and ships a build for this platform: https://github.com/${REPO}/releases/tag/${tag}"
+    else
+      err "could not download ${tarball_name} from the latest release (${tag})"
+    fi
+  fi
   curl -fsSL --proto '=https' --proto-redir '=https' -o "$tmp/SHA256SUMS" "${base_url}/SHA256SUMS"
 
   if command -v sha256sum >/dev/null 2>&1; then
@@ -161,9 +179,15 @@ install_binary() {
 main() {
   use_system=no
   print_target_only=no
+  version=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
+      --version)
+        [ $# -ge 2 ] || err "--version requires an argument, e.g. --version v0.11.0"
+        version="$2"
+        shift
+        ;;
       --system) use_system=yes ;;
       --print-target) print_target_only=yes ;;
       -h | --help)
