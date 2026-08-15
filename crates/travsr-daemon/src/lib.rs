@@ -55,6 +55,31 @@ pub fn set_allow_unsandboxed_lsif(val: bool) {
     travsr_indexer::sandbox::set_cli_allow_unsandboxed(val);
 }
 
+/// The user-facing product version, set once by the `travsr` binary at startup.
+static BUILD_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the product/build version (UX-019).
+///
+/// The `travsr-daemon` crate carries the workspace version (`0.7.0`), which is
+/// deliberately decoupled from the user-facing `travsr --version` (`0.11.0`, the
+/// npm-release line). Logging `env!("CARGO_PKG_VERSION")` therefore made the
+/// daemon's session-start line disagree with `--version`. The `travsr` binary
+/// (including the background daemon, which is a re-exec of the same binary) calls
+/// this early with its own `CARGO_PKG_VERSION` so [`build_version`] reports one
+/// consistent number everywhere.
+pub fn set_build_version(version: &str) {
+    let _ = BUILD_VERSION.set(version.to_string());
+}
+
+/// The product/build version to report in logs. Falls back to this crate's own
+/// version when the binary did not set one (e.g. a direct library embedder).
+pub fn build_version() -> &'static str {
+    BUILD_VERSION
+        .get()
+        .map(String::as_str)
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 /// Statistics returned by [`init_repo`] and displayed by `travsr init`.
 #[derive(Debug, Default)]
 pub struct InitStats {
@@ -75,6 +100,14 @@ pub struct InitStats {
     pub total_edges: u64,
     /// Per-language Phase B outcome, populated by the full init path.
     pub phase_b_report: Option<PhaseBReport>,
+    /// UX-023: number of nodes swept because their file no longer exists on disk
+    /// (deleted/moved upstream). Surfaced in the CLI summary — the tracing event
+    /// alone is invisible under the default `error` stderr filter (see UX-002).
+    pub ghosts_pruned: u64,
+    /// UX-023: the ghost sweep tripped the mass-delete circuit breaker and pruned
+    /// nothing. Without surfacing this the failure is silent (the warning no
+    /// longer passes the default filter), so the CLI points at `fsck --fix --force`.
+    pub ghost_prune_aborted: bool,
 }
 
 /// Per-language Phase B outcome, surfaced in [`InitStats`] so the CLI can
@@ -989,7 +1022,7 @@ pub fn fsck_repo(
 }
 
 pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
-    init_repo_with_progress(repo_root, None, false, &mut |_| {})
+    init_repo_with_progress(repo_root, None, false, false, &mut |_| {})
 }
 
 /// Like [`init_repo`], but reports progress via `on_progress` so the CLI can
@@ -1002,10 +1035,18 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
 /// the pre-deferred-Phase-B behaviour. Use this for CI / scripts that query
 /// call edges immediately after init. When `false` (the default), Phase B is
 /// deferred to the daemon background scheduler.
+///
+/// `force` (UX-004) bypasses the incremental up-to-date short-circuit: it purges
+/// the existing graph so every file is re-parsed from scratch, even when no file
+/// content changed. Needed because config that affects *semantic* output (e.g.
+/// `--allow-unsandboxed-lsif` toggling whether Rust LSIF edges are built) is not
+/// part of the per-file hash delta, so a plain re-init would report "up to date"
+/// without actually rebuilding those edges.
 pub fn init_repo_with_progress(
     repo_root: &Path,
     jobs: Option<usize>,
     semantic: bool,
+    force: bool,
     on_progress: &mut dyn FnMut(InitProgress),
 ) -> anyhow::Result<InitStats> {
     // M3: canonicalize so ~/.travsr/registry.json never gets two entries for the
@@ -1198,6 +1239,26 @@ pub fn init_repo_with_progress(
         .set_meta("corpus", &corpus)
         .context("writing corpus to meta (ARCH-102)")?;
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
+
+    // UX-004: `--force` bypasses the incremental up-to-date short-circuit by
+    // purging the existing graph so every file is re-parsed below (node_count then
+    // reads 0, which also re-activates the fast staging path). Config that changes
+    // *semantic* output but not file content — e.g. `--allow-unsandboxed-lsif` —
+    // is not part of the per-file hash delta, so without this a re-run would say
+    // "up to date" while never rebuilding those edges. Uses a 100%-ceiling policy
+    // because wiping the whole graph is the explicit, user-requested intent here.
+    if force && store.node_count().unwrap_or(0) > 0 {
+        tracing::info!("--force: purging graph for a full rebuild");
+        let empty_walked = std::collections::HashSet::<String>::new();
+        let purge_policy = travsr_core::SafetyPolicy {
+            mass_delete_ceiling_pct: 1.0,
+            ..Default::default()
+        };
+        store
+            .reconcile(&empty_walked, &purge_policy, repo_root, &corpus)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("--force full-graph purge")?;
+    }
 
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
     // path at query time without threading repo_root through function signatures.
@@ -1469,6 +1530,54 @@ pub fn init_repo_with_progress(
         }
     })?;
 
+    // UX-023: sweep nodes for files that no longer exist on disk. The incremental
+    // hash-delta path above only re-indexes files that are still present, so nodes
+    // for files deleted or moved upstream would otherwise survive as ghosts until
+    // a manual `travsr fsck --fix`. Reconcile the DB's file set against the freshly
+    // walked working tree so a completed `init` is genuinely fresh ("Always fresh
+    // — staleness is a bug"). This is a no-op on a first init (every walked file is
+    // present) and only does work on a re-init over a changed tree. The default
+    // SafetyPolicy's mass-delete circuit breaker still guards against a bad walk
+    // wiping the whole graph; if it trips, nothing is deleted and we say so.
+    let mut ghosts_pruned: u64 = 0;
+    let mut ghost_prune_aborted = false;
+    {
+        let walked: std::collections::HashSet<String> = indexable_paths
+            .iter()
+            .map(|p| {
+                p.strip_prefix(repo_root)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        match store.reconcile(
+            &walked,
+            &travsr_core::SafetyPolicy::default(),
+            repo_root,
+            &corpus,
+        ) {
+            Ok(report) if report.aborted => {
+                ghost_prune_aborted = true;
+                tracing::warn!(
+                    reason = report.abort_reason.as_deref().unwrap_or(""),
+                    "init reconcile: ghost prune tripped the mass-delete circuit breaker — \
+                     deleted nothing; run `travsr fsck --fix --force` to override"
+                );
+            }
+            Ok(report) if !report.ghost_paths.is_empty() => {
+                ghosts_pruned = report.ghost_paths.len() as u64;
+                tracing::info!(
+                    event = "init.reconcile.pruned",
+                    pruned = report.ghost_paths.len(),
+                    "init reconcile: pruned nodes for files no longer on disk"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(err = %e, "init reconcile: ghost prune failed (non-fatal)"),
+        }
+    }
+
     let nodes_after = store.node_count().context("counting nodes after init")? as i64;
 
     // E1: reconcile Phase A edge languages now so the graph is correctly
@@ -1686,6 +1795,8 @@ pub fn init_repo_with_progress(
         total_nodes: nodes_after as u64,
         total_edges,
         phase_b_report,
+        ghosts_pruned,
+        ghost_prune_aborted,
     })
 }
 
@@ -7887,7 +7998,7 @@ impl Daemon {
         // its own: which build wrote it, which repo, which process.
         tracing::info!(
             event = "daemon.session.start",
-            version = env!("CARGO_PKG_VERSION"),
+            version = build_version(),
             pid = std::process::id(),
             repo = %repo_root.display(),
             // No `foreground` field on purpose. A backgrounded daemon is a

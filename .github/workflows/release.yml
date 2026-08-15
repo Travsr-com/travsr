@@ -166,7 +166,7 @@ jobs:
       fail-fast: false
       matrix:
         # artifact: must stay in lockstep with the installer target maps
-        # (#576); checked in CI by .github/scripts/check-target-maps.mjs.
+        # (#576, #691); checked in CI by .github/scripts/check-target-maps.mjs.
         include:
           # musl = statically linked, runs on any Linux regardless of glibc version
           - target: x86_64-unknown-linux-musl
@@ -321,6 +321,7 @@ jobs:
             dist/*.tar.gz
             dist/*.bundle
             SHA256SUMS
+            install.sh
           generate_release_notes: true
           prerelease: ${{ needs.channel.outputs.prerelease }}
           make_latest: ${{ needs.channel.outputs.channel == 'stable' }}
@@ -454,10 +455,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Keep this pattern identical to the one in install.sh (search for
+          # certificate-identity-regexp there) and to SECURITY.md's manual
+          # verification command. A pipeline gate must never be looser than the
+          # client it publishes for, or a bundle this job accepts is one the
+          # installer rejects, and the failure surfaces on a user's machine
+          # instead of here. The ref pattern mirrors on.push.tags above; only
+          # the tag-triggered build job signs, and promote reuses those bundles.
           for t in dist/*.tar.gz; do
             cosign verify-blob --bundle "${t}.bundle" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              --certificate-identity-regexp 'https://github.com/Travsr-com/travsr/.github/workflows/release.yml' \
+              --certificate-identity-regexp '^https://github\.com/Travsr-com/travsr/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$' \
               "$t"
           done
 
@@ -483,6 +491,7 @@ jobs:
             dist/*.tar.gz
             dist/*.bundle
             SHA256SUMS
+            install.sh
           generate_release_notes: true
           prerelease: ${{ needs.channel.outputs.prerelease }}
           make_latest: ${{ needs.channel.outputs.channel == 'stable' }}

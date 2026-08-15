@@ -171,7 +171,12 @@ fn collect_source_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
                 .unwrap_or(false)
         })
     {
-        let entry = entry.context("walking directory")?;
+        // UX-011: `walkdir::Error`'s Display already embeds the path and the OS
+        // message ("IO error for operation on <dir>: <os error>"). Chaining it as
+        // a `#[source]` (what `.context()` does) makes `{:#}` print that OS text a
+        // second time from the underlying `io::Error`. Fold it into a source-less
+        // message so the OS string appears exactly once.
+        let entry = entry.map_err(|e| anyhow::anyhow!("walking directory: {e}"))?;
         if !entry.file_type().is_file() {
             continue;
         }

@@ -24,6 +24,7 @@ fn git_init(dir: &std::path::Path) {
 fn travsr_init(dir: &std::path::Path) -> assert_cmd::assert::Assert {
     Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(dir)
         .arg("init")
         .assert()
@@ -32,6 +33,7 @@ fn travsr_init(dir: &std::path::Path) -> assert_cmd::assert::Assert {
 fn travsr_status(dir: &std::path::Path) -> assert_cmd::assert::Assert {
     Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(dir)
         .arg("status")
         .assert()
@@ -65,6 +67,7 @@ fn init_fails_outside_git_repo() {
 
     let output = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .arg("init")
         .output()
@@ -198,6 +201,7 @@ fn hook_run_from_hook_reindexes_changed_file() {
 
     Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .args(["hook-run", "--from-hook"])
         .assert()
@@ -279,6 +283,7 @@ fn hook_run_from_hook_reindexes_after_merge_commit() {
     // see svc.ts and reindex it.
     Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .args(["hook-run", "--from-hook"])
         .assert()

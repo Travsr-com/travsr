@@ -1116,13 +1116,17 @@ pub fn find_pattern(
     // Wrap with the larger find-output limit (not the 4 KiB scalar cap) so a
     // capped 500-match list and its truncation notice survive intact.
     wrap_envelope(&sanitize_mcp_body_with_limit(
-        &find_pattern_body(store, pattern, scope, fixed),
+        &find_pattern_raw(store, pattern, scope, fixed),
         FIND_OUTPUT_LIMIT,
     ))
 }
 
-/// Raw (unsanitized) body for `find_pattern`, shared by the global aggregator.
-fn find_pattern_body(
+/// Raw (unsanitized) body for `find_pattern`, shared by the global aggregator
+/// and the CLI. Callers that hand the result to a model must wrap it in the
+/// `<travsr-data>` envelope and sanitize it (see `find_pattern`); the CLI, which
+/// prints straight to a human terminal, uses this raw form so source text is not
+/// HTML-entity escaped (`->` staying `->`, not `-&gt;`).
+pub fn find_pattern_raw(
     store: &SqliteStore,
     pattern: &str,
     scope: Option<&str>,
@@ -1760,7 +1764,7 @@ pub fn find_pattern_global(
     repo: Option<&str>,
     fixed: bool,
 ) -> String {
-    // #517 DD-7: same exemption as `find_pattern_body` — see
+    // #517 DD-7: same exemption as `find_pattern_raw` — see
     // `validate_mcp_pattern_arg`'s doc comment.
     if let Err(reason) = validate_mcp_pattern_arg(pattern) {
         tracing::warn!("find_pattern_global rejected invalid pattern: {reason}");
@@ -1775,7 +1779,7 @@ pub fn find_pattern_global(
     // Aggregate raw per-repo bodies (not the wrapped form) so there is a single
     // envelope + one large-limit sanitize over the whole result.
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = find_pattern_body(store, pattern, scope, fixed);
+        let result = find_pattern_raw(store, pattern, scope, fixed);
         if result.is_empty() || single {
             result
         } else {
@@ -3265,7 +3269,13 @@ pub fn repos_list() -> String {
     rows.iter()
         .map(|(name, db_path)| {
             let exists = if db_path.exists() { "1" } else { "0" };
-            format!("{name}\t{}\t{exists}", db_path.display())
+            // UX-018: emit the basename as the display Name and the verbatim-
+            // stripped full path, matching the CLI `repos` table. `repos_remove`
+            // resolves either back to the registry key.
+            let display = travsr_store::registry::display_name(name);
+            let path = travsr_store::registry::strip_verbatim_prefix(&db_path.to_string_lossy())
+                .into_owned();
+            format!("{display}\t{path}\t{exists}")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -3290,11 +3300,14 @@ pub fn repos_prune() -> String {
     }
 }
 
-/// Remove a single repo by registry-key name. Returns `ok` / `not found`.
+/// Remove a single repo by full registry key or display basename (UX-018).
+/// Returns `ok` / `not found` / `ambiguous: <paths>`.
 pub fn repos_remove(name: &str) -> String {
-    match travsr_store::registry::unregister(name) {
-        Ok(true) => "ok".to_string(),
-        Ok(false) => "not found".to_string(),
+    use travsr_store::registry::UnregisterResult;
+    match travsr_store::registry::unregister_resolving(name) {
+        Ok(UnregisterResult::Removed) => "ok".to_string(),
+        Ok(UnregisterResult::NotFound) => "not found".to_string(),
+        Ok(UnregisterResult::Ambiguous(paths)) => format!("ambiguous: {}", paths.join(", ")),
         Err(e) => {
             tracing::warn!("repos_remove error: {e}");
             "error".to_string()
