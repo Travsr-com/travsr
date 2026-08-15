@@ -104,3 +104,18 @@ present, installation falls back to SHA256 verification only with a warning.
 This applies to every channel — `npm i -g @travsr.com/travsr@beta` and `@rc`
 verify identically to `@latest`, since beta/rc/stable reuse the same signed
 artifact rather than each being signed separately.
+
+### Shell installer (install.sh)
+
+`curl -fsSL https://travsr.com/install.sh | sh` verifies the downloaded
+tarball's SHA256 against the release `SHA256SUMS` unconditionally; this check
+has no bypass flag or environment variable and a mismatch aborts the install
+with nothing written. If `cosign` is on `PATH`, the script also verifies the
+release's cosign signature, and unlike the npm postinstall behavior described
+above, a verification failure here aborts the install rather than falling
+back to SHA256-only. `install.sh` itself is served over TLS and its integrity
+relies on GitHub release integrity, but it is not part of `SHA256SUMS` and is
+not cosign-signed, so anyone who wants to inspect it before running should
+`curl -fsSL <url> | less` first. `--system` is the only flag that escalates
+privileges, and it does so via `sudo` only after printing the exact command
+it is about to run.

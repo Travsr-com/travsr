@@ -1,0 +1,216 @@
+#!/bin/sh
+# travsr installer: downloads, verifies, and installs the travsr CLI binary.
+# Usage: curl -fsSL https://travsr.com/install.sh | sh -s -- [--system] [--print-target] [--help]
+# Repo:  https://github.com/Travsr-com/travsr
+set -eu
+
+REPO="Travsr-com/travsr"
+SYSTEM_DIR="/usr/local/bin"
+DEFAULT_DIR="${TRAVSR_INSTALL_DIR:-${HOME:-}/.local/bin}"
+
+info() {
+  printf 'travsr: %s\n' "$1"
+}
+
+warn() {
+  printf 'travsr: warning: %s\n' "$1" >&2
+}
+
+err() {
+  printf 'travsr: error: %s\n' "$1" >&2
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+Usage: curl -fsSL https://travsr.com/install.sh | sh -s -- [OPTIONS]
+
+Installs the travsr CLI binary for this platform.
+
+Options:
+  --system        Install to ${SYSTEM_DIR} instead of the default user
+                   directory. Escalates with sudo unless already running
+                   as root.
+  --print-target  Print the detected target triple and exit. Does not
+                   touch the network.
+  -h, --help      Show this help and exit.
+
+Environment:
+  TRAVSR_INSTALL_DIR  Overrides the default install directory
+                       (default: \$HOME/.local/bin).
+
+A piped script cannot take flags directly; use the "sh -s --" form to
+forward them, for example:
+  curl -fsSL https://travsr.com/install.sh | sh -s -- --system
+EOF
+}
+
+# Normalises uname output and resolves the release artifact triple for this
+# platform. Sets $target. // O(1)
+detect_target() {
+  os=$(uname -s)
+  arch=$(uname -m)
+
+  case "$os" in
+    Linux) os=linux ;;
+    Darwin) os=darwin ;;
+  esac
+
+  case "$arch" in
+    x86_64 | amd64) arch=x86_64 ;;
+    aarch64 | arm64) arch=aarch64 ;;
+  esac
+
+  # BEGIN TARGET_MAP
+  # POSIX targets only. Must stay in lockstep with the release build matrix
+  # (.github/workflows/release.yml) minus the Windows artifact, the npm TARGETS
+  # map, and the vscode TARGET_MAP (#691); checked in CI by
+  # .github/scripts/check-target-maps.mjs. Never add a *-windows-* triple here.
+  case "${os}_${arch}" in
+    linux_x86_64) target='x86_64-unknown-linux-gnu' ;;
+    linux_aarch64) target='aarch64-unknown-linux-gnu' ;;
+    darwin_x86_64) target='x86_64-apple-darwin' ;;
+    darwin_aarch64) target='aarch64-apple-darwin' ;;
+    *)
+      err "Travsr does not yet ship a prebuilt binary for ${os}/${arch}. Build from source: https://github.com/${REPO}"
+      ;;
+  esac
+  # END TARGET_MAP
+}
+
+# Resolves the "latest" release tag via the redirect target of the GitHub
+# releases/latest URL, and validates it looks like a real tag. Sets $tag.
+resolve_tag() {
+  url=$(curl -fsSLI --proto '=https' --proto-redir '=https' -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")
+  tag=${url##*/}
+  case "$tag" in
+    v[0-9]*) ;;
+    *) err "could not resolve the latest release tag (got '${tag}' from ${url}); the repository may have no releases yet" ;;
+  esac
+}
+
+# Downloads the tarball and SHA256SUMS into $tmp, verifies the checksum
+# unconditionally, then verifies the cosign signature when cosign is on
+# PATH. Aborts on any verification failure; there is no bypass.
+download_and_verify() {
+  curl -fsSL --proto '=https' --proto-redir '=https' -o "$tmp/${tarball_name}" "${base_url}/${tarball_name}"
+  curl -fsSL --proto '=https' --proto-redir '=https' -o "$tmp/SHA256SUMS" "${base_url}/SHA256SUMS"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_hash=$(sha256sum "$tmp/${tarball_name}" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    actual_hash=$(shasum -a 256 "$tmp/${tarball_name}" | awk '{print $1}')
+  else
+    err "neither sha256sum nor shasum is available; cannot verify the release checksum, refusing to install"
+  fi
+
+  # SHA256SUMS path fields differ between the publish and promote jobs
+  # ("dist/travsr-..." vs "travsr-..."), and Windows lines are prefixed with
+  # "*". Normalise by stripping a leading '*' and everything up to the last
+  # '/', then require an exact basename match.
+  expected_hash=$(awk -v want="${tarball_name}" '
+    {
+      hash = $1
+      p = $2
+      sub(/^\*/, "", p)
+      n = split(p, parts, "/")
+      base = parts[n]
+      if (base == want) { print hash; exit }
+    }
+  ' "$tmp/SHA256SUMS")
+
+  [ -n "$expected_hash" ] || err "no SHA256SUMS entry found for ${tarball_name}; refusing to install"
+  [ "$actual_hash" = "$expected_hash" ] || err "SHA256 mismatch for ${tarball_name}: expected ${expected_hash}, got ${actual_hash}"
+
+  if command -v cosign >/dev/null 2>&1; then
+    info "cosign found, verifying signature"
+    bundle_name="${tarball_name}.bundle"
+    curl -fsSL --proto '=https' --proto-redir '=https' -o "$tmp/${bundle_name}" "${base_url}/${bundle_name}"
+    if ! cosign verify-blob --bundle "$tmp/${bundle_name}" \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp 'https://github.com/Travsr-com/travsr/.github/workflows/release.yml' \
+      "$tmp/${tarball_name}"; then
+      err "cosign signature verification failed for ${tarball_name}; aborting install"
+    fi
+    info "cosign signature verified"
+  else
+    warn "cosign not found, skipping signature verification. Install cosign for stronger guarantees: https://docs.sigstore.dev/cosign/system_config/installation/"
+  fi
+}
+
+# Copies the extracted, already-verified binary from $tmp into $dir via a
+# staging name plus atomic rename, so an in-place upgrade never leaves a
+# truncated binary on PATH. Escalates with sudo only for --system on a
+# non-root user, and only after printing the exact command being run.
+install_binary() {
+  staging="${dir}/.travsr.install.$$"
+
+  if [ "$use_system" = yes ] && [ "$(id -u)" != 0 ]; then
+    command -v sudo >/dev/null 2>&1 || err "--system requires root or sudo, and sudo was not found on PATH"
+    info "--system requested, elevating with sudo to write ${dir}/travsr"
+    sudo mkdir -p "$dir"
+    sudo cp "$tmp/travsr" "$staging"
+    sudo mv -f "$staging" "${dir}/travsr"
+  else
+    mkdir -p "$dir"
+    cp "$tmp/travsr" "$staging"
+    mv -f "$staging" "${dir}/travsr"
+  fi
+}
+
+main() {
+  use_system=no
+  print_target_only=no
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --system) use_system=yes ;;
+      --print-target) print_target_only=yes ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *) err "unrecognised option: $1 (see --help)" ;;
+    esac
+    shift
+  done
+
+  detect_target
+
+  if [ "$print_target_only" = yes ]; then
+    printf '%s\n' "$target"
+    exit 0
+  fi
+
+  if [ "$use_system" = yes ]; then
+    dir="$SYSTEM_DIR"
+  else
+    dir="$DEFAULT_DIR"
+    [ "$dir" != "/.local/bin" ] || err "HOME is not set and TRAVSR_INSTALL_DIR was not provided; cannot determine an install directory"
+  fi
+
+  command -v curl >/dev/null 2>&1 || err "curl is required to install travsr but was not found on PATH"
+
+  resolve_tag
+  tarball_name="travsr-${tag}-${target}.tar.gz"
+  base_url="https://github.com/${REPO}/releases/download/${tag}"
+
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT INT TERM HUP
+
+  download_and_verify
+
+  tar -xzf "$tmp/${tarball_name}" -C "$tmp" travsr
+  chmod 755 "$tmp/travsr"
+
+  install_binary
+
+  case ":${PATH}:" in
+    *":${dir}:"*) ;;
+    *) warn "${dir} is not on your PATH. Add this to your shell profile: export PATH=\"${dir}:\$PATH\"" ;;
+  esac
+
+  info "installed travsr to ${dir}/travsr"
+}
+
+main "$@"

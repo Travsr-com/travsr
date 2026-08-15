@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Guard for #576 / #497: the release build matrix and the two installer
+ * Guard for #576 / #497: the release build matrix and the three installer
  * target maps must agree on the exact set of published Rust target triples.
  *
  * The comparable field in release.yml is `artifact:`, not `target:`. The
@@ -10,13 +10,15 @@
  * (installer.ts, install.js) only ever request the artifact name. Comparing
  * against `target:` would fail on a clean tree.
  *
- * This checks set equality of triples across the three sources, not pairing
+ * This checks set equality of triples across the four sources, not pairing
  * correctness (platform/arch -> triple). Mis-pairing is covered separately
- * by packages/travsr-vscode/src/test/suite/installer.test.ts.
+ * by packages/travsr-vscode/src/test/suite/installer.test.ts. install.sh is
+ * POSIX-only, so it is compared against the release build matrix's non-Windows
+ * subset rather than the full artifact set.
  *
  * Known limitation: comment stripping is a naive line-based `//`/`#` strip
  * within the located region. A `//` or `#` inside a string literal would be
- * mis-stripped. No such literal exists in any of the three sources today.
+ * mis-stripped. No such literal exists in any of the four sources today.
  *
  * Zero dependencies, no npm install required. Run from anywhere:
  *   node .github/scripts/check-target-maps.mjs
@@ -32,6 +34,7 @@ const REPO_ROOT = join(__dirname, "..", "..");
 const RELEASE_YML = join(REPO_ROOT, ".github/workflows/release.yml");
 const INSTALLER_TS = join(REPO_ROOT, "packages/travsr-vscode/src/installer.ts");
 const INSTALL_JS = join(REPO_ROOT, "packages/travsr-npm/scripts/install.js");
+const INSTALL_SH = join(REPO_ROOT, "install.sh");
 
 /** Relative path for error messages, so they read the same regardless of cwd. */
 function rel(absPath) {
@@ -173,17 +176,69 @@ function extractNpmTargets(text) {
   return extractObjectValues(text, INSTALL_JS, "TARGETS");
 }
 
+/**
+ * Extracts install.sh's POSIX target triples from the region between the
+ * "# BEGIN TARGET_MAP" and "# END TARGET_MAP" marker comments. Unlike
+ * extractObjectValues, this does NOT strip # comments first, since the
+ * markers themselves are comments; anchoring on `target=` already excludes
+ * surrounding prose.
+ * // O(n) in file line count
+ */
+function extractShellTargets(text) {
+  const lines = text.split("\n");
+  const startIdx = lines.findIndex((l) => l.trim().startsWith("# BEGIN TARGET_MAP"));
+  if (startIdx === -1) {
+    console.error(
+      `ERROR: could not locate the "# BEGIN TARGET_MAP" marker in ${rel(INSTALL_SH)} (parser needs updating)`
+    );
+    process.exit(1);
+  }
+  let endIdx = -1;
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    if (lines[i].trim().startsWith("# END TARGET_MAP")) {
+      endIdx = i;
+      break;
+    }
+  }
+  if (endIdx === -1) {
+    console.error(
+      `ERROR: could not locate the closing "# END TARGET_MAP" marker in ${rel(INSTALL_SH)} (parser needs updating)`
+    );
+    process.exit(1);
+  }
+
+  const region = lines.slice(startIdx, endIdx + 1).join("\n");
+  const values = [];
+  const valueRe = /\btarget=(['"])([^'"]+)\1/g;
+  let m;
+  while ((m = valueRe.exec(region)) !== null) {
+    values.push(m[2]);
+  }
+
+  if (values.length === 0) {
+    console.error(
+      `ERROR: located the TARGET_MAP block in ${rel(INSTALL_SH)} but extracted zero values (parser needs updating)`
+    );
+    process.exit(1);
+  }
+  return values;
+}
+
 const releaseArtifacts = extractReleaseArtifacts(readFileOrFail(RELEASE_YML));
 const vscodeTargets = extractVscodeTargets(readFileOrFail(INSTALLER_TS));
 const npmTargets = extractNpmTargets(readFileOrFail(INSTALL_JS));
+const installShTargets = extractShellTargets(readFileOrFail(INSTALL_SH));
 
 const R = new Set(releaseArtifacts);
 const V = new Set(vscodeTargets);
 const N = new Set(npmTargets);
+const S = new Set(installShTargets);
+const P = new Set([...R].filter((t) => !/windows/.test(t)));
 
 console.log(`OK: ${rel(RELEASE_YML)} ships ${R.size} artifact(s)`);
 console.log(`OK: ${rel(INSTALLER_TS)} TARGET_MAP claims ${V.size} target(s)`);
 console.log(`OK: ${rel(INSTALL_JS)} TARGETS claims ${N.size} target(s)`);
+console.log(`OK: install.sh TARGET_MAP claims ${S.size} POSIX target(s)`);
 
 const setDiff = (a, b) => [...a].filter((x) => !b.has(x));
 
@@ -191,6 +246,9 @@ const vscodeExtra = setDiff(V, R);
 const npmExtra = setDiff(N, R);
 const vscodeMissing = setDiff(R, V);
 const npmMissing = setDiff(R, N);
+const shellWindows = [...S].filter((t) => /windows/.test(t));
+const shellExtra = setDiff(S, P);
+const shellMissing = setDiff(P, S);
 
 let failed = false;
 
@@ -222,16 +280,38 @@ for (const v of npmMissing) {
       `       but ${rel(INSTALL_JS)} TARGETS cannot consume it.`
   );
 }
+for (const v of shellWindows) {
+  failed = true;
+  console.error(
+    `ERROR: ${rel(INSTALL_SH)} TARGET_MAP claims '${v}',\n` +
+      `       but install.sh is POSIX-only and must never claim a Windows triple.`
+  );
+}
+for (const v of shellExtra) {
+  failed = true;
+  console.error(
+    `ERROR: ${rel(INSTALL_SH)} TARGET_MAP claims '${v}',\n` +
+      `       but ${rel(RELEASE_YML)} build matrix ships no such artifact (guaranteed 404).`
+  );
+}
+for (const v of shellMissing) {
+  failed = true;
+  console.error(
+    `ERROR: ${rel(RELEASE_YML)} ships POSIX artifact '${v}',\n` +
+      `       but ${rel(INSTALL_SH)} TARGET_MAP cannot consume it.`
+  );
+}
 
 if (failed) {
   console.error(
-    "\nFix: these three must agree on the published platform set:\n" +
+    "\nFix: these four must agree on the published platform set:\n" +
       `  - ${rel(RELEASE_YML)} (build matrix, artifact:)\n` +
       `  - ${rel(INSTALLER_TS)} (TARGET_MAP)\n` +
-      `  - ${rel(INSTALL_JS)} (TARGETS)`
+      `  - ${rel(INSTALL_JS)} (TARGETS)\n` +
+      `  - install.sh (TARGET_MAP block, POSIX targets only, no windows)`
   );
   process.exit(1);
 }
 
-console.log(`OK: all three target maps agree (${R.size} targets)`);
+console.log(`OK: all four target maps agree (${R.size} published targets, ${P.size} POSIX for install.sh)`);
 process.exit(0);

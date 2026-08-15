@@ -170,6 +170,83 @@ jobs:
       - name: verify release matrix and installer target maps agree (#576)
         run: node .github/scripts/check-target-maps.mjs
 
+  install-sh-lint:
+    name: "install.sh (shellcheck)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck if missing
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y shellcheck
+          fi
+
+      - name: shellcheck install.sh
+        run: shellcheck -s sh install.sh
+
+      - name: Truncated-pipe safety guard (#691)
+        run: |
+          [ "$(tail -n 1 install.sh)" = 'main "$@"' ] || { echo "install.sh must end with main \"\$@\" so a truncated download cannot half-execute (#691)"; exit 1; }
+
+      - name: POSIX syntax check
+        run: sh -n install.sh && dash -n install.sh
+
+  install-sh:
+    name: "install.sh (${{ matrix.os }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            expected: x86_64-unknown-linux-gnu
+            cosign: true
+          - os: macos-latest
+            # macos-latest is arm64 today; hardcode so a runner-arch change fails loudly.
+            expected: aarch64-apple-darwin
+            cosign: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cosign
+        if: matrix.cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Assert detected target triple
+        run: |
+          [ "$(cat install.sh | sh -s -- --print-target)" = "${{ matrix.expected }}" ]
+
+      # Piping through cat exercises the real curl|sh stdin-is-the-pipe path
+      # and the "sh -s --" argument form, not a plain sh ./install.sh.
+      - name: Install travsr via piped install.sh
+        run: cat install.sh | sh
+
+      - name: Verify installed binary
+        run: |
+          "$HOME/.local/bin/travsr" --version
+
+  install-sh-alpine:
+    name: "install.sh (alpine musl)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Not a container: job, because alpine:3 lacks the node*_alpine externals
+      # that JS actions (checkout, cosign-installer) require.
+      - name: Install and run install.sh inside alpine:3
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w alpine:3 sh -c '
+            set -eu
+            apk add --no-cache ca-certificates curl tar >/dev/null
+            [ "$(cat install.sh | sh -s -- --print-target)" = x86_64-unknown-linux-gnu ]
+            cat install.sh | sh
+            /root/.local/bin/travsr --version
+          '
+
   llm-dep-gate:
     name: TL1/TL2 — zero LLM/embedding deps in travsr-mcp
     runs-on: ubuntu-latest

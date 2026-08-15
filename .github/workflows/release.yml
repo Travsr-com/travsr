@@ -166,7 +166,7 @@ jobs:
       fail-fast: false
       matrix:
         # artifact: must stay in lockstep with the installer target maps
-        # (#576); checked in CI by .github/scripts/check-target-maps.mjs.
+        # (#576, #691); checked in CI by .github/scripts/check-target-maps.mjs.
         include:
           # musl = statically linked, runs on any Linux regardless of glibc version
           - target: x86_64-unknown-linux-musl
@@ -321,6 +321,7 @@ jobs:
             dist/*.tar.gz
             dist/*.bundle
             SHA256SUMS
+            install.sh
           generate_release_notes: true
           prerelease: ${{ needs.channel.outputs.prerelease }}
           make_latest: ${{ needs.channel.outputs.channel == 'stable' }}
@@ -483,6 +484,7 @@ jobs:
             dist/*.tar.gz
             dist/*.bundle
             SHA256SUMS
+            install.sh
           generate_release_notes: true
           prerelease: ${{ needs.channel.outputs.prerelease }}
           make_latest: ${{ needs.channel.outputs.channel == 'stable' }}
