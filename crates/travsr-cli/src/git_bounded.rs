@@ -124,7 +124,7 @@ mod tests {
     fn a_normal_query_answers() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         // This crate lives in a git repo, so this is a real end-to-end call.
-        let sha = git_stdout_bounded(Some(root), &["rev-parse", "--short", "HEAD"]);
+        let sha = git_stdout_bounded(Some(root), ["rev-parse", "--short", "HEAD"]);
         assert!(sha.is_some(), "a warm rev-parse must answer");
         assert!(!sha.unwrap().contains('\n'), "stdout must arrive trimmed");
     }
@@ -133,13 +133,13 @@ mod tests {
     fn a_failing_query_is_none_not_a_hang() {
         let dir = tempfile::tempdir().unwrap();
         // Not a git repository: git exits non-zero, promptly.
-        assert!(git_stdout_bounded(Some(dir.path()), &["rev-parse", "HEAD"]).is_none());
+        assert!(git_stdout_bounded(Some(dir.path()), ["rev-parse", "HEAD"]).is_none());
     }
 
     #[test]
     fn an_unknown_subcommand_is_none() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert!(git_stdout_bounded(Some(root), &["definitely-not-a-git-command"]).is_none());
+        assert!(git_stdout_bounded(Some(root), ["definitely-not-a-git-command"]).is_none());
     }
 
     /// The property the module exists for: a call that would block forever
@@ -152,7 +152,7 @@ mod tests {
         let started = std::time::Instant::now();
         // `hash-object --stdin` waits for input. stdin is null, so it sees EOF
         // immediately: the point is that stdin is never left open to block on.
-        let out = git_output_bounded(Some(root), &["hash-object", "--stdin"]);
+        let out = git_output_bounded(Some(root), ["hash-object", "--stdin"]);
         assert!(
             started.elapsed() < GIT_QUERY_TIMEOUT,
             "a stdin-reading command must not consume the deadline"
@@ -193,7 +193,9 @@ mod tests {
         );
     }
 
-    /// A path carrying bytes that are not valid UTF-8 must reach git intact.
+    /// A path carrying bytes that are not valid UTF-8 must reach git intact,
+    /// both as the working directory (what every caller here uses) and as an
+    /// argument (what the `AsRef<OsStr>` bound exists to allow).
     ///
     /// Linux-only, because that is where such a path can actually be created.
     /// macOS rejects the filename at the filesystem layer (APFS and HFS+ both
@@ -203,11 +205,11 @@ mod tests {
     /// is.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_non_utf8_path_argument_is_not_mangled() {
+    fn a_non_utf8_path_is_not_mangled() {
         use std::os::unix::ffi::OsStrExt;
 
         let dir = tempfile::tempdir().unwrap();
-        // 0xFF is a legal byte in a Unix filename and never legal in UTF-8.
+        // 0xFF is a legal byte in a Linux filename and never legal in UTF-8.
         let odd = dir.path().join(OsStr::from_bytes(b"work\xFFtree"));
         std::fs::create_dir(&odd).unwrap();
         assert!(
@@ -215,33 +217,39 @@ mod tests {
             "temp repo must initialise"
         );
 
-        // Passed as an argument, which is the path that used to go through
-        // `to_string_lossy`. Lossy conversion replaces 0xFF with U+FFFD, and git
-        // then cannot resolve the directory.
-        let top = git_stdout_bounded(
-            None,
-            [
-                OsStr::new("-C"),
-                odd.as_os_str(),
-                OsStr::new("rev-parse"),
-                OsStr::new("--show-toplevel"),
-            ],
-        );
+        // The shape the callers use: the path is the working directory, so it
+        // never round-trips through a string at all.
         assert!(
-            top.is_some(),
+            git_stdout_bounded(Some(&odd), ["rev-parse", "--show-toplevel"]).is_some(),
             "git must resolve a repo whose path is not valid UTF-8"
         );
 
-        // The same call with the lossy conversion the reviewer flagged: it must
-        // fail, which is what makes the assertion above meaningful rather than
-        // accidentally passing.
-        let lossy = git_stdout_bounded(
-            None,
-            ["-C", &odd.to_string_lossy(), "rev-parse", "--show-toplevel"],
-        );
+        // The path as an argument, which is what `to_string_lossy` used to
+        // corrupt. Only possible because `args` takes `AsRef<OsStr>`.
         assert!(
-            lossy.is_none(),
-            "the lossy form must genuinely fail, otherwise this test proves nothing"
+            git_stdout_bounded(
+                None,
+                [
+                    OsStr::new("-C"),
+                    odd.as_os_str(),
+                    OsStr::new("rev-parse"),
+                    OsStr::new("--show-toplevel"),
+                ],
+            )
+            .is_some(),
+            "a raw OsStr path argument must survive"
+        );
+
+        // The lossy form must genuinely fail. Without this the two assertions
+        // above could pass on a system that simply tolerates the mangling, and
+        // the test would prove nothing.
+        assert!(
+            git_stdout_bounded(
+                None,
+                ["-C", &odd.to_string_lossy(), "rev-parse", "--show-toplevel"],
+            )
+            .is_none(),
+            "lossy conversion must genuinely lose the repo"
         );
     }
 }

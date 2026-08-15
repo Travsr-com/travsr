@@ -25,10 +25,10 @@ fn head_at(cwd: &std::path::Path) -> Option<String> {
     // git child or grandchild inherits the pipe (#717 triage, same mechanism as
     // #503 / #572). A HEAD that does not arrive is the same as no HEAD, which
     // this function already handles.
-    crate::git_bounded::git_stdout_bounded(
-        None,
-        &["-C", &cwd.to_string_lossy(), "rev-parse", "--short", "HEAD"],
-    )
+    // `cwd` goes through as a real path rather than `-C <string>`: a path with
+    // bytes that are not valid UTF-8 is legal, and converting it to a string
+    // first would mangle it into U+FFFD and lose a repo that exists.
+    crate::git_bounded::git_stdout_bounded(Some(cwd), ["rev-parse", "--short", "HEAD"])
 }
 
 /// Extract the content between `<travsr-data>` and `</travsr-data>`. Mirrors
