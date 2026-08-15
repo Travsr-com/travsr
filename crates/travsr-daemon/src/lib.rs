@@ -7513,8 +7513,10 @@ mod tests {
             // Counted rather than silently dropped (#698 review, P3): the
             // client cannot observe the refusal, so a persistent mismatch is
             // undiagnosable unless the daemon keeps a tally someone can read.
+            // Keyed on the normalized root, so two spellings of one directory
+            // cannot become two entries (#698 review, P2).
             assert_eq!(
-                plane.refused.get(&theirs.to_string_lossy().into_owned()),
+                plane.refused.get(&travsr_ipc::normalize_repo_root(&theirs)),
                 Some(&1),
                 "a refused report must be countable: {:?}",
                 plane.refused
@@ -7542,6 +7544,129 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// #698 review P2: the refusal tally takes a caller-supplied string as a
+    /// map key, so it needs the same bound the sessions map has. The control
+    /// socket is reachable by any process running as this user and this
+    /// variant is parsed before any other limit applies.
+    #[test]
+    fn the_refusal_tally_is_bounded_and_keyed_on_the_normalized_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        let store = std::sync::Mutex::new(store);
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let sessions = std::sync::Mutex::new(EditorPlane::default());
+        let mine = tmp.path().join("mine");
+        std::fs::create_dir_all(&mine).unwrap();
+
+        let report = |root: &str| {
+            serde_json::to_string(&travsr_ipc::ControlMessage::ReportLspDiagnostics {
+                repo_root: root.to_string(),
+                session: "w".to_string(),
+                ttl_secs: 900,
+                files: vec![],
+                seen: 0,
+                undiagnosed: 0,
+            })
+            .unwrap()
+        };
+        let call = |line: String| {
+            handle_control_message(
+                &line,
+                &mine,
+                &store,
+                &read_store,
+                &cache,
+                &phase_b_scheduler,
+                &index_tx,
+                &sessions,
+            );
+        };
+
+        // Far more distinct roots than the cap allows.
+        for i in 0..(MAX_REFUSED_ROOTS * 3) {
+            call(report(&format!("/nowhere/repo-{i}")));
+        }
+
+        let plane = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            plane.refused.len() <= MAX_REFUSED_ROOTS,
+            "an unbounded map keyed on caller input is how a daemon dies: {} entries",
+            plane.refused.len()
+        );
+        assert!(
+            plane.refused_overflow > 0,
+            "refusals past the cap must still be counted, not dropped"
+        );
+    }
+
+    /// Two spellings of one directory must not read as two different repos:
+    /// that is the exact confusion the tally exists to remove.
+    #[test]
+    fn trailing_slash_and_plain_root_collapse_to_one_refusal_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        let store = std::sync::Mutex::new(store);
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let sessions = std::sync::Mutex::new(EditorPlane::default());
+
+        let mine = tmp.path().join("mine");
+        let theirs = tmp.path().join("theirs");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+
+        let report = |root: String| {
+            serde_json::to_string(&travsr_ipc::ControlMessage::ReportLspDiagnostics {
+                repo_root: root,
+                session: "w".to_string(),
+                ttl_secs: 900,
+                files: vec![],
+                seen: 0,
+                undiagnosed: 0,
+            })
+            .unwrap()
+        };
+        for spelling in [
+            theirs.to_string_lossy().into_owned(),
+            format!("{}/", theirs.to_string_lossy()),
+        ] {
+            handle_control_message(
+                &report(spelling),
+                &mine,
+                &store,
+                &read_store,
+                &cache,
+                &phase_b_scheduler,
+                &index_tx,
+                &sessions,
+            );
+        }
+
+        let plane = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            plane.refused.len(),
+            1,
+            "one directory, one entry: {:?}",
+            plane.refused
+        );
+        assert_eq!(plane.refused.values().sum::<usize>(), 2);
     }
 
     #[test]
@@ -8705,12 +8830,6 @@ fn normalize_nl_query_args(tool: &str, mut args: serde_json::Value) -> serde_jso
     args
 }
 
-/// #688: what one editor window currently sees as broken.
-///
-/// Held only in memory and only while its lease is alive. Nothing here is ever
-/// written to the graph: the graph must stay reproducible from the repository,
-/// and this depends on which extensions a developer installed and on unsaved
-/// buffers. Two planes, each true about its own thing.
 /// Everything the editor plane holds, under one lock.
 ///
 /// The refusal tally lives beside the sessions rather than in its own mutex
@@ -8730,9 +8849,33 @@ pub struct EditorPlane {
     /// editor attached", which is also what a closed panel and an uninstalled
     /// extension look like. Counting makes the drop self-explaining without
     /// costing a log line (#698 review, P3).
+    /// Distinct roots retained. Past this the identity of the root has stopped
+    /// being the useful part and the fact that reports are being refused at
+    /// all is, so further roots fold into `refused_overflow` rather than
+    /// growing the map (#698 review, P2).
+    ///
+    /// Bounded for the same reason `MAX_EDITOR_SESSIONS` is: the control
+    /// socket is reachable by any process running as this user, and this
+    /// variant is parsed before any other limit applies, so an unbounded map
+    /// keyed on a caller-supplied string is a way to grow the daemon without
+    /// limit. The key is the *normalized* root, so `/repo`, `/repo/` and a
+    /// symlinked spelling collapse to one entry instead of three.
     pub refused: std::collections::HashMap<String, usize>,
+    /// Refusals whose root arrived after `MAX_REFUSED_ROOTS` was reached.
+    pub refused_overflow: usize,
 }
 
+/// Distinct refused roots retained per daemon lifetime. Small because the
+/// message it feeds is diagnostic: a handful of roots names the problem, and a
+/// wall of them is noise.
+pub const MAX_REFUSED_ROOTS: usize = 16;
+
+/// #688: what one editor window currently sees as broken.
+///
+/// Held only in memory and only while its lease is alive. Nothing here is ever
+/// written to the graph: the graph must stay reproducible from the repository,
+/// and this depends on which extensions a developer installed and on unsaved
+/// buffers. Two planes, each true about its own thing.
 #[derive(Debug, Clone)]
 pub struct EditorSession {
     /// Repo-relative path → (errors, warnings). Only broken files are present.
@@ -8891,14 +9034,25 @@ fn handle_control_message(
             // would make `travsr daemon lsp` quote files this repo does not
             // have. Normalized through the same helper the socket name is
             // derived from, so the two cannot disagree about identity.
-            if travsr_ipc::normalize_repo_root(std::path::Path::new(&reported_root))
-                != travsr_ipc::normalize_repo_root(repo_root)
-            {
+            let reported = travsr_ipc::normalize_repo_root(std::path::Path::new(&reported_root));
+            if reported != travsr_ipc::normalize_repo_root(repo_root) {
                 // Counted, not logged: at a per-keystroke rate a log line would
                 // be noise, but a silent drop leaves a persistent mismatch with
                 // no thread to pull. `travsr daemon lsp` surfaces the tally.
+                //
+                // Keyed on the normalized root, the same form the comparison
+                // above uses, so the printed message cannot read "named X but
+                // this daemon serves X" for a symlinked or trailing-slash
+                // spelling of one directory, which is the exact case the tally
+                // exists to explain. Capped so a caller cannot grow the map
+                // without limit (#698 review, P2).
                 let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
-                *plane.refused.entry(reported_root.clone()).or_insert(0) += 1;
+                if plane.refused.len() < MAX_REFUSED_ROOTS || plane.refused.contains_key(&reported)
+                {
+                    *plane.refused.entry(reported).or_insert(0) += 1;
+                } else {
+                    plane.refused_overflow += 1;
+                }
                 return (
                     ControlResponse::err("report is for a different repo".to_string()),
                     false,
@@ -8989,8 +9143,12 @@ fn handle_control_message(
             let live = live_editor_sessions(&plane.sessions);
             let payload = serde_json::json!({
                 "editors": live.len(),
-                "served_repo_root": repo_root.to_string_lossy(),
+                // Normalized, matching the keys above: an unnormalized pair
+                // could print two spellings of one directory as if they were
+                // different repos.
+                "served_repo_root": travsr_ipc::normalize_repo_root(repo_root),
                 "refused": refused,
+                "refused_overflow": plane.refused_overflow,
                 "sessions": live
                     .iter()
                     .map(|(id, s)| {

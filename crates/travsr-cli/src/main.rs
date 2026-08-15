@@ -358,6 +358,11 @@ fn print_refused_reports(v: &serde_json::Value) {
             if count == 1 { " was" } else { "s were" }
         );
     }
+    if let Some(extra) = v.get("refused_overflow").and_then(|n| n.as_u64()) {
+        if extra > 0 {
+            println!("{extra} further refusals named other roots, not listed");
+        }
+    }
     println!(
         "An editor reports the first workspace folder, so a multi-root window \
          or one opened on a subdirectory names a root no daemon owns."
