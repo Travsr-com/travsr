@@ -33,22 +33,43 @@ use anyhow::{Context as _, Result};
 use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-/// The user-facing release identity, including any prerelease suffix.
+/// Resolve the reported version: an injected build id wins, the crate version
+/// is the fallback.
 ///
-/// `crates/travsr-cli/Cargo.toml` holds the *base* version (`1.0.0`), because
-/// `release.yml`'s `verify-version` job asserts the tag base equals it. The
-/// prerelease suffix therefore never reaches the crate version, and before this
-/// existed a `v1.0.0-beta.1` build reported plain `1.0.0`: identical to what the
-/// eventual stable `1.0.0` will report, so a tester's version string could not
-/// be told apart from a stable user's, and neither could `beta.1` from `beta.2`.
+/// Split out as a real function rather than inlined into the `const` below so a
+/// test can exercise this exact code with both inputs. A test that reimplements
+/// the match would pass even if these arms were swapped.
+const fn resolve_version(
+    injected: Option<&'static str>,
+    crate_version: &'static str,
+) -> &'static str {
+    match injected {
+        Some(v) => v,
+        None => crate_version,
+    }
+}
+
+/// The build identity reported by `--version` and by the daemon's `version=`
+/// telemetry field.
 ///
-/// The release workflow sets `TRAVSR_RELEASE_VERSION` to the tag without its
-/// leading `v`. Local and development builds leave it unset and fall back to the
-/// crate version, so nothing changes outside a tagged release.
-const RELEASE_VERSION: &str = match option_env!("TRAVSR_RELEASE_VERSION") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
-};
+/// The shipped `v1.0.0-beta.1` binary reported a bare `1.0.0`, identical to what
+/// the eventual stable `1.0.0` reports, so a tester's version string could not be
+/// attributed to a build.
+///
+/// It deliberately does **not** carry the prerelease suffix. `release.yml`'s
+/// `promote` job reuses the source channel's signed artifacts byte for byte and
+/// never rebuilds, so `beta.1 -> rc.1 -> stable` all ship the same binary. Baking
+/// in `1.0.0-beta.1` would make every promoted stable release report itself as a
+/// beta forever, which is a worse lie than the ambiguity it replaced.
+///
+/// Instead the release job injects `<tag base>+<short commit>`. The tag base is
+/// promotion-stable (`v1.0.0-beta.1` and `v1.0.0` share the base `1.0.0`), and
+/// the commit identifies the build itself: `beta.1` and `beta.2` differ because
+/// they are different commits, while a promoted stable matches the beta it came
+/// from because it genuinely is the same bits. Unset on local builds, which fall
+/// back to the crate version.
+const RELEASE_VERSION: &str =
+    resolve_version(option_env!("TRAVSR_BUILD_ID"), env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Parser)]
 #[command(
@@ -2431,7 +2452,7 @@ mod daemon_log_tests {
     // ── --level / --since ────────────────────────────────────────────────
 
     use super::{is_entry_start, parse_level, parse_since, LineFilter, LogLine, LogRenderer};
-    use super::{Cli, RELEASE_VERSION};
+    use super::{resolve_version, Cli, RELEASE_VERSION};
     use clap::CommandFactory as _;
 
     /// A JSON entry in the shape the daemon actually writes.
@@ -2743,9 +2764,9 @@ mod daemon_log_tests {
         assert!(!RELEASE_VERSION.is_empty(), "version must never be empty");
 
         // Unset in every local and CI test run, so this asserts the fallback
-        // branch. The injected branch is exercised by the release workflow, and
-        // by `release_version_prefers_the_injected_tag` below.
-        if option_env!("TRAVSR_RELEASE_VERSION").is_none() {
+        // branch. The injected branch is covered by `resolve_version_prefers_the
+        // _injected_build_id` below, which calls the real selection function.
+        if option_env!("TRAVSR_BUILD_ID").is_none() {
             assert_eq!(
                 RELEASE_VERSION,
                 env!("CARGO_PKG_VERSION"),
@@ -2761,19 +2782,31 @@ mod daemon_log_tests {
         );
     }
 
-    /// Pins the selection rule itself, independently of how this build was
-    /// compiled: an injected tag wins, and the crate version is only a fallback.
-    /// Without this, a release build that silently lost the injection would
-    /// still satisfy the test above.
+    /// Exercises the real `resolve_version`, not a copy of it, so swapping its
+    /// arms fails here. The previous version of this test reimplemented the
+    /// match locally and asserted against its own copy, which could never have
+    /// caught a regression in the production const.
     #[test]
-    fn release_version_prefers_the_injected_tag() {
-        const fn pick(injected: Option<&'static str>, crate_version: &'static str) -> &'static str {
-            match injected {
-                Some(v) => v,
-                None => crate_version,
-            }
-        }
-        assert_eq!(pick(Some("1.0.0-beta.1"), "1.0.0"), "1.0.0-beta.1");
-        assert_eq!(pick(None, "1.0.0"), "1.0.0");
+    fn resolve_version_prefers_the_injected_build_id() {
+        assert_eq!(
+            resolve_version(Some("1.0.0+56c9329"), "1.0.0"),
+            "1.0.0+56c9329"
+        );
+        assert_eq!(resolve_version(None, "1.0.0"), "1.0.0");
+    }
+
+    /// The injected id must never carry a prerelease suffix. `promote` reuses
+    /// artifacts byte for byte, so a suffix baked into a beta build would follow
+    /// it into the promoted stable release and misreport it forever.
+    #[test]
+    fn an_injected_build_id_never_carries_a_prerelease_suffix() {
+        // The shape the release workflow injects: base + short commit.
+        let injected = resolve_version(Some("1.0.0+56c9329"), "1.0.0");
+        let base = injected.split('+').next().unwrap_or_default();
+        assert!(
+            !base.contains('-'),
+            "a promoted stable release ships the beta's bits, so the baked id \
+             must not name a channel; got {injected:?}"
+        );
     }
 }
