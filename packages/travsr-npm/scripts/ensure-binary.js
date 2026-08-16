@@ -139,8 +139,14 @@ async function ensureBinary() {
   // Extract binary from tarball.
   // On Windows the archive contains travsr.exe; on Unix it contains travsr.
   // tar ships with macOS, Linux, and Windows 10+ (build 17063+).
+  // --force-local: without it, GNU tar reads a colon anywhere before the
+  // first path separator as a "host:path" remote-tape spec, so an absolute
+  // Windows path (C:\...) makes it try to rsh/ssh into a host named "C" and
+  // fail with "Cannot connect to ...: resolve failed" instead of extracting.
+  // Both GNU tar and bsdtar (macOS's and Windows 10's built-in tar.exe)
+  // accept the flag and it is a no-op on a path with no colon.
   const binName = process.platform === 'win32' ? 'travsr.exe' : 'travsr';
-  execFileSync('tar', ['-xzf', tmpTar, '-C', BIN_DIR, binName], { stdio: 'inherit' });
+  execFileSync('tar', ['-xzf', tmpTar, '--force-local', '-C', BIN_DIR, binName], { stdio: 'inherit' });
   fs.unlinkSync(tmpTar);
 
   if (process.platform !== 'win32') fs.chmodSync(destBin, 0o755);

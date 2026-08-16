@@ -6,6 +6,10 @@ All notable changes to Travsr are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- **`npm i -g @travsr.com/travsr` failed to extract the binary on Windows.** `ensure-binary.js` ran `tar -xzf <path>` with an absolute Windows path (`C:\...\travsr-*.tar.gz`), and GNU tar (the `tar` on PATH in a Git-for-Windows shell) reads a colon before the first path separator as a `host:path` remote-tape spec, so it tried to rsh/ssh into a host named `C` and failed with `Cannot connect to ...: resolve failed` instead of extracting. `v1.0.0-beta.1`'s and `v1.0.0-rc.1`'s Windows smoke-install jobs both hit this at the same step. Added `--force-local`, which both GNU tar and bsdtar (macOS's and Windows 10's built-in `tar.exe`) accept and which is a no-op on a path with no colon.
+
 ---
 
 ## v1.0.0-rc.1 - 2026-08-16
