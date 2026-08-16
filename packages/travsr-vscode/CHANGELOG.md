@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-16
+
 ### Fixed
 
 - Blast radius is now transitive across all languages (#613): the code lens count, the "Blast radius" panel, the hover card, and the pre-edit and rename warnings previously reported only direct importers for the languages resolved without `ResolvesTo` edges (Ruby, Go, Java, Kotlin, Scala, PHP, C#, C/C++, Swift, Dart). They now walk importers to a fixpoint, so an edit two or more hops away is reported, and Objective-C, which previously returned nothing, is supported. Counts rise accordingly and are more complete, so a file may cross the "high blast" code-lens threshold it did not before.
