@@ -459,7 +459,7 @@ pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
     // No-commit repos (both keys absent) and fully-indexed repos (both keys
     // present) fall through to the normal path.
     if phase_b_pending(store) {
-        return r#"{"status":"pending","message":"Semantic call-edge index is building in the background. Call edges will be available in ~2 minutes. Run `travsr status` to check progress."}"#.to_string();
+        return phase_b_pending_json("Semantic call-edge index");
     }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
     // #617: append the staleness note (marker behind HEAD / dirty flag) so an
@@ -938,6 +938,22 @@ fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
     out
 }
 
+/// The "Phase B has not finished" answer, shared by every tool that depends on it.
+///
+/// #726: these used to promise the result was "building in the background" and
+/// would arrive "in ~2 minutes". Phase B only runs under a daemon, so with none
+/// running the work is not scheduled at all and that wait never ends. The ETA
+/// was counting down something nothing was counting.
+///
+/// One function rather than three literals because the three tools drifted:
+/// `find_references`, `get_callers` and `get_execution_path` each carried their
+/// own copy, so fixing one left the other two telling users the same falsehood.
+fn phase_b_pending_json(index_name: &str) -> String {
+    format!(
+        r#"{{"status":"pending","message":"{index_name} has not finished. It is built by the daemon: check `travsr daemon status` and start one with `travsr daemon start` if none is running, or build it now with `travsr init --semantic`. `travsr status` shows progress."}}"#
+    )
+}
+
 /// Enumerate every use site (`path:line`) of a symbol across the current repo.
 ///
 /// Reads the `edge_sites` occurrence store (populated by every ingestion path —
@@ -957,7 +973,7 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
         }
     }
     if phase_b_pending(store) {
-        return r#"{"status":"pending","message":"Semantic occurrence index is building in the background. References will be available in ~2 minutes. Run `travsr status` to check progress."}"#.to_string();
+        return phase_b_pending_json("Semantic occurrence index");
     }
     // SEC-001: sanitize before returning. Use the larger find-output limit (not
     // the 4 KiB scalar cap) so a capped 500-site list and its truncation notice
@@ -3517,7 +3533,7 @@ pub fn repos_remove(name: &str) -> String {
 pub fn get_execution_path(store: &SqliteStore, source: &str, sink: &str) -> String {
     // Phase B deferred: execution paths require call edges which are not yet indexed.
     if phase_b_pending(store) {
-        return r#"{"status":"pending","message":"Semantic call-edge index is building in the background. Execution paths will be available in ~2 minutes. Run `travsr status` to check progress."}"#.to_string();
+        return phase_b_pending_json("Semantic call-edge index");
     }
     get_execution_path_with_filter(store, source, sink, &OpenFilter)
 }
@@ -13842,5 +13858,38 @@ mod snippet_tests {
 
         std::env::remove_var("TRAVSR_DOCS_ENABLED");
         std::env::remove_var("TRAVSR_DOC_FLOOR");
+    }
+
+    /// #726: the pending answer must not promise a time. Phase B only runs under
+    /// a daemon, so with none running there is nothing counting down and any ETA
+    /// is false. Asserts over the real helper, and over this file's whole source,
+    /// so a fourth caller cannot quietly reintroduce its own literal the way the
+    /// first three each did.
+    #[test]
+    fn the_phase_b_pending_answer_never_promises_a_time() {
+        let msg = super::phase_b_pending_json("Semantic occurrence index");
+        assert!(
+            !msg.contains("minute") && !msg.contains("~"),
+            "pending answer must not carry an ETA: {msg}"
+        );
+        assert!(
+            msg.contains("travsr daemon start"),
+            "pending answer must name what actually produces the index: {msg}"
+        );
+        assert!(
+            msg.contains("\"status\":\"pending\""),
+            "must stay valid pending JSON: {msg}"
+        );
+
+        // The whole file, so a new tool added later with its own hand-written
+        // literal fails here rather than shipping the falsehood again.
+        // Needle built at runtime so this assertion's own text cannot match it.
+        let needle = format!("will be available in {}", '~');
+        let src = include_str!("tools.rs");
+        assert!(
+            !src.contains(&needle),
+            "a pending message carrying an ETA has reappeared in tools.rs; call \
+             phase_b_pending_json instead of writing a new literal"
+        );
     }
 }
