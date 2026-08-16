@@ -1,7 +1,7 @@
 {
   "name": "travsr-lsif-py",
   "version": "0.1.0",
-  "description": "Python LSIF emitter for Travsr code intelligence — semantic edges via tree-sitter",
+  "description": "Python LSIF emitter for Travsr code intelligence: semantic edges via tree-sitter",
   "main": "dist/index.js",
   "bin": {
     "travsr-lsif-py": "dist/index.js"

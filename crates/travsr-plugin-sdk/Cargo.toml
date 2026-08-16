@@ -1,6 +1,6 @@
 [package]
 name = "travsr-plugin-sdk"
-description = "Travsr plugin SDK — run-loop and ergonomics for plugin authors"
+description = "Travsr plugin SDK: run-loop and ergonomics for plugin authors"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,7 +1,7 @@
 {
   "name": "travsr-lsif-ts",
   "version": "0.4.0",
-  "description": "TypeScript LSIF emitter for Travsr code intelligence — semantic edges via the TS compiler API",
+  "description": "TypeScript LSIF emitter for Travsr code intelligence: semantic edges via the TS compiler API",
   "main": "dist/index.js",
   "bin": {
     "travsr-lsif-ts": "dist/index.js"
