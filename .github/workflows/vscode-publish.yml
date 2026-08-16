@@ -112,6 +112,13 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           files: packages/travsr-vscode/*.vsix
+          # This action defaults make_latest to "true". The repo-wide GitHub
+          # "latest release" pointer belongs to the CLI's stable channel
+          # (release.yml sets make_latest explicitly per channel); a vscode
+          # tag must never contend for it, since install.sh's GitHub-fallback
+          # URL (releases/latest/download/install.sh) depends on "latest"
+          # actually being a CLI release with that asset attached.
+          make_latest: false
 
       - name: Publish to VS Code Marketplace
         if: ${{ !inputs.dry_run }}
