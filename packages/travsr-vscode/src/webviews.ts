@@ -1043,7 +1043,7 @@ export function buildLanguagesHtml(
     <label>Approver GitHub handle</label>
     <input id="by_${esc(l.language)}" placeholder="your-github-handle">
     <label>Reason (one sentence)</label>
-    <input id="reason_${esc(l.language)}" placeholder="e.g. Need Java SCIP for service indexing">
+    <input id="reason_${esc(l.language)}" placeholder="e.g. Enable Java cross-file analysis for service indexing">
     <label>Permitted hosts (comma-separated)</label>
     <input id="hosts_${esc(l.language)}" value="${esc(l.elevatedHosts.join(","))}" placeholder="${esc(l.elevatedHosts.join(","))}">
     <button class="btn primary" onclick="approveLang(this,'${esc(l.language)}')">Grant &amp; Install</button>
