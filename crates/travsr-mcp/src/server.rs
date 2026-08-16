@@ -383,7 +383,7 @@ pub fn tools_list() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "symbol": { "type": "string", "description": "Symbol to enumerate references of (bare name or full signature)" },
-                        "path": { "type": "string", "description": "Optional repo-relative file-path hint to disambiguate overloaded names" }
+                        "path": { "type": "string", "description": "Optional path hint to scope an overloaded name to a file or directory: a filename, a relative path, a directory prefix, or a path fragment (e.g. ppr.rs, src/ppr.rs, crates/travsr-retrieval, retrieval)" }
                     },
                     "required": ["symbol"],
                     "additionalProperties": false
@@ -1017,7 +1017,7 @@ pub fn tools_list_global() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "symbol": { "type": "string", "description": "Symbol to enumerate references of (bare name or full signature)" },
-                        "path": { "type": "string", "description": "Optional repo-relative file-path hint to disambiguate overloaded names" },
+                        "path": { "type": "string", "description": "Optional path hint to scope an overloaded name to a file or directory: a filename, a relative path, a directory prefix, or a path fragment (e.g. ppr.rs, src/ppr.rs, crates/travsr-retrieval, retrieval)" },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["symbol"],

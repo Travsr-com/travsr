@@ -839,8 +839,9 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                     .cloned()
                     .collect();
                 if let Some(p) = args.path.as_deref() {
-                    let boundary = format!("/{p}");
-                    file_hits.retain(|n| n.vname.path == p || n.vname.path.ends_with(&boundary));
+                    // #647: same widened path hint as the symbol ladder — a
+                    // directory or fragment must scope a file-name query too.
+                    file_hits.retain(|n| crate::tools::path_hint_matches(&n.vname.path, p));
                 }
                 file_hits.sort_by_key(|n| n.id.0);
                 file_hits.dedup_by_key(|n| n.id);
