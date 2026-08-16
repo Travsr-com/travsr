@@ -54,8 +54,10 @@ pub fn effective_cpu_count() -> usize {
         .map(|n| n.get())
         .unwrap_or(1);
 
+    // On Linux, additionally cap by the cgroup quota files (shadowing `base`
+    // keeps one tail expression for every OS — clippy::needless_return).
     #[cfg(target_os = "linux")]
-    {
+    let base = {
         let mut n = base;
         if let Some(q) = cgroup_v2_cpu_quota() {
             n = n.min(q);
@@ -63,10 +65,9 @@ pub fn effective_cpu_count() -> usize {
         if let Some(q) = cgroup_v1_cpu_quota() {
             n = n.min(q);
         }
-        return n.max(1);
-    }
+        n
+    };
 
-    #[cfg(not(target_os = "linux"))]
     base.max(1)
 }
 
