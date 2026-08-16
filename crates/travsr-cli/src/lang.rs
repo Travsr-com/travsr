@@ -252,20 +252,10 @@ fn cmd_list(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<12} {:<26} {:<10} STATUS",
-        "LANGUAGE", "PACKAGE", "SANDBOX"
-    );
-    println!("{}", "-".repeat(80));
+    println!("{:<12} STATUS", "LANGUAGE");
+    println!("{}", "-".repeat(48));
 
     for entry in CATALOG {
-        let sandbox_label = match entry.sandbox {
-            SandboxRequirement::Standard => "Standard",
-            SandboxRequirement::NativeIpc => "NativeIpc",
-            SandboxRequirement::RequiresElevated => "Elevated",
-        };
-
-        let package_col = entry.npm_package.unwrap_or(entry.command);
         let provider_on_path = entry.provider_binary.map_or(true, tool_available);
         let tool_on_path = tool_available(entry.command);
         let fully_ready = entry.builtin || (provider_on_path && tool_on_path);
@@ -279,12 +269,14 @@ fn cmd_list(json: bool) -> Result<()> {
         let approved = approval.is_some();
         let sandbox_ok = sandbox_available();
 
+        // Appended to an active language whose network approval has aged out.
         let expiry_warning = if let Some(appr) = &approval {
             if let Ok(date) = chrono::NaiveDate::parse_from_str(&appr.approved_date, "%Y-%m-%d") {
                 let age = (today - date).num_days();
                 if age > APPROVAL_EXPIRY_DAYS {
                     Some(format!(
-                        " ⚠ approval expired ({age} days ago — re-run travsr lang approve)"
+                        " \u{26a0} approval expired \u{00b7} travsr lang install {}",
+                        entry.language
                     ))
                 } else {
                     None
@@ -296,83 +288,57 @@ fn cmd_list(json: bool) -> Result<()> {
             None
         };
 
-        // UX-013: built-in language plugins (rust, typescript, python, dart) ship
-        // inside the travsr binary and their semantic analysis works without any
-        // `travsr lang install` step — registration in lang.toml is only for the
-        // external-tool languages. So a built-in that is ready must read as active,
-        // never "on PATH, not registered — run travsr lang install", which falsely
-        // told users their built-in semantic support was not set up.
+        // UX-013: built-in plugins (rust, typescript, python, dart) ship inside the
+        // travsr binary and work without any install step, so a ready built-in must
+        // read as active rather than "not set up".
         let active_eligible = registered || entry.builtin;
-        // #588: checked before every other branch. A language whose wrapper is
-        // not published for this host cannot become active here no matter what
-        // else is true, and "not installed — travsr lang install <lang>" would
-        // be an instruction that cannot succeed.
-        let status = if let Some(target) = wrapper_unavailable_target(entry) {
-            unavailable_status(entry, target)
+        // Deliberately terse: one short state per row, plus at most the single
+        // command that changes it. Verbose install URLs / chmod hints stay in
+        // `lang install` output, not here.
+        //
+        // #588: the platform-unavailable case is checked before every other branch
+        // — a wrapper that ships no binary for this host can never become active.
+        let status = if wrapper_unavailable_target(entry).is_some() {
+            "\u{2013} unavailable on this platform".to_string()
         } else if entry.sandbox == SandboxRequirement::RequiresElevated && !approved {
-            "needs security approval (travsr lang install — run interactively)".to_string()
-        } else if wrapper_only {
-            let hint = if entry.underlying_tool_hint.is_empty() {
-                entry.install_hint
-            } else {
-                entry.underlying_tool_hint
-            };
             format!(
-                "wrapper-only  ({} installed, {} missing — {})",
-                entry.provider_binary.unwrap(),
-                entry.command,
-                hint,
+                "\u{2013} needs approval \u{00b7} travsr lang install {}",
+                entry.language
+            )
+        } else if wrapper_only {
+            format!(
+                "\u{26a0} tool missing \u{00b7} travsr lang install {}",
+                entry.language
             )
         } else if active_eligible && fully_ready && !sandbox_ok && !entry.builtin {
-            #[cfg(target_os = "linux")]
-            let hint = "install bubblewrap: sudo apt-get install bubblewrap";
-            #[cfg(target_os = "macos")]
-            let hint = "sandbox-exec unavailable";
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            let hint = "sandbox not available on this platform";
-            format!("disabled (sandbox unavailable — {hint})")
-        } else if active_eligible && fully_ready {
-            let phase_b_note = if entry.builtin
-                && !entry.native_phase_b
-                && !tool_on_path
-                && !entry.install_hint.is_empty()
-            {
-                format!(
-                    " (parsing only, semantic analysis needs: {})",
-                    entry.install_hint
-                )
+            // Sandbox story is per-OS: Linux can install bubblewrap; macOS ships
+            // sandbox-exec (nothing to install if it is missing); Windows/other
+            // have no user-installable remedy. `cfg!` (not `#[cfg]`) so every
+            // platform's string is compiled and checked, not just this host's.
+            if cfg!(target_os = "linux") {
+                "\u{2013} disabled (sandbox unavailable) \u{00b7} install bubblewrap".to_string()
             } else {
-                String::new()
-            };
-            let kind = if entry.builtin { "built-in · " } else { "" };
+                "\u{2013} disabled (sandbox unavailable)".to_string()
+            }
+        } else if active_eligible && fully_ready {
+            let kind = if entry.builtin { " (built-in)" } else { "" };
             format!(
-                "\u{2713} {kind}active{}{}",
-                phase_b_note,
+                "\u{2713} active{kind}{}",
                 expiry_warning.as_deref().unwrap_or("")
             )
         } else if registered && !fully_ready {
-            let missing = if !provider_on_path {
-                entry.provider_binary.unwrap_or(entry.command)
-            } else {
-                entry.command
-            };
             format!(
-                "registered but {missing} not on PATH — run: travsr lang install {}",
-                entry.language
-            )
-        } else if fully_ready {
-            format!(
-                "on PATH, not registered — run: travsr lang install {}",
+                "\u{26a0} tool missing \u{00b7} travsr lang install {}",
                 entry.language
             )
         } else {
-            format!("not installed — {}", entry.install_hint)
+            format!(
+                "\u{2013} not set up \u{00b7} travsr lang install {}",
+                entry.language
+            )
         };
 
-        println!(
-            "{:<12} {:<26} {:<10} {}",
-            entry.language, package_col, sandbox_label, status
-        );
+        println!("{:<12} {}", entry.language, status);
     }
 
     // RFC-025 §8: sidecar version health for the installed Phase B tools

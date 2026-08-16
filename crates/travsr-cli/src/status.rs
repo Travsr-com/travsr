@@ -170,6 +170,19 @@ pub fn run() -> anyhow::Result<()> {
     // analyzers without having to re-read the init output.
     if let Some(warnings) = &payload.phase_b_warnings {
         if !warnings.is_empty() {
+            // Trust is per-repo, not per-language: a single `install` enables
+            // every language at once, so collapse the "not enabled here" notices
+            // into one line rather than repeating it per language (matches init).
+            let untrusted: Vec<&str> = warnings
+                .split(',')
+                .filter_map(|w| w.strip_prefix("untrusted_corpus:"))
+                .collect();
+            if !untrusted.is_empty() {
+                eprintln!(
+                    "warning: semantic analysis is not enabled for this repository yet ({}) — run `travsr lang install <lang>` here to enable",
+                    untrusted.join(", ")
+                );
+            }
             for warn in warnings.split(',') {
                 let parts: Vec<&str> = warn.splitn(2, ':').collect();
                 match parts.as_slice() {
@@ -220,12 +233,10 @@ pub fn run() -> anyhow::Result<()> {
                     ["skipped_unregistered", lang] => eprintln!(
                         "warning: '{lang}' sources found but semantic indexing is not set up. Run `travsr lang install {lang}`"
                     ),
-                    // #414 (ADR-017 Rule 3): the language is registered globally,
-                    // but this repo was never enabled, so its external tooling was
-                    // not spawned. Re-running `install` here grants that.
-                    ["untrusted_corpus", lang] => eprintln!(
-                        "warning: '{lang}' semantic analysis is not enabled for this repository yet. Run `travsr lang install {lang}` here to enable it"
-                    ),
+                    // #414 (ADR-017 Rule 3): registered globally but this repo was
+                    // never enabled. Collapsed into one combined line above the
+                    // loop (trust is per-repo, so one install fixes all of them).
+                    ["untrusted_corpus", _] => {}
                     ["skipped_no_analyzer", lang] => eprintln!(
                         "warning: '{lang}' is registered but its analyzer binary is missing. Run `travsr lang install {lang}`"
                     ),
