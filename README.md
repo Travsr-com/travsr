@@ -220,6 +220,8 @@ or the call returns an ambiguity error naming `repos_list`.
 |---|---|
 | `get_dependencies(file)` | All imports/dependencies of a file |
 | `get_callers(symbol)` | All nodes with an incoming edge to a symbol |
+| `find_references(symbol, path?)` | Every use site of a symbol as `path:line`, across every indexed language; `path` scopes an overloaded name to a file, directory, or path fragment |
+| `find_pattern(pattern, scope?, fixed?)` | Graph-scoped textual/regex search (`git grep`-style), optionally confined to a path prefix or to files importing a symbol |
 | `get_blast_radius(file)` | Files transitively affected if the given file changes |
 | `search_symbol(name)` | Symbol definitions matching a name across the graph |
 | `get_repo_map` | Structural overview of the indexed repository |
@@ -261,9 +263,15 @@ In global mode, tools that accept a `file` or `symbol` argument also accept an o
 
 ```
 travsr init                          Index the repo, install git hook, register globally
+travsr init --no-connect             Index the repo without wiring detected AI tools to Travsr
+travsr connect                       Detect installed AI coding tools and wire each to the Travsr MCP server
+travsr connect --print               Show what connect would write, without touching the filesystem
+travsr connect --remove              Undo a previous connect run
 travsr daemon start/stop/status      Start, stop, or check the background daemon
 travsr repos                         List all globally registered repos
 travsr status                        Show node/edge counts, schema version, last-indexed SHA
+travsr fsck                          Report ghost nodes and orphan edges (add --fix to repair)
+travsr config get/set <key>          Inspect or set a layered config key (global, or --repo for this repo)
 travsr ask <query>                   PPR + knapsack symbol lookup from the terminal
 travsr graph <query>                 Show dependency graph for a symbol or file
 travsr graph --all                   Show graph for the entire indexed repository
@@ -283,7 +291,25 @@ travsr embed init                    Initialize the embedding index for this rep
 travsr embed status                  Show embedding index status
 travsr embed reindex                 Rebuild the embedding index
 travsr embed switch <model>          Switch to a different embedding model
+travsr embed reconfigure             Change the reindex worker budget/priority and apply it immediately
+travsr embed gc                      Reclaim disk space held by inactive embedding models (dry-run; add --apply)
+travsr embed calibrate               Re-measure semantic floors on the existing index without re-embedding
+travsr rerank install                Download the cross-encoder reranker model
+travsr rerank status                 Show whether the reranker model is installed
 ```
+
+**AI tool auto-wiring.** `travsr init` (unless run with `--no-connect`) and
+`travsr connect` detect installed AI coding tools, Claude Code, Cursor, VS Code
+Copilot, Gemini CLI, Antigravity, Codex, Windsurf, and Zed, and for each one
+register the `travsr mcp --stdio` server plus an always-on rules file telling
+the agent to query Travsr before grep or a raw file read. Generated files are
+local and git-ignored by default (a committed MCP server definition is a
+clone-and-run-arbitrary-command vector), written only into files a strict-JSON
+check confirms Travsr already owns or that don't exist yet, so an existing
+hand-authored config is skipped rather than clobbered. Pass `--commit` to
+opt into committing the generated files instead, `--tool <id>` to wire a
+single tool, `--print` to preview without writing, or `--remove` to undo a
+previous run.
 
 **GPU acceleration (optional).** `travsr embed init` installs a CPU-only sidecar
 by default, which works everywhere with nothing to set up. Set
