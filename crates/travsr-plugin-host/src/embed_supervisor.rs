@@ -63,10 +63,7 @@ struct HookWorker<Req: Send + 'static, Resp: Send + 'static> {
 }
 
 impl<Req: Send + 'static, Resp: Send + 'static> HookWorker<Req, Resp> {
-    fn spawn(
-        name: &'static str,
-        handler: impl Fn(Req) -> Option<Resp> + Send + 'static,
-    ) -> Self {
+    fn spawn(name: &'static str, handler: impl Fn(Req) -> Option<Resp> + Send + 'static) -> Self {
         let (tx, rx) = mpsc::sync_channel::<(Req, mpsc::Sender<Resp>)>(HOOK_QUEUE_DEPTH);
         std::thread::Builder::new()
             .name(name.to_string())
@@ -251,27 +248,24 @@ impl EmbedSupervisor {
         if !self.capabilities()?.supports_doc_space() {
             return None;
         }
-        let worker = HookWorker::spawn(
-            "embed-doc-knn-worker",
-            move |(query, k): (String, u32)| {
-                let Ok(sidecar) = arc.lock() else { return None };
-                if !sidecar.is_alive() {
-                    return None;
+        let worker = HookWorker::spawn("embed-doc-knn-worker", move |(query, k): (String, u32)| {
+            let Ok(sidecar) = arc.lock() else { return None };
+            if !sidecar.is_alive() {
+                return None;
+            }
+            match sidecar.knn(&query, k, &model_id, Space::Docs) {
+                Ok(pairs) => Some(
+                    pairs
+                        .into_iter()
+                        .map(|(id, score)| (NodeId(id as u64), score))
+                        .collect::<Vec<(NodeId, f32)>>(),
+                ),
+                Err(e) => {
+                    tracing::warn!("embed doc knn failed (non-fatal): {e}");
+                    None
                 }
-                match sidecar.knn(&query, k, &model_id, Space::Docs) {
-                    Ok(pairs) => Some(
-                        pairs
-                            .into_iter()
-                            .map(|(id, score)| (NodeId(id as u64), score))
-                            .collect::<Vec<(NodeId, f32)>>(),
-                    ),
-                    Err(e) => {
-                        tracing::warn!("embed doc knn failed (non-fatal): {e}");
-                        None
-                    }
-                }
-            },
-        );
+            }
+        });
         Some(Arc::new(move |query: &str, k: u32| {
             Ok(worker
                 .call(

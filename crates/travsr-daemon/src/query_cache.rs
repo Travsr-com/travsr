@@ -322,7 +322,14 @@ mod tests {
         let big = "x".repeat(8 * 1024 * 1024);
         for i in 0..20 {
             let args = json!({ "k": i });
-            c.put("graph", &args, "c", "c", dv(1), json!({ "blob": big.clone() }));
+            c.put(
+                "graph",
+                &args,
+                "c",
+                "c",
+                dv(1),
+                json!({ "blob": big.clone() }),
+            );
         }
         assert!(
             c.total_bytes <= MAX_CACHE_BYTES,
