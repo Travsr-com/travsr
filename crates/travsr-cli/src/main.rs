@@ -511,13 +511,16 @@ async fn main() {
         std::process::exit(1);
     }));
 
-    // UX-019: publish the product version (this binary's `CARGO_PKG_VERSION`,
-    // 1.0.0) so the daemon's session-start log reports the same number as
-    // `travsr --version` instead of its own workspace crate version (0.7.0). The
-    // background daemon is a re-exec of this same binary, so it runs this too.
-    // Same string `--version` prints, so the daemon's session-start `version=`
-    // field identifies the exact release a tester is running rather than only
-    // its base version.
+    // UX-019: publish the product version (`RELEASE_VERSION`) so the daemon's
+    // session-start log reports the same string as `travsr --version` instead of
+    // its own workspace crate version (0.7.0). The background daemon is a re-exec
+    // of this same binary, so it runs this too.
+    //
+    // Must stay `RELEASE_VERSION`, not `CARGO_PKG_VERSION`: on a release build
+    // those differ, because `RELEASE_VERSION` carries the injected `+<shortsha>`
+    // build metadata that identifies which build a tester is running. Reverting
+    // this to `CARGO_PKG_VERSION` would silently restore the ambiguity where
+    // every build reports a bare `1.0.0`.
     travsr_daemon::set_build_version(RELEASE_VERSION);
 
     // Parse CLI args BEFORE initialising any subsystems.
@@ -2795,18 +2798,9 @@ mod daemon_log_tests {
         assert_eq!(resolve_version(None, "1.0.0"), "1.0.0");
     }
 
-    /// The injected id must never carry a prerelease suffix. `promote` reuses
-    /// artifacts byte for byte, so a suffix baked into a beta build would follow
-    /// it into the promoted stable release and misreport it forever.
-    #[test]
-    fn an_injected_build_id_never_carries_a_prerelease_suffix() {
-        // The shape the release workflow injects: base + short commit.
-        let injected = resolve_version(Some("1.0.0+56c9329"), "1.0.0");
-        let base = injected.split('+').next().unwrap_or_default();
-        assert!(
-            !base.contains('-'),
-            "a promoted stable release ships the beta's bits, so the baked id \
-             must not name a channel; got {injected:?}"
-        );
-    }
+    // The stripping that guarantees no channel reaches the baked id lives in
+    // `.github/scripts/build-id.sh`, not here, and is covered by that script's
+    // `--self-test` (run by CI). A Rust test could only assert against a
+    // hand-written string that is already correct, which would pass even if the
+    // real stripping regressed.
 }

@@ -230,10 +230,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASE="${GITHUB_REF_NAME#v}"
-          BASE="${BASE%%-*}"
-          echo "TRAVSR_BUILD_ID=${BASE}+${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
-          echo "building as ${BASE}+${GITHUB_SHA:0:7}"
+          ID="$(bash .github/scripts/build-id.sh "$GITHUB_REF_NAME" "$GITHUB_SHA")"
+          echo "TRAVSR_BUILD_ID=$ID" >> "$GITHUB_ENV"
+          echo "building as $ID"
 
       - name: Build (cargo)
         if: matrix.cross != true
