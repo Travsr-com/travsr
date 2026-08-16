@@ -8,7 +8,7 @@ All notable changes to Travsr are documented here.
 
 ### Fixed
 
-- **`npm i -g @travsr.com/travsr` failed to extract the binary on Windows.** `ensure-binary.js` ran `tar -xzf <path>` with an absolute Windows path (`C:\...\travsr-*.tar.gz`), and GNU tar (the `tar` on PATH in a Git-for-Windows shell) reads a colon before the first path separator as a `host:path` remote-tape spec, so it tried to rsh/ssh into a host named `C` and failed with `Cannot connect to ...: resolve failed` instead of extracting. `v1.0.0-beta.1`'s and `v1.0.0-rc.1`'s Windows smoke-install jobs both hit this at the same step. Added `--force-local`, which both GNU tar and bsdtar (macOS's and Windows 10's built-in `tar.exe`) accept and which is a no-op on a path with no colon.
+- **`npm i -g @travsr.com/travsr` failed to extract the binary on Windows.** `ensure-binary.js` ran `tar -xzf <path>` with an absolute Windows path (`C:\...\node_modules\@travsr.com\travsr\bin\travsr-*.tar.gz`), and GNU tar (the `tar` on PATH in a Git-for-Windows shell) parses the colons in it — both the drive letter and the `@travsr.com` package scope — as a `[user@]host:path` remote-tape spec, so it tried to rsh/ssh into the "host" and failed with `Cannot connect to ...: resolve failed` instead of extracting. `v1.0.0-beta.1`'s and `v1.0.0-rc.1`'s Windows smoke-install jobs both hit this at the same step. tar now runs with its working directory set to the destination and relative file names only, which contain no colons; this works identically under GNU tar and bsdtar (macOS's and stock Windows' `tar.exe` — which, notably, rejects GNU tar's `--force-local` escape hatch, so that flag was not an option).
 
 ---
 
