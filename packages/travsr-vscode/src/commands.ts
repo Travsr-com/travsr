@@ -971,8 +971,15 @@ export function registerShowLanguages(
   binary: string,
   onAfterInit?: () => void
 ): vscode.Disposable {
-  const getCorpus = (): string =>
-    path.basename(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "");
+  // The open workspace folder, passed as the CLI's cwd so `lang install` /
+  // `lang detect` run *inside* the repo and derive the corpus exactly as the
+  // daemon does (git remote). The extension used to pass `--corpus <basename>`,
+  // which never matched the daemon's git-remote-derived corpus, so the trust
+  // grant landed on the wrong key and the repo still read as untrusted. Letting
+  // the CLI auto-derive from cwd removes that mismatch entirely. Undefined when
+  // no folder is open.
+  const getWorkspaceRoot = (): string | undefined =>
+    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
   // Read the configured binary path at call time so we always use the value
   // written by checkBinaryAndPrompt, which runs async after activation.
@@ -996,7 +1003,7 @@ export function registerShowLanguages(
   // sent before handle() is ever called. postStatus drives the in-panel status bar for
   // operations that take >1s (install, detect, reload).
   const handle = async (msg: PanelMessage, refresh: RefreshFn, postStatus: PostStatus): Promise<void> => {
-    const corpus = getCorpus();
+    const wsRoot = getWorkspaceRoot();
 
     if (msg.command === "reloadAvailable") {
       availableLoaded = false;
@@ -1013,9 +1020,11 @@ export function registerShowLanguages(
     switch (msg.command) {
       case "installLang": {
         const args = ["lang", "install", msg.language, "--no-interactive", "--yes"];
-        if (corpus) args.push("--corpus", corpus);
         postStatus(`Installing ${msg.language} tool…`);
-        void spawnLangCommand(getBinary(), args).then(() => {
+        // cwd = repo so the CLI auto-enables this repo; 120s because install may
+        // download a binary from GitHub Releases — the 4s default would kill it
+        // mid-download, before the trust grant is even written.
+        void spawnLangCommand(getBinary(), args, wsRoot, 120_000).then(() => {
           availableLoaded = false;
           postStatus("");
           void refresh();
@@ -1036,10 +1045,9 @@ export function registerShowLanguages(
           "--permitted-hosts", m.permittedHosts || "",
         ];
         const installArgs = ["lang", "install", m.language, "--no-interactive", "--yes"];
-        if (corpus) installArgs.push("--corpus", corpus);
         postStatus(`Installing ${m.language} with elevated approval…`);
         void spawnLangCommand(getBinary(), approveArgs)
-          .then(() => spawnLangCommand(getBinary(), installArgs))
+          .then(() => spawnLangCommand(getBinary(), installArgs, wsRoot, 120_000))
           .then(() => {
             availableLoaded = false;
             postStatus("");
@@ -1071,7 +1079,8 @@ export function registerShowLanguages(
       }
       case "detectLangs":
         postStatus('Detecting languages…');
-        void spawnLangCommand(getBinary(), ["lang", "detect"]).then((out) => {
+        // cwd = repo so detect scans the open workspace, not the extension host's cwd.
+        void spawnLangCommand(getBinary(), ["lang", "detect"], wsRoot, 30_000).then((out) => {
           void vscode.window.showInformationMessage(
             out.trim() ? `Detect: ${out.trim().slice(0, 120)}` : "Detection complete."
           );
