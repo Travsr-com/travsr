@@ -33,10 +33,27 @@ use anyhow::{Context as _, Result};
 use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
+/// The user-facing release identity, including any prerelease suffix.
+///
+/// `crates/travsr-cli/Cargo.toml` holds the *base* version (`1.0.0`), because
+/// `release.yml`'s `verify-version` job asserts the tag base equals it. The
+/// prerelease suffix therefore never reaches the crate version, and before this
+/// existed a `v1.0.0-beta.1` build reported plain `1.0.0`: identical to what the
+/// eventual stable `1.0.0` will report, so a tester's version string could not
+/// be told apart from a stable user's, and neither could `beta.1` from `beta.2`.
+///
+/// The release workflow sets `TRAVSR_RELEASE_VERSION` to the tag without its
+/// leading `v`. Local and development builds leave it unset and fall back to the
+/// crate version, so nothing changes outside a tagged release.
+const RELEASE_VERSION: &str = match option_env!("TRAVSR_RELEASE_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "travsr",
-    version,
+    version = RELEASE_VERSION,
     about = "The code graph that lives next to git."
 )]
 struct Cli {
@@ -477,7 +494,10 @@ async fn main() {
     // 1.0.0) so the daemon's session-start log reports the same number as
     // `travsr --version` instead of its own workspace crate version (0.7.0). The
     // background daemon is a re-exec of this same binary, so it runs this too.
-    travsr_daemon::set_build_version(env!("CARGO_PKG_VERSION"));
+    // Same string `--version` prints, so the daemon's session-start `version=`
+    // field identifies the exact release a tester is running rather than only
+    // its base version.
+    travsr_daemon::set_build_version(RELEASE_VERSION);
 
     // Parse CLI args BEFORE initialising any subsystems.
     // Clap exits immediately for --version and --help via process::exit, so
@@ -2411,6 +2431,8 @@ mod daemon_log_tests {
     // ── --level / --since ────────────────────────────────────────────────
 
     use super::{is_entry_start, parse_level, parse_since, LineFilter, LogLine, LogRenderer};
+    use super::{Cli, RELEASE_VERSION};
+    use clap::CommandFactory as _;
 
     /// A JSON entry in the shape the daemon actually writes.
     fn json_entry(level: &str, msg: &str) -> LogLine {
@@ -2710,5 +2732,48 @@ mod daemon_log_tests {
         assert_eq!(parse_since("2h").unwrap(), chrono::Duration::hours(2));
         assert_eq!(parse_since("45s").unwrap(), chrono::Duration::seconds(45));
         assert_eq!(parse_since("1d").unwrap(), chrono::Duration::days(1));
+    }
+
+    /// `--version`, the daemon's `version=` telemetry field, and the release
+    /// identity must all be the same string. They disagreed before: the daemon
+    /// logged the workspace version while `--version` printed the CLI crate's,
+    /// and neither carried a prerelease suffix.
+    #[test]
+    fn release_version_is_reported_consistently() {
+        assert!(!RELEASE_VERSION.is_empty(), "version must never be empty");
+
+        // Unset in every local and CI test run, so this asserts the fallback
+        // branch. The injected branch is exercised by the release workflow, and
+        // by `release_version_prefers_the_injected_tag` below.
+        if option_env!("TRAVSR_RELEASE_VERSION").is_none() {
+            assert_eq!(
+                RELEASE_VERSION,
+                env!("CARGO_PKG_VERSION"),
+                "an untagged build must report the crate version"
+            );
+        }
+
+        // What `--version` actually prints, taken from clap rather than assumed.
+        let rendered = Cli::command().render_version();
+        assert!(
+            rendered.contains(RELEASE_VERSION),
+            "--version must print the release identity, got {rendered:?}"
+        );
+    }
+
+    /// Pins the selection rule itself, independently of how this build was
+    /// compiled: an injected tag wins, and the crate version is only a fallback.
+    /// Without this, a release build that silently lost the injection would
+    /// still satisfy the test above.
+    #[test]
+    fn release_version_prefers_the_injected_tag() {
+        const fn pick(injected: Option<&'static str>, crate_version: &'static str) -> &'static str {
+            match injected {
+                Some(v) => v,
+                None => crate_version,
+            }
+        }
+        assert_eq!(pick(Some("1.0.0-beta.1"), "1.0.0"), "1.0.0-beta.1");
+        assert_eq!(pick(None, "1.0.0"), "1.0.0");
     }
 }

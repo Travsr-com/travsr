@@ -212,13 +212,26 @@ jobs:
         if: matrix.cross == true
         run: cargo install cross --locked
 
+      # TRAVSR_RELEASE_VERSION carries the full tag, prerelease suffix included,
+      # so `travsr --version` can report `1.0.0-beta.1` rather than the bare
+      # `1.0.0` that `verify-version` pins the crate version to. Without it a
+      # beta tester and a stable user print the same string. Unset on local
+      # builds, where the crate version is used instead.
       - name: Build (cargo)
         if: matrix.cross != true
-        run: cargo build --release -p travsr-cli --target ${{ matrix.target }}
+        run: |
+          export TRAVSR_RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          echo "building as $TRAVSR_RELEASE_VERSION"
+          cargo build --release -p travsr-cli --target ${{ matrix.target }}
 
+      # `cross` builds inside a container, which does not inherit the host
+      # environment; `Cross.toml` passes this one variable through.
       - name: Build (cross)
         if: matrix.cross == true
-        run: cross build --release -p travsr-cli --target ${{ matrix.target }}
+        run: |
+          export TRAVSR_RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          echo "building as $TRAVSR_RELEASE_VERSION"
+          cross build --release -p travsr-cli --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
