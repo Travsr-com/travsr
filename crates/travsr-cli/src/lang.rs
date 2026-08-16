@@ -42,7 +42,8 @@ pub enum LangCommand {
         /// Skip all interactive prompts — for CI / scripting.
         #[arg(long)]
         no_interactive: bool,
-        /// Corpus to activate Phase B for immediately (sets trust grant).
+        /// Advanced: enable semantic analysis for a specific repository identity
+        /// instead of the current one (auto-detected). Rarely needed.
         #[arg(long)]
         corpus: Option<String>,
         /// Skip downloading the wrapper binary; only register in config.
@@ -66,7 +67,8 @@ pub enum LangCommand {
     Add {
         /// Canonical language name (e.g. rust, java, php).
         language: String,
-        /// Corpus to activate Phase B for immediately (sets trust grant).
+        /// Advanced: enable semantic analysis for a specific repository identity
+        /// instead of the current one (auto-detected). Rarely needed.
         #[arg(long)]
         corpus: Option<String>,
     },
@@ -539,14 +541,33 @@ fn cmd_install(
         }
     }
 
-    // Register in config and optionally trust a corpus.
+    // Register the language globally, then enable it for the repo we're being
+    // run in. Running `install` inside a repo is the consent signal for that
+    // repo, so we derive its identity and grant trust automatically — no second
+    // command, no flag to remember. An explicit `--corpus` still overrides, for
+    // scripting or enabling a different repo. Builtins ship inside the binary and
+    // are never gated (ADR-017 Rule 3, enforced in invoke_phase_b_all), so they
+    // need no grant.
     let mut config = load_config().unwrap_or_default();
     config.register(language);
-    if let Some(c) = corpus {
-        config.trust_corpus(c);
-        println!("\u{2713} Semantic indexing enabled for corpus '{c}'.");
-    }
+    let enabled_here = match corpus {
+        Some(c) => {
+            config.trust_corpus(c);
+            false
+        }
+        None if entry.builtin => false,
+        None => match current_repo_corpus() {
+            Some(c) => {
+                config.trust_corpus(&c);
+                true
+            }
+            None => false,
+        },
+    };
     save_config(&config)?;
+    if enabled_here {
+        println!("\u{2713} Semantic analysis enabled for this repository.");
+    }
 
     // provider_ready: check PATH for builtins; wrapper_installed already accounts
     // for downloaded wrappers (including those just placed in ~/.travsr/bin).
@@ -652,7 +673,7 @@ fn install_scip_tool(
                      type resolution, cross-file references). '{}' is the SCIP indexer\n\
                      for {} that travsr needs for semantic analysis.\n\
                      \n\
-                     Install it, then re-run `travsr lang install {} --corpus <your-corpus>`.\n\
+                     Install it, then re-run `travsr lang install {}`.\n\
                      \n\
                      Docs / install instructions:\n\
                      \t{}",
@@ -986,124 +1007,16 @@ fn cmd_detect() -> Result<()> {
     Ok(())
 }
 
-// ── add (legacy) ──────────────────────────────────────────────────────────────
+// ── add (legacy alias for install) ──────────────────────────────────────────
 
+/// `add` predates `install` and used to fetch the analyzer via `npm install -g`.
+/// Distribution moved to GitHub-release binaries (see `cmd_install`), so the npm
+/// path is gone: `add` now just forwards to `install`, which downloads the right
+/// binary, handles elevated approval interactively, and auto-enables the current
+/// repo. Kept as an alias because existing docs and muscle memory still reach for
+/// it.
 fn cmd_add(language: &str, corpus: Option<&str>) -> Result<()> {
-    let entry = lookup(language).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Unknown language '{language}'. Run `travsr lang list` to see available languages."
-        )
-    })?;
-
-    // RequiresElevated: must be approved first.
-    // ADR-017 Rule 1 is the internal policy behind this check — the user-facing
-    // message uses plain language instead.
-    if entry.sandbox == SandboxRequirement::RequiresElevated {
-        let config = load_config();
-        let approved = config
-            .as_ref()
-            .map(|c| c.is_approved(language))
-            .unwrap_or(false);
-        if !approved {
-            anyhow::bail!(
-                "'{language}' needs network access during indexing to resolve dependencies.\n\
-                 {}\n\
-                 \n\
-                 Record security approval first:\n\
-                 \n\
-                 travsr lang approve {language} \\\n\
-                 \t--approved-by <approver-github-handle> \\\n\
-                 \t--reason \"<one-sentence justification>\" \\\n\
-                 \t--permitted-hosts repo1.maven.org,repo.maven.apache.org\n\
-                 \n\
-                 Then re-run: travsr lang add {language}\n\
-                 \n\
-                 Alternatively, use `travsr lang install {language}` which handles approval interactively.",
-                entry.install_hint
-            );
-        }
-    }
-
-    let wrapper_installed = match entry.provider_binary {
-        None => true,
-        Some(bin) if which(bin) => true,
-        Some(_) => {
-            if let Some(pkg) = entry.npm_package {
-                println!("Installing {pkg} via npm...");
-                // #502: on Windows npm is npm.cmd, which a bare Command::new
-                // never finds (CreateProcessW only appends .exe). Resolve the
-                // real path; std spawns .cmd via cmd.exe with strict escaping.
-                let npm = travsr_core::exec::resolve_executable("npm")
-                    .map(|p| p.into_os_string())
-                    .unwrap_or_else(|| "npm".into());
-                match std::process::Command::new(npm)
-                    .args(["install", "-g", pkg])
-                    .status()
-                {
-                    Ok(s) if s.success() => {
-                        println!("\u{2713} {pkg} installed.");
-                        true
-                    }
-                    Ok(s) => {
-                        println!(
-                            "warning: npm install exited with {s}.\n\
-                             Install manually: {}",
-                            entry.install_hint
-                        );
-                        false
-                    }
-                    Err(e) => {
-                        println!(
-                            "warning: could not run npm ({e}).\n\
-                             Install manually: {}",
-                            entry.install_hint
-                        );
-                        false
-                    }
-                }
-            } else {
-                println!(
-                    "warning: '{}' is not on PATH.\n\
-                     Install manually: {}",
-                    entry.provider_binary.unwrap_or(entry.command),
-                    entry.install_hint
-                );
-                false
-            }
-        }
-    };
-
-    if wrapper_installed && !which(entry.command) && !entry.underlying_tool_hint.is_empty() {
-        println!(
-            "warning: {} not found on PATH.\n\
-             Install it: {}\n\
-             Phase B for '{}' will be inactive until {} is installed.",
-            entry.command, entry.underlying_tool_hint, entry.language, entry.command,
-        );
-    }
-
-    let mut config = load_config().unwrap_or_default();
-    config.register(language);
-
-    if let Some(c) = corpus {
-        config.trust_corpus(c);
-        println!("\u{2713} Semantic indexing enabled for corpus '{c}'.");
-    }
-
-    save_config(&config)?;
-
-    println!(
-        "\u{2713} '{language}' registered for semantic indexing.\n\
-         {}",
-        if corpus.is_none() {
-            format!(
-                "To activate for a repository:\n\n    travsr lang add {language} --corpus <your-corpus>"
-            )
-        } else {
-            String::new()
-        }
-    );
-    Ok(())
+    cmd_install(language, false, false, corpus, false, false, None).map(|_| ())
 }
 
 // ── remove ────────────────────────────────────────────────────────────────────
@@ -1338,6 +1251,34 @@ where
     })
 }
 
+/// The corpus identity of the repo we're being run in, or `None` when we're not
+/// inside a git repo. Mirrors the daemon's `detect_corpus` exactly (git origin
+/// remote canonicalised, else a local hash) so the grant we write lands on the
+/// same key the Phase B gate checks — a mismatch would silently leave the repo
+/// untrusted. `install` uses this to enable semantic analysis for the current
+/// repo without the user having to pass or even know the corpus id.
+fn current_repo_corpus() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let repo_root = crate::repo::find_git_root(&cwd).ok()?;
+    let remote = std::process::Command::new("git")
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "remote",
+            "get-url",
+            "origin",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some(match remote {
+        Some(url) => travsr_core::canonical_corpus(&url),
+        None => travsr_core::canonical_corpus_local(&repo_root),
+    })
+}
+
 fn fetch_version_with_fallback(fallback: &str) -> String {
     match run_async(crate::install::fetch_latest_version()) {
         Ok(v) => v,
@@ -1356,7 +1297,8 @@ pub(crate) struct LangConfig {
     registered: Vec<String>,
     #[serde(default)]
     elevated_approvals: Vec<ElevatedApproval>,
-    /// Corpora trusted for Phase B (set via --corpus or travsr config set).
+    /// Repos enabled for Phase B, keyed by corpus id. Auto-added when `install`
+    /// runs inside a repo; also settable via `--corpus` or `travsr config set`.
     #[serde(default)]
     trusted_corpora: Vec<String>,
 }

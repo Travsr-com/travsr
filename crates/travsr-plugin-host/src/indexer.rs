@@ -19,13 +19,13 @@ pub struct PhaseBOutcome {
     pub skipped_not_in_repo: Vec<String>,
     /// Languages present in the repo but for which no semantic analyzer was
     /// found or the analyzer declined the request. User-actionable:
-    /// `travsr lang add <lang>`.
+    /// `travsr lang install <lang>`.
     pub skipped_no_analyzer: Vec<String>,
     pub skipped_unregistered: Vec<String>,
-    /// Non-builtin languages that are registered but whose corpus has no
-    /// per-corpus trust grant in lang.toml (ADR-017 Rule 3 — #414). Their
-    /// external tooling is never spawned. User-actionable:
-    /// `travsr lang add <lang> --corpus <corpus>`.
+    /// Non-builtin languages that are registered globally but not yet enabled for
+    /// this repo (no per-corpus trust grant in lang.toml — ADR-017 Rule 3, #414).
+    /// Their external tooling is never spawned. User-actionable: re-run
+    /// `travsr lang install <lang>` inside the repo, which auto-grants trust.
     pub skipped_untrusted_corpus: Vec<String>,
     /// Languages that require a `compile_commands.json` at the repo root
     /// (scip-clang, for `c`/`cpp`) but don't have one. Without this gate the
@@ -407,8 +407,7 @@ impl PluginIndexer {
                 tracing::warn!(
                     lang = %lang,
                     corpus = %self.corpus,
-                    "Phase B skipped — corpus not trusted (run `travsr lang add {lang} --corpus {}`)",
-                    self.corpus
+                    "Phase B skipped — not enabled for this repo (run `travsr lang install {lang}` here)"
                 );
                 outcome.skipped_untrusted_corpus.push(lang.clone());
                 continue;

@@ -454,22 +454,14 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
             if !report.skipped_no_analyzer.is_empty() {
                 let langs = report.skipped_no_analyzer.join(", ");
                 println!(
-                    "  {} no semantic analyzer for: {langs} — run `travsr lang add <lang>` to enable",
+                    "  {} no semantic analyzer for: {langs} — run `travsr lang install <lang>` to enable",
                     pal.dim("ℹ"),
                 );
             }
             if !report.skipped_untrusted_corpus.is_empty() {
                 let langs = report.skipped_untrusted_corpus.join(", ");
-                // The corpus string is derived from the git remote and is not
-                // something a user can guess — name the real value whenever
-                // the report carries it (#414 follow-up).
-                let corpus = if report.corpus.is_empty() {
-                    "<your-corpus>"
-                } else {
-                    report.corpus.as_str()
-                };
                 println!(
-                    "  {} corpus not trusted for: {langs} - run `travsr lang add <lang> --corpus {corpus}` to enable",
+                    "  {} semantic analysis not enabled here for: {langs} — run `travsr lang install <lang>` in this repository to enable",
                     pal.dim("ℹ"),
                 );
             }
