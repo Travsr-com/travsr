@@ -351,14 +351,28 @@ fn make_relative(base: &str, abs_path: &str) -> String {
     if base.is_empty() {
         return abs_path.to_string();
     }
-    let base_n = normalize_path(base);
-    let abs_n = normalize_path(abs_path);
-    let base_with_sep = if base_n.ends_with('/') {
-        base_n
+    relative_to_base(&normalized_base_prefix(base), abs_path)
+}
+
+/// Normalize `base` (see [`normalize_path`]) and ensure a single trailing `/`,
+/// yielding a reusable strip prefix. Hoist this out of a loop that relativizes
+/// many paths against one base (e.g. [`ingest_rust_positional`]) so the base is
+/// normalized once per pass rather than once per emitted ref.
+fn normalized_base_prefix(base: &str) -> String {
+    let n = normalize_path(base);
+    if n.ends_with('/') {
+        n
     } else {
-        format!("{base_n}/")
-    };
-    match abs_n.strip_prefix(&base_with_sep) {
+        format!("{n}/")
+    }
+}
+
+/// Relativize `abs_path` against an already-[`normalized_base_prefix`], returning
+/// a forward-slash repo-relative path. Falls back to the normalized `abs_path`
+/// when it is not under the base.
+fn relative_to_base(base_with_sep: &str, abs_path: &str) -> String {
+    let abs_n = normalize_path(abs_path);
+    match abs_n.strip_prefix(base_with_sep) {
         Some(rel) => rel.to_string(),
         None => abs_n,
     }
@@ -1029,6 +1043,9 @@ pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::L
 
     let mut src = crate::callsite::SourceLines::new();
     let mut out = Vec::new();
+    // #738: normalize the repo root once — every emitted ref relativizes its
+    // caller/callee paths against this same base.
+    let base_prefix = normalized_base_prefix(repo_root);
     for (&range_id, &caller_line0) in &range_lines {
         if def_range_ids.contains(&range_id) {
             continue;
@@ -1059,7 +1076,7 @@ pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::L
         let Some(targets) = items.get(defres) else {
             continue;
         };
-        let caller_path = make_relative(repo_root, caller_abs);
+        let caller_path = relative_to_base(&base_prefix, caller_abs);
         for (tdoc, trid) in targets {
             let (Some(def_abs), Some(&def_line0)) = (doc_paths.get(tdoc), range_lines.get(trid))
             else {
@@ -1068,7 +1085,7 @@ pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::L
             out.push(travsr_core::LsifPositionalRef {
                 caller_path: caller_path.clone(),
                 caller_line: caller_line0 + 1,
-                callee_def_path: make_relative(repo_root, def_abs),
+                callee_def_path: relative_to_base(&base_prefix, def_abs),
                 callee_def_line: def_line0 + 1,
                 is_call,
             });

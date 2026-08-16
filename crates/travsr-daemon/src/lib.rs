@@ -6123,6 +6123,68 @@ mod tests {
         );
     }
 
+    /// #738: the `rust_lsif_degraded` flag must reflect surviving edges, not just
+    /// "did rust-analyzer run". A cycle that parsed positional refs but resolved
+    /// zero of them (the Windows path-mismatch signature) must record
+    /// `all_refs_dropped`; a cycle that resolved at least one must clear the flag;
+    /// and an empty batch must not be flagged (a repo with no rust refs at all is
+    /// not degraded).
+    #[test]
+    fn write_phase_b_results_flags_all_refs_dropped_on_total_wipeout() {
+        // The flag is gated on `!ra_lsif_sandbox_was_skipped()`; reset the
+        // process-global latch so a prior run cannot force `sandbox_unavailable`.
+        travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store =
+            travsr_store::SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+
+        let degraded = |store: &travsr_store::SqliteStore| {
+            store
+                .get_meta("rust_lsif_degraded")
+                .unwrap()
+                .unwrap_or_default()
+        };
+
+        let run = |store: &mut travsr_store::SqliteStore, stats: (usize, usize)| {
+            travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+            write_phase_b_results(
+                store,
+                "test",
+                vec![],
+                vec![],
+                vec![],
+                travsr_plugin_host::PhaseBOutcome::default(),
+                stats,
+            );
+        };
+
+        // Parsed refs but none resolved -> total wipeout -> flagged.
+        run(&mut store, (7, 0));
+        assert_eq!(
+            degraded(&store),
+            "all_refs_dropped",
+            "a 100% ref drop must set the degradation flag"
+        );
+
+        // At least one ref survived -> healthy -> flag cleared.
+        run(&mut store, (7, 3));
+        assert_eq!(
+            degraded(&store),
+            "",
+            "a partially-resolved batch is not degraded and must clear the flag"
+        );
+
+        // No refs parsed at all -> not a wipeout -> not flagged.
+        run(&mut store, (0, 0));
+        assert_eq!(
+            degraded(&store),
+            "",
+            "an empty ref batch (no rust refs) must not be flagged as degraded"
+        );
+    }
+
     /// RFC-002: when the stored signature format version differs from the binary's
     /// version, `reindex_files` must return `Ok(())` without touching the graph.
     /// This is the core correctness guarantee — a version mismatch must never
