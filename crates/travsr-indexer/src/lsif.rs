@@ -326,22 +326,61 @@ pub fn ingest_g2(dump: &str, corpus: &str) -> anyhow::Result<LsifG2Output> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Make `abs_path` relative to `base`. Falls back to returning `abs_path`
-/// unchanged on Windows path mismatches or if `abs_path` is not under `base`.
+/// Make `abs_path` relative to `base`, returning a forward-slash repo-relative
+/// path that matches the Tree-sitter indexer's `Node::vname.path`.
+///
+/// # Windows (issue #738)
+///
+/// The two operands arrive in different shapes on Windows and a naive
+/// `strip_prefix` never matches, so every ref was dropped fail-closed:
+/// - `base` is the daemon's `repo_root.to_string_lossy()`, an extended-length
+///   backslash path: `\\?\D:\com.travsr\travsr`.
+/// - `abs_path` comes from a rust-analyzer `file:///D:/...` URI decoded by
+///   [`file_uri_to_path`] to a forward-slash, drive-letter path: `D:/com.travsr/...`.
+///
+/// [`normalize_path`] both operands before comparing: strip the `\\?\` /
+/// `\\?\UNC\` verbatim prefix, unify separators to `/`, and lowercase a leading
+/// drive letter (Windows drives are case-insensitive — rust-analyzer may report
+/// `d:/` while `repo_root` is `\\?\D:\`). The comparison itself stays a plain,
+/// case-sensitive `strip_prefix`, so on a Unix path — which has no drive letter
+/// and no backslashes — normalization is a no-op and behaviour is byte-for-byte
+/// identical to before (no cross-platform regression).
+///
+/// Falls back to the normalized `abs_path` when it is not under `base`.
 fn make_relative(base: &str, abs_path: &str) -> String {
     if base.is_empty() {
         return abs_path.to_string();
     }
-    let base_with_sep = if base.ends_with('/') {
-        base.to_string()
+    let base_n = normalize_path(base);
+    let abs_n = normalize_path(abs_path);
+    let base_with_sep = if base_n.ends_with('/') {
+        base_n
     } else {
-        format!("{base}/")
+        format!("{base_n}/")
     };
-    if let Some(rel) = abs_path.strip_prefix(&base_with_sep) {
-        rel.to_string()
-    } else {
-        abs_path.to_string()
+    match abs_n.strip_prefix(&base_with_sep) {
+        Some(rel) => rel.to_string(),
+        None => abs_n,
     }
+}
+
+/// Normalize a path for prefix comparison: strip a Windows extended-length
+/// prefix (`\\?\`, `\\?\UNC\`), unify separators to `/`, and lowercase a leading
+/// `X:` drive letter. A Unix path (no drive letter, no backslashes) is returned
+/// unchanged, so downstream comparison is unaffected off Windows.
+fn normalize_path(p: &str) -> String {
+    let stripped = p
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| p.strip_prefix(r"\\?\"))
+        .unwrap_or(p);
+    let mut s = stripped.replace('\\', "/");
+    // Lowercase only a leading `X:` drive letter so a case-mismatched drive
+    // (`D:` vs `d:`) still matches; the rest of the path keeps its casing.
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        s[..1].make_ascii_lowercase();
+    }
+    s
 }
 
 /// Decode a `file://` URI from an LSIF dump into an OS filesystem path.
@@ -504,6 +543,61 @@ mod tests {
         assert_eq!(make_relative("/repo", "/repo/src/foo.ts"), "src/foo.ts");
         assert_eq!(make_relative("/repo/", "/repo/src/foo.ts"), "src/foo.ts");
         assert_eq!(make_relative("", "/abs/path"), "/abs/path");
+    }
+
+    #[test]
+    fn make_relative_unix_no_regression_case_sensitive() {
+        // #738 guard: the Windows fix must NOT make Unix matching case-insensitive.
+        // A case-mismatched Unix prefix (no drive letter) must still fail to match
+        // and fall back to the abs path unchanged — byte-for-byte old behaviour.
+        assert_eq!(
+            make_relative("/repo", "/REPO/src/foo.ts"),
+            "/REPO/src/foo.ts"
+        );
+        // Casing inside the repo-relative portion is preserved verbatim.
+        assert_eq!(make_relative("/repo", "/repo/Src/Foo.TS"), "Src/Foo.TS");
+    }
+
+    #[test]
+    fn make_relative_windows_backslash_base_vs_forward_slash_uri() {
+        // #738: the real daemon passes `repo_root.to_string_lossy()` — an
+        // extended-length backslash path — while `file_uri_to_path` yields a
+        // forward-slash, drive-letter path from rust-analyzer's `file:///D:/..`
+        // URI. Before the fix, `strip_prefix` never matched and the absolute
+        // path was returned, so `resolve_lsif_positional_refs` dropped every ref.
+        // The result must be the repo-relative, forward-slash path that matches a
+        // Phase A `Node::vname.path` (e.g. `crates/travsr-store/src/lib.rs`).
+        let phase_a_path = "crates/travsr-store/src/lib.rs";
+        let abs = "D:/com.travsr/travsr/crates/travsr-store/src/lib.rs";
+
+        // `\\?\`-extended backslash base (what the daemon actually passes).
+        assert_eq!(
+            make_relative(r"\\?\D:\com.travsr\travsr", abs),
+            phase_a_path
+        );
+        // Plain backslash drive base (still mismatched separators before the fix).
+        assert_eq!(make_relative(r"D:\com.travsr\travsr", abs), phase_a_path);
+        // Forward-slash base with a trailing separator.
+        assert_eq!(make_relative("D:/com.travsr/travsr/", abs), phase_a_path);
+        // Drive-letter case-insensitivity: base `\\?\D:\..` vs URI `d:/..`.
+        assert_eq!(
+            make_relative(
+                r"\\?\D:\com.travsr\travsr",
+                "d:/com.travsr/travsr/crates/travsr-store/src/lib.rs"
+            ),
+            phase_a_path
+        );
+    }
+
+    #[test]
+    fn make_relative_not_under_base_returns_normalized_abs() {
+        // A path outside the repo (e.g. an out-of-tree std/dep def) falls back to
+        // the normalized abs path so downstream comparisons stay separator-
+        // consistent; it still matches no Phase A node and is dropped fail-closed.
+        assert_eq!(
+            make_relative(r"\\?\D:\repo", r"C:\other\lib.rs"),
+            "c:/other/lib.rs"
+        );
     }
 
     #[test]
