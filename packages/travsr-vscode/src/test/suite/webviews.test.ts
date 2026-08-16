@@ -23,6 +23,8 @@ const LANG: LangInfo = {
   language: "rust",
   package: "@travsr-plugin/rust",
   sandbox: "Standard",
+  status: "active",
+  statusLine: "active",
   installed: true,
   registered: true,
   builtin: false,
@@ -105,18 +107,21 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
   const available: LangInfo[] = [
     {
       language: "rust", package: "scip-rust", sandbox: "Standard",
+      status: "active", statusLine: "active",
       installed: true, registered: true, builtin: true, needsApproval: false,
       scipInstallType: "Command", installHint: "travsr lang install rust",
       underlyingToolHint: "", elevatedHosts: [],
     },
     {
       language: "java", package: "scip-java", sandbox: "Elevated",
+      status: "needs_approval", statusLine: "needs approval (run: travsr lang install java)",
       installed: false, registered: false, builtin: false, needsApproval: true,
       scipInstallType: "GithubBinary", installHint: "travsr lang install java",
       underlyingToolHint: "", elevatedHosts: ["repo1.maven.org"],
     },
     {
       language: "scala", package: "scip-scala", sandbox: "Elevated",
+      status: "partial", statusLine: "partial (run: travsr lang install scala for full analysis)",
       installed: false, registered: false, builtin: false, needsApproval: false,
       scipInstallType: "Manual", installHint: "travsr lang install scala",
       underlyingToolHint: "https://docs.scala-lang.org/scip", elevatedHosts: [],
@@ -131,8 +136,8 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
   });
   test("renders available tools with correct action cells", () => {
     const html = buildLanguagesHtml([], available);
-    // rust: registered+installed+builtin → Built-in badge (no Disable button for builtins)
-    assert.ok(html.includes("Built-in"), "builtin shows Built-in badge");
+    // rust: active built-in analyzer → "on" badge, no Disable button for builtins
+    assert.ok(html.includes(">on<"), "active builtin shows an 'on' badge");
     assert.ok(!html.includes('onclick="removeLang'), "builtin has no Disable onclick");
     // java: needsApproval → consent form (inside not-here disclosure when undetected)
     assert.ok(html.includes("approveLang") && html.includes("Grant"));
@@ -150,6 +155,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     const indexedWithRust: LangCount[] = [{ language: "rust", count: 10 }];
     const uninstalledRust: LangInfo[] = [{
       language: "rust", package: "scip-rust", sandbox: "Standard",
+      status: "partial", statusLine: "partial (run: travsr lang install rust for full analysis)",
       installed: false, registered: false, builtin: false, needsApproval: false,
       scipInstallType: "Command", installHint: "travsr lang install rust",
       underlyingToolHint: "", elevatedHosts: [],
@@ -158,13 +164,16 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     assert.ok(html.includes("installLang") && html.includes("Install"));
     assert.ok(!html.includes('<details class="not-here">'), "detected language skips the disclosure gate");
   });
-  test("semantic badge reflects Phase B registration state", () => {
+  test("analysis badge shows the CLI's computed status, no jargon", () => {
     const html = buildLanguagesHtml(indexed, available);
-    // rust: builtin + installed → active → enabled badge
-    assert.ok(html.includes(">enabled<"), "enabled badge for active language");
-    // java/scala: not registered → disabled badge
-    assert.ok(html.includes(">disabled<"), "disabled badge for inactive language");
-    assert.ok(html.includes("Semantic analysis"), "semantic tooltip present");
+    // rust: active → "active" badge
+    assert.ok(html.includes(">active<"), "active badge for a live language");
+    // scala: partial → "partial"; java: needs approval → "needs approval"
+    assert.ok(html.includes(">partial<"), "partial badge for a language on structure only");
+    assert.ok(html.includes(">needs approval<"), "needs-approval badge");
+    // The plain statusLine is the tooltip; no internal jargon leaks.
+    assert.ok(html.includes("full analysis"), "plain statusLine used as tooltip");
+    assert.ok(!/SCIP|LSIF|Phase B|Built-in to the travsr/.test(html), "no internal jargon in the panel");
     assert.ok(html.includes("Semantic"), "Semantic column header present");
   });
   test("detects empty indexed section", () => {

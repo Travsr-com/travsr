@@ -964,6 +964,12 @@ export interface LangInfo {
   language: string;
   package: string;
   sandbox: "Standard" | "Elevated";
+  /** Authoritative status computed by the CLI — render this, never re-derive it.
+   *  `active` = full cross-file analysis is live; `partial` = structure only;
+   *  `needs_approval` = one-time approval required; `unsupported` = no build here. */
+  status: "active" | "partial" | "needs_approval" | "unsupported";
+  /** The exact plain wording the CLI shows for this status — used as the tooltip. */
+  statusLine: string;
   installed: boolean;
   registered: boolean;
   builtin: boolean;
@@ -991,7 +997,7 @@ export function buildLanguagesHtml(
         .join("\n")
     : `<tr><td colspan="2" class="empty" style="font-style:normal">No language metadata yet.&nbsp; <button class="btn primary" id="initBtn" onclick="initRepo(this)">Initialize this repo</button></td></tr>`;
   const indexedNote = indexed.length
-    ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural (tree-sitter) analysis — includes test &amp; fixture files.</p>`
+    ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural analysis — includes test &amp; fixture files.</p>`
     : "";
 
   // ── Available section ────────────────────────────────────────────────────────
@@ -1000,9 +1006,10 @@ export function buildLanguagesHtml(
   const availRows = available
     .map((l) => {
       const detected = detectedLangs.has(l.language);
-      // Builtins bypass lang.toml registration — their semantic analysis runs whenever
-      // the underlying tool is installed, regardless of the registered field.
-      const active = l.builtin ? l.installed : (l.registered && l.installed);
+      // Render the CLI's computed status — never re-derive it here, so the panel
+      // can never disagree with `travsr lang list`. `active` means full cross-file
+      // analysis is live; everything else is `partial` (structure still works).
+      const isActive = l.status === "active";
 
       // Sandbox badge
       const sandboxBadge =
@@ -1010,22 +1017,25 @@ export function buildLanguagesHtml(
           ? `<span class="badge elevated">Elevated</span>`
           : `<span class="badge ok">Standard</span>`;
 
-      // Semantic column: single badge reflecting Phase B SCIP/LSIF registration state.
-      // Tree-sitter structural analysis is unconditional and not shown here.
-      const semCls = active ? "ok" : l.registered ? "stale" : "dim";
-      const semTitle = active
-        ? "Semantic analysis enabled (SCIP/LSIF active)"
-        : l.registered
-          ? "Registered but underlying tool not found — reinstall to fix"
-          : "Semantic analysis not enabled";
-      const analysisBadges = `<span class="badge ${semCls}" title="${semTitle}">${active ? "enabled" : l.registered ? "partial" : "disabled"}</span>`;
+      // Analysis column: the same word the CLI shows, with its plain line as the
+      // tooltip. No "SCIP/LSIF/Phase B" jargon reaches the user.
+      const semCls =
+        l.status === "active" ? "ok" : l.status === "needs_approval" ? "dim" : "stale";
+      const semText =
+        l.status === "active"
+          ? "active"
+          : l.status === "needs_approval"
+            ? "needs approval"
+            : "partial";
+      const analysisBadges = `<span class="badge ${semCls}" title="${esc(l.statusLine)}">${semText}</span>`;
 
-      // Raw action HTML (used directly when detected or active; wrapped otherwise)
+      // Raw action HTML (used directly when detected or active; wrapped otherwise).
       let rawAction: string;
-      if (l.builtin) {
-        rawAction = `<span class="badge ok" title="Built-in to the travsr binary — always active, cannot be disabled">Built-in</span>`;
-      } else if (active) {
+      if (isActive && !l.builtin) {
         rawAction = `<button class="btn danger" onclick="removeLang(this,'${esc(l.language)}')">Disable</button>`;
+      } else if (isActive) {
+        // A built-in analyzer that is live (e.g. python): nothing to install or turn off.
+        rawAction = `<span class="badge ok" title="${esc(l.statusLine)}">on</span>`;
       } else if (l.needsApproval) {
         rawAction = `<details class="consent">
   <summary>Grant access &amp; Install</summary>
@@ -1054,7 +1064,7 @@ export function buildLanguagesHtml(
       // Gate: undetected + inactive non-builtins get a disclosure instead of a direct button.
       // Builtins always show their badge directly — they're always available regardless of repo.
       const actionCell =
-        !detected && !active && !l.builtin
+        !detected && !isActive && !l.builtin
           ? `<details class="not-here"><summary>Not in this repo</summary><div class="not-here-body">${rawAction}</div></details>`
           : rawAction;
 

@@ -237,6 +237,23 @@ pub struct PhaseBEntry {
     pub has_share_assets: bool,
 }
 
+impl PhaseBEntry {
+    /// Whether this language's full cross-file analyzer ships with travsr — i.e.
+    /// full semantic works out of the box with no separate tool to install.
+    ///
+    /// True for python, typescript, and javascript: all three use the same bundled
+    /// Node emitter (`travsr-lsif-py` / `travsr-lsif-ts`), resolved next to the
+    /// executable or from the distribution — no external binary to install (see
+    /// `travsr-indexer/src/runner.rs`). Every other language's analyzer is external
+    /// and must be installed: rust-analyzer for rust, a downloaded analyzer for
+    /// go/java/… . This is the single fact that keeps a status renderer from
+    /// claiming a language is "active" out of the box when its analyzer is not
+    /// actually present.
+    pub fn analyzer_bundled(&self) -> bool {
+        matches!(self.language, "python" | "typescript" | "javascript")
+    }
+}
+
 pub static CATALOG: &[PhaseBEntry] = &[
     PhaseBEntry {
         language: "typescript",

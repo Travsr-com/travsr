@@ -218,8 +218,8 @@ fn phase_b_pending(store: &SqliteStore) -> bool {
 /// never disagree about completeness. Returns the note to append, or `None`
 /// when Phase B is complete for the current commit.
 pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
-    const PENDING: &str = "[note: call-graph index incomplete — Phase B has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
-    const STALE: &str = "[note: call-graph edges degraded — a background re-index dropped call edges since the last Phase B run; empty results are not authoritative. Run `travsr init` to rebuild.]";
+    const PENDING: &str = "[note: call-graph index incomplete — semantic analysis has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
+    const STALE: &str = "[note: call-graph edges degraded — a background re-index dropped call edges since the last semantic analysis run; empty results are not authoritative. Run `travsr init` to rebuild.]";
     let phase_b = store
         .get_meta("phase_b_commit")
         .ok()
@@ -1105,9 +1105,9 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
             // lines. This is a coverage gap, not a "zero references" answer.
             return format!(
                 "{header}\nOccurrence index unavailable for '{lang}': semantic \
-                 analysis (Phase B) recorded no reference occurrences for this \
+                 analysis recorded no reference occurrences for this \
                  language in this repo — the result below is not a definitive \
-                 zero. Run `travsr status` to check Phase B, or use `find_pattern` \
+                 zero. Run `travsr status` to check progress, or use `find_pattern` \
                  for a textual search."
             );
         }
@@ -2014,124 +2014,9 @@ pub enum AnalysisMode {
     Semantic,
 }
 
-/// Minimal per-language metadata used by `get_lang_status`.
-/// Kept here to avoid a DAG-violating dependency on `travsr-plugin-host`.
-/// Must stay in sync with `travsr-plugin-host/src/phase_b/catalog.rs`.
-struct LangMeta {
-    language: &'static str,
-    builtin: bool,
-    extensions: &'static [&'static str],
-    install_hint: &'static str,
-    underlying_tool_hint: &'static str,
-}
-
-static LANG_CATALOG: &[LangMeta] = &[
-    LangMeta {
-        language: "typescript",
-        builtin: true,
-        extensions: &[".ts", ".tsx"],
-        install_hint: "travsr lang install typescript",
-        underlying_tool_hint: "",
-    },
-    LangMeta {
-        language: "javascript",
-        builtin: true,
-        extensions: &[".js", ".jsx", ".mjs", ".cjs"],
-        install_hint: "travsr lang install javascript",
-        underlying_tool_hint: "",
-    },
-    LangMeta {
-        language: "rust",
-        builtin: true,
-        extensions: &[".rs"],
-        install_hint: "travsr lang install rust",
-        underlying_tool_hint: "rustup component add rust-analyzer",
-    },
-    LangMeta {
-        language: "python",
-        builtin: true,
-        extensions: &[".py"],
-        install_hint: "travsr lang install python",
-        underlying_tool_hint: "npm install -g @sourcegraph/scip-python",
-    },
-    LangMeta {
-        language: "go",
-        builtin: false,
-        extensions: &[".go"],
-        install_hint: "travsr lang install go",
-        underlying_tool_hint: "go install github.com/scip-code/scip-go/cmd/scip-go@latest",
-    },
-    LangMeta {
-        language: "java",
-        builtin: false,
-        extensions: &[".java"],
-        install_hint: "travsr lang install java",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-java/releases",
-    },
-    LangMeta {
-        language: "kotlin",
-        builtin: false,
-        extensions: &[".kt", ".kts"],
-        install_hint: "travsr lang install kotlin",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-java/releases",
-    },
-    LangMeta {
-        language: "scala",
-        builtin: false,
-        extensions: &[".scala", ".sbt"],
-        install_hint: "travsr lang install scala",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-scala",
-    },
-    LangMeta {
-        language: "ruby",
-        builtin: false,
-        extensions: &[".rb"],
-        install_hint: "travsr lang install ruby",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-ruby/releases",
-    },
-    LangMeta {
-        language: "php",
-        builtin: false,
-        extensions: &[".php"],
-        install_hint: "travsr lang install php",
-        underlying_tool_hint: "https://github.com/davidrjenni/scip-php",
-    },
-    LangMeta {
-        language: "csharp",
-        builtin: false,
-        extensions: &[".cs", ".csx"],
-        install_hint: "travsr lang install csharp",
-        underlying_tool_hint: "dotnet tool install --global scip-dotnet",
-    },
-    LangMeta {
-        language: "cpp",
-        builtin: false,
-        extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
-        install_hint: "travsr lang install cpp",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases",
-    },
-    LangMeta {
-        language: "c",
-        builtin: false,
-        extensions: &[".c", ".h"],
-        install_hint: "travsr lang install c",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases",
-    },
-    LangMeta {
-        language: "swift",
-        builtin: false,
-        extensions: &[".swift"],
-        install_hint: "travsr lang install swift",
-        underlying_tool_hint: "swift build -c release in travsr-lang/packages/swift-index-emitter",
-    },
-    LangMeta {
-        language: "dart",
-        builtin: false,
-        extensions: &[".dart"],
-        install_hint: "travsr lang install dart",
-        underlying_tool_hint: "https://dart.dev/get-dart",
-    },
-];
+/// The one honest "not a language we handle" envelope, shared by every
+/// `get_lang_status` return path so the shape never drifts between them.
+const UNKNOWN_LANG_JSON: &str = r#"{"language":"unknown","status":"unknown","statusLine":"not a supported language","builtin":false,"semantic_available":false,"install_hint":""}"#;
 
 /// Return the set of files transitively affected if the given file changes.
 ///
@@ -2507,8 +2392,7 @@ pub fn get_blast_radius_global(
 pub fn get_lang_status(store: &SqliteStore, file: &str) -> String {
     if let Err(reason) = validate_mcp_arg(file) {
         tracing::warn!("get_lang_status rejected invalid arg: {reason}");
-        return r#"{"language":"unknown","builtin":false,"semantic_available":false,"install_hint":""}"#
-            .to_string();
+        return UNKNOWN_LANG_JSON.to_string();
     }
     get_lang_status_raw(store, file)
 }
@@ -2545,45 +2429,56 @@ fn analyzer_installed(lang: &str) -> bool {
     let Some(entry) = travsr_plugin_host::phase_b::catalog::lookup(lang) else {
         return false;
     };
-    if entry.builtin {
+    // Honest: present when bundled (python) or when the external analyzer resolves
+    // — never just because the language is built in. Rust is not special here.
+    if entry.analyzer_bundled() {
         return true;
     }
     entry.provider_binary.map_or(true, bin_resolvable) && bin_resolvable(entry.command)
 }
 
 fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
+    use travsr_plugin_host::phase_b::status::{install_step, LangStatus};
+
     let ext = std::path::Path::new(file)
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
 
-    let entry = LANG_CATALOG
+    let entry = travsr_plugin_host::phase_b::catalog::CATALOG
         .iter()
         .find(|e| e.extensions.contains(&ext.as_str()));
 
     let Some(meta) = entry else {
-        return r#"{"language":"unknown","builtin":false,"semantic_available":false,"install_hint":"unknown language"}"#
-            .to_string();
+        return UNKNOWN_LANG_JSON.to_string();
     };
 
+    // Repo-view truth: full cross-file analysis is live iff we actually recorded
+    // cross-file (call/reference) edges for this language here.
     let semantic_available = store.has_refcall_edges_for_language(meta.language);
 
-    let install_hint = if semantic_available {
-        ""
-    } else if meta.builtin {
-        meta.underlying_tool_hint
-    } else if analyzer_installed(meta.language) {
-        // #712: the analyzer is installed but has produced no call edges yet
-        // (Phase B not run, or it ran and yielded nothing). Advise a rebuild
-        // rather than a reinstall so the hint agrees with `travsr lang list`,
-        // which already reports this analyzer as active.
-        "travsr init --semantic --force"
+    // The honest next step when it is not live, in the shared vocabulary:
+    //  - analyzer present but no edges yet  -> rebuild
+    //  - analyzer absent                    -> install (same step for every language)
+    let status = if semantic_available {
+        LangStatus::Active
     } else {
-        meta.install_hint
+        let next = if analyzer_installed(meta.language) {
+            "travsr init --semantic --force".to_string()
+        } else {
+            install_step(meta.language)
+        };
+        LangStatus::Partial { next: Some(next) }
+    };
+    // `install_hint` stays for backward compatibility; it mirrors the step above.
+    let install_hint = match &status {
+        LangStatus::Active => String::new(),
+        LangStatus::Partial { next: Some(step) } => step.clone(),
+        _ => install_step(meta.language),
     };
 
-    // #318 O5: staleness marker — the commit Phase B data was last built at.
+    // #318 O5: staleness marker — the commit the semantic data was last built at.
     // A hex SHA needs no JSON escaping; anything else is rejected here.
     let phase_b_commit = store
         .get_meta("phase_b_commit")
@@ -2593,11 +2488,14 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
         .map(|s| format!("\"{s}\""))
         .unwrap_or_else(|| "null".to_string());
 
-    // Manual JSON to avoid a serde_json dependency on a hot path.
-    // Fields are all static strings — no escaping needed.
+    // Manual JSON to avoid a serde_json dependency on a hot path. `status` is a
+    // stable machine tag; `statusLine` is the exact plain wording every other
+    // surface shows, so the extension renders it verbatim instead of re-deriving.
     format!(
-        r#"{{"language":"{lang}","builtin":{builtin},"semantic_available":{sem},"install_hint":"{hint}","phase_b_commit":{pbc}}}"#,
+        r#"{{"language":"{lang}","status":"{status_tag}","statusLine":"{status_line}","builtin":{builtin},"semantic_available":{sem},"install_hint":"{hint}","phase_b_commit":{pbc}}}"#,
         lang = meta.language,
+        status_tag = status.tag(),
+        status_line = status.line(),
         builtin = meta.builtin,
         sem = semantic_available,
         hint = install_hint,
@@ -2613,16 +2511,14 @@ pub fn get_lang_status_global(
 ) -> String {
     if let Err(reason) = validate_mcp_arg(file) {
         tracing::warn!("get_lang_status_global rejected invalid arg: {reason}");
-        return r#"{"language":"unknown","builtin":false,"semantic_available":false,"install_hint":""}"#
-            .to_string();
+        return UNKNOWN_LANG_JSON.to_string();
     }
     // collect_global returns newline-joined results; we only need the first repo's answer.
     let raw = collect_global(repos, repo, |store, _repo_name, _single| {
         get_lang_status_raw(store, file)
     });
     if raw.is_empty() {
-        r#"{"language":"unknown","builtin":false,"semantic_available":false,"install_hint":""}"#
-            .to_string()
+        UNKNOWN_LANG_JSON.to_string()
     } else {
         // collect_global joins results with "\n"; take only the first JSON line.
         raw.lines().next().unwrap_or("").to_string()
@@ -3186,9 +3082,9 @@ fn get_repo_map_raw(store: &SqliteStore, reserve_per_line: usize) -> String {
     // call-graph data is absent, which affects the tools the agent calls next.
     if !has_refcall {
         header.push_str(
-            "Note: semantic analysis (Phase B) has not run — dependents are from \
+            "Note: semantic analysis has not run — dependents are from \
              import structure only; call-graph data is unavailable. Commit to \
-             trigger Phase B.\n",
+             build it.\n",
         );
     }
 
@@ -7977,7 +7873,8 @@ mod tests {
         );
     }
 
-    /// get_lang_status returns valid JSON for a known extension with no RefCall data.
+    /// get_lang_status returns valid JSON for a known extension with no RefCall data,
+    /// and reports the honest `partial` status (structure works, full analysis not live).
     #[test]
     fn get_lang_status_known_extension_semantic_unavailable() {
         let store = make_store(&[], &[]);
@@ -7985,9 +7882,10 @@ mod tests {
         assert!(json.contains(r#""language":"typescript""#));
         assert!(json.contains(r#""builtin":true"#));
         assert!(json.contains(r#""semantic_available":false"#));
+        assert!(json.contains(r#""status":"partial""#), "got: {json}");
     }
 
-    /// get_lang_status returns semantic_available:true after a RefCall edge is inserted.
+    /// get_lang_status flips to `active` after a RefCall edge is inserted.
     #[test]
     fn get_lang_status_returns_semantic_available_true_after_refcall_insert() {
         use travsr_core::{Edge, EdgeKind, Node, VName};
@@ -7999,6 +7897,7 @@ mod tests {
             .unwrap();
         let json = get_lang_status(&store, "a.ts");
         assert!(json.contains(r#""semantic_available":true"#));
+        assert!(json.contains(r#""status":"active""#), "got: {json}");
         assert!(json.contains(r#""install_hint":"""#));
     }
 
@@ -8011,7 +7910,7 @@ mod tests {
         assert!(json.contains(r#""semantic_available":false"#));
     }
 
-    /// Non-builtin language (Go) shows install_hint when semantic unavailable.
+    /// A language whose analyzer is absent shows the uniform install step.
     #[test]
     fn get_lang_status_non_builtin_shows_install_hint() {
         let store = make_store(&[], &[]);
@@ -8022,14 +7921,20 @@ mod tests {
         assert!(json.contains("travsr lang install go"));
     }
 
-    /// Builtin language (Rust) shows underlying_tool_hint when semantic unavailable.
+    /// Rust is not special: with no cross-file edges it reads `partial` and points
+    /// at the same uniform install step, never leaking tool jargon like
+    /// "rust-analyzer" or "rustup" into the user-facing hint.
     #[test]
-    fn get_lang_status_builtin_shows_underlying_tool_hint() {
+    fn get_lang_status_rust_partial_uses_uniform_step_no_tool_jargon() {
         let store = make_store(&[], &[]);
         let json = get_lang_status(&store, "src/main.rs");
         assert!(json.contains(r#""language":"rust""#));
-        assert!(json.contains(r#""builtin":true"#));
-        assert!(json.contains("rust-analyzer"));
+        assert!(json.contains(r#""status":"partial""#), "got: {json}");
+        assert!(
+            !json.contains("rust-analyzer"),
+            "no tool jargon in hint: {json}"
+        );
+        assert!(!json.contains("rustup"), "no tool jargon in hint: {json}");
     }
 
     // ── get_graph_stats unit tests ───────────────────────────────────────────
@@ -8849,17 +8754,21 @@ mod tests {
 
     #[test]
     fn get_repo_map_discloses_missing_phase_b() {
-        // No ref/call edges => semantic note present.
+        // No ref/call edges => semantic note present, in plain words (no jargon).
         let without = get_repo_map(&two_crate_store(false));
         assert!(
-            without.contains("Phase B"),
-            "missing-Phase-B state must be disclosed:\n{without}"
+            without.contains("semantic analysis has not run"),
+            "missing-semantic state must be disclosed:\n{without}"
+        );
+        assert!(
+            !without.contains("Phase B"),
+            "no internal jargon:\n{without}"
         );
         // ref/call present => note omitted.
         let with = get_repo_map(&two_crate_store(true));
         assert!(
-            !with.contains("Phase B) has not run"),
-            "semantic note must be omitted once Phase B has run:\n{with}"
+            !with.contains("semantic analysis has not run"),
+            "semantic note must be omitted once semantic analysis has run:\n{with}"
         );
     }
 

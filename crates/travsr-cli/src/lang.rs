@@ -185,6 +185,40 @@ fn unavailable_status(entry: &PhaseBEntry, target: &str) -> String {
 
 // ── list ──────────────────────────────────────────────────────────────────────
 
+/// Whether full cross-file semantic can actually run for `entry` on this machine:
+/// the analyzer is present (bundled, or its external binary resolves) AND the
+/// language is enabled (built in, or registered for indexing). One rule for every
+/// language — nothing is special-cased, so `lang list` and `lang detect` can never
+/// disagree again.
+fn analyzer_ready(entry: &PhaseBEntry, registered: bool) -> bool {
+    let enabled = entry.builtin || registered;
+    let present = if entry.analyzer_bundled() {
+        true
+    } else {
+        entry.provider_binary.map_or(true, tool_available) && tool_available(entry.command)
+    };
+    enabled && present
+}
+
+/// The capability-view status for one language, shared by `lang list` (text and
+/// JSON) and `lang detect`. Store-independent: the repo-level "did we actually
+/// produce edges here" answer lives in `travsr status`, in the same vocabulary.
+fn lang_capability_status(
+    entry: &PhaseBEntry,
+    registered: bool,
+    approved: bool,
+) -> travsr_plugin_host::phase_b::status::LangStatus {
+    travsr_plugin_host::phase_b::status::capability(
+        &travsr_plugin_host::phase_b::status::Capability {
+            entry,
+            analyzer_ready: analyzer_ready(entry, registered),
+            approved,
+            unsupported_on: wrapper_unavailable_target(entry)
+                .map(|_| travsr_plugin_host::phase_b::status::os_label().to_string()),
+        },
+    )
+}
+
 fn json_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -216,7 +250,9 @@ fn cmd_list(json: bool) -> Result<()> {
                 .unwrap_or(false);
             let provider_on_path = entry.provider_binary.map_or(true, tool_available);
             let tool_on_path = tool_available(entry.command);
-            let installed = entry.builtin || (provider_on_path && tool_on_path);
+            // Honest: the analyzer is installed when it is bundled (python) or its
+            // external binary resolves — never just because a language is built in.
+            let installed = entry.analyzer_bundled() || (provider_on_path && tool_on_path);
             let needs_approval =
                 matches!(entry.sandbox, SandboxRequirement::RequiresElevated) && !approved;
             let package = entry.npm_package.unwrap_or(entry.command);
@@ -231,11 +267,17 @@ fn cmd_list(json: bool) -> Result<()> {
             // surface an install prompt (the VS Code extension included) need
             // that difference, so it is stated rather than implied.
             let unavailable_on = wrapper_unavailable_target(entry);
+            // The authoritative status every consumer renders. `status` is a stable
+            // machine tag; `statusLine` is the exact human wording used in the CLI,
+            // so the extension shows the same words without re-deriving them.
+            let status = lang_capability_status(entry, registered, approved);
             entries.push(format!(
-                r#"{{"language":{},"package":{},"sandbox":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{}}}"#,
+                r#"{{"language":{},"package":{},"sandbox":{},"status":{},"statusLine":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{}}}"#,
                 json_str(entry.language),
                 json_str(package),
                 json_str(sandbox),
+                json_str(status.tag()),
+                json_str(&status.line()),
                 installed,
                 registered,
                 entry.builtin,
@@ -256,89 +298,31 @@ fn cmd_list(json: bool) -> Result<()> {
     println!("{}", "-".repeat(48));
 
     for entry in CATALOG {
-        let provider_on_path = entry.provider_binary.map_or(true, tool_available);
-        let tool_on_path = tool_available(entry.command);
-        let fully_ready = entry.builtin || (provider_on_path && tool_on_path);
-        let wrapper_only =
-            !entry.builtin && provider_on_path && !tool_on_path && entry.provider_binary.is_some();
         let registered = config
             .as_ref()
             .map(|c| c.is_registered(entry.language))
             .unwrap_or(false);
         let approval = config.as_ref().and_then(|c| c.get_approval(entry.language));
-        let approved = approval.is_some();
-        let sandbox_ok = sandbox_available();
 
-        // Appended to an active language whose network approval has aged out.
-        let expiry_warning = if let Some(appr) = &approval {
-            if let Ok(date) = chrono::NaiveDate::parse_from_str(&appr.approved_date, "%Y-%m-%d") {
-                let age = (today - date).num_days();
-                if age > APPROVAL_EXPIRY_DAYS {
-                    Some(format!(
-                        " \u{26a0} approval expired \u{00b7} travsr lang install {}",
-                        entry.language
-                    ))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // One computed status for every language — the same call `lang detect` and
+        // the JSON branch make, so the three can never drift apart again.
+        let status = lang_capability_status(entry, registered, approval.is_some());
 
-        // UX-013: built-in plugins (rust, typescript, python, dart) ship inside the
-        // travsr binary and work without any install step, so a ready built-in must
-        // read as active rather than "not set up".
-        let active_eligible = registered || entry.builtin;
-        // Deliberately terse: one short state per row, plus at most the single
-        // command that changes it. Verbose install URLs / chmod hints stay in
-        // `lang install` output, not here.
-        //
-        // #588: the platform-unavailable case is checked before every other branch
-        // — a wrapper that ships no binary for this host can never become active.
-        let status = if wrapper_unavailable_target(entry).is_some() {
-            "\u{2013} unavailable on this platform".to_string()
-        } else if entry.sandbox == SandboxRequirement::RequiresElevated && !approved {
-            format!(
-                "\u{2013} needs approval \u{00b7} travsr lang install {}",
-                entry.language
-            )
-        } else if wrapper_only {
-            format!(
-                "\u{26a0} tool missing \u{00b7} travsr lang install {}",
-                entry.language
-            )
-        } else if active_eligible && fully_ready && !sandbox_ok && !entry.builtin {
-            // Sandbox story is per-OS: Linux can install bubblewrap; macOS ships
-            // sandbox-exec (nothing to install if it is missing); Windows/other
-            // have no user-installable remedy. `cfg!` (not `#[cfg]`) so every
-            // platform's string is compiled and checked, not just this host's.
-            if cfg!(target_os = "linux") {
-                "\u{2013} disabled (sandbox unavailable) \u{00b7} install bubblewrap".to_string()
-            } else {
-                "\u{2013} disabled (sandbox unavailable)".to_string()
-            }
-        } else if active_eligible && fully_ready {
-            let kind = if entry.builtin { " (built-in)" } else { "" };
-            format!(
-                "\u{2713} active{kind}{}",
-                expiry_warning.as_deref().unwrap_or("")
-            )
-        } else if registered && !fully_ready {
-            format!(
-                "\u{26a0} tool missing \u{00b7} travsr lang install {}",
-                entry.language
-            )
-        } else {
-            format!(
-                "\u{2013} not set up \u{00b7} travsr lang install {}",
-                entry.language
-            )
-        };
+        // A recorded network approval that has aged past expiry is surfaced in
+        // plain words on top of the state — no symbols.
+        let expiry = approval
+            .as_ref()
+            .and_then(|a| chrono::NaiveDate::parse_from_str(&a.approved_date, "%Y-%m-%d").ok())
+            .filter(|d| (today - *d).num_days() > APPROVAL_EXPIRY_DAYS)
+            .map(|_| {
+                format!(
+                    "  (approval expired, run: travsr lang install {})",
+                    entry.language
+                )
+            })
+            .unwrap_or_default();
 
-        println!("{:<12} {}", entry.language, status);
+        println!("{:<12} {}{}", entry.language, status.line(), expiry);
     }
 
     // RFC-025 §8: sidecar version health for the installed Phase B tools
@@ -420,7 +404,7 @@ fn cmd_install(
     let wrapper_installed = match entry.provider_binary {
         None => true, // builtin — no external wrapper needed
         Some(bin) if which(bin) && !reinstall => {
-            println!("\u{2713} {bin} already installed.");
+            println!("{bin} already installed.");
             // RFC-025 Point B: presence never re-checks the release the wrapper
             // was pinned to. Surface a below-floor WARN (offline) and a newer-
             // release advisory (best-effort) over the installed wrapper. Never
@@ -456,7 +440,7 @@ fn cmd_install(
                 })
                 .context("downloading wrapper binary")?;
 
-                println!("\u{2713} {bin} installed to {}", path.display());
+                println!("{bin} installed to {}", path.display());
 
                 if entry.has_share_assets {
                     let sv = version.clone();
@@ -464,7 +448,7 @@ fn cmd_install(
                     match run_async(
                         async move { crate::install::install_share_assets(&sv, &sb).await },
                     ) {
-                        Ok(()) => println!("\u{2713} {bin} emitter files installed"),
+                        Ok(()) => println!("{bin} emitter files installed"),
                         Err(e) => println!("warning: could not install {bin} share assets: {e:#}"),
                     }
                 }
@@ -502,7 +486,7 @@ fn cmd_install(
     // fires until a floor is raised in the same commit a tool behavior needs it.
     if tool_ready {
         if let Some(refusal) = phase_b_tool_floor_refusal(entry) {
-            eprintln!("\u{26A0} {refusal}");
+            eprintln!("{refusal}");
             tool_ready = false;
         }
     }
@@ -532,7 +516,7 @@ fn cmd_install(
     };
     save_config(&config)?;
     if enabled_here {
-        println!("\u{2713} Semantic analysis enabled for this repository.");
+        println!("Semantic analysis enabled for this repository.");
     }
 
     // provider_ready: check PATH for builtins; wrapper_installed already accounts
@@ -544,15 +528,15 @@ fn cmd_install(
 
     if !provider_ready || !tool_ready {
         println!(
-            "\u{26A0} '{language}' is registered but '{}' is not installed yet.\n\
-             Deep code analysis will be inactive until it is set up.\n\
-             Once the tool is installed, run `travsr init` inside your repository.",
+            "'{language}' is set up, but its analyzer '{}' is not installed yet.\n\
+             Full cross-file analysis stays off until it is; basic analysis still runs.\n\
+             After it installs, run `travsr init` in your repository.",
             entry.command
         );
         return Ok(InstallStatus::WrapperOnly);
     }
 
-    println!("\u{2713} '{language}' is ready for deep code analysis.");
+    println!("'{language}' is active — full cross-file analysis is on.");
     Ok(InstallStatus::FullyReady)
 }
 
@@ -610,7 +594,7 @@ fn install_scip_tool(
                     .with_context(|| format!("running '{}'", cmd_args.join(" ")))?;
                 let status = child.wait()?;
                 if status.success() {
-                    println!("\u{2713} {} installed.", entry.command);
+                    println!("{} installed.", entry.command);
                     // Trust exit 0: the binary may be in $GOPATH/bin, ~/.cargo/bin,
                     // or another tool-managed dir not yet in the process's PATH.
                     return Ok(true);
@@ -760,11 +744,7 @@ fn install_scip_github_binary(
         crate::install::download_scip_binary(&repo2, &tag2, &asset2, &name2, verify, expected).await
     }) {
         Ok(path) => {
-            println!(
-                "\u{2713} {} installed to {}",
-                spec.install_name,
-                path.display()
-            );
+            println!("{} installed to {}", spec.install_name, path.display());
             // UX-4: some SCIP launchers (scip-java's coursier wrapper) report the
             // `0.0.0` "unset" sentinel from `--version`, so `travsr status` can only
             // show a real version via the `<bin>.version` fallback file. Nothing was
@@ -859,11 +839,7 @@ fn install_zip_binary(
             .context("chmod +x wrapper")?;
     }
 
-    println!(
-        "\u{2713} {} installed to {}",
-        spec.install_name,
-        wrapper.display()
-    );
+    println!("{} installed to {}", spec.install_name, wrapper.display());
     if !crate::install::path_contains_travsr_bin() {
         println!("\n{}", crate::install::path_hint());
     }
@@ -896,27 +872,20 @@ fn cmd_detect() -> Result<()> {
             .as_ref()
             .map(|c| c.is_registered(lang))
             .unwrap_or(false);
-        let provider_ready = entry.provider_binary.map_or(true, tool_available);
-        let fully_ready = entry.builtin || (provider_ready && tool_available(entry.command));
+        let approved = config
+            .as_ref()
+            .map(|c| c.is_approved(lang))
+            .unwrap_or(false);
 
-        let status = if let Some(target) = wrapper_unavailable_target(entry) {
-            // #588: shown in the numbered menu so a doomed choice is visible
-            // before it is made, not after a 404.
-            format!("not available on {target} yet")
-        } else if registered && fully_ready {
-            "\u{2713} already active".to_string()
-        } else if registered {
-            "registered (analyzer binary missing)".to_string()
-        } else {
-            "not installed".to_string()
-        };
+        // Same computed status as `lang list`, so the two commands agree exactly.
+        let status = lang_capability_status(entry, registered, approved);
 
         println!(
-            "  [{}] {}  ({})  — {}",
+            "  [{}] {}  ({})  {}",
             i + 1,
             lang,
             entry.extensions.join(", "),
-            status
+            status.line()
         );
     }
     println!();
@@ -959,11 +928,11 @@ fn cmd_detect() -> Result<()> {
 
     println!();
     for lang in &selected {
-        println!("── {} ──", lang);
+        println!("{lang}:");
         match cmd_install(lang, false, false, None, false, false, None) {
             Ok(InstallStatus::FullyReady) => {}
             Ok(InstallStatus::WrapperOnly) => {
-                println!("  \u{26A0} {lang}: wrapper installed but the analyzer binary is missing")
+                println!("  {lang}: analyzer not installed yet — full analysis stays off")
             }
             Err(e) => eprintln!("  error: {e:#}"),
         }
@@ -998,7 +967,7 @@ fn cmd_remove(language: &str) -> Result<()> {
     let mut config = load_config().unwrap_or_default();
     if config.unregister(language) {
         save_config(&config)?;
-        println!("\u{2713} '{language}' semantic analysis unregistered.");
+        println!("'{language}' full analysis turned off — basic analysis still runs.");
     } else {
         println!("'{language}' was not registered.");
     }
@@ -1041,7 +1010,7 @@ fn cmd_approve(
     save_config(&config)?;
 
     println!(
-        "\u{2713} Security approval recorded for '{language}'.\n\
+        "Security approval recorded for '{language}'.\n\
          Permitted hosts: {}\n\
          note: the sandbox does not filter traffic per host — this allowlist is\n\
          only enforced if a host-level firewall or egress proxy backs it.\n\
@@ -1103,7 +1072,7 @@ fn inline_approval_prompt(
     save_config(&config)?;
 
     println!(
-        "\u{2713} Approval recorded. Permitted hosts: {}\n\
+        "Approval recorded. Permitted hosts: {}\n\
          note: the sandbox does not filter traffic per host — this allowlist is\n\
          only enforced if a host-level firewall or egress proxy backs it.\n",
         permitted_hosts.join(", ")
@@ -1449,15 +1418,6 @@ fn phase_b_tool_floor_refusal(entry: &travsr_plugin_host::PhaseBEntry) -> Option
             None
         }
     }
-}
-
-fn sandbox_available() -> bool {
-    #[cfg(target_os = "linux")]
-    return which("bwrap");
-    #[cfg(target_os = "macos")]
-    return std::path::Path::new("/usr/bin/sandbox-exec").exists();
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    return false;
 }
 
 #[cfg(test)]

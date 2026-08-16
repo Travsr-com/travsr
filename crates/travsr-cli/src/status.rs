@@ -202,7 +202,7 @@ pub fn run() -> anyhow::Result<()> {
                         }
                     }
                     ["needs_approval", lang] => eprintln!(
-                        "warning: '{lang}' requires elevated sandbox approval — run `travsr lang approve {lang}`"
+                        "warning: '{lang}' needs a one-time network approval before it can index — run `travsr lang approve {lang}`"
                     ),
                     // #712: analyzer ran but produced no nodes over the repo's
                     // source files of this language — a silent zero-node result,
@@ -216,7 +216,7 @@ pub fn run() -> anyhow::Result<()> {
                     // which the host now forwards on stderr.
                     ["zero_nodes", lang] => {
                         eprintln!(
-                            "warning: semantic analyzer for '{lang}' ran but produced no symbols despite '{lang}' sources in the repo. The analyzer is installed and active, so reinstalling will not help — its sidecar likely could not parse or resolve these sources. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see the sidecar's own diagnostics"
+                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help — it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
                         );
                         // #724 Finding 4: the most common cause of a zero-node
                         // Java run on macOS is scip-java's javac shim crashing
@@ -231,7 +231,7 @@ pub fn run() -> anyhow::Result<()> {
                     // never ran, previously a silent skip that left the user
                     // with "0 references" and no explanation.
                     ["skipped_unregistered", lang] => eprintln!(
-                        "warning: '{lang}' sources found but semantic indexing is not set up. Run `travsr lang install {lang}`"
+                        "warning: '{lang}' sources found but full analysis is not set up. Run `travsr lang install {lang}`"
                     ),
                     // #414 (ADR-017 Rule 3): registered globally but this repo was
                     // never enabled. Collapsed into one combined line above the
@@ -243,7 +243,7 @@ pub fn run() -> anyhow::Result<()> {
                     // L5a: scip-clang (c/cpp) needs a compile_commands.json at the
                     // repo root — without one it hangs, so it is skipped up front.
                     ["skipped_no_compdb", lang] => eprintln!(
-                        "warning: '{lang}' semantic indexing needs a compile_commands.json at the repo root. Generate one (e.g. `bear -- make`, or CMake's CMAKE_EXPORT_COMPILE_COMMANDS) to enable it"
+                        "warning: full '{lang}' analysis needs a compile database (compile_commands.json) at the repo root. Generate one (e.g. `bear -- make`, or CMake's CMAKE_EXPORT_COMPILE_COMMANDS)"
                     ),
                     // E6: SCIP definitions that did not unify onto their Phase A
                     // tree-sitter node — their references attribute to an orphaned
@@ -257,14 +257,20 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
-    // M1: warn when Rust semantic edges are degraded due to sandbox unavailability.
+    // M1: warn when Rust's full cross-file edges were skipped for lack of a
+    // security sandbox. The remedy is per-OS: only Linux has a sandbox the user
+    // can install (bubblewrap); Windows and macOS have none to add here, so the
+    // only path to full edges is the trusted-repo opt-in. `cfg!` (not `#[cfg]`)
+    // keeps every platform's wording compiled and checked.
     if let Some(reason) = &payload.rust_lsif_degraded {
         if reason == "sandbox_unavailable" {
+            let remedy = if cfg!(target_os = "linux") {
+                "Install bubblewrap, or re-run `travsr init --allow-unsandboxed-lsif` if you trust this repo."
+            } else {
+                "Re-run `travsr init --allow-unsandboxed-lsif` if you trust this repo."
+            };
             eprintln!(
-                "warning: Rust semantic edges degraded — rust-analyzer LSIF was \
-                 skipped because the OS sandbox (bubblewrap/sandbox-exec) is \
-                 unavailable. Install bubblewrap, or re-run \
-                 `travsr init --allow-unsandboxed-lsif` if you trust this repo."
+                "warning: Rust is on basic analysis — full cross-file edges (from rust-analyzer) were skipped because they need a security sandbox that is not available here. {remedy}"
             );
         }
     }
