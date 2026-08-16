@@ -3909,7 +3909,7 @@ fn reconcile_head_drift(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
     phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
-    index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
 ) -> bool {
     let head = match read_head_commit_sha(repo_root) {
         Ok(h) if !h.is_empty() => h,
@@ -7270,7 +7270,8 @@ mod tests {
         let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         let msg = serde_json::to_string(&travsr_ipc::ControlMessage::ReindexCommit {
             sha: "deadbeef".to_string(),
@@ -7337,7 +7338,8 @@ mod tests {
         store.set_meta("last_commit", "f0f0f0f").unwrap();
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         assert!(
             reconcile_head_drift(tmp.path(), &store, &sched, &index_tx),
@@ -7379,7 +7381,8 @@ mod tests {
         store.set_meta("last_commit", &head).unwrap();
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         assert!(
             !reconcile_head_drift(tmp.path(), &store, &sched, &index_tx),
@@ -7411,7 +7414,8 @@ mod tests {
             .unwrap();
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         assert!(!reconcile_head_drift(tmp.path(), &store, &sched, &index_tx));
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -7437,7 +7441,8 @@ mod tests {
         store.set_meta("last_commit", "abc123").unwrap();
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         assert!(!reconcile_head_drift(tmp.path(), &store, &sched, &index_tx));
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -7465,7 +7470,8 @@ mod tests {
         store.set_meta("last_commit", "f0f0f0f").unwrap();
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         reconcile_head_drift(tmp.path(), &store, &sched, &index_tx);
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -7582,7 +7588,8 @@ mod tests {
 
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         assert!(reconcile_head_drift(tmp.path(), &store, &sched, &index_tx));
 
@@ -7638,7 +7645,8 @@ mod tests {
 
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         assert!(reconcile_head_drift(tmp.path(), &store, &sched, &index_tx));
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -7730,7 +7738,8 @@ mod tests {
         let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
         let sessions = std::sync::Mutex::new(EditorPlane::default());
 
         let mine = tmp.path().join("repo-a");
@@ -7824,7 +7833,8 @@ mod tests {
         let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
         let sessions = std::sync::Mutex::new(EditorPlane::default());
         let mine = tmp.path().join("mine");
         std::fs::create_dir_all(&mine).unwrap();
@@ -7885,7 +7895,8 @@ mod tests {
         let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
         let sessions = std::sync::Mutex::new(EditorPlane::default());
 
         let mine = tmp.path().join("mine");
@@ -7948,7 +7959,8 @@ mod tests {
         let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         // repo_root does not exist, so git cannot spawn there and both
         // changed_files_from_git and tracked_files_from_git error.
@@ -8011,7 +8023,8 @@ mod tests {
         let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         let msg = serde_json::to_string(&travsr_ipc::ControlMessage::ReindexCommit {
             sha: "deadbeef".to_string(),
@@ -8584,7 +8597,17 @@ impl Daemon {
         // forwards `WatchEvent`s through a std channel (`index_tx`) to this
         // worker. No new threads are ever spawned for indexing — at most ONE
         // blocking thread handles indexing at any time.
-        let (index_tx, index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        //
+        // #736 A2: the channel is BOUNDED (`sync_channel`) and every producer
+        // uses `try_send`. The previous unbounded channel defeated the 256-slot
+        // watcher backpressure above, and `enqueue_dirty_callers` feeds this
+        // queue from inside its own consumer — up to 100k paths per reindex —
+        // so it grew without limit under load. Shedding on Full is safe by the
+        // same argument as DIRTY_QUEUE_CAP: missed events are covered by the
+        // gc-tick head reconcile and the next Phase B / `travsr init` pass.
+        // `try_send` never blocks, so the self-feeding path cannot deadlock.
+        let (index_tx, index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
         // worker_stop lets shutdown signal the worker to exit even though
         // index_tx_worker (the clone held by the closure) keeps the channel
         // alive after drop(index_tx). Without this, recv() never returns Err,
@@ -8736,8 +8759,10 @@ impl Daemon {
                     Some(ev) = rx.recv() => {
                         // Forward to the dedicated indexer worker — never spawn a
                         // new thread here (PERF-001).
-                        if index_tx.send(ev).is_err() {
-                            tracing::warn!("indexer worker has exited; dropping watch event");
+                        if let Err(e) = index_tx.try_send(ev) {
+                            // Full = queue at INDEX_QUEUE_CAP (shed; reconcile
+                            // covers it), Disconnected = worker exited.
+                            tracing::warn!("indexer queue rejected watch event: {e}");
                         }
                     }
                     Ok((conn, _)) = listener.accept() => {
@@ -8891,8 +8916,10 @@ impl Daemon {
                     Some(ev) = rx.recv() => {
                         // Forward to the dedicated indexer worker — never spawn a
                         // new thread here (PERF-001).
-                        if index_tx.send(ev).is_err() {
-                            tracing::warn!("indexer worker has exited; dropping watch event");
+                        if let Err(e) = index_tx.try_send(ev) {
+                            // Full = queue at INDEX_QUEUE_CAP (shed; reconcile
+                            // covers it), Disconnected = worker exited.
+                            tracing::warn!("indexer queue rejected watch event: {e}");
                         }
                     }
                     _ = gc_tick.tick() => {
@@ -8970,7 +8997,7 @@ impl Daemon {
         //    worker concurrently holds store.lock().
         rx.close();
         while let Ok(ev) = rx.try_recv() {
-            let _ = index_tx.send(ev);
+            let _ = index_tx.try_send(ev);
         }
         // 2. Signal the indexer worker: set stop flag first (so the worker can
         //    exit via the recv_timeout path even though index_tx_worker keeps
@@ -9002,6 +9029,16 @@ impl Daemon {
 /// reconcile covers missed re-resolutions.
 const DIRTY_QUEUE_CAP: usize = 100_000;
 
+/// Bound on the indexer worker's event queue (#736 A2).
+///
+/// Sized to DIRTY_QUEUE_CAP so a full dirty-caller set still fits into an
+/// otherwise-empty queue; beyond that, producers shed via `try_send` and the
+/// gc-tick head reconcile / next Phase B pass covers whatever was dropped —
+/// the exact recovery contract DIRTY_QUEUE_CAP already relies on. At ~150
+/// bytes per buffered event this bounds the queue at roughly 15 MB where it
+/// previously grew without limit.
+const INDEX_QUEUE_CAP: usize = DIRTY_QUEUE_CAP;
+
 /// Send Tier-0 re-resolve requests for `callers` into the indexer channel.
 ///
 /// Each caller is sent as a `WatchEvent::Upsert` so it runs through the same
@@ -9011,23 +9048,37 @@ const DIRTY_QUEUE_CAP: usize = 100_000;
 fn enqueue_dirty_callers(
     callers: travsr_core::DirtySet,
     repo_root: &std::path::Path,
-    index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
 ) {
     if callers.is_empty() {
         return;
     }
     let total = callers.len();
     let mut enqueued = 0usize;
+    let mut shed = 0usize;
     for caller in callers.into_iter().take(DIRTY_QUEUE_CAP) {
         let abs = repo_root.join(&caller);
         if !abs.exists() {
             continue;
         }
-        if index_tx.send(watcher::WatchEvent::Upsert(abs)).is_err() {
-            tracing::warn!("Tier-0: indexer channel closed, dropping remaining callers");
-            break;
+        match index_tx.try_send(watcher::WatchEvent::Upsert(abs)) {
+            Ok(()) => enqueued += 1,
+            // #736 A2: queue at INDEX_QUEUE_CAP — shed the rest of this set;
+            // the next Phase B / reconcile covers them, same as the cap above.
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                shed += 1;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!("Tier-0: indexer channel closed, dropping remaining callers");
+                break;
+            }
         }
-        enqueued += 1;
+    }
+    if shed > 0 {
+        tracing::warn!(
+            shed,
+            "Tier-0: indexer queue full — {shed} caller(s) deferred to Phase B / next reconcile"
+        );
     }
     if total > DIRTY_QUEUE_CAP {
         tracing::warn!(
@@ -9047,7 +9098,7 @@ fn handle_watch_event(
     ev: watcher::WatchEvent,
     repo_root: &std::path::Path,
     store: &std::sync::Mutex<SqliteStore>,
-    index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
 ) {
     use watcher::WatchEvent;
 
@@ -9201,7 +9252,7 @@ fn handle_control_message(
     read_store: &std::sync::Mutex<SqliteStore>,
     cache: &std::sync::Mutex<query_cache::QueryCache>,
     phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
-    index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
     lsp_sessions: &std::sync::Mutex<EditorPlane>,
 ) -> (travsr_ipc::ControlResponse, bool) {
     use travsr_ipc::{ControlMessage, ControlResponse};

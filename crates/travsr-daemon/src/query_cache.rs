@@ -53,16 +53,31 @@ struct CacheKey {
     embed_data_version: Option<u64>,
 }
 
+/// Byte budget across all cached values (issue #736 B1).
+///
+/// The entry-count cap alone does not bound memory: values are whole query
+/// results, and a single legitimate `graph <hub> --budget 0` response can
+/// reach 256 MiB (see `travsr-ipc`'s `MAX_RESPONSE_BYTES`), so 256 entries
+/// could resident multiple GB. The byte budget makes the worst case a known
+/// constant; typical entries are small, so the effective capacity for normal
+/// workloads is still the entry cap.
+const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Bounded LRU over serialized query results.
 ///
 /// Eviction is exact LRU: every access stamps the entry with a monotonically
 /// increasing tick, and the entry with the smallest tick is dropped when
-/// capacity is exceeded. Eviction is `O(n)` but `n` is the (small) capacity and
-/// `put` is rare relative to `get`, so the linear scan is not a hot path.
+/// either the entry cap or the byte budget is exceeded. Eviction is `O(n)`
+/// but `n` is the (small) capacity and `put` is rare relative to `get`, so
+/// the linear scan is not a hot path.
 pub struct QueryCache {
     cap: usize,
     tick: u64,
-    entries: HashMap<CacheKey, (serde_json::Value, u64)>,
+    /// Value, LRU tick, and the value's approximate resident bytes (computed
+    /// once at insert so eviction never has to re-measure).
+    entries: HashMap<CacheKey, (serde_json::Value, u64, usize)>,
+    /// Sum of the per-entry byte estimates, kept under `MAX_CACHE_BYTES`.
+    total_bytes: usize,
 }
 
 impl QueryCache {
@@ -72,6 +87,7 @@ impl QueryCache {
             cap: cap.max(1),
             tick: 0,
             entries: HashMap::new(),
+            total_bytes: 0,
         }
     }
 
@@ -109,8 +125,8 @@ impl QueryCache {
         Some(entry.0.clone())
     }
 
-    /// Insert (or refresh) a result, evicting the least-recently-used entry if
-    /// the cache is over capacity.
+    /// Insert (or refresh) a result, evicting least-recently-used entries
+    /// while either the entry cap or the byte budget is exceeded.
     pub fn put(
         &mut self,
         tool: &str,
@@ -120,29 +136,69 @@ impl QueryCache {
         versions: DataVersions,
         value: serde_json::Value,
     ) {
+        let cost = approx_value_bytes(&value);
+        // A value bigger than the whole budget would evict everything and
+        // still not fit — refuse it; the query simply stays uncached.
+        if cost > MAX_CACHE_BYTES {
+            return;
+        }
         let k = Self::key(tool, args, last_commit, phase_b_commit, versions);
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
-        self.entries.insert(k, (value, tick));
-        if self.entries.len() > self.cap {
-            self.evict_lru();
+        if let Some((_, _, prev_cost)) = self.entries.insert(k, (value, tick, cost)) {
+            self.total_bytes = self.total_bytes.saturating_sub(prev_cost);
+        }
+        self.total_bytes += cost;
+        while self.entries.len() > self.cap || self.total_bytes > MAX_CACHE_BYTES {
+            if !self.evict_lru() {
+                break;
+            }
         }
     }
 
-    fn evict_lru(&mut self) {
-        if let Some(victim) = self
+    /// Evict the least-recently-used entry. Returns false when empty.
+    fn evict_lru(&mut self) -> bool {
+        let Some(victim) = self
             .entries
             .iter()
-            .min_by_key(|(_, (_, t))| *t)
+            .min_by_key(|(_, (_, t, _))| *t)
             .map(|(k, _)| k.clone())
-        {
-            self.entries.remove(&victim);
+        else {
+            return false;
+        };
+        if let Some((_, _, cost)) = self.entries.remove(&victim) {
+            self.total_bytes = self.total_bytes.saturating_sub(cost);
         }
+        true
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+/// Approximate resident bytes of a JSON value, without serializing it.
+///
+/// Proportionality is what matters (the budget bounds growth); exactness is
+/// not. String content dominates real payloads; containers get a fixed
+/// per-element overhead for their allocation and enum tags.
+fn approx_value_bytes(v: &serde_json::Value) -> usize {
+    const ELEM_OVERHEAD: usize = 32;
+    match v {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            ELEM_OVERHEAD
+        }
+        serde_json::Value::String(s) => s.len() + ELEM_OVERHEAD,
+        serde_json::Value::Array(items) => {
+            items.iter().map(approx_value_bytes).sum::<usize>() + ELEM_OVERHEAD
+        }
+        serde_json::Value::Object(map) => {
+            map.iter()
+                .map(|(k, val)| k.len() + approx_value_bytes(val))
+                .sum::<usize>()
+                + ELEM_OVERHEAD
+        }
     }
 }
 
@@ -255,6 +311,41 @@ mod tests {
             c.get("ask", &args, "c1", "p1", embedded(7)),
             Some(json!("old embeddings"))
         );
+    }
+
+    /// #736 B1: the entry cap alone does not bound memory — large values must
+    /// trigger eviction well before 256 entries accumulate.
+    #[test]
+    fn byte_budget_evicts_before_entry_cap() {
+        let mut c = QueryCache::new(256);
+        // ~8 MB per value → the 64 MB budget holds at most 8 of them.
+        let big = "x".repeat(8 * 1024 * 1024);
+        for i in 0..20 {
+            let args = json!({ "k": i });
+            c.put("graph", &args, "c", "c", dv(1), json!({ "blob": big.clone() }));
+        }
+        assert!(
+            c.total_bytes <= MAX_CACHE_BYTES,
+            "total_bytes {} exceeds budget {}",
+            c.total_bytes,
+            MAX_CACHE_BYTES
+        );
+        assert!(c.len() < 20, "old large entries must have been evicted");
+        // Newest entry is still served.
+        assert!(c.get("graph", &json!({"k": 19}), "c", "c", dv(1)).is_some());
+        // Oldest was evicted by the byte budget.
+        assert!(c.get("graph", &json!({"k": 0}), "c", "c", dv(1)).is_none());
+    }
+
+    /// A single value larger than the whole budget must be refused outright.
+    #[test]
+    fn oversized_value_is_not_cached() {
+        let mut c = QueryCache::new(8);
+        let args = json!({"k": "big"});
+        let huge = "x".repeat(MAX_CACHE_BYTES + 1);
+        c.put("graph", &args, "c", "c", dv(1), json!(huge));
+        assert!(c.get("graph", &args, "c", "c", dv(1)).is_none());
+        assert_eq!(c.total_bytes, 0);
     }
 
     #[test]

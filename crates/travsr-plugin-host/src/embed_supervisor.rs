@@ -33,6 +33,67 @@ const MAX_RESPAWN_ATTEMPTS: u32 = 3;
 /// after warm-up complete in <200 ms and always beat this threshold.
 const KNN_CALL_TIMEOUT_MS: u64 = 600;
 
+/// Pending-request depth for one hook worker (issue #736 A3).
+///
+/// Kept deliberately small: a caller abandons its request after
+/// [`KNN_CALL_TIMEOUT_MS`], so anything queued deeper than a couple of slots
+/// behind a slow sidecar would be computed for nobody. When the queue is full
+/// the request is shed immediately (empty result → FTS fallback), which is
+/// the same outcome the caller's timeout would produce, minus the wasted work.
+const HOOK_QUEUE_DEPTH: usize = 2;
+
+/// One long-lived worker thread serving one hook type (issue #736 A3).
+///
+/// Replaces the previous thread-per-invocation pattern, where every hook call
+/// spawned a fresh OS thread and abandoned it on timeout. Under a slow or
+/// cold sidecar those abandoned threads piled up behind the sidecar mutex
+/// without bound — a stack (~2 MiB reserved) plus the owned query per thread,
+/// and a CPU/memory feedback loop once throttling made the sidecar slower.
+///
+/// Now exactly one thread per hook type exists for the supervisor's lifetime.
+/// Requests travel over a bounded channel; the caller waits on a per-request
+/// reply channel with the same timeout as before, so the observable contract
+/// (empty result after 600 ms, warm calls fast) is unchanged. A reply whose
+/// caller already gave up is dropped on send — no thread is ever stranded.
+///
+/// The worker exits when the last hook closure holding `tx` is dropped
+/// (channel disconnect), i.e. at daemon shutdown.
+struct HookWorker<Req: Send + 'static, Resp: Send + 'static> {
+    tx: mpsc::SyncSender<(Req, mpsc::Sender<Resp>)>,
+}
+
+impl<Req: Send + 'static, Resp: Send + 'static> HookWorker<Req, Resp> {
+    fn spawn(
+        name: &'static str,
+        handler: impl Fn(Req) -> Option<Resp> + Send + 'static,
+    ) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<(Req, mpsc::Sender<Resp>)>(HOOK_QUEUE_DEPTH);
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                while let Ok((req, reply)) = rx.recv() {
+                    if let Some(resp) = handler(req) {
+                        // Caller may have timed out and dropped its receiver —
+                        // a failed send is the expected shape of that race.
+                        let _ = reply.send(resp);
+                    }
+                }
+            })
+            .ok();
+        Self { tx }
+    }
+
+    /// Submit a request and wait up to `timeout` for the reply. Returns None
+    /// when the queue is full (worker backed up) or the reply timed out.
+    fn call(&self, req: Req, timeout: Duration) -> Option<Resp> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self.tx.try_send((req, reply_tx)).is_err() {
+            return None;
+        }
+        reply_rx.recv_timeout(timeout).ok()
+    }
+}
+
 /// Manages the embed plugin subprocess for one daemon session.
 ///
 /// Created once at daemon startup. If the binary is not installed or the
@@ -133,47 +194,46 @@ impl EmbedSupervisor {
     /// or the HNSW index, so the first real KNN call would otherwise block the
     /// calling thread for the full load time (~30 s on kubernetes).
     ///
-    /// Each hook invocation spawns a worker thread that acquires the sidecar
-    /// lock and does the blocking KNN I/O. The calling thread waits at most
-    /// `KNN_CALL_TIMEOUT_MS` (600 ms) via `recv_timeout`. If the sidecar has
-    /// not responded by then, the hook returns an empty set immediately and the
-    /// query falls back to FTS seeds. The worker thread continues running in
-    /// the background; once the model is loaded subsequent calls are fast.
+    /// One long-lived [`HookWorker`] thread owns the blocking sidecar I/O
+    /// (issue #736 A3 — previously a fresh thread per invocation, abandoned on
+    /// timeout, piled up behind the sidecar mutex without bound). The calling
+    /// thread waits at most `KNN_CALL_TIMEOUT_MS` (600 ms). If the sidecar has
+    /// not responded by then, the hook returns an empty set immediately and
+    /// the query falls back to FTS seeds. The worker keeps processing in the
+    /// background; once the model is loaded subsequent calls are fast.
     pub fn knn_hook(&self, model_id: String) -> Option<KnnHook> {
         let arc = self.inner.as_ref()?.clone();
+        let worker = HookWorker::spawn("embed-knn-worker", move |(query, k): (String, u32)| {
+            let Ok(sidecar) = arc.lock() else { return None };
+            if !sidecar.is_alive() {
+                return None;
+            }
+            match sidecar.knn(&query, k, &model_id, Space::Code) {
+                Ok(pairs) => {
+                    // Kythe VName hashes are signed i64 and can be negative;
+                    // usearch stores them as u64 via bit-reinterpretation and
+                    // returns the same bit pattern. Cast roundtrips correctly.
+                    Some(
+                        pairs
+                            .into_iter()
+                            .map(|(id, score)| (NodeId(id as u64), score))
+                            .collect::<Vec<(NodeId, f32)>>(),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!("embed knn failed (non-fatal): {e}");
+                    None
+                }
+            }
+        });
         Some(Arc::new(move |query: &str, k: u32| {
-            let arc2 = Arc::clone(&arc);
-            let query_owned = query.to_string();
-            let model_id2 = model_id.clone();
-
-            let (tx, rx) = mpsc::channel::<Vec<(NodeId, f32)>>();
-            std::thread::Builder::new()
-                .name("embed-knn-worker".into())
-                .spawn(move || {
-                    let Ok(sidecar) = arc2.lock() else { return };
-                    if !sidecar.is_alive() {
-                        return;
-                    }
-                    match sidecar.knn(&query_owned, k, &model_id2, Space::Code) {
-                        Ok(pairs) => {
-                            // Kythe VName hashes are signed i64 and can be negative;
-                            // usearch stores them as u64 via bit-reinterpretation and
-                            // returns the same bit pattern. Cast roundtrips correctly.
-                            let nodes: Vec<(NodeId, f32)> = pairs
-                                .into_iter()
-                                .map(|(id, score)| (NodeId(id as u64), score))
-                                .collect();
-                            let _ = tx.send(nodes);
-                        }
-                        Err(e) => tracing::warn!("embed knn failed (non-fatal): {e}"),
-                    }
-                })
-                .ok();
-
-            // Return whatever arrived within the budget. `unwrap_or_default`
-            // covers both timeout (Disconnected or Timeout) and spawn failure.
-            Ok(rx
-                .recv_timeout(Duration::from_millis(KNN_CALL_TIMEOUT_MS))
+            // Empty set on shed (worker backed up) or timeout — same contract
+            // as before, without the per-call thread.
+            Ok(worker
+                .call(
+                    (query.to_string(), k),
+                    Duration::from_millis(KNN_CALL_TIMEOUT_MS),
+                )
                 .unwrap_or_default())
         }))
     }
@@ -191,34 +251,33 @@ impl EmbedSupervisor {
         if !self.capabilities()?.supports_doc_space() {
             return None;
         }
+        let worker = HookWorker::spawn(
+            "embed-doc-knn-worker",
+            move |(query, k): (String, u32)| {
+                let Ok(sidecar) = arc.lock() else { return None };
+                if !sidecar.is_alive() {
+                    return None;
+                }
+                match sidecar.knn(&query, k, &model_id, Space::Docs) {
+                    Ok(pairs) => Some(
+                        pairs
+                            .into_iter()
+                            .map(|(id, score)| (NodeId(id as u64), score))
+                            .collect::<Vec<(NodeId, f32)>>(),
+                    ),
+                    Err(e) => {
+                        tracing::warn!("embed doc knn failed (non-fatal): {e}");
+                        None
+                    }
+                }
+            },
+        );
         Some(Arc::new(move |query: &str, k: u32| {
-            let arc2 = Arc::clone(&arc);
-            let query_owned = query.to_string();
-            let model_id2 = model_id.clone();
-
-            let (tx, rx) = mpsc::channel::<Vec<(NodeId, f32)>>();
-            std::thread::Builder::new()
-                .name("embed-doc-knn-worker".into())
-                .spawn(move || {
-                    let Ok(sidecar) = arc2.lock() else { return };
-                    if !sidecar.is_alive() {
-                        return;
-                    }
-                    match sidecar.knn(&query_owned, k, &model_id2, Space::Docs) {
-                        Ok(pairs) => {
-                            let nodes: Vec<(NodeId, f32)> = pairs
-                                .into_iter()
-                                .map(|(id, score)| (NodeId(id as u64), score))
-                                .collect();
-                            let _ = tx.send(nodes);
-                        }
-                        Err(e) => tracing::warn!("embed doc knn failed (non-fatal): {e}"),
-                    }
-                })
-                .ok();
-
-            Ok(rx
-                .recv_timeout(Duration::from_millis(KNN_CALL_TIMEOUT_MS))
+            Ok(worker
+                .call(
+                    (query.to_string(), k),
+                    Duration::from_millis(KNN_CALL_TIMEOUT_MS),
+                )
                 .unwrap_or_default())
         }))
     }
@@ -226,39 +285,35 @@ impl EmbedSupervisor {
     /// Build the RFC-019 query-embedding hook: embeds one short query text and
     /// returns its raw vector BLOB. `None` when the supervisor is inactive.
     ///
-    /// Same cold-start protection as [`Self::knn_hook`]: a worker thread does the
-    /// blocking `embed_batch` I/O while the calling thread waits at most
-    /// `KNN_CALL_TIMEOUT_MS`. On timeout or error the hook returns an **empty**
-    /// BLOB — the caller's `decode_embedding` then fails and no candidates are
-    /// scored (unknown), so a slow/cold sidecar can never stall `get_context` or
-    /// fabricate a false cosine. Warm `embed_batch` of one short text is ~tens of ms.
+    /// Same cold-start protection as [`Self::knn_hook`]: one long-lived
+    /// [`HookWorker`] does the blocking `embed_batch` I/O while the calling
+    /// thread waits at most `KNN_CALL_TIMEOUT_MS`. On shed, timeout, or error
+    /// the hook returns an **empty** BLOB — the caller's `decode_embedding`
+    /// then fails and no candidates are scored (unknown), so a slow/cold
+    /// sidecar can never stall `get_context` or fabricate a false cosine.
+    /// Warm `embed_batch` of one short text is ~tens of ms.
     pub fn embed_query_hook(&self) -> Option<EmbedQueryHook> {
         let arc = self.inner.as_ref()?.clone();
+        let worker = HookWorker::spawn("embed-query-worker", move |query: String| {
+            let Ok(sidecar) = arc.lock() else { return None };
+            if !sidecar.is_alive() {
+                return None;
+            }
+            match sidecar.embed_batch(std::slice::from_ref(&query)) {
+                Ok(mut blobs) if !blobs.is_empty() => Some(blobs.swap_remove(0)),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!("embed query failed (non-fatal): {e}");
+                    None
+                }
+            }
+        });
         Some(Arc::new(move |query: &str| {
-            let arc2 = Arc::clone(&arc);
-            let query_owned = query.to_string();
-
-            let (tx, rx) = mpsc::channel::<Vec<u8>>();
-            std::thread::Builder::new()
-                .name("embed-query-worker".into())
-                .spawn(move || {
-                    let Ok(sidecar) = arc2.lock() else { return };
-                    if !sidecar.is_alive() {
-                        return;
-                    }
-                    match sidecar.embed_batch(std::slice::from_ref(&query_owned)) {
-                        Ok(mut blobs) if !blobs.is_empty() => {
-                            let _ = tx.send(blobs.swap_remove(0));
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("embed query failed (non-fatal): {e}"),
-                    }
-                })
-                .ok();
-
-            // Empty vec on timeout / spawn failure → decode fails → no scoring.
-            Ok(rx
-                .recv_timeout(Duration::from_millis(KNN_CALL_TIMEOUT_MS))
+            Ok(worker
+                .call(
+                    query.to_string(),
+                    Duration::from_millis(KNN_CALL_TIMEOUT_MS),
+                )
                 .unwrap_or_default())
         }))
     }
