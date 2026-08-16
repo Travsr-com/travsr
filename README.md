@@ -69,12 +69,12 @@ a pre-release, so `latest` is always what you get unless you opt in explicitly:
 
 ```bash
 npm i -g @travsr.com/travsr@latest   # stable (default if you omit the tag)
-npm i -g @travsr.com/travsr@rc       # release candidate — final gates in flight
+npm i -g @travsr.com/travsr@rc       # release candidate, final gates in flight
 npm i -g @travsr.com/travsr@beta     # earliest builds, opt-in testing only
 ```
 
 A `beta` and its later-promoted `rc`/`latest` releases are byte-identical
-binaries — promotion re-publishes the same signed artifact under a new tag
+binaries: promotion re-publishes the same signed artifact under a new tag
 rather than rebuilding, so what you tested on `beta` is exactly what ships to
 `latest`. Every tarball is cosign-signed and SLSA-attested regardless of
 channel; see [SECURITY.md](SECURITY.md) for verification steps.
@@ -318,7 +318,7 @@ by default, which works everywhere with nothing to set up. Set
 | Value | Effect |
 |---|---|
 | `off` *(default)* | CPU build |
-| `auto` | picks an accelerated build only where it needs no host setup — currently DirectML on Windows x86_64 |
+| `auto` | picks an accelerated build only where it needs no host setup (currently DirectML on Windows x86_64) |
 | `directml` | Windows x86_64. Any DX12 GPU: Intel, AMD or NVIDIA |
 | `cuda` | Linux x86_64 + NVIDIA. Requires a host CUDA runtime, cuDNN and glibc 2.38+ |
 
@@ -334,7 +334,7 @@ has no accelerator, it is reinstalled rather than reported as ready. No
 installer cannot verify. Accelerated builds also install the ONNX Runtime
 libraries they load; if the GPU turns out to be unusable at run time the sidecar
 logs why and falls back to its CPU engine, so a wrong guess costs speed, not
-function. macOS needs none of this — its default build already uses CoreML, and
+function. macOS needs none of this, its default build already uses CoreML, and
 Linux aarch64 has no accelerated build at all.
 
 ### travsr graph

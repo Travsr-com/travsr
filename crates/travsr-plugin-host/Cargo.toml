@@ -1,6 +1,6 @@
 [package]
 name = "travsr-plugin-host"
-description = "Travsr plugin host — Transport trait, dispatcher, sidecar supervisor, ADR-017 sandbox"
+description = "Travsr plugin host: Transport trait, dispatcher, sidecar supervisor, ADR-017 sandbox"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

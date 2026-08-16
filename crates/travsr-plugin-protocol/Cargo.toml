@@ -1,6 +1,6 @@
 [package]
 name = "travsr-plugin-protocol"
-description = "Travsr plugin wire protocol — Plugin trait, message types, and frame codec"
+description = "Travsr plugin wire protocol: Plugin trait, message types, and frame codec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
