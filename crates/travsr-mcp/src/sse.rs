@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
@@ -26,6 +26,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::auth::{auth_error_status, verify_token, AuthError, TokenScope, VerifiedToken};
+use crate::session::SessionStore;
 use crate::tools;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -46,7 +47,24 @@ pub struct AppState {
     /// Per-session monotonic event counter.
     pub event_counters: DashMap<Uuid, u64>,
     /// In-flight RPC requests: (tenant_id, request_id) → ().
-    pub in_flight: DashMap<(TenantId, String), ()>,
+    ///
+    /// `Arc`'d so [`InFlightGuard`] can hold the map independently of the
+    /// `AppState` borrow and remove its entry in `Drop` (#736 item 6).
+    pub in_flight: Arc<DashMap<(TenantId, String), ()>>,
+    /// RBAC session store (RFC-006, S14).
+    ///
+    /// Held here so the periodic maintenance task spawned in [`router`] can
+    /// call `evict_expired()`. Expiry is otherwise only enforced lazily on
+    /// `get()`, so a session that is created but never looked up again would
+    /// be retained until process exit (#736 item 6).
+    pub session_store: SessionStore,
+    /// Bounds concurrent `dispatch_tool_call` executions (#736 item 8).
+    ///
+    /// `spawn_blocking` alone has no concurrency limit — the only backstop is
+    /// tokio's default 512-thread blocking pool, and 512 concurrent reranks /
+    /// graph walks is an OOM, not a limit. RPC handlers await an owned permit
+    /// before spawning, which is the natural backpressure point.
+    pub dispatch_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -54,13 +72,22 @@ impl AppState {
         tenant_repos: DashMap<TenantId, HashMap<String, PathBuf>>,
         signing_keys: Vec<[u8; 32]>,
     ) -> Self {
+        // #736 item 8: 2× the core count keeps the blocking pool busy while
+        // I/O-bound dispatches overlap; the floor of 8 keeps small containers
+        // (1–2 vCPU) from serialising every RPC behind a couple of slots.
+        let dispatch_slots = std::cmp::max(
+            8,
+            2 * std::thread::available_parallelism().map_or(4, usize::from),
+        );
         Self {
             sessions: DashMap::new(),
             tenant_repos,
             signing_keys,
             ring_buffers: DashMap::new(),
             event_counters: DashMap::new(),
-            in_flight: DashMap::new(),
+            in_flight: Arc::new(DashMap::new()),
+            session_store: SessionStore::new(),
+            dispatch_permits: Arc::new(tokio::sync::Semaphore::new(dispatch_slots)),
         }
     }
 }
@@ -82,13 +109,92 @@ pub enum SseEvent {
 // Ring buffer limits.
 const RING_BUFFER_CAPACITY: usize = 1000;
 const RING_BUFFER_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// Per-session byte budget for buffered payloads (#736 item 6).
+///
+/// The entry cap alone is not a memory bound: entries are JSON-RPC response
+/// chunks of up to `MAX_RESPONSE_BYTES` (512 KB), so 1000 of them is ~500 MB
+/// for a single session. 4 MiB still replays ~8 full-size chunks — plenty for
+/// the reconnect window the TTL allows — while capping worst-case residency.
+const RING_BUFFER_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// A single ring-buffer entry: (event_id, received_at, json_payload).
 type RingEntry = (u64, Instant, String);
 /// The ring buffer map type.
-type RingBufferMap = DashMap<(TenantId, Uuid), VecDeque<RingEntry>>;
+type RingBufferMap = DashMap<(TenantId, Uuid), RingBuffer>;
+
+/// Per-session replay buffer with byte accounting (#736 item 6).
+///
+/// `total_bytes` is maintained on every push/evict so the byte-budget check is
+/// O(evicted) per push instead of re-summing the deque.
+#[derive(Default)]
+pub struct RingBuffer {
+    entries: VecDeque<RingEntry>,
+    /// Invariant: always equals the sum of `payload.len()` over `entries`.
+    total_bytes: usize,
+}
+
+impl RingBuffer {
+    /// Push with the production limits. See [`Self::push_bounded`] for the
+    /// eviction order.
+    fn push(&mut self, entry: RingEntry) {
+        self.push_bounded(
+            entry,
+            RING_BUFFER_CAPACITY,
+            RING_BUFFER_TTL,
+            RING_BUFFER_MAX_BYTES,
+        );
+    }
+
+    /// Push `entry`, evicting oldest-first in this order:
+    /// 1. entries older than `ttl` (pre-existing TTL-on-push behaviour),
+    /// 2. down to `capacity - 1` entries (pre-existing count bound),
+    /// 3. until `entry` fits inside `max_bytes` (the #736 byte budget).
+    ///
+    /// A payload larger than `max_bytes` on its own is still buffered (after
+    /// draining everything else): dropping it silently would break replay for
+    /// that event id, and `MAX_RESPONSE_BYTES` chunking keeps real payloads
+    /// far below the budget anyway.
+    ///
+    /// Limits are parameters (rather than reading the consts directly) so the
+    /// eviction logic is testable without multi-MiB fixtures.
+    fn push_bounded(&mut self, entry: RingEntry, capacity: usize, ttl: Duration, max_bytes: usize) {
+        let now = entry.1;
+        // Evict expired entries.
+        while let Some(front) = self.entries.front() {
+            if now.duration_since(front.1) > ttl {
+                self.pop_front();
+            } else {
+                break;
+            }
+        }
+        // Enforce the entry cap.
+        while self.entries.len() >= capacity {
+            self.pop_front();
+        }
+        // Enforce the byte budget.
+        while !self.entries.is_empty() && self.total_bytes + entry.2.len() > max_bytes {
+            self.pop_front();
+        }
+        self.total_bytes += entry.2.len();
+        self.entries.push_back(entry);
+    }
+
+    /// Remove the oldest entry, keeping `total_bytes` in sync.
+    fn pop_front(&mut self) {
+        if let Some((_, _, payload)) = self.entries.pop_front() {
+            self.total_bytes -= payload.len();
+        }
+    }
+}
 
 // ── Router ────────────────────────────────────────────────────────────────────
+
+/// How often the background maintenance task sweeps expired state (#736 item 6).
+///
+/// 600 s is deliberately coarse: the sweep exists to bound memory over hours of
+/// idleness, not to make expiry precise — lookups and pushes still enforce
+/// expiry lazily in the meantime.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Build the axum router. Path-only spans are included; Authorization headers are
 /// never captured in trace spans.
@@ -98,6 +204,27 @@ pub fn router(state: Arc<AppState>) -> Router {
     // RFC-021: background-warm the reranker (idempotent, non-blocking) so the
     // first real request doesn't pay the model-load cost.
     crate::rerank::warm_background();
+
+    // #736 item 6: periodic eviction. Session expiry and the ring-buffer TTL
+    // are otherwise only enforced lazily (on lookup / on push), so state owned
+    // by idle or abandoned sessions is retained until process exit. Every SSE
+    // deployment passes through router(), and `travsr serve` calls it from
+    // inside its tokio runtime, so this is the construction point to spawn at.
+    // The Handle guard keeps router() callable from non-async contexts (tests)
+    // where tokio::spawn would panic.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let state_maint = state.clone();
+        handle.spawn(async move {
+            let mut ticker = tokio::time::interval(MAINTENANCE_INTERVAL);
+            loop {
+                // The first tick completes immediately; both sweeps are cheap
+                // no-ops on empty maps, so no special-casing is needed.
+                ticker.tick().await;
+                state_maint.session_store.evict_expired();
+                sweep_idle_ring_buffers(&state_maint);
+            }
+        });
+    }
 
     Router::new()
         .route("/sse", get(sse_handler))
@@ -171,20 +298,9 @@ fn ring_buffer_push(
     payload: String,
 ) {
     let key = (tenant_id.to_string(), session_id);
-    let now = Instant::now();
     let mut buf = state.ring_buffers.entry(key).or_default();
-    // Evict expired entries.
-    while let Some(front) = buf.front() {
-        if now.duration_since(front.1) > RING_BUFFER_TTL {
-            buf.pop_front();
-        } else {
-            break;
-        }
-    }
-    if buf.len() >= RING_BUFFER_CAPACITY {
-        buf.pop_front();
-    }
-    buf.push_back((event_id, now, payload));
+    // TTL, entry-cap, and byte-budget eviction all happen inside push.
+    buf.push((event_id, Instant::now(), payload));
 }
 
 fn ring_buffer_replay(
@@ -198,11 +314,28 @@ fn ring_buffer_replay(
     match state.ring_buffers.get(&key) {
         None => vec![],
         Some(buf) => buf
+            .entries
             .iter()
             .filter(|(id, ts, _)| *id > after_id && now.duration_since(*ts) <= RING_BUFFER_TTL)
             .map(|(id, _, payload)| (*id, payload.clone()))
             .collect(),
     }
+}
+
+/// Drop ring buffers whose newest entry is older than `RING_BUFFER_TTL` (#736 item 6).
+///
+/// The TTL is otherwise only enforced on push, so a session that stops
+/// producing events keeps its last buffered window resident forever. Called by
+/// the periodic maintenance task spawned in [`router`]. Anything this removes
+/// was already unreplayable — every entry in the buffer is past the TTL — so no
+/// live reconnect can lose data to the sweep.
+fn sweep_idle_ring_buffers(state: &AppState) {
+    let now = Instant::now();
+    state.ring_buffers.retain(|_, buf| {
+        buf.entries
+            .back()
+            .is_some_and(|(_, ts, _)| now.duration_since(*ts) <= RING_BUFFER_TTL)
+    });
 }
 
 fn next_event_id(state: &AppState, session_id: Uuid) -> u64 {
@@ -414,6 +547,47 @@ async fn sse_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
 
 // ── POST /rpc ─────────────────────────────────────────────────────────────────
 
+/// RAII guard for an `in_flight` dedup entry (#736 item 6).
+///
+/// The entry used to be removed manually on the success and error paths, which
+/// missed the third exit: axum drops the handler future when the HTTP client
+/// disconnects mid-await (during `spawn_blocking` or the SSE channel send), and
+/// code after a dropped await point never runs. The leaked entry then rejected
+/// that rpc id as a duplicate forever. `Drop` runs on every exit path — early
+/// return, panic unwind, and future cancellation alike.
+struct InFlightGuard {
+    map: Arc<DashMap<(TenantId, String), ()>>,
+    key: (TenantId, String),
+}
+
+impl InFlightGuard {
+    /// Atomically insert `key`; `None` means the id is already in flight.
+    ///
+    /// Uses the entry API rather than contains_key-then-insert so two racing
+    /// requests with the same id cannot both pass the dedup check.
+    fn try_acquire(
+        map: &Arc<DashMap<(TenantId, String), ()>>,
+        key: (TenantId, String),
+    ) -> Option<Self> {
+        match map.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => None,
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(());
+                Some(Self {
+                    map: Arc::clone(map),
+                    key,
+                })
+            }
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.key);
+    }
+}
+
 /// Maximum JSON body size accepted (512 KB).
 const MAX_BODY_BYTES: usize = 512 * 1024;
 
@@ -469,16 +643,17 @@ async fn rpc_handler(
     }
     let rpc_id = id_str.to_string();
 
-    // Check in-flight dedup.
+    // Check in-flight dedup. The guard removes the entry when it drops — on
+    // the normal return, on the no-session early return, and (critically) when
+    // axum cancels this future because the client disconnected mid-dispatch.
     let in_flight_key = (tenant_id.clone(), rpc_id.clone());
-    if state.in_flight.contains_key(&in_flight_key) {
+    let Some(_in_flight_guard) = InFlightGuard::try_acquire(&state.in_flight, in_flight_key) else {
         return (
             StatusCode::BAD_REQUEST,
             "duplicate request id: already in flight",
         )
             .into_response();
-    }
-    state.in_flight.insert(in_flight_key.clone(), ());
+    };
 
     // Find the most recently opened SSE session for this tenant.
     let session_entry = {
@@ -493,7 +668,6 @@ async fn rpc_handler(
     let (_session_id, session_tx) = match session_entry {
         Some((id, tx)) => (id, tx),
         None => {
-            state.in_flight.remove(&in_flight_key);
             let mut resp = (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no active SSE session for tenant",
@@ -516,8 +690,23 @@ async fn rpc_handler(
     // other blocking work must not run on the async/tokio worker thread (RFC-021
     // §15 G5(a)); move the whole synchronous dispatch to a blocking pool.
     let response_payload = {
+        // #736 item 8: take a dispatch permit before spawning onto the blocking
+        // pool. `acquire_owned().await` is the backpressure point — excess RPCs
+        // queue here instead of growing the blocking pool towards its
+        // 512-thread ceiling. The permit MOVES INTO the closure so it is
+        // released when the blocking work actually finishes, not when this
+        // future is dropped: a cancelled handler leaves its spawn_blocking
+        // task running to completion, and freeing the permit early would let
+        // orphaned dispatches accumulate without bound.
+        let permit = state
+            .dispatch_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("dispatch semaphore is never closed");
         let rpc_id_for_dispatch = rpc_id.clone();
         match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             dispatch_tool_call(&req_value, &rpc_id_for_dispatch, &repos)
         })
         .await
@@ -566,7 +755,7 @@ async fn rpc_handler(
         }
     }
 
-    state.in_flight.remove(&in_flight_key);
+    // _in_flight_guard drops here, releasing the dedup entry.
     StatusCode::OK.into_response()
 }
 
@@ -678,5 +867,157 @@ fn dispatch_tool_call(
             METHOD_NOT_FOUND,
             &format!("method not found: {other}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: u64, payload: &str) -> RingEntry {
+        (id, Instant::now(), payload.to_string())
+    }
+
+    /// Sanity check the `total_bytes` invariant against a recount.
+    fn recounted_bytes(buf: &RingBuffer) -> usize {
+        buf.entries.iter().map(|(_, _, p)| p.len()).sum()
+    }
+
+    #[test]
+    fn ring_buffer_evicts_oldest_when_byte_budget_exceeded() {
+        let mut buf = RingBuffer::default();
+        // Budget of 10 bytes, 4-byte payloads: the third push must evict the first.
+        buf.push_bounded(entry(1, "aaaa"), 1000, RING_BUFFER_TTL, 10);
+        buf.push_bounded(entry(2, "bbbb"), 1000, RING_BUFFER_TTL, 10);
+        assert_eq!(buf.total_bytes, 8);
+        buf.push_bounded(entry(3, "cccc"), 1000, RING_BUFFER_TTL, 10);
+        assert_eq!(buf.entries.len(), 2, "oldest entry must be evicted");
+        assert_eq!(buf.entries.front().unwrap().0, 2);
+        assert_eq!(buf.entries.back().unwrap().0, 3);
+        assert_eq!(buf.total_bytes, 8);
+        assert_eq!(buf.total_bytes, recounted_bytes(&buf));
+    }
+
+    #[test]
+    fn ring_buffer_oversized_payload_drains_buffer_but_is_kept() {
+        let mut buf = RingBuffer::default();
+        buf.push_bounded(entry(1, "aaaa"), 1000, RING_BUFFER_TTL, 10);
+        // 16 bytes > the 10-byte budget: everything else is drained, but the
+        // payload itself must still be buffered (dropping it would break
+        // replay for that event id).
+        buf.push_bounded(entry(2, "0123456789abcdef"), 1000, RING_BUFFER_TTL, 10);
+        assert_eq!(buf.entries.len(), 1);
+        assert_eq!(buf.entries.front().unwrap().0, 2);
+        assert_eq!(buf.total_bytes, 16);
+        // The next in-budget push evicts the oversized entry again.
+        buf.push_bounded(entry(3, "dddd"), 1000, RING_BUFFER_TTL, 10);
+        assert_eq!(buf.entries.len(), 1);
+        assert_eq!(buf.entries.front().unwrap().0, 3);
+        assert_eq!(buf.total_bytes, recounted_bytes(&buf));
+    }
+
+    #[test]
+    fn ring_buffer_entry_cap_still_enforced() {
+        let mut buf = RingBuffer::default();
+        buf.push_bounded(entry(1, "a"), 2, RING_BUFFER_TTL, usize::MAX);
+        buf.push_bounded(entry(2, "b"), 2, RING_BUFFER_TTL, usize::MAX);
+        buf.push_bounded(entry(3, "c"), 2, RING_BUFFER_TTL, usize::MAX);
+        assert_eq!(buf.entries.len(), 2, "entry cap must still apply");
+        assert_eq!(buf.entries.front().unwrap().0, 2);
+        assert_eq!(buf.total_bytes, recounted_bytes(&buf));
+    }
+
+    #[test]
+    fn ring_buffer_ttl_eviction_still_applies_on_push() {
+        let mut buf = RingBuffer::default();
+        // A zero TTL means any measurable age expires the entry on the next push.
+        buf.push_bounded(entry(1, "old"), 1000, Duration::ZERO, usize::MAX);
+        std::thread::sleep(Duration::from_millis(5));
+        buf.push_bounded(entry(2, "new"), 1000, Duration::ZERO, usize::MAX);
+        assert_eq!(buf.entries.len(), 1, "expired entry must be evicted");
+        assert_eq!(buf.entries.front().unwrap().0, 2);
+        assert_eq!(buf.total_bytes, 3);
+    }
+
+    #[test]
+    fn sweep_removes_only_buffers_whose_newest_entry_expired() {
+        // An Instant far enough in the past to be beyond the ring TTL. On
+        // platforms where Instant cannot go back that far (very early after
+        // boot) there is nothing meaningful to test, so skip.
+        let Some(stale) = Instant::now().checked_sub(RING_BUFFER_TTL + Duration::from_secs(1))
+        else {
+            return;
+        };
+
+        let state = AppState::new(DashMap::new(), vec![]);
+        let idle_key = ("tenant-a".to_string(), Uuid::new_v4());
+        let live_key = ("tenant-a".to_string(), Uuid::new_v4());
+
+        let mut idle = RingBuffer::default();
+        idle.push_bounded((1, stale, "old".into()), 1000, Duration::MAX, usize::MAX);
+        state.ring_buffers.insert(idle_key.clone(), idle);
+
+        let mut live = RingBuffer::default();
+        live.push_bounded((1, stale, "old".into()), 1000, Duration::MAX, usize::MAX);
+        live.push((2, Instant::now(), "fresh".into()));
+        state.ring_buffers.insert(live_key.clone(), live);
+
+        sweep_idle_ring_buffers(&state);
+
+        assert!(
+            !state.ring_buffers.contains_key(&idle_key),
+            "buffer whose newest entry is past the TTL must be swept"
+        );
+        assert!(
+            state.ring_buffers.contains_key(&live_key),
+            "buffer with a fresh newest entry must survive the sweep"
+        );
+    }
+
+    #[test]
+    fn in_flight_guard_removes_entry_on_drop() {
+        let map: Arc<DashMap<(TenantId, String), ()>> = Arc::new(DashMap::new());
+        let key = ("tenant-a".to_string(), "rpc-1".to_string());
+
+        let guard =
+            InFlightGuard::try_acquire(&map, key.clone()).expect("first acquire must succeed");
+        assert!(map.contains_key(&key), "entry must exist while guard lives");
+
+        // A second acquire for the same key is the duplicate-request case.
+        assert!(
+            InFlightGuard::try_acquire(&map, key.clone()).is_none(),
+            "duplicate id must be rejected while in flight"
+        );
+        // The failed acquire must not have disturbed the live entry.
+        assert!(map.contains_key(&key));
+
+        drop(guard);
+        assert!(
+            !map.contains_key(&key),
+            "entry must be removed when the guard drops"
+        );
+
+        // The id is usable again after the guard is gone — this is exactly the
+        // property the pre-guard code lost when the handler future was cancelled.
+        assert!(InFlightGuard::try_acquire(&map, key).is_some());
+    }
+
+    #[test]
+    fn in_flight_guards_for_different_keys_do_not_interfere() {
+        let map: Arc<DashMap<(TenantId, String), ()>> = Arc::new(DashMap::new());
+        let key_a = ("tenant-a".to_string(), "rpc-1".to_string());
+        let key_b = ("tenant-b".to_string(), "rpc-1".to_string());
+
+        let guard_a = InFlightGuard::try_acquire(&map, key_a.clone()).expect("acquire a");
+        let guard_b = InFlightGuard::try_acquire(&map, key_b.clone()).expect("acquire b");
+
+        drop(guard_a);
+        assert!(!map.contains_key(&key_a));
+        assert!(
+            map.contains_key(&key_b),
+            "dropping one guard must not remove another tenant's entry"
+        );
+        drop(guard_b);
+        assert!(map.is_empty());
     }
 }

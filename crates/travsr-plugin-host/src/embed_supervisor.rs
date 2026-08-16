@@ -384,11 +384,24 @@ impl EmbedSupervisor {
         let model_id = self.model_id.as_deref().unwrap_or("");
 
         match EmbedSidecar::spawn(binary, db_path, model_id) {
-            Ok(sidecar) => {
-                let mid = sidecar.caps.model_id.clone();
+            Ok(new_sidecar) => {
+                let mid = new_sidecar.caps.model_id.clone();
                 tracing::info!(model_id = %mid, attempt = self.respawn_count, "embed sidecar respawned");
                 self.model_id = Some(mid);
-                self.inner = Some(Arc::new(Mutex::new(sidecar)));
+                // #736 item 6: swap the sidecar INSIDE the existing Arc. The
+                // injected hook closures hold clones of this Arc — replacing
+                // the Arc itself (the previous behaviour) left every hook
+                // pointing at the dead child forever, which is what made this
+                // whole method dead code in the daemon. Assigning through the
+                // guard also drops the old EmbedSidecar, whose Drop impl
+                // kills and reaps the dead process.
+                match &self.inner {
+                    Some(arc) => {
+                        let mut guard = arc.lock().unwrap_or_else(|p| p.into_inner());
+                        *guard = new_sidecar;
+                    }
+                    None => self.inner = Some(Arc::new(Mutex::new(new_sidecar))),
+                }
                 true
             }
             Err(e) => {
@@ -396,7 +409,9 @@ impl EmbedSupervisor {
                     attempt = self.respawn_count,
                     "embed sidecar respawn failed: {e}"
                 );
-                self.inner = None;
+                // Keep `inner` (and its Arc identity) so a later successful
+                // attempt can still swap in place for the already-injected
+                // hooks; clearing it would orphan them permanently.
                 false
             }
         }

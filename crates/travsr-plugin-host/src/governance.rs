@@ -81,10 +81,13 @@ impl Capacity {
 pub fn auto_capacity_fraction() -> f32 {
     const FLOOR: f32 = 0.25;
     const UNKNOWN: f32 = 0.5;
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .max(1) as f32;
+    // Container-aware core count (#736): `/proc/loadavg` is not namespaced —
+    // it reports host-wide load — so dividing it by the *host* core count made
+    // a quota-limited container on an idle host look nearly all-idle and yield
+    // close to the full derived worker count. Dividing by the quota-capped
+    // count keeps the "idle headroom" estimate honest about what this cgroup
+    // may actually schedule. On bare metal both counts are equal.
+    let cores = crate::resource_limits::effective_cpu_count().max(1) as f32;
     match one_minute_load() {
         Some(load1) => {
             // Idle cores as a fraction of the machine; never below the floor so

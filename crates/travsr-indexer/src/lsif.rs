@@ -66,12 +66,32 @@ struct LsifGraph {
     /// Populated so `ingest_g2` can recover the occurrence line of each
     /// `item/references` `inVs` entry instead of dropping it.
     range_lines: HashMap<u64, u32>,
+    /// `item property:"references"` edges buffered during the single streaming
+    /// pass (#736 item 7). The emit phases used to re-walk the raw dump for
+    /// these — impossible on a streaming reader, and the reason callers had to
+    /// materialize the whole dump as one `String`. Each record is a few dozen
+    /// bytes vs the ~100+-byte JSON line it came from, and they are part of
+    /// the same irreducible working set as the side tables above.
+    ref_items: Vec<RefItem>,
 }
 
-fn parse_graph(dump: &str, corpus: &str) -> anyhow::Result<LsifGraph> {
+/// One `item` edge with `property:"references"` — the minimal fields the emit
+/// phases ([`ingest_raw_from_reader`], [`ingest_g2_from_reader`]) need.
+#[derive(Debug)]
+struct RefItem {
+    /// `outV` — the `referenceResult` vertex id.
+    ref_result_id: u64,
+    /// `document` — id of the document containing the occurrence(s).
+    caller_doc_id: u64,
+    /// `inVs` — range vertex ids of the individual occurrences.
+    range_ids: Vec<u64>,
+}
+
+fn parse_graph(dump: impl std::io::BufRead, corpus: &str) -> anyhow::Result<LsifGraph> {
     let mut graph = LsifGraph::default();
 
     for line in dump.lines() {
+        let line = line.context("reading LSIF dump line")?;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -81,10 +101,9 @@ fn parse_graph(dump: &str, corpus: &str) -> anyhow::Result<LsifGraph> {
             Err(_) => continue, // non-JSON line — skip
         };
 
-        let id = match obj["id"].as_u64() {
-            Some(v) => v,
-            None => continue,
-        };
+        // Vertex arms key their side tables by `id`; edge arms are keyed by
+        // outV/inV (plus `document` for item edges), so `id` is optional here.
+        let id = obj["id"].as_u64();
         let type_ = obj["type"].as_str().unwrap_or("");
         let label = obj["label"].as_str().unwrap_or("");
 
@@ -97,7 +116,7 @@ fn parse_graph(dump: &str, corpus: &str) -> anyhow::Result<LsifGraph> {
             }
 
             ("vertex", "document") => {
-                if let Some(uri) = obj["uri"].as_str() {
+                if let (Some(id), Some(uri)) = (id, obj["uri"].as_str()) {
                     let abs = uri.strip_prefix("file://").unwrap_or(uri);
                     // Make path relative to project_root so it matches the
                     // vname_path produced by the Tree-sitter indexer.
@@ -107,6 +126,9 @@ fn parse_graph(dump: &str, corpus: &str) -> anyhow::Result<LsifGraph> {
             }
 
             ("vertex", "resultSet") => {
+                let Some(id) = id else {
+                    continue;
+                };
                 // Non-standard field emitted by the travsr LSIF emitters
                 // (travsr-lsif-ts, travsr-lsif-py).
                 if let Some(vname_obj) = obj.get("travsr_vname") {
@@ -136,7 +158,7 @@ fn parse_graph(dump: &str, corpus: &str) -> anyhow::Result<LsifGraph> {
             ("vertex", "range") => {
                 // #299: record the 1-based start line so item/references inVs can
                 // be resolved to occurrence lines. 0-based → +1, saturating.
-                if let Some(l) = obj["start"]["line"].as_u64() {
+                if let (Some(id), Some(l)) = (id, obj["start"]["line"].as_u64()) {
                     graph.range_lines.insert(id, (l as u32).saturating_add(1));
                 }
             }
@@ -150,6 +172,28 @@ fn parse_graph(dump: &str, corpus: &str) -> anyhow::Result<LsifGraph> {
                 }
             }
 
+            ("edge", "item") => {
+                // Only `item` edges with property "references" carry call-site
+                // info — buffer them for the single-pass emit phases (#736).
+                if obj["property"].as_str() != Some("references") {
+                    continue;
+                }
+                let (Some(ref_result_id), Some(caller_doc_id)) =
+                    (obj["outV"].as_u64(), obj["document"].as_u64())
+                else {
+                    continue;
+                };
+                let range_ids = obj["inVs"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|r| r.as_u64()).collect())
+                    .unwrap_or_default();
+                graph.ref_items.push(RefItem {
+                    ref_result_id,
+                    caller_doc_id,
+                    range_ids,
+                });
+            }
+
             _ => {}
         }
     }
@@ -160,44 +204,31 @@ fn parse_graph(dump: &str, corpus: &str) -> anyhow::Result<LsifGraph> {
 /// Full ingestion: parse graph metadata AND emit edges in one pass.
 ///
 /// Separated from `ingest` so that unit tests can feed synthetic dumps without
-/// going through the `ParseOutput` wrapper.
+/// going through the `ParseOutput` wrapper. Thin wrapper over
+/// [`ingest_raw_from_reader`] for callers that already hold the dump in memory.
 pub fn ingest_raw(dump: &str, corpus: &str) -> anyhow::Result<Vec<Edge>> {
+    ingest_raw_from_reader(std::io::Cursor::new(dump), corpus)
+}
+
+/// Streaming variant of [`ingest_raw`] (#736 item 7): consumes the LSIF
+/// JSON-Lines dump incrementally from any `BufRead` — a capped child-stdout
+/// buffer, a file, an in-memory cursor — so the raw dump text never has to be
+/// held as one `String` alongside the side tables. The side tables (and the
+/// buffered `item/references` records) are the irreducible working set.
+pub fn ingest_raw_from_reader(
+    dump: impl std::io::BufRead,
+    corpus: &str,
+) -> anyhow::Result<Vec<Edge>> {
     let graph = parse_graph(dump, corpus).context("parsing LSIF graph metadata")?;
 
     let mut edges = Vec::new();
 
-    for line in dump.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let obj: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Only `item` edges with property "references" carry call-site info.
-        if obj["type"].as_str() != Some("edge") || obj["label"].as_str() != Some("item") {
-            continue;
-        }
-        if obj["property"].as_str() != Some("references") {
-            continue;
-        }
-
-        let ref_result_id = match obj["outV"].as_u64() {
-            Some(v) => v,
-            None => continue,
-        };
-        let caller_doc_id = match obj["document"].as_u64() {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let caller_path = match graph.doc_paths.get(&caller_doc_id) {
+    for item in &graph.ref_items {
+        let caller_path = match graph.doc_paths.get(&item.caller_doc_id) {
             Some(p) => p,
             None => continue,
         };
-        let rs_id = match graph.ref_result_to_rs.get(&ref_result_id) {
+        let rs_id = match graph.ref_result_to_rs.get(&item.ref_result_id) {
             Some(id) => id,
             None => continue,
         };
@@ -252,41 +283,30 @@ pub struct LsifG2Output {
 /// languages (TypeScript / JavaScript / Python).
 ///
 /// O(N) over dump lines plus O(occurrences) for the emit pass.
+///
+/// Thin wrapper over [`ingest_g2_from_reader`] for callers that already hold
+/// the dump in memory.
 pub fn ingest_g2(dump: &str, corpus: &str) -> anyhow::Result<LsifG2Output> {
+    ingest_g2_from_reader(std::io::Cursor::new(dump), corpus)
+}
+
+/// Streaming variant of [`ingest_g2`] (#736 item 7): consumes the LSIF
+/// JSON-Lines dump incrementally from any `BufRead` so the raw dump text never
+/// has to be held as one `String` alongside the side tables.
+pub fn ingest_g2_from_reader(
+    dump: impl std::io::BufRead,
+    corpus: &str,
+) -> anyhow::Result<LsifG2Output> {
     let graph = parse_graph(dump, corpus).context("parsing LSIF graph metadata")?;
 
     let mut out = LsifG2Output::default();
 
-    for line in dump.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let obj: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        if obj["type"].as_str() != Some("edge") || obj["label"].as_str() != Some("item") {
-            continue;
-        }
-        if obj["property"].as_str() != Some("references") {
-            continue;
-        }
-
-        let ref_result_id = match obj["outV"].as_u64() {
-            Some(v) => v,
-            None => continue,
-        };
-        let caller_doc_id = match obj["document"].as_u64() {
-            Some(v) => v,
-            None => continue,
-        };
-        let caller_path = match graph.doc_paths.get(&caller_doc_id) {
+    for item in &graph.ref_items {
+        let caller_path = match graph.doc_paths.get(&item.caller_doc_id) {
             Some(p) => p,
             None => continue,
         };
-        let rs_id = match graph.ref_result_to_rs.get(&ref_result_id) {
+        let rs_id = match graph.ref_result_to_rs.get(&item.ref_result_id) {
             Some(id) => id,
             None => continue,
         };
@@ -299,14 +319,8 @@ pub fn ingest_g2(dump: &str, corpus: &str) -> anyhow::Result<LsifG2Output> {
         // One occurrence per range id in `inVs`. Range ids whose vertex carried
         // no `start.line` are skipped (never fabricate a line). The store's
         // `edge_sites` PK dedups identical (caller-fn, callee, line) rows.
-        let Some(in_vs) = obj["inVs"].as_array() else {
-            continue;
-        };
-        for range in in_vs {
-            let Some(range_id) = range.as_u64() else {
-                continue;
-            };
-            let Some(&caller_line) = graph.range_lines.get(&range_id) else {
+        for range_id in &item.range_ids {
+            let Some(&caller_line) = graph.range_lines.get(range_id) else {
                 continue;
             };
             out.refs.push(travsr_core::ScipRef {
@@ -533,6 +547,33 @@ mod tests {
         assert_eq!(out.nodes.len(), 0);
         assert_eq!(out.edges.len(), 1);
     }
+
+    #[test]
+    fn reader_entry_points_match_str_wrappers() {
+        // #736: the streaming (`BufRead`) entry points must produce exactly what
+        // the in-memory `&str` wrappers do — same edges, same occurrences —
+        // whether fed from a byte slice or a buffered file reader.
+        let dump = minimal_dump("svc.ts", "fn:charge", "caller.ts");
+
+        let via_str = ingest_raw(&dump, "").unwrap();
+        let via_reader = ingest_raw_from_reader(dump.as_bytes(), "").unwrap();
+        assert_eq!(via_str, via_reader, "ingest_raw: reader must match &str");
+
+        let g2_str = ingest_g2(&dump, "").unwrap();
+        let g2_reader = ingest_g2_from_reader(dump.as_bytes(), "").unwrap();
+        assert_eq!(g2_str.refs.len(), g2_reader.refs.len());
+        assert_eq!(g2_reader.refs[0].caller_path, g2_str.refs[0].caller_path);
+        assert_eq!(g2_reader.refs[0].caller_line, g2_str.refs[0].caller_line);
+        assert_eq!(g2_reader.refs[0].callee_id, g2_str.refs[0].callee_id);
+
+        // Also through a real buffered file reader — the production streaming
+        // shape (dump on disk, never materialized as one String).
+        let mut file = tempfile::NamedTempFile::new().expect("tempfile");
+        std::io::Write::write_all(&mut file, dump.as_bytes()).expect("write dump");
+        let reader = std::io::BufReader::new(std::fs::File::open(file.path()).expect("open"));
+        let via_file = ingest_raw_from_reader(reader, "").unwrap();
+        assert_eq!(via_str, via_file, "ingest_raw: file reader must match &str");
+    }
 }
 
 // ── Rust LSIF ingestion (INDEX-212) ───────────────────────────────────────────
@@ -564,15 +605,22 @@ struct RustLsifGraph {
     ref_result_to_rs: HashMap<u64, u64>,
     /// document id → repo-relative file path.
     doc_paths: HashMap<u64, String>,
+    /// `item property:"references"` edges as (referenceResult id, document id),
+    /// buffered during the single streaming pass so the emit phase never needs
+    /// a second walk over the raw dump (#736 item 7). `inVs` is deliberately
+    /// not kept — this path emits one document-level edge per item edge
+    /// (DEBT travsr-126).
+    ref_items: Vec<(u64, u64)>,
 }
 
 /// Parse a rust-analyzer LSIF dump into an intermediate graph.
 ///
-/// Two-pass to handle forward-referenced monikers: rust-analyzer sometimes
-/// emits a `moniker` edge (outV=resultSet, inV=moniker_vertex) before the
-/// moniker vertex itself. Pass 1 builds what it can; pass 2 resolves
-/// any pending entries.
-fn parse_rust_graph(dump: &str) -> anyhow::Result<RustLsifGraph> {
+/// Two-pass over the *side tables* (not the raw dump) to handle
+/// forward-referenced monikers: rust-analyzer sometimes emits a `moniker` edge
+/// (outV=resultSet, inV=moniker_vertex) before the moniker vertex itself.
+/// Pass 1 builds what it can while streaming the dump once; pass 2 resolves
+/// any pending entries from the tables.
+fn parse_rust_graph(dump: impl std::io::BufRead) -> anyhow::Result<RustLsifGraph> {
     let mut g = RustLsifGraph::default();
 
     // (resultSet id, moniker vertex id) pairs encountered as edges but whose
@@ -580,6 +628,7 @@ fn parse_rust_graph(dump: &str) -> anyhow::Result<RustLsifGraph> {
     let mut pending: Vec<(u64, u64)> = Vec::new();
 
     for line in dump.lines() {
+        let line = line.context("reading LSIF dump line")?;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -657,6 +706,19 @@ fn parse_rust_graph(dump: &str) -> anyhow::Result<RustLsifGraph> {
                         g.ref_result_to_rs.insert(rr_id, rs_id);
                     }
                 }
+                Some("item") => {
+                    // Buffer `item property:"references"` edges for the
+                    // single-pass emit phase (#736).
+                    if v.get("property").and_then(|p| p.as_str()) != Some("references") {
+                        continue;
+                    }
+                    if let (Some(rr_id), Some(doc_id)) = (
+                        v.get("outV").and_then(|i| i.as_u64()),
+                        v.get("document").and_then(|i| i.as_u64()),
+                    ) {
+                        g.ref_items.push((rr_id, doc_id));
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -680,44 +742,12 @@ fn parse_rust_graph(dump: &str) -> anyhow::Result<RustLsifGraph> {
     Ok(g)
 }
 
-/// Walk all `item` edges and emit `RefCall` edges for `property: "references"`.
-fn ingest_rust_edges_from_dump(dump: &str, corpus: &str) -> Vec<Edge> {
-    let g = match parse_rust_graph(dump) {
-        Ok(g) => g,
-        Err(_) => return Vec::new(),
-    };
-
+/// Emit `RefCall` edges from the graph's buffered `item property:"references"`
+/// records.
+fn ingest_rust_edges(g: &RustLsifGraph, corpus: &str) -> Vec<Edge> {
     let mut edges = Vec::new();
 
-    for line in dump.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        if v.get("type").and_then(|t| t.as_str()) != Some("edge") {
-            continue;
-        }
-        if v.get("label").and_then(|l| l.as_str()) != Some("item") {
-            continue;
-        }
-        if v.get("property").and_then(|p| p.as_str()) != Some("references") {
-            continue;
-        }
-
-        let rr_id = match v.get("outV").and_then(|i| i.as_u64()) {
-            Some(id) => id,
-            None => continue,
-        };
-        let doc_id = match v.get("document").and_then(|i| i.as_u64()) {
-            Some(id) => id,
-            None => continue,
-        };
-
+    for &(rr_id, doc_id) in &g.ref_items {
         let rs_id = match g.ref_result_to_rs.get(&rr_id) {
             Some(id) => *id,
             None => continue,
@@ -772,9 +802,21 @@ pub fn ingest_rust(dump: &str, corpus: &str) -> anyhow::Result<ParseOutput> {
 /// Return only the `Edge` vec from a rust-analyzer LSIF dump.
 ///
 /// Useful in tests that want to inspect edges directly without the
-/// `ParseOutput` wrapper.
+/// `ParseOutput` wrapper. Thin wrapper over [`ingest_rust_raw_from_reader`]
+/// for callers that already hold the dump in memory.
 pub fn ingest_rust_raw(dump: &str, corpus: &str) -> anyhow::Result<Vec<Edge>> {
-    Ok(ingest_rust_edges_from_dump(dump, corpus))
+    ingest_rust_raw_from_reader(std::io::Cursor::new(dump), corpus)
+}
+
+/// Streaming variant of [`ingest_rust_raw`] (#736 item 7): consumes the LSIF
+/// JSON-Lines dump incrementally from any `BufRead` so the raw dump text never
+/// has to be held as one `String` alongside the side tables.
+pub fn ingest_rust_raw_from_reader(
+    dump: impl std::io::BufRead,
+    corpus: &str,
+) -> anyhow::Result<Vec<Edge>> {
+    let g = parse_rust_graph(dump)?;
+    Ok(ingest_rust_edges(&g, corpus))
 }
 
 /// Positional, fail-closed ingestion of a rust-analyzer LSIF dump (E3 W3b).
@@ -821,6 +863,21 @@ pub fn ingest_rust_raw(dump: &str, corpus: &str) -> anyhow::Result<Vec<Edge>> {
 /// caller-supplied `repo_root` so both sides of every downstream comparison
 /// (`resolve_lsif_positional_refs`, E7's `lsif_covered`) agree.
 pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::LsifPositionalRef> {
+    // A Cursor over an in-memory &str cannot fail a line read, so the reader
+    // core's only error path (I/O) is unreachable here.
+    ingest_rust_positional_from_reader(std::io::Cursor::new(dump), repo_root)
+        .expect("in-memory LSIF dump reads cannot fail")
+}
+
+/// Streaming variant of [`ingest_rust_positional`] (#736 item 7): consumes the
+/// LSIF JSON-Lines dump incrementally from any `BufRead` so the raw dump text
+/// never has to be held as one `String` alongside the side tables built below
+/// (which are the irreducible working set). Errors only on a failed read from
+/// the underlying reader.
+pub fn ingest_rust_positional_from_reader(
+    dump: impl std::io::BufRead,
+    repo_root: &str,
+) -> anyhow::Result<Vec<travsr_core::LsifPositionalRef>> {
     let mut doc_paths: HashMap<u64, String> = HashMap::new();
     let mut range_lines: HashMap<u64, u32> = HashMap::new();
     // range id → 0-based UTF-16 start column (for the call-site filter, #650).
@@ -835,6 +892,7 @@ pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::L
     let mut items: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
 
     for line in dump.lines() {
+        let line = line.context("reading LSIF dump line")?;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -980,7 +1038,7 @@ pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::L
             });
         }
     }
-    out
+    Ok(out)
 }
 
 // ── Rust LSIF unit tests ───────────────────────────────────────────────────────
@@ -1139,6 +1197,28 @@ mod rust_lsif_tests {
             out[0].callee_def_path, "crates/foo/src/helper.rs",
             "callee_def_path must be relative to the real repo root, not the dump's projectRoot"
         );
+
+        // #736: the streaming entry point must agree with the &str wrapper.
+        let via_reader = ingest_rust_positional_from_reader(dump.as_bytes(), "/repo").unwrap();
+        assert_eq!(via_reader.len(), 1);
+        assert_eq!(via_reader[0].caller_path, out[0].caller_path);
+        assert_eq!(via_reader[0].callee_def_path, out[0].callee_def_path);
+        assert_eq!(via_reader[0].caller_line, out[0].caller_line);
+        assert_eq!(via_reader[0].callee_def_line, out[0].callee_def_line);
+    }
+
+    #[test]
+    fn rust_reader_entry_points_match_str_wrappers() {
+        // #736: the streaming (`BufRead`) rust-analyzer entry points must
+        // produce exactly what the in-memory `&str` wrappers do.
+        let dump = rust_dump_one_ref();
+        let via_str = ingest_rust_raw(dump, "corp").unwrap();
+        let via_reader = ingest_rust_raw_from_reader(dump.as_bytes(), "corp").unwrap();
+        assert_eq!(
+            via_str, via_reader,
+            "ingest_rust_raw: reader must match &str"
+        );
+        assert_eq!(via_reader.len(), 1);
     }
 
     #[test]

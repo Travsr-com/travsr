@@ -34,7 +34,9 @@ pub use ffi_resolver::FfiConfig;
 pub use hash::hash_file;
 pub use lsif::ingest as ingest_lsif;
 pub use lsif::{
-    ingest_g2 as ingest_lsif_g2, ingest_rust, ingest_rust_positional, ingest_rust_raw, ingest_scip,
+    ingest_g2 as ingest_lsif_g2, ingest_g2_from_reader as ingest_lsif_g2_from_reader,
+    ingest_raw_from_reader as ingest_lsif_raw_from_reader, ingest_rust, ingest_rust_positional,
+    ingest_rust_positional_from_reader, ingest_rust_raw, ingest_rust_raw_from_reader, ingest_scip,
     LsifG2Output,
 };
 pub use ra_runner::run_ra_lsif;

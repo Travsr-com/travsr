@@ -8450,11 +8450,17 @@ impl Daemon {
 
         // Wire Step 4 (semantic ANN) into the query store. Must happen after
         // both stores are open so the sidecar handshake can read the DB.
-        {
+        // #736 item 6: hold the supervisor for the daemon's lifetime — dropping
+        // it here (the previous behaviour) made maybe_respawn unreachable, so
+        // a crashed sidecar could never come back. The embed tick drives
+        // respawn; the swap happens inside the Arc the hooks already hold.
+        let embed_supervisor = {
             let mut rs = read_store.lock().unwrap_or_else(|e| e.into_inner());
             let mut ws = store.lock().unwrap_or_else(|e| e.into_inner());
-            try_inject_embed_hook(&mut rs, &mut ws, &db_path);
-        }
+            Arc::new(Mutex::new(try_inject_embed_hook(
+                &mut rs, &mut ws, &db_path,
+            )))
+        };
 
         // Migration: repos initialised before per-repo embed config was introduced
         // have an `embed_text_model_id` meta key in graph.db but no
@@ -8608,6 +8614,8 @@ impl Daemon {
         // `try_send` never blocks, so the self-feeding path cannot deadlock.
         let (index_tx, index_rx) =
             std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
+        // #736 item 8: see MAX_CONCURRENT_CONNECTIONS.
+        let conn_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
         // worker_stop lets shutdown signal the worker to exit even though
         // index_tx_worker (the clone held by the closure) keeps the channel
         // alive after drop(index_tx). Without this, recv() never returns Err,
@@ -8665,6 +8673,7 @@ impl Daemon {
             let sched_win = Arc::clone(&phase_b_scheduler);
             let lsp_sessions_win = Arc::clone(&lsp_sessions);
             let index_tx_win = index_tx.clone();
+            let conn_limiter_win = Arc::clone(&conn_limiter);
             let pipe_name_accept = pipe_name.clone();
             tokio::spawn(async move {
                 let mut first_instance = true;
@@ -8695,7 +8704,14 @@ impl Daemon {
                     let sched = Arc::clone(&sched_win);
                     let lsp_sessions_conn = Arc::clone(&lsp_sessions_win);
                     let index_tx_conn = index_tx_win.clone();
+                    let limiter = Arc::clone(&conn_limiter_win);
                     tokio::spawn(async move {
+                        // #736 item 8: gate the blocking work, not the accept —
+                        // the task itself is a few KB; the permit bounds the
+                        // spawn_blocking threads below at MAX_CONCURRENT_CONNECTIONS.
+                        let Ok(_permit) = limiter.acquire_owned().await else {
+                            return; // semaphore closed = daemon shutting down
+                        };
                         let (reader, mut writer) = tokio::io::split(server);
                         let mut lines = BufReader::new(reader).lines();
                         if let Ok(Some(line)) = lines.next_line().await {
@@ -8774,7 +8790,14 @@ impl Daemon {
                         let sched = Arc::clone(&phase_b_scheduler);
                         let lsp_sessions_conn = Arc::clone(&lsp_sessions);
                         let index_tx_conn = index_tx.clone();
+                        let limiter = Arc::clone(&conn_limiter);
                         tokio::spawn(async move {
+                            // #736 item 8: gate the blocking work, not the
+                            // accept — the permit bounds the spawn_blocking
+                            // threads below at MAX_CONCURRENT_CONNECTIONS.
+                            let Ok(_permit) = limiter.acquire_owned().await else {
+                                return; // semaphore closed = daemon shutting down
+                            };
                             let (reader, mut writer) = conn.into_split();
                             let mut lines = BufReader::new(reader).lines();
                             if let Ok(Some(line)) = lines.next_line().await {
@@ -8895,7 +8918,21 @@ impl Daemon {
                         let store_bg = Arc::clone(&store);
                         let repo_bg = Arc::clone(&repo_root_arc);
                         let p2_flag = Arc::clone(&embed_phase2_spawned);
+                        // #736 item 6: revive a crashed sidecar before the
+                        // spawn check. maybe_respawn swaps the new child inside
+                        // the Arc the injected hooks already hold, so no
+                        // re-injection is needed; attempts are bounded by
+                        // MAX_RESPAWN_ATTEMPTS and the mutex makes overlapping
+                        // ticks single-flight.
+                        let supervisor_bg = Arc::clone(&embed_supervisor);
                         tokio::task::spawn_blocking(move || {
+                            if let Ok(mut guard) = supervisor_bg.lock() {
+                                if let Some(s) = guard.as_mut() {
+                                    if !s.is_active() {
+                                        s.maybe_respawn();
+                                    }
+                                }
+                            }
                             maybe_spawn_embed(repo_bg.as_path(), &store_bg, &p2_flag);
                         });
                     }
@@ -8974,7 +9011,21 @@ impl Daemon {
                         let store_bg = Arc::clone(&store);
                         let repo_bg = Arc::clone(&repo_root_arc);
                         let p2_flag = Arc::clone(&embed_phase2_spawned);
+                        // #736 item 6: revive a crashed sidecar before the
+                        // spawn check. maybe_respawn swaps the new child inside
+                        // the Arc the injected hooks already hold, so no
+                        // re-injection is needed; attempts are bounded by
+                        // MAX_RESPAWN_ATTEMPTS and the mutex makes overlapping
+                        // ticks single-flight.
+                        let supervisor_bg = Arc::clone(&embed_supervisor);
                         tokio::task::spawn_blocking(move || {
+                            if let Ok(mut guard) = supervisor_bg.lock() {
+                                if let Some(s) = guard.as_mut() {
+                                    if !s.is_active() {
+                                        s.maybe_respawn();
+                                    }
+                                }
+                            }
                             maybe_spawn_embed(repo_bg.as_path(), &store_bg, &p2_flag);
                         });
                     }
@@ -9038,6 +9089,16 @@ const DIRTY_QUEUE_CAP: usize = 100_000;
 /// bytes per buffered event this bounds the queue at roughly 15 MB where it
 /// previously grew without limit.
 const INDEX_QUEUE_CAP: usize = DIRTY_QUEUE_CAP;
+
+/// Bound on concurrently-processed control connections (#736 item 8).
+///
+/// Each accepted connection's real cost is a blocking-pool thread
+/// (`handle_control_message` runs under `spawn_blocking`), and accepts were
+/// previously unbounded — tokio's 512-thread blocking pool default was the
+/// only backstop (512 × ~2 MiB stacks). Connections beyond this limit are
+/// still accepted but wait for a permit before their request line is read:
+/// backpressure, not rejection.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
 /// Send Tier-0 re-resolve requests for `callers` into the indexer channel.
 ///
@@ -9759,16 +9820,22 @@ fn hook_backend_id(db_path: &Path) -> Option<String> {
 ///
 /// No-op when the active backend binary is not installed.
 /// Called once at daemon startup AFTER both stores are open and migrated.
+///
+/// #736 item 6: returns the supervisor on success so the caller can KEEP IT
+/// ALIVE and drive `maybe_respawn` from its periodic tick. Previously the
+/// supervisor was dropped here after injection — the hooks kept the sidecar
+/// process alive through their `Arc` clones, but the respawn state died with
+/// the supervisor, so a crashed sidecar could never come back.
 pub fn try_inject_embed_hook(
     query_store: &mut SqliteStore,
     write_store: &mut SqliteStore,
     db_path: &Path,
-) {
+) -> Option<travsr_plugin_host::EmbedSupervisor> {
     use travsr_plugin_host::{embed_backends, lookup_embed_backend, EmbedSupervisor};
 
     let Some(home) = dirs::home_dir() else {
         tracing::debug!("embed hook: HOME not set — skipping");
-        return;
+        return None;
     };
 
     // Prefer the repo's own `.travsr/embed.toml` override, then the user's
@@ -9783,7 +9850,7 @@ pub fn try_inject_embed_hook(
         .or_else(|| embed_backends().first())
         .cloned();
     let Some(backend) = backend else {
-        return;
+        return None;
     };
 
     let binary = home
@@ -9792,12 +9859,12 @@ pub fn try_inject_embed_hook(
         .join(backend.binary_filename());
     let supervisor = EmbedSupervisor::try_start(&binary, db_path, &backend.id);
     if !supervisor.is_active() {
-        return;
+        return None;
     }
 
     let model_id = match supervisor.model_id() {
         Some(id) => id.to_string(),
-        None => return,
+        None => return None,
     };
 
     // Guard: if a model_id was previously recorded it must match the plugin's.
@@ -9810,11 +9877,14 @@ pub fn try_inject_embed_hook(
                 "embed model_id mismatch — Step 4 disabled. \
                  Run `travsr embed reindex` to rebuild embeddings with the installed model."
             );
-            return;
+            return None;
         }
     }
 
-    if let Some(hook) = supervisor.knn_hook(model_id.clone()) {
+    let Some(hook) = supervisor.knn_hook(model_id.clone()) else {
+        return None;
+    };
+    {
         // Warm the sidecar (ONNX + HNSW load) BEFORE arming the hook so the
         // daemon's first query never pays the cold-start cost that would trip
         // the 600 ms KNN breaker and degrade to FTS. Blocking, but this runs
@@ -9858,6 +9928,7 @@ pub fn try_inject_embed_hook(
         }
         tracing::info!(model_id = %model_id, "embed plugin active — Step 4 (semantic ANN) enabled");
     }
+    Some(supervisor)
 }
 
 /// Cold-path variant of [`try_inject_embed_hook`] for read-only CLI queries —
