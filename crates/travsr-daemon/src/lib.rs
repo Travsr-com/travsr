@@ -8616,6 +8616,12 @@ impl Daemon {
             std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
         // #736 item 8: see MAX_CONCURRENT_CONNECTIONS.
         let conn_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+        // #736 review: shed watch events are logged in AGGREGATE. A build tool
+        // churning a watched tree overflows the queue and would otherwise emit
+        // one WARN per event — an IO load of its own, during exactly the burst
+        // the bound exists to absorb, burying the incident in its own log.
+        let mut watch_shed: u64 = 0;
+        let mut watch_shed_last_log = std::time::Instant::now();
         // worker_stop lets shutdown signal the worker to exit even though
         // index_tx_worker (the clone held by the closure) keeps the channel
         // alive after drop(index_tx). Without this, recv() never returns Err,
@@ -8775,10 +8781,28 @@ impl Daemon {
                     Some(ev) = rx.recv() => {
                         // Forward to the dedicated indexer worker — never spawn a
                         // new thread here (PERF-001).
-                        if let Err(e) = index_tx.try_send(ev) {
-                            // Full = queue at INDEX_QUEUE_CAP (shed; reconcile
-                            // covers it), Disconnected = worker exited.
-                            tracing::warn!("indexer queue rejected watch event: {e}");
+                        match index_tx.try_send(ev) {
+                            Ok(()) => {}
+                            // Full = queue at INDEX_QUEUE_CAP: count and log
+                            // at most once per 10 s (see watch_shed above);
+                            // the head reconcile covers dropped events.
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                watch_shed += 1;
+                                if watch_shed_last_log.elapsed()
+                                    >= std::time::Duration::from_secs(10)
+                                {
+                                    tracing::warn!(
+                                        shed = watch_shed,
+                                        "indexer queue full — watch events shed; \
+                                         head reconcile will cover them"
+                                    );
+                                    watch_shed = 0;
+                                    watch_shed_last_log = std::time::Instant::now();
+                                }
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                tracing::warn!("indexer worker has exited; dropping watch event");
+                            }
                         }
                     }
                     Ok((conn, _)) = listener.accept() => {
@@ -8953,10 +8977,28 @@ impl Daemon {
                     Some(ev) = rx.recv() => {
                         // Forward to the dedicated indexer worker — never spawn a
                         // new thread here (PERF-001).
-                        if let Err(e) = index_tx.try_send(ev) {
-                            // Full = queue at INDEX_QUEUE_CAP (shed; reconcile
-                            // covers it), Disconnected = worker exited.
-                            tracing::warn!("indexer queue rejected watch event: {e}");
+                        match index_tx.try_send(ev) {
+                            Ok(()) => {}
+                            // Full = queue at INDEX_QUEUE_CAP: count and log
+                            // at most once per 10 s (see watch_shed above);
+                            // the head reconcile covers dropped events.
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                watch_shed += 1;
+                                if watch_shed_last_log.elapsed()
+                                    >= std::time::Duration::from_secs(10)
+                                {
+                                    tracing::warn!(
+                                        shed = watch_shed,
+                                        "indexer queue full — watch events shed; \
+                                         head reconcile will cover them"
+                                    );
+                                    watch_shed = 0;
+                                    watch_shed_last_log = std::time::Instant::now();
+                                }
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                tracing::warn!("indexer worker has exited; dropping watch event");
+                            }
                         }
                     }
                     _ = gc_tick.tick() => {
@@ -9117,17 +9159,23 @@ fn enqueue_dirty_callers(
     let total = callers.len();
     let mut enqueued = 0usize;
     let mut shed = 0usize;
-    for caller in callers.into_iter().take(DIRTY_QUEUE_CAP) {
+    let mut iter = callers.into_iter().take(DIRTY_QUEUE_CAP);
+    for caller in iter.by_ref() {
         let abs = repo_root.join(&caller);
         if !abs.exists() {
             continue;
         }
         match index_tx.try_send(watcher::WatchEvent::Upsert(abs)) {
             Ok(()) => enqueued += 1,
-            // #736 A2: queue at INDEX_QUEUE_CAP — shed the rest of this set;
-            // the next Phase B / reconcile covers them, same as the cap above.
+            // #736 A2: queue at INDEX_QUEUE_CAP. This function runs ON the
+            // queue's consumer thread, so once the queue is full it stays
+            // full for the rest of this loop — stop immediately instead of
+            // stat-ing up to 100k callers that cannot be enqueued (review).
+            // The recovery contract (Phase B / next reconcile) is the same
+            // whether they are counted one at a time or in bulk.
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                shed += 1;
+                shed += 1 + iter.count();
+                break;
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 tracing::warn!("Tier-0: indexer channel closed, dropping remaining callers");
@@ -9848,10 +9896,7 @@ pub fn try_inject_embed_hook(
         .as_deref()
         .and_then(lookup_embed_backend)
         .or_else(|| embed_backends().first())
-        .cloned();
-    let Some(backend) = backend else {
-        return None;
-    };
+        .cloned()?;
 
     let binary = home
         .join(".travsr")
@@ -9862,10 +9907,7 @@ pub fn try_inject_embed_hook(
         return None;
     }
 
-    let model_id = match supervisor.model_id() {
-        Some(id) => id.to_string(),
-        None => return None,
-    };
+    let model_id = supervisor.model_id()?.to_string();
 
     // Guard: if a model_id was previously recorded it must match the plugin's.
     // When absent (first run after `travsr embed reindex`) we proceed and write it below.
@@ -9881,9 +9923,7 @@ pub fn try_inject_embed_hook(
         }
     }
 
-    let Some(hook) = supervisor.knn_hook(model_id.clone()) else {
-        return None;
-    };
+    let hook = supervisor.knn_hook(model_id.clone())?;
     {
         // Warm the sidecar (ONNX + HNSW load) BEFORE arming the hook so the
         // daemon's first query never pays the cold-start cost that would trip

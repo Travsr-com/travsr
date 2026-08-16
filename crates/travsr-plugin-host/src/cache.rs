@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use travsr_plugin_protocol::ParseResponse;
 
 /// Daemon-computed parse cache key. plugin_version prevents stale cached
@@ -29,11 +29,14 @@ pub struct ParseCache {
     store: HashMap<CacheKey, ParseResponse>,
     /// Approximate resident bytes of all cached values (see `approx_bytes`).
     approx_bytes: usize,
-    /// Insertion order for eviction. A Vec of keys, oldest first: eviction is
-    /// rare (only when the budget overflows) and FIFO is the right policy for
-    /// this cache — within one run a file is parsed once and hit shortly
-    /// after, so the oldest entries are the least likely to be needed again.
-    insertion_order: Vec<CacheKey>,
+    /// Insertion order for eviction, oldest first. A `VecDeque` because the
+    /// byte budget admits tens of thousands of typical-size entries, so once
+    /// the cache is full eviction runs on nearly every insert — `pop_front`
+    /// must be O(1), not a Vec::remove(0) memmove of the whole queue. FIFO is
+    /// the right policy for this cache: within one run a file is parsed once
+    /// and hit shortly after, so the oldest entries are the least likely to
+    /// be needed again.
+    insertion_order: VecDeque<CacheKey>,
 }
 
 impl ParseCache {
@@ -41,7 +44,7 @@ impl ParseCache {
         Self {
             store: HashMap::new(),
             approx_bytes: 0,
-            insertion_order: Vec::new(),
+            insertion_order: VecDeque::new(),
         }
     }
 
@@ -59,18 +62,36 @@ impl ParseCache {
         if cost > MAX_CACHE_BYTES {
             return;
         }
-        // Evict oldest-first until the new entry fits.
-        while self.approx_bytes + cost > MAX_CACHE_BYTES && !self.insertion_order.is_empty() {
-            let oldest = self.insertion_order.remove(0);
+        // Credit an existing entry's cost BEFORE the budget check, so a
+        // refresh is charged as a delta rather than a wholly new entry —
+        // otherwise re-inserting a large value evicts neighbours to make room
+        // for bytes that are about to be released anyway.
+        let existed = match self.store.remove(&key) {
+            Some(prev) => {
+                self.approx_bytes = self.approx_bytes.saturating_sub(approx_bytes(&prev));
+                true
+            }
+            None => false,
+        };
+        // Evict oldest-first until the new entry fits. A refreshed key's own
+        // (now dangling) order slot may be popped here — track that so the key
+        // still ends up with exactly one slot.
+        let mut key_slot_popped = false;
+        while self.approx_bytes + cost > MAX_CACHE_BYTES {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if oldest == key {
+                key_slot_popped = true;
+                continue;
+            }
             if let Some(evicted) = self.store.remove(&oldest) {
                 self.approx_bytes = self.approx_bytes.saturating_sub(approx_bytes(&evicted));
             }
         }
-        if let Some(prev) = self.store.insert(key.clone(), resp) {
-            // Same key re-inserted: replace its cost, keep its order slot.
-            self.approx_bytes = self.approx_bytes.saturating_sub(approx_bytes(&prev));
-        } else {
-            self.insertion_order.push(key);
+        self.store.insert(key.clone(), resp);
+        if !existed || key_slot_popped {
+            self.insertion_order.push_back(key);
         }
         self.approx_bytes += cost;
     }
@@ -203,5 +224,29 @@ mod tests {
         cache.insert(key(1), response_with_nodes(10, 64));
         assert_eq!(cache.approx_bytes, first);
         assert_eq!(cache.insertion_order.len(), 1);
+    }
+
+    /// Review follow-up on #736: a refresh must be charged as a delta, not as
+    /// a wholly new entry. Two entries that together fill most of the budget,
+    /// then a same-size refresh of the newer one — the older entry must
+    /// survive, because the refresh releases exactly the bytes it adds.
+    #[test]
+    fn refresh_does_not_evict_neighbours() {
+        let mut cache = ParseCache::new();
+        // Two ~29 MB entries (~1.2 KB estimated per node): ~59 MB total,
+        // inside the 64 MB budget with room to spare.
+        let big = 24 * 1024;
+        cache.insert(key(1), response_with_nodes(big, 1024));
+        cache.insert(key(2), response_with_nodes(big, 1024));
+        assert!(cache.get("1.0.0", [1; 32]).is_some());
+        // Refresh key 2 with an equal-cost value.
+        cache.insert(key(2), response_with_nodes(big, 1024));
+        assert!(
+            cache.get("1.0.0", [1; 32]).is_some(),
+            "refreshing key 2 must not evict key 1 — the delta is zero"
+        );
+        assert!(cache.get("1.0.0", [2; 32]).is_some());
+        assert!(cache.approx_bytes <= MAX_CACHE_BYTES);
+        assert_eq!(cache.insertion_order.len(), 2, "one order slot per key");
     }
 }
