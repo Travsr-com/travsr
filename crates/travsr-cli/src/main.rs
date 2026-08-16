@@ -162,7 +162,9 @@ enum Command {
     References {
         /// Symbol to enumerate references of (bare name or full signature).
         symbol: String,
-        /// Optional file-path hint to disambiguate overloaded names.
+        /// Optional path hint to scope an overloaded name to a file or
+        /// directory: a filename, relative path, directory, or path fragment
+        /// (e.g. ppr.rs, src/ppr.rs, crates/travsr-retrieval, retrieval).
         #[arg(long)]
         path: Option<String>,
         /// Output format: text (default) or json.
@@ -205,7 +207,8 @@ enum Command {
     Graph {
         /// Symbol or file name to start from. Mutually exclusive with --all.
         query: Option<String>,
-        /// Exact path of the definition file to resolve ambiguity.
+        /// Path hint to resolve ambiguity: a filename, relative path, directory,
+        /// or path fragment (e.g. ppr.rs, crates/travsr-retrieval, retrieval).
         #[arg(long)]
         path: Option<String>,
         /// Dump the entire indexed repository graph.

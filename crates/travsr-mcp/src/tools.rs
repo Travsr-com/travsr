@@ -753,15 +753,50 @@ pub(crate) enum RefTarget {
     None,
 }
 
+/// Does a stored node `path` satisfy a user-supplied `--path` / `path` hint?
+///
+/// A hint scopes a symbol query to a file or directory. #647: the original pin
+/// only accepted a filename suffix on a `/` boundary (`ppr.rs`, `src/ppr.rs`),
+/// so a directory prefix (`crates/travsr-retrieval`) or a bare fragment
+/// (`retrieval`) silently matched nothing and read as a definitive "0
+/// references". This widens the pin while keeping the boundary rule that stops a
+/// bare filename bleeding into a longer one (`tools.rs` never matches
+/// `mytools.rs`, #299 F1). A trailing `/` on the hint is ignored so
+/// `crates/travsr-retrieval/` behaves like `crates/travsr-retrieval`.
+///
+/// Match if any of:
+/// - the whole path equals the hint;
+/// - the path ends with `/hint` (filename / trailing path on a `/` boundary);
+/// - the path starts with `hint/` (directory prefix);
+/// - the path contains `/hint/` (interior whole path segment);
+/// - the hint is a bare word (no `/` and no `.`) and is a substring of the path
+///   — so `retrieval` scopes to `crates/travsr-retrieval/...`. A filename-shaped
+///   hint (one containing `.`) never gets this loose treatment, so the
+///   `/`-boundary guard above still holds for it.
+pub(crate) fn path_hint_matches(node_path: &str, hint: &str) -> bool {
+    let hint = hint.trim_end_matches('/');
+    if hint.is_empty() {
+        return true;
+    }
+    node_path == hint
+        || node_path.ends_with(&format!("/{hint}"))
+        || node_path.starts_with(&format!("{hint}/"))
+        || node_path.contains(&format!("/{hint}/"))
+        || (!hint.contains('/') && !hint.contains('.') && node_path.contains(hint))
+}
+
 /// Resolve a symbol name (or full signature) to its definition node(s).
 ///
 /// Ladder (consistent with `get_snippets` resolution): exact-signature match
 /// first (handles full headers like `fn:charge` from `get_context`), then an
-/// exact simple-name match over the FTS candidates. An optional `path` suffix
-/// pins overloaded names to one file.
+/// exact simple-name match over the FTS candidates. An optional `path` hint
+/// (see [`path_hint_matches`]) pins overloaded names to a file or directory.
 fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<CoreNode> {
-    // Tier 1: exact signature (+ optional path pin).
-    let mut candidates = store.lookup_nodes_exact(symbol, path).unwrap_or_else(|e| {
+    // Tier 1: exact signature. The path hint is applied by the shared Rust pin
+    // below (the single source of truth for `--path`), not by the store's narrow
+    // suffix-only SQL fast-path, so a directory or fragment hint (#647) is not
+    // dropped here before the pin can widen it.
+    let mut candidates = store.lookup_nodes_exact(symbol, None).unwrap_or_else(|e| {
         tracing::warn!("resolve_symbol_nodes lookup_nodes_exact '{symbol}': {e}");
         Vec::new()
     });
@@ -836,10 +871,10 @@ fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -
         }
     }
 
-    // Apply the path suffix pin if the caller supplied one.
+    // Apply the path hint if the caller supplied one (#647: file, directory, or
+    // fragment — see `path_hint_matches`).
     if let Some(p) = path {
-        let boundary = format!("/{p}");
-        candidates.retain(|n| n.vname.path == p || n.vname.path.ends_with(&boundary));
+        candidates.retain(|n| path_hint_matches(&n.vname.path, p));
     }
 
     // Distinct definitions by node id.
@@ -885,6 +920,24 @@ pub(crate) fn resolve_reference_targets(
     }
 }
 
+/// #647: message for a `path` hint that matched no definition of a symbol that
+/// does resolve elsewhere. Shows where the symbol actually lives so the answer
+/// is never mistaken for a real "0 references".
+fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
+    let mut out = format!(
+        "'{symbol}' resolves, but no definition is under path '{hint}'. It is defined at:\n"
+    );
+    for n in defs.iter().take(MAX_REFERENCE_SITES) {
+        let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+        out.push_str(&format!(
+            "  {} ({}) \u{2014} {}{}\n",
+            n.vname.signature, n.kind, n.vname.path, loc
+        ));
+    }
+    out.push_str("Re-run without `path`, or with a `path` hint that matches one of these.");
+    out
+}
+
 /// Enumerate every use site (`path:line`) of a symbol across the current repo.
 ///
 /// Reads the `edge_sites` occurrence store (populated by every ingestion path —
@@ -922,7 +975,22 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
 fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> String {
     let target = match resolve_reference_targets(store, symbol, path) {
         RefTarget::Unique(n) => n,
-        RefTarget::None => return String::new(),
+        RefTarget::None => {
+            // #647: a `path` hint that filtered out every real definition must
+            // not read as a definitive "0 references" — that is the exact
+            // misleading-abstention pattern the rest of this function is
+            // hardened against (#299 / #450). Re-resolve ignoring the hint; if
+            // the symbol genuinely exists elsewhere, say where instead of
+            // returning an empty result.
+            if let Some(hint) = path {
+                match resolve_reference_targets(store, symbol, None) {
+                    RefTarget::Unique(n) => return path_miss_message(symbol, hint, &[n]),
+                    RefTarget::Ambiguous(nodes) => return path_miss_message(symbol, hint, &nodes),
+                    RefTarget::None => {}
+                }
+            }
+            return String::new();
+        }
         RefTarget::Ambiguous(nodes) => {
             let mut out = format!(
                 "'{symbol}' is ambiguous — {} definitions. Re-run with a `path` hint to pick one:\n",
@@ -12373,6 +12441,123 @@ mod snippet_tests {
         assert!(
             pinned.contains("src/tools.rs") && !pinned.contains("mytools.rs"),
             "must select src/tools.rs, not src/mytools.rs: {pinned}"
+        );
+    }
+
+    #[test]
+    fn path_hint_matches_covers_forms_and_keeps_boundary_guard() {
+        // #647: every documented hint form matches; the #299 F1 boundary guard
+        // (a filename hint never bleeds into a longer filename) still holds.
+        let p = "crates/travsr-retrieval/src/ppr.rs";
+        assert!(path_hint_matches(p, p), "whole path");
+        assert!(path_hint_matches(p, "ppr.rs"), "filename suffix");
+        assert!(path_hint_matches(p, "src/ppr.rs"), "trailing path");
+        assert!(
+            path_hint_matches(p, "crates/travsr-retrieval"),
+            "directory prefix"
+        );
+        assert!(
+            path_hint_matches(p, "crates/travsr-retrieval/"),
+            "prefix + trailing slash"
+        );
+        assert!(path_hint_matches(p, "src"), "interior whole segment");
+        assert!(
+            path_hint_matches(p, "retrieval"),
+            "bare-word substring of a segment"
+        );
+        assert!(!path_hint_matches(p, "travsr-store"), "unrelated directory");
+        // #299 F1: a filename-shaped hint (has `.`) stays boundary-pinned.
+        assert!(
+            !path_hint_matches("src/mytools.rs", "tools.rs"),
+            "no filename bleed"
+        );
+        assert!(
+            path_hint_matches("src/tools.rs", "tools.rs"),
+            "exact filename on boundary"
+        );
+    }
+
+    #[test]
+    fn find_references_path_hint_directory_and_fragment_return_refs() {
+        // #647: a directory prefix, an interior segment, and a bare fragment all
+        // scope references instead of silently returning "0 references".
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let def = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/travsr-retrieval/src/ppr.rs",
+                "rust",
+                "fn:ppr",
+            ),
+            "function",
+        )
+        .with_line(10);
+        let caller = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/travsr-retrieval/benches/retrieval.rs",
+                "rust",
+                "fn:bench",
+            ),
+            "function",
+        );
+        store.put_node(&def).unwrap();
+        store.put_node(&caller).unwrap();
+        store.record_edge_sites(&[(caller.id, def.id, 42)]).unwrap();
+
+        for hint in [
+            "crates/travsr-retrieval",  // directory prefix
+            "crates/travsr-retrieval/", // + trailing slash
+            "src",                      // interior whole segment
+            "retrieval",                // bare-word substring of `travsr-retrieval`
+        ] {
+            let out = find_references(&store, "ppr", Some(hint));
+            assert!(
+                out.contains("resolved: fn:ppr"),
+                "hint {hint:?} must resolve the definition: {out}"
+            );
+            assert!(
+                out.contains("crates/travsr-retrieval/benches/retrieval.rs:42"),
+                "hint {hint:?} must list the reference site: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_references_path_miss_is_informative_not_empty() {
+        // #647: a symbol that resolves but has no definition under the given path
+        // must explain where it lives, never return an empty (misleading "0
+        // references") result.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let def = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/travsr-retrieval/src/ppr.rs",
+                "rust",
+                "fn:ppr",
+            ),
+            "function",
+        )
+        .with_line(10);
+        store.put_node(&def).unwrap();
+
+        let out = find_references(&store, "ppr", Some("crates/travsr-store"));
+        assert!(
+            out.contains("resolves") && out.contains("no definition is under path"),
+            "must explain the path miss: {out}"
+        );
+        assert!(
+            out.contains("crates/travsr-retrieval/src/ppr.rs"),
+            "must show where the symbol actually lives: {out}"
+        );
+        assert!(
+            !out.contains("ambiguous"),
+            "a single def is not ambiguous: {out}"
         );
     }
 
