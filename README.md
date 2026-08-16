@@ -504,7 +504,7 @@ Pre-built binaries are available on the [Releases](https://github.com/Travsr-com
 - **`not initialized: run travsr init`**
   Run `travsr init` in the repo root before using `graph`, `ask`, `status`, or `mcp`.
 
-- **MCP server returns empty results in `--global` mode`**
+- **MCP server returns empty results in `--global` mode**
   Run `travsr repos` to verify the repo is registered and `Exists` shows `yes`.
   If missing, re-run `travsr init` in that repo.
 

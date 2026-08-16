@@ -474,7 +474,7 @@ async fn main() {
     }));
 
     // UX-019: publish the product version (this binary's `CARGO_PKG_VERSION`,
-    // 0.11.0) so the daemon's session-start log reports the same number as
+    // 1.0.0) so the daemon's session-start log reports the same number as
     // `travsr --version` instead of its own workspace crate version (0.7.0). The
     // background daemon is a re-exec of this same binary, so it runs this too.
     travsr_daemon::set_build_version(env!("CARGO_PKG_VERSION"));

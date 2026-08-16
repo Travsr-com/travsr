@@ -6,6 +6,15 @@ All notable changes to Travsr are documented here.
 
 ## Unreleased
 
+---
+
+## v1.0.0-beta.1 - 2026-08-16
+
+> First 1.0 beta. Install with `npm i -g @travsr.com/travsr@beta` or
+> `sh -s -- --version v1.0.0-beta.1` via the shell installer. Promotion to
+> `rc` and `latest` republishes these exact signed artifacts unchanged; see
+> [Release channels](README.md#release-channels).
+
 ### Added
 
 - **`curl | sh` one-line installer (#691).** `curl -fsSL https://travsr.com/install.sh | sh` installs the travsr CLI without Node, with `sh -s -- --system` to install to `/usr/local/bin` instead of the default `~/.local/bin`, and `sh -s -- --version v0.11.0` to install a specific release instead of latest stable. SHA256 verification against the release `SHA256SUMS` is mandatory on every install with no bypass; the cosign signature is verified when cosign is on `PATH`, and verification failure aborts the install (unlike the npm postinstall path, which falls back to SHA256-only). Supports Linux, macOS, and Alpine/musl; no Windows build is offered. The script's target map is guarded in CI by `.github/scripts/check-target-maps.mjs` alongside the release build matrix and the two existing installer target maps. The hosted URLs (`travsr.com/install.sh` and the GitHub Releases fallback) go live with this release; the `travsr.com` redirect follows as a separate change.
@@ -29,6 +38,8 @@ All notable changes to Travsr are documented here.
 ### Removed
 
 - **Kùzu storage backend dropped (#457).** The optional, feature-gated Kùzu backend (`--features kuzu`), the `travsr migrate --to kuzu` command and its SQLite→Kùzu migration + integrity manifest, the SQLite/Kùzu parity harness, the nightly Kùzu CI workflow, and the `kuzu` dependency have all been removed. SQLite+WAL is the storage backend for both MVP and production; RocksDB remains a possible future hyperscale backend. See `docs/adrs/ADR-018-drop-kuzu-backend.md`.
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v0.11.0...v1.0.0-beta.1
 
 ---
 

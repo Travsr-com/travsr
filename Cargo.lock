@@ -3886,7 +3886,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-cli"
-version = "0.11.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -4027,7 +4027,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-mcp"
-version = "0.11.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
