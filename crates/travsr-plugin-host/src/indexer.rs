@@ -40,11 +40,15 @@ pub struct PhaseBOutcome {
     /// Languages whose analyzer was found and spawned but died or errored
     /// mid-invoke.
     pub crashed: Vec<String>,
-    /// #712: languages whose analyzer ran cleanly but produced zero nodes even
+    /// #712: languages whose analyzer ran cleanly but produced no graph output
+    /// at all (no nodes, edges, refs, unresolved calls, or positional refs) even
     /// though the language is present in the repo. A build-free tool that
     /// silently indexes nothing (e.g. scip-ruby spawned without an input path)
     /// would otherwise read as success. User-actionable: rebuild / check the
     /// tool. Not a crash — the sidecar completed, it just emitted nothing.
+    /// #724 Finding 2: this is emptiness of ALL output, not just nodes; native
+    /// Phase B analyzers legitimately emit edges onto existing Phase A nodes
+    /// with no new nodes of their own.
     pub produced_no_nodes: Vec<String>,
     /// Languages whose sidecar binary responded with a mismatched protocol
     /// version. User-actionable: `travsr lang install <lang>` to upgrade.
@@ -989,16 +993,14 @@ impl PluginIndexer {
                 // nothing despite having source files — surface it instead of
                 // recording a silent zero-node "success".
                 //
-                // #724: "nothing" has to mean every output, not just nodes.
-                // Native Phase B (rust, typescript, python) resolves calls
-                // directly and emits edges and reference occurrences without
-                // emitting SCIP-style definition nodes, so keying the check on
-                // `nodes` alone reported a fully working language as broken. The
-                // warning it raised told the user to debug a sidecar that does
-                // not exist for these languages. The genuine all-zero case still
-                // fires, and so does the inverse shape (nodes but no references,
-                // which is where the Java ingest gap shows up), because that
-                // language does emit nodes and is not caught here.
+                // #724 Finding 2: "nothing" must mean no graph output at all, not
+                // merely no nodes. Native Phase B analyzers (python/typescript/
+                // rust) attach ref/call edges to existing Phase A tree-sitter
+                // nodes and emit no new SCIP-style definition nodes, so an empty
+                // `nodes` list is normal for a fully successful run. Only flag a
+                // language that produced neither nodes nor edges/refs of any kind,
+                // so an analyzer that produced call edges is not falsely reported
+                // as having "produced no symbols".
                 if r.nodes.is_empty()
                     && r.edges.is_empty()
                     && r.refs.is_empty()
