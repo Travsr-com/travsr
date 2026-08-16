@@ -975,7 +975,11 @@ export interface LangInfo {
 }
 
 /** Languages panel: indexed section + available section with install/approve actions. */
-export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]): string {
+export function buildLanguagesHtml(
+  indexed: LangCount[],
+  available: LangInfo[],
+  targetRepo?: string
+): string {
   // ── Indexed section ──────────────────────────────────────────────────────────
   const indexedRows = indexed.length
     ? indexed
@@ -1063,9 +1067,15 @@ export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]):
     })
     .join("\n");
 
+  // When several repos are open the panel names the one install/detect will
+  // target and offers a one-click change, so the destination is never a guess.
+  const sub = targetRepo
+    ? `<p class="sub">Target repo: <b>${esc(targetRepo)}</b> — install &amp; detect run here. <a href="#" onclick="pickRepo();return false" style="color:var(--green)">change</a></p>`
+    : `<p class="sub">Indexed languages in this repo and available semantic analysis tools.</p>`;
+
   const body = `
 <h2>Languages</h2>
-<p class="sub">Indexed languages in this repo and available semantic analysis tools.</p>
+${sub}
 <div class="toolbar">
   <button class="btn" id="detectBtn" onclick="detectLangs(this)">Detect &amp; install</button>
   <button class="btn" id="refreshBtn" onclick="doRefresh(this)" title="Refresh indexed counts (fast)">Refresh</button>
@@ -1084,6 +1094,9 @@ export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]):
 </section>`;
 
   const script = `
+function pickRepo() {
+  vscode.postMessage({command:'pickRepo'});
+}
 function installLang(btn, lang) {
   setLoading(btn, true, 'Install');
   vscode.postMessage({command:'installLang', language:lang});

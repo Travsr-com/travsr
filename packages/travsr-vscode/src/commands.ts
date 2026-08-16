@@ -18,6 +18,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import type { McpClient } from "./mcp";
+import { ActiveRepo } from "./activeRepo";
 import { GraphPanel, type GraphData, type GraphNode } from "./graph";
 import {
   buildSynonymsHtml,
@@ -609,6 +610,7 @@ type PanelMessage =
   | { command: "removeLang"; language: string }
   | { command: "detectLangs" }
   | { command: "reloadAvailable" }
+  | { command: "pickRepo" }
   | { command: "initRepo" }
   | { command: "openFile"; path: string }
   | { command: "refreshLog" }
@@ -969,17 +971,15 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
 export function registerShowLanguages(
   client: McpClient,
   binary: string,
+  activeRepo: ActiveRepo,
   onAfterInit?: () => void
 ): vscode.Disposable {
-  // The open workspace folder, passed as the CLI's cwd so `lang install` /
-  // `lang detect` run *inside* the repo and derive the corpus exactly as the
-  // daemon does (git remote). The extension used to pass `--corpus <basename>`,
-  // which never matched the daemon's git-remote-derived corpus, so the trust
-  // grant landed on the wrong key and the repo still read as untrusted. Letting
-  // the CLI auto-derive from cwd removes that mismatch entirely. Undefined when
-  // no folder is open.
-  const getWorkspaceRoot = (): string | undefined =>
-    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  // `lang install` / `lang detect` / `init` run with the targeted repo as cwd, so
+  // the CLI derives the corpus exactly as the daemon does (git remote) and enables
+  // the right repo. The extension used to pass `--corpus <folder-basename>`, which
+  // never matched the daemon's corpus, and it only ever looked at the first
+  // workspace folder — wrong or ambiguous the moment several repos are open. The
+  // user now picks the target (ActiveRepo), shown in the status bar.
 
   // Read the configured binary path at call time so we always use the value
   // written by checkBinaryAndPrompt, which runs async after activation.
@@ -996,15 +996,16 @@ export function registerShowLanguages(
       cachedAvailable = parseAvailableLanguages(raw);
       availableLoaded = true;
     }
-    return buildLanguagesHtml(parseLanguageCounts(langsRaw), cachedAvailable);
+    // Show the target repo in the panel only when several are open — with one
+    // repo there is no ambiguity to surface.
+    const target = activeRepo.hasChoice() ? activeRepo.currentName() : undefined;
+    return buildLanguagesHtml(parseLanguageCounts(langsRaw), cachedAvailable, target);
   };
 
   // Buttons are unlocked immediately by openManagedPanel's 'unlockButtons' postMessage
   // sent before handle() is ever called. postStatus drives the in-panel status bar for
   // operations that take >1s (install, detect, reload).
   const handle = async (msg: PanelMessage, refresh: RefreshFn, postStatus: PostStatus): Promise<void> => {
-    const wsRoot = getWorkspaceRoot();
-
     if (msg.command === "reloadAvailable") {
       availableLoaded = false;
       postStatus('Reloading available tools…');
@@ -1019,12 +1020,15 @@ export function registerShowLanguages(
 
     switch (msg.command) {
       case "installLang": {
+        // Prompt once if which repo is ambiguous; abort if dismissed.
+        const repo = await activeRepo.ensureChosen();
+        if (!repo) return;
         const args = ["lang", "install", msg.language, "--no-interactive", "--yes"];
         postStatus(`Installing ${msg.language} tool…`);
-        // cwd = repo so the CLI auto-enables this repo; 120s because install may
-        // download a binary from GitHub Releases — the 4s default would kill it
-        // mid-download, before the trust grant is even written.
-        void spawnLangCommand(getBinary(), args, wsRoot, 120_000).then(() => {
+        // cwd = the chosen repo so the CLI auto-enables it; 120s because install
+        // may download a binary from GitHub Releases — the 4s default would kill
+        // it mid-download, before the trust grant is even written.
+        void spawnLangCommand(getBinary(), args, repo, 120_000).then(() => {
           availableLoaded = false;
           postStatus("");
           void refresh();
@@ -1044,10 +1048,12 @@ export function registerShowLanguages(
           "--reason", m.reason,
           "--permitted-hosts", m.permittedHosts || "",
         ];
+        const repo = await activeRepo.ensureChosen();
+        if (!repo) return;
         const installArgs = ["lang", "install", m.language, "--no-interactive", "--yes"];
         postStatus(`Installing ${m.language} with elevated approval…`);
         void spawnLangCommand(getBinary(), approveArgs)
-          .then(() => spawnLangCommand(getBinary(), installArgs, wsRoot, 120_000))
+          .then(() => spawnLangCommand(getBinary(), installArgs, repo, 120_000))
           .then(() => {
             availableLoaded = false;
             postStatus("");
@@ -1065,11 +1071,15 @@ export function registerShowLanguages(
           void vscode.window.showInformationMessage(`Disabled language tool for ${msg.language}.`);
         });
         return;
+      case "pickRepo":
+        await activeRepo.pick();
+        void refresh();
+        return;
       case "initRepo": {
-        const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        if (!wsRoot) return;
+        const repo = await activeRepo.ensureChosen();
+        if (!repo) return;
         postStatus("Initializing repo…");
-        void spawnLangCommand(getBinary(), ["init"], wsRoot, 120_000).then(() => {
+        void spawnLangCommand(getBinary(), ["init"], repo, 120_000).then(() => {
           postStatus("");
           // Graph rebuilt — evict stale blast-radius and caller counts.
           onAfterInit?.();
@@ -1077,10 +1087,12 @@ export function registerShowLanguages(
         });
         return;
       }
-      case "detectLangs":
+      case "detectLangs": {
+        const repo = await activeRepo.ensureChosen();
+        if (!repo) return;
         postStatus('Detecting languages…');
-        // cwd = repo so detect scans the open workspace, not the extension host's cwd.
-        void spawnLangCommand(getBinary(), ["lang", "detect"], wsRoot, 30_000).then((out) => {
+        // cwd = the chosen repo so detect scans it, not the extension host's cwd.
+        void spawnLangCommand(getBinary(), ["lang", "detect"], repo, 30_000).then((out) => {
           void vscode.window.showInformationMessage(
             out.trim() ? `Detect: ${out.trim().slice(0, 120)}` : "Detection complete."
           );
@@ -1089,6 +1101,7 @@ export function registerShowLanguages(
           void refresh();
         });
         return;
+      }
       case "refresh":
         availableLoaded = false;
         await refresh();
@@ -1111,13 +1124,15 @@ export function registerParityCommands(
   binary: string,
   onAfterInit?: () => void
 ): void {
+  const activeRepo = new ActiveRepo(context);
   context.subscriptions.push(
+    vscode.commands.registerCommand("travsr.selectRepository", () => activeRepo.pick()),
     registerAskSymbol(client),
     registerManageSynonyms(client),
     registerShowDependencies(client),
     registerShowExecutionPath(client, context),
     registerShowRepos(client),
     registerShowGraphStats(client),
-    registerShowLanguages(client, binary, onAfterInit)
+    registerShowLanguages(client, binary, activeRepo, onAfterInit)
   );
 }
