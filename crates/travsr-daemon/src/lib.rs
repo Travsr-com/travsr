@@ -61,7 +61,7 @@ static BUILD_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// Record the product/build version (UX-019).
 ///
 /// The `travsr-daemon` crate carries the workspace version (`0.7.0`), which is
-/// deliberately decoupled from the user-facing `travsr --version` (`0.11.0`, the
+/// deliberately decoupled from the user-facing `travsr --version` (`1.0.0`, the
 /// npm-release line). Logging `env!("CARGO_PKG_VERSION")` therefore made the
 /// daemon's session-start line disagree with `--version`. The `travsr` binary
 /// (including the background daemon, which is a re-exec of the same binary) calls
