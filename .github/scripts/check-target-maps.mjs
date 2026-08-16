@@ -7,7 +7,7 @@
  * Linux entries build against musl (`target: x86_64-unknown-linux-musl`) but
  * ship a gnu-named asset (`artifact: x86_64-unknown-linux-gnu`); the package
  * step (release.yml, STAGE="travsr-${TAG}-${ARTIFACT}") and both installers
- * (installer.ts, install.js) only ever request the artifact name. Comparing
+ * (installer.ts, ensure-binary.js) only ever request the artifact name. Comparing
  * against `target:` would fail on a clean tree.
  *
  * This checks set equality of triples across the four sources, not pairing
@@ -33,7 +33,7 @@ const REPO_ROOT = join(__dirname, "..", "..");
 
 const RELEASE_YML = join(REPO_ROOT, ".github/workflows/release.yml");
 const INSTALLER_TS = join(REPO_ROOT, "packages/travsr-vscode/src/installer.ts");
-const INSTALL_JS = join(REPO_ROOT, "packages/travsr-npm/scripts/install.js");
+const INSTALL_JS = join(REPO_ROOT, "packages/travsr-npm/scripts/ensure-binary.js");
 const INSTALL_SH = join(REPO_ROOT, "install.sh");
 
 /** Relative path for error messages, so they read the same regardless of cwd. */
