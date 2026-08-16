@@ -985,10 +985,26 @@ impl PluginIndexer {
         for r in lang_results {
             if r.ran {
                 // #712: Phase B only invokes languages present in the repo, so a
-                // clean run that yields no nodes means the analyzer indexed
+                // clean run that yields nothing means the analyzer indexed
                 // nothing despite having source files — surface it instead of
                 // recording a silent zero-node "success".
-                if r.nodes.is_empty() {
+                //
+                // #724: "nothing" has to mean every output, not just nodes.
+                // Native Phase B (rust, typescript, python) resolves calls
+                // directly and emits edges and reference occurrences without
+                // emitting SCIP-style definition nodes, so keying the check on
+                // `nodes` alone reported a fully working language as broken. The
+                // warning it raised told the user to debug a sidecar that does
+                // not exist for these languages. The genuine all-zero case still
+                // fires, and so does the inverse shape (nodes but no references,
+                // which is where the Java ingest gap shows up), because that
+                // language does emit nodes and is not caught here.
+                if r.nodes.is_empty()
+                    && r.edges.is_empty()
+                    && r.refs.is_empty()
+                    && r.unresolved_calls.is_empty()
+                    && r.positional_refs.is_empty()
+                {
                     outcome.produced_no_nodes.push(r.lang.clone());
                 }
                 outcome.ran.push(r.lang);

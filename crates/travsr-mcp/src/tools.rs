@@ -957,7 +957,11 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
         }
     }
     if phase_b_pending(store) {
-        return r#"{"status":"pending","message":"Semantic occurrence index is building in the background. References will be available in ~2 minutes. Run `travsr status` to check progress."}"#.to_string();
+        // #726: this used to promise "available in ~2 minutes". Phase B only
+        // runs when a daemon is running, so with no daemon the wait never ends
+        // and the ETA is simply false. State the requirement instead of an
+        // elapsed time nothing is counting down.
+        return r#"{"status":"pending","message":"Semantic occurrence index has not finished. It is built by the daemon: check `travsr daemon status` and start one with `travsr daemon start` if none is running, or build it now with `travsr init --semantic`. `travsr status` shows progress."}"#.to_string();
     }
     // SEC-001: sanitize before returning. Use the larger find-output limit (not
     // the 4 KiB scalar cap) so a capped 500-site list and its truncation notice
