@@ -214,9 +214,19 @@ pub fn run() -> anyhow::Result<()> {
                     // repo's sources (e.g. a sandbox-denied read, a missing SDK, or
                     // no buildable project). Point at the sidecar's own diagnostics,
                     // which the host now forwards on stderr.
-                    ["zero_nodes", lang] => eprintln!(
-                        "warning: semantic analyzer for '{lang}' ran but produced no symbols despite '{lang}' sources in the repo. The analyzer is installed and active, so reinstalling will not help — its sidecar likely could not parse or resolve these sources. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see the sidecar's own diagnostics"
-                    ),
+                    ["zero_nodes", lang] => {
+                        eprintln!(
+                            "warning: semantic analyzer for '{lang}' ran but produced no symbols despite '{lang}' sources in the repo. The analyzer is installed and active, so reinstalling will not help — its sidecar likely could not parse or resolve these sources. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see the sidecar's own diagnostics"
+                        );
+                        // #724 Finding 4: the most common cause of a zero-node
+                        // Java run on macOS is scip-java's javac shim crashing
+                        // under the stock bash 3.2. Surface the actionable fix.
+                        if *lang == "java" {
+                            if let Some(hint) = crate::progress::macos_java_bash_hint() {
+                                eprintln!("  {hint}");
+                            }
+                        }
+                    }
                     // #449: languages present in the repo whose Phase B sidecar
                     // never ran, previously a silent skip that left the user
                     // with "0 references" and no explanation.

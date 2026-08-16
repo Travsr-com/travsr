@@ -445,6 +445,11 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                     "  {} semantic analyzer ran but produced no symbols for: {langs} — see `travsr status` for why",
                     pal.orange("⚠"),
                 );
+                if report.produced_no_nodes.iter().any(|l| l == "java") {
+                    if let Some(hint) = macos_java_bash_hint() {
+                        println!("    {hint}");
+                    }
+                }
             }
             if !report.skipped_no_analyzer.is_empty() {
                 let langs = report.skipped_no_analyzer.join(", ");
@@ -707,6 +712,49 @@ fn eta(start: Instant, done: u64, total: u64) -> Option<Duration> {
     Some(Duration::from_secs_f64((total - done) as f64 / rate))
 }
 
+/// #724 Finding 4: scip-java generates a `javac` wrapper that expands empty
+/// arrays under `set -u`; that is an "unbound variable" error in bash 3.2 (the
+/// default `/bin/bash` on macOS) but legal in bash 4.4+. When the `bash`
+/// resolved on PATH is too old, scip-java exits 1 and Java Phase B silently
+/// produces no call edges, surfacing only as the generic zero-node warning.
+/// Returns an actionable hint when running on macOS with a `bash` older than
+/// 4.4, else `None`.
+pub(crate) fn macos_java_bash_hint() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    // scip-java's shim resolves `bash` via `/usr/bin/env bash`; probing plain
+    // `bash` here resolves the same first-on-PATH interpreter.
+    let output = std::process::Command::new("bash")
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (major, minor) = parse_bash_version(&text)?;
+    if major > 4 || (major == 4 && minor >= 4) {
+        return None;
+    }
+    Some(format!(
+        "note: scip-java's javac shim requires bash 4.4+, but this Mac's `bash` is {major}.{minor}. Install a newer bash (`brew install bash`) and put it ahead of /bin/bash on PATH, otherwise Java semantic indexing silently produces no call edges."
+    ))
+}
+
+/// Parse the `bash --version` banner into `(major, minor)`, e.g.
+/// "GNU bash, version 3.2.57(1)-release (...)" → `(3, 2)`.
+fn parse_bash_version(text: &str) -> Option<(u32, u32)> {
+    let ver = text.split("version ").nth(1)?;
+    let mut parts = ver.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts
+        .next()?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some((major, minor))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,5 +829,24 @@ mod tests {
         let pal = Palette { color: false };
         assert_eq!(pal.orange("x"), "x");
         assert_eq!(pal.green("●"), "●");
+    }
+
+    #[test]
+    fn parses_bash_version_banner() {
+        // #724 Finding 4: the macOS stock bash and a brew bash must parse, and
+        // the 4.4 boundary must land on the right side.
+        assert_eq!(
+            parse_bash_version("GNU bash, version 3.2.57(1)-release (arm64-apple-darwin24)"),
+            Some((3, 2))
+        );
+        assert_eq!(
+            parse_bash_version("GNU bash, version 5.2.37(1)-release (aarch64-apple-darwin24.4.0)"),
+            Some((5, 2))
+        );
+        assert_eq!(
+            parse_bash_version("GNU bash, version 4.4.23(1)-release"),
+            Some((4, 4))
+        );
+        assert_eq!(parse_bash_version("not a version banner"), None);
     }
 }
