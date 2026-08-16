@@ -33,10 +33,48 @@ use anyhow::{Context as _, Result};
 use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
+/// Resolve the reported version: an injected build id wins, the crate version
+/// is the fallback.
+///
+/// Split out as a real function rather than inlined into the `const` below so a
+/// test can exercise this exact code with both inputs. A test that reimplements
+/// the match would pass even if these arms were swapped.
+const fn resolve_version(
+    injected: Option<&'static str>,
+    crate_version: &'static str,
+) -> &'static str {
+    match injected {
+        Some(v) => v,
+        None => crate_version,
+    }
+}
+
+/// The build identity reported by `--version` and by the daemon's `version=`
+/// telemetry field.
+///
+/// The shipped `v1.0.0-beta.1` binary reported a bare `1.0.0`, identical to what
+/// the eventual stable `1.0.0` reports, so a tester's version string could not be
+/// attributed to a build.
+///
+/// It deliberately does **not** carry the prerelease suffix. `release.yml`'s
+/// `promote` job reuses the source channel's signed artifacts byte for byte and
+/// never rebuilds, so `beta.1 -> rc.1 -> stable` all ship the same binary. Baking
+/// in `1.0.0-beta.1` would make every promoted stable release report itself as a
+/// beta forever, which is a worse lie than the ambiguity it replaced.
+///
+/// Instead the release job injects `<tag base>+<short commit>`. The tag base is
+/// promotion-stable (`v1.0.0-beta.1` and `v1.0.0` share the base `1.0.0`), and
+/// the commit identifies the build itself: `beta.1` and `beta.2` differ because
+/// they are different commits, while a promoted stable matches the beta it came
+/// from because it genuinely is the same bits. Unset on local builds, which fall
+/// back to the crate version.
+const RELEASE_VERSION: &str =
+    resolve_version(option_env!("TRAVSR_BUILD_ID"), env!("CARGO_PKG_VERSION"));
+
 #[derive(Debug, Parser)]
 #[command(
     name = "travsr",
-    version,
+    version = RELEASE_VERSION,
     about = "The code graph that lives next to git."
 )]
 struct Cli {
@@ -473,11 +511,17 @@ async fn main() {
         std::process::exit(1);
     }));
 
-    // UX-019: publish the product version (this binary's `CARGO_PKG_VERSION`,
-    // 1.0.0) so the daemon's session-start log reports the same number as
-    // `travsr --version` instead of its own workspace crate version (0.7.0). The
-    // background daemon is a re-exec of this same binary, so it runs this too.
-    travsr_daemon::set_build_version(env!("CARGO_PKG_VERSION"));
+    // UX-019: publish the product version (`RELEASE_VERSION`) so the daemon's
+    // session-start log reports the same string as `travsr --version` instead of
+    // its own workspace crate version (0.7.0). The background daemon is a re-exec
+    // of this same binary, so it runs this too.
+    //
+    // Must stay `RELEASE_VERSION`, not `CARGO_PKG_VERSION`: on a release build
+    // those differ, because `RELEASE_VERSION` carries the injected `+<shortsha>`
+    // build metadata that identifies which build a tester is running. Reverting
+    // this to `CARGO_PKG_VERSION` would silently restore the ambiguity where
+    // every build reports a bare `1.0.0`.
+    travsr_daemon::set_build_version(RELEASE_VERSION);
 
     // Parse CLI args BEFORE initialising any subsystems.
     // Clap exits immediately for --version and --help via process::exit, so
@@ -2411,6 +2455,8 @@ mod daemon_log_tests {
     // ── --level / --since ────────────────────────────────────────────────
 
     use super::{is_entry_start, parse_level, parse_since, LineFilter, LogLine, LogRenderer};
+    use super::{resolve_version, Cli, RELEASE_VERSION};
+    use clap::CommandFactory as _;
 
     /// A JSON entry in the shape the daemon actually writes.
     fn json_entry(level: &str, msg: &str) -> LogLine {
@@ -2711,4 +2757,50 @@ mod daemon_log_tests {
         assert_eq!(parse_since("45s").unwrap(), chrono::Duration::seconds(45));
         assert_eq!(parse_since("1d").unwrap(), chrono::Duration::days(1));
     }
+
+    /// `--version`, the daemon's `version=` telemetry field, and the release
+    /// identity must all be the same string. They disagreed before: the daemon
+    /// logged the workspace version while `--version` printed the CLI crate's,
+    /// and neither carried a prerelease suffix.
+    #[test]
+    fn release_version_is_reported_consistently() {
+        assert!(!RELEASE_VERSION.is_empty(), "version must never be empty");
+
+        // Unset in every local and CI test run, so this asserts the fallback
+        // branch. The injected branch is covered by `resolve_version_prefers_the
+        // _injected_build_id` below, which calls the real selection function.
+        if option_env!("TRAVSR_BUILD_ID").is_none() {
+            assert_eq!(
+                RELEASE_VERSION,
+                env!("CARGO_PKG_VERSION"),
+                "an untagged build must report the crate version"
+            );
+        }
+
+        // What `--version` actually prints, taken from clap rather than assumed.
+        let rendered = Cli::command().render_version();
+        assert!(
+            rendered.contains(RELEASE_VERSION),
+            "--version must print the release identity, got {rendered:?}"
+        );
+    }
+
+    /// Exercises the real `resolve_version`, not a copy of it, so swapping its
+    /// arms fails here. The previous version of this test reimplemented the
+    /// match locally and asserted against its own copy, which could never have
+    /// caught a regression in the production const.
+    #[test]
+    fn resolve_version_prefers_the_injected_build_id() {
+        assert_eq!(
+            resolve_version(Some("1.0.0+56c9329"), "1.0.0"),
+            "1.0.0+56c9329"
+        );
+        assert_eq!(resolve_version(None, "1.0.0"), "1.0.0");
+    }
+
+    // The stripping that guarantees no channel reaches the baked id lives in
+    // `.github/scripts/build-id.sh`, not here, and is covered by that script's
+    // `--self-test` (run by CI). A Rust test could only assert against a
+    // hand-written string that is already correct, which would pass even if the
+    // real stripping regressed.
 }

@@ -212,10 +212,34 @@ jobs:
         if: matrix.cross == true
         run: cargo install cross --locked
 
+      # Build identity baked into the binary, so `travsr --version` and the
+      # daemon's version= telemetry identify which build a tester is running.
+      #
+      # Deliberately `<tag base>+<short commit>` and NOT the full tag: `promote`
+      # reuses the source channel's signed artifacts byte for byte and never
+      # rebuilds, so beta.1 -> rc.1 -> stable all ship the same binary. Baking in
+      # `1.0.0-beta.1` would make every promoted stable release report itself as
+      # a beta forever. The tag base survives promotion unchanged (v1.0.0-beta.1
+      # and v1.0.0 share the base 1.0.0), and the commit identifies the build:
+      # beta.1 and beta.2 differ, while a promoted stable matches the beta it was
+      # promoted from because it genuinely is the same bits.
+      #
+      # Set once here rather than in each build step so the cargo and cross
+      # variants cannot drift.
+      - name: Compute build id
+        shell: bash
+        run: |
+          set -euo pipefail
+          ID="$(bash .github/scripts/build-id.sh "$GITHUB_REF_NAME" "$GITHUB_SHA")"
+          echo "TRAVSR_BUILD_ID=$ID" >> "$GITHUB_ENV"
+          echo "building as $ID"
+
       - name: Build (cargo)
         if: matrix.cross != true
         run: cargo build --release -p travsr-cli --target ${{ matrix.target }}
 
+      # `cross` builds inside a container, which does not inherit the host
+      # environment; `Cross.toml` passes this one variable through.
       - name: Build (cross)
         if: matrix.cross == true
         run: cross build --release -p travsr-cli --target ${{ matrix.target }}
