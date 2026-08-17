@@ -124,14 +124,8 @@ pub fn run() -> anyhow::Result<()> {
         format!(" | rerank: {}", payload.rerank)
     };
     println!(
-        "nodes: {} | edges: {} | schema: v{} | journal: {} | last_commit: {} | semantic: {}{}",
-        payload.nodes,
-        payload.edges,
-        payload.schema,
-        payload.journal,
-        last_commit,
-        phase_b_state,
-        rerank_segment
+        "nodes: {} | edges: {} | schema: v{} | last_commit: {} | semantic: {}{}",
+        payload.nodes, payload.edges, payload.schema, last_commit, phase_b_state, rerank_segment
     );
 
     // #645 WS-B: the freshness markers only ever compare against each other,
@@ -152,7 +146,7 @@ pub fn run() -> anyhow::Result<()> {
     let sig_v = payload.signature_format_version;
     if sig_v != travsr_core::SIGNATURE_FORMAT_VERSION {
         eprintln!(
-            "warning: signature format v{sig_v} != current v{} — graph built with an older format; run `travsr init` to re-index",
+            "warning: this index was built with an older version of travsr (format v{sig_v}, current v{}) — run `travsr init` to rebuild it",
             travsr_core::SIGNATURE_FORMAT_VERSION
         );
     }
@@ -197,7 +191,7 @@ pub fn run() -> anyhow::Result<()> {
                         let v: Vec<&str> = rest.splitn(3, ':').collect();
                         if let [lang, expected, got] = v.as_slice() {
                             eprintln!(
-                                "warning: '{lang}' sidecar protocol v{got} != expected v{expected} — run `travsr lang install {lang}`"
+                                "warning: the '{lang}' analyzer is out of date (protocol v{got}, expected v{expected}) — run `travsr lang install {lang}`"
                             );
                         }
                     }

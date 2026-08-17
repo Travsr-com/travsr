@@ -106,15 +106,15 @@ enum Command {
         /// which the per-file change detection does not otherwise pick up.
         #[arg(long, visible_alias = "rebuild")]
         force: bool,
-        /// Allow rust-analyzer to run UNCONFINED when the OS sandbox (bubblewrap
-        /// on Linux, sandbox-exec on macOS) is unavailable. Without this flag,
-        /// the rust-analyzer LSIF pass is skipped entirely on sandbox-less hosts
-        /// and Rust semantic edges degrade to tree-sitter structural edges.
+        /// Allow rust-analyzer to run without OS sandboxing (bubblewrap on Linux,
+        /// sandbox-exec on macOS) when no sandbox is available. Without this flag,
+        /// Rust's full cross-file analysis is skipped on hosts that have no
+        /// sandbox, and Rust falls back to structural analysis only.
         ///
         /// Only set this when you fully trust the repository being indexed.
         /// This flag cannot be set by repository contents (.env, Cargo.toml,
         /// tsconfig, etc.) — it must be an explicit, per-invocation decision.
-        #[arg(long)]
+        #[arg(long, visible_alias = "allow-unsandboxed")]
         allow_unsandboxed_lsif: bool,
         /// Skip auto-detecting AI coding tools and wiring them to Travsr.
         #[arg(long)]

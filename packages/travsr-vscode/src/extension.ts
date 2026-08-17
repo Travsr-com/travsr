@@ -880,15 +880,15 @@ export function buildFileListHtml(
   const tsPill = `<button id="pill-ts"
     style="${mode === "tree-sitter" ? activeStyle : inactiveStyle}"
     onclick="setMode('tree-sitter')"
-    title="Basic analysis — single-file structure and best-effort calls (always available)"
+    title="Structural analysis — single-file structure and best-effort calls (always available)"
     aria-pressed="${mode === "tree-sitter"}"
-  >Basic</button>`;
+  >Structural</button>`;
 
   const semTooltip = semanticAvailable
-    ? "Full analysis — precise cross-file calls and references"
+    ? "Semantic analysis — precise cross-file calls and references"
     : installHint
-      ? `Full analysis not yet available. ${installHint}`
-      : "Full analysis not yet available for this language.";
+      ? `Semantic analysis not yet available. ${installHint}`
+      : "Semantic analysis not yet available for this language.";
 
   const semPill = semanticAvailable
     ? `<button id="pill-sem"
@@ -896,14 +896,14 @@ export function buildFileListHtml(
         onclick="setMode('semantic')"
         title="${escHtml(semTooltip)}"
         aria-pressed="${mode === "semantic"}"
-      >Full</button>`
+      >Semantic</button>`
     : `<button id="pill-sem"
         style="${disabledStyle}"
         disabled
         title="${escHtml(semTooltip)}"
         aria-pressed="false"
         onclick="showInstallHint()"
-      >Full ▾</button>`;
+      >Semantic ▾</button>`;
 
   const installHintHtml = installHint
     ? `<div id="install-hint" style="display:none;margin-top:8px;padding:8px 12px;` +
