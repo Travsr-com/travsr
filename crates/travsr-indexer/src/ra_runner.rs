@@ -61,11 +61,19 @@ pub fn ra_binary_path() -> Option<std::path::PathBuf> {
                 return Some(std::path::PathBuf::from("rust-analyzer"));
             }
             // 2–4. Explicit home-relative fallbacks survive daemon PATH stripping.
-            // `HOME` is unset on Windows, so fall back to `USERPROFILE` for the
-            // home-anchored candidates.
+            // The home anchor MUST match where `travsr lang install rust` wrote the
+            // binary — the installer uses `dirs::home_dir()`, which is `USERPROFILE`
+            // on Windows. So on Windows prefer `USERPROFILE`: a daemon launched from
+            // Git Bash inherits a POSIX-style `HOME` (e.g. `/c/Users/me`) that does
+            // not resolve as a native path, and preferring it would miss the
+            // just-installed binary. On unix `HOME` is the home dir and is used.
             let exe = std::env::consts::EXE_SUFFIX; // ".exe" on windows, "" elsewhere
             let ra = format!("rust-analyzer{exe}");
-            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+            let home = if cfg!(windows) {
+                std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+            } else {
+                std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+            };
             let candidates = [
                 std::env::var_os("CARGO_HOME")
                     .map(|h| std::path::PathBuf::from(h).join("bin").join(&ra)),

@@ -192,6 +192,26 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
       "not-enabled tooltip explains per-repo enablement"
     );
   });
+  test("builtin without its analyzer shows 'no analyzer', not a green 'always on'", () => {
+    // rust is builtin but its analyzer (rust-analyzer) can be missing: the CLI
+    // then sends repoState=needs_analyzer with status=partial. The panel must not
+    // render a green "always on" that contradicts the "partial" analysis badge.
+    const rustNoAnalyzer: LangInfo[] = [{
+      language: "rust", package: "scip-rust", sandbox: "Standard",
+      status: "partial", statusLine: "partial (run: travsr lang install rust for full analysis)",
+      repoState: "needs_analyzer",
+      installed: false, registered: true, builtin: true, needsApproval: false,
+      scipInstallType: "Command", installHint: "travsr lang install rust",
+      underlyingToolHint: "", elevatedHosts: [],
+    }];
+    const html = buildLanguagesHtml([], rustNoAnalyzer);
+    assert.ok(html.includes(">no analyzer<"), "shows 'no analyzer' for a builtin missing its analyzer");
+    assert.ok(!html.includes(">always on<"), "must not claim 'always on' while analysis is partial");
+    assert.ok(
+      html.includes("only structural analysis runs until it is"),
+      "no-analyzer tooltip explains the analyzer is missing"
+    );
+  });
   test("detects empty indexed section", () => {
     const html = buildLanguagesHtml([], []);
     assert.ok(html.includes("No language metadata"));

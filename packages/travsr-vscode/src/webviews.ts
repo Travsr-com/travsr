@@ -971,9 +971,11 @@ export interface LangInfo {
   statusLine: string;
   /** Per-repo enablement for the target repo (corpus trust gate), computed by the
    *  CLI. `always_on` = builtin, no per-repo step; `enabled` = on for this repo;
-   *  `not_enabled` = installed globally but off for this repo; `no_repo` = the CLI
-   *  was not run inside a git repo. Stable machine tag — render, never re-derive. */
-  repoState: "always_on" | "enabled" | "not_enabled" | "no_repo";
+   *  `needs_analyzer` = authorized for this repo but the analyzer is not installed
+   *  yet (e.g. rust without rust-analyzer) — only structural analysis runs until it
+   *  is; `not_enabled` = installed globally but off for this repo; `no_repo` = the
+   *  CLI was not run inside a git repo. Stable machine tag — render, never re-derive. */
+  repoState: "always_on" | "enabled" | "needs_analyzer" | "not_enabled" | "no_repo";
   installed: boolean;
   registered: boolean;
   builtin: boolean;
@@ -1072,18 +1074,20 @@ export function buildLanguagesHtml(
       const repoText = {
         always_on: "always on",
         enabled: "enabled",
+        needs_analyzer: "no analyzer",
         not_enabled: "not enabled",
         no_repo: "n/a",
       }[l.repoState];
       const repoCls =
         l.repoState === "enabled" || l.repoState === "always_on"
           ? "ok"
-          : l.repoState === "not_enabled"
+          : l.repoState === "not_enabled" || l.repoState === "needs_analyzer"
             ? "stale"
             : "dim";
       const repoTip = {
         always_on: "Built in — always on for every repo",
         enabled: "Full analysis is on for this repo",
+        needs_analyzer: `Authorized for this repo, but its analyzer isn't installed yet — only structural analysis runs until it is. Install it: travsr lang install ${l.language}`,
         not_enabled: `Full analysis is off for this repo. Enable it: travsr lang install ${l.language} (run in this repo)`,
         no_repo: "Open a repo to see per-repo status",
       }[l.repoState];

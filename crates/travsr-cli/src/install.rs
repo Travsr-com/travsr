@@ -23,6 +23,62 @@ const DEFAULT_API_URL: &str = "https://api.github.com/repos/Travsr-com/travsr-la
 
 const SIZE_LIMIT: u64 = 100 * 1024 * 1024;
 
+/// Connect-phase deadline for a binary download — bounds a host that accepts the
+/// TCP/TLS handshake but never starts responding.
+const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Idle (read) deadline: the download fails only when NO bytes arrive for this
+/// long, and the clock resets after every successful read. This is the stall
+/// detector — it replaces the old blunt *total-request* deadline, which killed a
+/// slow-but-progressing download at the wall clock even while bytes were still
+/// flowing. A stalled connection is caught within this window; a merely slow one
+/// runs to completion.
+const DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Generous total-request backstop. Not the stall detector (idle timeout is) —
+/// only a ceiling against a pathological connection that trickles a byte just
+/// often enough to keep resetting the idle clock forever. Sized so even a large
+/// asset over a genuinely slow link finishes well within it.
+const DOWNLOAD_TOTAL_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// The HTTP client for streaming a release-asset download. Idle-timeout based, not
+/// total-deadline based (see the constants) — shared by every binary download path
+/// so the stall policy is identical everywhere.
+fn download_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_IDLE_TIMEOUT)
+        .timeout(DOWNLOAD_TOTAL_BACKSTOP)
+        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building HTTP client")
+}
+
+/// Render a single self-updating download-progress line to stderr. Callers gate
+/// this on `stderr` being a real terminal (see `show_progress` in `fetch_verified`)
+/// so a spawned or piped process — CI logs, the VS Code extension capturing output
+/// — never sees `\r` spam. Shows MB downloaded and, when the server advertised a
+/// length, the total and percentage.
+fn render_download_progress(downloaded: u64, total: Option<u64>) {
+    use std::io::Write as _;
+    let mb = |n: u64| n as f64 / (1024.0 * 1024.0);
+    let mut err = std::io::stderr();
+    match total {
+        Some(t) if t > 0 => {
+            let pct = (downloaded as f64 / t as f64 * 100.0).min(100.0);
+            let _ = write!(
+                err,
+                "\r  {:.1}/{:.1} MB ({:.0}%)   ",
+                mb(downloaded),
+                mb(t),
+                pct
+            );
+        }
+        _ => {
+            let _ = write!(err, "\r  {:.1} MB   ", mb(downloaded));
+        }
+    }
+    let _ = err.flush();
+}
+
 /// Returns the Rust target triple for the current machine.
 /// Returns an error on platforms travsr has no target triple for.
 pub fn current_target() -> Result<&'static str> {
@@ -373,11 +429,7 @@ pub async fn download_scip_binary(
     let base = format!("https://github.com/{repo}/releases/download/{tag}");
     let bin_url = format!("{base}/{asset_name}");
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building HTTP client")?;
+    let client = download_http_client()?;
 
     // Upstreams that publish a sidecar are verified against it; the rest are
     // verified against the hash vendored at pin time. An entry with neither is
@@ -458,7 +510,7 @@ async fn fetch_verified(
     // The sidecar is fetched concurrently with the asset, so the extra round
     // trip costs nothing on the happy path.
     let sha_url = format!("{bin_url}.sha256");
-    let (bin_resp, sha_resp) = match integrity {
+    let (mut bin_resp, sha_resp) = match integrity {
         Integrity::Sidecar => {
             let (b, s) = tokio::try_join!(client.get(bin_url).send(), client.get(&sha_url).send())
                 .context("sending download requests")?;
@@ -509,10 +561,32 @@ async fn fetch_verified(
         }
     }
 
-    let bin_bytes = bin_resp.bytes().await.context("reading binary body")?;
-    let got = bin_bytes.len() as u64;
-    if got > size_limit {
-        bail!("{label} exceeds the download size limit after download: {got} bytes > {size_limit}");
+    // Stream the body chunk by chunk rather than reading it all in one await. Two
+    // reasons: (1) a live progress line so a slow download shows movement instead
+    // of a frozen "Downloading…", and (2) the size cap is enforced incrementally,
+    // so a server that lies about (or omits) Content-Length cannot make us buffer
+    // past `size_limit`. Stalls are handled by the client's idle read timeout
+    // (`DOWNLOAD_IDLE_TIMEOUT`): a read that makes no progress errors out here.
+    // `chunk()` avoids pulling in a `Stream` extension trait — no extra dependency.
+    let total = bin_resp.content_length();
+    let show_progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let mut bin_bytes: Vec<u8> = Vec::with_capacity(total.unwrap_or(0).min(size_limit) as usize);
+    while let Some(chunk) = bin_resp.chunk().await.context("reading binary body")? {
+        bin_bytes.extend_from_slice(&chunk);
+        let got = bin_bytes.len() as u64;
+        if got > size_limit {
+            if show_progress {
+                eprintln!();
+            }
+            bail!("{label} exceeds the download size limit after download: {got} bytes > {size_limit}");
+        }
+        if show_progress {
+            render_download_progress(got, total);
+        }
+    }
+    if show_progress {
+        // Close the self-updating line so later output starts on a fresh row.
+        eprintln!();
     }
 
     match integrity {
@@ -541,7 +615,7 @@ async fn fetch_verified(
         Integrity::Unverified => {}
     }
 
-    Ok(bin_bytes.to_vec())
+    Ok(bin_bytes)
 }
 
 /// Fetches a wrapper binary and its published `.sha256`, and returns the bytes
@@ -570,11 +644,7 @@ async fn fetch_and_verify_binary(
     let asset = wrapper_asset_name(binary_name, target);
     let bin_url = format!("{base}/download/{version}/{asset}");
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building HTTP client")?;
+    let client = download_http_client()?;
 
     fetch_verified(
         &client,
@@ -917,11 +987,7 @@ pub async fn download_ra_binary(
     const RA_ASSET_SIZE_LIMIT: u64 = 200 * 1024 * 1024;
 
     let asset_url = format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building HTTP client")?;
+    let client = download_http_client()?;
 
     let label = format!("{asset_name} at {tag}");
     let asset_bytes = fetch_verified(
@@ -1882,6 +1948,11 @@ mod download_tests {
         /// Lets the pre-download size guard be exercised without moving 100 MB
         /// across a socket.
         advertised_len: Option<u64>,
+        /// Send no Content-Length header at all — the body is then delimited by
+        /// the connection close. Models a server (chunked/streaming origin) whose
+        /// length the client cannot know up front, so the size cap can only be
+        /// enforced incrementally as bytes arrive.
+        omit_content_length: bool,
     }
 
     fn route(path: &str, status: u16, body: Vec<u8>) -> Route {
@@ -1890,6 +1961,7 @@ mod download_tests {
             status,
             body,
             advertised_len: None,
+            omit_content_length: false,
         }
     }
 
@@ -1934,19 +2006,25 @@ mod download_tests {
                 }
 
                 let matched = routes.iter().find(|r| r.path == path);
-                let (status, body, len) = match matched {
+                let (status, body, len, omit_len) = match matched {
                     Some(r) => (
                         r.status,
                         r.body.clone(),
                         r.advertised_len.unwrap_or(r.body.len() as u64),
+                        r.omit_content_length,
                     ),
-                    None => (404, Vec::new(), 0),
+                    None => (404, Vec::new(), 0, false),
                 };
 
-                let head = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
-                    reason = if status == 200 { "OK" } else { "Not Found" }
-                );
+                let reason = if status == 200 { "OK" } else { "Not Found" };
+                // Without Content-Length the body is delimited by the connection
+                // close (Connection: close is always sent), which is exactly the
+                // "unknown length" case the incremental size cap must handle.
+                let head = if omit_len {
+                    format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n\r\n")
+                } else {
+                    format!("HTTP/1.1 {status} {reason}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n")
+                };
                 let _ = stream.write_all(head.as_bytes());
                 let _ = stream.write_all(&body);
                 let _ = stream.flush();
@@ -2125,6 +2203,7 @@ mod download_tests {
                 status: 200,
                 body: body.clone(),
                 advertised_len: Some(SIZE_LIMIT + 1),
+                omit_content_length: false,
             },
             route(&sha_path(), 200, sha_line(&body)),
         ]);
@@ -2218,6 +2297,35 @@ mod download_tests {
                 .await
                 .unwrap(),
             body
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lengthless_body_over_the_size_cap_is_refused_mid_stream() {
+        // A server that advertises no Content-Length (so the pre-download guard
+        // has nothing to check) streams a body larger than the cap. The streaming
+        // reader must stop and refuse it, not buffer the whole thing. size_limit is
+        // set below the body size to trigger the cap without moving large data.
+        let body = vec![b'x'; 4096];
+        let path = format!("/releases/download/v9/{ASSET}");
+        let mut r = route(&path, 200, body);
+        r.omit_content_length = true;
+        let base = serve(vec![r]);
+
+        let client = reqwest::Client::new();
+        let err = fetch_verified(
+            &client,
+            &vendored_url(&base),
+            ASSET,
+            1024, // cap below the 4096-byte body
+            Integrity::Unverified,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("exceeds the download size limit"),
+            "a lengthless oversize body must be refused mid-stream: {err}"
         );
     }
 }

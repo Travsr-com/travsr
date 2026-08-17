@@ -207,7 +207,9 @@ fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         if answer.trim().eq_ignore_ascii_case("y") {
-            return crate::lang::run(crate::lang::LangCommand::Detect);
+            // Interactive (the user just answered "y" at a terminal): let detect
+            // run its own per-language prompt rather than force-installing all.
+            return crate::lang::run(crate::lang::LangCommand::Detect { yes: false });
         }
     }
 

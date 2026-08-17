@@ -260,9 +260,9 @@ pub fn run() -> anyhow::Result<()> {
         match reason.as_str() {
             "sandbox_unavailable" => {
                 let remedy = if cfg!(target_os = "linux") {
-                    "Install bubblewrap, or re-run `travsr init --allow-unsandboxed-lsif` if you trust this repo."
+                    "Install bubblewrap, or re-run `travsr init --allow-unsandboxed` if you trust this repo."
                 } else {
-                    "Re-run `travsr init --allow-unsandboxed-lsif` if you trust this repo."
+                    "Re-run `travsr init --allow-unsandboxed` if you trust this repo."
                 };
                 eprintln!(
                     "warning: Rust is on basic analysis — full cross-file edges (from rust-analyzer) were skipped because they need a security sandbox that is not available here. {remedy}"
@@ -276,7 +276,7 @@ pub fn run() -> anyhow::Result<()> {
                 "warning: Rust is on basic analysis — rust-analyzer produced \
                  references but none could be matched to indexed symbols, so no \
                  type-resolved call edges were added (structural call edges are \
-                 unaffected). Re-run `travsr init --force --allow-unsandboxed-lsif \
+                 unaffected). Re-run `travsr init --force --allow-unsandboxed \
                  --semantic`; if it persists, please report it."
             ),
             _ => {}

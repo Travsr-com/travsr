@@ -61,7 +61,14 @@ pub enum LangCommand {
         version: Option<String>,
     },
     /// Scan this repo, detect its languages, and set up full analysis for them.
-    Detect,
+    Detect {
+        /// Install every detected language without prompting. Use this in scripts
+        /// and from the editor extension, where there is no interactive terminal to
+        /// answer the per-language prompt. Elevated languages that need a security
+        /// approval are skipped with a note rather than reaching the network.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Set up full analysis for a language (older name for `install`).
     Add {
         /// Language name (e.g. rust, java, php).
@@ -127,7 +134,7 @@ pub fn run(cmd: LangCommand) -> Result<()> {
                 InstallStatus::FullyReady => Ok(()),
             }
         }
-        LangCommand::Detect => cmd_detect(),
+        LangCommand::Detect { yes } => cmd_detect(yes),
         LangCommand::Add { language, corpus } => cmd_add(&language, corpus.as_deref()),
         LangCommand::Remove { language } => cmd_remove(&language),
         LangCommand::Approve {
@@ -223,10 +230,18 @@ fn lang_capability_status(
 /// every other language runs only when it is registered AND this repo's corpus
 /// carries the per-repo trust grant.
 enum RepoState {
-    /// Builtin (ts/js/python/rust) — ships in the binary, never per-repo gated.
+    /// Builtin (ts/js/python/rust) with its analyzer present — ships/runs without
+    /// a per-repo step, and full analysis is actually available here.
     BuiltinAlwaysOn,
-    /// Registered and this repo's corpus is trusted — full analysis runs here.
+    /// Registered and this repo's corpus is trusted, and the analyzer is present —
+    /// full analysis runs here.
     Enabled,
+    /// Full analysis is authorized for this repo (builtin, or registered+trusted)
+    /// but its analyzer is not installed on this machine, so only structural
+    /// analysis runs until it is. The remedy is `travsr lang install <lang>` — not
+    /// a per-repo trust step. This is the honest cell for rust when rust-analyzer
+    /// is absent: it never claims a green "always on" while STATUS says "partial".
+    NeedsAnalyzer,
     /// Inside a repo, but not registered and/or the corpus is untrusted.
     NotEnabled,
     /// Not inside a git repo, so there is no repo to enable for.
@@ -234,15 +249,38 @@ enum RepoState {
 }
 
 impl RepoState {
-    fn compute(entry: &PhaseBEntry, registered: bool, in_repo: bool, corpus_trusted: bool) -> Self {
+    /// `analyzer_ready` is whether full cross-file analysis can actually run for
+    /// this language on this machine (analyzer bundled or its binary resolves) —
+    /// the same fact `lang list`'s STATUS column reflects. Threading it in keeps
+    /// the THIS REPO column from claiming a language is on here while STATUS shows
+    /// it is only partial (the rust-without-rust-analyzer case).
+    fn compute(
+        entry: &PhaseBEntry,
+        registered: bool,
+        in_repo: bool,
+        corpus_trusted: bool,
+        analyzer_ready: bool,
+    ) -> Self {
         if entry.builtin {
-            return RepoState::BuiltinAlwaysOn;
+            // Builtins bypass the per-repo trust gate, but "always on" is only
+            // honest when the analyzer is actually present. Rust is the one builtin
+            // whose analyzer (rust-analyzer) is external and can be missing.
+            return if analyzer_ready {
+                RepoState::BuiltinAlwaysOn
+            } else {
+                RepoState::NeedsAnalyzer
+            };
         }
         if !in_repo {
             return RepoState::NotInRepo;
         }
         if registered && corpus_trusted {
-            RepoState::Enabled
+            // Authorized for this repo; still gated on the analyzer being present.
+            if analyzer_ready {
+                RepoState::Enabled
+            } else {
+                RepoState::NeedsAnalyzer
+            }
         } else {
             RepoState::NotEnabled
         }
@@ -253,6 +291,7 @@ impl RepoState {
         match self {
             RepoState::BuiltinAlwaysOn => "always on",
             RepoState::Enabled => "enabled",
+            RepoState::NeedsAnalyzer => "no analyzer",
             RepoState::NotEnabled => "not enabled",
             RepoState::NotInRepo => "n/a",
         }
@@ -264,6 +303,7 @@ impl RepoState {
         match self {
             RepoState::BuiltinAlwaysOn => "always_on",
             RepoState::Enabled => "enabled",
+            RepoState::NeedsAnalyzer => "needs_analyzer",
             RepoState::NotEnabled => "not_enabled",
             RepoState::NotInRepo => "no_repo",
         }
@@ -271,7 +311,28 @@ impl RepoState {
 }
 
 fn json_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    // Full JSON string escaping, not just `\` and `"`: a control character
+    // (newline, tab, …) in any field — an `underlying_tool_hint`, a status line —
+    // would otherwise emit invalid JSON that the VS Code panel's `JSON.parse`
+    // rejects. No catalog field carries one today, so this only hardens the
+    // contract against a future hint that does.
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn json_arr(items: &[&str]) -> String {
@@ -337,7 +398,13 @@ fn cmd_list(json: bool) -> Result<()> {
             // Per-repo enablement for the repo we are being run in (corpus trust
             // gate). The VS Code panel runs `lang list --json` with the target
             // repo as cwd, so this reflects that repo.
-            let repo_state = RepoState::compute(entry, registered, in_repo, corpus_trusted);
+            let repo_state = RepoState::compute(
+                entry,
+                registered,
+                in_repo,
+                corpus_trusted,
+                analyzer_ready(entry, registered),
+            );
             entries.push(format!(
                 r#"{{"language":{},"package":{},"sandbox":{},"status":{},"statusLine":{},"repoState":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{}}}"#,
                 json_str(entry.language),
@@ -395,7 +462,13 @@ fn cmd_list(json: bool) -> Result<()> {
             .unwrap_or_default();
 
         // Is full analysis turned on for the repo we are in? (corpus trust gate)
-        let repo_state = RepoState::compute(entry, registered, in_repo, corpus_trusted);
+        let repo_state = RepoState::compute(
+            entry,
+            registered,
+            in_repo,
+            corpus_trusted,
+            analyzer_ready(entry, registered),
+        );
         if matches!(repo_state, RepoState::NotEnabled) {
             any_not_enabled = true;
         }
@@ -1107,7 +1180,7 @@ fn install_zip_binary(
 
 // ── detect ────────────────────────────────────────────────────────────────────
 
-fn cmd_detect() -> Result<()> {
+fn cmd_detect(yes: bool) -> Result<()> {
     use std::io::IsTerminal as _;
 
     let cwd = std::env::current_dir().context("getting current directory")?;
@@ -1148,8 +1221,23 @@ fn cmd_detect() -> Result<()> {
     }
     println!();
 
+    // `--yes`: install everything detected without prompting. This is the path the
+    // VS Code "Detect & install" button takes — it spawns `lang detect` with no
+    // terminal attached, so without this it would only ever print the list and
+    // install nothing. Each install is non-interactive; an elevated language with
+    // no approval on file is skipped by `cmd_install` with a note, never silently
+    // reaching the network.
+    if yes {
+        let selected: Vec<&str> = found.iter().map(|s| s.as_str()).collect();
+        install_selected(&selected, /*no_interactive*/ true, /*yes*/ true);
+        return Ok(());
+    }
+
     if !std::io::stdin().is_terminal() {
-        println!("(non-interactive — run `travsr lang install <lang>` to install individually)");
+        println!(
+            "(non-interactive — run `travsr lang install <lang>` to install one, or \
+             `travsr lang detect --yes` to set up all detected)"
+        );
         return Ok(());
     }
 
@@ -1184,10 +1272,19 @@ fn cmd_detect() -> Result<()> {
         return Ok(());
     }
 
+    install_selected(&selected, /*no_interactive*/ false, /*yes*/ false);
+    Ok(())
+}
+
+/// Install each detected language in turn, reporting per-language outcome without
+/// aborting the batch on a single failure. Shared by the interactive selection and
+/// the `--yes` path so both install exactly the same way — only the interactivity
+/// of each underlying `cmd_install` differs.
+fn install_selected(selected: &[&str], no_interactive: bool, yes: bool) {
     println!();
-    for lang in &selected {
+    for lang in selected {
         println!("{lang}:");
-        match cmd_install(lang, false, false, None, false, false, None) {
+        match cmd_install(lang, false, no_interactive, None, false, yes, None) {
             Ok(InstallStatus::FullyReady) => {}
             Ok(InstallStatus::WrapperOnly) => {
                 println!("  {lang}: analyzer not installed yet — full analysis stays off")
@@ -1196,8 +1293,6 @@ fn cmd_detect() -> Result<()> {
         }
         println!();
     }
-
-    Ok(())
 }
 
 // ── add (legacy alias for install) ──────────────────────────────────────────
@@ -1742,5 +1837,67 @@ mod tests {
         let tag = resolve_install_tag(false, "v0.3.0", None, "t", || anyhow::bail!("network down"))
             .unwrap();
         assert_eq!(tag, "v0.3.0");
+    }
+
+    use super::RepoState;
+    use travsr_plugin_host::phase_b::catalog::lookup;
+
+    #[test]
+    fn builtin_without_its_analyzer_is_not_reported_always_on() {
+        // Rust is builtin but its analyzer (rust-analyzer) is external and can be
+        // missing. The THIS REPO column must not claim "always on" while STATUS
+        // says "partial" — it reports "no analyzer" instead, whose remedy is the
+        // same `travsr lang install rust`.
+        let rust = lookup("rust").expect("rust entry present");
+        let missing = RepoState::compute(
+            rust, /*registered*/ true, true, true, /*ready*/ false,
+        );
+        assert_eq!(missing.tag(), "needs_analyzer");
+        assert_eq!(missing.cell(), "no analyzer");
+
+        // With rust-analyzer present, the builtin is honestly always on.
+        let present = RepoState::compute(rust, true, true, true, /*ready*/ true);
+        assert_eq!(present.tag(), "always_on");
+    }
+
+    #[test]
+    fn bundled_builtin_stays_always_on() {
+        // Python's analyzer is bundled, so it is always ready and always on.
+        let python = lookup("python").expect("python entry present");
+        let state = RepoState::compute(python, true, true, true, /*ready*/ true);
+        assert_eq!(state.tag(), "always_on");
+    }
+
+    #[test]
+    fn registered_trusted_but_analyzer_missing_reads_needs_analyzer() {
+        // A non-builtin authorized for the repo but with no analyzer installed is
+        // "no analyzer", not a green "enabled".
+        let go = lookup("go").expect("go entry present");
+        let state = RepoState::compute(
+            go, /*registered*/ true, true, /*trusted*/ true, false,
+        );
+        assert_eq!(state.tag(), "needs_analyzer");
+    }
+
+    #[test]
+    fn untrusted_repo_still_reads_not_enabled() {
+        // The trust gate is the first blocker for a non-builtin: no grant → the
+        // per-repo "not enabled", regardless of analyzer presence.
+        let go = lookup("go").expect("go entry present");
+        let state = RepoState::compute(go, true, true, /*trusted*/ false, /*ready*/ true);
+        assert_eq!(state.tag(), "not_enabled");
+    }
+
+    #[test]
+    fn json_str_escapes_control_characters() {
+        use super::json_str;
+        // Quotes and backslashes were always escaped; a control char (newline,
+        // tab, CR) must be too, or the emitted `lang list --json` is invalid JSON.
+        assert_eq!(json_str("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(json_str("line1\nline2"), "\"line1\\nline2\"");
+        assert_eq!(json_str("col1\tcol2"), "\"col1\\tcol2\"");
+        assert_eq!(json_str("\r"), "\"\\r\"");
+        // A bare low control char uses the \u escape.
+        assert_eq!(json_str("\u{01}"), "\"\\u0001\"");
     }
 }
