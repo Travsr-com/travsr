@@ -28,6 +28,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from checks import _corpus_from_hint  # noqa: E402
 from report import Outcome, Report, Result  # noqa: E402
@@ -168,6 +169,58 @@ class ReportBehaviour(unittest.TestCase):
             suite = ET.parse(x).getroot()
             self.assertEqual(suite.get("failures"), "1")
             self.assertEqual(suite.get("skipped"), "1")
+
+
+class Summariser(unittest.TestCase):
+    """The step-summary renderer, which CI reads when a release check goes red."""
+
+    def _payload(self) -> dict:
+        return {
+            "subject": "v1.0.0-rc.1",
+            "totals": {"pass": 2, "fail": 1, "skip": 1},
+            "results": [
+                {"name": "ok thing", "phase": "graph", "outcome": "pass", "detail": "", "issues": []},
+                {"name": "marker recovers", "phase": "honesty", "outcome": "fail",
+                 "detail": "semantic marker is 'stale'\nsecond line", "issues": ["741"]},
+                {"name": "cosign", "phase": "artifacts", "outcome": "skip",
+                 "detail": "cosign not installed", "issues": []},
+            ],
+        }
+
+    def test_failures_and_skips_are_both_listed(self):
+        from summarise import render
+
+        out = render(self._payload(), "ubuntu-latest")
+        self.assertIn("marker recovers", out)
+        self.assertIn("(#741)", out)
+        # A skip must be visible in the summary. Reporting only failures would let
+        # an unverified guarantee read as a clean run.
+        self.assertIn("cosign", out)
+        self.assertIn("NOT verified", out)
+
+    def test_only_the_first_detail_line_is_inlined(self):
+        from summarise import render
+
+        out = render(self._payload(), "ubuntu-latest")
+        self.assertIn("semantic marker is 'stale'", out)
+        self.assertNotIn("second line", out)
+
+    def test_a_label_with_shell_or_python_metacharacters_is_safe(self):
+        # The heredoc version interpolated the runner label into Python source, so
+        # a quote or backslash would have been a syntax error inside the workflow
+        # at exactly the wrong moment. Passing it as argv makes it inert data.
+        from summarise import render
+
+        for label in ["ubuntu-latest", 'has"quote', "has'quote", "back\\slash", "$(whoami)"]:
+            out = render(self._payload(), label)
+            self.assertIn(label, out)
+
+    def test_a_clean_run_still_renders_totals(self):
+        from summarise import render
+
+        out = render({"subject": "x", "totals": {"pass": 5, "fail": 0, "skip": 0}, "results": []}, "l")
+        self.assertIn("5 passed, 0 failed, 0 skipped", out)
+        self.assertNotIn("Failures", out)
 
 
 class CheckRegistry(unittest.TestCase):

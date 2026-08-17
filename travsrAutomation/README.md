@@ -154,6 +154,68 @@ traceback, so a broken check is never mistaken for a passing one.
 
 ## CI
 
+All in `.github/workflows/ci.yml`. No scheduled runs.
+
+| Job | When | Mode |
+| --- | --- | --- |
+| `automation self-test` | every PR and push | `selftest.py`, seconds, no binary |
+| `automation regression` | every PR and push | `--binary target/debug/travsr` |
+| `automation sanity (ubuntu / macos)` | a release is published, or a manual run naming a tag | `--tag` |
+
+The sanity job is guarded by
+
+```yaml
+if: github.event_name == 'release' || github.event.inputs.sanity_tag != ''
+```
+
+so it is skipped on every ordinary push and pull request, where `--tag` has
+nothing to download. To verify a tag by hand: Actions, CI, "Run workflow", fill in
+`sanity_tag` (and tick `sanity_with_cpp` if the runner has the scip-clang
+sidecar).
+
+Adding the `release: published` trigger means the rest of CI runs once per
+release too. That is a few extra runner minutes, and `preflight` in `release.yml`
+already required those checks green on the tagged commit, so treat it as
+confirmation rather than new signal.
+
+The regression job builds **debug**, not release: it indexes a seven-file
+fixture, so compile time dominates and a release build would roughly double the
+job for no extra signal.
+
+No CI job passes `--strict-skip`. On a bare runner `cosign` and the c/c++
+sidecars are legitimately absent, and the suite lists every skip in its summary
+rather than folding one into a pass, so failing on those would make a job red for
+reasons that have nothing to do with the release. Verified on a simulated bare
+runner (empty `HOME`, so no `~/.travsr/bin`): 33 passed, 0 failed, 8 skipped.
+Native Phase B needs no sidecar, so the cross-language, MCP and honesty phases
+are real coverage there rather than smoke.
+
+Results are uploaded as JSON and JUnit artifacts, and `summarise.py` renders a
+job summary listing every failure and every skip, so a red release check is
+readable without opening the log.
+
+## Adding a check
+
+Write a function taking `Context` and returning `(Outcome, detail)`, then
+register it in `all_checks()` with its phase and the issue numbers it guards:
+
+```python
+def check_something(ctx: Context) -> tuple[Outcome, str]:
+    r = ctx.cli.run("references", "validateCharge")
+    if "src/payment.ts" not in r.answer:
+        return Outcome.FAIL, f"got:\n{r.answer[:300]}"
+    return Outcome.PASS, ""
+```
+
+Use `r.answer` rather than `r.out` when asserting on a result: it strips
+`warning:` lines, so a staleness banner cannot defeat an assertion about the
+answer underneath it. Assert on `r.out` when the warning *is* the subject.
+
+Raising is fine. The runner turns an unexpected exception into a FAIL with a
+traceback, so a broken check is never mistaken for a passing one.
+
+## CI
+
 Three jobs, split by what each can actually run.
 
 | Workflow | Job | When | Mode |

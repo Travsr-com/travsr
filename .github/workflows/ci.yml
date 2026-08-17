@@ -6,7 +6,22 @@ on:
       - master
       - main
   pull_request:
+  # A published release is the only time the release-artifact sanity job has
+  # something to download, so it is a trigger here rather than in a separate
+  # workflow. The other jobs run too, which is a few extra runner minutes once
+  # per release; `preflight` in release.yml already required them green on the
+  # tagged commit, so treat it as confirmation rather than new signal.
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      sanity_tag:
+        description: 'Release tag to verify with the sanity suite (e.g. v1.0.0-rc.1). Leave blank to skip.'
+        required: false
+      sanity_with_cpp:
+        description: 'Sanity: also exercise c/c++ (needs the scip-clang sidecar on the runner)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -215,6 +230,78 @@ jobs:
             sanity.json
             sanity.xml
           if-no-files-found: warn
+
+  automation-sanity:
+    name: automation sanity (${{ matrix.os }})
+    # Only when there is a published artifact to check: a release event, or a
+    # dispatch that named a tag. Skipped on every push and pull request, because
+    # `--tag` has nothing to download there.
+    if: github.event_name == 'release' || github.event.inputs.sanity_tag != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both, deliberately. The functional phases only ever execute the host's
+        # own binary, so a single runner would leave the other platform's artifact
+        # verified by byte inspection alone.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the tag under test
+        id: t
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.sanity_tag || github.event.release.tag_name }}"
+          [ -n "$TAG" ] || { echo "no tag to verify" >&2; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "verifying $TAG"
+
+      # Downloads the release with `gh`, which is preinstalled on hosted runners.
+      #
+      # No --strict-skip: cosign and the c/c++ sidecars are legitimately absent on
+      # a bare runner, and the suite lists every skip in its summary rather than
+      # folding one into a pass, so failing on those would make this red for
+      # reasons that are not about the release.
+      - name: Sanity suite against the published artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [ "${{ github.event.inputs.sanity_with_cpp }}" = "true" ]; then
+            EXTRA="--with-cpp"
+          fi
+          python3 travsrAutomation/run.py \
+            --tag "${{ steps.t.outputs.tag }}" \
+            $EXTRA \
+            --json "sanity-${{ matrix.os }}.json" \
+            --junit "sanity-${{ matrix.os }}.xml"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: automation-sanity-${{ matrix.os }}
+          path: |
+            sanity-${{ matrix.os }}.json
+            sanity-${{ matrix.os }}.xml
+          if-no-files-found: warn
+
+      # A published release that fails this is worth surfacing beyond a red check,
+      # since by then users can already download it.
+      - name: Summarise
+        if: always()
+        shell: bash
+        run: |
+          F="sanity-${{ matrix.os }}.json"
+          if [ ! -f "$F" ]; then
+            echo "### Release sanity produced no results on ${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 travsrAutomation/summarise.py "$F" "${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
 
   build-id:
     name: release build id
