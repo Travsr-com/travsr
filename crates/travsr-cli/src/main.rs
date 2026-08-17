@@ -464,8 +464,34 @@ fn print_refused_reports(v: &serde_json::Value) {
     );
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+/// Manual runtime construction instead of `#[tokio::main(flavor =
+/// "current_thread")]`, solely to bound the blocking pool (#736 item 8).
+///
+/// The macro leaves `max_blocking_threads` at tokio's default of 512.
+/// `spawn_blocking` callers here (store I/O, git subprocess waits, the embed
+/// sidecar plumbing) can therefore fan out to 512 OS threads at ~2 MiB of
+/// stack each — ~1 GiB of potential thread-stack commitment, which a
+/// memory-limited container has no room for and no say in. `4 ×` the
+/// container-aware CPU count, clamped to `[8, 64]`, keeps blocking I/O
+/// overlapped without letting the pool outgrow the cage: the floor keeps
+/// small machines from serialising independent blocking calls, the ceiling
+/// bounds the worst case on big hosts.
+///
+/// Everything else about the entry point is unchanged: same current-thread
+/// flavor, same async body (now `async_main`), same panic/exit behavior —
+/// `Builder::build()` failure panics just as the macro's expansion does.
+fn main() {
+    let max_blocking =
+        (4 * travsr_plugin_host::resource_limits::effective_cpu_count()).clamp(8, 64);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(max_blocking)
+        .build()
+        .expect("failed to build the tokio runtime")
+        .block_on(async_main());
+}
+
+async fn async_main() {
     // Hidden subcommand: __plugin <lang>
     // Invoked by the daemon's Sidecar::spawn() to run a built-in Phase A plugin
     // over stdin/stdout. Not user-facing — absent from --help output.

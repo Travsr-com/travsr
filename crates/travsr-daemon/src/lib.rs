@@ -3953,7 +3953,7 @@ fn reconcile_head_drift(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
     phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
-    index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
 ) -> bool {
     let head = match read_head_commit_sha(repo_root) {
         Ok(h) if !h.is_empty() => h,
@@ -7379,7 +7379,8 @@ mod tests {
         let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         let msg = serde_json::to_string(&travsr_ipc::ControlMessage::ReindexCommit {
             sha: "deadbeef".to_string(),
@@ -7446,7 +7447,8 @@ mod tests {
         store.set_meta("last_commit", "f0f0f0f").unwrap();
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         assert!(
             reconcile_head_drift(tmp.path(), &store, &sched, &index_tx),
@@ -7488,7 +7490,8 @@ mod tests {
         store.set_meta("last_commit", &head).unwrap();
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         assert!(
             !reconcile_head_drift(tmp.path(), &store, &sched, &index_tx),
@@ -7520,7 +7523,8 @@ mod tests {
             .unwrap();
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         assert!(!reconcile_head_drift(tmp.path(), &store, &sched, &index_tx));
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -7546,7 +7550,8 @@ mod tests {
         store.set_meta("last_commit", "abc123").unwrap();
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         assert!(!reconcile_head_drift(tmp.path(), &store, &sched, &index_tx));
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -7574,7 +7579,8 @@ mod tests {
         store.set_meta("last_commit", "f0f0f0f").unwrap();
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         reconcile_head_drift(tmp.path(), &store, &sched, &index_tx);
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -7691,7 +7697,8 @@ mod tests {
 
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         assert!(reconcile_head_drift(tmp.path(), &store, &sched, &index_tx));
 
@@ -7747,7 +7754,8 @@ mod tests {
 
         let store = std::sync::Mutex::new(store);
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         assert!(reconcile_head_drift(tmp.path(), &store, &sched, &index_tx));
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -7839,7 +7847,8 @@ mod tests {
         let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
         let sessions = std::sync::Mutex::new(EditorPlane::default());
 
         let mine = tmp.path().join("repo-a");
@@ -7933,7 +7942,8 @@ mod tests {
         let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
         let sessions = std::sync::Mutex::new(EditorPlane::default());
         let mine = tmp.path().join("mine");
         std::fs::create_dir_all(&mine).unwrap();
@@ -7994,7 +8004,8 @@ mod tests {
         let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
         let sessions = std::sync::Mutex::new(EditorPlane::default());
 
         let mine = tmp.path().join("mine");
@@ -8057,7 +8068,8 @@ mod tests {
         let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         // repo_root does not exist, so git cannot spawn there and both
         // changed_files_from_git and tracked_files_from_git error.
@@ -8120,7 +8132,8 @@ mod tests {
         let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
         let phase_b_scheduler =
             phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
-        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
 
         let msg = serde_json::to_string(&travsr_ipc::ControlMessage::ReindexCommit {
             sha: "deadbeef".to_string(),
@@ -8546,11 +8559,17 @@ impl Daemon {
 
         // Wire Step 4 (semantic ANN) into the query store. Must happen after
         // both stores are open so the sidecar handshake can read the DB.
-        {
+        // #736 item 6: hold the supervisor for the daemon's lifetime — dropping
+        // it here (the previous behaviour) made maybe_respawn unreachable, so
+        // a crashed sidecar could never come back. The embed tick drives
+        // respawn; the swap happens inside the Arc the hooks already hold.
+        let embed_supervisor = {
             let mut rs = read_store.lock().unwrap_or_else(|e| e.into_inner());
             let mut ws = store.lock().unwrap_or_else(|e| e.into_inner());
-            try_inject_embed_hook(&mut rs, &mut ws, &db_path);
-        }
+            Arc::new(Mutex::new(try_inject_embed_hook(
+                &mut rs, &mut ws, &db_path,
+            )))
+        };
 
         // Migration: repos initialised before per-repo embed config was introduced
         // have an `embed_text_model_id` meta key in graph.db but no
@@ -8693,7 +8712,25 @@ impl Daemon {
         // forwards `WatchEvent`s through a std channel (`index_tx`) to this
         // worker. No new threads are ever spawned for indexing — at most ONE
         // blocking thread handles indexing at any time.
-        let (index_tx, index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        //
+        // #736 A2: the channel is BOUNDED (`sync_channel`) and every producer
+        // uses `try_send`. The previous unbounded channel defeated the 256-slot
+        // watcher backpressure above, and `enqueue_dirty_callers` feeds this
+        // queue from inside its own consumer — up to 100k paths per reindex —
+        // so it grew without limit under load. Shedding on Full is safe by the
+        // same argument as DIRTY_QUEUE_CAP: missed events are covered by the
+        // gc-tick head reconcile and the next Phase B / `travsr init` pass.
+        // `try_send` never blocks, so the self-feeding path cannot deadlock.
+        let (index_tx, index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
+        // #736 item 8: see MAX_CONCURRENT_CONNECTIONS.
+        let conn_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+        // #736 review: shed watch events are logged in AGGREGATE. A build tool
+        // churning a watched tree overflows the queue and would otherwise emit
+        // one WARN per event — an IO load of its own, during exactly the burst
+        // the bound exists to absorb, burying the incident in its own log.
+        let mut watch_shed: u64 = 0;
+        let mut watch_shed_last_log = std::time::Instant::now();
         // worker_stop lets shutdown signal the worker to exit even though
         // index_tx_worker (the clone held by the closure) keeps the channel
         // alive after drop(index_tx). Without this, recv() never returns Err,
@@ -8751,6 +8788,7 @@ impl Daemon {
             let sched_win = Arc::clone(&phase_b_scheduler);
             let lsp_sessions_win = Arc::clone(&lsp_sessions);
             let index_tx_win = index_tx.clone();
+            let conn_limiter_win = Arc::clone(&conn_limiter);
             let pipe_name_accept = pipe_name.clone();
             tokio::spawn(async move {
                 let mut first_instance = true;
@@ -8781,7 +8819,14 @@ impl Daemon {
                     let sched = Arc::clone(&sched_win);
                     let lsp_sessions_conn = Arc::clone(&lsp_sessions_win);
                     let index_tx_conn = index_tx_win.clone();
+                    let limiter = Arc::clone(&conn_limiter_win);
                     tokio::spawn(async move {
+                        // #736 item 8: gate the blocking work, not the accept —
+                        // the task itself is a few KB; the permit bounds the
+                        // spawn_blocking threads below at MAX_CONCURRENT_CONNECTIONS.
+                        let Ok(_permit) = limiter.acquire_owned().await else {
+                            return; // semaphore closed = daemon shutting down
+                        };
                         let (reader, mut writer) = tokio::io::split(server);
                         let mut lines = BufReader::new(reader).lines();
                         if let Ok(Some(line)) = lines.next_line().await {
@@ -8845,8 +8890,28 @@ impl Daemon {
                     Some(ev) = rx.recv() => {
                         // Forward to the dedicated indexer worker — never spawn a
                         // new thread here (PERF-001).
-                        if index_tx.send(ev).is_err() {
-                            tracing::warn!("indexer worker has exited; dropping watch event");
+                        match index_tx.try_send(ev) {
+                            Ok(()) => {}
+                            // Full = queue at INDEX_QUEUE_CAP: count and log
+                            // at most once per 10 s (see watch_shed above);
+                            // the head reconcile covers dropped events.
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                watch_shed += 1;
+                                if watch_shed_last_log.elapsed()
+                                    >= std::time::Duration::from_secs(10)
+                                {
+                                    tracing::warn!(
+                                        shed = watch_shed,
+                                        "indexer queue full — watch events shed; \
+                                         head reconcile will cover them"
+                                    );
+                                    watch_shed = 0;
+                                    watch_shed_last_log = std::time::Instant::now();
+                                }
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                tracing::warn!("indexer worker has exited; dropping watch event");
+                            }
                         }
                     }
                     Ok((conn, _)) = listener.accept() => {
@@ -8858,7 +8923,14 @@ impl Daemon {
                         let sched = Arc::clone(&phase_b_scheduler);
                         let lsp_sessions_conn = Arc::clone(&lsp_sessions);
                         let index_tx_conn = index_tx.clone();
+                        let limiter = Arc::clone(&conn_limiter);
                         tokio::spawn(async move {
+                            // #736 item 8: gate the blocking work, not the
+                            // accept — the permit bounds the spawn_blocking
+                            // threads below at MAX_CONCURRENT_CONNECTIONS.
+                            let Ok(_permit) = limiter.acquire_owned().await else {
+                                return; // semaphore closed = daemon shutting down
+                            };
                             let (reader, mut writer) = conn.into_split();
                             let mut lines = BufReader::new(reader).lines();
                             if let Ok(Some(line)) = lines.next_line().await {
@@ -8979,7 +9051,21 @@ impl Daemon {
                         let store_bg = Arc::clone(&store);
                         let repo_bg = Arc::clone(&repo_root_arc);
                         let p2_flag = Arc::clone(&embed_phase2_spawned);
+                        // #736 item 6: revive a crashed sidecar before the
+                        // spawn check. maybe_respawn swaps the new child inside
+                        // the Arc the injected hooks already hold, so no
+                        // re-injection is needed; attempts are bounded by
+                        // MAX_RESPAWN_ATTEMPTS and the mutex makes overlapping
+                        // ticks single-flight.
+                        let supervisor_bg = Arc::clone(&embed_supervisor);
                         tokio::task::spawn_blocking(move || {
+                            if let Ok(mut guard) = supervisor_bg.lock() {
+                                if let Some(s) = guard.as_mut() {
+                                    if !s.is_active() {
+                                        s.maybe_respawn();
+                                    }
+                                }
+                            }
                             maybe_spawn_embed(repo_bg.as_path(), &store_bg, &p2_flag);
                         });
                     }
@@ -9000,8 +9086,28 @@ impl Daemon {
                     Some(ev) = rx.recv() => {
                         // Forward to the dedicated indexer worker — never spawn a
                         // new thread here (PERF-001).
-                        if index_tx.send(ev).is_err() {
-                            tracing::warn!("indexer worker has exited; dropping watch event");
+                        match index_tx.try_send(ev) {
+                            Ok(()) => {}
+                            // Full = queue at INDEX_QUEUE_CAP: count and log
+                            // at most once per 10 s (see watch_shed above);
+                            // the head reconcile covers dropped events.
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                watch_shed += 1;
+                                if watch_shed_last_log.elapsed()
+                                    >= std::time::Duration::from_secs(10)
+                                {
+                                    tracing::warn!(
+                                        shed = watch_shed,
+                                        "indexer queue full — watch events shed; \
+                                         head reconcile will cover them"
+                                    );
+                                    watch_shed = 0;
+                                    watch_shed_last_log = std::time::Instant::now();
+                                }
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                tracing::warn!("indexer worker has exited; dropping watch event");
+                            }
                         }
                     }
                     _ = gc_tick.tick() => {
@@ -9056,7 +9162,21 @@ impl Daemon {
                         let store_bg = Arc::clone(&store);
                         let repo_bg = Arc::clone(&repo_root_arc);
                         let p2_flag = Arc::clone(&embed_phase2_spawned);
+                        // #736 item 6: revive a crashed sidecar before the
+                        // spawn check. maybe_respawn swaps the new child inside
+                        // the Arc the injected hooks already hold, so no
+                        // re-injection is needed; attempts are bounded by
+                        // MAX_RESPAWN_ATTEMPTS and the mutex makes overlapping
+                        // ticks single-flight.
+                        let supervisor_bg = Arc::clone(&embed_supervisor);
                         tokio::task::spawn_blocking(move || {
+                            if let Ok(mut guard) = supervisor_bg.lock() {
+                                if let Some(s) = guard.as_mut() {
+                                    if !s.is_active() {
+                                        s.maybe_respawn();
+                                    }
+                                }
+                            }
                             maybe_spawn_embed(repo_bg.as_path(), &store_bg, &p2_flag);
                         });
                     }
@@ -9079,7 +9199,7 @@ impl Daemon {
         //    worker concurrently holds store.lock().
         rx.close();
         while let Ok(ev) = rx.try_recv() {
-            let _ = index_tx.send(ev);
+            let _ = index_tx.try_send(ev);
         }
         // 2. Signal the indexer worker: set stop flag first (so the worker can
         //    exit via the recv_timeout path even though index_tx_worker keeps
@@ -9111,6 +9231,26 @@ impl Daemon {
 /// reconcile covers missed re-resolutions.
 const DIRTY_QUEUE_CAP: usize = 100_000;
 
+/// Bound on the indexer worker's event queue (#736 A2).
+///
+/// Sized to DIRTY_QUEUE_CAP so a full dirty-caller set still fits into an
+/// otherwise-empty queue; beyond that, producers shed via `try_send` and the
+/// gc-tick head reconcile / next Phase B pass covers whatever was dropped —
+/// the exact recovery contract DIRTY_QUEUE_CAP already relies on. At ~150
+/// bytes per buffered event this bounds the queue at roughly 15 MB where it
+/// previously grew without limit.
+const INDEX_QUEUE_CAP: usize = DIRTY_QUEUE_CAP;
+
+/// Bound on concurrently-processed control connections (#736 item 8).
+///
+/// Each accepted connection's real cost is a blocking-pool thread
+/// (`handle_control_message` runs under `spawn_blocking`), and accepts were
+/// previously unbounded — tokio's 512-thread blocking pool default was the
+/// only backstop (512 × ~2 MiB stacks). Connections beyond this limit are
+/// still accepted but wait for a permit before their request line is read:
+/// backpressure, not rejection.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
 /// Send Tier-0 re-resolve requests for `callers` into the indexer channel.
 ///
 /// Each caller is sent as a `WatchEvent::Upsert` so it runs through the same
@@ -9120,23 +9260,43 @@ const DIRTY_QUEUE_CAP: usize = 100_000;
 fn enqueue_dirty_callers(
     callers: travsr_core::DirtySet,
     repo_root: &std::path::Path,
-    index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
 ) {
     if callers.is_empty() {
         return;
     }
     let total = callers.len();
     let mut enqueued = 0usize;
-    for caller in callers.into_iter().take(DIRTY_QUEUE_CAP) {
+    let mut shed = 0usize;
+    let mut iter = callers.into_iter().take(DIRTY_QUEUE_CAP);
+    for caller in iter.by_ref() {
         let abs = repo_root.join(&caller);
         if !abs.exists() {
             continue;
         }
-        if index_tx.send(watcher::WatchEvent::Upsert(abs)).is_err() {
-            tracing::warn!("Tier-0: indexer channel closed, dropping remaining callers");
-            break;
+        match index_tx.try_send(watcher::WatchEvent::Upsert(abs)) {
+            Ok(()) => enqueued += 1,
+            // #736 A2: queue at INDEX_QUEUE_CAP. This function runs ON the
+            // queue's consumer thread, so once the queue is full it stays
+            // full for the rest of this loop — stop immediately instead of
+            // stat-ing up to 100k callers that cannot be enqueued (review).
+            // The recovery contract (Phase B / next reconcile) is the same
+            // whether they are counted one at a time or in bulk.
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                shed += 1 + iter.count();
+                break;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!("Tier-0: indexer channel closed, dropping remaining callers");
+                break;
+            }
         }
-        enqueued += 1;
+    }
+    if shed > 0 {
+        tracing::warn!(
+            shed,
+            "Tier-0: indexer queue full — {shed} caller(s) deferred to Phase B / next reconcile"
+        );
     }
     if total > DIRTY_QUEUE_CAP {
         tracing::warn!(
@@ -9156,7 +9316,7 @@ fn handle_watch_event(
     ev: watcher::WatchEvent,
     repo_root: &std::path::Path,
     store: &std::sync::Mutex<SqliteStore>,
-    index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
 ) {
     use watcher::WatchEvent;
 
@@ -9310,7 +9470,7 @@ fn handle_control_message(
     read_store: &std::sync::Mutex<SqliteStore>,
     cache: &std::sync::Mutex<query_cache::QueryCache>,
     phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
-    index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
     lsp_sessions: &std::sync::Mutex<EditorPlane>,
 ) -> (travsr_ipc::ControlResponse, bool) {
     use travsr_ipc::{ControlMessage, ControlResponse};
@@ -9817,16 +9977,22 @@ fn hook_backend_id(db_path: &Path) -> Option<String> {
 ///
 /// No-op when the active backend binary is not installed.
 /// Called once at daemon startup AFTER both stores are open and migrated.
+///
+/// #736 item 6: returns the supervisor on success so the caller can KEEP IT
+/// ALIVE and drive `maybe_respawn` from its periodic tick. Previously the
+/// supervisor was dropped here after injection — the hooks kept the sidecar
+/// process alive through their `Arc` clones, but the respawn state died with
+/// the supervisor, so a crashed sidecar could never come back.
 pub fn try_inject_embed_hook(
     query_store: &mut SqliteStore,
     write_store: &mut SqliteStore,
     db_path: &Path,
-) {
+) -> Option<travsr_plugin_host::EmbedSupervisor> {
     use travsr_plugin_host::{embed_backends, lookup_embed_backend, EmbedSupervisor};
 
     let Some(home) = dirs::home_dir() else {
         tracing::debug!("embed hook: HOME not set — skipping");
-        return;
+        return None;
     };
 
     // Prefer the repo's own `.travsr/embed.toml` override, then the user's
@@ -9839,10 +10005,7 @@ pub fn try_inject_embed_hook(
         .as_deref()
         .and_then(lookup_embed_backend)
         .or_else(|| embed_backends().first())
-        .cloned();
-    let Some(backend) = backend else {
-        return;
-    };
+        .cloned()?;
 
     let binary = home
         .join(".travsr")
@@ -9850,13 +10013,10 @@ pub fn try_inject_embed_hook(
         .join(backend.binary_filename());
     let supervisor = EmbedSupervisor::try_start(&binary, db_path, &backend.id);
     if !supervisor.is_active() {
-        return;
+        return None;
     }
 
-    let model_id = match supervisor.model_id() {
-        Some(id) => id.to_string(),
-        None => return,
-    };
+    let model_id = supervisor.model_id()?.to_string();
 
     // Guard: if a model_id was previously recorded it must match the plugin's.
     // When absent (first run after `travsr embed reindex`) we proceed and write it below.
@@ -9868,11 +10028,12 @@ pub fn try_inject_embed_hook(
                 "embed model_id mismatch — Step 4 disabled. \
                  Run `travsr embed reindex` to rebuild embeddings with the installed model."
             );
-            return;
+            return None;
         }
     }
 
-    if let Some(hook) = supervisor.knn_hook(model_id.clone()) {
+    let hook = supervisor.knn_hook(model_id.clone())?;
+    {
         // Warm the sidecar (ONNX + HNSW load) BEFORE arming the hook so the
         // daemon's first query never pays the cold-start cost that would trip
         // the 600 ms KNN breaker and degrade to FTS. Blocking, but this runs
@@ -9916,6 +10077,7 @@ pub fn try_inject_embed_hook(
         }
         tracing::info!(model_id = %model_id, "embed plugin active — Step 4 (semantic ANN) enabled");
     }
+    Some(supervisor)
 }
 
 /// Cold-path variant of [`try_inject_embed_hook`] for read-only CLI queries —

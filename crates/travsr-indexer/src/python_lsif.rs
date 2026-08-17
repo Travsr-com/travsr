@@ -180,6 +180,9 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout_ms: u64) -> anyhow
                 buf.extend_from_slice(&tmp[..n]);
                 if buf.len() > MAX_JSON_BYTES {
                     let _ = child.kill();
+                    // Reap after kill — kill() alone leaves a zombie until the
+                    // daemon exits (#736; the timeout branch below already waits).
+                    let _ = child.wait();
                     anyhow::bail!("pyright output exceeded {MAX_JSON_BYTES} byte cap");
                 }
             }

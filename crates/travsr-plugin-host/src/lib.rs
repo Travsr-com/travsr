@@ -15,6 +15,7 @@ pub mod phase_b;
 pub mod plugins;
 pub mod registry;
 pub mod resolver;
+pub mod resource_limits;
 pub mod sandbox;
 pub mod sidecar_version;
 mod stderr_ring;
