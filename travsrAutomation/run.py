@@ -41,7 +41,7 @@ from fixtures import Fixture  # noqa: E402
 from report import Outcome, Report  # noqa: E402
 from travsr import Travsr, download_release, extract, host_target  # noqa: E402
 
-PHASES = ["artifacts", "first-run", "languages", "graph", "honesty"]
+PHASES = ["artifacts", "first-run", "languages", "graph", "mcp", "cli-surface", "honesty"]
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

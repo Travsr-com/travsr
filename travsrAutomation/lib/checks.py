@@ -12,6 +12,7 @@ unexpected exception into a FAIL with the traceback, so a broken check is never
 mistaken for a passing one.
 """
 
+import json
 import shutil
 import time
 from pathlib import Path
@@ -394,7 +395,29 @@ def all_checks() -> list[Check]:
         )
     checks += [
         Check("cross-file caller edge", "graph", check_cross_file_edge),
+        Check("graph --format json is parseable", "graph", check_graph_json_is_parseable),
         Check("fsck reports no ghost nodes", "graph", check_fsck_clean),
+        # MCP: the only external interface, so these are not optional extras.
+        Check("mcp handshake", "mcp", check_mcp_handshake),
+        Check("mcp advertises every documented tool", "mcp", check_mcp_lists_tools),
+        Check("mcp tools carry descriptions and schemas", "mcp", check_mcp_tools_have_schemas),
+        Check("mcp responses are enveloped", "mcp", check_mcp_tool_call_is_enveloped),
+        Check("mcp and cli agree on the same symbol", "mcp", check_mcp_find_references_agrees_with_cli),
+        Check("mcp refuses path traversal", "mcp", check_mcp_rejects_path_traversal),
+        Check("mcp errors on an unknown tool", "mcp", check_mcp_unknown_tool_errors),
+        Check("mcp survives a malformed frame", "mcp", check_mcp_survives_a_malformed_frame),
+        Check("mcp serverInfo.version matches the cli", "mcp", check_mcp_server_version_matches_cli, ["728"]),
+        # cli-surface: shallow smoke coverage for the subcommands nothing else
+        # touches. A release can break argument parsing anywhere.
+        Check("ask answers", "cli-surface", check_ask_runs),
+        Check("explain runs", "cli-surface", check_explain_runs),
+        Check("pattern searches", "cli-surface", check_pattern_runs),
+        Check("repos runs", "cli-surface", check_repos_runs),
+        Check("config get runs", "cli-surface", check_config_get_runs),
+        Check("synonym list runs", "cli-surface", check_synonym_list_runs),
+        Check("embed status runs", "cli-surface", check_embed_status_runs),
+        Check("rerank status runs", "cli-surface", check_rerank_status_runs),
+        Check("a missing symbol never panics or hangs", "cli-surface", check_no_command_panics_on_a_missing_symbol),
         Check("no false 'produced no symbols' warning", "honesty", check_no_false_zero_symbol_warning, ["724"]),
         Check("semantic marker recovers after a commit", "honesty", check_marker_recovers_after_commit, ["741"]),
         Check("newly committed symbol is indexed", "honesty", check_new_symbol_is_indexed, ["741"]),
@@ -430,3 +453,275 @@ def run_all(ctx: Context, report: Report, phases: Optional[set[str]], name_filte
         )
         report.add(r)
         report.print_result(r)
+
+
+# ── phase: mcp ───────────────────────────────────────────────────────────────
+#
+# MCP is the only external interface travsr exposes (principle 4). Everything
+# above this point tests the CLI, which is a convenience wrapper; an agent talks
+# to the server. Leaving this phase out meant the primary surface was the least
+# verified one.
+
+
+def _ensure_indexed(ctx: "Context") -> None:
+    """Index the fixture if it is not already.
+
+    `travsr mcp --stdio` refuses to start without an index and exits, so the mcp
+    phase cannot assume an earlier phase ran. This keeps `--phase mcp` usable on
+    its own, which is how anyone iterating on one check will invoke it.
+    """
+    if "nodes:" not in ctx.cli.status():
+        ctx.cli.run("init", "--semantic")
+
+
+def _mcp(ctx: "Context"):
+    from mcp import McpClient
+
+    _ensure_indexed(ctx)
+    return McpClient(ctx.cli.binary, ctx.fixture.root)
+
+
+def check_mcp_handshake(ctx: Context) -> tuple[Outcome, str]:
+    from mcp import PROTOCOL_VERSION
+
+    with _mcp(ctx) as c:
+        info = c.initialize()
+        if info.get("protocolVersion") != PROTOCOL_VERSION:
+            return Outcome.FAIL, f"protocolVersion is {info.get('protocolVersion')!r}"
+        # `"tools": {}` is a valid declaration: tools are supported, with no
+        # sub-capabilities. Presence is the contract, not truthiness.
+        if "tools" not in info.get("capabilities", {}):
+            return Outcome.FAIL, f"server advertises no tools capability: {info}"
+        return Outcome.PASS, f"{info.get('serverInfo', {})}"
+
+
+def check_mcp_server_version_matches_cli(ctx: Context) -> tuple[Outcome, str]:
+    """#728, on the interface that matters.
+
+    `travsr --version` reports the injected build id, but `serverInfo.version`
+    comes from the crate version. An agent talking over MCP therefore cannot tell
+    which build it is attached to, which is the exact ambiguity #728 removed from
+    the CLI. Skipped for a local build, which legitimately has no injected id.
+    """
+    if ctx.artifacts is None:
+        return Outcome.SKIP, "local build has no injected build id to compare against"
+    cli_version = ctx.cli.version().replace("travsr", "").strip()
+    with _mcp(ctx) as c:
+        server_version = c.initialize().get("serverInfo", {}).get("version", "")
+    if server_version != cli_version:
+        return Outcome.FAIL, (
+            f"MCP serverInfo.version is {server_version!r} but the CLI reports "
+            f"{cli_version!r}; an agent cannot identify the build it is talking to"
+        )
+    return Outcome.PASS, server_version
+
+
+def check_mcp_lists_tools(ctx: Context) -> tuple[Outcome, str]:
+    """The documented query tools must all be advertised, not merely some."""
+    expected = {
+        "get_dependencies", "get_callers", "find_references", "find_pattern",
+        "get_blast_radius", "get_execution_path", "get_context", "get_snippets",
+        "search_symbol", "get_repo_map", "get_graph_stats", "get_graph_json",
+    }
+    with _mcp(ctx) as c:
+        c.initialize()
+        names = {t.get("name") for t in c.list_tools()}
+    missing = sorted(expected - names)
+    if missing:
+        return Outcome.FAIL, f"tools/list is missing: {', '.join(missing)}"
+    return Outcome.PASS, f"{len(names)} tools advertised"
+
+
+def check_mcp_tools_have_schemas(ctx: Context) -> tuple[Outcome, str]:
+    """A tool without an input schema cannot be called correctly by a model."""
+    with _mcp(ctx) as c:
+        c.initialize()
+        tools = c.list_tools()
+    problems: list[str] = []
+    documented_params = 0
+    for t in tools:
+        name = t.get("name", "<unnamed>")
+        if not t.get("description"):
+            problems.append(f"{name}: no description")
+        schema = t.get("inputSchema") or {}
+        # An empty `properties` is correct for a zero-argument tool such as
+        # get_repo_map or get_graph_stats, so the contract is a well-formed object
+        # schema, not a non-empty one. Requiring parameters here failed nine
+        # perfectly correct tools on the first run of this check.
+        if schema.get("type") != "object":
+            problems.append(f"{name}: inputSchema is not an object schema")
+            continue
+        for param, spec in (schema.get("properties") or {}).items():
+            documented_params += 1
+            if not (spec or {}).get("description"):
+                # A parameter a model cannot understand is a parameter it will
+                # guess at, which is the failure mode this catches.
+                problems.append(f"{name}.{param}: parameter has no description")
+    if problems:
+        return Outcome.FAIL, "\n".join(problems[:10])
+    return Outcome.PASS, f"{len(tools)} tools, {documented_params} documented parameters"
+
+
+def check_mcp_tool_call_is_enveloped(ctx: Context) -> tuple[Outcome, str]:
+    """Every response reaching a model must be wrapped in <travsr-data>.
+
+    The envelope is the boundary that keeps repo content from being read as
+    instructions. A tool answering outside it is a prompt-injection surface.
+    """
+    from mcp import ENVELOPE_CLOSE, ENVELOPE_OPEN
+
+    with _mcp(ctx) as c:
+        c.initialize()
+        r = c.call_tool("search_symbol", {"name": "validateCharge"})
+        if "error" in r:
+            return Outcome.FAIL, f"search_symbol errored: {r['error']}"
+        text = c.text_of(r)
+    if ENVELOPE_OPEN not in text or ENVELOPE_CLOSE not in text:
+        return Outcome.FAIL, f"response not enveloped:\n{text[:300]}"
+    if "validateCharge" not in text:
+        return Outcome.FAIL, f"envelope present but the answer is wrong:\n{text[:300]}"
+    return Outcome.PASS, ""
+
+
+def check_mcp_find_references_agrees_with_cli(ctx: Context) -> tuple[Outcome, str]:
+    """The two interfaces must not disagree about the same graph.
+
+    A divergence here is worse than either being wrong alone, because it means
+    the answer depends on how you asked.
+    """
+    with _mcp(ctx) as c:
+        c.initialize()
+        text = c.text_of(c.call_tool("find_references", {"symbol": "summarize_rows"}))
+    cli = ctx.cli.run("references", "summarize_rows").answer
+    if "src/report.py" not in text:
+        return Outcome.FAIL, f"MCP find_references missed src/report.py:\n{text[:300]}"
+    if ("src/report.py" in cli) != ("src/report.py" in text):
+        return Outcome.FAIL, "CLI and MCP disagree about the same symbol"
+    return Outcome.PASS, ""
+
+
+def check_mcp_rejects_path_traversal(ctx: Context) -> tuple[Outcome, str]:
+    """SEC-002: arguments are validated before any store access.
+
+    Asserted as "does not leak", not "returns an error": a refusal and an empty
+    answer are both acceptable, reading /etc/passwd is not.
+    """
+    attempts = ["../../../../etc/passwd", "/etc/passwd", "..\\..\\windows\\system32"]
+    with _mcp(ctx) as c:
+        c.initialize()
+        for probe in attempts:
+            r = c.call_tool("get_dependencies", {"file": probe})
+            text = c.text_of(r)
+            if "root:" in text or "/bin/bash" in text or "Administrator" in text:
+                return Outcome.FAIL, f"{probe!r} appears to have escaped the repo:\n{text[:300]}"
+    return Outcome.PASS, f"{len(attempts)} traversal attempts refused or empty"
+
+
+def check_mcp_unknown_tool_errors(ctx: Context) -> tuple[Outcome, str]:
+    """An unknown tool must be a protocol error, not a silent empty success."""
+    with _mcp(ctx) as c:
+        c.initialize()
+        r = c.call_tool("definitely_not_a_tool", {})
+    if "error" not in r and not (r.get("result") or {}).get("isError"):
+        return Outcome.FAIL, f"unknown tool did not error: {json.dumps(r)[:300]}"
+    return Outcome.PASS, ""
+
+
+def check_mcp_survives_a_malformed_frame(ctx: Context) -> tuple[Outcome, str]:
+    """A garbage line must not kill the session.
+
+    An agent that sends one bad frame should not have to reconnect, and a server
+    that exits here turns a client bug into an outage.
+    """
+    with _mcp(ctx) as c:
+        c.initialize()
+        assert c._proc.stdin is not None
+        c._proc.stdin.write("this is not json\n")
+        c._proc.stdin.flush()
+        try:
+            tools = c.list_tools()
+        except Exception as e:
+            return Outcome.FAIL, f"session died after a malformed frame: {e}"
+    return Outcome.PASS, f"still serving after garbage input ({len(tools)} tools)"
+
+
+# ── phase: cli-surface ───────────────────────────────────────────────────────
+#
+# Smoke coverage for the subcommands the suite otherwise never touches. Shallow
+# by design: the point is that they run, parse their arguments and do not crash
+# on a real index, which is the class of breakage a release can introduce
+# anywhere. Depth belongs in each area's own tests.
+
+
+def _smoke(ctx: Context, *args: str, expect: str = "") -> tuple[Outcome, str]:
+    r = ctx.cli.run(*args)
+    if r.timed_out:
+        return Outcome.FAIL, f"`{' '.join(args)}` did not return within the timeout"
+    if "panicked" in r.out or "RUST_BACKTRACE" in r.out:
+        return Outcome.FAIL, f"`{' '.join(args)}` panicked:\n{r.out[:300]}"
+    if expect and expect not in r.out:
+        return Outcome.FAIL, f"expected {expect!r} in output of `{' '.join(args)}`:\n{r.out[:300]}"
+    return Outcome.PASS, ""
+
+
+def check_ask_runs(ctx: Context) -> tuple[Outcome, str]:
+    # Asserts it answers, not that it ranks well. Retrieval quality is a measured
+    # open problem (hit@1 0.208), so pinning ranking here would freeze numbers
+    # the project is actively trying to move.
+    return _smoke(ctx, "ask", "validateCharge", expect="validateCharge")
+
+
+def check_explain_runs(ctx: Context) -> tuple[Outcome, str]:
+    return _smoke(ctx, "explain", "validateCharge")
+
+
+def check_pattern_runs(ctx: Context) -> tuple[Outcome, str]:
+    return _smoke(ctx, "pattern", "amountCents", expect="src/payment.ts")
+
+
+def check_repos_runs(ctx: Context) -> tuple[Outcome, str]:
+    return _smoke(ctx, "repos")
+
+
+def check_config_get_runs(ctx: Context) -> tuple[Outcome, str]:
+    return _smoke(ctx, "config", "get", "reindex.max_parallelism")
+
+
+def check_synonym_list_runs(ctx: Context) -> tuple[Outcome, str]:
+    return _smoke(ctx, "synonym", "list")
+
+
+def check_embed_status_runs(ctx: Context) -> tuple[Outcome, str]:
+    return _smoke(ctx, "embed", "status")
+
+
+def check_rerank_status_runs(ctx: Context) -> tuple[Outcome, str]:
+    return _smoke(ctx, "rerank", "status")
+
+
+def check_graph_json_is_parseable(ctx: Context) -> tuple[Outcome, str]:
+    """`--format json` must emit JSON, since renderers consume it."""
+    r = ctx.cli.run("graph", "PaymentService", "--format", "json")
+    payload = r.stdout.strip()
+    if not payload:
+        return Outcome.FAIL, "no stdout from graph --format json"
+    try:
+        json.loads(payload)
+    except json.JSONDecodeError as e:
+        return Outcome.FAIL, f"graph --format json emitted invalid JSON: {e}\n{payload[:300]}"
+    return Outcome.PASS, ""
+
+
+def check_no_command_panics_on_a_missing_symbol(ctx: Context) -> tuple[Outcome, str]:
+    """A symbol that does not exist must be answered, not crashed on."""
+    problems = []
+    for args in (("references", "zzz_no_such_symbol"),
+                 ("graph", "zzz_no_such_symbol"),
+                 ("ask", "zzz_no_such_symbol"),
+                 ("explain", "zzz_no_such_symbol")):
+        r = ctx.cli.run(*args)
+        if "panicked" in r.out:
+            problems.append(f"{' '.join(args)} panicked")
+        if r.timed_out:
+            problems.append(f"{' '.join(args)} hung")
+    return (Outcome.FAIL, "\n".join(problems)) if problems else (Outcome.PASS, "")

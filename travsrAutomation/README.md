@@ -62,8 +62,17 @@ skips into failures, which is what you want in CI.
 | `artifacts` | checksums, target coverage, build-id identity (`--tag` only) |
 | `first-run` | `lang status`, `init`, the no-daemon pending message, and that `init --semantic` genuinely completes Phase B with no daemon |
 | `languages` | `references` resolves to the right file for typescript, javascript (`.mjs`), python, rust, and with `--with-cpp` also c and c++ |
-| `graph` | a cross-file caller edge, which is the one answer Phase A alone cannot give; `fsck` |
+| `graph` | a cross-file caller edge, which is the one answer Phase A alone cannot give; `fsck`; `--format json` is parseable |
+| `mcp` | handshake, every documented tool advertised with a description and a well-formed schema, the `<travsr-data>` envelope, CLI/MCP agreement on the same symbol, path-traversal refusal, unknown-tool error, survival of a malformed frame, and `serverInfo.version` matching the CLI |
+| `cli-surface` | smoke coverage for `ask`, `explain`, `pattern`, `repos`, `config get`, `synonym list`, `embed status`, `rerank status`, and that a missing symbol never panics or hangs |
 | `honesty` | the marker and the data are asserted **separately** |
+
+MCP is not an optional extra here: it is the only external interface travsr has
+(principle 4, no REST and no GraphQL), so it is the surface an agent actually
+uses. Adding this phase immediately found that `serverInfo.version` still
+reported a bare crate version after #728 gave the CLI and the daemon an injected
+build id, meaning the one interface agents talk to was the one that could not say
+which build it was.
 
 Run a subset with `--phase honesty --phase languages`, or `--filter references`.
 
