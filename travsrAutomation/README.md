@@ -1,4 +1,6 @@
-# Release sanity / regression suite
+# travsrAutomation
+
+Release sanity and regression automation for the `travsr` CLI.
 
 Verifies that a travsr build actually works, end to end, against a real
 multi-language repository.
@@ -6,13 +8,13 @@ multi-language repository.
 ```bash
 # regression: a locally built binary, before tagging anything
 cargo build --release -p travsr-cli
-python3 scripts/sanity/main.py --binary target/release/travsr
+python3 travsrAutomation/run.py --binary target/release/travsr
 
 # sanity: a published release, before promoting it to the next channel
-python3 scripts/sanity/main.py --tag v1.0.0-rc.1
+python3 travsrAutomation/run.py --tag v1.0.0-rc.1
 
 # everything, with machine-readable output for CI
-python3 scripts/sanity/main.py --tag v1.0.0 --with-cpp --strict-skip \
+python3 travsrAutomation/run.py --tag v1.0.0 --with-cpp --strict-skip \
     --json sanity.json --junit sanity.xml
 ```
 
@@ -86,6 +88,40 @@ never touches your repo registry or any real repository.
 The one exception is `--with-cpp`. C and C++ need a per-corpus trust grant
 (ADR-017), and that grant is written to your real `~/.travsr/lang.toml`, outside
 the temp dir. It is off by default and the suite says so when it fires.
+
+## Layout
+
+```
+travsrAutomation/
+├── run.py          entry point
+├── selftest.py     tests for the harness itself (no travsr binary needed)
+├── lib/
+│   ├── checks.py   the checks, each tagged with the issues it guards
+│   ├── fixtures.py the multi-language fixture repo and its expected answers
+│   ├── report.py   outcomes, console output, JSON, JUnit
+│   └── travsr.py   CLI wrapper, release download, checksums, build-id extraction
+└── README.md
+```
+
+## Testing the harness
+
+```bash
+python3 travsrAutomation/selftest.py
+```
+
+23 tests, no travsr binary and no network, so unlike the suite it guards this can
+run on every pull request.
+
+It exists because the harness has already had two real bugs, both found by
+running it rather than reading it. It scraped a corpus name out of travsr's
+remediation line and kept a trailing backtick, writing a permanently
+unmatchable entry into the caller's real `~/.travsr/lang.toml`; and that scrape
+assumed the hint was present, so on any machine where trust had already been
+granted every c/c++ check silently skipped, degrading on exactly the machines
+that had run it most. Both are pinned.
+
+It also asserts that #724, #726, #727, #728 and #741 each still have a check
+guarding them, so deleting one fails rather than quietly reducing coverage.
 
 ## Adding a check
 

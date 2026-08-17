@@ -4,11 +4,11 @@
 Two modes, because the same checks are worth running at two different times:
 
     # sanity: against a published release, before promoting it
-    python3 scripts/sanity/main.py --tag v1.0.0-rc.1
+    python3 travsrAutomation/run.py --tag v1.0.0-rc.1
 
     # regression: against a locally built binary, before tagging anything
     cargo build --release -p travsr-cli
-    python3 scripts/sanity/main.py --binary target/release/travsr
+    python3 travsrAutomation/run.py --binary target/release/travsr
 
 Every check corresponds to something that actually broke. #724, #726, #727 and
 #728 were found by a manual pass on v1.0.0-beta.1, three of them already shipped
@@ -34,7 +34,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 import checks  # noqa: E402
 from fixtures import Fixture  # noqa: E402
@@ -51,9 +51,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  python3 scripts/sanity/main.py --tag v1.0.0-rc.1\n"
-            "  python3 scripts/sanity/main.py --binary target/release/travsr\n"
-            "  python3 scripts/sanity/main.py --tag v1.0.0 --with-cpp --junit sanity.xml\n"
+            "  python3 travsrAutomation/run.py --tag v1.0.0-rc.1\n"
+            "  python3 travsrAutomation/run.py --binary target/release/travsr\n"
+            "  python3 travsrAutomation/run.py --tag v1.0.0 --with-cpp --junit sanity.xml\n"
         ),
     )
     src = p.add_mutually_exclusive_group(required=True)
