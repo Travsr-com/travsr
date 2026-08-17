@@ -226,6 +226,9 @@ pub fn extract_native_phase_b(
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
+                // Reap after kill — kill() alone leaves a zombie until the
+                // daemon exits (#736 zombie fix).
+                let _ = child.wait();
                 let _ = err_t.join();
                 anyhow::bail!("dart emitter timed out after {TIMEOUT_SECS}s");
             }

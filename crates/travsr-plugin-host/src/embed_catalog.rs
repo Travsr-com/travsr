@@ -732,7 +732,24 @@ impl PhaseFilter {
 ///                         and counts cores whose `EfficiencyClass` equals the maximum
 ///                         observed value (= P-cores on hybrid, all cores on homogeneous).
 ///                         Falls back to `available_parallelism()` on API failure.
+///
+/// The result is capped at [`resource_limits::effective_cpu_count`] (#736):
+/// the sysfs/sysctl/Windows-API detection above deliberately bypasses
+/// `available_parallelism()` to see physical P-cores, which means it also
+/// bypasses the cgroup CPU-quota awareness `available_parallelism()` carries —
+/// inside a `--cpus 2` container on a 64-core host it happily reports 64.
+/// The cap restores the quota without giving up P-core detection on bare metal,
+/// where the effective count equals the host count and the min is a no-op.
 fn p_core_count() -> usize {
+    detected_p_core_count()
+        .min(crate::resource_limits::effective_cpu_count())
+        .max(1)
+}
+
+/// The raw host-topology detection behind [`p_core_count`] — see its doc
+/// comment for the per-OS sources. Split out so the container-quota cap in
+/// the caller stays impossible to miss (#736).
+fn detected_p_core_count() -> usize {
     let fallback = || {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -832,7 +849,10 @@ fn linux_p_core_count() -> Option<usize> {
 fn derive_num_workers(model_ram_mb: u64, max_workers: Option<usize>, capacity: f32) -> usize {
     derive_num_workers_inner(
         p_core_count(),
-        available_memory_mb(),
+        // `available_memory_mb()` reads host-wide free RAM; inside a
+        // memory-limited container the cgroup's own headroom is what the OOM
+        // killer enforces, so clamp to it before the RAM guard sees it (#736).
+        crate::resource_limits::effective_available_memory_mb(available_memory_mb()),
         model_ram_mb,
         max_workers,
         capacity,

@@ -6,6 +6,8 @@
 
 use std::io::Read as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -27,6 +29,18 @@ const POLL_INTERVAL_MS: u64 = 200;
 /// Hard ceiling for `scip-python` (large projects can be slow).
 /// Separate from LSIF_TIMEOUT because scip-python is a different tool class.
 const SCIP_PYTHON_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Hard cap on the bytes accepted from a child's stdout — and on the size of
+/// the scip-python `index.scip` tempfile, which is the same payload arriving
+/// via disk (#736 item 7). A pathological emitter (or a poisoned repo driving
+/// one) can otherwise materialize unbounded output in daemon RAM. 512 MiB is
+/// orders of magnitude above any legitimate LSIF/SCIP index we have observed,
+/// so real runs never trip it.
+pub(crate) const MAX_CHILD_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Chunk size for the capped stdout drain. 64 KiB matches the OS pipe buffer,
+/// so a healthy child is never throttled by the chunking.
+const DRAIN_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Return the configured timeout for Node LSIF emitters (TS and Python).
 ///
@@ -53,18 +67,30 @@ fn lsif_node_timeout() -> Duration {
 /// Returns `(exit_status, stdout_bytes, stderr_string)`.
 ///
 /// Stdout is drained into `Vec<u8>` to avoid silent truncation on a stray
-/// non-UTF-8 byte in a multi-MB LSIF dump (O(output_size) memory — acceptable
-/// for LSIF < 10 MB). Callers that need a `String` convert via
-/// `String::from_utf8_lossy`. Stderr is small diagnostic text and is decoded
-/// as `String` directly.
+/// non-UTF-8 byte in a multi-MB LSIF dump (O(output_size) memory, hard-capped
+/// at [`MAX_CHILD_OUTPUT_BYTES`] — a child that exceeds the cap is killed and
+/// an error naming the cap and the program is returned). Callers that need a
+/// `String` convert via `String::from_utf8_lossy`. Stderr is small diagnostic
+/// text and is decoded as `String` directly.
 ///
 /// `wait_with_output()` is **not** a substitute: it drains safely but cannot
 /// express a concurrent timeout-kill, which every runner needs so a hung tool
 /// can't block `git commit`.
 pub(crate) fn run_with_drain(
+    child: std::process::Child,
+    timeout: Duration,
+    name: &str,
+) -> anyhow::Result<(std::process::ExitStatus, Vec<u8>, String)> {
+    run_with_drain_capped(child, timeout, name, MAX_CHILD_OUTPUT_BYTES)
+}
+
+/// [`run_with_drain`] with an injectable stdout byte cap — separated so tests
+/// can trip the overflow path without generating 512 MiB of real output.
+fn run_with_drain_capped(
     mut child: std::process::Child,
     timeout: Duration,
     name: &str,
+    max_stdout_bytes: u64,
 ) -> anyhow::Result<(std::process::ExitStatus, Vec<u8>, String)> {
     let stdout_pipe = child
         .stdout
@@ -75,10 +101,32 @@ pub(crate) fn run_with_drain(
         .take()
         .ok_or_else(|| anyhow::anyhow!("{name} child has no piped stderr"))?;
 
+    // #736: chunked read instead of read_to_end so the byte cap can stop the
+    // drain mid-stream. When the cap is exceeded the thread stops reading and
+    // raises `overflowed`; the poll loop below kills the child. Leaving the
+    // pipe open-but-unread back-pressures the child (64 KiB OS pipe buffer),
+    // so it cannot outrun the kill by more than one pipe buffer.
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let overflow_flag = Arc::clone(&overflowed);
     let out_t = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let mut pipe = stdout_pipe;
-        let _ = pipe.read_to_end(&mut buf);
+        let mut chunk = [0u8; DRAIN_CHUNK_BYTES];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break, // EOF — child closed stdout
+                Ok(n) => {
+                    if buf.len() as u64 + n as u64 > max_stdout_bytes {
+                        overflow_flag.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                // Read error (e.g. pipe torn down by the timeout kill): keep
+                // what was drained — matches the old `let _ = read_to_end(..)`.
+                Err(_) => break,
+            }
+        }
         buf
     });
     let err_t = std::thread::spawn(move || {
@@ -93,6 +141,20 @@ pub(crate) fn run_with_drain(
     // deadlock risk. This is the one site in the codebase where try_wait is safe.
     #[allow(clippy::disallowed_methods)]
     let status = loop {
+        // Cap check before the exit poll: an over-cap child is usually still
+        // alive, blocked on its full stdout pipe, and would otherwise sit here
+        // burning RAM-adjacent time until the wall-clock timeout.
+        if overflowed.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            // Reap after kill — kill() alone leaves a zombie until daemon exit.
+            let _ = child.wait();
+            let _ = out_t.join();
+            let _ = err_t.join();
+            anyhow::bail!(
+                "{name} produced more than {max_stdout_bytes} bytes on stdout \
+                 (MAX_CHILD_OUTPUT_BYTES cap) — killed"
+            );
+        }
         match child
             .try_wait()
             .with_context(|| format!("polling {name}"))?
@@ -100,6 +162,9 @@ pub(crate) fn run_with_drain(
             Some(s) => break s,
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
+                // Reap after kill — kill() alone leaves a zombie until daemon
+                // exit (#736 zombie fix).
+                let _ = child.wait();
                 // Join drain threads so they don't dangle after we return.
                 let _ = out_t.join();
                 let _ = err_t.join();
@@ -111,6 +176,15 @@ pub(crate) fn run_with_drain(
 
     let stdout = out_t.join().unwrap_or_default();
     let stderr = err_t.join().unwrap_or_default();
+    // Re-check after joining: a child can write past the cap and exit before
+    // the poll loop observes the flag — truncated output must never be
+    // returned as Ok.
+    if overflowed.load(Ordering::Relaxed) {
+        anyhow::bail!(
+            "{name} produced more than {max_stdout_bytes} bytes on stdout \
+             (MAX_CHILD_OUTPUT_BYTES cap) — output discarded"
+        );
+    }
     Ok((status, stdout, stderr))
 }
 
@@ -287,9 +361,29 @@ pub fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<Option<Vec<u
         anyhow::bail!("scip-python exited with {status}: {stderr}");
     }
 
-    let bytes =
-        std::fs::read(&output).with_context(|| format!("read scip output {}", output.display()))?;
+    let bytes = read_scip_output_capped(&output, MAX_CHILD_OUTPUT_BYTES)?;
     Ok(Some(bytes))
+}
+
+/// Read the scip-python output file, refusing anything over `cap` bytes.
+///
+/// Stat-then-read (#736 item 7): scip-python on a pathological repo can write
+/// a multi-GB protobuf; `std::fs::read` would materialize all of it in daemon
+/// RAM before the parser even runs. The cap is injectable so the refusal path
+/// is unit-testable without a 512 MiB fixture; production goes through
+/// [`MAX_CHILD_OUTPUT_BYTES`].
+fn read_scip_output_capped(output: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
+    let len = std::fs::metadata(output)
+        .with_context(|| format!("stat scip output {}", output.display()))?
+        .len();
+    if len > cap {
+        anyhow::bail!(
+            "scip-python output {} is {len} bytes — exceeds the {cap}-byte cap \
+             (MAX_CHILD_OUTPUT_BYTES); refusing to load it into memory",
+            output.display()
+        );
+    }
+    std::fs::read(output).with_context(|| format!("read scip output {}", output.display()))
 }
 
 // ── travsr-lsif-py ────────────────────────────────────────────────────────────
@@ -680,6 +774,114 @@ mod tests {
         assert!(
             stderr.contains("fatal error"),
             "stderr must be captured: {stderr}"
+        );
+    }
+
+    // ── #736 — stdout byte cap ────────────────────────────────────────────────
+
+    #[test]
+    fn run_drained_stdout_over_cap_kills_child_and_names_cap() {
+        // Child writes 1 MiB then hangs forever; a 64 KiB cap must stop the
+        // drain, kill the child (well before the harness deadline), and
+        // surface an error naming both the cap and the program.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node(
+            "require('fs').writeSync(1,Buffer.alloc(1048576,0x61));\
+             setInterval(()=>{},1e9);",
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        std::thread::spawn(move || {
+            let child = std::process::Command::new("node")
+                .arg(&script_path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn node");
+            let result = run_with_drain_capped(child, HARNESS_DEADLINE, "cap-test", 65536);
+            let _ = tx.send(result);
+        });
+
+        let result = rx
+            .recv_timeout(HARNESS_DEADLINE)
+            .expect("over-cap child must be killed within the watchdog window");
+        assert!(result.is_err(), "over-cap output must be Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("65536"), "error must name the cap: {msg}");
+        assert!(
+            msg.contains("cap-test"),
+            "error must name the program: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_drained_stdout_under_cap_passes_through() {
+        // 64 KiB of output under a 128 KiB cap must arrive intact — the cap
+        // must never truncate or reject legitimate output.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node("require('fs').writeSync(1,Buffer.alloc(65536,0x61));");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        std::thread::spawn(move || {
+            let child = std::process::Command::new("node")
+                .arg(&script_path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn node");
+            let result = run_with_drain_capped(child, HARNESS_DEADLINE, "cap-ok-test", 131072);
+            let _ = tx.send(result);
+        });
+
+        let result = rx
+            .recv_timeout(HARNESS_DEADLINE)
+            .expect("must return within watchdog window");
+        let (_status, stdout, _stderr) = result.expect("under-cap output must succeed");
+        assert_eq!(stdout.len(), 65536, "under-cap output must be complete");
+    }
+
+    // ── #736 — scip output file cap ───────────────────────────────────────────
+
+    #[test]
+    fn scip_output_over_cap_is_refused_without_reading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("index.scip");
+        std::fs::write(&path, vec![0u8; 1024]).expect("write fixture");
+
+        let err = read_scip_output_capped(&path, 512).expect_err("1 KiB over a 512 B cap");
+        let msg = err.to_string();
+        assert!(msg.contains("512"), "error must name the cap: {msg}");
+        assert!(
+            msg.contains("1024"),
+            "error must name the actual size: {msg}"
+        );
+
+        let ok = read_scip_output_capped(&path, 4096).expect("1 KiB under a 4 KiB cap");
+        assert_eq!(ok.len(), 1024);
+    }
+
+    #[test]
+    fn scip_output_missing_file_is_a_stat_error() {
+        // The stat-first guard must not mask the original "file missing"
+        // failure mode with a confusing cap message.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does_not_exist.scip");
+        let err = read_scip_output_capped(&path, 4096).expect_err("missing file");
+        assert!(
+            err.to_string().contains("stat scip output"),
+            "must surface as a stat failure: {err}"
         );
     }
 
