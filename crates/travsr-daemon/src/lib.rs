@@ -1018,7 +1018,8 @@ pub fn fsck_repo(
     if self_loops > 0 {
         tracing::warn!(
             self_loops,
-            "fsck: swept self-referential ref/call edges — pre-guard DB or bypassed write choke point (#650)"
+            "fsck: swept self-referential edges (a symbol pointing at itself) — \
+             pre-existing database, or a write that bypassed the guard"
         );
     }
 
@@ -1097,7 +1098,7 @@ pub fn init_repo_with_progress(
             tracing::warn!(
                 path = %db_path.display(),
                 err = %e,
-                "failed to restrict graph.db permissions to 0600 — file may be world-readable"
+                "failed to restrict index file permissions to 0600 — it may be world-readable"
             );
         }
     }
@@ -1111,7 +1112,7 @@ pub fn init_repo_with_progress(
         let Some(path_str) = db_path.to_str() else {
             tracing::warn!(
                 path = %db_path.display(),
-                "graph.db path is not valid UTF-8 — skipping icacls permission restriction"
+                "index file path is not valid UTF-8 — skipping the icacls permission restriction"
             );
             break 'acl;
         };
@@ -1120,7 +1121,7 @@ pub fn init_repo_with_progress(
         if user.is_empty() {
             tracing::warn!(
                 path = %db_path.display(),
-                "USERNAME env var not set — skipping graph.db permission restriction on Windows"
+                "USERNAME env var not set — skipping the index file permission restriction on Windows"
             );
             break 'acl;
         }
@@ -1144,12 +1145,12 @@ pub fn init_repo_with_progress(
             Ok(s) => tracing::warn!(
                 path = %db_path.display(),
                 exit_code = ?s.code(),
-                "icacls failed to restrict graph.db permissions — file may be readable by other users on this machine"
+                "icacls failed to restrict index file permissions — it may be readable by other users on this machine"
             ),
             Err(e) => tracing::warn!(
                 path = %db_path.display(),
                 err = %e,
-                "icacls not available — graph.db permissions not restricted on Windows"
+                "icacls not available — index file permissions not restricted on Windows"
             ),
         }
     }
@@ -1225,7 +1226,7 @@ pub fn init_repo_with_progress(
         tracing::warn!(
             old = %stored_corpus,
             new = %corpus,
-            "corpus changed — purging all graph data for clean rebuild (§5 #12)"
+            "repository identity changed (e.g. its git remote) — purging all graph data for a clean rebuild"
         );
         let empty_walked = std::collections::HashSet::<String>::new();
         let purge_policy = travsr_core::SafetyPolicy {
@@ -1236,7 +1237,7 @@ pub fn init_repo_with_progress(
             .reconcile(&empty_walked, &purge_policy, repo_root, &stored_corpus)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("corpus-change global-invalidation purge")?;
-        tracing::info!("corpus-change purge complete — rebuilding from scratch");
+        tracing::info!("identity-change purge complete — rebuilding from scratch");
     }
 
     store
@@ -3562,16 +3563,16 @@ pub fn reindex_files(
     match store.get_signature_format_version() {
         Ok(stored) if stored != SIGNATURE_FORMAT_VERSION => {
             tracing::warn!(
-                "skipping reindex: graph.db was built with signature format v{stored} \
-                 but this binary uses v{SIGNATURE_FORMAT_VERSION}. \
-                 Run `travsr init` to re-index and update the graph."
+                "skipping reindex: this index was built with an older version of travsr \
+                 (format v{stored}, current v{SIGNATURE_FORMAT_VERSION}). \
+                 Run `travsr init` to rebuild it."
             );
             return Ok(Default::default());
         }
         Err(e) => {
             tracing::warn!(
-                "could not read signature_format_version: {e}, skipping reindex. \
-                 Run `travsr init` to repair the graph."
+                "could not read the index format version: {e} — skipping reindex. \
+                 Run `travsr init` to rebuild the index."
             );
             return Ok(Default::default());
         }
@@ -3585,13 +3586,13 @@ pub fn reindex_files(
         Ok(Some(c)) => c,
         Ok(None) => {
             tracing::warn!(
-                "no corpus in meta — VNames will use empty corpus. \
-                 Run `travsr init` to set the canonical corpus (ARCH-102)."
+                "this index has no repository identity recorded — symbol identifiers \
+                 may be inconsistent. Run `travsr init` to rebuild it with a stable identity."
             );
             String::new()
         }
         Err(e) => {
-            tracing::warn!("could not read corpus from meta: {e} — using empty corpus");
+            tracing::warn!("could not read the repository identity: {e} — continuing without one");
             String::new()
         }
     };

@@ -54,8 +54,10 @@ pub fn build_sandboxed_command(
             // permitted_hosts list — bwrap has no per-host network rule support.
             tracing::info!(
                 permitted_hosts = ?permitted_hosts,
-                "ADR-017 Elevated policy: network namespace isolation disabled; \
-                 plugin may reach permitted hosts (enforce via egress controls)"
+                "network-permitted policy active: this plugin's network isolation is \
+                 intentionally off so it can reach its permitted hosts — enforce the host \
+                 allowlist with egress controls (a firewall or proxy), since bubblewrap has \
+                 no per-host network rules"
             );
         }
     }

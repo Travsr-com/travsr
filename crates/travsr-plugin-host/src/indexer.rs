@@ -407,7 +407,7 @@ impl PluginIndexer {
                 tracing::warn!(
                     lang = %lang,
                     corpus = %self.corpus,
-                    "Phase B skipped — not enabled for this repo (run `travsr lang install {lang}` here)"
+                    "semantic analysis skipped — not enabled for this repo (run `travsr lang install {lang}` here)"
                 );
                 outcome.skipped_untrusted_corpus.push(lang.clone());
                 continue;

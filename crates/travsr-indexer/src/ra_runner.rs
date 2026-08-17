@@ -123,7 +123,7 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
     let ra_path = match ra_binary_path() {
         Some(p) => p,
         None => {
-            tracing::info!("rust-analyzer not found — skipping Rust LSIF ingestion");
+            tracing::info!("rust-analyzer not found — skipping Rust's full cross-file analysis");
             return Ok(None);
         }
     };
@@ -157,16 +157,23 @@ fn spawn_or_skip_ra(
         SandboxStatus::Unavailable { reason } => {
             if should_skip_unsandboxed(&status, cfg.allow_unsandboxed) {
                 // UX-002: the sandbox being unavailable is a degradation, not an
-                // error — the run still succeeds with structural edges. Keep it at
-                // WARN and fold the "install bubblewrap" detail into the single
-                // SKIPPED line so only one line reaches the user.
+                // error — the run still succeeds with structural analysis. Keep it at
+                // WARN and fold the recovery hint into the single skipped line so
+                // only one line reaches the user. The recovery differs per OS:
+                // bubblewrap is installable on Linux, but macOS/Windows have no
+                // user-installable sandbox on this path — there the only recourse is
+                // the explicit --allow-unsandboxed opt-in.
+                #[cfg(target_os = "linux")]
+                let recovery =
+                    "Install bubblewrap, or pass --allow-unsandboxed if you trust this repository.";
+                #[cfg(not(target_os = "linux"))]
+                let recovery = "Pass --allow-unsandboxed if you trust this repository.";
                 tracing::warn!(
                     repo = %repo_root.display(),
                     reason,
-                    "rust-analyzer LSIF SKIPPED — sandbox unavailable and \
-                     --allow-unsandboxed-lsif not set; Rust semantic edges degraded \
-                     to tree-sitter/native structural edges. Install bubblewrap, or \
-                     pass --allow-unsandboxed-lsif if you trust this repository."
+                    "rust-analyzer skipped — no OS sandbox available and \
+                     --allow-unsandboxed not set; Rust falls back to structural \
+                     analysis only. {recovery}"
                 );
                 record_ra_lsif_sandbox_skip();
                 return Ok(None);
@@ -179,8 +186,8 @@ fn spawn_or_skip_ra(
             tracing::warn!(
                 repo = %repo_root.display(),
                 reason,
-                "rust-analyzer will run UNCONFINED — TRAVSR_ALLOW_UNSANDBOXED_LSIF \
-                 opt-in acknowledged. Ensure this repository is fully trusted."
+                "rust-analyzer will run without OS sandboxing — the --allow-unsandboxed \
+                 opt-in was acknowledged. Make sure you trust this repository."
             );
         }
     }
