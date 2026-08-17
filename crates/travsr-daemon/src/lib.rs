@@ -1767,6 +1767,21 @@ pub fn init_repo_with_progress(
             .unwrap_or(false);
         if run_phase_b_inline && phase_b_made_progress {
             let _ = store.set_meta("phase_b_commit", &sha);
+            // #741: clear `phase_b_dirty` too, exactly as the daemon's own Phase B
+            // path does when it advances this marker. Init's Phase A pass goes
+            // through `reindex_files`, which sets the flag because rewriting a
+            // file's Phase A nodes drops its `ref/call` edges (#583). Phase B then
+            // rebuilds them, so by this point the flag describes a degradation
+            // that no longer exists.
+            //
+            // Stamping the commit without clearing the flag left `travsr status`
+            // reporting `stale (run travsr init to refresh)` permanently after the
+            // first source commit: every subsequent `travsr init` set the flag
+            // again on its Phase A pass and never cleared it, so the remediation
+            // the message named was the command that reproduced the state. The
+            // graph itself was correct throughout, which is what made this a
+            // status-honesty bug rather than staleness.
+            let _ = store.set_meta("phase_b_dirty", "0");
         }
     }
 
