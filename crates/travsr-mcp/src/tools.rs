@@ -218,8 +218,8 @@ fn phase_b_pending(store: &SqliteStore) -> bool {
 /// never disagree about completeness. Returns the note to append, or `None`
 /// when Phase B is complete for the current commit.
 pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
-    const PENDING: &str = "[note: call-graph index incomplete — Phase B has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
-    const STALE: &str = "[note: call-graph edges degraded — a background re-index dropped call edges since the last Phase B run; empty results are not authoritative. Run `travsr init` to rebuild.]";
+    const PENDING: &str = "[note: call-graph index incomplete — semantic analysis has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
+    const STALE: &str = "[note: call-graph edges degraded — a background re-index dropped call edges since the last semantic-analysis pass; empty results are not authoritative. Run `travsr init` to rebuild.]";
     let phase_b = store
         .get_meta("phase_b_commit")
         .ok()
@@ -3186,9 +3186,8 @@ fn get_repo_map_raw(store: &SqliteStore, reserve_per_line: usize) -> String {
     // call-graph data is absent, which affects the tools the agent calls next.
     if !has_refcall {
         header.push_str(
-            "Note: semantic analysis (Phase B) has not run — dependents are from \
-             import structure only; call-graph data is unavailable. Commit to \
-             trigger Phase B.\n",
+            "Note: semantic analysis has not run — dependents are from import \
+             structure only; call-graph data is unavailable. Commit to run it.\n",
         );
     }
 
@@ -8852,14 +8851,14 @@ mod tests {
         // No ref/call edges => semantic note present.
         let without = get_repo_map(&two_crate_store(false));
         assert!(
-            without.contains("Phase B"),
-            "missing-Phase-B state must be disclosed:\n{without}"
+            without.contains("semantic analysis has not run"),
+            "missing-semantic-analysis state must be disclosed:\n{without}"
         );
         // ref/call present => note omitted.
         let with = get_repo_map(&two_crate_store(true));
         assert!(
-            !with.contains("Phase B) has not run"),
-            "semantic note must be omitted once Phase B has run:\n{with}"
+            !with.contains("semantic analysis has not run"),
+            "semantic note must be omitted once semantic analysis has run:\n{with}"
         );
     }
 

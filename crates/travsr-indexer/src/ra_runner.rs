@@ -41,12 +41,18 @@ pub fn ra_binary_path() -> Option<std::path::PathBuf> {
     RA_PATH
         .get_or_init(|| {
             // 1. PATH probe: preferred — honours user's active toolchain.
+            // #738: require a SUCCESSFUL exit, not merely a spawned process. A
+            // rustup proxy shim is on PATH even when the `rust-analyzer` component
+            // is not installed; `rust-analyzer --version` through it then exits
+            // non-zero. `.status().is_ok()` (process ran at all) treated that as
+            // "available" and later spawned `rust-analyzer lsif`, which the shim
+            // rejected with "Unknown binary ..." — silently skipping LSIF.
             let on_path = std::process::Command::new("rust-analyzer")
                 .arg("--version")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .is_ok();
+                .is_ok_and(|s| s.success());
             if on_path {
                 return Some(std::path::PathBuf::from("rust-analyzer"));
             }
