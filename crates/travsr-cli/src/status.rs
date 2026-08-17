@@ -259,15 +259,27 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
-    // M1: warn when Rust semantic edges are degraded due to sandbox unavailability.
+    // M1 / #738: warn when Rust semantic edges are degraded.
     if let Some(reason) = &payload.rust_lsif_degraded {
-        if reason == "sandbox_unavailable" {
-            eprintln!(
+        match reason.as_str() {
+            "sandbox_unavailable" => eprintln!(
                 "warning: Rust semantic edges degraded — rust-analyzer LSIF was \
                  skipped because the OS sandbox (bubblewrap/sandbox-exec) is \
                  unavailable. Install bubblewrap, or re-run \
                  `travsr init --allow-unsandboxed-lsif` if you trust this repo."
-            );
+            ),
+            // #738: rust-analyzer ran and produced references, but every one was
+            // dropped during resolution (none matched a parsed symbol). On Windows
+            // this was the path-normalization bug; if it persists after upgrading,
+            // it points at a repo-root/URI mismatch worth reporting.
+            "all_refs_dropped" => eprintln!(
+                "warning: Rust semantic edges degraded — rust-analyzer produced \
+                 references but none could be matched to indexed symbols, so no \
+                 type-resolved call edges were added (structural call edges are \
+                 unaffected). Re-run `travsr init --force --allow-unsandboxed-lsif \
+                 --semantic`; if it persists, please report it."
+            ),
+            _ => {}
         }
     }
 

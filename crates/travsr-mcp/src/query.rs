@@ -224,8 +224,9 @@ pub struct StatusPayload {
     /// H3: warnings from the last Phase B run (crashed/version_mismatch/needs_approval).
     /// Empty string = no warnings.
     pub phase_b_warnings: Option<String>,
-    /// M1: set to "sandbox_unavailable" when the last Phase B skipped rust-analyzer
-    /// LSIF because the OS sandbox was unavailable. Empty string = not degraded.
+    /// M1 / #738: rust-analyzer LSIF degradation for the last semantic pass.
+    /// "sandbox_unavailable" = ra was skipped (OS sandbox missing); "all_refs_dropped"
+    /// = ra ran but every reference failed resolution (0 edges landed). Empty = healthy.
     #[serde(default)]
     pub rust_lsif_degraded: Option<String>,
     /// RFC-021 P5: reranker state ("off"/"not installed"/"installed"/"ready"/
