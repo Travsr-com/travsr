@@ -18,6 +18,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import type { McpClient } from "./mcp";
+import { ActiveRepo } from "./activeRepo";
 import { GraphPanel, type GraphData, type GraphNode } from "./graph";
 import {
   buildSynonymsHtml,
@@ -609,6 +610,7 @@ type PanelMessage =
   | { command: "removeLang"; language: string }
   | { command: "detectLangs" }
   | { command: "reloadAvailable" }
+  | { command: "pickRepo" }
   | { command: "initRepo" }
   | { command: "openFile"; path: string }
   | { command: "refreshLog" }
@@ -946,7 +948,12 @@ export async function readDiagnostics(binary: string, cwd: string): Promise<Diag
   return found;
 }
 
-/** Spawn a travsr CLI command and return its combined stdout+stderr. */
+/** Spawn a travsr CLI command and return its combined stdout+stderr.
+ *
+ *  For fast, local, read-only commands (`lang list`, `lang remove`): a short
+ *  wall-clock timeout is fine here because these do no network I/O, so a hang
+ *  means something is wrong and killing it is the right move. Network installs
+ *  must NOT use this — see `spawnManagedInstall`. */
 function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutMs = 4_000): Promise<string> {
   return new Promise((resolve) => {
     let out = "";
@@ -961,6 +968,55 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
   });
 }
 
+/** The last non-empty line of CLI output — the final status the command printed
+ *  (e.g. "'rust' is active — full cross-file analysis is on."). Empty when the
+ *  command printed nothing. */
+function lastLine(s: string): string {
+  const lines = s.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  return lines.length ? lines[lines.length - 1] : "";
+}
+
+/** Run a network-bound install command (`lang install`, `lang detect --yes`,
+ *  `init`) under a cancellable progress notification.
+ *
+ *  Deliberately imposes NO wall-clock timeout. A fixed timer is the wrong tool
+ *  here: on a slow connection it SIGKILLs the CLI mid-download and — because the
+ *  killed process resolves with empty output — the panel would report a false
+ *  success while leaving a half-finished install behind. Instead the worst case
+ *  is bounded by the CLI's own per-download network timeouts, and the user can
+ *  stop it at any time from the notification's Cancel button. The result says
+ *  whether the user cancelled so the caller can report an honest outcome. */
+function spawnManagedInstall(
+  binary: string,
+  args: string[],
+  cwd: string,
+  title: string
+): Thenable<{ out: string; cancelled: boolean }> {
+  return vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title, cancellable: true },
+    (_progress, token) =>
+      new Promise((resolve) => {
+        let out = "";
+        let settled = false;
+        const finish = (r: { out: string; cancelled: boolean }): void => {
+          if (!settled) { settled = true; resolve(r); }
+        };
+        const proc = cp.spawn(binary, args, {
+          env: { ...process.env, TERM: "dumb", NO_COLOR: "1" },
+          cwd,
+        });
+        proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
+        proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
+        token.onCancellationRequested(() => {
+          try { proc.kill(); } catch { /* ignore */ }
+          finish({ out, cancelled: true });
+        });
+        proc.on("close", () => finish({ out, cancelled: false }));
+        proc.on("error", (e) => finish({ out: `${out}\nerror: ${e.message}`, cancelled: false }));
+      })
+  );
+}
+
 /**
  * travsr.showLanguages — Languages panel: indexed node counts from the graph +
  * available SCIP tools from `travsr lang list --json`, with one-click install,
@@ -969,10 +1025,15 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
 export function registerShowLanguages(
   client: McpClient,
   binary: string,
+  activeRepo: ActiveRepo,
   onAfterInit?: () => void
 ): vscode.Disposable {
-  const getCorpus = (): string =>
-    path.basename(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "");
+  // `lang install` / `lang detect` / `init` run with the targeted repo as cwd, so
+  // the CLI derives the corpus exactly as the daemon does (git remote) and enables
+  // the right repo. The extension used to pass `--corpus <folder-basename>`, which
+  // never matched the daemon's corpus, and it only ever looked at the first
+  // workspace folder — wrong or ambiguous the moment several repos are open. The
+  // user now picks the target (ActiveRepo), shown in the status bar.
 
   // Read the configured binary path at call time so we always use the value
   // written by checkBinaryAndPrompt, which runs async after activation.
@@ -989,15 +1050,16 @@ export function registerShowLanguages(
       cachedAvailable = parseAvailableLanguages(raw);
       availableLoaded = true;
     }
-    return buildLanguagesHtml(parseLanguageCounts(langsRaw), cachedAvailable);
+    // Show the target repo in the panel only when several are open — with one
+    // repo there is no ambiguity to surface.
+    const target = activeRepo.hasChoice() ? activeRepo.currentName() : undefined;
+    return buildLanguagesHtml(parseLanguageCounts(langsRaw), cachedAvailable, target);
   };
 
   // Buttons are unlocked immediately by openManagedPanel's 'unlockButtons' postMessage
   // sent before handle() is ever called. postStatus drives the in-panel status bar for
   // operations that take >1s (install, detect, reload).
   const handle = async (msg: PanelMessage, refresh: RefreshFn, postStatus: PostStatus): Promise<void> => {
-    const corpus = getCorpus();
-
     if (msg.command === "reloadAvailable") {
       availableLoaded = false;
       postStatus('Reloading available tools…');
@@ -1012,14 +1074,23 @@ export function registerShowLanguages(
 
     switch (msg.command) {
       case "installLang": {
+        // Prompt once if which repo is ambiguous; abort if dismissed.
+        const repo = await activeRepo.ensureChosen();
+        if (!repo) return;
         const args = ["lang", "install", msg.language, "--no-interactive", "--yes"];
-        if (corpus) args.push("--corpus", corpus);
-        postStatus(`Installing ${msg.language} tool…`);
-        void spawnLangCommand(getBinary(), args).then(() => {
+        // cwd = the chosen repo so the CLI auto-enables it. Runs under a
+        // cancellable progress notification with no wall-clock kill, so a slow
+        // download is never cut off mid-flight and reported as a false success.
+        void spawnManagedInstall(getBinary(), args, repo, `Installing ${msg.language}…`).then(({ out, cancelled }) => {
           availableLoaded = false;
-          postStatus("");
           void refresh();
-          void vscode.window.showInformationMessage(`${msg.language} tool installed.`);
+          if (cancelled) {
+            void vscode.window.showWarningMessage(
+              `Install of ${msg.language} was cancelled — it may be partly done. Re-run, or run \`travsr lang install ${msg.language}\` in a terminal.`
+            );
+          } else {
+            void vscode.window.showInformationMessage(lastLine(out) || `${msg.language} tool installed.`);
+          }
         });
         return;
       }
@@ -1035,16 +1106,24 @@ export function registerShowLanguages(
           "--reason", m.reason,
           "--permitted-hosts", m.permittedHosts || "",
         ];
+        const repo = await activeRepo.ensureChosen();
+        if (!repo) return;
         const installArgs = ["lang", "install", m.language, "--no-interactive", "--yes"];
-        if (corpus) installArgs.push("--corpus", corpus);
-        postStatus(`Installing ${m.language} with elevated approval…`);
+        // Record the approval (local, fast), then install under a cancellable
+        // progress notification — the install reaches the network, so it must not
+        // be governed by a fixed timer.
         void spawnLangCommand(getBinary(), approveArgs)
-          .then(() => spawnLangCommand(getBinary(), installArgs))
-          .then(() => {
+          .then(() => spawnManagedInstall(getBinary(), installArgs, repo, `Installing ${m.language} with approval…`))
+          .then(({ out, cancelled }) => {
             availableLoaded = false;
-            postStatus("");
             void refresh();
-            void vscode.window.showInformationMessage(`${m.language} installed with elevated approval.`);
+            if (cancelled) {
+              void vscode.window.showWarningMessage(
+                `Install of ${m.language} was cancelled — it may be partly done. Re-run, or run \`travsr lang install ${m.language}\` in a terminal.`
+              );
+            } else {
+              void vscode.window.showInformationMessage(lastLine(out) || `${m.language} installed with elevated approval.`);
+            }
           });
         return;
       }
@@ -1057,29 +1136,48 @@ export function registerShowLanguages(
           void vscode.window.showInformationMessage(`Disabled language tool for ${msg.language}.`);
         });
         return;
+      case "pickRepo":
+        await activeRepo.pick();
+        void refresh();
+        return;
       case "initRepo": {
-        const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        if (!wsRoot) return;
-        postStatus("Initializing repo…");
-        void spawnLangCommand(getBinary(), ["init"], wsRoot, 120_000).then(() => {
-          postStatus("");
+        const repo = await activeRepo.ensureChosen();
+        if (!repo) return;
+        // `init` rebuilds the graph and can run long on a large repo; cancellable
+        // progress, no fixed kill.
+        void spawnManagedInstall(getBinary(), ["init"], repo, "Initializing repo…").then(({ cancelled }) => {
+          if (cancelled) {
+            void vscode.window.showWarningMessage("Repo initialization was cancelled.");
+            return;
+          }
           // Graph rebuilt — evict stale blast-radius and caller counts.
           onAfterInit?.();
           refreshOpenPanels();
         });
         return;
       }
-      case "detectLangs":
-        postStatus('Detecting languages…');
-        void spawnLangCommand(getBinary(), ["lang", "detect"]).then((out) => {
-          void vscode.window.showInformationMessage(
-            out.trim() ? `Detect: ${out.trim().slice(0, 120)}` : "Detection complete."
-          );
+      case "detectLangs": {
+        const repo = await activeRepo.ensureChosen();
+        if (!repo) return;
+        // cwd = the chosen repo so detect scans it, not the extension host's cwd.
+        // `--yes` makes the button live up to its "Detect & install" label: a
+        // spawned process has no terminal, so a bare `lang detect` would only ever
+        // print the list and install nothing. It may download an analyzer per
+        // detected language, so it runs under a cancellable notification with no
+        // wall-clock kill (a fixed timer would cut a slow batch off mid-download
+        // and report a false "complete"). Elevated languages that need approval
+        // are skipped by the CLI, never installed silently.
+        void spawnManagedInstall(getBinary(), ["lang", "detect", "--yes"], repo, "Detecting & installing languages…").then(({ cancelled }) => {
           availableLoaded = false;
-          postStatus("");
           void refresh();
+          void vscode.window.showInformationMessage(
+            cancelled
+              ? "Detect & install was cancelled — some languages may not be set up. See the Languages panel."
+              : "Detect & install finished. See the Languages panel for per-language status."
+          );
         });
         return;
+      }
       case "refresh":
         availableLoaded = false;
         await refresh();
@@ -1102,13 +1200,15 @@ export function registerParityCommands(
   binary: string,
   onAfterInit?: () => void
 ): void {
+  const activeRepo = new ActiveRepo(context);
   context.subscriptions.push(
+    vscode.commands.registerCommand("travsr.selectRepository", () => activeRepo.pick()),
     registerAskSymbol(client),
     registerManageSynonyms(client),
     registerShowDependencies(client),
     registerShowExecutionPath(client, context),
     registerShowRepos(client),
     registerShowGraphStats(client),
-    registerShowLanguages(client, binary, onAfterInit)
+    registerShowLanguages(client, binary, activeRepo, onAfterInit)
   );
 }

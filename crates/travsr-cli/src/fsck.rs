@@ -26,7 +26,7 @@ fn resolve_fsck_root(cwd: &Path, fix: bool) -> anyhow::Result<PathBuf> {
             anyhow::bail!(
                 "this worktree's queries are served by the index at {}; run \
                  `travsr fsck --fix` from there. A linked worktree must not \
-                 mutate another checkout's index (#586). `travsr fsck` (report \
+                 mutate another checkout's index. `travsr fsck` (report \
                  only) inspects that index from here.",
                 read_root.display()
             );
@@ -73,7 +73,7 @@ pub fn run(fix: bool, json: bool, force: bool) -> anyhow::Result<()> {
         }
         if report.self_ref_call_edges_swept > 0 {
             println!(
-                "swept {} self-referential ref/call edge(s) (#650)",
+                "swept {} self-referential edge(s) (a symbol pointing at itself)",
                 report.self_ref_call_edges_swept
             );
         }
@@ -86,7 +86,7 @@ pub fn run(fix: bool, json: bool, force: bool) -> anyhow::Result<()> {
         }
         if report.self_ref_call_edges_detected > 0 {
             println!(
-                "{} self-referential ref/call edge(s) (run with --fix to sweep) (#650)",
+                "{} self-referential edge(s) (a symbol pointing at itself; run with --fix to sweep)",
                 report.self_ref_call_edges_detected
             );
         }
@@ -188,8 +188,8 @@ mod tests {
             "refusal must name the served main root: {err}"
         );
         assert!(
-            err.contains("#586"),
-            "refusal must cite the invariant: {err}"
+            err.contains("another checkout's index"),
+            "refusal must explain the worktree-safety reason: {err}"
         );
     }
 

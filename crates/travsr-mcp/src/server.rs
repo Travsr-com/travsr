@@ -410,7 +410,7 @@ pub fn tools_list() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" },
-                        "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (RefCall only, requires Phase B)." }
+                        "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (call/reference edges; needs full cross-file analysis to be built)." }
                     },
                     "required": ["file"],
                     "additionalProperties": false
@@ -418,7 +418,7 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_lang_status",
-                "description": "Return whether semantic (Phase B) analysis is available for the language of the given file, and an install hint if not. Returns JSON.",
+                "description": "Return whether semantic (full cross-file) analysis is available for the language of the given file, and an install hint if not. Returns JSON.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -452,7 +452,7 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_execution_path",
-                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST. Answers explicitly when the symbols do not resolve or resolve but are disconnected ('no path found'), so an empty-looking result is never ambiguous.",
+                "description": "Find the lowest-cost path from a source symbol to a sink symbol through the code graph. Answers explicitly when the symbols do not resolve or resolve but are disconnected ('no path found'), so an empty-looking result is never ambiguous.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -474,7 +474,7 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_context",
-                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). A three-layer heuristic normaliser (T0 stopword strip + synonym expansion + L2-A vocabulary-grounded expansion) translates NL to FTS seeds deterministically — no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata.",
+                "description": "Retrieve the most relevant context for a query within a token budget. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). Natural-language queries are translated to search terms deterministically — no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -489,7 +489,7 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_graph_json",
-                "description": "Return a subgraph around a symbol as structured JSON nodes and edges for graph renderers. Pass mode='overview' with no query for the repo-map LOD tile layout.",
+                "description": "Return a subgraph around a symbol as structured JSON nodes and edges for graph renderers. Pass mode='overview' with no query for the repository overview tile layout.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -499,7 +499,7 @@ pub fn tools_list() -> serde_json::Value {
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
                         "token_budget": { "type": "integer", "description": "Cap the payload to roughly this many tokens (0 or omitted = unlimited). Truncation is reported via truncated_by_budget." },
                         "mode": { "type": "string", "enum": ["", "overview"], "description": "'overview' returns directory-level component tiles (each with file_count and dependents) plus cross-component dependency edges from the resolved graph, ranked by how depended-upon each component is. Combine with path_prefix to drill into a component." },
-                        "path_prefix": { "type": "string", "description": "When mode='overview', scope to files under this path prefix (e.g. 'src/components/'). Returns file nodes inside the prefix plus ghost-port package nodes for cross-boundary deps." }
+                        "path_prefix": { "type": "string", "description": "When mode='overview', scope to files under this path prefix (e.g. 'src/components/'). Returns file nodes inside the prefix plus external package nodes for cross-boundary dependencies." }
                     },
                     "required": [],
                     "additionalProperties": false
@@ -615,7 +615,7 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_snippets",
-                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to an AST skeleton. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the AST summary only. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
+                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to a condensed structural outline. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the structural outline only. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -630,7 +630,7 @@ pub fn tools_list() -> serde_json::Value {
                         "mode": {
                             "type": "string",
                             "enum": ["auto", "full", "skeleton"],
-                            "description": "Representation per symbol. 'auto' (default): raw body if within the kind line-cap, else AST skeleton. 'full': complete definition, no line cap. 'skeleton': AST summary only."
+                            "description": "Representation per symbol. 'auto' (default): raw body if within the kind line-cap, else a condensed structural outline. 'full': complete definition, no line cap. 'skeleton': structural outline only (signatures, no bodies)."
                         },
                         "repo": {
                             "type": "string",
@@ -643,7 +643,7 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_index_status",
-                "description": "Return index freshness and completeness: schema version, indexed vs HEAD commit staleness, node/edge counts, Phase A/Phase B state (including per-language failed/unavailable/done), and semantic (embeddings/rerank) readiness. Read-only. Returns JSON.",
+                "description": "Return index freshness and completeness: schema version, indexed vs HEAD commit staleness, node/edge counts, structural and semantic analysis state (including per-language failed/unavailable/done), and semantic (embeddings/rerank) readiness. Read-only. Returns JSON.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -1046,7 +1046,7 @@ pub fn tools_list_global() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" },
-                        "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (RefCall only, requires Phase B)." },
+                        "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (call/reference edges; needs full cross-file analysis to be built)." },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["file"],
@@ -1055,7 +1055,7 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_lang_status",
-                "description": "Return whether semantic (Phase B) analysis is available for the language of the given file, and an install hint if not. Returns JSON.",
+                "description": "Return whether semantic (full cross-file) analysis is available for the language of the given file, and an install hint if not. Returns JSON.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1093,7 +1093,7 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_execution_path",
-                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST. Supply `repo` to scope to a single codebase; scoped queries answer explicitly when the symbols do not resolve or are disconnected ('no path found').",
+                "description": "Find the lowest-cost path from a source symbol to a sink symbol through the code graph. Supply `repo` to scope to a single codebase; scoped queries answer explicitly when the symbols do not resolve or are disconnected ('no path found').",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1118,7 +1118,7 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_context",
-                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). T0 + L2-A heuristic normaliser translates NL to FTS seeds deterministically — no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata. Supply `repo` to scope to a single codebase; omit only for cross-repo queries.",
+                "description": "Retrieve the most relevant context for a query within a token budget. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). Natural-language queries are translated to search terms deterministically — no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata. Supply `repo` to scope to a single codebase; omit only for cross-repo queries.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1134,7 +1134,7 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_graph_json",
-                "description": "Return a subgraph around a symbol as structured JSON nodes and edges for graph renderers. Pass mode='overview' with no query for the repo-map LOD tile layout.",
+                "description": "Return a subgraph around a symbol as structured JSON nodes and edges for graph renderers. Pass mode='overview' with no query for the repository overview tile layout.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1144,7 +1144,7 @@ pub fn tools_list_global() -> serde_json::Value {
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." },
                         "mode": { "type": "string", "enum": ["", "overview"], "description": "'overview' returns directory-level component tiles (each with file_count and dependents) plus cross-component dependency edges from the resolved graph." },
-                        "path_prefix": { "type": "string", "description": "When mode='overview', scope to files under this path prefix. Returns file nodes inside the prefix plus ghost-port package nodes for cross-boundary deps." }
+                        "path_prefix": { "type": "string", "description": "When mode='overview', scope to files under this path prefix. Returns file nodes inside the prefix plus external package nodes for cross-boundary dependencies." }
                     },
                     "required": [],
                     "additionalProperties": false
@@ -1152,7 +1152,7 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_snippets",
-                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to an AST skeleton. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the AST summary only. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
+                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to a condensed structural outline. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the structural outline only. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1167,7 +1167,7 @@ pub fn tools_list_global() -> serde_json::Value {
                         "mode": {
                             "type": "string",
                             "enum": ["auto", "full", "skeleton"],
-                            "description": "Representation per symbol. 'auto' (default): raw body if within the kind line-cap, else AST skeleton. 'full': complete definition, no line cap. 'skeleton': AST summary only."
+                            "description": "Representation per symbol. 'auto' (default): raw body if within the kind line-cap, else a condensed structural outline. 'full': complete definition, no line cap. 'skeleton': structural outline only (signatures, no bodies)."
                         },
                         "repo": {
                             "type": "string",
@@ -1180,7 +1180,7 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_index_status",
-                "description": "Return index freshness and completeness for a single repo: schema version, indexed vs HEAD commit staleness, node/edge counts, Phase A/Phase B state (including per-language failed/unavailable/done), and semantic (embeddings/rerank) readiness. Read-only. Never aggregates across repos; supply `repo` when more than one is registered, or the call returns an ambiguity error. Returns JSON.",
+                "description": "Return index freshness and completeness for a single repo: schema version, indexed vs HEAD commit staleness, node/edge counts, structural and semantic analysis state (including per-language failed/unavailable/done), and semantic (embeddings/rerank) readiness. Read-only. Never aggregates across repos; supply `repo` when more than one is registered, or the call returns an ambiguity error. Returns JSON.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1301,6 +1301,68 @@ mod tests {
         "repos_prune",
         "repos_remove",
     ];
+
+    /// Collect every `description` string value anywhere in a tools/list value.
+    fn collect_descriptions(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    if k == "description" {
+                        if let Some(s) = val.as_str() {
+                            out.push(s.to_string());
+                        }
+                    }
+                    collect_descriptions(val, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for val in arr {
+                    collect_descriptions(val, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// UX-031/032/033: no project-internal jargon may reach a consumer through a
+    /// tool `description` in EITHER list. These are implementation terms that are
+    /// meaningless outside this repo (and `PCST` was also factually wrong — the
+    /// path search is Dijkstra + λ-corridor, not PCST; see issue #527). Wire enum
+    /// values like `tree-sitter` are deliberately not covered — this checks prose
+    /// descriptions only, so the two lists cannot drift jargon back in.
+    #[test]
+    fn tool_descriptions_are_jargon_free() {
+        // Case-sensitive tokens that do not occur in ordinary English prose, so
+        // substring matching is safe (no false positives on words like "approach").
+        const BANNED: &[&str] = &[
+            "PCST",
+            "Phase A",
+            "Phase B",
+            "RefCall",
+            "knapsack",
+            "k-core",
+            "ghost-port",
+            "L2-A",
+            "T0 ",
+            "PPR",
+            "cross-encoder",
+            "AST skeleton",
+            "AST summary",
+            "LOD",
+        ];
+        for list in [tools_list(), tools_list_global()] {
+            let mut descriptions = Vec::new();
+            collect_descriptions(&list, &mut descriptions);
+            for desc in &descriptions {
+                for banned in BANNED {
+                    assert!(
+                        !desc.contains(banned),
+                        "jargon '{banned}' leaked into a tool description: {desc:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn stdio_tools_list_contains_synonym_tools() {

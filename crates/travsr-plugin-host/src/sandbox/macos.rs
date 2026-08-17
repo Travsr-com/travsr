@@ -126,9 +126,9 @@ pub fn build_sandboxed_command(
             // allowlist. Log a warning so the operator is aware.
             tracing::warn!(
                 permitted_hosts = ?permitted_hosts,
-                "ADR-017 Elevated policy on macOS: sandbox-exec cannot enforce per-host \
-                 network filtering; '(allow network*)' is in effect — enforce permitted \
-                 hosts via a local firewall or egress proxy"
+                "network-permitted policy active: sandbox-exec cannot enforce per-host \
+                 network filtering, so '(allow network*)' is in effect — enforce the \
+                 permitted hosts with a local firewall or egress proxy"
             );
             "(allow network*)".to_string()
         }
@@ -197,8 +197,8 @@ pub fn build_sandboxed_command(
         SandboxPolicy::Elevated { .. } => {
             tracing::debug!(
                 language,
-                "macOS Elevated policy: skipping sandbox-exec, running sidecar directly \
-                 (PSE-approved; resource-capped via ulimit)"
+                "network-permitted policy on macOS: skipping sandbox-exec, running the \
+                 sidecar directly (a security approval is on file; resource-capped via ulimit)"
             );
             let quoted_args = args
                 .iter()

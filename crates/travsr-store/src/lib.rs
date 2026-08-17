@@ -6767,7 +6767,7 @@ impl SqliteStore {
             }
         }
         tx.commit()?;
-        tracing::info!("RFC-012 A2 F1: fts_synonyms reset to static defaults");
+        tracing::info!("reset search synonyms to the built-in defaults");
         Ok(())
     }
 

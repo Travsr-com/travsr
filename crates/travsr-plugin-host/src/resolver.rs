@@ -287,9 +287,10 @@ impl CatalogResolver {
                     else {
                         tracing::info!(
                             lang,
-                            "Phase B catalog: '{}' is RequiresElevated but no PSE approval \
-                             recorded in lang.toml — skipping (fail-closed, ADR-017 Rule 2). \
-                             Run: travsr lang approve {} --approved-by <pse> --reason \"...\" \
+                            "'{}' needs network access during indexing but has no security \
+                             approval on file — skipping (its semantic analysis stays disabled \
+                             until it is approved). Run: travsr lang approve {} \
+                             --approved-by <approver-github-handle> --reason \"...\" \
                              --permitted-hosts <hosts>",
                             lang,
                             lang
@@ -322,8 +323,8 @@ impl CatalogResolver {
                     if let Err(e) = policy.validate() {
                         tracing::warn!(
                             lang,
-                            "Phase B catalog: Elevated policy validation failed for '{}': {} \
-                             — skipping (fail-closed, ADR-017 Rule 2)",
+                            "the security approval for '{}' is incomplete: {} \
+                             — skipping (its semantic analysis stays disabled)",
                             lang,
                             e
                         );

@@ -218,8 +218,9 @@ impl AppContainerSpawn {
         {
             tracing::warn!(
                 permitted_hosts = ?permitted_hosts,
-                "ADR-017 Elevated on Windows: AppContainer allows internet client; \
-                 per-host filtering unavailable at OS level — enforce via egress proxy"
+                "network-permitted policy active: Windows AppContainer allows the \
+                 internet-client capability with no per-host filtering — enforce the \
+                 permitted hosts with an egress proxy"
             );
         }
 

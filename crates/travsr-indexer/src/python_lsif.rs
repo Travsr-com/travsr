@@ -43,7 +43,7 @@ pub fn parse_python_with_pyright(
 
     // Warn once per session that pyright runs unsandboxed (SEC P1-A5).
     tracing::warn!(
-        "pyright invoked without OS-level sandbox — see docs/security/python-indexing-risks.md"
+        "pyright is running without OS sandboxing — see docs/security/python-indexing-risks.md"
     );
 
     let json_bytes = match run_pyright(&pyright, path, timeout) {

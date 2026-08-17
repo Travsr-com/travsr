@@ -1018,7 +1018,8 @@ pub fn fsck_repo(
     if self_loops > 0 {
         tracing::warn!(
             self_loops,
-            "fsck: swept self-referential ref/call edges — pre-guard DB or bypassed write choke point (#650)"
+            "fsck: swept self-referential edges (a symbol pointing at itself) — \
+             pre-existing database, or a write that bypassed the guard"
         );
     }
 
@@ -1097,7 +1098,7 @@ pub fn init_repo_with_progress(
             tracing::warn!(
                 path = %db_path.display(),
                 err = %e,
-                "failed to restrict graph.db permissions to 0600 — file may be world-readable"
+                "failed to restrict index file permissions to 0600 — it may be world-readable"
             );
         }
     }
@@ -1111,7 +1112,7 @@ pub fn init_repo_with_progress(
         let Some(path_str) = db_path.to_str() else {
             tracing::warn!(
                 path = %db_path.display(),
-                "graph.db path is not valid UTF-8 — skipping icacls permission restriction"
+                "index file path is not valid UTF-8 — skipping the icacls permission restriction"
             );
             break 'acl;
         };
@@ -1120,7 +1121,7 @@ pub fn init_repo_with_progress(
         if user.is_empty() {
             tracing::warn!(
                 path = %db_path.display(),
-                "USERNAME env var not set — skipping graph.db permission restriction on Windows"
+                "USERNAME env var not set — skipping the index file permission restriction on Windows"
             );
             break 'acl;
         }
@@ -1144,12 +1145,12 @@ pub fn init_repo_with_progress(
             Ok(s) => tracing::warn!(
                 path = %db_path.display(),
                 exit_code = ?s.code(),
-                "icacls failed to restrict graph.db permissions — file may be readable by other users on this machine"
+                "icacls failed to restrict index file permissions — it may be readable by other users on this machine"
             ),
             Err(e) => tracing::warn!(
                 path = %db_path.display(),
                 err = %e,
-                "icacls not available — graph.db permissions not restricted on Windows"
+                "icacls not available — index file permissions not restricted on Windows"
             ),
         }
     }
@@ -1225,7 +1226,7 @@ pub fn init_repo_with_progress(
         tracing::warn!(
             old = %stored_corpus,
             new = %corpus,
-            "corpus changed — purging all graph data for clean rebuild (§5 #12)"
+            "repository identity changed (e.g. its git remote) — purging all graph data for a clean rebuild"
         );
         let empty_walked = std::collections::HashSet::<String>::new();
         let purge_policy = travsr_core::SafetyPolicy {
@@ -1236,7 +1237,7 @@ pub fn init_repo_with_progress(
             .reconcile(&empty_walked, &purge_policy, repo_root, &stored_corpus)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("corpus-change global-invalidation purge")?;
-        tracing::info!("corpus-change purge complete — rebuilding from scratch");
+        tracing::info!("identity-change purge complete — rebuilding from scratch");
     }
 
     store
@@ -1661,7 +1662,7 @@ pub fn init_repo_with_progress(
                     tracing::debug!(
                         positional_in = lsif_parsed,
                         resolved = resolved.len(),
-                        "Phase B: rust-analyzer positional refs resolved"
+                        "semantic analysis: rust-analyzer positional refs resolved"
                     );
                     lsif_resolved = resolved.len();
                     // E7: remember which call sites LSIF positionally resolved,
@@ -1682,7 +1683,7 @@ pub fn init_repo_with_progress(
             );
             tracing::debug!(
                 resolved_cross_crate_edges = resolved.len(),
-                "Phase B UnresolvedCall resolution complete"
+                "semantic analysis cross-reference resolution complete"
             );
             let (report, alias_map) = write_phase_b_results(
                 &mut store,
@@ -1699,7 +1700,7 @@ pub fn init_repo_with_progress(
             // not compiler-derived — write them separately with truthful
             // provenance instead of folding them into the SCIP batch as 'lsif'.
             if let Err(e) = store.write_phase_b_batch(&[], &resolved, "tree-sitter") {
-                tracing::warn!("phase B native resolved edges write error: {e:#}");
+                tracing::warn!("semantic analysis native resolved edges write error: {e:#}");
             }
             // #299 WS-4: record cross-crate call occurrence lines after the edges
             // (and their callee nodes) are in the store. #299 F2: remap dst ids
@@ -2628,7 +2629,7 @@ fn write_phase_b_results(
         // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
         // These are analyzer/SCIP-derived structural edges (E1: provenance 'scip').
         if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges, "scip") {
-            tracing::warn!("phase B batch write error: {e:#}");
+            tracing::warn!("semantic analysis batch write error: {e:#}");
         }
     } else {
         // G1: unify SCIP nodes (all languages) onto tree-sitter nodes before
@@ -2669,13 +2670,13 @@ fn write_phase_b_results(
 
         // G2 path: span-attributed ref/call edges.
         if let Err(e) = store.write_scip_attributed_batch(corpus, &pb_nodes, &pb_refs) {
-            tracing::warn!("phase B attributed write error: {e:#}");
+            tracing::warn!("semantic analysis attributed write error: {e:#}");
         }
         // Structural edges from SCIP relationships (Pass 2 in scip-reader) still
         // need to be written — they are not represented in ScipRef records.
         if !pb_edges.is_empty() {
             if let Err(e) = store.write_phase_b_batch(&[], &pb_edges, "scip") {
-                tracing::warn!("phase B structural edges write error: {e:#}");
+                tracing::warn!("semantic analysis structural edges write error: {e:#}");
             }
         }
     }
@@ -3071,7 +3072,9 @@ fn maybe_spawn_embed(
                 );
                 travsr_plugin_host::spawn_background_reindex_phase1(&db_path);
             } else {
-                tracing::debug!("embed_tick: Phase 1 pending — waiting for Phase B to complete");
+                tracing::debug!(
+                    "embed_tick: Phase 1 pending — waiting for semantic analysis to complete"
+                );
             }
         } else {
             tracing::debug!(
@@ -3316,7 +3319,7 @@ fn run_background_phase_b_inner(
             tracing::debug!(
                 positional_in = lsif_parsed,
                 resolved = resolved.len(),
-                "Phase B: rust-analyzer positional refs resolved"
+                "semantic analysis: rust-analyzer positional refs resolved"
             );
             lsif_resolved = resolved.len();
             // E7: remember which call sites LSIF positionally resolved, keyed
@@ -3331,7 +3334,7 @@ fn run_background_phase_b_inner(
         resolve_unresolved_calls(&s, &pb_unresolved, &pb_nodes, &pb_edges, &lsif_covered);
     tracing::debug!(
         resolved_cross_crate_edges = resolved.len(),
-        "Phase B UnresolvedCall resolution complete"
+        "semantic analysis cross-reference resolution complete"
     );
 
     // Write LSIF edges first (pre-collected lock-free above).
@@ -3355,7 +3358,7 @@ fn run_background_phase_b_inner(
     // E1: native leaf-name resolved edges are tree-sitter-heuristic — truthful
     // provenance, not the SCIP batch's 'lsif'.
     if let Err(e) = s.write_phase_b_batch(&[], &resolved, "tree-sitter") {
-        tracing::warn!("phase B native resolved edges write error: {e:#}");
+        tracing::warn!("semantic analysis native resolved edges write error: {e:#}");
     }
     // #299 WS-4: record cross-crate call occurrence lines after their edges land.
     // #299 F2: remap dst ids through the unification alias map so a site never
@@ -3425,12 +3428,14 @@ fn run_background_phase_b_inner(
             Ok(shells) => {
                 let pairs: Vec<_> = shells.into_iter().collect();
                 if let Err(e) = s.write_shell_numbers(&pairs) {
-                    tracing::warn!("kcore: failed to update shell numbers after phase B: {e}");
+                    tracing::warn!(
+                        "kcore: failed to update shell numbers after semantic analysis: {e}"
+                    );
                 } else {
                     tracing::info!(event = "kcore.updated", "graph centrality updated");
                 }
             }
-            Err(e) => tracing::warn!("kcore: computation failed after phase B: {e}"),
+            Err(e) => tracing::warn!("kcore: computation failed after semantic analysis: {e}"),
         }
     }
 
@@ -3558,16 +3563,16 @@ pub fn reindex_files(
     match store.get_signature_format_version() {
         Ok(stored) if stored != SIGNATURE_FORMAT_VERSION => {
             tracing::warn!(
-                "skipping reindex: graph.db was built with signature format v{stored} \
-                 but this binary uses v{SIGNATURE_FORMAT_VERSION}. \
-                 Run `travsr init` to re-index and update the graph."
+                "skipping reindex: this index was built with an older version of travsr \
+                 (format v{stored}, current v{SIGNATURE_FORMAT_VERSION}). \
+                 Run `travsr init` to rebuild it."
             );
             return Ok(Default::default());
         }
         Err(e) => {
             tracing::warn!(
-                "could not read signature_format_version: {e}, skipping reindex. \
-                 Run `travsr init` to repair the graph."
+                "could not read the index format version: {e} — skipping reindex. \
+                 Run `travsr init` to rebuild the index."
             );
             return Ok(Default::default());
         }
@@ -3581,13 +3586,13 @@ pub fn reindex_files(
         Ok(Some(c)) => c,
         Ok(None) => {
             tracing::warn!(
-                "no corpus in meta — VNames will use empty corpus. \
-                 Run `travsr init` to set the canonical corpus (ARCH-102)."
+                "this index has no repository identity recorded — symbol identifiers \
+                 may be inconsistent. Run `travsr init` to rebuild it with a stable identity."
             );
             String::new()
         }
         Err(e) => {
-            tracing::warn!("could not read corpus from meta: {e} — using empty corpus");
+            tracing::warn!("could not read the repository identity: {e} — continuing without one");
             String::new()
         }
     };
@@ -3990,7 +3995,7 @@ fn reconcile_head_drift(
         event = "head.reconcile.complete",
         head = %head,
         files,
-        "head reconcile complete — Phase B rebuild armed"
+        "head reconcile complete: semantic rebuild armed"
     );
     true
 }
@@ -9297,7 +9302,7 @@ fn enqueue_dirty_callers(
         tracing::warn!(
             total,
             "Tier-0: dirty caller set ({total}) exceeded cap {DIRTY_QUEUE_CAP}; \
-             excess deferred to Phase B / next reconcile"
+             excess deferred to semantic analysis / next reconcile"
         );
     } else {
         tracing::debug!(
@@ -9731,7 +9736,7 @@ fn handle_control_message(
             } else if phase_b_commit.is_empty() {
                 "pending".to_string()
             } else if phase_b_commit == last_commit {
-                "up-to-date".to_string()
+                "complete".to_string()
             } else {
                 "stale (new commits since last run)".to_string()
             };
@@ -9764,7 +9769,7 @@ fn handle_control_message(
 
             let msg = format!(
                 "nodes: {nodes} | edges: {edges} | last_commit: {last_commit}\n\
-                 phase B : {phase_b_activity}\n\
+                 semantic: {phase_b_activity}\n\
                  {embed_line}"
             );
             (ControlResponse::ok(Some(msg)), false)

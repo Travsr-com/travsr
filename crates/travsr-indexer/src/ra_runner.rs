@@ -28,11 +28,15 @@ use crate::sandbox::{
 /// Search order:
 /// 1. `rust-analyzer` on the process PATH.
 /// 2. `$CARGO_HOME/bin/rust-analyzer` — explicit install root.
-/// 3. `$HOME/.cargo/bin/rust-analyzer` — default Cargo install location.
+/// 3. `$HOME/.cargo/bin/rust-analyzer` — default Cargo (rustup) install location.
+/// 4. `~/.travsr/bin/rust-analyzer` — where `travsr lang install rust` places a
+///    binary downloaded from GitHub when rustup is absent.
 ///
-/// Fallbacks 2 and 3 ensure LSIF enrichment works even when the daemon's PATH
-/// has been stripped to `/usr/bin:/bin:/usr/sbin:/sbin` (e.g. when forked to
+/// Fallbacks 2–4 ensure LSIF enrichment works even when the daemon's PATH has
+/// been stripped to `/usr/bin:/bin:/usr/sbin:/sbin` (e.g. when forked to
 /// background by the CLI where the parent shell had `~/.cargo/bin` on PATH).
+/// The home-relative candidates carry the platform executable suffix so the
+/// Windows `rust-analyzer.exe` is found the same way as the unix binary.
 ///
 /// Result is cached via `OnceLock` — the probe runs at most once per process
 /// lifetime.
@@ -56,25 +60,41 @@ pub fn ra_binary_path() -> Option<std::path::PathBuf> {
             if on_path {
                 return Some(std::path::PathBuf::from("rust-analyzer"));
             }
-            // 2 + 3. Explicit home-relative fallbacks survive daemon PATH stripping.
+            // 2–4. Explicit home-relative fallbacks survive daemon PATH stripping.
+            // The home anchor MUST match where `travsr lang install rust` wrote the
+            // binary — the installer uses `dirs::home_dir()`, which is `USERPROFILE`
+            // on Windows. So on Windows prefer `USERPROFILE`: a daemon launched from
+            // Git Bash inherits a POSIX-style `HOME` (e.g. `/c/Users/me`) that does
+            // not resolve as a native path, and preferring it would miss the
+            // just-installed binary. On unix `HOME` is the home dir and is used.
+            let exe = std::env::consts::EXE_SUFFIX; // ".exe" on windows, "" elsewhere
+            let ra = format!("rust-analyzer{exe}");
+            let home = if cfg!(windows) {
+                std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+            } else {
+                std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+            };
             let candidates = [
-                std::env::var("CARGO_HOME").ok().map(|h| {
-                    std::path::PathBuf::from(h)
-                        .join("bin")
-                        .join("rust-analyzer")
-                }),
-                std::env::var("HOME").ok().map(|h| {
+                std::env::var_os("CARGO_HOME")
+                    .map(|h| std::path::PathBuf::from(h).join("bin").join(&ra)),
+                home.clone().map(|h| {
                     std::path::PathBuf::from(h)
                         .join(".cargo")
                         .join("bin")
-                        .join("rust-analyzer")
+                        .join(&ra)
+                }),
+                home.map(|h| {
+                    std::path::PathBuf::from(h)
+                        .join(".travsr")
+                        .join("bin")
+                        .join(&ra)
                 }),
             ];
             for candidate in candidates.into_iter().flatten() {
                 if candidate.exists() {
                     tracing::info!(
                         path = %candidate.display(),
-                        "rust-analyzer found via cargo home (not on PATH)"
+                        "rust-analyzer found off-PATH (cargo home or ~/.travsr/bin)"
                     );
                     return Some(candidate);
                 }
@@ -111,7 +131,7 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
     let ra_path = match ra_binary_path() {
         Some(p) => p,
         None => {
-            tracing::info!("rust-analyzer not found — skipping Rust LSIF ingestion");
+            tracing::info!("rust-analyzer not found — skipping Rust's full cross-file analysis");
             return Ok(None);
         }
     };
@@ -145,16 +165,23 @@ fn spawn_or_skip_ra(
         SandboxStatus::Unavailable { reason } => {
             if should_skip_unsandboxed(&status, cfg.allow_unsandboxed) {
                 // UX-002: the sandbox being unavailable is a degradation, not an
-                // error — the run still succeeds with structural edges. Keep it at
-                // WARN and fold the "install bubblewrap" detail into the single
-                // SKIPPED line so only one line reaches the user.
+                // error — the run still succeeds with structural analysis. Keep it at
+                // WARN and fold the recovery hint into the single skipped line so
+                // only one line reaches the user. The recovery differs per OS:
+                // bubblewrap is installable on Linux, but macOS/Windows have no
+                // user-installable sandbox on this path — there the only recourse is
+                // the explicit --allow-unsandboxed opt-in.
+                #[cfg(target_os = "linux")]
+                let recovery =
+                    "Install bubblewrap, or pass --allow-unsandboxed if you trust this repository.";
+                #[cfg(not(target_os = "linux"))]
+                let recovery = "Pass --allow-unsandboxed if you trust this repository.";
                 tracing::warn!(
                     repo = %repo_root.display(),
                     reason,
-                    "rust-analyzer LSIF SKIPPED — sandbox unavailable and \
-                     --allow-unsandboxed-lsif not set; Rust semantic edges degraded \
-                     to tree-sitter/native structural edges. Install bubblewrap, or \
-                     pass --allow-unsandboxed-lsif if you trust this repository."
+                    "rust-analyzer skipped — no OS sandbox available and \
+                     --allow-unsandboxed not set; Rust falls back to structural \
+                     analysis only. {recovery}"
                 );
                 record_ra_lsif_sandbox_skip();
                 return Ok(None);
@@ -167,8 +194,8 @@ fn spawn_or_skip_ra(
             tracing::warn!(
                 repo = %repo_root.display(),
                 reason,
-                "rust-analyzer will run UNCONFINED — TRAVSR_ALLOW_UNSANDBOXED_LSIF \
-                 opt-in acknowledged. Ensure this repository is fully trusted."
+                "rust-analyzer will run without OS sandboxing — the --allow-unsandboxed \
+                 opt-in was acknowledged. Make sure you trust this repository."
             );
         }
     }

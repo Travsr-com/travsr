@@ -169,7 +169,7 @@ fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
 
     if !offerable.is_empty() {
         println!(
-            "tip: {} found in this repo but semantic (call/reference) indexing is not set up:",
+            "tip: {} found in this repo — full cross-file analysis is not set up yet:",
             offerable
                 .iter()
                 .map(|s| s.as_str())
@@ -182,17 +182,17 @@ fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
     }
 
     if !unavailable.is_empty() {
-        // Stated, not silently dropped: structural indexing did cover these
-        // files, and the user should know which part is missing and why.
+        // Stated, not silently dropped: basic analysis did cover these files, and
+        // the user should know which part is missing and why — in plain words.
         println!(
-            "note: {} found in this repo, but no semantic analyzer is published for \
-             this platform yet — structural indexing covers them, call/reference \
-             analysis does not.",
+            "note: {} found in this repo, but no analyzer is available for {} yet — \
+             basic analysis covers them, full cross-file analysis does not.",
             unavailable
                 .iter()
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            travsr_plugin_host::phase_b::status::os_label(),
         );
     }
 
@@ -207,7 +207,9 @@ fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         if answer.trim().eq_ignore_ascii_case("y") {
-            return crate::lang::run(crate::lang::LangCommand::Detect);
+            // Interactive (the user just answered "y" at a terminal): let detect
+            // run its own per-language prompt rather than force-installing all.
+            return crate::lang::run(crate::lang::LangCommand::Detect { yes: false });
         }
     }
 

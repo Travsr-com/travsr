@@ -549,16 +549,16 @@ pre.raw-fallback{
 
 <!-- provenance legend (shown once results arrive) -->
 <div class="legend-box" id="legend-box" style="display:none">
-  <div class="t">How each node was matched (match source), then its graph provenance</div>
+  <div class="t">How each result was matched, then how it connects in the graph</div>
   <div class="items">
-    <div class="it"><span class="ms-tag">Exact</span><span class="why">literal symbol / FTS name match</span></div>
-    <div class="it"><span class="ms-tag">Semantic</span><span class="why">cross-encoder ranked by relevance</span></div>
+    <div class="it"><span class="ms-tag">Exact</span><span class="why">literal symbol / name match</span></div>
+    <div class="it"><span class="ms-tag">Semantic</span><span class="why">ranked by relevance</span></div>
     <div class="it"><span class="ms-tag">Docs</span><span class="why">documentation prose (verify against code)</span></div>
     <div class="it"><span class="ms-tag">Tests</span><span class="why">test entry points &amp; fixtures</span></div>
-    <div class="it"><span class="ms-tag">Relevant</span><span class="why">graph-adjacent context (see via)</span></div>
-    <div class="it"><span class="via caller">caller</span><span class="why">calls a seed</span></div>
-    <div class="it"><span class="via dependency">dependency</span><span class="why">imported / used by a seed</span></div>
-    <div class="it"><span class="via context">context</span><span class="why">on the path between them</span></div>
+    <div class="it"><span class="ms-tag">Relevant</span><span class="why">nearby in the graph (see via)</span></div>
+    <div class="it"><span class="via caller">caller</span><span class="why">calls a match</span></div>
+    <div class="it"><span class="via dependency">dependency</span><span class="why">imported or used by a match</span></div>
+    <div class="it"><span class="via context">context</span><span class="why">on the path between matches</span></div>
   </div>
 </div>
 
@@ -716,7 +716,7 @@ function renderParsed(data, rawText){
     document.getElementById('save-pct').textContent = over ? '↑ over budget' : '';
     document.getElementById('save-pct').style.color = over ? 'var(--orange-400)' : '';
     document.getElementById('base-tok-txt').textContent = over
-      ? 'lexical tier returns all matches — budget controls PPR/embed only'
+      ? 'exact text matches are always shown in full — the budget only limits the ranked-by-relevance results'
       : 'tokens of context';
     document.getElementById('tok-fill').style.width = Math.min(100,Math.round(totalTok/budget*100))+'%';
     document.getElementById('tok-fill').style.background = over

@@ -71,7 +71,7 @@ fn detect_dart_sdk() -> Option<PathBuf> {
         }
     }
     tracing::warn!(
-        "Dart SDK not found on PATH; Dart Phase B call-site edges will be unavailable. \
+        "Dart SDK not found on PATH; Dart's full cross-file analysis will be unavailable. \
          Set DART_SDK to the SDK root (the directory containing lib/_internal) to enable it."
     );
     None

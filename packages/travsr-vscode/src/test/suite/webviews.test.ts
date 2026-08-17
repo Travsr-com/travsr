@@ -23,6 +23,9 @@ const LANG: LangInfo = {
   language: "rust",
   package: "@travsr-plugin/rust",
   sandbox: "Standard",
+  status: "active",
+  statusLine: "active",
+  repoState: "enabled",
   installed: true,
   registered: true,
   builtin: false,
@@ -105,18 +108,23 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
   const available: LangInfo[] = [
     {
       language: "rust", package: "scip-rust", sandbox: "Standard",
+      status: "active", statusLine: "active", repoState: "always_on",
       installed: true, registered: true, builtin: true, needsApproval: false,
       scipInstallType: "Command", installHint: "travsr lang install rust",
       underlyingToolHint: "", elevatedHosts: [],
     },
     {
       language: "java", package: "scip-java", sandbox: "Elevated",
+      status: "needs_approval", statusLine: "needs approval (run: travsr lang install java)",
+      repoState: "not_enabled",
       installed: false, registered: false, builtin: false, needsApproval: true,
       scipInstallType: "GithubBinary", installHint: "travsr lang install java",
       underlyingToolHint: "", elevatedHosts: ["repo1.maven.org"],
     },
     {
       language: "scala", package: "scip-scala", sandbox: "Elevated",
+      status: "partial", statusLine: "partial (run: travsr lang install scala for full analysis)",
+      repoState: "not_enabled",
       installed: false, registered: false, builtin: false, needsApproval: false,
       scipInstallType: "Manual", installHint: "travsr lang install scala",
       underlyingToolHint: "https://docs.scala-lang.org/scip", elevatedHosts: [],
@@ -131,8 +139,8 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
   });
   test("renders available tools with correct action cells", () => {
     const html = buildLanguagesHtml([], available);
-    // rust: registered+installed+builtin → Built-in badge (no Disable button for builtins)
-    assert.ok(html.includes("Built-in"), "builtin shows Built-in badge");
+    // rust: active built-in analyzer → "on" badge, no Disable button for builtins
+    assert.ok(html.includes(">on<"), "active builtin shows an 'on' badge");
     assert.ok(!html.includes('onclick="removeLang'), "builtin has no Disable onclick");
     // java: needsApproval → consent form (inside not-here disclosure when undetected)
     assert.ok(html.includes("approveLang") && html.includes("Grant"));
@@ -150,6 +158,8 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     const indexedWithRust: LangCount[] = [{ language: "rust", count: 10 }];
     const uninstalledRust: LangInfo[] = [{
       language: "rust", package: "scip-rust", sandbox: "Standard",
+      status: "partial", statusLine: "partial (run: travsr lang install rust for full analysis)",
+      repoState: "always_on",
       installed: false, registered: false, builtin: false, needsApproval: false,
       scipInstallType: "Command", installHint: "travsr lang install rust",
       underlyingToolHint: "", elevatedHosts: [],
@@ -158,14 +168,49 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     assert.ok(html.includes("installLang") && html.includes("Install"));
     assert.ok(!html.includes('<details class="not-here">'), "detected language skips the disclosure gate");
   });
-  test("semantic badge reflects Phase B registration state", () => {
+  test("analysis badge shows the CLI's computed status, no jargon", () => {
     const html = buildLanguagesHtml(indexed, available);
-    // rust: builtin + installed → active → enabled badge
-    assert.ok(html.includes(">enabled<"), "enabled badge for active language");
-    // java/scala: not registered → disabled badge
-    assert.ok(html.includes(">disabled<"), "disabled badge for inactive language");
-    assert.ok(html.includes("Semantic analysis"), "semantic tooltip present");
+    // rust: active → "active" badge
+    assert.ok(html.includes(">active<"), "active badge for a live language");
+    // scala: partial → "partial"; java: needs approval → "needs approval"
+    assert.ok(html.includes(">partial<"), "partial badge for a language on structure only");
+    assert.ok(html.includes(">needs approval<"), "needs-approval badge");
+    // The plain statusLine is the tooltip; no internal jargon leaks.
+    assert.ok(html.includes("full analysis"), "plain statusLine used as tooltip");
+    assert.ok(!/SCIP|LSIF|Phase B|Built-in to the travsr/.test(html), "no internal jargon in the panel");
     assert.ok(html.includes("Semantic"), "Semantic column header present");
+  });
+  test("This repo column shows per-repo enablement with the CLI's tag", () => {
+    const html = buildLanguagesHtml(indexed, available);
+    assert.ok(html.includes("This repo"), "This repo column header present");
+    // rust is builtin -> always on; java/scala are not_enabled in the mocks.
+    assert.ok(html.includes(">always on<"), "builtin shows 'always on' for the repo");
+    assert.ok(html.includes(">not enabled<"), "an off-for-this-repo language shows 'not enabled'");
+    // The not-enabled badge tooltip states the per-repo remedy explicitly.
+    assert.ok(
+      html.includes("Full analysis is off for this repo"),
+      "not-enabled tooltip explains per-repo enablement"
+    );
+  });
+  test("builtin without its analyzer shows 'no analyzer', not a green 'always on'", () => {
+    // rust is builtin but its analyzer (rust-analyzer) can be missing: the CLI
+    // then sends repoState=needs_analyzer with status=partial. The panel must not
+    // render a green "always on" that contradicts the "partial" analysis badge.
+    const rustNoAnalyzer: LangInfo[] = [{
+      language: "rust", package: "scip-rust", sandbox: "Standard",
+      status: "partial", statusLine: "partial (run: travsr lang install rust for full analysis)",
+      repoState: "needs_analyzer",
+      installed: false, registered: true, builtin: true, needsApproval: false,
+      scipInstallType: "Command", installHint: "travsr lang install rust",
+      underlyingToolHint: "", elevatedHosts: [],
+    }];
+    const html = buildLanguagesHtml([], rustNoAnalyzer);
+    assert.ok(html.includes(">no analyzer<"), "shows 'no analyzer' for a builtin missing its analyzer");
+    assert.ok(!html.includes(">always on<"), "must not claim 'always on' while analysis is partial");
+    assert.ok(
+      html.includes("only structural analysis runs until it is"),
+      "no-analyzer tooltip explains the analyzer is missing"
+    );
   });
   test("detects empty indexed section", () => {
     const html = buildLanguagesHtml([], []);

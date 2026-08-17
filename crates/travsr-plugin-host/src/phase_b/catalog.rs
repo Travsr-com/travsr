@@ -69,11 +69,42 @@ pub struct ZipBinarySpec {
     pub sha256_fn: Option<fn(tag: &str) -> Option<&'static str>>,
 }
 
+/// Specifies a compressed single-binary asset on GitHub Releases that ships as a
+/// bare gzip (`.gz`) on unix and a zip on windows, each carrying exactly one
+/// executable. Unlike [`ZipBinarySpec`], nothing is left extracted on disk and
+/// no wrapper script is written: the decompressed binary lands directly in
+/// `~/.travsr/bin/<install_name>`. Used for rust-analyzer, whose upstream
+/// (rust-lang/rust-analyzer) publishes exactly this shape.
+#[derive(Debug, Clone, Copy)]
+pub struct GzBinarySpec {
+    /// GitHub repo slug, e.g. `"rust-lang/rust-analyzer"`.
+    pub repo: &'static str,
+    /// Map a release tag and Rust target triple to the asset filename. Returns a
+    /// `.gz` name on unix targets and a `.zip` name on windows; `None` when no
+    /// asset exists for the platform.
+    pub asset_fn: fn(tag: &str, target: &str) -> Option<String>,
+    /// Binary name after installation in `~/.travsr/bin/` (`.exe` appended on windows).
+    pub install_name: &'static str,
+    /// Release tag this entry is pinned to (its vendored hashes match this tag only).
+    pub version_fallback: &'static str,
+    /// Vendored sha256 of the *downloaded asset* (the `.gz` / `.zip`) for
+    /// `(tag, target)`. Returns `None` for a platform whose hash was not vendored,
+    /// which the installer treats as "no verified asset here" and refuses rather
+    /// than installing unchecked.
+    pub sha256_fn: fn(tag: &str, target: &str) -> Option<&'static str>,
+}
+
 /// How to install the underlying SCIP tool once the travsr-lang wrapper is present.
 #[derive(Debug, Clone, Copy)]
 pub enum ScipInstall {
     /// Run this command to install the underlying tool automatically.
     Command(&'static [&'static str]),
+    /// Try a toolchain-managed command first (e.g. `rustup component add
+    /// rust-analyzer`); if the underlying tool is still absent afterward — the
+    /// command's driver is not installed, or the user declined — fall back to a
+    /// pinned binary downloaded from GitHub Releases via [`GzBinarySpec`]. This is
+    /// what lets a user without `rustup` still obtain rust-analyzer.
+    CommandThenGithubGz(&'static [&'static str], GzBinarySpec),
     /// Download a pre-built binary directly from the tool's GitHub Releases.
     GithubBinary(ScipBinarySpec),
     /// Download a zip archive from GitHub Releases, extract it, and create a
@@ -136,6 +167,54 @@ pub fn scip_clang_sha256(tag: &str, target: &str) -> Option<&'static str> {
         }
         ("v0.4.0", "x86_64-unknown-linux-gnu") => {
             Some("06fd18c576f979a726c651594644ec4a35db4f471f2160b3f72eb89fa6001784")
+        }
+        _ => None,
+    }
+}
+
+/// rust-analyzer (rust-lang/rust-analyzer) ships one executable per platform:
+/// a bare gzip (`.gz`) on unix and a zip on windows. The target triple is part
+/// of the asset name, so the mapping is just a suffix rule per OS family. Covers
+/// every triple `install::current_target()` can return, plus aarch64-windows for
+/// when that leg is added — an asset with no vendored hash is refused by the
+/// installer, so naming a platform here never implies an unverified install.
+pub fn rust_analyzer_asset(_tag: &str, target: &str) -> Option<String> {
+    match target {
+        "aarch64-apple-darwin"
+        | "x86_64-apple-darwin"
+        | "x86_64-unknown-linux-gnu"
+        | "aarch64-unknown-linux-gnu" => Some(format!("rust-analyzer-{target}.gz")),
+        "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc" => {
+            Some(format!("rust-analyzer-{target}.zip"))
+        }
+        _ => None,
+    }
+}
+
+/// Vendored sha256 of each rust-analyzer asset for the pinned release. Fetched
+/// over TLS on 2026-08-17 from rust-lang/rust-analyzer, which publishes no
+/// `.sha256` sidecar — pinning + a vendored hash is the only fixity check
+/// available. A hash is only ever returned for the tag `version_fallback` points
+/// at; a different tag returns `None`, so the checksum can never be applied to
+/// the wrong asset. aarch64-pc-windows-msvc is intentionally absent: its asset
+/// exists upstream but was not hashed here, so the installer refuses it rather
+/// than downloading unverified.
+pub fn rust_analyzer_sha256(tag: &str, target: &str) -> Option<&'static str> {
+    match (tag, target) {
+        ("2026-08-17.3", "aarch64-apple-darwin") => {
+            Some("ece932daf2f077be87bf745d2eb0a62cbc550f4b1e2e31ca76dfafdd0cc599b3")
+        }
+        ("2026-08-17.3", "x86_64-apple-darwin") => {
+            Some("134a7d305991de776864e43d1e6c291f60fa2888d4b9b7749864c562c5dc28b7")
+        }
+        ("2026-08-17.3", "x86_64-unknown-linux-gnu") => {
+            Some("a559eaa29920e4c12718fba101f2055f1da0ad8bc458ef9dc1a670778cc66901")
+        }
+        ("2026-08-17.3", "aarch64-unknown-linux-gnu") => {
+            Some("941ad31c4256eec3c8457257b0fcfb696d2b4f80c0e5a996f7375a92130c2447")
+        }
+        ("2026-08-17.3", "x86_64-pc-windows-msvc") => {
+            Some("3212cc9e7ab3f6b07f97be681c2a7200f73fb0463e6f8055c214ebe0b00901f2")
         }
         _ => None,
     }
@@ -237,6 +316,23 @@ pub struct PhaseBEntry {
     pub has_share_assets: bool,
 }
 
+impl PhaseBEntry {
+    /// Whether this language's full cross-file analyzer ships with travsr — i.e.
+    /// full semantic works out of the box with no separate tool to install.
+    ///
+    /// True for python, typescript, and javascript: all three use the same bundled
+    /// Node emitter (`travsr-lsif-py` / `travsr-lsif-ts`), resolved next to the
+    /// executable or from the distribution — no external binary to install (see
+    /// `travsr-indexer/src/runner.rs`). Every other language's analyzer is external
+    /// and must be installed: rust-analyzer for rust, a downloaded analyzer for
+    /// go/java/… . This is the single fact that keeps a status renderer from
+    /// claiming a language is "active" out of the box when its analyzer is not
+    /// actually present.
+    pub fn analyzer_bundled(&self) -> bool {
+        matches!(self.language, "python" | "typescript" | "javascript")
+    }
+}
+
 pub static CATALOG: &[PhaseBEntry] = &[
     PhaseBEntry {
         language: "typescript",
@@ -282,10 +378,23 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Lsif,
         sandbox: SandboxRequirement::Standard,
         install_hint: "travsr lang install rust",
-        underlying_tool_hint: "rustup component add rust-analyzer",
+        underlying_tool_hint: "`travsr lang install rust` sets this up for you \
+            (it uses rustup if present, otherwise downloads rust-analyzer directly)",
         provider_binary: None,
         elevated_hosts: &[],
-        scip_install: ScipInstall::Command(&["rustup", "component", "add", "rust-analyzer"]),
+        // rustup is the preferred path (toolchain-matched, no decompression);
+        // when it is absent, download a pinned rust-analyzer straight from
+        // rust-lang/rust-analyzer so users without rustup are not stranded.
+        scip_install: ScipInstall::CommandThenGithubGz(
+            &["rustup", "component", "add", "rust-analyzer"],
+            GzBinarySpec {
+                repo: "rust-lang/rust-analyzer",
+                asset_fn: rust_analyzer_asset,
+                install_name: "rust-analyzer",
+                version_fallback: "2026-08-17.3",
+                sha256_fn: rust_analyzer_sha256,
+            },
+        ),
         extensions: &[".rs"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
@@ -764,6 +873,46 @@ mod vendored_hash_tests {
                     e.language
                 );
             }
+        }
+    }
+
+    /// rust-analyzer is installed via `CommandThenGithubGz`, whose `GzBinarySpec`
+    /// is pinned and always carries a vendored hash. Every asset the resolver
+    /// names for the pinned tag on a first-class platform must have a matching
+    /// 64-hex hash, and no hash may leak for a different tag.
+    #[test]
+    fn rust_analyzer_gz_spec_hashes_are_pinned_and_complete() {
+        use super::{rust_analyzer_asset, rust_analyzer_sha256, ScipInstall};
+        let rust = super::lookup("rust").expect("rust entry present");
+        let ScipInstall::CommandThenGithubGz(_, spec) = rust.scip_install else {
+            panic!("rust must install via CommandThenGithubGz");
+        };
+        let pinned = spec.version_fallback;
+        // The first-class targets `install::current_target()` can return.
+        for target in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-pc-windows-msvc",
+        ] {
+            let asset = rust_analyzer_asset(pinned, target)
+                .unwrap_or_else(|| panic!("{target}: resolver names no asset"));
+            assert!(
+                asset.ends_with(".gz") || asset.ends_with(".zip"),
+                "{target}: asset must be .gz or .zip, got {asset}"
+            );
+            let h = rust_analyzer_sha256(pinned, target)
+                .unwrap_or_else(|| panic!("{target}: no vendored hash for the pinned tag"));
+            assert_eq!(h.len(), 64, "{target}: hash must be 64 hex chars");
+            assert!(
+                h.chars().all(|c| c.is_ascii_hexdigit()),
+                "{target}: non-hex in vendored hash"
+            );
+            assert!(
+                rust_analyzer_sha256("some-other-tag", target).is_none(),
+                "{target}: a hash was returned for a tag the entry is not pinned to"
+            );
         }
     }
 

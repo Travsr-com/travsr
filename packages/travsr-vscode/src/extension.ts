@@ -880,12 +880,12 @@ export function buildFileListHtml(
   const tsPill = `<button id="pill-ts"
     style="${mode === "tree-sitter" ? activeStyle : inactiveStyle}"
     onclick="setMode('tree-sitter')"
-    title="Structural analysis — Tree-sitter import/call edges (always available)"
+    title="Structural analysis — single-file structure and best-effort calls (always available)"
     aria-pressed="${mode === "tree-sitter"}"
-  >Tree-sitter</button>`;
+  >Structural</button>`;
 
   const semTooltip = semanticAvailable
-    ? "Semantic analysis — precise RefCall edges from SCIP/LSIF (Phase B)"
+    ? "Semantic analysis — precise cross-file calls and references"
     : installHint
       ? `Semantic analysis not yet available. ${installHint}`
       : "Semantic analysis not yet available for this language.";

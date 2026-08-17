@@ -97,7 +97,6 @@ export function webviewShell(title: string, body: string, script: string): strin
   .badge { border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600; }
   .badge.ok { background: var(--green-deep); color: var(--green); }
   .badge.stale { background: var(--orange-deep); color: var(--orange); }
-  .badge.elevated { background: #3b2000; color: var(--gold); }
   .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
   .addrow { display: flex; gap: 8px; margin: 14px 0; align-items: flex-start; flex-wrap: wrap; }
   .cards { display: flex; gap: 12px; flex-wrap: wrap; }
@@ -964,6 +963,19 @@ export interface LangInfo {
   language: string;
   package: string;
   sandbox: "Standard" | "Elevated";
+  /** Authoritative status computed by the CLI — render this, never re-derive it.
+   *  `active` = full cross-file analysis is live; `partial` = structure only;
+   *  `needs_approval` = one-time approval required; `unsupported` = no build here. */
+  status: "active" | "partial" | "needs_approval" | "unsupported";
+  /** The exact plain wording the CLI shows for this status — used as the tooltip. */
+  statusLine: string;
+  /** Per-repo enablement for the target repo (corpus trust gate), computed by the
+   *  CLI. `always_on` = builtin, no per-repo step; `enabled` = on for this repo;
+   *  `needs_analyzer` = authorized for this repo but the analyzer is not installed
+   *  yet (e.g. rust without rust-analyzer) — only structural analysis runs until it
+   *  is; `not_enabled` = installed globally but off for this repo; `no_repo` = the
+   *  CLI was not run inside a git repo. Stable machine tag — render, never re-derive. */
+  repoState: "always_on" | "enabled" | "needs_analyzer" | "not_enabled" | "no_repo";
   installed: boolean;
   registered: boolean;
   builtin: boolean;
@@ -975,7 +987,11 @@ export interface LangInfo {
 }
 
 /** Languages panel: indexed section + available section with install/approve actions. */
-export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]): string {
+export function buildLanguagesHtml(
+  indexed: LangCount[],
+  available: LangInfo[],
+  targetRepo?: string
+): string {
   // ── Indexed section ──────────────────────────────────────────────────────────
   const indexedRows = indexed.length
     ? indexed
@@ -987,7 +1003,7 @@ export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]):
         .join("\n")
     : `<tr><td colspan="2" class="empty" style="font-style:normal">No language metadata yet.&nbsp; <button class="btn primary" id="initBtn" onclick="initRepo(this)">Initialize this repo</button></td></tr>`;
   const indexedNote = indexed.length
-    ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural (tree-sitter) analysis — includes test &amp; fixture files.</p>`
+    ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural analysis — includes test &amp; fixture files.</p>`
     : "";
 
   // ── Available section ────────────────────────────────────────────────────────
@@ -996,32 +1012,30 @@ export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]):
   const availRows = available
     .map((l) => {
       const detected = detectedLangs.has(l.language);
-      // Builtins bypass lang.toml registration — their semantic analysis runs whenever
-      // the underlying tool is installed, regardless of the registered field.
-      const active = l.builtin ? l.installed : (l.registered && l.installed);
+      // Render the CLI's computed status — never re-derive it here, so the panel
+      // can never disagree with `travsr lang list`. `active` means full cross-file
+      // analysis is live; everything else is `partial` (structure still works).
+      const isActive = l.status === "active";
 
-      // Sandbox badge
-      const sandboxBadge =
-        l.sandbox === "Elevated"
-          ? `<span class="badge elevated">Elevated</span>`
-          : `<span class="badge ok">Standard</span>`;
+      // Analysis column: the same word the CLI shows, with its plain line as the
+      // tooltip. No "SCIP/LSIF/Phase B" jargon reaches the user.
+      const semCls =
+        l.status === "active" ? "ok" : l.status === "needs_approval" ? "dim" : "stale";
+      const semText =
+        l.status === "active"
+          ? "active"
+          : l.status === "needs_approval"
+            ? "needs approval"
+            : "partial";
+      const analysisBadges = `<span class="badge ${semCls}" title="${esc(l.statusLine)}">${semText}</span>`;
 
-      // Semantic column: single badge reflecting Phase B SCIP/LSIF registration state.
-      // Tree-sitter structural analysis is unconditional and not shown here.
-      const semCls = active ? "ok" : l.registered ? "stale" : "dim";
-      const semTitle = active
-        ? "Semantic analysis enabled (SCIP/LSIF active)"
-        : l.registered
-          ? "Registered but underlying tool not found — reinstall to fix"
-          : "Semantic analysis not enabled";
-      const analysisBadges = `<span class="badge ${semCls}" title="${semTitle}">${active ? "enabled" : l.registered ? "partial" : "disabled"}</span>`;
-
-      // Raw action HTML (used directly when detected or active; wrapped otherwise)
+      // Raw action HTML (used directly when detected or active; wrapped otherwise).
       let rawAction: string;
-      if (l.builtin) {
-        rawAction = `<span class="badge ok" title="Built-in to the travsr binary — always active, cannot be disabled">Built-in</span>`;
-      } else if (active) {
+      if (isActive && !l.builtin) {
         rawAction = `<button class="btn danger" onclick="removeLang(this,'${esc(l.language)}')">Disable</button>`;
+      } else if (isActive) {
+        // A built-in analyzer that is live (e.g. python): nothing to install or turn off.
+        rawAction = `<span class="badge ok" title="${esc(l.statusLine)}">on</span>`;
       } else if (l.needsApproval) {
         rawAction = `<details class="consent">
   <summary>Grant access &amp; Install</summary>
@@ -1029,7 +1043,7 @@ export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]):
     <label>Approver GitHub handle</label>
     <input id="by_${esc(l.language)}" placeholder="your-github-handle">
     <label>Reason (one sentence)</label>
-    <input id="reason_${esc(l.language)}" placeholder="e.g. Need Java SCIP for service indexing">
+    <input id="reason_${esc(l.language)}" placeholder="e.g. Enable Java cross-file analysis for service indexing">
     <label>Permitted hosts (comma-separated)</label>
     <input id="hosts_${esc(l.language)}" value="${esc(l.elevatedHosts.join(","))}" placeholder="${esc(l.elevatedHosts.join(","))}">
     <button class="btn primary" onclick="approveLang(this,'${esc(l.language)}')">Grant &amp; Install</button>
@@ -1050,22 +1064,52 @@ export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]):
       // Gate: undetected + inactive non-builtins get a disclosure instead of a direct button.
       // Builtins always show their badge directly — they're always available regardless of repo.
       const actionCell =
-        !detected && !active && !l.builtin
+        !detected && !isActive && !l.builtin
           ? `<details class="not-here"><summary>Not in this repo</summary><div class="not-here-body">${rawAction}</div></details>`
           : rawAction;
 
+      // This repo: is full analysis actually turned on for the target repo (the
+      // corpus trust gate), independent of whether the tool is installed. This is
+      // the fact that keeps "active on this machine" from being read as "on here".
+      const repoText = {
+        always_on: "always on",
+        enabled: "enabled",
+        needs_analyzer: "no analyzer",
+        not_enabled: "not enabled",
+        no_repo: "n/a",
+      }[l.repoState];
+      const repoCls =
+        l.repoState === "enabled" || l.repoState === "always_on"
+          ? "ok"
+          : l.repoState === "not_enabled" || l.repoState === "needs_analyzer"
+            ? "stale"
+            : "dim";
+      const repoTip = {
+        always_on: "Built in — always on for every repo",
+        enabled: "Full analysis is on for this repo",
+        needs_analyzer: `Authorized for this repo, but its analyzer isn't installed yet — only structural analysis runs until it is. Install it: travsr lang install ${l.language}`,
+        not_enabled: `Full analysis is off for this repo. Enable it: travsr lang install ${l.language} (run in this repo)`,
+        no_repo: "Open a repo to see per-repo status",
+      }[l.repoState];
+      const repoBadge = `<span class="badge ${repoCls}" title="${esc(repoTip)}">${repoText}</span>`;
+
       return `<tr>
 <td><span class="mono">${esc(l.language)}</span></td>
-<td class="mono muted">${esc(l.package)}</td>
-<td>${sandboxBadge}</td>
 <td>${analysisBadges}</td>
+<td>${repoBadge}</td>
 <td>${actionCell}</td></tr>`;
     })
     .join("\n");
 
+  // When several repos are open the panel names the one install/detect will
+  // target and offers a one-click change, so the destination is never a guess.
+  const sub = targetRepo
+    ? `<p class="sub">Target repo: <b>${esc(targetRepo)}</b> — install &amp; detect run here. <a href="#" onclick="pickRepo();return false" style="color:var(--green)">change</a></p>`
+    : `<p class="sub">Indexed languages in this repo and available semantic analysis tools.</p>`;
+
   const body = `
 <h2>Languages</h2>
-<p class="sub">Indexed languages in this repo and available semantic analysis tools.</p>
+${sub}
 <div class="toolbar">
   <button class="btn" id="detectBtn" onclick="detectLangs(this)">Detect &amp; install</button>
   <button class="btn" id="refreshBtn" onclick="doRefresh(this)" title="Refresh indexed counts (fast)">Refresh</button>
@@ -1079,11 +1123,14 @@ export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]):
 </section>
 <section>
   <h3>Available tools</h3>
-  <table><thead><tr><th>Language</th><th>Package</th><th>Sandbox</th><th>Semantic</th><th>Action</th></tr></thead>
-  <tbody>${availRows || '<tr><td colspan="5" class="empty">No language tools found. Is the travsr binary on PATH?</td></tr>'}</tbody></table>
+  <table><thead><tr><th>Language</th><th>Semantic</th><th>This repo</th><th>Action</th></tr></thead>
+  <tbody>${availRows || '<tr><td colspan="4" class="empty">No language tools found. Is the travsr binary on PATH?</td></tr>'}</tbody></table>
 </section>`;
 
   const script = `
+function pickRepo() {
+  vscode.postMessage({command:'pickRepo'});
+}
 function installLang(btn, lang) {
   setLoading(btn, true, 'Install');
   vscode.postMessage({command:'installLang', language:lang});

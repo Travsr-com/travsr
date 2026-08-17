@@ -95,9 +95,8 @@ fn indexed_repo(lang: &str) -> tempfile::TempDir {
     ]);
 
     // First pass establishes the corpus. For a non-builtin language this pass
-    // *cannot* produce semantic data: ADR-017 Rule 3 gates external tooling on
-    // a per-corpus trust grant, and a repo nobody has trusted yet does not have
-    // one. The grant needs the corpus id, which only exists after this runs.
+    // *cannot* produce semantic data: ADR-017 Rule 3 gates external tooling on a
+    // per-corpus trust grant, and a repo nobody has enabled yet has none.
     let out = Command::new(travsr())
         .args(["init", "--semantic"])
         .current_dir(root)
@@ -109,77 +108,48 @@ fn indexed_repo(lang: &str) -> tempfile::TempDir {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let init_text =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-    if let Some(corpus) = corpus_from_hint(&init_text) {
-        // Serialized because the grant is a read-modify-write of the *global*
-        // `~/.travsr/lang.toml`: two tests granting at once can lose one
-        // another's `trusted_corpora` entry, and the loser then indexes with
-        // no semantic data and reports its language as broken.
-        //
-        // Held here rather than left to `--test-threads=1` on the command
-        // line. A suite that only works with a flag people have to remember
-        // fails intermittently for whoever forgets, and an intermittently red
-        // suite gets ignored, which costs more than the lost parallelism.
+    // Enable the repo the way the tool now tells a user to: run `lang install`
+    // inside it. That registers the language and auto-grants trust for *this*
+    // repo's corpus. The analyzer is already present (`provider_active` gated us
+    // in), so nothing is downloaded; a builtin needs no grant and this is a
+    // harmless no-op there.
+    //
+    // Serialized because the grant is a read-modify-write of the *global*
+    // `~/.travsr/lang.toml`: two tests enabling at once can lose one another's
+    // `trusted_corpora` entry, and the loser then indexes with no semantic data
+    // and reports its language as broken. Held here rather than left to
+    // `--test-threads=1`, which people forget, giving an intermittently red suite
+    // that gets ignored.
+    {
         let _guard = trust_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let granted = Command::new(travsr())
-            .args(["lang", "add", lang, "--corpus", &corpus])
+        let enabled = Command::new(travsr())
+            .args(["lang", "install", lang])
             .current_dir(root)
             .output()
-            .expect("travsr lang add");
+            .expect("travsr lang install");
         assert!(
-            granted.status.success(),
-            "trust grant failed for {lang}/{corpus}: {}",
-            String::from_utf8_lossy(&granted.stderr)
-        );
-        // Re-index now that the sidecar is allowed to run at all.
-        let out = Command::new(travsr())
-            .args(["init", "--semantic"])
-            .current_dir(root)
-            .output()
-            .expect("travsr re-init");
-        assert!(
-            out.status.success(),
-            "re-init failed for {lang}: {}",
-            String::from_utf8_lossy(&out.stderr)
+            enabled.status.success(),
+            "enabling {lang} failed: {}",
+            String::from_utf8_lossy(&enabled.stderr)
         );
     }
 
+    // Re-index now that the sidecar is allowed to run at all.
+    let out = Command::new(travsr())
+        .args(["init", "--semantic"])
+        .current_dir(root)
+        .output()
+        .expect("travsr re-init");
+    assert!(
+        out.status.success(),
+        "re-init failed for {lang}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     wait_for_phase_b(root, lang);
     dir
-}
-
-/// The corpus id, taken from the trust hint `init` prints when a language is
-/// gated:
-///
-/// ```text
-/// corpus not trusted for: c - run `travsr lang add <lang> --corpus local/tmp-x` to enable
-/// ```
-///
-/// Read out of that line rather than recomputed, for two reasons. The id is
-/// normalized from the directory name, so a test that reimplemented the rule
-/// could pass while trusting a different corpus than the binary gated. And
-/// this is literally the command the message tells a user to run, so the test
-/// exercises the documented recovery rather than a private path around it.
-///
-/// `None` when no hint appeared, which is the normal case for a builtin
-/// language that needs no grant.
-fn corpus_from_hint(init_output: &str) -> Option<String> {
-    init_output
-        .lines()
-        .find(|l| l.contains("--corpus"))
-        .and_then(|l| {
-            let after = l.split("--corpus").nth(1)?;
-            let token = after.split_whitespace().next()?;
-            Some(
-                token
-                    .trim_matches(|c: char| c == '`' || c == '\'' || c == '"')
-                    .to_string(),
-            )
-        })
-        .filter(|c| !c.is_empty())
 }
 
 /// Block until Phase B has settled for this repo.

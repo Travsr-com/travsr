@@ -124,14 +124,8 @@ pub fn run() -> anyhow::Result<()> {
         format!(" | rerank: {}", payload.rerank)
     };
     println!(
-        "nodes: {} | edges: {} | schema: v{} | journal: {} | last_commit: {} | semantic: {}{}",
-        payload.nodes,
-        payload.edges,
-        payload.schema,
-        payload.journal,
-        last_commit,
-        phase_b_state,
-        rerank_segment
+        "nodes: {} | edges: {} | schema: v{} | last_commit: {} | semantic: {}{}",
+        payload.nodes, payload.edges, payload.schema, last_commit, phase_b_state, rerank_segment
     );
 
     // #645 WS-B: the freshness markers only ever compare against each other,
@@ -152,7 +146,7 @@ pub fn run() -> anyhow::Result<()> {
     let sig_v = payload.signature_format_version;
     if sig_v != travsr_core::SIGNATURE_FORMAT_VERSION {
         eprintln!(
-            "warning: signature format v{sig_v} != current v{} — graph built with an older format; run `travsr init` to re-index",
+            "warning: this index was built with an older version of travsr (format v{sig_v}, current v{}) — run `travsr init` to rebuild it",
             travsr_core::SIGNATURE_FORMAT_VERSION
         );
     }
@@ -170,19 +164,19 @@ pub fn run() -> anyhow::Result<()> {
     // analyzers without having to re-read the init output.
     if let Some(warnings) = &payload.phase_b_warnings {
         if !warnings.is_empty() {
-            // #414 follow-up: the trust hint should name the repo's actual
-            // corpus (derived from the git remote, not guessable). Read it
-            // from the store meta stamped by init; best-effort — a failed
-            // read falls back to the placeholder.
-            let corpus = if warnings.contains("untrusted_corpus") {
-                daemon_client::open_read_store(&db_path)
-                    .ok()
-                    .and_then(|s| s.get_meta("corpus").ok().flatten())
-                    .filter(|c| !c.is_empty())
-            } else {
-                None
-            };
-            let corpus = corpus.as_deref().unwrap_or("<your-corpus>");
+            // Trust is per-repo, not per-language: a single `install` enables
+            // every language at once, so collapse the "not enabled here" notices
+            // into one line rather than repeating it per language (matches init).
+            let untrusted: Vec<&str> = warnings
+                .split(',')
+                .filter_map(|w| w.strip_prefix("untrusted_corpus:"))
+                .collect();
+            if !untrusted.is_empty() {
+                eprintln!(
+                    "warning: semantic analysis is not enabled for this repository yet ({}) — run `travsr lang install <lang>` here to enable",
+                    untrusted.join(", ")
+                );
+            }
             for warn in warnings.split(',') {
                 let parts: Vec<&str> = warn.splitn(2, ':').collect();
                 match parts.as_slice() {
@@ -197,12 +191,12 @@ pub fn run() -> anyhow::Result<()> {
                         let v: Vec<&str> = rest.splitn(3, ':').collect();
                         if let [lang, expected, got] = v.as_slice() {
                             eprintln!(
-                                "warning: '{lang}' sidecar protocol v{got} != expected v{expected} — run `travsr lang install {lang}`"
+                                "warning: the '{lang}' analyzer is out of date (protocol v{got}, expected v{expected}) — run `travsr lang install {lang}`"
                             );
                         }
                     }
                     ["needs_approval", lang] => eprintln!(
-                        "warning: '{lang}' requires elevated sandbox approval — run `travsr lang approve {lang}`"
+                        "warning: '{lang}' needs a one-time network approval before it can index — run `travsr lang approve {lang}`"
                     ),
                     // #712: analyzer ran but produced no nodes over the repo's
                     // source files of this language — a silent zero-node result,
@@ -216,7 +210,7 @@ pub fn run() -> anyhow::Result<()> {
                     // which the host now forwards on stderr.
                     ["zero_nodes", lang] => {
                         eprintln!(
-                            "warning: semantic analyzer for '{lang}' ran but produced no symbols despite '{lang}' sources in the repo. The analyzer is installed and active, so reinstalling will not help — its sidecar likely could not parse or resolve these sources. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see the sidecar's own diagnostics"
+                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help — it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
                         );
                         // #724 Finding 4: the most common cause of a zero-node
                         // Java run on macOS is scip-java's javac shim crashing
@@ -231,21 +225,19 @@ pub fn run() -> anyhow::Result<()> {
                     // never ran, previously a silent skip that left the user
                     // with "0 references" and no explanation.
                     ["skipped_unregistered", lang] => eprintln!(
-                        "warning: '{lang}' sources found but semantic indexing is not set up. Run `travsr lang install {lang}`"
+                        "warning: '{lang}' sources found but full analysis is not set up. Run `travsr lang install {lang}`"
                     ),
-                    // #414 (ADR-017 Rule 3): registered language, but this
-                    // repo's corpus has no per-corpus trust grant, so its
-                    // external tooling was not spawned.
-                    ["untrusted_corpus", lang] => eprintln!(
-                        "warning: '{lang}' is registered but this repository's corpus is not trusted for semantic indexing. Run `travsr lang add {lang} --corpus {corpus}` to trust it"
-                    ),
+                    // #414 (ADR-017 Rule 3): registered globally but this repo was
+                    // never enabled. Collapsed into one combined line above the
+                    // loop (trust is per-repo, so one install fixes all of them).
+                    ["untrusted_corpus", _] => {}
                     ["skipped_no_analyzer", lang] => eprintln!(
                         "warning: '{lang}' is registered but its analyzer binary is missing. Run `travsr lang install {lang}`"
                     ),
                     // L5a: scip-clang (c/cpp) needs a compile_commands.json at the
                     // repo root — without one it hangs, so it is skipped up front.
                     ["skipped_no_compdb", lang] => eprintln!(
-                        "warning: '{lang}' semantic indexing needs a compile_commands.json at the repo root. Generate one (e.g. `bear -- make`, or CMake's CMAKE_EXPORT_COMPILE_COMMANDS) to enable it"
+                        "warning: full '{lang}' analysis needs a compile database (compile_commands.json) at the repo root. Generate one (e.g. `bear -- make`, or CMake's CMAKE_EXPORT_COMPILE_COMMANDS)"
                     ),
                     // E6: SCIP definitions that did not unify onto their Phase A
                     // tree-sitter node — their references attribute to an orphaned
@@ -259,24 +251,32 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
-    // M1 / #738: warn when Rust semantic edges are degraded.
+    // M1 / #738: warn when Rust's full cross-file edges are degraded. The
+    // sandbox remedy is per-OS: only Linux has a sandbox the user can install
+    // (bubblewrap); Windows and macOS have none to add here, so the only path
+    // to full edges is the trusted-repo opt-in. `cfg!` (not `#[cfg]`) keeps
+    // every platform's wording compiled and checked.
     if let Some(reason) = &payload.rust_lsif_degraded {
         match reason.as_str() {
-            "sandbox_unavailable" => eprintln!(
-                "warning: Rust semantic edges degraded — rust-analyzer LSIF was \
-                 skipped because the OS sandbox (bubblewrap/sandbox-exec) is \
-                 unavailable. Install bubblewrap, or re-run \
-                 `travsr init --allow-unsandboxed-lsif` if you trust this repo."
-            ),
+            "sandbox_unavailable" => {
+                let remedy = if cfg!(target_os = "linux") {
+                    "Install bubblewrap, or re-run `travsr init --allow-unsandboxed` if you trust this repo."
+                } else {
+                    "Re-run `travsr init --allow-unsandboxed` if you trust this repo."
+                };
+                eprintln!(
+                    "warning: Rust is on basic analysis — full cross-file edges (from rust-analyzer) were skipped because they need a security sandbox that is not available here. {remedy}"
+                );
+            }
             // #738: rust-analyzer ran and produced references, but every one was
             // dropped during resolution (none matched a parsed symbol). On Windows
             // this was the path-normalization bug; if it persists after upgrading,
             // it points at a repo-root/URI mismatch worth reporting.
             "all_refs_dropped" => eprintln!(
-                "warning: Rust semantic edges degraded — rust-analyzer produced \
+                "warning: Rust is on basic analysis — rust-analyzer produced \
                  references but none could be matched to indexed symbols, so no \
                  type-resolved call edges were added (structural call edges are \
-                 unaffected). Re-run `travsr init --force --allow-unsandboxed-lsif \
+                 unaffected). Re-run `travsr init --force --allow-unsandboxed \
                  --semantic`; if it persists, please report it."
             ),
             _ => {}

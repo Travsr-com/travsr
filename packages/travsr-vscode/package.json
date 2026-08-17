@@ -68,6 +68,10 @@
     },
     "commands": [
       {
+        "command": "travsr.selectRepository",
+        "title": "Travsr: Select Repository"
+      },
+      {
         "command": "travsr.showStatus",
         "title": "Travsr: Show Status"
       },
