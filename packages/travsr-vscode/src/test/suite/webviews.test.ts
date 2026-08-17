@@ -25,6 +25,7 @@ const LANG: LangInfo = {
   sandbox: "Standard",
   status: "active",
   statusLine: "active",
+  repoState: "enabled",
   installed: true,
   registered: true,
   builtin: false,
@@ -107,7 +108,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
   const available: LangInfo[] = [
     {
       language: "rust", package: "scip-rust", sandbox: "Standard",
-      status: "active", statusLine: "active",
+      status: "active", statusLine: "active", repoState: "always_on",
       installed: true, registered: true, builtin: true, needsApproval: false,
       scipInstallType: "Command", installHint: "travsr lang install rust",
       underlyingToolHint: "", elevatedHosts: [],
@@ -115,6 +116,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     {
       language: "java", package: "scip-java", sandbox: "Elevated",
       status: "needs_approval", statusLine: "needs approval (run: travsr lang install java)",
+      repoState: "not_enabled",
       installed: false, registered: false, builtin: false, needsApproval: true,
       scipInstallType: "GithubBinary", installHint: "travsr lang install java",
       underlyingToolHint: "", elevatedHosts: ["repo1.maven.org"],
@@ -122,6 +124,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     {
       language: "scala", package: "scip-scala", sandbox: "Elevated",
       status: "partial", statusLine: "partial (run: travsr lang install scala for full analysis)",
+      repoState: "not_enabled",
       installed: false, registered: false, builtin: false, needsApproval: false,
       scipInstallType: "Manual", installHint: "travsr lang install scala",
       underlyingToolHint: "https://docs.scala-lang.org/scip", elevatedHosts: [],
@@ -156,6 +159,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     const uninstalledRust: LangInfo[] = [{
       language: "rust", package: "scip-rust", sandbox: "Standard",
       status: "partial", statusLine: "partial (run: travsr lang install rust for full analysis)",
+      repoState: "always_on",
       installed: false, registered: false, builtin: false, needsApproval: false,
       scipInstallType: "Command", installHint: "travsr lang install rust",
       underlyingToolHint: "", elevatedHosts: [],
@@ -175,6 +179,18 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     assert.ok(html.includes("full analysis"), "plain statusLine used as tooltip");
     assert.ok(!/SCIP|LSIF|Phase B|Built-in to the travsr/.test(html), "no internal jargon in the panel");
     assert.ok(html.includes("Semantic"), "Semantic column header present");
+  });
+  test("This repo column shows per-repo enablement with the CLI's tag", () => {
+    const html = buildLanguagesHtml(indexed, available);
+    assert.ok(html.includes("This repo"), "This repo column header present");
+    // rust is builtin -> always on; java/scala are not_enabled in the mocks.
+    assert.ok(html.includes(">always on<"), "builtin shows 'always on' for the repo");
+    assert.ok(html.includes(">not enabled<"), "an off-for-this-repo language shows 'not enabled'");
+    // The not-enabled badge tooltip states the per-repo remedy explicitly.
+    assert.ok(
+      html.includes("Full analysis is off for this repo"),
+      "not-enabled tooltip explains per-repo enablement"
+    );
   });
   test("detects empty indexed section", () => {
     const html = buildLanguagesHtml([], []);

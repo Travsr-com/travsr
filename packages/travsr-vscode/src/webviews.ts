@@ -970,6 +970,11 @@ export interface LangInfo {
   status: "active" | "partial" | "needs_approval" | "unsupported";
   /** The exact plain wording the CLI shows for this status — used as the tooltip. */
   statusLine: string;
+  /** Per-repo enablement for the target repo (corpus trust gate), computed by the
+   *  CLI. `always_on` = builtin, no per-repo step; `enabled` = on for this repo;
+   *  `not_enabled` = installed globally but off for this repo; `no_repo` = the CLI
+   *  was not run inside a git repo. Stable machine tag — render, never re-derive. */
+  repoState: "always_on" | "enabled" | "not_enabled" | "no_repo";
   installed: boolean;
   registered: boolean;
   builtin: boolean;
@@ -1068,11 +1073,35 @@ export function buildLanguagesHtml(
           ? `<details class="not-here"><summary>Not in this repo</summary><div class="not-here-body">${rawAction}</div></details>`
           : rawAction;
 
+      // This repo: is full analysis actually turned on for the target repo (the
+      // corpus trust gate), independent of whether the tool is installed. This is
+      // the fact that keeps "active on this machine" from being read as "on here".
+      const repoText = {
+        always_on: "always on",
+        enabled: "enabled",
+        not_enabled: "not enabled",
+        no_repo: "n/a",
+      }[l.repoState];
+      const repoCls =
+        l.repoState === "enabled" || l.repoState === "always_on"
+          ? "ok"
+          : l.repoState === "not_enabled"
+            ? "stale"
+            : "dim";
+      const repoTip = {
+        always_on: "Built in — always on for every repo",
+        enabled: "Full analysis is on for this repo",
+        not_enabled: `Full analysis is off for this repo. Enable it: travsr lang install ${l.language} (run in this repo)`,
+        no_repo: "Open a repo to see per-repo status",
+      }[l.repoState];
+      const repoBadge = `<span class="badge ${repoCls}" title="${esc(repoTip)}">${repoText}</span>`;
+
       return `<tr>
 <td><span class="mono">${esc(l.language)}</span></td>
 <td class="mono muted">${esc(l.package)}</td>
 <td>${sandboxBadge}</td>
 <td>${analysisBadges}</td>
+<td>${repoBadge}</td>
 <td>${actionCell}</td></tr>`;
     })
     .join("\n");
@@ -1099,8 +1128,8 @@ ${sub}
 </section>
 <section>
   <h3>Available tools</h3>
-  <table><thead><tr><th>Language</th><th>Package</th><th>Sandbox</th><th>Semantic</th><th>Action</th></tr></thead>
-  <tbody>${availRows || '<tr><td colspan="5" class="empty">No language tools found. Is the travsr binary on PATH?</td></tr>'}</tbody></table>
+  <table><thead><tr><th>Language</th><th>Package</th><th>Sandbox</th><th>Semantic</th><th>This repo</th><th>Action</th></tr></thead>
+  <tbody>${availRows || '<tr><td colspan="6" class="empty">No language tools found. Is the travsr binary on PATH?</td></tr>'}</tbody></table>
 </section>`;
 
   const script = `

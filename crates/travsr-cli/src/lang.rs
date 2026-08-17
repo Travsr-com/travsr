@@ -257,6 +257,17 @@ impl RepoState {
             RepoState::NotInRepo => "n/a",
         }
     }
+
+    /// Stable machine tag for JSON consumers (the VS Code panel). Never reworded
+    /// once shipped: it is an API surface, not UI copy.
+    fn tag(&self) -> &'static str {
+        match self {
+            RepoState::BuiltinAlwaysOn => "always_on",
+            RepoState::Enabled => "enabled",
+            RepoState::NotEnabled => "not_enabled",
+            RepoState::NotInRepo => "no_repo",
+        }
+    }
 }
 
 fn json_str(s: &str) -> String {
@@ -271,6 +282,17 @@ fn json_arr(items: &[&str]) -> String {
 fn cmd_list(json: bool) -> Result<()> {
     let config = load_config();
     let today = chrono::Local::now().date_naive();
+
+    // Per-repo enablement (corpus trust gate): languages install globally, but
+    // full analysis only runs in a repo whose corpus carries the trust grant.
+    // Resolve the current repo's corpus once and share it across the JSON and
+    // text renderings, so both agree with what `invoke_phase_b_all` enforces.
+    let corpus = current_repo_corpus();
+    let in_repo = corpus.is_some();
+    let corpus_trusted = match (&corpus, &config) {
+        (Some(c), Some(cfg)) => cfg.is_corpus_trusted(c),
+        _ => false,
+    };
 
     if json {
         let mut entries: Vec<String> = Vec::new();
@@ -312,13 +334,18 @@ fn cmd_list(json: bool) -> Result<()> {
             // machine tag; `statusLine` is the exact human wording used in the CLI,
             // so the extension shows the same words without re-deriving them.
             let status = lang_capability_status(entry, registered, approved);
+            // Per-repo enablement for the repo we are being run in (corpus trust
+            // gate). The VS Code panel runs `lang list --json` with the target
+            // repo as cwd, so this reflects that repo.
+            let repo_state = RepoState::compute(entry, registered, in_repo, corpus_trusted);
             entries.push(format!(
-                r#"{{"language":{},"package":{},"sandbox":{},"status":{},"statusLine":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{}}}"#,
+                r#"{{"language":{},"package":{},"sandbox":{},"status":{},"statusLine":{},"repoState":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{}}}"#,
                 json_str(entry.language),
                 json_str(package),
                 json_str(sandbox),
                 json_str(status.tag()),
                 json_str(&status.line()),
+                json_str(repo_state.tag()),
                 installed,
                 registered,
                 entry.builtin,
@@ -335,15 +362,8 @@ fn cmd_list(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Per-repo enablement: languages install globally, but full analysis only
-    // runs in a repo whose corpus carries the trust grant. Resolve the current
-    // repo's corpus once and reuse it for every row.
-    let corpus = current_repo_corpus();
-    let in_repo = corpus.is_some();
-    let corpus_trusted = match (&corpus, &config) {
-        (Some(c), Some(cfg)) => cfg.is_corpus_trusted(c),
-        _ => false,
-    };
+    // `corpus`, `in_repo` and `corpus_trusted` were resolved once at the top of
+    // this function and are shared with the JSON branch above.
     let mut any_not_enabled = false;
 
     println!("{:<12} {:<13} STATUS", "LANGUAGE", "THIS REPO");
