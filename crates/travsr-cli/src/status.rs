@@ -257,21 +257,35 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
-    // M1: warn when Rust's full cross-file edges were skipped for lack of a
-    // security sandbox. The remedy is per-OS: only Linux has a sandbox the user
-    // can install (bubblewrap); Windows and macOS have none to add here, so the
-    // only path to full edges is the trusted-repo opt-in. `cfg!` (not `#[cfg]`)
-    // keeps every platform's wording compiled and checked.
+    // M1 / #738: warn when Rust's full cross-file edges are degraded. The
+    // sandbox remedy is per-OS: only Linux has a sandbox the user can install
+    // (bubblewrap); Windows and macOS have none to add here, so the only path
+    // to full edges is the trusted-repo opt-in. `cfg!` (not `#[cfg]`) keeps
+    // every platform's wording compiled and checked.
     if let Some(reason) = &payload.rust_lsif_degraded {
-        if reason == "sandbox_unavailable" {
-            let remedy = if cfg!(target_os = "linux") {
-                "Install bubblewrap, or re-run `travsr init --allow-unsandboxed-lsif` if you trust this repo."
-            } else {
-                "Re-run `travsr init --allow-unsandboxed-lsif` if you trust this repo."
-            };
-            eprintln!(
-                "warning: Rust is on basic analysis — full cross-file edges (from rust-analyzer) were skipped because they need a security sandbox that is not available here. {remedy}"
-            );
+        match reason.as_str() {
+            "sandbox_unavailable" => {
+                let remedy = if cfg!(target_os = "linux") {
+                    "Install bubblewrap, or re-run `travsr init --allow-unsandboxed-lsif` if you trust this repo."
+                } else {
+                    "Re-run `travsr init --allow-unsandboxed-lsif` if you trust this repo."
+                };
+                eprintln!(
+                    "warning: Rust is on basic analysis — full cross-file edges (from rust-analyzer) were skipped because they need a security sandbox that is not available here. {remedy}"
+                );
+            }
+            // #738: rust-analyzer ran and produced references, but every one was
+            // dropped during resolution (none matched a parsed symbol). On Windows
+            // this was the path-normalization bug; if it persists after upgrading,
+            // it points at a repo-root/URI mismatch worth reporting.
+            "all_refs_dropped" => eprintln!(
+                "warning: Rust is on basic analysis — rust-analyzer produced \
+                 references but none could be matched to indexed symbols, so no \
+                 type-resolved call edges were added (structural call edges are \
+                 unaffected). Re-run `travsr init --force --allow-unsandboxed-lsif \
+                 --semantic`; if it persists, please report it."
+            ),
+            _ => {}
         }
     }
 

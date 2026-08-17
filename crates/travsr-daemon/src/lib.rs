@@ -1652,13 +1652,18 @@ pub fn init_repo_with_progress(
             // no dangling ref/call edge is ever written.
             let mut lsif_covered: std::collections::HashSet<(String, u32, String)> =
                 std::collections::HashSet::new();
+            // #738: track how many positional refs survived resolution so the
+            // degradation flag reflects landed edges, not just "did ra run".
+            let lsif_parsed = pb_positional.len();
+            let mut lsif_resolved = 0usize;
             match store.resolve_lsif_positional_refs(&corpus, &pb_positional) {
                 Ok(resolved) => {
                     tracing::debug!(
-                        positional_in = pb_positional.len(),
+                        positional_in = lsif_parsed,
                         resolved = resolved.len(),
                         "semantic analysis: rust-analyzer positional refs resolved"
                     );
+                    lsif_resolved = resolved.len();
                     // E7: remember which call sites LSIF positionally resolved,
                     // keyed by the resolved callee's leaf name too — a suppression
                     // keyed only on (path, line) would drop a second real call
@@ -1679,8 +1684,15 @@ pub fn init_repo_with_progress(
                 resolved_cross_crate_edges = resolved.len(),
                 "semantic analysis cross-reference resolution complete"
             );
-            let (report, alias_map) =
-                write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+            let (report, alias_map) = write_phase_b_results(
+                &mut store,
+                &corpus,
+                pb_nodes,
+                pb_edges,
+                pb_refs,
+                pb_outcome,
+                (lsif_parsed, lsif_resolved),
+            );
             // WS-2: flag Dart packages indexed without resolved dependencies.
             record_dart_resolution_state(&mut store, repo_root, present_languages.contains("dart"));
             // E1: edges resolved by native leaf-name heuristics are tree-sitter,
@@ -2581,6 +2593,11 @@ fn write_phase_b_results(
     pb_edges: Vec<travsr_core::Edge>,
     pb_refs: Vec<travsr_core::ScipRef>,
     pb_outcome: travsr_plugin_host::PhaseBOutcome,
+    // #738: rust-analyzer LSIF positional-ref resolution stats for this cycle
+    // (parsed_from_dump, survived_resolution). Used to detect a 100% drop — the
+    // Windows path bug where every ref parsed but none matched a Phase A node —
+    // so `rust_lsif_degraded` reflects surviving edges, not just "did ra run".
+    lsif_stats: (usize, usize),
 ) -> (
     PhaseBReport,
     std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId>,
@@ -2735,15 +2752,26 @@ fn write_phase_b_results(
         let _ = store.set_meta("phase_b_warnings", "");
     }
 
-    // M1 degradation flag: record when rust-analyzer LSIF was skipped because
-    // the OS sandbox was unavailable and --allow-unsandboxed-lsif was not set.
-    // Surfaced by `travsr status` so the user knows Rust semantic edges are
-    // degraded without having to grep logs.
-    if travsr_indexer::sandbox::ra_lsif_sandbox_was_skipped() {
-        let _ = store.set_meta("rust_lsif_degraded", "sandbox_unavailable");
+    // M1 degradation flag: surfaced by `travsr status` so the user knows Rust
+    // semantic edges are degraded without having to grep logs. Precedence:
+    //  1. `sandbox_unavailable` — rust-analyzer never ran (OS sandbox missing and
+    //     --allow-unsandboxed-lsif not set).
+    //  2. `all_refs_dropped` (#738) — rust-analyzer ran and produced positional
+    //     refs, but NONE survived resolution (every callee matched no Phase A
+    //     node). Previously invisible: the flag tracked "did ra run", not "did any
+    //     edge land", so the Windows path bug cleared the warning while silently
+    //     dropping 100% of edges. Only fires on a total wipeout of a non-empty
+    //     batch, so a repo whose refs are all legitimately out-of-tree is not
+    //     flagged in the common case (it has resolvable in-tree calls too).
+    let (lsif_parsed, lsif_resolved) = lsif_stats;
+    let degraded = if travsr_indexer::sandbox::ra_lsif_sandbox_was_skipped() {
+        "sandbox_unavailable"
+    } else if lsif_parsed > 0 && lsif_resolved == 0 {
+        "all_refs_dropped"
     } else {
-        let _ = store.set_meta("rust_lsif_degraded", "");
-    }
+        ""
+    };
+    let _ = store.set_meta("rust_lsif_degraded", degraded);
 
     let report = PhaseBReport {
         corpus: corpus.to_string(),
@@ -3282,13 +3310,17 @@ fn run_background_phase_b_inner(
     // never dangled.
     let mut lsif_covered: std::collections::HashSet<(String, u32, String)> =
         std::collections::HashSet::new();
+    // #738: track surviving positional refs for the degradation flag.
+    let lsif_parsed = pb_positional.len();
+    let mut lsif_resolved = 0usize;
     match s.resolve_lsif_positional_refs(&corpus, &pb_positional) {
         Ok(resolved) => {
             tracing::debug!(
-                positional_in = pb_positional.len(),
+                positional_in = lsif_parsed,
                 resolved = resolved.len(),
                 "semantic analysis: rust-analyzer positional refs resolved"
             );
+            lsif_resolved = resolved.len();
             // E7: remember which call sites LSIF positionally resolved, keyed
             // by the resolved callee's leaf name too (#I2) — see lsif_covered_keys.
             lsif_covered.extend(lsif_covered_keys(&s, &resolved));
@@ -3311,8 +3343,15 @@ fn run_background_phase_b_inner(
         }
     }
 
-    let (report, alias_map) =
-        write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+    let (report, alias_map) = write_phase_b_results(
+        &mut s,
+        &corpus,
+        pb_nodes,
+        pb_edges,
+        pb_refs,
+        pb_outcome,
+        (lsif_parsed, lsif_resolved),
+    );
     // WS-2: flag Dart packages indexed without resolved dependencies.
     record_dart_resolution_state(&mut s, repo_root, dart_present);
     // E1: native leaf-name resolved edges are tree-sitter-heuristic — truthful
@@ -5655,6 +5694,7 @@ mod tests {
             Vec::new(),
             pb_refs,
             travsr_plugin_host::PhaseBOutcome::default(),
+            (0, 0),
         );
 
         // Literal repro from issue #449: "ClassA (Swift class instantiated via
@@ -6064,6 +6104,7 @@ mod tests {
             vec![],
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
+            (0, 0),
         );
         assert!(
             !linked(&store),
@@ -6078,10 +6119,73 @@ mod tests {
             vec![],
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
+            (0, 0),
         );
         assert!(
             linked(&store),
             "a cycle that writes a crate node links crate -> package"
+        );
+    }
+
+    /// #738: the `rust_lsif_degraded` flag must reflect surviving edges, not just
+    /// "did rust-analyzer run". A cycle that parsed positional refs but resolved
+    /// zero of them (the Windows path-mismatch signature) must record
+    /// `all_refs_dropped`; a cycle that resolved at least one must clear the flag;
+    /// and an empty batch must not be flagged (a repo with no rust refs at all is
+    /// not degraded).
+    #[test]
+    fn write_phase_b_results_flags_all_refs_dropped_on_total_wipeout() {
+        // The flag is gated on `!ra_lsif_sandbox_was_skipped()`; reset the
+        // process-global latch so a prior run cannot force `sandbox_unavailable`.
+        travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store =
+            travsr_store::SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+
+        let degraded = |store: &travsr_store::SqliteStore| {
+            store
+                .get_meta("rust_lsif_degraded")
+                .unwrap()
+                .unwrap_or_default()
+        };
+
+        let run = |store: &mut travsr_store::SqliteStore, stats: (usize, usize)| {
+            travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+            write_phase_b_results(
+                store,
+                "test",
+                vec![],
+                vec![],
+                vec![],
+                travsr_plugin_host::PhaseBOutcome::default(),
+                stats,
+            );
+        };
+
+        // Parsed refs but none resolved -> total wipeout -> flagged.
+        run(&mut store, (7, 0));
+        assert_eq!(
+            degraded(&store),
+            "all_refs_dropped",
+            "a 100% ref drop must set the degradation flag"
+        );
+
+        // At least one ref survived -> healthy -> flag cleared.
+        run(&mut store, (7, 3));
+        assert_eq!(
+            degraded(&store),
+            "",
+            "a partially-resolved batch is not degraded and must clear the flag"
+        );
+
+        // No refs parsed at all -> not a wipeout -> not flagged.
+        run(&mut store, (0, 0));
+        assert_eq!(
+            degraded(&store),
+            "",
+            "an empty ref batch (no rust refs) must not be flagged as degraded"
         );
     }
 

@@ -3082,9 +3082,8 @@ fn get_repo_map_raw(store: &SqliteStore, reserve_per_line: usize) -> String {
     // call-graph data is absent, which affects the tools the agent calls next.
     if !has_refcall {
         header.push_str(
-            "Note: semantic analysis has not run — dependents are from \
-             import structure only; call-graph data is unavailable. Commit to \
-             build it.\n",
+            "Note: semantic analysis has not run — dependents are from import \
+             structure only; call-graph data is unavailable. Commit to run it.\n",
         );
     }
 
