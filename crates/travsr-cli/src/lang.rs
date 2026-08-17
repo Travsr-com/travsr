@@ -218,6 +218,47 @@ fn lang_capability_status(
     )
 }
 
+/// Whether a language's full analysis is turned on for the repo we are standing
+/// in. Mirrors the gate in `invoke_phase_b_all` exactly: builtins always run;
+/// every other language runs only when it is registered AND this repo's corpus
+/// carries the per-repo trust grant.
+enum RepoState {
+    /// Builtin (ts/js/python/rust) — ships in the binary, never per-repo gated.
+    BuiltinAlwaysOn,
+    /// Registered and this repo's corpus is trusted — full analysis runs here.
+    Enabled,
+    /// Inside a repo, but not registered and/or the corpus is untrusted.
+    NotEnabled,
+    /// Not inside a git repo, so there is no repo to enable for.
+    NotInRepo,
+}
+
+impl RepoState {
+    fn compute(entry: &PhaseBEntry, registered: bool, in_repo: bool, corpus_trusted: bool) -> Self {
+        if entry.builtin {
+            return RepoState::BuiltinAlwaysOn;
+        }
+        if !in_repo {
+            return RepoState::NotInRepo;
+        }
+        if registered && corpus_trusted {
+            RepoState::Enabled
+        } else {
+            RepoState::NotEnabled
+        }
+    }
+
+    /// The cell text for the THIS REPO column.
+    fn cell(&self) -> &'static str {
+        match self {
+            RepoState::BuiltinAlwaysOn => "always on",
+            RepoState::Enabled => "enabled",
+            RepoState::NotEnabled => "not enabled",
+            RepoState::NotInRepo => "n/a",
+        }
+    }
+}
+
 fn json_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -294,8 +335,19 @@ fn cmd_list(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<12} STATUS", "LANGUAGE");
-    println!("{}", "-".repeat(48));
+    // Per-repo enablement: languages install globally, but full analysis only
+    // runs in a repo whose corpus carries the trust grant. Resolve the current
+    // repo's corpus once and reuse it for every row.
+    let corpus = current_repo_corpus();
+    let in_repo = corpus.is_some();
+    let corpus_trusted = match (&corpus, &config) {
+        (Some(c), Some(cfg)) => cfg.is_corpus_trusted(c),
+        _ => false,
+    };
+    let mut any_not_enabled = false;
+
+    println!("{:<12} {:<13} STATUS", "LANGUAGE", "THIS REPO");
+    println!("{}", "-".repeat(60));
 
     for entry in CATALOG {
         let registered = config
@@ -322,7 +374,39 @@ fn cmd_list(json: bool) -> Result<()> {
             })
             .unwrap_or_default();
 
-        println!("{:<12} {}{}", entry.language, status.line(), expiry);
+        // Is full analysis turned on for the repo we are in? (corpus trust gate)
+        let repo_state = RepoState::compute(entry, registered, in_repo, corpus_trusted);
+        if matches!(repo_state, RepoState::NotEnabled) {
+            any_not_enabled = true;
+        }
+
+        println!(
+            "{:<12} {:<13} {}{}",
+            entry.language,
+            repo_state.cell(),
+            status.line(),
+            expiry
+        );
+    }
+
+    // Explain the THIS REPO column once, below the table, rather than repeating a
+    // remedy on every row.
+    if !in_repo {
+        println!();
+        println!(
+            "THIS REPO shows 'n/a' because you are not inside a git repository. \
+             cd into a repo to enable languages there."
+        );
+    } else if any_not_enabled {
+        println!();
+        println!(
+            "'not enabled' means full analysis is off for THIS repo even when the tool \
+             is installed globally."
+        );
+        println!(
+            "Turn a language on for this repo:  travsr lang install <language>   \
+             (run inside the repo)"
+        );
     }
 
     // RFC-025 §8: sidecar version health for the installed Phase B tools
@@ -1408,6 +1492,13 @@ struct ElevatedApproval {
 impl LangConfig {
     pub(crate) fn is_registered(&self, language: &str) -> bool {
         self.registered.iter().any(|l| l == language)
+    }
+
+    /// Whether a repo (by corpus id) has the per-repo Phase B trust grant.
+    /// This is the half of the gate that `invoke_phase_b_all` checks per repo;
+    /// `is_registered` is the global per-language half.
+    pub(crate) fn is_corpus_trusted(&self, corpus: &str) -> bool {
+        self.trusted_corpora.iter().any(|c| c == corpus)
     }
 
     fn is_approved(&self, language: &str) -> bool {
