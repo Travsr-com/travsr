@@ -152,8 +152,32 @@ answer underneath it. Assert on `r.out` when the warning *is* the subject.
 Raising is fine. The runner turns an unexpected exception into a FAIL with a
 traceback, so a broken check is never mistaken for a passing one.
 
-## Not wired into CI
+## CI
 
-`--tag` needs a published release, so it cannot run on a pull request. `--binary`
-can, and is the mode to wire up if the team wants this gating merges; it takes a
-few minutes because it indexes a real repo and waits on Phase B.
+Three jobs, split by what each can actually run.
+
+| Workflow | Job | When | Mode |
+| --- | --- | --- | --- |
+| `ci.yml` | `automation self-test` | every PR | `selftest.py`, seconds, no binary |
+| `ci.yml` | `automation regression` | every PR | `--binary target/debug/travsr` |
+| `release-sanity.yml` | `sanity (ubuntu / macos)` | release published, or manual with a tag | `--tag` |
+
+`--tag` cannot run on a pull request, because there is nothing published to
+download. That is the whole reason it is a separate workflow rather than another
+job in `ci.yml`.
+
+The regression job builds **debug**, not release: it indexes a seven-file
+fixture, so compile time dominates and a release build would roughly double the
+job for no extra signal.
+
+Neither CI job passes `--strict-skip`. On a bare runner `cosign` and the
+c/c++ sidecars are legitimately absent, and the suite lists every skip in its
+summary rather than folding one into a pass, so failing on them would make the
+job red for reasons that have nothing to do with the release. Verified on a
+simulated bare runner (empty `HOME`, so no `~/.travsr/bin`): 33 passed, 0 failed,
+8 skipped. Native Phase B needs no sidecar, so the cross-language, MCP and
+honesty phases are real coverage there.
+
+To verify a tag by hand: Actions, "Release sanity", "Run workflow", enter the
+tag. Results land as a JUnit and JSON artifact plus a job summary listing every
+failure and every skip.

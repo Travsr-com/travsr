@@ -1,0 +1,119 @@
+name: Release sanity
+
+# Verifies a *published* release artifact, which is why this cannot live in ci.yml:
+# there is nothing to download on a pull request.
+#
+# Runs automatically when a release is published, and on demand for any tag. The
+# on-demand path is the one that matters before a promotion: `promote` republishes
+# the source channel's artifacts byte for byte without rebuilding, so checking a
+# tag before promoting it is the last point where a bad artifact can be caught.
+#
+# It found #724, #726, #727 and #728 on v1.0.0-beta.1, three of which had already
+# shipped in a tagged artifact testers were being asked to install, and #741 on
+# v1.0.0-rc.1.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to verify (e.g. v1.0.0-rc.1)'
+        required: true
+      with_cpp:
+        description: 'Also exercise c/c++ (needs the scip-clang sidecar on the runner)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-sanity-${{ github.event.inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  sanity:
+    name: sanity (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both, deliberately. The functional phases only ever execute the host's
+        # own binary, so a single runner leaves the other platform's artifact
+        # verified by byte inspection alone. Windows is excluded only because the
+        # fixture's git and shell assumptions are not portable yet; the artifact
+        # phase still checks its build id from any host.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the tag under test
+        id: t
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.event.release.tag_name }}"
+          [ -n "$TAG" ] || { echo "no tag to verify" >&2; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "verifying $TAG"
+
+      # The suite needs `gh` to download release assets. Present on GitHub-hosted
+      # runners; authenticated via GH_TOKEN below.
+      - name: Run the sanity suite
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [ "${{ github.event.inputs.with_cpp }}" = "true" ]; then
+            EXTRA="--with-cpp"
+          fi
+          # No --strict-skip: cosign and the c/c++ sidecars are legitimately
+          # absent on a bare runner, and the suite lists every skip in its summary
+          # rather than folding one into a pass. Failing on those would make the
+          # job red for reasons that are not about the release.
+          python3 travsrAutomation/run.py \
+            --tag "${{ steps.t.outputs.tag }}" \
+            $EXTRA \
+            --json "sanity-${{ matrix.os }}.json" \
+            --junit "sanity-${{ matrix.os }}.xml"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-sanity-${{ matrix.os }}
+          path: |
+            sanity-${{ matrix.os }}.json
+            sanity-${{ matrix.os }}.xml
+          if-no-files-found: warn
+
+      # A published release that fails this is worth surfacing beyond a red check,
+      # since by then users can already download it.
+      - name: Summarise
+        if: always()
+        shell: bash
+        run: |
+          F="sanity-${{ matrix.os }}.json"
+          if [ ! -f "$F" ]; then
+            echo "### Release sanity did not produce results on ${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - "$F" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          t = d["totals"]
+          print(f"### {d['subject']} on ${{ matrix.os }}")
+          print()
+          print(f"{t['pass']} passed, {t['fail']} failed, {t['skip']} skipped")
+          for label, key in (("Failures", "fail"), ("Skipped (not verified)", "skip")):
+              rows = [r for r in d["results"] if r["outcome"] == key]
+              if rows:
+                  print(f"\n**{label}**\n")
+                  for r in rows:
+                      tag = " (#" + ", #".join(r["issues"]) + ")" if r["issues"] else ""
+                      detail = (r["detail"] or "").splitlines()
+                      print(f"- `{r['phase']}` {r['name']}{tag}" + (f" — {detail[0]}" if detail else ""))
+          PY
