@@ -7,7 +7,8 @@ use anyhow::{Context as _, Result};
 use clap::Subcommand;
 use std::path::PathBuf;
 use travsr_plugin_host::phase_b::catalog::{
-    lookup, PhaseBEntry, SandboxRequirement, ScipBinarySpec, ScipInstall, ZipBinarySpec, CATALOG,
+    lookup, GzBinarySpec, PhaseBEntry, SandboxRequirement, ScipBinarySpec, ScipInstall,
+    ZipBinarySpec, CATALOG,
 };
 use travsr_plugin_host::sandbox::policy::validate_permitted_host;
 
@@ -15,7 +16,7 @@ const APPROVAL_EXPIRY_DAYS: i64 = 365;
 
 #[derive(Debug, Subcommand)]
 pub enum LangCommand {
-    /// Show all known Phase B language tools and their status.
+    /// Show every supported language and whether full analysis is available.
     ///
     /// #727: aliased to `status` because every other area of the CLI spells this
     /// `status` (`travsr status`, `daemon status`, `embed status`, `rerank
@@ -27,54 +28,52 @@ pub enum LangCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Install and register a Phase B tool for a language.
+    /// Set up full cross-file analysis (calls and references) for a language.
     ///
-    /// Downloads the travsr-lang-* wrapper binary from GitHub Releases into
-    /// ~/.travsr/bin/ and registers the language for Phase B indexing.
-    /// For languages that need network access during indexing (Java, Kotlin,
-    /// Scala, C#), an interactive security approval step is included.
+    /// Downloads the language's analyzer into ~/.travsr/bin/ and turns on full
+    /// analysis for it. For languages that reach the network while analyzing
+    /// (Java, Kotlin, Scala, C#), a one-time security approval step is included.
     Install {
-        /// Canonical language name (e.g. rust, go, python).
+        /// Language name (e.g. rust, go, python).
         language: String,
-        /// Re-download and overwrite the wrapper even if already installed.
+        /// Re-download and overwrite the analyzer even if it is already installed.
         #[arg(long)]
         reinstall: bool,
         /// Skip all interactive prompts — for CI / scripting.
         #[arg(long)]
         no_interactive: bool,
-        /// Advanced: enable semantic analysis for a specific repository identity
+        /// Advanced: turn on full analysis for a specific repository identity
         /// instead of the current one (auto-detected). Rarely needed.
         #[arg(long)]
         corpus: Option<String>,
-        /// Skip downloading the wrapper binary; only register in config.
+        /// Only turn the language on in config; do not download its analyzer.
         #[arg(long)]
         skip_wrapper: bool,
-        /// Auto-confirm the SCIP tool install command without interactive prompt.
-        /// Useful for --no-interactive invocations from the VS Code extension.
+        /// Auto-confirm the analyzer install without prompting. Used by the VS
+        /// Code extension's non-interactive installs.
         #[arg(long)]
         yes: bool,
-        /// Pin the downloaded analysis-tool binary to a specific release tag
-        /// (e.g. --version v0.3.0) instead of the latest release. Applies to
-        /// tools fetched from GitHub Releases; the travsr-lang wrapper still
-        /// tracks latest. Tools with a vendored checksum stay pinned and reject
-        /// a mismatching version.
+        /// Pin the downloaded analyzer to a specific release (e.g. --version
+        /// v0.3.0) instead of the latest one. Applies to analyzers fetched from
+        /// GitHub releases. Analyzers with a built-in checksum stay pinned and
+        /// reject a mismatching version.
         #[arg(long)]
         version: Option<String>,
     },
-    /// Scan the current repo, detect supported languages, and install them.
+    /// Scan this repo, detect its languages, and set up full analysis for them.
     Detect,
-    /// Register and install a Phase B tool for a language (legacy — prefer `install`).
+    /// Set up full analysis for a language (older name for `install`).
     Add {
-        /// Canonical language name (e.g. rust, java, php).
+        /// Language name (e.g. rust, java, php).
         language: String,
-        /// Advanced: enable semantic analysis for a specific repository identity
+        /// Advanced: turn on full analysis for a specific repository identity
         /// instead of the current one (auto-detected). Rarely needed.
         #[arg(long)]
         corpus: Option<String>,
     },
-    /// Unregister a Phase B tool for a language.
+    /// Turn off full analysis for a language.
     Remove {
-        /// Canonical language name.
+        /// Language name.
         language: String,
     },
     /// Record security approval for a language that needs network access during indexing.
@@ -260,6 +259,7 @@ fn cmd_list(json: bool) -> Result<()> {
                 ScipInstall::GithubBinary(_) => "GithubBinary",
                 ScipInstall::ZipBinary(_) => "ZipBinary",
                 ScipInstall::Command(_) => "Command",
+                ScipInstall::CommandThenGithubGz(_, _) => "CommandThenGithubGz",
                 ScipInstall::Manual => "Manual",
             };
             // #588: `installed:false` alone cannot distinguish "run the install
@@ -540,6 +540,68 @@ fn cmd_install(
     Ok(InstallStatus::FullyReady)
 }
 
+/// Result of attempting a package-manager install command.
+enum CmdOutcome {
+    /// The command was run; `success` is its exit status.
+    Ran { success: bool },
+    /// The command was not run — declined in interactive mode, or only printed
+    /// as a hint in non-interactive/non-`--yes` mode.
+    NotRun,
+}
+
+/// Run (or hint at) a package-manager install command for `entry`, honouring the
+/// same interactive / `--yes` / hint gating every `Command`-style install uses.
+/// Shared by the plain `Command` path and the `CommandThenGithubGz` path so the
+/// two never drift.
+fn run_pkg_command(
+    entry: &PhaseBEntry,
+    cmd_args: &[&str],
+    interactive: bool,
+    yes: bool,
+) -> Result<CmdOutcome> {
+    let do_run = if interactive {
+        use std::io::Write as _;
+        print!(
+            "'{}' is not installed.\nInstall via: {}\nRun it now? [Y/n]: ",
+            entry.command,
+            cmd_args.join(" ")
+        );
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("y")
+    } else if yes {
+        println!("Auto-installing: {}", cmd_args.join(" "));
+        true
+    } else {
+        println!(
+            "Note: '{}' not found. Install it:\n\n\t{}",
+            entry.command,
+            cmd_args.join(" ")
+        );
+        false
+    };
+    if !do_run {
+        return Ok(CmdOutcome::NotRun);
+    }
+    let mut child = std::process::Command::new(cmd_args[0])
+        .args(&cmd_args[1..])
+        .spawn()
+        .with_context(|| format!("running '{}'", cmd_args.join(" ")))?;
+    let status = child.wait()?;
+    if status.success() {
+        println!("{} installed.", entry.command);
+    } else {
+        println!(
+            "Install command exited with {status}.\nRun manually: {}",
+            cmd_args.join(" ")
+        );
+    }
+    Ok(CmdOutcome::Ran {
+        success: status.success(),
+    })
+}
+
 /// Attempt to install or hint for the underlying SCIP tool. Returns true if the
 /// tool is now on PATH (or was already present), false if still missing.
 fn install_scip_tool(
@@ -554,7 +616,9 @@ fn install_scip_tool(
     if override_version.is_some()
         && !matches!(
             entry.scip_install,
-            ScipInstall::GithubBinary(_) | ScipInstall::ZipBinary(_)
+            ScipInstall::GithubBinary(_)
+                | ScipInstall::ZipBinary(_)
+                | ScipInstall::CommandThenGithubGz(_, _)
         )
     {
         eprintln!(
@@ -565,46 +629,42 @@ fn install_scip_tool(
     }
     match entry.scip_install {
         ScipInstall::Command(cmd_args) => {
-            let do_run = if interactive {
-                use std::io::Write as _;
-                print!(
-                    "'{}' is not installed.\nInstall via: {}\nRun it now? [Y/n]: ",
-                    entry.command,
-                    cmd_args.join(" ")
+            if let CmdOutcome::Ran { success: true } =
+                run_pkg_command(entry, cmd_args, interactive, yes)?
+            {
+                // Trust exit 0: the binary may be in $GOPATH/bin, ~/.cargo/bin,
+                // or another tool-managed dir not yet in the process's PATH.
+                return Ok(true);
+            }
+        }
+        ScipInstall::CommandThenGithubGz(cmd_args, ref spec) => {
+            // Preferred path: the toolchain-managed command (e.g. `rustup
+            // component add rust-analyzer`) — version-matched and no
+            // decompression. Only attempt it when its driver is actually present;
+            // a user without rustup skips straight to the pinned GitHub download.
+            let driver = cmd_args[0];
+            if tool_available(driver) {
+                run_pkg_command(entry, cmd_args, interactive, yes)?;
+                if tool_available(entry.command) {
+                    return Ok(true);
+                }
+                // Driver present but the tool is still missing (declined or the
+                // command failed): fall through to the download rather than
+                // leaving semantic analysis off.
+                println!(
+                    "'{}' still isn't available via {driver}. Downloading a \
+                     ready-to-run {} from its official releases instead.",
+                    entry.command, entry.command
                 );
-                std::io::stdout().flush()?;
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer)?;
-                answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("y")
-            } else if yes {
-                println!("Auto-installing: {}", cmd_args.join(" "));
-                true
             } else {
                 println!(
-                    "Note: '{}' not found. Install it:\n\n\t{}",
-                    entry.command,
-                    cmd_args.join(" ")
+                    "'{driver}' isn't installed, so '{}' can't be added that way. \
+                     Downloading a ready-to-run {} from its official releases instead.",
+                    entry.command, entry.command
                 );
-                false
-            };
-            if do_run {
-                let mut child = std::process::Command::new(cmd_args[0])
-                    .args(&cmd_args[1..])
-                    .spawn()
-                    .with_context(|| format!("running '{}'", cmd_args.join(" ")))?;
-                let status = child.wait()?;
-                if status.success() {
-                    println!("{} installed.", entry.command);
-                    // Trust exit 0: the binary may be in $GOPATH/bin, ~/.cargo/bin,
-                    // or another tool-managed dir not yet in the process's PATH.
-                    return Ok(true);
-                } else {
-                    println!(
-                        "Install command exited with {status}.\nRun manually: {}",
-                        cmd_args.join(" ")
-                    );
-                }
             }
+            install_gz_github_binary(entry, spec, override_version)?;
+            return Ok(tool_available(entry.command));
         }
         ScipInstall::GithubBinary(ref spec) => {
             install_scip_github_binary(entry, spec, override_version)?;
@@ -617,21 +677,17 @@ fn install_scip_tool(
         ScipInstall::Manual => {
             if !entry.underlying_tool_hint.is_empty() {
                 println!(
-                    "'{}' not found.\n\
+                    "'{}' is not installed.\n\
                      \n\
-                     SCIP is an open standard for deep code intelligence (call graphs,\n\
-                     type resolution, cross-file references). '{}' is the SCIP indexer\n\
-                     for {} that travsr needs for semantic analysis.\n\
+                     travsr needs it to see calls and references across files for {}\n\
+                     (full cross-file analysis). Without it, only basic single-file\n\
+                     analysis runs.\n\
                      \n\
                      Install it, then re-run `travsr lang install {}`.\n\
                      \n\
-                     Docs / install instructions:\n\
+                     How to install it:\n\
                      \t{}",
-                    entry.command,
-                    entry.command,
-                    entry.language,
-                    entry.language,
-                    entry.underlying_tool_hint
+                    entry.command, entry.language, entry.language, entry.underlying_tool_hint
                 );
             }
         }
@@ -751,6 +807,104 @@ fn install_scip_github_binary(
             // writing it, so scip-java installed but was silently omitted from the
             // sidecars block. Record the resolved release tag now — the version we
             // just downloaded — so the tool is visible and floor-checked.
+            if let Some(vpath) = travsr_plugin_host::sidecar_version::version_sidecar_path(&path) {
+                if let Err(e) = std::fs::write(&vpath, format!("{tag}\n")) {
+                    tracing::debug!(path = %vpath.display(), error = %e, "could not write version sidecar file");
+                }
+            }
+            if !crate::install::path_contains_travsr_bin() {
+                println!("\n{}", crate::install::path_hint());
+            }
+        }
+        Err(e) => {
+            println!(
+                "Download failed: {e:#}\n\
+                 Install '{}' manually:\n\t{}",
+                entry.command, entry.underlying_tool_hint
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Download a pinned single-executable release that ships compressed (`.gz` on
+/// unix, `.zip` on windows) and install the binary into `~/.travsr/bin`. This is
+/// the rust-analyzer fallback used when `rustup` is unavailable.
+///
+/// The entry is always pinned (its hash is vendored for one exact tag), so
+/// `--version` may only ask for that same tag; `resolve_install_tag` rejects any
+/// other. A platform with no vendored hash is refused rather than downloaded
+/// unverified.
+fn install_gz_github_binary(
+    entry: &travsr_plugin_host::phase_b::catalog::PhaseBEntry,
+    spec: &GzBinarySpec,
+    override_version: Option<&str>,
+) -> Result<()> {
+    let target = match crate::install::current_target() {
+        Ok(t) => t,
+        Err(e) => {
+            println!(
+                "Cannot determine your platform ({e}).\n\
+                 Install '{}' manually:\n\t{}",
+                entry.command, entry.underlying_tool_hint
+            );
+            return Ok(());
+        }
+    };
+
+    // Always pinned: the vendored hash only matches `version_fallback`, so the
+    // tag never floats to `releases/latest`.
+    let tag = resolve_install_tag(
+        true,
+        spec.version_fallback,
+        override_version,
+        spec.install_name,
+        || Ok(spec.version_fallback.to_string()),
+    )?;
+
+    let asset_name = match (spec.asset_fn)(&tag, target) {
+        Some(a) => a,
+        None => {
+            println!(
+                "'{}' has no pre-built binary for your platform ({target}).\n\
+                 Install it manually:\n\t{}",
+                entry.command, entry.underlying_tool_hint
+            );
+            return Ok(());
+        }
+    };
+
+    // Fail closed: an asset we never hashed is refused, not fetched over TLS alone.
+    let expected = match (spec.sha256_fn)(&tag, target) {
+        Some(h) => h.to_string(),
+        None => {
+            println!(
+                "'{}' {tag} for {target} has no verified checksum on record, so it \
+                 will not be downloaded automatically.\n\
+                 Install it manually:\n\t{}",
+                entry.command, entry.underlying_tool_hint
+            );
+            return Ok(());
+        }
+    };
+
+    println!("Downloading {} {} ...", spec.install_name, tag);
+
+    let repo = spec.repo.to_string();
+    let tag2 = tag.clone();
+    let asset2 = asset_name.clone();
+    let name2 = spec.install_name.to_string();
+    let target2 = target.to_string();
+
+    match run_async(async move {
+        crate::install::download_ra_binary(&repo, &tag2, &asset2, &name2, &target2, &expected).await
+    }) {
+        Ok(path) => {
+            println!("{} installed to {}", spec.install_name, path.display());
+            // Record the resolved release tag next to the binary — rust-analyzer
+            // uses date-based tags that don't parse as semver, so this is what
+            // `travsr status` reads back rather than a `--version` probe.
             if let Some(vpath) = travsr_plugin_host::sidecar_version::version_sidecar_path(&path) {
                 if let Err(e) = std::fs::write(&vpath, format!("{tag}\n")) {
                     tracing::debug!(path = %vpath.display(), error = %e, "could not write version sidecar file");

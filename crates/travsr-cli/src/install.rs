@@ -889,6 +889,77 @@ pub async fn download_zip_and_extract(
     Ok(dest)
 }
 
+/// Download a single-executable release asset that ships compressed — a bare
+/// gzip (`.gz`) on unix, a zip on windows — verify it against its vendored
+/// sha256, decompress in memory, and install the one binary it carries into
+/// `~/.travsr/bin/<install_name>` (`.exe` appended on windows).
+///
+/// This is the rust-analyzer path: upstream publishes no `.sha256` sidecar, so
+/// `expected_sha256` (vendored in the catalog for the pinned tag) is the only
+/// fixity check and is required — the asset is verified *before* any
+/// decompression, so a replaced archive is never opened. Returns the installed
+/// binary's path.
+pub async fn download_ra_binary(
+    repo: &str,
+    tag: &str,
+    asset_name: &str,
+    install_name: &str,
+    target: &str,
+    expected_sha256: &str,
+) -> Result<PathBuf> {
+    let dest_dir = travsr_bin_dir()?;
+    let dest = dest_dir.join(format!("{install_name}{}", exe_suffix_for_target(target)));
+    if std::env::var(SKIP_DOWNLOAD_ENV).is_ok() {
+        return Ok(dest);
+    }
+
+    // The compressed asset is small (~15 MB); the decompressed binary is ~40 MB.
+    const RA_ASSET_SIZE_LIMIT: u64 = 200 * 1024 * 1024;
+
+    let asset_url = format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building HTTP client")?;
+
+    let label = format!("{asset_name} at {tag}");
+    let asset_bytes = fetch_verified(
+        &client,
+        &asset_url,
+        &label,
+        RA_ASSET_SIZE_LIMIT,
+        Integrity::Vendored(expected_sha256),
+    )
+    .await?;
+
+    // Decompress to the raw executable. `.gz` is a single gzip member; the
+    // windows `.zip` carries `rust-analyzer.exe` (plus a `.pdb` we ignore).
+    let binary = if asset_name.ends_with(".gz") {
+        gunzip_single(&asset_bytes).with_context(|| format!("decompressing {asset_name}"))?
+    } else if asset_name.ends_with(".zip") {
+        zip_extract_single_exe(&asset_bytes)
+            .with_context(|| format!("extracting the executable from {asset_name}"))?
+    } else {
+        // No other shape is emitted by `rust_analyzer_asset`; treat the bytes as
+        // the binary itself rather than silently corrupting the install.
+        asset_bytes
+    };
+
+    let tmp = dest_dir.join(format!("{install_name}.tmp.{}", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, &binary)
+        .with_context(|| format!("writing temp file {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .context("setting executable permission")?;
+    }
+    replace_file(&tmp, &dest)?;
+
+    Ok(dest)
+}
+
 fn parse_sha256_line(line: &str) -> Result<String> {
     let hex = line
         .split_whitespace()
@@ -1462,6 +1533,61 @@ pub(crate) fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Decompress a single-member gzip stream into memory, capping the output so a
+/// crafted stream cannot balloon past [`MAX_ARCHIVE_BYTES`] (the input is
+/// already bounded by the download size limit; this bounds the *output*).
+pub(crate) fn gunzip_single(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    anyhow::ensure!(
+        bytes.len() <= MAX_ARCHIVE_BYTES,
+        "compressed asset is {} bytes, over the {MAX_ARCHIVE_BYTES}-byte limit",
+        bytes.len()
+    );
+    let mut out = Vec::new();
+    let read = flate2::read::GzDecoder::new(bytes)
+        .take(MAX_ARCHIVE_BYTES as u64 + 1)
+        .read_to_end(&mut out)
+        .context("gunzip")?;
+    anyhow::ensure!(
+        read <= MAX_ARCHIVE_BYTES,
+        "decompressed binary exceeds the {MAX_ARCHIVE_BYTES}-byte limit"
+    );
+    Ok(out)
+}
+
+/// Read the single `*.exe` member out of a zip archive into memory. Used for
+/// upstreams (rust-analyzer on windows) that ship one executable plus debug
+/// side files (`.pdb`) in a zip; the first `.exe` is the binary we install.
+pub(crate) fn zip_extract_single_exe(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    anyhow::ensure!(
+        bytes.len() <= MAX_ARCHIVE_BYTES,
+        "archive is {} bytes, over the {MAX_ARCHIVE_BYTES}-byte limit",
+        bytes.len()
+    );
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("reading zip archive")?;
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).context("reading a zip entry")?;
+        // `enclosed_name` rejects traversal entries; we only read into memory
+        // anyway, but the name check keeps a hostile archive from matching.
+        let is_exe = file
+            .enclosed_name()
+            .map(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")))
+            .unwrap_or(false);
+        if file.is_file() && is_exe {
+            anyhow::ensure!(
+                file.size() <= MAX_ARCHIVE_BYTES as u64,
+                "zip member exceeds the {MAX_ARCHIVE_BYTES}-byte limit"
+            );
+            let mut out = Vec::with_capacity(file.size() as usize);
+            file.read_to_end(&mut out).context("reading zip member")?;
+            return Ok(out);
+        }
+    }
+    bail!("no .exe member found in zip archive")
+}
+
 /// Check an archive against its expected hash, then extract it.
 ///
 /// #410 M2: the two steps live together because the ordering is the point.
@@ -1492,8 +1618,64 @@ pub(crate) fn verify_and_extract_zip(
 
 #[cfg(test)]
 mod extraction_tests {
-    use super::{extract_tar_gz, extract_zip, safe_entry_path, MAX_ARCHIVE_BYTES};
+    use super::{
+        extract_tar_gz, extract_zip, gunzip_single, safe_entry_path, zip_extract_single_exe,
+        MAX_ARCHIVE_BYTES,
+    };
     use std::path::Path;
+
+    /// Gzip `body` as a single member — the shape rust-analyzer ships on unix.
+    fn gzip_bytes(body: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut enc, body).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn gunzip_single_round_trips_a_binary() {
+        let payload = b"\x7fELF not-really-but-good-enough-for-a-round-trip";
+        let out = gunzip_single(&gzip_bytes(payload)).expect("gunzip");
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn gunzip_single_rejects_a_non_gzip_stream() {
+        // Raw bytes with no gzip magic must error rather than yield garbage.
+        assert!(gunzip_single(b"not gzip at all").is_err());
+    }
+
+    #[test]
+    fn zip_extract_single_exe_pulls_the_executable_out() {
+        // rust-analyzer's windows zip carries rust-analyzer.exe plus a .pdb; the
+        // extractor must return the .exe and ignore the debug file.
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file::<_, ()>(
+            "rust_analyzer.pdb",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        std::io::Write::write_all(&mut w, b"debug-symbols").unwrap();
+        w.start_file::<_, ()>(
+            "rust-analyzer.exe",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        std::io::Write::write_all(&mut w, b"MZ the-actual-binary").unwrap();
+        let bytes = w.finish().unwrap().into_inner();
+
+        let out = zip_extract_single_exe(&bytes).expect("extract exe");
+        assert_eq!(out, b"MZ the-actual-binary");
+    }
+
+    #[test]
+    fn zip_extract_single_exe_errors_when_no_exe_present() {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file::<_, ()>("readme.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut w, b"no binary here").unwrap();
+        let bytes = w.finish().unwrap().into_inner();
+        assert!(zip_extract_single_exe(&bytes).is_err());
+    }
 
     #[test]
     fn safe_entry_path_rejects_escapes() {

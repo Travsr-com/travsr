@@ -95,8 +95,8 @@ enum Command {
         /// Number of parallel parse workers (default: available CPU cores).
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
-        /// Run semantic Phase B (call edges) synchronously before returning.
-        /// By default Phase B runs in the background via the daemon.
+        /// Build full cross-file analysis (call edges) synchronously before returning.
+        /// By default it runs in the background via the daemon.
         /// Use this in CI or scripts that query call edges immediately after init.
         #[arg(long)]
         semantic: bool,
@@ -313,7 +313,7 @@ enum Command {
         #[arg(long)]
         tenants_dir: std::path::PathBuf,
     },
-    /// Manage Phase B language tools (semantic analysis).
+    /// Set up and manage full cross-file analysis per language.
     Lang {
         #[command(subcommand)]
         action: lang::LangCommand,
