@@ -17,11 +17,10 @@ const APPROVAL_EXPIRY_DAYS: i64 = 365;
 #[derive(Debug, Subcommand)]
 pub enum LangCommand {
     /// Show every supported language and whether full analysis is available.
-    ///
-    /// #727: aliased to `status` because every other area of the CLI spells this
-    /// `status` (`travsr status`, `daemon status`, `embed status`, `rerank
-    /// status`). `lang` was the only one that did not, which is why the project
-    /// docs told agents to run `travsr lang status` and got an error.
+    // Aliased to `status` because every other area of the CLI spells this
+    // `status` (`travsr status`, `daemon status`, `embed status`, `rerank
+    // status`). `lang` was the only one that did not, which is why the project
+    // docs told agents to run `travsr lang status` and got an error.
     #[command(visible_alias = "status")]
     List {
         /// Output as a JSON array for programmatic / extension use.

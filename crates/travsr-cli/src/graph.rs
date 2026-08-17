@@ -226,32 +226,48 @@ fn render(mut payload: GraphPayload, format: Format, budget: usize) -> anyhow::R
 
     match format {
         Format::Tree => {
-            if let Some(seed) = &payload.seed {
+            let rendered = if let Some(seed) = &payload.seed {
                 println!("{} ({})", seed.label, seed.kind);
                 print_tree(&payload);
+                payload.nodes.len()
             } else {
                 // --all tree mode: file listing (historic behaviour).
                 let mut files: Vec<&NodeEntry> =
                     payload.nodes.iter().filter(|n| n.kind == "file").collect();
                 files.sort_by(|a, b| a.path.cmp(&b.path));
-                for node in files {
+                for node in &files {
                     println!("{}", node.path);
                 }
-            }
-            if truncated > 0 {
-                println!("… {truncated} more nodes beyond budget (raise with --budget)");
-            }
+                files.len()
+            };
+            print_budget_footer(rendered, truncated, budget, "");
         }
         Format::Dot => {
             print_dot(&payload)?;
-            if truncated > 0 {
-                println!("// … {truncated} more nodes beyond budget (raise with --budget)");
-            }
+            print_budget_footer(payload.nodes.len(), truncated, budget, "// ");
         }
         Format::Json => print_json(&payload, budget, truncated)?,
     }
 
     Ok(())
+}
+
+/// Footer shown after a budgeted graph render. When some nodes were displayed it
+/// reports how many more were cut; when the budget was too small to display any
+/// node at all, the "N more" phrasing is misleading (there is no partial list to
+/// extend), so it says the budget is too small and how to lift it.
+fn print_budget_footer(rendered: usize, truncated: usize, budget: usize, prefix: &str) {
+    if truncated == 0 {
+        return;
+    }
+    if rendered == 0 {
+        println!(
+            "{prefix}Budget of {budget} tokens is too small to display any graph nodes — \
+             raise it with --budget (or --budget 0 for no limit)."
+        );
+    } else {
+        println!("{prefix}… {truncated} more nodes beyond budget (raise with --budget)");
+    }
 }
 
 fn print_tree(payload: &GraphPayload) {

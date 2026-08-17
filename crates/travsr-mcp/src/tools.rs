@@ -987,6 +987,154 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
     wrap_envelope(&with_head_note(store, body))
 }
 
+/// One resolved definition site, for the structured `find_references` result.
+#[derive(serde::Serialize)]
+pub struct ResolvedSymbol {
+    pub signature: String,
+    pub kind: String,
+    pub path: String,
+    pub line: Option<u32>,
+}
+
+impl ResolvedSymbol {
+    fn from_node(n: &CoreNode) -> Self {
+        Self {
+            signature: n.vname.signature.clone(),
+            kind: n.kind.clone(),
+            path: n.vname.path.clone(),
+            line: n.line,
+        }
+    }
+}
+
+/// Machine-readable `find_references` result for the CLI `--format json` path.
+///
+/// The plain [`find_references`] returns the model-facing `<travsr-data>`
+/// envelope, which is a human-readable text blob — unusable as structured data.
+/// This mirrors the same resolution and occurrence lookup but exposes the parts
+/// separately, so a script gets a real `references` array keyed off `symbol` and
+/// `resolved_to` instead of having to parse prose.
+#[derive(serde::Serialize)]
+pub struct StructuredReferences {
+    pub symbol: String,
+    pub path: Option<String>,
+    /// One of: `resolved`, `not_found`, `ambiguous`, `pending`.
+    pub status: &'static str,
+    /// The single definition the symbol resolved to, when `status == resolved`.
+    pub resolved_to: Option<ResolvedSymbol>,
+    /// Candidate definitions when the name is ambiguous, or defined outside a
+    /// `path` hint. Disambiguate by re-running with a `path`.
+    pub candidates: Vec<ResolvedSymbol>,
+    /// Exact occurrence sites (capped at `MAX_REFERENCE_SITES`).
+    pub references: Vec<travsr_core::RefSite>,
+    /// Total occurrence count before the cap; `references.len()` when not truncated.
+    pub total: usize,
+    pub truncated: bool,
+    /// Human caveat when a zero result is not definitive (degraded coverage,
+    /// path-hint miss, still-building index). `null` on a clean answer.
+    pub note: Option<String>,
+}
+
+/// Drop a leading `resolved: …` header line: `resolved_to` already carries it as
+/// structured fields, so it would be redundant inside `note`.
+fn strip_resolved_header(text: &str) -> String {
+    text.strip_prefix("resolved:")
+        .and_then(|rest| rest.split_once('\n'))
+        .map(|(_, body)| body.trim_start().to_string())
+        .unwrap_or_else(|| text.trim().to_string())
+}
+
+/// Structured variant of [`find_references`], consumed by `travsr references
+/// --format json`. Reuses the same resolver and occurrence store as the text
+/// path so the two never disagree on what a symbol resolves to.
+pub fn find_references_structured(
+    store: &SqliteStore,
+    symbol: &str,
+    path: Option<&str>,
+) -> StructuredReferences {
+    let mut out = StructuredReferences {
+        symbol: symbol.to_string(),
+        path: path.map(str::to_string),
+        status: "not_found",
+        resolved_to: None,
+        candidates: Vec::new(),
+        references: Vec::new(),
+        total: 0,
+        truncated: false,
+        note: None,
+    };
+
+    // SEC-002: validate every argument before any store query, as the text path does.
+    if validate_mcp_arg(symbol).is_err() || path.is_some_and(|p| validate_mcp_arg(p).is_err()) {
+        out.note = Some("invalid symbol or path argument".to_string());
+        return out;
+    }
+    if phase_b_pending(store) {
+        out.status = "pending";
+        out.note = Some(
+            "Semantic occurrence index is still building — results are not yet \
+             authoritative. Run `travsr status` to check progress."
+                .to_string(),
+        );
+        return out;
+    }
+
+    let target = match resolve_reference_targets(store, symbol, path) {
+        RefTarget::Unique(n) => n,
+        RefTarget::Ambiguous(nodes) => {
+            out.status = "ambiguous";
+            out.note = Some(format!(
+                "'{symbol}' is ambiguous — {} definitions. Re-run with a `path` hint to pick one.",
+                nodes.len()
+            ));
+            out.candidates = nodes.iter().map(ResolvedSymbol::from_node).collect();
+            return out;
+        }
+        RefTarget::None => {
+            // A `path` hint that filtered out every definition is not a definitive
+            // not-found: re-resolve without it and, if the symbol lives elsewhere,
+            // report those as candidates rather than a bare miss.
+            if let Some(hint) = path {
+                let elsewhere = match resolve_reference_targets(store, symbol, None) {
+                    RefTarget::Unique(n) => vec![n],
+                    RefTarget::Ambiguous(nodes) => nodes,
+                    RefTarget::None => Vec::new(),
+                };
+                if !elsewhere.is_empty() {
+                    out.note = Some(format!(
+                        "Symbol '{symbol}' was not found under path '{hint}', but is \
+                         defined elsewhere (see candidates)."
+                    ));
+                    out.candidates = elsewhere.iter().map(ResolvedSymbol::from_node).collect();
+                    return out;
+                }
+            }
+            out.note = Some(format!("Symbol '{symbol}' was not found."));
+            return out;
+        }
+    };
+
+    out.status = "resolved";
+    out.resolved_to = Some(ResolvedSymbol::from_node(&target));
+
+    match store.reference_sites(target.id) {
+        Ok(sites) if !sites.is_empty() => {
+            out.total = sites.len();
+            out.truncated = out.total > MAX_REFERENCE_SITES;
+            out.references = sites.into_iter().take(MAX_REFERENCE_SITES).collect();
+        }
+        _ => {
+            // Resolved, but no exact occurrence sites. Carry the text path's honest
+            // caveat (degraded coverage vs. genuine zero) as `note`, minus the
+            // header line that `resolved_to` already encodes.
+            out.note = Some(strip_resolved_header(&find_references_raw(
+                store, symbol, path,
+            )));
+        }
+    }
+    out
+}
+
 /// Raw (unsanitized) variant, shared by the global aggregator.
 fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> String {
     let target = match resolve_reference_targets(store, symbol, path) {
