@@ -97,7 +97,6 @@ export function webviewShell(title: string, body: string, script: string): strin
   .badge { border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600; }
   .badge.ok { background: var(--green-deep); color: var(--green); }
   .badge.stale { background: var(--orange-deep); color: var(--orange); }
-  .badge.elevated { background: #3b2000; color: var(--gold); }
   .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
   .addrow { display: flex; gap: 8px; margin: 14px 0; align-items: flex-start; flex-wrap: wrap; }
   .cards { display: flex; gap: 12px; flex-wrap: wrap; }
@@ -1016,12 +1015,6 @@ export function buildLanguagesHtml(
       // analysis is live; everything else is `partial` (structure still works).
       const isActive = l.status === "active";
 
-      // Sandbox badge
-      const sandboxBadge =
-        l.sandbox === "Elevated"
-          ? `<span class="badge elevated">Elevated</span>`
-          : `<span class="badge ok">Standard</span>`;
-
       // Analysis column: the same word the CLI shows, with its plain line as the
       // tooltip. No "SCIP/LSIF/Phase B" jargon reaches the user.
       const semCls =
@@ -1098,8 +1091,6 @@ export function buildLanguagesHtml(
 
       return `<tr>
 <td><span class="mono">${esc(l.language)}</span></td>
-<td class="mono muted">${esc(l.package)}</td>
-<td>${sandboxBadge}</td>
 <td>${analysisBadges}</td>
 <td>${repoBadge}</td>
 <td>${actionCell}</td></tr>`;
@@ -1128,8 +1119,8 @@ ${sub}
 </section>
 <section>
   <h3>Available tools</h3>
-  <table><thead><tr><th>Language</th><th>Package</th><th>Sandbox</th><th>Semantic</th><th>This repo</th><th>Action</th></tr></thead>
-  <tbody>${availRows || '<tr><td colspan="6" class="empty">No language tools found. Is the travsr binary on PATH?</td></tr>'}</tbody></table>
+  <table><thead><tr><th>Language</th><th>Semantic</th><th>This repo</th><th>Action</th></tr></thead>
+  <tbody>${availRows || '<tr><td colspan="4" class="empty">No language tools found. Is the travsr binary on PATH?</td></tr>'}</tbody></table>
 </section>`;
 
   const script = `

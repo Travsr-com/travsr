@@ -7,8 +7,10 @@
 //!     language, always. It also produces best-effort call edges, but not full
 //!     cross-file coverage.
 //!   * Full cross-file semantic analysis needs the language's analyzer: bundled
-//!     for python, an external tool for the rest (rust-analyzer for rust, a
-//!     `travsr-lang-*` analyzer for go/java/…). Only python is full out of the box.
+//!     for python, typescript, and javascript (they share one bundled Node
+//!     emitter), an external tool for the rest (rust-analyzer for rust, a
+//!     `travsr-lang-*` analyzer for go/java/…). Those three are full out of the
+//!     box; every other language needs its analyzer installed.
 //!
 //! So the only axis worth a word is whether full cross-file semantic is *live*.
 //! The vocabulary is deliberately tiny and uniform across all languages:

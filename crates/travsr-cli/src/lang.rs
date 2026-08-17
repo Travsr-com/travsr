@@ -1245,8 +1245,8 @@ fn cmd_approve(
 
     if entry.sandbox != SandboxRequirement::RequiresElevated {
         anyhow::bail!(
-            "'{language}' uses Standard sandbox — no approval needed. \
-             Run `travsr lang install {language}` directly."
+            "'{language}' does not need network access during indexing, so no approval \
+             is required. Run `travsr lang install {language}` directly."
         );
     }
 
