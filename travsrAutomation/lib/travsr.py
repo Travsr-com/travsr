@@ -5,6 +5,7 @@ import hashlib
 import re
 import shutil
 import subprocess
+import time
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,19 +128,43 @@ def host_target() -> Optional[str]:
     return None
 
 
+#: Release assets are tens of megabytes each, so a TLS handshake timeout on one
+#: of five is ordinary rather than exceptional. Retried because a network hiccup
+#: aborting a release check trains people to ignore the tool, and a checker
+#: nobody trusts is worse than no checker.
+DOWNLOAD_ATTEMPTS = 3
+
+
 def download_release(tag: str, repo: str, dest: Path) -> tuple[bool, str]:
-    """Fetch a published release's tarballs and SHA256SUMS via `gh`."""
+    """Fetch a published release's tarballs and SHA256SUMS via `gh`.
+
+    Retries transient network failures. `--clobber` makes each attempt
+    idempotent, and assets already fetched are re-verified against SHA256SUMS
+    later regardless, so a partial download from a failed attempt cannot be
+    mistaken for a good one.
+    """
     if shutil.which("gh") is None:
         return False, "the `gh` CLI is required to download a release"
     dest.mkdir(parents=True, exist_ok=True)
-    p = subprocess.run(
-        ["gh", "release", "download", tag, "--repo", repo,
-         "--pattern", "*.tar.gz", "--pattern", "SHA256SUMS", "--clobber"],
-        cwd=dest, capture_output=True, text=True, timeout=1800,
-    )
-    if p.returncode != 0:
-        return False, f"gh release download failed: {p.stderr.strip()[:400]}"
-    return True, ""
+
+    last = ""
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        p = subprocess.run(
+            ["gh", "release", "download", tag, "--repo", repo,
+             "--pattern", "*.tar.gz", "--pattern", "SHA256SUMS", "--clobber"],
+            cwd=dest, capture_output=True, text=True, timeout=1800,
+        )
+        if p.returncode == 0:
+            return True, ""
+        last = p.stderr.strip()
+        # A missing or misspelled tag will never succeed, so do not spend three
+        # attempts on it.
+        if "release not found" in last.lower() or "not found" in last.lower():
+            break
+        if attempt < DOWNLOAD_ATTEMPTS:
+            print(f"  download attempt {attempt} failed, retrying: {last.splitlines()[-1][:120]}")
+            time.sleep(3 * attempt)
+    return False, f"gh release download failed after {attempt} attempt(s): {last[:400]}"
 
 
 def sha256(path: Path) -> str:
