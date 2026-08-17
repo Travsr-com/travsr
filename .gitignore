@@ -8,6 +8,13 @@ Next-Gen Git Hosting_ Algorithmic Stack.md
 # Internal sprint planning and roadmap docs
 docs/planning/
 
+# Internal working docs (local-only, never commit)
+docs/mockups/
+docs/plans/
+docs/ai-tool-prompt.md
+docs/benchmark-travsr-vs-vector-rag-kubernetes.md
+docs/dogfooding.md
+
 # Rust
 /target
 **/*.rs.bk
@@ -44,3 +51,7 @@ out/
 
 
 design/
+
+# travsr:begin (generated AI-tool config, `travsr connect --remove` to undo)
+/.mcp.json
+# travsr:end
