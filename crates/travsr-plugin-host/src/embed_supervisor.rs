@@ -488,3 +488,182 @@ impl EmbedSupervisor {
         }
     }
 }
+
+#[cfg(test)]
+mod hook_worker_tests {
+    //! `HookWorker` is the #736 A3 bound on pending KNN work. It arrived with no
+    //! tests, and its whole value is in the paths that are hard to reach by hand:
+    //! a full queue, a caller that already gave up, and a worker thread that died.
+    //! Each of those degrades to "no semantic results" at the call site, so a
+    //! regression in any of them looks like a quality problem rather than a bug.
+    //!
+    //! Timing is driven by channels and barriers rather than sleeps wherever the
+    //! property allows it, because a flaky bound is a bound nobody trusts.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    use super::{HookWorker, HOOK_QUEUE_DEPTH};
+
+    const GENEROUS: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn a_call_returns_the_handlers_result() {
+        let w = HookWorker::spawn("test-echo", |req: u32| Some(req * 2)).unwrap();
+        assert_eq!(w.call(21, GENEROUS), Some(42));
+        // Reusable: the worker loops rather than serving one request.
+        assert_eq!(w.call(1, GENEROUS), Some(2));
+    }
+
+    #[test]
+    fn a_handler_returning_none_yields_none() {
+        // The sidecar's "no result" is distinct from a shed or a timeout, but the
+        // call site sees None for all three, so this pins that None is reachable
+        // through the ordinary path too.
+        let w = HookWorker::spawn("test-none", |_: u32| -> Option<u32> { None }).unwrap();
+        assert_eq!(w.call(7, GENEROUS), None);
+    }
+
+    /// A full queue must shed immediately rather than block the caller.
+    ///
+    /// Deterministic: the handler parks until released, so the worker is provably
+    /// busy, and the queue is then filled through `tx` directly instead of racing
+    /// real calls against each other.
+    #[test]
+    fn a_full_queue_sheds_instead_of_blocking() {
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+
+        let w = HookWorker::spawn("test-full", move |_: u32| {
+            let _ = started_tx.send(());
+            // Park until the test releases us, so "busy" is a fact rather than a
+            // race against a sleep.
+            let _ = release_rx.lock().unwrap().recv();
+            Some(1u32)
+        })
+        .unwrap();
+
+        // Occupy the worker thread.
+        let (dead_tx, _dead_rx) = mpsc::channel();
+        w.tx.try_send((0u32, dead_tx, Instant::now() + GENEROUS))
+            .expect("first send must be accepted");
+        started_rx
+            .recv_timeout(GENEROUS)
+            .expect("handler must start, otherwise the worker is not busy");
+
+        // Fill every queue slot. The worker is parked, so nothing drains.
+        for i in 0..HOOK_QUEUE_DEPTH {
+            let (t, _r) = mpsc::channel();
+            w.tx.try_send((i as u32, t, Instant::now() + GENEROUS))
+                .expect("queue slot must accept a request while the worker is parked");
+        }
+
+        // The next call has nowhere to go and must not wait out its timeout.
+        let began = Instant::now();
+        let got = w.call(99, Duration::from_secs(5));
+        let waited = began.elapsed();
+
+        assert_eq!(got, None, "a shed request must report no result");
+        assert!(
+            waited < Duration::from_secs(1),
+            "shedding must be immediate, waited {waited:?}; blocking here would \
+             hold the query path for the full timeout and defeat the bound"
+        );
+
+        let _ = release_tx.send(());
+    }
+
+    /// A request whose caller already gave up must be skipped before the handler
+    /// runs. Running it would hold the sidecar mutex to produce a result nobody
+    /// can receive, which is what starves live requests under load.
+    #[test]
+    fn an_expired_request_never_reaches_the_handler() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_h = Arc::clone(&seen);
+        let w = HookWorker::spawn("test-expired", move |req: u32| {
+            seen_h.fetch_add(1, Ordering::SeqCst);
+            Some(req)
+        })
+        .unwrap();
+
+        // Deadline already in the past.
+        let (t, _r) = mpsc::channel();
+        w.tx.try_send((1u32, t, Instant::now() - Duration::from_secs(1)))
+            .unwrap();
+
+        // A live request behind it, used as a barrier: once this returns, the
+        // worker has necessarily passed the expired entry.
+        assert_eq!(w.call(2, GENEROUS), Some(2));
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "only the live request may reach the handler; the expired one must be \
+             skipped before the sidecar lock is taken"
+        );
+    }
+
+    /// A caller that times out must not wedge the worker for everyone else.
+    #[test]
+    fn a_timed_out_call_leaves_the_worker_usable() {
+        let w = HookWorker::spawn("test-slow", |req: u32| {
+            if req == 0 {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            Some(req)
+        })
+        .unwrap();
+
+        // Far shorter than the handler's work, so this call gives up first.
+        assert_eq!(w.call(0, Duration::from_millis(20)), None);
+
+        // The worker is still alive and serving. Generous timeout so the earlier
+        // sleep draining does not make this flaky.
+        assert_eq!(w.call(5, GENEROUS), Some(5));
+    }
+
+    /// A dead worker must report None rather than hanging, and must set its
+    /// death flag exactly once so the warning is logged once instead of per query.
+    #[test]
+    fn a_dead_worker_reports_none_and_flags_itself_once() {
+        // The panic is deliberate; silence the default hook so the test output is
+        // not mistaken for a failure.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let w = HookWorker::spawn("test-panic", |_: u32| -> Option<u32> {
+            panic!("handler panics, killing the worker thread");
+        })
+        .unwrap();
+
+        // First call: the handler panics, the thread unwinds, the channel
+        // disconnects. Either this call sees the disconnect or the reply channel
+        // simply closes; both must be None, never a hang.
+        let first = w.call(1, Duration::from_secs(2));
+        assert_eq!(first, None, "a panicking handler must not yield a result");
+
+        // Subsequent calls hit Disconnected deterministically.
+        assert_eq!(w.call(2, Duration::from_secs(2)), None);
+        assert_eq!(w.call(3, Duration::from_secs(2)), None);
+        assert!(
+            w.worker_died.load(Ordering::Relaxed),
+            "the death must be recorded so it is logged rather than silently \
+             degrading every later query to FTS"
+        );
+
+        std::panic::set_hook(prev);
+    }
+
+    /// The depth is deliberately small, and the reason is load-bearing: a caller
+    /// abandons its request after KNN_CALL_TIMEOUT_MS, so work queued deeper than
+    /// a couple of slots would be computed for nobody.
+    #[test]
+    fn the_queue_depth_stays_small() {
+        assert!(
+            (1..=4).contains(&HOOK_QUEUE_DEPTH),
+            "HOOK_QUEUE_DEPTH is {HOOK_QUEUE_DEPTH}; deeper than a few slots means \
+             queueing work whose caller has already timed out"
+        );
+    }
+}
