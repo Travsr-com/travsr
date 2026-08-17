@@ -164,7 +164,12 @@ impl SessionStore {
         }
     }
 
-    /// Evict all expired sessions. Call periodically to bound memory usage.
+    /// Evict all expired sessions. Called periodically to bound memory usage.
+    ///
+    /// #736 item 6: lazy expiry on `get()` alone is not a memory bound — a
+    /// session that is created but never looked up again is retained until
+    /// process exit. The SSE server's maintenance task (spawned in
+    /// `sse::router`) calls this on an interval to sweep those.
     pub fn evict_expired(&self) {
         let now = Instant::now();
         self.sessions.retain(|_, s| s.expires_at > now);
@@ -234,6 +239,22 @@ mod tests {
             store.get(&session.id).is_none(),
             "revoked session must be gone"
         );
+    }
+
+    #[test]
+    fn evict_expired_sweeps_without_lookup() {
+        // #736 item 6: the periodic sweep must remove expired sessions that are
+        // never passed to `get()` — the lazy path can never reach them.
+        let store = SessionStore::new();
+        let expired = store.create(["corp:a"], Duration::from_nanos(1));
+        let live = store.create(["corp:b"], DEFAULT_SESSION_TTL);
+        std::thread::sleep(Duration::from_millis(1));
+
+        assert_eq!(store.active_count(), 2, "both retained before the sweep");
+        store.evict_expired();
+        assert_eq!(store.active_count(), 1, "expired session must be swept");
+        assert!(store.get(&live.id).is_some(), "live session must survive");
+        assert!(store.get(&expired.id).is_none());
     }
 
     #[test]
