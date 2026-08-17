@@ -150,10 +150,13 @@ impl RingBuffer {
     /// 2. down to `capacity - 1` entries (pre-existing count bound),
     /// 3. until `entry` fits inside `max_bytes` (the #736 byte budget).
     ///
-    /// A payload larger than `max_bytes` on its own is still buffered (after
-    /// draining everything else): dropping it silently would break replay for
-    /// that event id, and `MAX_RESPONSE_BYTES` chunking keeps real payloads
-    /// far below the budget anyway.
+    /// A payload larger than `max_bytes` on its own is REFUSED, making the
+    /// budget a hard bound — the same contract as `ParseCache::insert` and
+    /// `QueryCache::put` (#737 review). The cost is a replay gap for that one
+    /// event id on reconnect, which the ring already tolerates (TTL and the
+    /// entry cap drop events too), and `MAX_RESPONSE_BYTES` chunking keeps
+    /// real payloads far below the budget, so the refusal is a last-resort
+    /// guard rather than an expected path.
     ///
     /// Limits are parameters (rather than reading the consts directly) so the
     /// eviction logic is testable without multi-MiB fixtures.
@@ -167,12 +170,23 @@ impl RingBuffer {
                 break;
             }
         }
+        // Refuse payloads that could never fit: buffering one would drain the
+        // whole ring and still leave total_bytes above the budget by up to a
+        // whole tool response.
+        if entry.2.len() > max_bytes {
+            tracing::debug!(
+                bytes = entry.2.len(),
+                max_bytes,
+                "SSE replay entry exceeds the ring budget — not buffered"
+            );
+            return;
+        }
         // Enforce the entry cap.
         while self.entries.len() >= capacity {
             self.pop_front();
         }
         // Enforce the byte budget.
-        while !self.entries.is_empty() && self.total_bytes + entry.2.len() > max_bytes {
+        while self.total_bytes + entry.2.len() > max_bytes {
             self.pop_front();
         }
         self.total_bytes += entry.2.len();
@@ -898,21 +912,23 @@ mod tests {
         assert_eq!(buf.total_bytes, recounted_bytes(&buf));
     }
 
+    /// #737 review: the byte budget is a HARD bound. An oversized payload is
+    /// refused outright (mirroring ParseCache and QueryCache) instead of
+    /// draining the ring and then exceeding the budget by its own size.
     #[test]
-    fn ring_buffer_oversized_payload_drains_buffer_but_is_kept() {
+    fn ring_buffer_oversized_payload_is_refused() {
         let mut buf = RingBuffer::default();
         buf.push_bounded(entry(1, "aaaa"), 1000, RING_BUFFER_TTL, 10);
-        // 16 bytes > the 10-byte budget: everything else is drained, but the
-        // payload itself must still be buffered (dropping it would break
-        // replay for that event id).
+        // 16 bytes > the 10-byte budget: refused, and the existing in-budget
+        // entries survive untouched.
         buf.push_bounded(entry(2, "0123456789abcdef"), 1000, RING_BUFFER_TTL, 10);
         assert_eq!(buf.entries.len(), 1);
-        assert_eq!(buf.entries.front().unwrap().0, 2);
-        assert_eq!(buf.total_bytes, 16);
-        // The next in-budget push evicts the oversized entry again.
+        assert_eq!(buf.entries.front().unwrap().0, 1, "entry 1 must survive");
+        assert_eq!(buf.total_bytes, 4);
+        assert!(buf.total_bytes <= 10, "budget must be a hard bound");
+        // Normal pushes continue to work afterwards.
         buf.push_bounded(entry(3, "dddd"), 1000, RING_BUFFER_TTL, 10);
-        assert_eq!(buf.entries.len(), 1);
-        assert_eq!(buf.entries.front().unwrap().0, 3);
+        assert_eq!(buf.entries.len(), 2);
         assert_eq!(buf.total_bytes, recounted_bytes(&buf));
     }
 
