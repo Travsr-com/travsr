@@ -209,15 +209,17 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         // said, rather than leading with it.
         println!("no grounded match for '{display_query}' in this repo");
         let suggestions = suggest_next(&db_path, display_query);
+        use std::io::IsTerminal as _;
         if suggestions.is_empty() {
             println!("run `travsr ask --examples` to see what travsr can answer");
         } else {
+            let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
             println!("\ntry one of these:");
             for s in &suggestions {
-                println!("  {}", s.command);
-                println!("      {}", s.why);
+                println!("  {}", paint_command(pal, &s.command, &s.ident));
+                println!("      {}", pal.dim(&s.why));
             }
-            println!("\nor `travsr ask --examples` for the full list");
+            println!("\n{}", pal.dim("or `travsr ask --examples` for more"));
         }
         // #376 §4.3: doc hits may appear below the abstain message, but never
         // convert it into a match — `payload.matched` stays false and no
@@ -423,111 +425,69 @@ mod docs_note_tests {
     }
 }
 
-/// The question shapes `travsr ask` and its sibling commands can answer.
+/// The questions travsr answers, as templates over a symbol.
 ///
-/// Written because the abstention path told users to "try rephrasing" without
-/// saying what to rephrase *towards*. A user who does not already know the
-/// product cannot act on that, and `ask` abstains most often on exactly the
-/// conceptual questions where they are least sure what is supported.
+/// A flat list rather than grouped sections with notes: an earlier version read
+/// as a manual page, and the point is to show what can be typed, not to document
+/// the CLI. Each entry is a question a reader might actually have, paired with
+/// the one command that answers it.
 ///
-/// Every entry is a real command against real capabilities. Nothing aspirational:
-/// an example here that does not work would be worse than no catalogue, because
-/// it would send someone to a dead end while looking authoritative.
-struct QuestionShape {
-    /// What the user is actually trying to find out, in their words.
-    intent: &'static str,
-    /// A runnable command, using a placeholder the user substitutes.
-    example: &'static str,
-    /// Why this command rather than `ask`, when that is the better route.
-    note: &'static str,
-}
-
-const QUESTION_CATALOGUE: &[(&str, &[QuestionShape])] = &[
+/// `(question, command)`. `{sym}` is filled with a real symbol from the reader's
+/// own repository, `{term}` with a lowercased form for text search.
+///
+/// Only `ask` shapes measured to return results are included. `ask` is
+/// graph-grounded, so it answers when the question is anchored to something in
+/// the code and abstains when it is not: "what breaks if I change X" returns
+/// nothing today, which is the known conceptual-query gap, so that question is
+/// routed to `graph` instead of being suggested as an `ask`.
+const FAQ: &[(&str, &str)] = &[
+    // Orientation: what someone asks before they know any symbol.
+    ("what is this repo written in?", "travsr lang list"),
+    ("is the index ready to query?", "travsr status"),
+    ("how big is the graph?", "travsr status"),
+    // Finding things.
+    ("where is {sym} defined?", "travsr ask \"{sym}\""),
     (
-        "Start here",
-        &[
-            QuestionShape {
-                intent: "what is this repo written in?",
-                example: "travsr lang list",
-                note: "which languages are here, and which resolve calls",
-            },
-            QuestionShape {
-                intent: "is the index ready to query?",
-                example: "travsr status",
-                note: "size, freshness, and anything degraded",
-            },
-        ],
+        "what is {sym} related to?",
+        "travsr ask \"how does {sym} work\"",
     ),
     (
-        "Find code",
-        &[
-            QuestionShape {
-                intent: "where is {sym} defined?",
-                example: "travsr ask \"{sym}\"",
-                note: "a question works too, not just a name",
-            },
-            QuestionShape {
-                intent: "where does the text \"TODO\" appear?",
-                example: "travsr pattern \"TODO\"",
-                note: "for text, not symbols: log strings, TODOs, config keys",
-            },
-        ],
+        "where does the text \"TODO\" appear?",
+        "travsr pattern \"TODO\"",
+    ),
+    // Structure. These are the questions the graph exists for.
+    (
+        "what calls {sym}?",
+        "travsr graph {sym} --direction callers",
     ),
     (
-        "Understand impact",
-        &[
-            QuestionShape {
-                intent: "what calls {sym}?",
-                example: "travsr graph {sym} --direction callers",
-                note: "",
-            },
-            QuestionShape {
-                intent: "what breaks if I change {sym}?",
-                example: "travsr graph {sym} --direction both",
-                note: "callers and dependencies together",
-            },
-            QuestionShape {
-                intent: "where is {sym} used?",
-                example: "travsr references {sym}",
-                note: "every use site, what you want before a rename",
-            },
-        ],
+        "what does {sym} depend on?",
+        "travsr graph {sym} --direction deps",
     ),
     (
-        "When an answer looks wrong",
-        &[
-            QuestionShape {
-                intent: "why did {sym} rank where it did?",
-                example: "travsr explain \"{sym}\" {sym}",
-                note: "which terms matched, which thresholds failed",
-            },
-            QuestionShape {
-                intent: "is anything missing or stale in the graph?",
-                example: "travsr fsck",
-                note: "ghost nodes left by deletes or checkouts",
-            },
-        ],
+        "what breaks if I change {sym}?",
+        "travsr graph {sym} --direction both",
     ),
+    (
+        "where is {sym} used, before a rename?",
+        "travsr references {sym}",
+    ),
+    // When the answer looks wrong.
+    (
+        "why did {sym} rank where it did?",
+        "travsr explain \"{sym}\" {sym}",
+    ),
+    ("is anything stale or missing?", "travsr fsck"),
 ];
 
-/// Print the catalogue, using symbols from the caller's own repository.
-///
-/// The first version printed `<symbol>` placeholders and a paragraph of prose.
-/// It was accurate and unreadable: a reader who does not already know the product
-/// cannot tell what `<symbol>` should be, so every line needed translating before
-/// it could be used. Substituting a real name from the indexed graph removes that
-/// step, and turns each line into something that can be pasted as-is.
-///
-/// Falls back to placeholders when there is no index yet, which is exactly when a
-/// user is most likely to run this.
+/// Print the questions, using symbols from the reader's own repository.
 pub fn print_examples(db_path: Option<&std::path::Path>) {
     use std::io::IsTerminal as _;
     let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
 
-    // Several symbols, not one. Repeating a single name down the whole list reads
-    // as a template with a variable substituted, which is exactly what it is; a
-    // varied set reads as questions about this codebase, which is the point.
-    let symbols = example_symbols(db_path, 6);
+    // Several symbols, rotated. One name repeated down the page reads as a
+    // template with a variable substituted, which is what it would be.
+    let symbols = example_symbols(db_path, FAQ.len());
     let grounded = !symbols.is_empty();
     let symbols = if grounded {
         symbols
@@ -539,34 +499,20 @@ pub fn print_examples(db_path: Option<&std::path::Path>) {
     println!(
         "{}",
         pal.dim(&if grounded {
-            "using symbols from this repo, so these are runnable as they are".to_string()
+            "using symbols from this repo, so these run as they are".to_string()
         } else {
             "run `travsr init` first and these fill in with your own symbols".to_string()
         })
     );
+    println!();
 
-    let mut n = 0usize;
-    for (group, shapes) in QUESTION_CATALOGUE {
-        println!();
-        println!("{}", pal.orange(group));
-        for s in *shapes {
-            // Rotate through the available symbols so consecutive lines differ.
-            let sym = &symbols[n % symbols.len()];
-            let term = sym.to_lowercase();
-            n += 1;
-
-            let question = s.intent.replace("{sym}", sym).replace("{term}", &term);
-            let cmd = s.example.replace("{sym}", sym).replace("{term}", &term);
-            let painted = paint_command(pal, &cmd, sym, &term);
-
-            // The question leads, because that is what the reader is scanning for.
-            println!("  {question}");
-            if s.note.is_empty() {
-                println!("      {painted}");
-            } else {
-                println!("      {painted}  {}", pal.dim(&format!("({})", s.note)));
-            }
-        }
+    for (i, (question, command)) in FAQ.iter().enumerate() {
+        let sym = &symbols[i % symbols.len()];
+        let term = sym.to_lowercase();
+        let q = question.replace("{sym}", sym).replace("{term}", &term);
+        let c = command.replace("{sym}", sym).replace("{term}", &term);
+        println!("  {q}");
+        println!("      {}", paint_command(pal, &c, sym));
     }
 }
 
@@ -579,7 +525,7 @@ pub fn print_examples(db_path: Option<&std::path::Path>) {
 ///
 /// Everything routes through `Palette`, so `NO_COLOR`, `CLICOLOR_FORCE` and a
 /// non-tty stdout all fall back to plain text with the spacing unchanged.
-fn paint_command(pal: crate::progress::Palette, cmd: &str, sym: &str, term: &str) -> String {
+fn paint_command(pal: crate::progress::Palette, cmd: &str, ident: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     for (i, word) in cmd.split(' ').enumerate() {
         let painted = if i == 0 {
@@ -590,7 +536,7 @@ fn paint_command(pal: crate::progress::Palette, cmd: &str, sym: &str, term: &str
             pal.green(word)
         } else if word.starts_with("--") {
             pal.dim(word)
-        } else if word.contains(sym) || word.contains(term) {
+        } else if word.contains(ident) {
             // The part the reader swaps for their own symbol.
             pal.ident(word)
         } else {
@@ -653,19 +599,46 @@ fn example_symbols(db_path: Option<&std::path::Path>, want: usize) -> Vec<String
 }
 
 #[cfg(test)]
-mod catalogue_tests {
-    use super::QUESTION_CATALOGUE;
+mod faq_tests {
+    use super::FAQ;
 
-    /// Every example must name a subcommand that exists. A catalogue that sends
-    /// users to a command travsr does not have is worse than no catalogue: #727
-    /// was exactly that failure, where the docs told agents to run `travsr lang
-    /// status` while the subcommand did not exist.
+    /// Every entry must render with nothing left to substitute. A stray `{sym}`
+    /// reaching the terminal would be pasted verbatim and search for that text.
     #[test]
-    fn every_example_names_a_real_subcommand() {
-        // Taken from clap itself rather than a hand-maintained list, so a renamed
-        // or removed subcommand fails here instead of drifting. A hardcoded list
-        // would have to be remembered, which is the same weakness that let #727
-        // ship: the docs named `travsr lang status` while the CLI did not have it.
+    fn every_entry_renders_cleanly() {
+        for (question, command) in FAQ {
+            for (label, text) in [("question", question), ("command", command)] {
+                let r = text.replace("{sym}", "Widget").replace("{term}", "widget");
+                assert!(
+                    !r.contains('{') && !r.contains('}'),
+                    "{label} `{text}` left a slot unfilled: {r}"
+                );
+            }
+        }
+    }
+
+    /// Each entry is scanned for by its question, so it has to read as one.
+    /// An earlier version used command labels ("Find a symbol by name"), which
+    /// describe the tool rather than the reader's problem.
+    #[test]
+    fn every_question_reads_as_a_question() {
+        for (question, _) in FAQ {
+            assert!(
+                question.ends_with('?'),
+                "`{question}` is a label, not a question"
+            );
+            assert!(
+                question.chars().next().is_some_and(|c| c.is_lowercase()),
+                "`{question}` should read as spoken text, not a heading"
+            );
+        }
+    }
+
+    /// Only commands that exist. A list naming a subcommand travsr does not have
+    /// sends someone to a dead end while looking authoritative, which is exactly
+    /// what #727 was. Read from clap rather than a hand-kept copy.
+    #[test]
+    fn every_command_names_a_real_subcommand() {
         use clap::CommandFactory as _;
         let cmd = crate::Cli::command();
         let known: Vec<String> = cmd
@@ -676,140 +649,30 @@ mod catalogue_tests {
             })
             .collect();
         assert!(!known.is_empty(), "clap reported no subcommands");
-        for (group, shapes) in QUESTION_CATALOGUE {
-            for s in *shapes {
-                let mut words = s.example.split_whitespace();
-                assert_eq!(words.next(), Some("travsr"), "{group}: {}", s.example);
-                let sub = words.next().unwrap_or("");
-                assert!(
-                    known.iter().any(|k| k == sub),
-                    "{group}: `{}` names unknown subcommand {sub:?}; known: {known:?}",
-                    s.example
-                );
-            }
+
+        for (_, command) in FAQ {
+            let mut words = command.split_whitespace();
+            assert_eq!(words.next(), Some("travsr"), "`{command}`");
+            let sub = words.next().unwrap_or("");
+            assert!(
+                known.iter().any(|k| k == sub),
+                "`{command}` names unknown subcommand {sub:?}"
+            );
         }
     }
 
-    /// Every example must render to a runnable command with nothing left to
-    /// substitute. The catalogue's whole value is that a line can be pasted as
-    /// is; a stray `{sym}` reaching the terminal would search for that literal
-    /// text and quietly return nothing.
-    ///
-    /// Also pins that only the two known slots exist, so a new template variable
-    /// cannot be added without teaching the printer about it.
+    /// `ask` abstains on questions it cannot ground. "what breaks if I change X"
+    /// is the measured case: it returns nothing today, so it must be routed to
+    /// `graph`, not offered as something to ask. Pins the routing rather than
+    /// leaving it to whoever edits the list next.
     #[test]
-    fn every_example_renders_with_nothing_left_to_substitute() {
-        for (group, shapes) in QUESTION_CATALOGUE {
-            for s in *shapes {
-                // The question is templated too, so it gets the same guarantee:
-                // a stray `{sym}` in the text a reader scans is as bad as one in
-                // the command they paste.
-                let asked = s
-                    .intent
-                    .replace("{sym}", "Widget")
-                    .replace("{term}", "widget");
+    fn questions_ask_cannot_answer_are_not_routed_to_ask() {
+        for (question, command) in FAQ {
+            if question.to_lowercase().contains("what breaks") {
                 assert!(
-                    !asked.contains('{') && !asked.contains('}'),
-                    "{group}: question `{}` left a slot unfilled: {asked}",
-                    s.intent
+                    command.contains("graph") && command.contains("--direction both"),
+                    "`{question}` must route to graph, not `{command}`"
                 );
-                let rendered = s
-                    .example
-                    .replace("{sym}", "Widget")
-                    .replace("{term}", "widget");
-                assert!(
-                    !rendered.contains('{') && !rendered.contains('}'),
-                    "{group}: `{}` left a slot unfilled: {rendered}",
-                    s.example
-                );
-                // The old `<symbol>` style is what made this unreadable: a reader
-                // could not tell what to put there. Nothing should reintroduce it.
-                assert!(
-                    !rendered.contains('<') && !rendered.contains('>'),
-                    "{group}: `{}` uses an abstract placeholder instead of a real \
-                     symbol; substitute {{sym}} so the line can be pasted",
-                    s.example
-                );
-            }
-        }
-    }
-
-    /// Colour must be decoration only. A user piping this into a script, or
-    /// running with NO_COLOR, has to get the same commands back, and escape codes
-    /// embedded in a command would make it unrunnable if copied.
-    #[test]
-    fn painting_a_command_does_not_change_its_text() {
-        use crate::progress::Palette;
-
-        for (_, shapes) in QUESTION_CATALOGUE {
-            for s in *shapes {
-                let cmd = s
-                    .example
-                    .replace("{sym}", "Widget")
-                    .replace("{term}", "widget");
-
-                let plain =
-                    super::paint_command(Palette::for_stream(false), &cmd, "Widget", "widget");
-                assert_eq!(plain, cmd, "with colour off the command must be untouched");
-
-                let coloured =
-                    super::paint_command(Palette::for_stream(true), &cmd, "Widget", "widget");
-                let stripped: String = {
-                    // Strip CSI sequences the same way a terminal would.
-                    let mut out = String::new();
-                    let mut chars = coloured.chars();
-                    while let Some(c) = chars.next() {
-                        if c == '\u{1b}' {
-                            for c2 in chars.by_ref() {
-                                if c2 == 'm' {
-                                    break;
-                                }
-                            }
-                        } else {
-                            out.push(c);
-                        }
-                    }
-                    out
-                };
-                assert_eq!(
-                    stripped, cmd,
-                    "colour changed the command text, not just its appearance"
-                );
-            }
-        }
-    }
-
-    /// Each entry is a question the reader scans for, so it has to read as one.
-    /// The earlier version used labels ("Find a symbol by name"), which describe
-    /// the command rather than the reader's problem, and that is what made the
-    /// list hard to use.
-    #[test]
-    fn every_intent_reads_as_a_question() {
-        for (group, shapes) in QUESTION_CATALOGUE {
-            for s in *shapes {
-                assert!(
-                    s.intent.ends_with('?'),
-                    "{group}: `{}` is a label, not a question",
-                    s.intent
-                );
-                assert!(
-                    s.intent.chars().next().is_some_and(|c| c.is_lowercase()),
-                    "{group}: `{}` should read as spoken text, not a heading",
-                    s.intent
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_catalogue_is_not_empty_and_every_entry_is_filled_in() {
-        assert!(!QUESTION_CATALOGUE.is_empty());
-        for (group, shapes) in QUESTION_CATALOGUE {
-            assert!(!group.is_empty());
-            assert!(!shapes.is_empty(), "{group} has no entries");
-            for s in *shapes {
-                assert!(!s.intent.is_empty(), "{group}: empty intent");
-                assert!(!s.example.is_empty(), "{group}: empty example");
             }
         }
     }
@@ -819,6 +682,9 @@ mod catalogue_tests {
 pub(crate) struct Suggestion {
     pub command: String,
     pub why: String,
+    /// The part of `command` the reader is expected to swap. Carried rather than
+    /// re-derived so the painter highlights exactly what was substituted.
+    pub ident: String,
 }
 
 /// Intent keywords mapped to the command that actually answers them.
@@ -908,6 +774,7 @@ pub(crate) fn suggest_next(db_path: &std::path::Path, query: &str) -> Vec<Sugges
         out.push(Suggestion {
             command: format!("travsr ask \"{sym}\""),
             why: "closest symbol in this repo to what you typed".to_string(),
+            ident: sym.to_string(),
         });
     }
 
@@ -919,6 +786,7 @@ pub(crate) fn suggest_next(db_path: &std::path::Path, query: &str) -> Vec<Sugges
             out.push(Suggestion {
                 command: template.replace("{sym}", &sym_slot).replace("{q}", query),
                 why: (*why).to_string(),
+                ident: sym_slot.clone(),
             });
             // One intent route is a hint; several is a menu the user has to
             // re-read. Stop at the most specific match.
@@ -934,6 +802,7 @@ pub(crate) fn suggest_next(db_path: &std::path::Path, query: &str) -> Vec<Sugges
             command: format!("travsr pattern \"{term}\""),
             why: "searches the text of tracked files, for things the graph does not model"
                 .to_string(),
+            ident: term.clone(),
         });
     }
 
