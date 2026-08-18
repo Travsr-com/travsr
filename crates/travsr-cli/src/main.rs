@@ -1264,7 +1264,15 @@ async fn run(cli: Cli) -> Result<()> {
             examples,
         } => {
             if examples {
-                ask::print_examples();
+                // Best effort: an un-indexed repo, or none at all, falls back to
+                // placeholders rather than failing. `--examples` must work before
+                // `init`, which is exactly when someone is most likely to run it.
+                let db = std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| crate::repo::find_git_root(&cwd).ok())
+                    .map(|root| root.join(".travsr/graph.db"))
+                    .filter(|p| p.is_file());
+                ask::print_examples(db.as_deref());
             } else {
                 // `required_unless_present` guarantees a query here; the
                 // `unwrap_or_default` keeps a future flag change from turning

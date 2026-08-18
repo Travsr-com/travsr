@@ -86,7 +86,7 @@ impl Palette {
         self.paint("2", s)
     }
     /// Bold — the wordmark.
-    fn bold(self, s: &str) -> String {
+    pub fn bold(self, s: &str) -> String {
         self.paint("1", s)
     }
 }
