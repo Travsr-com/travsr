@@ -16,11 +16,18 @@ use std::io::IsTerminal as _;
 
 use crate::progress::Palette;
 
-/// One question and its answer. Answers are wrapped at print time, so they are
-/// written here as single paragraphs.
+/// One question, answered as a short lead plus scannable points.
+///
+/// Prose was the first shape and it read badly in a terminal: five wrapped lines
+/// of paragraph that have to be read start to finish before the shape of the
+/// answer is visible. A lead line plus points can be scanned, which is what
+/// someone does with terminal output.
 pub(crate) struct Entry {
     pub question: &'static str,
-    pub answer: &'static str,
+    /// One sentence. The answer, if the reader stops here.
+    pub lead: &'static str,
+    /// Supporting points, each short enough to sit on one line.
+    pub points: &'static [&'static str],
     /// A command that demonstrates or acts on the answer. Empty when there is
     /// nothing to run, rather than inventing one.
     pub command: &'static str,
@@ -29,88 +36,116 @@ pub(crate) struct Entry {
 const ENTRIES: &[Entry] = &[
     Entry {
         question: "what is travsr?",
-        answer: "A code intelligence daemon that builds a graph of your codebase and keeps \
-                 it current with git. Every function, class and call is a node or an edge, so \
-                 questions about structure have exact answers instead of guesses.",
+        lead: "A code graph that lives next to git.",
+        points: &[
+            "every function, class and call is a node or an edge",
+            "structural questions get exact answers, not guesses",
+            "the graph updates as you commit",
+        ],
         command: "",
     },
     Entry {
         question: "how is it different from search or vector RAG?",
-        answer: "Vector search chunks code into passages and retrieves by similarity, which \
-                 approximates relationships that are already exact. Travsr computes them: a \
-                 parser produces the structure and a resolver decides what each call refers to. \
-                 Ask what calls a function and the answer is derived, not inferred.",
+        lead: "It computes relationships instead of approximating them.",
+        points: &[
+            "vector search chunks code and retrieves by similarity",
+            "travsr parses the code and resolves each call to its definition",
+            "\"what calls this\" is derived, not inferred",
+        ],
         command: "",
     },
     Entry {
         question: "how does it work?",
-        answer: "Two passes. Phase A parses every tracked file with tree-sitter into nodes and \
-                 definition edges. Phase B resolves calls to specific definitions, natively for \
-                 Rust, TypeScript and Python and via a sandboxed analyzer for other languages. \
-                 Retrieval then seeds from your query, walks the graph with personalized \
-                 PageRank, reranks, and packs the result into your token budget.",
+        lead: "Two indexing passes, then a retrieval pipeline.",
+        points: &[
+            "Phase A   tree-sitter parses every tracked file into nodes",
+            "Phase B   resolves calls to the definitions they point at",
+            "retrieval seeds from your query, walks the graph, reranks",
+            "the result is packed to fit your token budget",
+        ],
         command: "",
     },
     Entry {
         question: "how do I install it?",
-        answer: "The installer verifies the release signature before installing. npm and \
-                 building from source both work too.",
+        lead: "One line. The installer verifies the release signature first.",
+        points: &["npm and building from source also work"],
         command: "curl -fsSL https://travsr.com/install.sh | sh",
     },
     Entry {
         question: "how do I start using it on a repo?",
-        answer: "Run this from the repo root. It indexes the tracked files and installs a git \
-                 hook so the graph stays current as you commit.",
+        lead: "Run this from the repo root.",
+        points: &[
+            "indexes the tracked files",
+            "installs a git hook so the graph stays current",
+        ],
         command: "travsr init --semantic",
     },
     Entry {
         question: "which languages does it support?",
-        answer: "Sixteen for structure. Call resolution is native for Rust, TypeScript, \
-                 JavaScript and Python, and needs an installed analyzer for the rest. This \
-                 command shows which are active for your repo.",
+        lead: "Sixteen for structure; four resolve calls without setup.",
+        points: &[
+            "native   rust, typescript, javascript, python",
+            "others need an analyzer installed",
+        ],
         command: "travsr lang list",
     },
     Entry {
         question: "does my code leave my machine?",
-        answer: "No. Indexing, storage and queries are all local. The graph lives in .travsr/ \
-                 inside your repo, and embedding models run as a local sidecar. Network access \
-                 is only for downloading travsr itself and optional models.",
+        lead: "No. Indexing, storage and queries are all local.",
+        points: &[
+            "the graph lives in .travsr/ inside your repo",
+            "embedding models run as a local sidecar",
+            "network is only for downloading travsr and optional models",
+        ],
         command: "",
     },
     Entry {
         question: "do I need the daemon running?",
-        answer: "No. Queries work without it, served from the database directly. The daemon \
-                 keeps semantic analysis current as files change and answers faster from a warm \
-                 store, so it is worth starting for day-to-day use.",
+        lead: "No, but it helps.",
+        points: &[
+            "queries work without it, served from the database",
+            "the daemon keeps semantic analysis current as files change",
+            "and answers faster from a warm store",
+        ],
         command: "travsr daemon start",
     },
     Entry {
         question: "how do I connect it to an AI agent?",
-        answer: "Travsr speaks MCP, so any agent that supports it can query the graph. This \
-                 detects installed tools and writes their config; add --print first to see what \
-                 would change.",
+        lead: "Travsr speaks MCP, so any agent that supports it can query the graph.",
+        points: &[
+            "detects installed tools and writes their config",
+            "add --print first to see what would change",
+        ],
         command: "travsr connect",
     },
     Entry {
         question: "what can I ask about my code?",
-        answer: "Structural questions have exact answers: what calls this, what does it depend \
-                 on, where is it used. Anchor a question to a symbol name for the best results.",
+        lead: "Structural questions, anchored to a symbol name.",
+        points: &[
+            "what calls it, what it depends on, where it is used",
+            "naming a symbol gives the best results",
+        ],
         command: "travsr ask --examples",
     },
     Entry {
         question: "why did it say it found nothing?",
-        answer: "Travsr abstains rather than returning a low-confidence guess, because an \
-                 answer you cannot trust is worse than none. Conceptual questions that name no \
-                 symbol are the common case, and are a known gap being worked on. The \
-                 abstention suggests what to try instead.",
+        lead: "It abstains rather than returning a low-confidence guess.",
+        points: &[
+            "an answer you cannot trust is worse than none",
+            "conceptual questions naming no symbol are a known gap",
+            "the abstention suggests what to try instead",
+        ],
         command: "",
     },
     Entry {
         question: "where is the data, and how do I remove it?",
-        answer: "Per-repo state is .travsr/ in the repo. Shared binaries and models are in \
-                 ~/.travsr. Deleting either is safe: the graph is derived from your source and \
-                 rebuilds with travsr init.",
-        command: "",
+        lead: "Two places, both safe to delete.",
+        points: &[
+            ".travsr/    per-repo graph, inside the repo",
+            "~/.travsr   shared binaries and models",
+            "the graph is derived from your source and rebuilds",
+        ],
+        command: "travsr init",
     },
 ];
 
@@ -125,13 +160,30 @@ pub(crate) fn entry(question: &str) -> Option<&'static Entry> {
     ENTRIES.iter().find(|e| e.question == question)
 }
 
-/// Print one entry, wrapped, with its command when it has one.
+/// Print one entry: lead, points, then the command.
 pub(crate) fn print_entry(e: &Entry, pal: Palette) {
-    for line in wrap(e.answer, 76) {
-        println!("{line}");
+    for line in wrap(e.lead, 74) {
+        println!("  {line}");
+    }
+    for p in e.points {
+        // Only wrap when it does not fit. `wrap` splits on whitespace, so running
+        // it over a short point would collapse the runs of spaces some points use
+        // to align a label against its description ("Phase A   parses ...").
+        if p.chars().count() <= 70 {
+            println!("    {} {p}", pal.dim("·"));
+            continue;
+        }
+        let mut lines = wrap(p, 70).into_iter();
+        if let Some(first) = lines.next() {
+            println!("    {} {first}", pal.dim("·"));
+        }
+        for rest in lines {
+            println!("      {rest}");
+        }
     }
     if !e.command.is_empty() {
-        println!("  {} {}", pal.dim("$"), pal.ident(e.command));
+        println!();
+        println!("    {} {}", pal.dim("$"), pal.ident(e.command));
     }
 }
 
@@ -144,12 +196,7 @@ pub fn run() {
 
     for e in ENTRIES {
         println!("{}", pal.orange(e.question));
-        for line in wrap(e.answer, 76) {
-            println!("  {line}");
-        }
-        if !e.command.is_empty() {
-            println!("  {} {}", pal.dim("$"), pal.ident(e.command));
-        }
+        print_entry(e, pal);
         println!();
     }
 
@@ -200,13 +247,38 @@ mod tests {
                 "`{}` should read as spoken text",
                 e.question
             );
-            assert!(!e.answer.is_empty(), "`{}` has no answer", e.question);
+            assert!(!e.lead.is_empty(), "`{}` has no lead", e.question);
+            // A lead that runs long is a paragraph again, which is the format
+            // this structure replaced. One sentence, readable at a glance.
+            assert!(
+                e.lead.chars().count() <= 90,
+                "`{}` has a {}-char lead; that is a paragraph, not a lead",
+                e.question,
+                e.lead.chars().count()
+            );
         }
     }
 
     /// A command that does not exist sends someone to a dead end while looking
     /// authoritative, which is what #727 was. Read the subcommand list from clap
     /// rather than keeping a copy here.
+    /// Points are printed unwrapped when short, to keep column alignment, so an
+    /// over-long one would run off a narrow terminal. Kept within the width the
+    /// renderer treats as "short".
+    #[test]
+    fn points_fit_on_one_line() {
+        for e in ENTRIES {
+            for p in e.points {
+                let n = p.chars().count();
+                assert!(
+                    n <= 70,
+                    "`{}` has a {n}-char point; it would wrap and lose alignment: {p}",
+                    e.question
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_command_is_runnable() {
         use clap::CommandFactory as _;
@@ -235,8 +307,8 @@ mod tests {
     #[test]
     fn wrapping_preserves_every_word() {
         for e in ENTRIES {
-            let joined = wrap(e.answer, 76).join(" ");
-            let before: Vec<&str> = e.answer.split_whitespace().collect();
+            let joined = wrap(e.lead, 76).join(" ");
+            let before: Vec<&str> = e.lead.split_whitespace().collect();
             let after: Vec<&str> = joined.split_whitespace().collect();
             assert_eq!(before, after, "wrapping altered `{}`", e.question);
         }
@@ -250,7 +322,7 @@ mod tests {
     #[test]
     fn no_line_exceeds_the_wrap_width() {
         for e in ENTRIES {
-            for line in wrap(e.answer, 76) {
+            for line in wrap(e.lead, 76) {
                 let n = line.chars().count();
                 // Only a single over-long word may exceed it.
                 assert!(
