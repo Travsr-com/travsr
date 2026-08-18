@@ -113,13 +113,52 @@ def check_build_id_identical(ctx: Context) -> tuple[Outcome, str]:
 
 
 def check_signatures(ctx: Context) -> tuple[Outcome, str]:
+    """Verify each artifact against its Sigstore bundle with `cosign verify-blob`.
+
+    This used to return PASS the moment `cosign` was on PATH, having verified
+    nothing, and the bundles were not even downloaded. That is the exact failure
+    `report.py` says this suite exists to prevent, a check that did not run
+    reading as a check that succeeded, and it was worse than a SKIP because it was
+    invisible in both the summary and the JSON.
+    """
     if ctx.artifacts is None:
         return Outcome.SKIP, "no release downloaded (running against a local binary)"
     if shutil.which("cosign") is None:
-        # Reported, never silently passed. A signature nobody verifies buys
-        # nothing, so a run that could not check them has to say so.
         return Outcome.SKIP, "cosign not installed, so .bundle signatures were NOT verified"
-    return Outcome.PASS, "cosign available"
+
+    bundles = sorted(ctx.artifacts.glob("*.tar.gz.bundle"))
+    if not bundles:
+        return Outcome.SKIP, "the release published no .bundle files to verify"
+
+    import subprocess
+
+    verified, problems = 0, []
+    for bundle in bundles:
+        blob = bundle.with_suffix("")  # strip `.bundle`
+        if not blob.is_file():
+            problems.append(f"{bundle.name}: no matching artifact to verify")
+            continue
+        proc = subprocess.run(
+            [
+                "cosign", "verify-blob",
+                "--bundle", str(bundle),
+                # Keyless signing: the release workflow uses GitHub OIDC, so the
+                # identity is the workflow itself rather than a key.
+                "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com",
+                "--certificate-identity-regexp", r"^https://github\.com/Travsr-com/travsr/",
+                str(blob),
+            ],
+            capture_output=True, text=True, timeout=300,
+        )
+        if proc.returncode == 0:
+            verified += 1
+        else:
+            tail = (proc.stderr or proc.stdout).strip().splitlines()
+            problems.append(f"{blob.name}: {tail[-1][:160] if tail else 'verification failed'}")
+
+    if problems:
+        return Outcome.FAIL, "\n".join(problems)
+    return Outcome.PASS, f"{verified} artifact signature(s) verified"
 
 
 def check_version_reports_build_id(ctx: Context) -> tuple[Outcome, str]:
@@ -201,6 +240,7 @@ def make_language_check(sym) -> CheckFn:
             return Outcome.SKIP, "needs --with-cpp (writes a trust grant outside the temp dir)"
         if sym.needs_compdb and ctx.notes.get("cpp_skip"):
             return Outcome.SKIP, ctx.notes["cpp_skip"]
+        _ensure_indexed(ctx)
         r = ctx.cli.run("references", sym.name)
         if sym.def_file not in r.answer:
             return Outcome.FAIL, (
@@ -278,6 +318,7 @@ def prepare_cpp(ctx: Context) -> tuple[Outcome, str]:
 
 def check_cross_file_edge(ctx: Context) -> tuple[Outcome, str]:
     """The one answer Phase A alone cannot give: an edge between two files."""
+    _ensure_indexed(ctx)
     r = ctx.cli.run("graph", CROSS_FILE_CALLEE, "--direction", "both")
     if CROSS_FILE_CALLER not in r.answer:
         return Outcome.FAIL, (
@@ -288,6 +329,7 @@ def check_cross_file_edge(ctx: Context) -> tuple[Outcome, str]:
 
 
 def check_fsck_clean(ctx: Context) -> tuple[Outcome, str]:
+    _ensure_indexed(ctx)
     r = ctx.cli.run("fsck")
     if "no ghost nodes" not in r.out:
         return Outcome.FAIL, f"fsck reported a problem:\n{r.out.strip()[:400]}"
@@ -303,6 +345,7 @@ def check_no_false_zero_symbol_warning(ctx: Context) -> tuple[Outcome, str]:
     Warning that a working language "produced no symbols" sent users to debug a
     sidecar that does not exist for native languages.
     """
+    _ensure_indexed(ctx)
     status = ctx.cli.status()
     if "produced no symbols" not in status:
         return Outcome.PASS, ""
@@ -317,6 +360,7 @@ def check_marker_recovers_after_commit(ctx: Context) -> tuple[Outcome, str]:
     where the marker lies and the graph is correct, so asserting only one of the
     two would either miss it or misattribute it.
     """
+    _ensure_indexed(ctx)
     ctx.fixture.append(
         "src/payment.ts",
         "\nexport function applyDiscount(c: number): number { return c - 1; }\n",
@@ -466,9 +510,14 @@ def run_all(ctx: Context, report: Report, phases: Optional[set[str]], name_filte
 def _ensure_indexed(ctx: "Context") -> None:
     """Index the fixture if it is not already.
 
-    `travsr mcp --stdio` refuses to start without an index and exits, so the mcp
-    phase cannot assume an earlier phase ran. This keeps `--phase mcp` usable on
-    its own, which is how anyone iterating on one check will invoke it.
+    Every phase after `first-run` queries a graph, so none of them can assume an
+    earlier phase ran. Without this, `--phase honesty` or `--filter references`
+    (the invocations someone iterating on one check actually types) ran against a
+    fixture that was never indexed and came back red for reasons that had nothing
+    to do with the product.
+
+    `travsr mcp --stdio` additionally refuses to start without an index and exits,
+    so the mcp phase would not even reach its assertions.
     """
     if "nodes:" not in ctx.cli.status():
         ctx.cli.run("init", "--semantic")
@@ -654,11 +703,19 @@ def check_mcp_survives_a_malformed_frame(ctx: Context) -> tuple[Outcome, str]:
 
 
 def _smoke(ctx: Context, *args: str, expect: str = "") -> tuple[Outcome, str]:
+    _ensure_indexed(ctx)
     r = ctx.cli.run(*args)
     if r.timed_out:
         return Outcome.FAIL, f"`{' '.join(args)}` did not return within the timeout"
     if "panicked" in r.out or "RUST_BACKTRACE" in r.out:
         return Outcome.FAIL, f"`{' '.join(args)}` panicked:\n{r.out[:300]}"
+    # The exit code is the load-bearing assertion, not an extra. A removed or
+    # renamed subcommand exits 2 with clap's "unrecognized subcommand" and none of
+    # the other conditions here trip, so without this every check that passes no
+    # `expect` would report PASS for a command that no longer exists. That is
+    # #727 exactly, which is the regression this phase exists to catch.
+    if r.code != 0:
+        return Outcome.FAIL, f"`{' '.join(args)}` exited {r.code}:\n{r.out[:300]}"
     if expect and expect not in r.out:
         return Outcome.FAIL, f"expected {expect!r} in output of `{' '.join(args)}`:\n{r.out[:300]}"
     return Outcome.PASS, ""
@@ -672,7 +729,10 @@ def check_ask_runs(ctx: Context) -> tuple[Outcome, str]:
 
 
 def check_explain_runs(ctx: Context) -> tuple[Outcome, str]:
-    return _smoke(ctx, "explain", "validateCharge")
+    # `explain` takes <QUERY> <SYMBOL>, not one argument. The single-argument
+    # form exits 2 on a missing required argument, and this check reported PASS
+    # for it until `_smoke` started asserting the exit code.
+    return _smoke(ctx, "explain", "validateCharge", "validateCharge")
 
 
 def check_pattern_runs(ctx: Context) -> tuple[Outcome, str]:
@@ -684,7 +744,15 @@ def check_repos_runs(ctx: Context) -> tuple[Outcome, str]:
 
 
 def check_config_get_runs(ctx: Context) -> tuple[Outcome, str]:
-    return _smoke(ctx, "config", "get", "reindex.max_parallelism")
+    # Must be a key in travsr-config's registry. `reindex.max_parallelism` does
+    # not exist anywhere in the tree, so this check was asserting against an
+    # `unknown key` error and reporting PASS, because `_smoke` ignored the exit
+    # code at the time.
+    # `config get` prints the value, not the key, so asserting on the key name
+    # would fail on correct output. The exit code is what matters here: an
+    # unknown key exits non-zero, which is how the previous
+    # `reindex.max_parallelism` version was silently failing.
+    return _smoke(ctx, "config", "get", "embed.capacity")
 
 
 def check_synonym_list_runs(ctx: Context) -> tuple[Outcome, str]:
@@ -701,6 +769,7 @@ def check_rerank_status_runs(ctx: Context) -> tuple[Outcome, str]:
 
 def check_graph_json_is_parseable(ctx: Context) -> tuple[Outcome, str]:
     """`--format json` must emit JSON, since renderers consume it."""
+    _ensure_indexed(ctx)
     r = ctx.cli.run("graph", "PaymentService", "--format", "json")
     payload = r.stdout.strip()
     if not payload:

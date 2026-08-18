@@ -27,13 +27,25 @@ use crate::repo::find_git_root;
 /// revert) all restore the file to its committed content, so the working tree
 /// ends up equal to HEAD with the flag still set and the `ref/call` edge still
 /// missing. Telling the user to commit is a dead end there: there is nothing
-/// to stage. Recovery is `travsr init`, or any later commit that fires the
-/// hook.
+/// to stage. Recovery is `travsr init --semantic`, or any later commit that
+/// fires the hook.
+///
+/// The `--semantic` is load-bearing rather than decorative. Plain `travsr init`
+/// defers Phase B to the daemon (`run_phase_b_inline = semantic || !has_commit`),
+/// so on an already-committed repo it re-runs Phase A and returns without
+/// rebuilding the `ref/call` edges this flag is reporting as missing. The flag
+/// therefore survives, and the message would be naming a command that cannot
+/// clear it. Nor can the daemon rescue it here: `arm_phase_b_if_pending` only
+/// arms when `last_commit != phase_b_commit`, and in this state they are equal.
+///
+/// Clearing the flag on the deferred path instead would be the wrong fix: the
+/// edges genuinely are missing until Phase B re-runs, so the flag is honest and
+/// it is the remedy that was wrong.
 fn phase_b_state(payload: &StatusPayload) -> String {
     match payload.phase_b_commit.as_deref() {
         Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => {
             if payload.phase_b_dirty {
-                "stale (run travsr init to refresh)".to_string()
+                "stale (run travsr init --semantic to refresh)".to_string()
             } else {
                 // #712: the marker now advances even when a language crashed, so
                 // the healthy languages are complete and queryable at HEAD. Name
@@ -377,7 +389,7 @@ mod tests {
         // old logic said `complete`, but the file's `ref/call` edges are gone.
         assert_eq!(
             phase_b_state(&payload("abc", "abc", true)),
-            "stale (run travsr init to refresh)"
+            "stale (run travsr init --semantic to refresh)"
         );
     }
 

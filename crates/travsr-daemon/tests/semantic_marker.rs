@@ -184,3 +184,74 @@ fn the_marker_recovers_after_a_source_commit_and_reindex() {
          marker over a stale graph is a worse failure than the one being fixed"
     );
 }
+
+/// Plain `travsr init` must NOT clear the flag, and `status` must not tell users
+/// to run it.
+///
+/// Review on #742 caught that both other tests here go through `--semantic`, so
+/// neither covered the path `travsr status` actually named. `run_phase_b_inline`
+/// is `semantic || !has_commit`, so on an already-committed repo plain init
+/// re-runs Phase A and returns without rebuilding the `ref/call` edges the flag
+/// reports as missing.
+///
+/// The flag staying set is correct: the edges are genuinely still missing, so
+/// clearing it would be a lie. What was wrong was the remedy the message named,
+/// which is asserted in `the_remediation_names_a_command_that_works`.
+#[test]
+fn plain_init_leaves_the_flag_set_because_it_does_not_run_phase_b() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    git_init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/m.py"),
+        "def add(a, b):\n    return a + b\n\n\ndef run():\n    return add(1, 2)\n",
+    )
+    .unwrap();
+    commit_all(root, "seed");
+
+    init_semantic(root);
+    let db = root.join(".travsr/graph.db");
+
+    // The state a watcher or hook reindex leaves behind.
+    mark_dirty(&db);
+    assert!(
+        reads_as_dirty(&db),
+        "arrangement failed: the flag is not set"
+    );
+
+    // Plain init: semantic = false, and the repo has a HEAD commit.
+    travsr_daemon::init_repo(root).expect("plain init_repo");
+
+    assert!(
+        reads_as_dirty(&db),
+        "plain `travsr init` defers Phase B, so the ref/call edges are still \
+         missing and the flag must stay set; clearing it here would report a \
+         clean semantic layer over a degraded graph"
+    );
+
+    // And the documented remedy does clear it.
+    init_semantic(root);
+    assert!(
+        !reads_as_dirty(&db),
+        "`travsr init --semantic` must clear what plain init cannot"
+    );
+}
+
+/// The remediation string must name a command that can actually clear the state
+/// it appears in. Pinned as a string because the message is the whole product
+/// surface for this bug: #741 was a dead-end loop precisely because the text
+/// named `travsr init`, which cannot clear the flag on an already-committed repo.
+#[test]
+fn the_remediation_names_a_command_that_works() {
+    let status_rs = include_str!("../../travsr-cli/src/status.rs");
+    assert!(
+        status_rs.contains("stale (run travsr init --semantic to refresh)"),
+        "the stale message must name `travsr init --semantic`"
+    );
+    assert!(
+        !status_rs.contains("stale (run travsr init to refresh)"),
+        "the old message named plain `travsr init`, which defers Phase B and so \
+         cannot clear the flag: running it returns the user to the same message"
+    );
+}

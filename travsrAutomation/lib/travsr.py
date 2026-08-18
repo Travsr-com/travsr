@@ -148,12 +148,28 @@ def download_release(tag: str, repo: str, dest: Path) -> tuple[bool, str]:
     dest.mkdir(parents=True, exist_ok=True)
 
     last = ""
+    attempt = 0
     for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
-        p = subprocess.run(
-            ["gh", "release", "download", tag, "--repo", repo,
-             "--pattern", "*.tar.gz", "--pattern", "SHA256SUMS", "--clobber"],
-            cwd=dest, capture_output=True, text=True, timeout=1800,
-        )
+        try:
+            p = subprocess.run(
+                ["gh", "release", "download", tag, "--repo", repo,
+                 # `.bundle` explicitly: `*.tar.gz` does not match
+                 # `travsr-<tag>-<target>.tar.gz.bundle`, so without this the
+                 # Sigstore bundles never land and signature verification has
+                 # nothing to check.
+                 "--pattern", "*.tar.gz", "--pattern", "*.bundle",
+                 "--pattern", "SHA256SUMS", "--clobber"],
+                cwd=dest, capture_output=True, text=True, timeout=1800,
+            )
+        except subprocess.TimeoutExpired:
+            # Uncaught, this escaped download_release and out of resolve_binary as
+            # a traceback, breaking the documented "error: ... / exit 2" contract
+            # at the moment the operator most needs a readable message.
+            last = "gh release download timed out after 1800s"
+            if attempt < DOWNLOAD_ATTEMPTS:
+                print(f"  download attempt {attempt} timed out, retrying")
+                time.sleep(3 * attempt)
+            continue
         if p.returncode == 0:
             return True, ""
         last = p.stderr.strip()
@@ -162,7 +178,12 @@ def download_release(tag: str, repo: str, dest: Path) -> tuple[bool, str]:
         if "release not found" in last.lower() or "not found" in last.lower():
             break
         if attempt < DOWNLOAD_ATTEMPTS:
-            print(f"  download attempt {attempt} failed, retrying: {last.splitlines()[-1][:120]}")
+            # `gh` can exit non-zero having written nothing to stderr (killed by a
+            # signal, or an error on stdout). Indexing [-1] of an empty list then
+            # raised IndexError from inside the retry handler, so the suite died
+            # with a traceback instead of its readable failure path.
+            tail = last.splitlines()[-1] if last else "(no stderr)"
+            print(f"  download attempt {attempt} failed, retrying: {tail[:120]}")
             time.sleep(3 * attempt)
     return False, f"gh release download failed after {attempt} attempt(s): {last[:400]}"
 
@@ -202,14 +223,32 @@ def extract(tarball: Path, dest: Path) -> Optional[Path]:
     """Extract a release tarball and return the `travsr` binary inside it."""
     dest.mkdir(parents=True, exist_ok=True)
     with tarfile.open(tarball) as tf:
-        # Refuse absolute or parent-escaping members rather than trusting the
-        # archive. These are our own artifacts, but a sanity tool that unpacks
-        # blindly is a bad tool to hand someone.
-        for m in tf.getmembers():
-            p = Path(m.name)
-            if p.is_absolute() or ".." in p.parts:
-                raise ValueError(f"unsafe path in {tarball.name}: {m.name}")
-        tf.extractall(dest)
+        # `filter="data"` is the interpreter's own extraction guard: it rejects
+        # absolute paths, parent traversal, device nodes, and crucially link
+        # targets that point outside the destination.
+        #
+        # Checking member names alone was not enough, which is what the previous
+        # version did. A symlink member named `travsr` with a linkname of
+        # `../../../etc/passwd` passes a name check, and extraction then creates a
+        # link out of the temp dir that a later member, or `extract`'s own
+        # rglob("travsr") below, follows.
+        try:
+            tf.extractall(dest, filter="data")
+        except TypeError:
+            # `filter=` landed in 3.12. On older interpreters, validate names and
+            # link targets by hand rather than silently unpacking unchecked.
+            for m in tf.getmembers():
+                for candidate in (m.name, m.linkname or ""):
+                    if not candidate:
+                        continue
+                    cp = Path(candidate)
+                    if cp.is_absolute() or ".." in cp.parts:
+                        raise ValueError(
+                            f"unsafe path in {tarball.name}: {m.name} -> {candidate}"
+                        )
+                if m.isdev():
+                    raise ValueError(f"device node in {tarball.name}: {m.name}")
+            tf.extractall(dest)
     for name in ("travsr", "travsr.exe"):
         found = sorted(dest.rglob(name))
         if found:

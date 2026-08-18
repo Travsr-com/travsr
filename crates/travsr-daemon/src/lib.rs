@@ -1780,19 +1780,23 @@ pub fn init_repo_with_progress(
         if run_phase_b_inline && phase_b_made_progress {
             let _ = store.set_meta("phase_b_commit", &sha);
             // #741: clear `phase_b_dirty` too, exactly as the daemon's own Phase B
-            // path does when it advances this marker. Init's Phase A pass goes
-            // through `reindex_files`, which sets the flag because rewriting a
-            // file's Phase A nodes drops its `ref/call` edges (#583). Phase B then
-            // rebuilds them, so by this point the flag describes a degradation
-            // that no longer exists.
+            // path does when it advances this marker.
             //
-            // Stamping the commit without clearing the flag left `travsr status`
-            // reporting `stale (run travsr init to refresh)` permanently after the
-            // first source commit: every subsequent `travsr init` set the flag
-            // again on its Phase A pass and never cleared it, so the remediation
-            // the message named was the command that reproduced the state. The
-            // graph itself was correct throughout, which is what made this a
-            // status-honesty bug rather than staleness.
+            // The flag is set by `reindex_files` on the watcher and hook paths,
+            // because rewriting a file's Phase A nodes drops its `ref/call` edges
+            // (#583). Init's own indexing does not route through `reindex_files`,
+            // so the flag reaching here was set by an earlier watcher or hook
+            // reindex, not by this run. Phase B has just rebuilt those edges, so
+            // by this point the flag describes a degradation that no longer
+            // exists and leaving it set makes `travsr status` report `stale`
+            // over a correct graph.
+            //
+            // Only reachable with `run_phase_b_inline`, which means
+            // `travsr init --semantic` or a repo with no HEAD commit. Plain
+            // `travsr init` defers Phase B and must NOT clear the flag: the edges
+            // really are still missing, so the flag is honest there. That is why
+            // `status.rs` names `travsr init --semantic` as the remedy rather
+            // than `travsr init`.
             let _ = store.set_meta("phase_b_dirty", "0");
         }
     }

@@ -248,13 +248,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Every `${{ }}` below is bound through `env:` rather than interpolated
+      # into the script body. GitHub substitutes those expressions into the shell
+      # source before bash ever parses it, so a dispatch input or a tag name of
+      # the form `x"; curl ... | sh; #` would execute as script, not data, in a
+      # job that runs `gh` with a repo token. `set -euo pipefail` is no defence:
+      # the injected text IS the script.
       - name: Resolve the tag under test
         id: t
         shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.sanity_tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.sanity_tag || github.event.release.tag_name }}"
+          TAG="${INPUT_TAG:-$RELEASE_TAG}"
           [ -n "$TAG" ] || { echo "no tag to verify" >&2; exit 1; }
+          # A tag is a git ref, so anything outside this set is not one, and
+          # rejecting it here keeps the value from reaching `gh` at all.
+          case "$TAG" in
+            *[!A-Za-z0-9._/-]*) echo "refusing tag with unexpected characters: $TAG" >&2; exit 1 ;;
+          esac
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "verifying $TAG"
 
@@ -267,18 +281,21 @@ jobs:
       - name: Sanity suite against the published artifact
         env:
           GH_TOKEN: ${{ github.token }}
+          SANITY_TAG: ${{ steps.t.outputs.tag }}
+          WITH_CPP: ${{ github.event.inputs.sanity_with_cpp }}
+          OS_LABEL: ${{ matrix.os }}
         shell: bash
         run: |
           set -euo pipefail
           EXTRA=""
-          if [ "${{ github.event.inputs.sanity_with_cpp }}" = "true" ]; then
+          if [ "$WITH_CPP" = "true" ]; then
             EXTRA="--with-cpp"
           fi
           python3 travsrAutomation/run.py \
-            --tag "${{ steps.t.outputs.tag }}" \
+            --tag "$SANITY_TAG" \
             $EXTRA \
-            --json "sanity-${{ matrix.os }}.json" \
-            --junit "sanity-${{ matrix.os }}.xml"
+            --json "sanity-$OS_LABEL.json" \
+            --junit "sanity-$OS_LABEL.xml"
 
       - name: Upload results
         if: always()
@@ -295,13 +312,15 @@ jobs:
       - name: Summarise
         if: always()
         shell: bash
+        env:
+          OS_LABEL: ${{ matrix.os }}
         run: |
-          F="sanity-${{ matrix.os }}.json"
+          F="sanity-$OS_LABEL.json"
           if [ ! -f "$F" ]; then
-            echo "### Release sanity produced no results on ${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Release sanity produced no results on $OS_LABEL" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          python3 travsrAutomation/summarise.py "$F" "${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
+          python3 travsrAutomation/summarise.py "$F" "$OS_LABEL" >> "$GITHUB_STEP_SUMMARY"
 
   build-id:
     name: release build id
