@@ -145,6 +145,23 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     if query_str.trim().is_empty() {
         anyhow::bail!("search query must not be empty — try: travsr ask \"PaymentService\"");
     }
+    // The explicit route, checked before the repository is even located: a
+    // question about travsr is answerable with no index, which is exactly when
+    // someone is most likely to ask one. `match_question` still handles the
+    // natural phrasing; this is the spelling that cannot be ambiguous, and the
+    // one the agent guidance points at.
+    if let Some(rest) = crate::faq::strip_namespace(query_str) {
+        use std::io::IsTerminal as _;
+        let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
+        match crate::faq::match_namespaced(rest) {
+            Some(e) => crate::faq::print_entry(e, pal),
+            // Listing the questions beats "no match": the reader has already
+            // said what kind of answer they want, so show what is on offer.
+            None => crate::faq::print_questions(pal),
+        }
+        return Ok(());
+    }
+
     note_docs_flag_is_read_by_the_daemon();
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = find_git_root(&cwd)?;

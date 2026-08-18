@@ -117,43 +117,41 @@ const GUIDE_TITLE: &str = "Use Travsr first for all code questions";
 /// a `repo` argument and every schema is closed (`additionalProperties: false`).
 /// The multi-repo surface behind `travsr mcp --global` is a different tool list.
 /// When a tool is added or renamed in single-repo mode, update this table.
+/// The text written into every agent's always-on rules file.
+///
+/// Kept deliberately small. This is loaded on every turn of every conversation,
+/// so each line is paid for again and again, and it competes for attention with
+/// the user's own rules. The earlier version carried a question-to-tool routing
+/// table: eleven rows naming the tool to call for each kind of question. That
+/// was the bulk of it and it was redundant, because the MCP client already
+/// hands the model all twenty-six tool names with their descriptions before the
+/// conversation starts. Restating them here bought nothing and cost the tokens
+/// twice.
+///
+/// What stays is the part a tool schema cannot say: query the graph *before*
+/// grepping, and the handful of rules about how this server behaves. Detail
+/// that a reader wants once, rather than on every turn, lives in the FAQ and is
+/// one command away.
 fn guide_body() -> String {
-    "This repository is indexed by Travsr, a code graph served over MCP. For ANY \
-question about where code lives or how it connects (definitions, call sites, \
-imports, change impact, call paths, repo structure), query Travsr BEFORE \
-grep/find/ripgrep or reading whole files. Travsr answers from the graph, so it is \
-token-cheap and does not invent structure that is not there.
+    "This repository is indexed by Travsr, a code graph served over MCP. For any \
+question about where code lives or how it connects, query Travsr before grep, \
+find or reading whole files. It answers from the graph, so it is token-cheap and \
+does not invent structure that is not there.
 
-Pick the tool by the question:
-
-| question                          | tool                                        |
-| --------------------------------- | ------------------------------------------- |
-| where is X defined?               | search_symbol(name, exact)                  |
-| what does X actually look like?   | get_snippets(symbols, mode)                 |
-| who calls X?                      | get_callers(symbol)                         |
-| every use site of X?              | find_references(symbol, path)               |
-| what does this file import?       | get_dependencies(file, transitive)          |
-| what breaks if I change this?     | get_blast_radius(file, analysis)            |
-| how does A reach B?               | get_execution_path(source, sink)            |
-| what is in this repo?             | get_repo_map()                              |
-| open-ended \"how does X work?\"     | get_context(query, include_snippets)        |
-| text or regex search              | find_pattern(pattern, scope, fixed)         |
-| is the index fresh?               | get_index_status(), get_graph_health()      |
-
-Rules:
+The tool names and their descriptions arrive over MCP, so choose from those.
 
 1. This server is bound to this repository alone, so no tool takes a `repo` \
-   argument. Every schema is closed, pass only the arguments named above.
-2. Start open-ended questions with get_context, not with a file read. Set \
-   include_snippets=true and it returns the source inline, so there is no \
-   follow-up read at all.
-3. Prefer find_pattern over your own grep: it is the same regex search already \
-   scoped to the indexed file set, and `scope` narrows it further to a path \
-   prefix or to files-importing(<symbol>).
-4. Read a whole file only after Travsr has told you which file, and only when \
-   you need something the graph does not carry.
-5. Fall back to plain text search when Travsr returns nothing, or when it \
-   reports the index is unavailable or stale."
+   argument. Every schema is closed: pass only the arguments it names.
+2. Start open-ended questions with get_context and include_snippets=true. It \
+   returns the source inline, so there is no follow-up read.
+3. Prefer find_pattern over your own grep: the same regex search, already scoped \
+   to the indexed files, and `scope` narrows it further.
+4. Read a whole file only after Travsr has told you which file, and only for \
+   what the graph does not carry.
+5. Fall back to plain text search when Travsr returns nothing, or reports the \
+   index unavailable or stale.
+
+For anything about Travsr itself, run: travsr ask \"travsr: <question>\""
         .to_string()
 }
 
@@ -1827,9 +1825,12 @@ mod tests {
             .collect();
 
         let named = guide_table_tools(&guide_body());
+        // The guidance names only the few tools whose *use* needs explaining
+        // beyond their own description, so this is a floor against the parser
+        // silently matching nothing, not a target to grow.
         assert!(
-            named.len() >= 10,
-            "table parse recovered too few tools, it has probably broken: {named:?}"
+            named.len() >= 2,
+            "extraction recovered too few tools, it has probably broken: {named:?}"
         );
         for name in &named {
             assert!(
@@ -1883,32 +1884,66 @@ mod tests {
         );
     }
 
-    /// Tool names the routing table tells the agent to call: every identifier
-    /// immediately followed by `(` in the table's second column. Reading them
-    /// back out of the generated text is what makes the pin above real.
+    /// Tool names the guidance tells the agent to call.
+    ///
+    /// Read out of the generated text rather than kept as a list here, which is
+    /// what makes the pin above real: a rename on the server side fails the
+    /// test, where a hardcoded copy would happily agree with itself.
+    ///
+    /// Scans the whole body. It used to parse the second column of a routing
+    /// table, and when that table was removed for costing tokens on every turn
+    /// the parser silently recovered nothing, so the check passed by finding no
+    /// tools to check. Anchored to the naming convention instead.
     fn guide_table_tools(body: &str) -> Vec<String> {
         let mut names = Vec::new();
-        for line in body.lines().filter(|l| l.trim_start().starts_with('|')) {
-            let Some(cell) = line.split('|').nth(2) else {
-                continue;
-            };
-            let chars: Vec<char> = cell.chars().collect();
-            for (i, c) in chars.iter().enumerate() {
-                if *c != '(' {
-                    continue;
-                }
-                let start = chars[..i]
-                    .iter()
-                    .rposition(|c| !(c.is_alphanumeric() || *c == '_'))
-                    .map(|p| p + 1)
-                    .unwrap_or(0);
-                let name: String = chars[start..i].iter().collect();
-                if !name.is_empty() && !names.contains(&name) {
-                    names.push(name);
-                }
+        for word in body.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            let looks_like_a_tool = word.starts_with("get_")
+                || word.starts_with("find_")
+                || word.starts_with("search_")
+                || word.starts_with("repos_");
+            if looks_like_a_tool && !names.contains(&word.to_string()) {
+                names.push(word.to_string());
             }
         }
         names
+    }
+
+    /// The guidance is loaded on every turn of every conversation, so its size
+    /// is a recurring cost paid by every user of every agent, not a one-off.
+    /// Nothing else in the codebase makes that cost visible, which is how it
+    /// reached 2270 characters: each addition looked small on its own.
+    ///
+    /// The budget is the point of this test. Adding a line means removing one,
+    /// or making a deliberate case for raising the limit.
+    #[test]
+    fn the_always_on_guidance_stays_small() {
+        let n = guide_body().chars().count();
+        assert!(
+            n <= 1200,
+            "agent guidance is {n} chars, over the 1200 budget. It is re-sent on \
+             every turn, so this is paid repeatedly. Detail that a reader wants \
+             once belongs in the FAQ, reachable with `travsr ask \"travsr: ...\"`"
+        );
+    }
+
+    /// The pointer has to be a command that works, or it is worse than nothing:
+    /// an agent that follows it gets an error and learns to distrust the rest.
+    #[test]
+    fn the_guidance_points_at_a_working_command() {
+        let body = guide_body();
+        let marker = "travsr ask \"travsr:";
+        assert!(
+            body.contains(marker),
+            "guidance lost its pointer to the FAQ"
+        );
+        assert!(
+            crate::faq::strip_namespace("travsr: how does MCP work").is_some(),
+            "the namespace the guidance tells agents to use is not recognised"
+        );
+        assert!(
+            crate::faq::match_namespaced("how does MCP work").is_some(),
+            "the example question the pointer implies matches nothing"
+        );
     }
 
     /// `plan()` wires `travsr mcp --stdio` with no `--global`, which is

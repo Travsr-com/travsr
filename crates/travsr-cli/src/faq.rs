@@ -445,6 +445,60 @@ const ENTRIES: &[Entry] = &[
     },
 ];
 
+/// The prefix that says "this is a question about travsr, not about my code".
+pub(crate) const NAMESPACE: &str = "travsr:";
+
+/// The question inside an explicitly namespaced query, if it is one.
+pub(crate) fn strip_namespace(query: &str) -> Option<&str> {
+    let q = query.trim();
+    // Accept the spelling with a space before the colon too; someone typing a
+    // sentence naturally writes one, and rejecting it would be a puzzle rather
+    // than a rule.
+    let rest = q
+        .strip_prefix(NAMESPACE)
+        .or_else(|| q.strip_prefix("travsr :"))?;
+    Some(rest.trim())
+}
+
+/// Best entry for a question that is already known to be about travsr.
+///
+/// Deliberately looser than [`match_question`]. That one has to protect a code
+/// search from being hijacked, so it demands a question shape and coverage in
+/// both directions. Here the reader has said which kind of question this is by
+/// typing the prefix, so `travsr: logs` should work even though bare `logs`
+/// is a symbol search.
+pub(crate) fn match_namespaced(question: &str) -> Option<&'static Entry> {
+    let asked = distinctive_words(question);
+    if asked.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, &'static Entry)> = None;
+    for e in ENTRIES {
+        let want = distinctive_words(e.question);
+        let hits = want.iter().filter(|w| asked.contains(*w)).count();
+        if hits == 0 {
+            continue;
+        }
+        if best.map_or(true, |(n, _)| hits > n) {
+            best = Some((hits, e));
+        }
+    }
+    best.map(|(_, e)| e)
+}
+
+/// Print the catalogue's questions, for a namespaced query that matched nothing.
+pub(crate) fn print_questions(pal: Palette) {
+    println!("{}", pal.bold("Questions about travsr"));
+    for q in questions() {
+        println!("  {q}");
+    }
+    println!();
+    println!(
+        "{}",
+        pal.dim("Ask one with: travsr ask \"travsr: <question>\"")
+    );
+}
+
 /// The FAQ entry a free-form question is asking, if any.
 ///
 /// Matched by word overlap against the catalogue's own questions rather than a
