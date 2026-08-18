@@ -170,16 +170,8 @@ impl EmbedOpLock {
             }
         };
         if file.try_lock_exclusive().is_err() {
-            let held = std::fs::read_to_string(&info_path).unwrap_or_default();
-            let (pid, held_op) = held
-                .trim()
-                .split_once('\t')
-                .map(|(p, o)| (p.to_string(), o.to_string()))
-                .unwrap_or_else(|| ("unknown".to_string(), "an embed operation".to_string()));
-            return Err(anyhow::Error::new(Contended(format!(
-                "Another embed operation is already running for this repo \
-                 ({held_op}, pid {pid}).\n\
-                 Wait for it to finish, or stop it with: travsr daemon stop"
+            return Err(anyhow::Error::new(Contended(contention_message(
+                &info_path,
             ))));
         }
         std::fs::write(&info_path, format!("{}\t{op}", std::process::id()))
@@ -227,6 +219,94 @@ impl EmbedOpLock {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+/// Build the user-facing message for a lock we could not take.
+///
+/// #735: this used to read `embed.lock.info` and name whatever pid was in it,
+/// unconditionally. That file is only rewritten on a *successful* acquire, so a
+/// reindex that died without releasing leaves it naming a process that no longer
+/// exists, and the message then blamed a dead pid and told the user to run
+/// `travsr daemon stop`, which had nothing to stop. A live incident reported
+/// exactly that, against a pid confirmed absent from `ps`.
+///
+/// The recorded pid is not evidence of the holder in the first place. `flock` is
+/// released by the OS when a process dies, so a dead pid cannot be holding this
+/// lock: if the file says otherwise, the file is stale and something else is
+/// holding it. And because `flock` is per open file description, two opens in the
+/// *same* process conflict, so this daemon's own in-flight operation is a real
+/// possibility that the old wording actively denied by saying "another".
+///
+/// So the message now distinguishes three cases and only recommends an action it
+/// can justify.
+fn contention_message(info_path: &Path) -> String {
+    let held = std::fs::read_to_string(info_path).unwrap_or_default();
+    let (pid_str, held_op) = held
+        .trim()
+        .split_once('\t')
+        .map(|(p, o)| (p.trim().to_string(), o.trim().to_string()))
+        .unwrap_or_else(|| (String::new(), "an embed operation".to_string()));
+    let pid: Option<u32> = pid_str.parse().ok();
+
+    if pid.is_some_and(|p| p == std::process::id()) {
+        return format!(
+            "An embed operation ({held_op}) is already running in this same process.\n\
+             Waiting for it to finish; no action is needed."
+        );
+    }
+
+    match pid.map(pid_liveness) {
+        Some(Liveness::Dead) => format!(
+            "The embed lock is held, but .travsr/embed.lock.info still names pid \
+             {pid_str}, which is not running.\n\
+             That file is only updated when a lock is taken, so it is stale after an \
+             interrupted run and does not identify the current holder.\n\
+             No action is needed: the lock is released automatically when its holder \
+             exits."
+        ),
+        Some(Liveness::Alive) => format!(
+            "Another embed operation is already running for this repo \
+             ({held_op}, pid {pid_str}).\n\
+             Wait for it to finish, or stop it with: travsr daemon stop"
+        ),
+        // Unparseable pid, or a platform where liveness cannot be checked. Say
+        // what is known and claim nothing further.
+        _ => "Another embed operation is already running for this repo.\n\
+              Wait for it to finish, or stop it with: travsr daemon stop"
+            .to_string(),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Liveness {
+    Alive,
+    Dead,
+    /// Only constructed off-unix, where there is no safe liveness probe here.
+    /// Kept as an explicit third state rather than collapsing into `Alive`,
+    /// because "we could not tell" and "we checked and it is running" justify
+    /// different messages, and conflating them is how the original bug read a
+    /// dead pid as a live holder.
+    #[cfg_attr(unix, allow(dead_code))]
+    Unknown,
+}
+
+fn pid_liveness(pid: u32) -> Liveness {
+    #[cfg(unix)]
+    {
+        if crate::unix_pid_is_alive(pid) {
+            Liveness::Alive
+        } else {
+            Liveness::Dead
+        }
+    }
+    // No equivalent safe probe on Windows here, and guessing would be worse than
+    // saying nothing: reporting a live holder as stale would tell a user to
+    // ignore a real conflict.
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Liveness::Unknown
     }
 }
 
@@ -2211,9 +2291,21 @@ mod tests {
             .open(repo.path().join(".travsr").join("embed.lock"))
             .unwrap();
         fs2::FileExt::lock_exclusive(&held).unwrap();
+        // #735: the recorded pid must be one that is actually alive. This used
+        // to be a made-up number, which worked only because the message named
+        // whatever the file contained without checking it. That is the bug being
+        // fixed, so the fixture has to stop relying on it: a pid that is not
+        // running now reports the info file as stale, which is correct, and would
+        // make this test assert the wrong branch.
+        //
+        // On unix, pid 1 is always alive and is never this process, which is
+        // exactly "some other live holder". Elsewhere, liveness cannot be probed
+        // here, so the message degrades to naming no pid and the assertion below
+        // adapts rather than pretending otherwise.
+        let recorded_pid = if cfg!(unix) { "1" } else { "41822" };
         std::fs::write(
             repo.path().join(".travsr").join("embed.lock.info"),
-            b"41822\treindex",
+            format!("{recorded_pid}\treindex"),
         )
         .unwrap();
 
@@ -2221,9 +2313,15 @@ mod tests {
             .expect_err("must not acquire while another holder has the lock");
         let msg = err.to_string();
         assert!(
-            msg.contains("41822") && msg.contains("reindex"),
-            "error must name the holder's recorded pid and operation, got: {msg}"
+            msg.contains("already running"),
+            "error must report the conflict, got: {msg}"
         );
+        if cfg!(unix) {
+            assert!(
+                msg.contains(recorded_pid) && msg.contains("reindex"),
+                "a live holder must still be named with its pid and operation, got: {msg}"
+            );
+        }
 
         fs2::FileExt::unlock(&held).unwrap();
         drop(held);
@@ -2529,5 +2627,127 @@ mod tests {
         for b in &parsed.backend {
             assert!(!b.arch.trim().is_empty(), "{} has no arch", b.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_lock_tests {
+    //! #735: the lock-contention message named whatever pid `embed.lock.info`
+    //! happened to contain, without checking it. A live incident hit exactly
+    //! that: the daemon logged a conflict against pid 485836 once a minute while
+    //! `ps` showed no such process, and told the user to `travsr daemon stop`
+    //! something that did not exist.
+    //!
+    //! The recorded pid is not evidence of the holder at all. `flock` is released
+    //! by the OS on process death, so a dead pid cannot hold this lock; and
+    //! because `flock` is per open file description, a second open in the *same*
+    //! process conflicts too, which the old wording denied by saying "another".
+
+    use super::{contention_message, pid_liveness, Liveness};
+
+    fn info(dir: &std::path::Path, contents: &str) -> std::path::PathBuf {
+        let p = dir.join("embed.lock.info");
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    /// A pid that is not running must not be named as the holder, and the message
+    /// must not prescribe an action against it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_pid_is_reported_as_stale_not_as_the_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Allocated high and never spawned. If this ever collides with a real
+        // process the assertion below fails loudly rather than passing wrongly.
+        let dead = 4_194_300u32;
+        if super::super::unix_pid_is_alive(dead) {
+            eprintln!("skipping: pid {dead} unexpectedly exists on this host");
+            return;
+        }
+        let msg = contention_message(&info(tmp.path(), &format!("{dead}\treindex")));
+
+        assert!(
+            msg.contains("stale"),
+            "message must name the file as stale: {msg}"
+        );
+        assert!(
+            !msg.contains("Another embed operation is already running"),
+            "a dead pid must not be reported as a running operation: {msg}"
+        );
+        assert!(
+            !msg.contains("travsr daemon stop"),
+            "must not prescribe stopping a process that does not exist: {msg}"
+        );
+    }
+
+    /// The same-process case, which `flock`'s per-description semantics make
+    /// reachable and the old wording called "another" operation.
+    #[test]
+    fn our_own_pid_is_not_described_as_another_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let msg = contention_message(&info(
+            tmp.path(),
+            &format!("{}\treindex", std::process::id()),
+        ));
+
+        assert!(
+            msg.contains("same process"),
+            "self-contention must be named as such: {msg}"
+        );
+        assert!(
+            !msg.contains("Another embed operation"),
+            "our own operation is not another process's: {msg}"
+        );
+        assert!(
+            !msg.contains("travsr daemon stop"),
+            "telling a user to stop the daemon that is mid-operation is wrong advice: {msg}"
+        );
+    }
+
+    /// A live holder must still produce the original actionable message, since
+    /// that case was never wrong.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_holder_still_gets_the_actionable_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        // PID 1 is always alive and is not this process.
+        let msg = contention_message(&info(tmp.path(), "1\treindex"));
+        assert!(
+            msg.contains("Another embed operation is already running"),
+            "a live holder must still be reported as one: {msg}"
+        );
+        assert!(
+            msg.contains("travsr daemon stop"),
+            "and stay actionable: {msg}"
+        );
+    }
+
+    /// A missing or malformed info file must degrade to a message that claims
+    /// nothing about a pid, rather than printing "pid unknown" as if it were one.
+    #[test]
+    fn a_missing_or_malformed_info_file_claims_nothing_about_a_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        for contents in ["", "garbage-without-a-tab", "not-a-number\treindex"] {
+            let msg = contention_message(&info(tmp.path(), contents));
+            assert!(
+                !msg.contains("pid "),
+                "must not name a pid it could not read ({contents:?}): {msg}"
+            );
+            assert!(
+                msg.contains("already running"),
+                "the conflict itself is still real and must be reported ({contents:?}): {msg}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn liveness_agrees_with_the_platform_probe() {
+        assert_eq!(pid_liveness(1), Liveness::Alive, "pid 1 is always alive");
+        assert_eq!(
+            pid_liveness(std::process::id()),
+            Liveness::Alive,
+            "this process is alive"
+        );
     }
 }
