@@ -199,12 +199,26 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         // "try rephrasing" is not actionable on its own: a user who does not
         // already know what travsr answers cannot tell what to rephrase towards,
         // and this path fires most often on exactly the conceptual questions
-        // where they are least sure. Name the catalogue instead.
-        println!(
-            "no grounded match for '{display_query}' in this repo\n\
-             try a symbol name directly, or run `travsr ask --examples` to see \
-             what travsr can answer"
-        );
+        // where they are least sure.
+        //
+        // A static list of examples is barely better, because the user still has
+        // to translate their own question into one of them. So the suggestions
+        // below are built from what they actually typed: the nearest real symbol
+        // in this repo, and the command that matches the intent their wording
+        // signals. Falls back to the catalogue only when nothing specific can be
+        // said, rather than leading with it.
+        println!("no grounded match for '{display_query}' in this repo");
+        let suggestions = suggest_next(&db_path, display_query);
+        if suggestions.is_empty() {
+            println!("run `travsr ask --examples` to see what travsr can answer");
+        } else {
+            println!("\ntry one of these:");
+            for s in &suggestions {
+                println!("  {}", s.command);
+                println!("      {}", s.why);
+            }
+            println!("\nor `travsr ask --examples` for the full list");
+        }
         // #376 §4.3: doc hits may appear below the abstain message, but never
         // convert it into a match — `payload.matched` stays false and no
         // confidence, coverage or tier label is derived from them. This is the
@@ -589,5 +603,236 @@ mod catalogue_tests {
                 assert!(!s.example.is_empty(), "{group}: empty example");
             }
         }
+    }
+}
+
+/// One concrete next step, phrased as a command the user can paste.
+pub(crate) struct Suggestion {
+    pub command: String,
+    pub why: String,
+}
+
+/// Intent keywords mapped to the command that actually answers them.
+///
+/// `ask` is graph-grounded retrieval, so several common questions are better
+/// served by a different subcommand entirely. A user who phrases one of those as
+/// a question gets an abstention today and no hint that the answer exists one
+/// command over.
+///
+/// Ordered most specific first: "what breaks if" must win over the bare "what",
+/// and "who calls" over "call".
+const INTENT_ROUTES: &[(&[&str], &str, &str)] = &[
+    (
+        &[
+            "what breaks",
+            "blast radius",
+            "impact of",
+            "safe to change",
+            "safe to remove",
+        ],
+        "travsr graph {sym} --direction both",
+        "callers and dependencies together, which is what breaks",
+    ),
+    (
+        &[
+            "who calls",
+            "what calls",
+            "callers of",
+            "used by",
+            "call sites",
+        ],
+        "travsr graph {sym} --direction callers",
+        "incoming call edges",
+    ),
+    (
+        &[
+            "depend on",
+            "dependencies of",
+            "imports",
+            "what does it use",
+        ],
+        "travsr graph {sym} --direction deps",
+        "outgoing dependency edges",
+    ),
+    (
+        &["every use", "all uses", "references to", "rename"],
+        "travsr references {sym}",
+        "every use site with path:line, wider than callers",
+    ),
+    (
+        &[
+            "config",
+            "setting",
+            "option",
+            "env var",
+            "environment variable",
+        ],
+        "travsr config get <key>",
+        "configuration is not in the code graph",
+    ),
+    (
+        &["why did", "why is", "ranked", "scored", "not showing"],
+        "travsr explain \"{q}\" <symbol>",
+        "shows which terms matched and which thresholds failed",
+    ),
+];
+
+/// Build next steps from the user's own question.
+///
+/// Two independent sources, because they fail differently. Symbol lookup finds a
+/// real name in *this* repo, which is the strongest possible suggestion but only
+/// works when the query contains something close to one. Intent routing works on
+/// phrasing alone, which covers the case where the user described what they want
+/// without naming anything that exists.
+///
+/// Returns empty rather than padding with generic advice, so the caller can fall
+/// back to the catalogue instead of printing suggestions that suggest nothing.
+pub(crate) fn suggest_next(db_path: &std::path::Path, query: &str) -> Vec<Suggestion> {
+    let lower = query.to_lowercase();
+    let mut out: Vec<Suggestion> = Vec::new();
+
+    // The nearest real symbol, if the repo has one. Uses the same fuzzy search
+    // `ask` itself uses, so a suggestion can never name something unindexed.
+    let nearest = nearest_symbol(db_path, query);
+
+    if let Some(sym) = nearest.as_deref() {
+        out.push(Suggestion {
+            command: format!("travsr ask \"{sym}\""),
+            why: "closest symbol in this repo to what you typed".to_string(),
+        });
+    }
+
+    // Intent routing. `{sym}` is substituted when a real symbol was found;
+    // otherwise a placeholder, so the shape of the answer is still visible.
+    let sym_slot = nearest.clone().unwrap_or_else(|| "<symbol>".to_string());
+    for (keys, template, why) in INTENT_ROUTES {
+        if keys.iter().any(|k| lower.contains(k)) {
+            out.push(Suggestion {
+                command: template.replace("{sym}", &sym_slot).replace("{q}", query),
+                why: (*why).to_string(),
+            });
+            // One intent route is a hint; several is a menu the user has to
+            // re-read. Stop at the most specific match.
+            break;
+        }
+    }
+
+    // The text escape hatch, offered only when there is a distinctive term to
+    // search for. `pattern` answers questions the graph deliberately does not
+    // model, which is a large share of what reaches this path.
+    if let Some(term) = distinctive_term(query) {
+        out.push(Suggestion {
+            command: format!("travsr pattern \"{term}\""),
+            why: "searches the text of tracked files, for things the graph does not model"
+                .to_string(),
+        });
+    }
+
+    out
+}
+
+/// The closest indexed symbol to `query`, or `None` when nothing is close.
+///
+/// Deliberately reuses the store's own fuzzy search rather than a bespoke match,
+/// so a suggestion is always a name that exists. Suggesting a symbol the repo
+/// does not contain would repeat the mistake this whole path exists to fix.
+fn nearest_symbol(db_path: &std::path::Path, query: &str) -> Option<String> {
+    let store = crate::daemon_client::open_read_store(db_path).ok()?;
+    let hits = store.search_nodes_fuzzy(query).ok()?;
+    let leaf = hits
+        .iter()
+        .find(|n| !travsr_core::noise::is_structural_noise(n))
+        .or_else(|| hits.first())
+        .map(|n| travsr_core::ident::leaf_of(&n.vname.signature).to_string())?;
+    (!leaf.is_empty()).then_some(leaf)
+}
+
+/// The longest word in the query that is not a stop word, used as a text search
+/// term. Longest because it is the most selective: `pattern "the"` is noise.
+fn distinctive_term(query: &str) -> Option<String> {
+    const STOP: &[&str] = &[
+        "what", "where", "which", "who", "why", "how", "does", "do", "did", "is", "are", "was",
+        "the", "this", "that", "for", "from", "with", "and", "not", "can", "should", "would",
+        "when", "there", "here", "into", "about", "code", "function", "class", "file",
+    ];
+    query
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.len() >= 4 && !STOP.contains(&w.to_lowercase().as_str()))
+        .max_by_key(|w| w.len())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::{distinctive_term, INTENT_ROUTES};
+
+    /// Every route must produce a runnable command, not a template with an
+    /// unsubstituted slot left in it.
+    #[test]
+    fn routes_have_no_unsubstituted_slots_after_rendering() {
+        for (_, template, _) in INTENT_ROUTES {
+            let rendered = template.replace("{sym}", "Foo").replace("{q}", "a query");
+            assert!(
+                !rendered.contains('{') && !rendered.contains('}'),
+                "template `{template}` left a slot unfilled: {rendered}"
+            );
+        }
+    }
+
+    /// The specific phrasings must beat the general ones. "what breaks if I
+    /// change X" must route to blast radius, not to the bare "what calls" rule,
+    /// which is why order is load-bearing rather than incidental.
+    #[test]
+    fn the_most_specific_intent_wins() {
+        let q = "what breaks if i change the ledger";
+        let first = INTENT_ROUTES
+            .iter()
+            .find(|(keys, _, _)| keys.iter().any(|k| q.contains(k)))
+            .expect("phrase must match some route");
+        assert!(
+            first.1.contains("--direction both"),
+            "expected the blast-radius route, got `{}`",
+            first.1
+        );
+    }
+
+    #[test]
+    fn caller_phrasings_route_to_callers() {
+        for q in [
+            "who calls payment service",
+            "what calls this",
+            "call sites of foo",
+        ] {
+            let hit = INTENT_ROUTES
+                .iter()
+                .find(|(keys, _, _)| keys.iter().any(|k| q.contains(k)))
+                .unwrap_or_else(|| panic!("no route matched {q:?}"));
+            assert!(hit.1.contains("callers"), "{q:?} routed to `{}`", hit.1);
+        }
+    }
+
+    /// Configuration questions are the clearest case of "the answer exists, just
+    /// not in the graph", so they must not route to a graph command.
+    #[test]
+    fn configuration_questions_route_away_from_the_graph() {
+        let hit = INTENT_ROUTES
+            .iter()
+            .find(|(keys, _, _)| {
+                keys.iter()
+                    .any(|k| "how do i set the config option".contains(k))
+            })
+            .expect("must match");
+        assert!(hit.1.starts_with("travsr config get"), "got `{}`", hit.1);
+    }
+
+    #[test]
+    fn the_search_term_is_selective_not_a_stop_word() {
+        assert_eq!(
+            distinctive_term("where is the retry budget configured"),
+            Some("configured".to_string())
+        );
+        // All stop words or too short: nothing worth searching for.
+        assert_eq!(distinctive_term("what is it for"), None);
+        assert_eq!(distinctive_term(""), None);
     }
 }
