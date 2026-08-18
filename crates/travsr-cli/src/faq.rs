@@ -12,8 +12,6 @@
 //! graph-grounded, so it answers questions about code and cannot answer
 //! questions about the product.
 
-use std::io::IsTerminal as _;
-
 use crate::progress::Palette;
 
 /// One question, answered as a short lead plus scannable points.
@@ -206,9 +204,18 @@ pub(crate) fn match_question(query: &str) -> Option<&'static Entry> {
         // replaced by an answer about travsr. Requiring most of what *they*
         // typed to be accounted for keeps an extra subject like "parser" from
         // being ignored.
-        let covered = asked.iter().filter(|w| want.contains(w)).count();
-        if covered * 5 < asked.len() * 3 {
-            continue;
+        // "travsr" is the implicit subject of every catalogue question, so it
+        // carries no signal about *which* one is being asked. Counting it against
+        // coverage rejected "how does travsr work", where naming the subject is
+        // the most natural phrasing. It still counts for matching, so "what is
+        // travsr?" is reachable.
+        let subject = |w: &String| w == "travsr";
+        let judged: Vec<&String> = asked.iter().filter(|w| !subject(w)).collect();
+        if !judged.is_empty() {
+            let covered = judged.iter().filter(|w| want.contains(**w)).count();
+            if covered * 5 < judged.len() * 3 {
+                continue;
+            }
         }
         if best.map_or(true, |(n, _)| hits > n) {
             best = Some((hits, e));
@@ -237,17 +244,6 @@ fn distinctive_words(text: &str) -> Vec<String> {
         .map(|w| w.to_lowercase())
         .filter(|w| !FILLER.contains(&w.as_str()))
         .collect()
-}
-
-/// The FAQ entry whose question is exactly `question`.
-///
-/// Exact rather than fuzzy: the caller already decided which entry applies, by
-/// matching the phrase the user typed. An earlier version re-derived it by
-/// substring, which silently failed whenever the user's wording differed from
-/// the catalogue's ("how do i install travsr" does not contain "how do I install
-/// it"), and fell back to naming another command instead of answering.
-pub(crate) fn entry(question: &str) -> Option<&'static Entry> {
-    ENTRIES.iter().find(|e| e.question == question)
 }
 
 /// Print one entry: lead, points, then the command.
@@ -279,23 +275,12 @@ pub(crate) fn print_entry(e: &Entry, pal: Palette) {
     }
 }
 
-/// Print the FAQ.
-pub fn run() {
-    let pal = Palette::for_stream(std::io::stdout().is_terminal());
-
-    println!("{}", pal.bold("Travsr FAQ"));
-    println!();
-
-    for e in ENTRIES {
-        println!("{}", pal.orange(e.question));
-        print_entry(e, pal);
-        println!();
-    }
-
-    println!(
-        "{}",
-        pal.dim("`travsr ask --examples` lists questions about your indexed code.")
-    );
+/// Every catalogue question, for `ask --examples` to list.
+///
+/// These are answered by `ask` directly, so they are shown without a command
+/// beside them: the question *is* the command.
+pub(crate) fn questions() -> impl Iterator<Item = &'static str> {
+    ENTRIES.iter().map(|e| e.question)
 }
 
 /// Wrap on whitespace at `width` columns.

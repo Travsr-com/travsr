@@ -179,14 +179,6 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         // question has already said what they want to know, and "run this other
         // thing" is a worse response than the answer itself.
         match redirect.command {
-            "travsr faq" => match crate::faq::entry(redirect.faq_question) {
-                Some(e) => crate::faq::print_entry(e, pal),
-                // Recognised as a travsr question but not one the FAQ covers.
-                None => {
-                    println!("{}", redirect.answer);
-                    println!("  {} {}", pal.dim("$"), pal.ident("travsr faq"));
-                }
-            },
             "travsr lang list" => {
                 println!("{}", pal.dim(redirect.answer));
                 crate::lang::run(crate::lang::LangCommand::List { json: false })?;
@@ -545,16 +537,18 @@ pub fn print_examples(db_path: Option<&std::path::Path>) {
     };
 
     println!("{}", pal.bold("Questions you can ask"));
-    println!(
-        "{}",
-        pal.dim(&if grounded {
-            "using symbols from this repo, so these run as they are".to_string()
-        } else {
-            "run `travsr init` first and these fill in with your own symbols".to_string()
-        })
-    );
     println!();
 
+    // Answered by `ask` itself, so no command is shown: typing the question is
+    // the whole action. Listed first because they are what someone asks before
+    // they know a symbol to ask about.
+    println!("{}", pal.orange("About travsr"));
+    for q in crate::faq::questions() {
+        println!("  {q}");
+    }
+
+    println!();
+    println!("{}", pal.orange("About this repo"));
     for (i, (question, command)) in FAQ.iter().enumerate() {
         let sym = &symbols[i % symbols.len()];
         let term = sym.to_lowercase();
@@ -563,25 +557,32 @@ pub fn print_examples(db_path: Option<&std::path::Path>) {
         println!("  {q}");
         println!("      {}", paint_command(pal, &c, sym));
     }
+
+    if !grounded {
+        println!();
+        println!(
+            "{}",
+            pal.dim("Run `travsr init` first and these fill in with your own symbols.")
+        );
+    }
 }
 
 /// A question `ask` cannot answer, and the command that can.
 pub(crate) struct MetaRedirect {
     pub answer: &'static str,
     pub command: &'static str,
-    /// The FAQ question to answer with, verbatim. Empty when the route is served
-    /// by running a command instead. Named explicitly rather than re-derived from
-    /// the user's wording, which does not match the catalogue's.
-    pub faq_question: &'static str,
 }
 
-/// Phrases that mean the question is about travsr or the repository as a whole,
-/// paired with what actually answers them.
+/// Phrases meaning the question is about the repository as a whole, paired with
+/// what actually answers them.
+///
+/// Only the two routes that run a command live here. Questions about travsr are
+/// matched against the FAQ catalogue itself (`faq::match_question`), so there is
+/// no parallel phrase list for those to drift out of sync with.
 ///
 /// Matched as whole phrases rather than keywords, deliberately. A bare "repo" or
 /// "language" appears in plenty of legitimate code questions, and hijacking those
-/// would be a worse failure than the one being fixed: a user asking about a
-/// symbol named `Language` must still get their search.
+/// would be a worse failure than the one being fixed.
 const META_QUESTIONS: &[(&[&str], MetaRedirect)] = &[
     (
         &[
@@ -595,7 +596,6 @@ const META_QUESTIONS: &[(&[&str], MetaRedirect)] = &[
         MetaRedirect {
             answer: "That is a question about the repository rather than about a symbol in it.",
             command: "travsr lang list",
-            faq_question: "",
         },
     ),
     (
@@ -611,65 +611,11 @@ const META_QUESTIONS: &[(&[&str], MetaRedirect)] = &[
         MetaRedirect {
             answer: "That is a question about the index rather than about the code.",
             command: "travsr status",
-            faq_question: "",
-        },
-    ),
-    (
-        &["what is travsr", "what does travsr do"],
-        MetaRedirect {
-            answer: "That is a question about travsr itself.",
-            command: "travsr faq",
-            faq_question: "what is travsr?",
-        },
-    ),
-    (
-        // "how does it work" with no symbol named is, in a travsr session, a
-        // question about travsr. Left ambiguous it abstains and suggests whatever
-        // fuzzy-matches "work", which is worse than answering.
-        &[
-            "how does travsr work",
-            "how travsr works",
-            "how does it work",
-            "how does this work",
-        ],
-        MetaRedirect {
-            answer: "That is a question about travsr itself.",
-            command: "travsr faq",
-            faq_question: "how does it work?",
-        },
-    ),
-    (
-        &["how do i install", "how to install", "installing travsr"],
-        MetaRedirect {
-            answer: "That is a question about travsr itself.",
-            command: "travsr faq",
-            faq_question: "how do I install it?",
-        },
-    ),
-    (
-        &[
-            "does my code leave",
-            "is my code sent",
-            "do you upload",
-            "is it private",
-        ],
-        MetaRedirect {
-            answer: "That is a question about travsr itself.",
-            command: "travsr faq",
-            faq_question: "does my code leave my machine?",
-        },
-    ),
-    (
-        &["do i need the daemon", "is the daemon required"],
-        MetaRedirect {
-            answer: "That is a question about travsr itself.",
-            command: "travsr faq",
-            faq_question: "do I need the daemon running?",
         },
     ),
 ];
 
-/// Route a question about travsr or the repo away from graph retrieval.
+/// Route a question about the repository away from graph retrieval.
 ///
 /// Returns `None` for anything else, so an ordinary code question is untouched.
 pub(crate) fn meta_question_redirect(query: &str) -> Option<&'static MetaRedirect> {
@@ -780,15 +726,24 @@ mod meta_question_tests {
         assert_eq!(r.command, "travsr lang list");
     }
 
+    /// Questions about travsr are answered by matching the FAQ catalogue itself,
+    /// not by this phrase list, so they must NOT appear here. A second list would
+    /// be one more thing to keep in sync, which is what this design removed.
     #[test]
-    fn questions_about_travsr_itself_go_to_the_faq() {
+    fn travsr_questions_are_not_duplicated_in_the_phrase_list() {
         for q in [
             "what is travsr",
             "how does travsr work",
             "how do I install travsr",
         ] {
-            let r = meta_question_redirect(q).unwrap_or_else(|| panic!("{q} not matched"));
-            assert_eq!(r.command, "travsr faq", "{q}");
+            assert!(
+                meta_question_redirect(q).is_none(),
+                "`{q}` should be handled by the FAQ matcher, not a phrase"
+            );
+            assert!(
+                crate::faq::match_question(q).is_some(),
+                "`{q}` must still be answerable, via the FAQ matcher"
+            );
         }
     }
 

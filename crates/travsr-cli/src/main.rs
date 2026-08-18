@@ -181,10 +181,6 @@ enum Command {
         #[arg(long)]
         examples: bool,
     },
-    /// Answer common questions about travsr itself: what it is, how it works,
-    /// how to install it, and where your data lives. For questions about your
-    /// indexed code, see `travsr ask --examples`.
-    Faq,
     /// Show why `travsr ask` ranked (or skipped) results for a query: which
     /// terms matched, which relevance thresholds passed or failed, and the final
     /// decision. A diagnostic for tuning search; not part of normal use.
@@ -1285,7 +1281,6 @@ async fn run(cli: Cli) -> Result<()> {
                 ask::run(&query.unwrap_or_default(), format)?;
             }
         }
-        Command::Faq => faq::run(),
         Command::Explain {
             query,
             symbol,
