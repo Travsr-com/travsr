@@ -536,20 +536,49 @@ pub fn print_examples(db_path: Option<&std::path::Path>) {
         println!("{}", pal.orange(group));
         for s in *shapes {
             let cmd = s.example.replace("{sym}", &sym).replace("{term}", &term);
+            let painted = paint_command(pal, &cmd, &sym, &term);
             // Intent first: someone who does not know the commands is scanning
             // for their question, not for a command name.
             println!("  {}", s.intent);
             if s.note.is_empty() {
-                println!("      {}", pal.bold(&cmd));
+                println!("      {painted}");
             } else {
-                println!(
-                    "      {}  {}",
-                    pal.bold(&cmd),
-                    pal.dim(&format!("({})", s.note))
-                );
+                println!("      {painted}  {}", pal.dim(&format!("({})", s.note)));
             }
         }
     }
+}
+
+/// Colour a rendered command so its shape reads at a glance.
+///
+/// Three roles, because they answer three different questions for the reader:
+/// which tool (constant, so dimmed), which action (the verb, so it leads), and
+/// which part is theirs to replace (the identifier). Without that, the line is a
+/// uniform run of words and the reader has to parse it before they can use it.
+///
+/// Everything routes through `Palette`, so `NO_COLOR`, `CLICOLOR_FORCE` and a
+/// non-tty stdout all fall back to plain text with the spacing unchanged.
+fn paint_command(pal: crate::progress::Palette, cmd: &str, sym: &str, term: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for (i, word) in cmd.split(' ').enumerate() {
+        let painted = if i == 0 {
+            // `travsr` is on every line, so it carries no information.
+            pal.dim(word)
+        } else if i == 1 {
+            // The subcommand is the verb: what this line actually does.
+            pal.green(word)
+        } else if word.starts_with("--") {
+            pal.dim(word)
+        } else if word.contains(sym) || word.contains(term) {
+            // The part the reader swaps for their own symbol.
+            pal.ident(word)
+        } else {
+            // A flag's value (`callers`, `both`) belongs with its flag.
+            pal.dim(word)
+        };
+        out.push(painted);
+    }
+    out.join(" ")
 }
 
 /// A symbol worth putting in an example: real, in this repo, and not noise.
@@ -650,6 +679,51 @@ mod catalogue_tests {
                     "{group}: `{}` uses an abstract placeholder instead of a real \
                      symbol; substitute {{sym}} so the line can be pasted",
                     s.example
+                );
+            }
+        }
+    }
+
+    /// Colour must be decoration only. A user piping this into a script, or
+    /// running with NO_COLOR, has to get the same commands back, and escape codes
+    /// embedded in a command would make it unrunnable if copied.
+    #[test]
+    fn painting_a_command_does_not_change_its_text() {
+        use crate::progress::Palette;
+
+        for (_, shapes) in QUESTION_CATALOGUE {
+            for s in *shapes {
+                let cmd = s
+                    .example
+                    .replace("{sym}", "Widget")
+                    .replace("{term}", "widget");
+
+                let plain =
+                    super::paint_command(Palette::for_stream(false), &cmd, "Widget", "widget");
+                assert_eq!(plain, cmd, "with colour off the command must be untouched");
+
+                let coloured =
+                    super::paint_command(Palette::for_stream(true), &cmd, "Widget", "widget");
+                let stripped: String = {
+                    // Strip CSI sequences the same way a terminal would.
+                    let mut out = String::new();
+                    let mut chars = coloured.chars();
+                    while let Some(c) = chars.next() {
+                        if c == '\u{1b}' {
+                            for c2 in chars.by_ref() {
+                                if c2 == 'm' {
+                                    break;
+                                }
+                            }
+                        } else {
+                            out.push(c);
+                        }
+                    }
+                    out
+                };
+                assert_eq!(
+                    stripped, cmd,
+                    "colour changed the command text, not just its appearance"
                 );
             }
         }
