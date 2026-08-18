@@ -302,18 +302,50 @@ const ENTRIES: &[Entry] = &[
     },
     Entry {
         question: "how do I see the logs?",
-        lead: "The daemon writes a log per repo, and one command reads it.",
-        detail: "It reads the file rather than asking the daemon, so it still works after a crash, which is when you need it. One caveat worth knowing before you need it: the log is written at info, so --level debug cannot show you debug lines that were never recorded. Start the daemon with --verbose when you want them.",
+        lead: "There are two logs, and one command reads either of them.",
+        detail: "Reading goes to the file rather than to the daemon, so it works after a crash, which is when you need it most. Rotation is daily and roughly a week is kept: seven files or fifty megabytes, whichever binds first, swept when the daemon starts. One caveat worth knowing before you need it: the file is written at info, so --level debug cannot show you lines that were never recorded, and you have to have started the daemon with --verbose.",
         steps: &[],
         points: &[
-            "last 50 lines by default; --lines 0 prints all retained history",
-            "-f follows new lines, across the daily rotation",
-            "--level warn, --since 10m and --repo narrow it down",
-            "--json prints the stored lines verbatim, for jq or a collector",
+            ".travsr/     this repo's daemon, tagged by full path",
+            "~/.travsr    the global log, from `travsr mcp --global`",
+            "--level      trace, debug, info, warn or error, and above",
+            "--since 45s, 10m, 2h, 1d; --lines 0 for all of it",
+            "--json for jq or a collector; --utc to stop local time",
         ],
         commands: &[
-            "travsr daemon logs",
-            "travsr daemon logs -f --level warn",
+            "travsr daemon logs --lines 100",
+            "travsr daemon logs --global --level warn",
+        ],
+    },
+    Entry {
+        question: "how do I tail the logs live?",
+        lead: "-f follows the log, and keeps following it across rotation.",
+        detail: "A plain `tail -f` on the file is the trap this avoids. At midnight the appender moves to a new file and the old one stops growing, so tail keeps polling something nothing will ever write to again and shows you a live-looking stream that has silently stopped. -f re-resolves the file on every poll, which is `tail -F` behaviour, so it survives the rollover.",
+        steps: &[],
+        points: &[
+            "-f streams new lines until you stop it",
+            "--level warn -f follows only what you care about",
+            "--since 10m -f starts with context, then follows",
+            "--json -f pipes a structured stream straight into jq",
+        ],
+        commands: &[
+            "travsr daemon logs -f",
+            "travsr daemon logs -f --level warn --since 10m",
+        ],
+    },
+    Entry {
+        question: "what is in the logs?",
+        lead: "A level, a target and a message, plus a key on the ones that matter.",
+        detail: "The keys are identifiers and keep their spelling; the messages beside them are written for people and can be reworded at any time. That is why both exist: an alert or a jq filter built on event=phase_b.complete keeps working, where one that matched the message text would break the next time someone improved the wording.",
+        steps: &[],
+        points: &[
+            "phase_b.start, phase_b.indexed, phase_b.complete",
+            "lsif.spawn, lsif.complete, kcore.updated",
+            "query.served, embed.text.updated, lsp.diagnostics",
+            "file.skipped, the one you see most when something is wrong",
+        ],
+        commands: &[
+            "travsr daemon logs --lines 0 --json",
         ],
     },
     Entry {
