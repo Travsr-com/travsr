@@ -147,6 +147,75 @@ const ENTRIES: &[Entry] = &[
         commands: &["travsr connect"],
     },
     Entry {
+        question: "what is the graph, exactly?",
+        lead: "Nodes are things you write; edges are how they relate.",
+        steps: &[],
+        points: &[
+            "nodes       functions, classes, methods, files, imports",
+            "ref/call    this calls that, the edge most answers rely on",
+            "defines     this file or class contains that symbol",
+            "depends     this file imports that module",
+            "identity is a Kythe VName, stable across re-indexes and repos",
+        ],
+        commands: &["travsr graph <symbol> --direction both"],
+    },
+    Entry {
+        question: "how does MCP work?",
+        lead: "MCP is the only way in from outside travsr.",
+        steps: &[],
+        points: &[
+            "your agent starts `travsr mcp --stdio` and speaks JSON-RPC to it",
+            "travsr advertises its tools; the agent calls them by name",
+            "every response is wrapped in a <travsr-data> envelope",
+            "so repo content reaches the model as data, not instructions",
+            "no REST and no GraphQL, so there is one surface to secure",
+        ],
+        commands: &[],
+    },
+    Entry {
+        question: "how do I connect MCP to my agent?",
+        lead: "One command detects your tools and writes their config.",
+        steps: &[
+            (
+                "see what would change, without writing anything",
+                "travsr connect --print",
+            ),
+            ("write the config for every detected tool", "travsr connect"),
+            ("restart the agent so it re-reads its config", ""),
+        ],
+        points: &[
+            "recognised today: claude-code, cursor, zed",
+            "one tool only        travsr connect --tool cursor",
+            "undo it later        travsr connect --remove",
+        ],
+        commands: &[],
+    },
+    Entry {
+        question: "what tools does the MCP server expose?",
+        lead: "Twenty-six, covering structure, search and diagnostics.",
+        steps: &[],
+        points: &[
+            "structure   get_callers, get_dependencies, get_blast_radius",
+            "search      search_symbol, find_references, find_pattern",
+            "context     get_context, get_snippets, get_execution_path",
+            "overview    get_repo_map, get_graph_stats, get_graph_json",
+            "your agent lists them itself once connected",
+        ],
+        commands: &[],
+    },
+    Entry {
+        question: "how does the VS Code extension work?",
+        lead: "It runs the same daemon and renders the graph in the editor.",
+        steps: &[],
+        points: &[
+            "a Travsr Graph view, plus a Repo Files tree",
+            "callers and blast radius for the symbol under your cursor",
+            "LSP diagnostics overlaid onto the graph",
+            "it drives the same binary, so the graph matches the CLI's",
+        ],
+        commands: &[],
+    },
+    Entry {
         question: "what can I ask about my code?",
         lead: "Structural questions, anchored to a symbol name.",
         steps: &[],
@@ -278,7 +347,11 @@ pub(crate) fn print_entry(e: &Entry, pal: Palette) {
     for (i, (what, cmd)) in e.steps.iter().enumerate() {
         println!();
         println!("    {} {what}", pal.dim(&format!("{}.", i + 1)));
-        println!("       {}", pal.ident(cmd));
+        // A step can be an instruction with nothing to run ("restart the agent"),
+        // and printing an empty command line for it would look like a bug.
+        if !cmd.is_empty() {
+            println!("       {}", pal.ident(cmd));
+        }
     }
     if !e.steps.is_empty() && !e.points.is_empty() {
         println!();
@@ -465,7 +538,7 @@ mod tests {
                     "`{}` has a step with no description",
                     e.question
                 );
-                assert!(!c.is_empty(), "`{}` has a step with no command", e.question);
+                // A step may legitimately have no command.
                 // The install line is a shell pipeline, not a travsr invocation.
                 if !c.starts_with("travsr ") {
                     continue;
