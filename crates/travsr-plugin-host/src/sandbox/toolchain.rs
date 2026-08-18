@@ -29,6 +29,21 @@ pub struct ToolchainAccess {
     pub read_paths: Vec<PathBuf>,
     /// Directories the analyzer must be able to **write** (build cache).
     pub write_paths: Vec<PathBuf>,
+    /// Directories the analyzer must be able to **execute** binaries from — the
+    /// genuine toolchain *bin* dirs it shells out to (GOROOT/bin, GOPATH/bin,
+    /// JAVA_HOME/bin, the sbt/dotnet bin dirs). These are ADDITIVE over
+    /// `read_paths`: an exec dir is also listed in `read_paths`, so platforms that
+    /// already grant reads-with-execute (Linux bwrap binds, the macOS profile) are
+    /// unchanged, while the Windows AppContainer — which grants read WITHOUT
+    /// execute by default — adds the execute right only here.
+    ///
+    /// Deliberately EXCLUDES module / package caches (GOMODCACHE, ~/.m2, ~/.ivy2,
+    /// ~/.nuget): those are populated over the network during dependency
+    /// resolution, so granting execute there would let a planted binary run.
+    /// Least-privilege: execute exactly the toolchain, read the caches. The
+    /// residual risk equals the existing `~/.travsr/bin` execute grant — both are
+    /// user-write-only trusted install dirs.
+    pub exec_paths: Vec<PathBuf>,
     /// Env vars to pass through into the otherwise-cleared sandbox env.
     pub env: Vec<(String, String)>,
 }
@@ -201,12 +216,46 @@ fn dart_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env,
     }
 }
 
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Resolve the JDK installation dir (`JAVA_HOME`): the env var if set, else
+/// parsed from `java -XshowSettings:properties`. Shared by the JVM-driven
+/// analyzers (scip-java, sbt) so the sandbox can read the JDK and execute
+/// `JAVA_HOME/bin/java`.
+fn java_home() -> Option<PathBuf> {
+    std::env::var("JAVA_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            // -XshowSettings prints to stderr for the `-version` combination.
+            let output = Command::new("java")
+                .args(["-XshowSettings:properties", "-version"])
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&output.stderr);
+            text.lines()
+                .find(|l| l.contains("java.home"))
+                .and_then(|l| l.split('=').nth(1))
+                .map(|v| PathBuf::from(v.trim()))
+        })
+}
+
+/// The directory a PATH-resolvable tool lives in, symlinks resolved so the REAL
+/// dir is granted. PATHEXT-aware (finds `sbt.bat` on Windows, not just `sbt`).
+/// `None` when the tool is not on PATH.
+fn tool_bin_dir(tool: &str) -> Option<PathBuf> {
+    let exe = travsr_core::exec::resolve_executable(tool)?;
+    std::fs::canonicalize(&exe)
+        .ok()
+        .and_then(|r| r.parent().map(|p| p.to_path_buf()))
+        .or_else(|| exe.parent().map(|p| p.to_path_buf()))
 }
 
 /// `scip-java index` drives Gradle (and Maven) to resolve dependencies. Needs:
@@ -222,22 +271,7 @@ fn java_access() -> ToolchainAccess {
     let mut env = Vec::new();
 
     // JAVA_HOME: env var takes priority; fall back to `java -XshowSettings:properties`.
-    let java_home: Option<PathBuf> =
-        std::env::var("JAVA_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| {
-                // Output goes to stderr for this flag.
-                let output = Command::new("java")
-                    .args(["-XshowSettings:properties", "-version"])
-                    .output()
-                    .ok()?;
-                let text = String::from_utf8_lossy(&output.stderr);
-                text.lines()
-                    .find(|l| l.contains("java.home"))
-                    .and_then(|l| l.split('=').nth(1))
-                    .map(|v| PathBuf::from(v.trim()))
-            });
+    let java_home: Option<PathBuf> = java_home();
     if let Some(ref p) = java_home {
         tracing::debug!(path = %p.display(), "java_access: JAVA_HOME grant");
         read_paths.push(p.clone());
@@ -270,9 +304,18 @@ fn java_access() -> ToolchainAccess {
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
     }
 
+    // G5: scip-java (and kotlin-language-server) drive Gradle/Maven, which invoke
+    // `java`. Grant execute on JAVA_HOME/bin so the sandbox can run it; the JDK
+    // root is already in read_paths. Gradle/Maven caches stay read-only.
+    let mut exec_paths = Vec::new();
+    if let Some(p) = &java_home {
+        exec_paths.push(p.join("bin"));
+    }
+
     ToolchainAccess {
         read_paths,
         write_paths,
+        exec_paths,
         env,
     }
 }
@@ -303,9 +346,26 @@ fn scala_access() -> ToolchainAccess {
         env.push(("SBT_OPTS".to_string(), sbt_opts));
     }
 
+    // G5: sbt drives the build through the JVM. Grant execute on the sbt
+    // launcher's bin dir and on JAVA_HOME/bin (java); their roots are also
+    // read-granted so the launcher and JDK can be read. Ivy/sbt caches above stay
+    // read-only.
+    let mut exec_paths = Vec::new();
+    if let Some(jh) = java_home() {
+        exec_paths.push(jh.join("bin"));
+        read_paths.push(jh.clone());
+        env.push(("JAVA_HOME".to_string(), jh.to_string_lossy().into_owned()));
+    }
+    if let Some(sbt_bin) = tool_bin_dir("sbt") {
+        tracing::debug!(path = %sbt_bin.display(), "scala_access: sbt bin dir grant (read+execute)");
+        read_paths.push(sbt_bin.clone());
+        exec_paths.push(sbt_bin);
+    }
+
     ToolchainAccess {
         read_paths,
         write_paths,
+        exec_paths,
         env,
     }
 }
@@ -336,6 +396,7 @@ fn php_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env,
     }
 }
@@ -412,9 +473,22 @@ fn csharp_access() -> ToolchainAccess {
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
     }
 
+    // G5: scip-dotnet shells out to `dotnet` (in the dotnet root) and is itself a
+    // global tool under ~/.dotnet/tools. Grant execute on both; their parents are
+    // already read-granted. The NuGet package cache stays read/write only — never
+    // executable, since it is filled over the network during restore.
+    let mut exec_paths = Vec::new();
+    if let Some(p) = &dotnet_root {
+        exec_paths.push(p.clone());
+    }
+    if let Some(h) = home() {
+        exec_paths.push(h.join(".dotnet").join("tools"));
+    }
+
     ToolchainAccess {
         read_paths,
         write_paths,
+        exec_paths,
         env,
     }
 }
@@ -456,6 +530,7 @@ fn ruby_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env,
     }
 }
@@ -484,6 +559,7 @@ fn objc_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env: vec![],
     }
 }
@@ -522,6 +598,7 @@ fn swift_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env: vec![],
     }
 }
@@ -561,6 +638,7 @@ fn rust_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env,
     }
 }
@@ -602,6 +680,7 @@ fn typescript_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env,
     }
 }
@@ -640,6 +719,7 @@ fn python_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env,
     }
 }
@@ -742,9 +822,23 @@ fn go_access() -> ToolchainAccess {
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
     }
 
+    // G5: the sandbox must EXECUTE the toolchain, not just read it. GOPATH/bin
+    // holds scip-go itself; GOROOT/bin holds go, which scip-go shells out to for
+    // cross-package type resolution. Both are already in read_paths (via their
+    // roots) — listing the bin dirs here adds the execute right the Windows
+    // AppContainer withholds by default. Module/build caches stay read-only.
+    let mut exec_paths = Vec::new();
+    if let Some(p) = &gopath {
+        exec_paths.push(p.join("bin"));
+    }
+    if let Some(p) = &goroot {
+        exec_paths.push(p.join("bin"));
+    }
+
     ToolchainAccess {
         read_paths,
         write_paths,
+        exec_paths,
         env,
     }
 }

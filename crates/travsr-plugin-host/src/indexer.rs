@@ -293,9 +293,15 @@ impl PluginIndexer {
         // and `status`. Surface repo-present ones as skipped_no_analyzer: the
         // native binary IS missing, and the bucket's `travsr lang install
         // <lang>` hint is the fix.
-        let shim_only_langs: Vec<String> = catalog
+        // G2: a wrapper that is installed but whose underlying analyzer tool is
+        // absent is dropped here (rather than spawned into a zero-node run that
+        // reads as "analyzer installed, fix your project"). Same treatment as the
+        // shim case: surface repo-present ones as skipped_no_analyzer so the
+        // `travsr lang install <lang>` hint fires.
+        let no_analyzer_langs: Vec<String> = catalog
             .unresolvable_shims()
             .iter()
+            .chain(catalog.missing_tool())
             .filter(|lang| {
                 inputs.present_languages.is_empty()
                     || inputs.present_languages.contains(lang.as_str())
@@ -313,7 +319,7 @@ impl PluginIndexer {
 
         let mut outcome = PhaseBOutcome {
             skipped_needs_approval: needs_approval_langs,
-            skipped_no_analyzer: shim_only_langs,
+            skipped_no_analyzer: no_analyzer_langs,
             ..Default::default()
         };
 

@@ -117,7 +117,14 @@ pub enum ScipInstall {
 
 // ── asset resolution functions ────────────────────────────────────────────────
 
-/// scip-java ships a single platform-agnostic binary; the version is part of the name.
+/// scip-java's release asset is a single coursier polyglot launcher: a
+/// `#!/usr/bin/env sh` preamble in front of an embedded JAR. The same file runs
+/// three ways — `./scip-java` (sh) on unix, and `java -jar scip-java` on any
+/// platform with a JVM, including Windows. So the asset exists for every
+/// platform (the version is part of the name); what differs is how it is
+/// launched. On Windows the installer writes a `.cmd` that runs it through the
+/// JVM (see `install_scip_github_binary`), because Windows cannot exec the sh
+/// preamble directly.
 pub fn scip_java_asset(tag: &str, _target: &str) -> Option<String> {
     Some(format!("scip-java-{tag}"))
 }
@@ -586,7 +593,12 @@ pub static CATALOG: &[PhaseBEntry] = &[
         language: "csharp",
         npm_package: Some("@travsr-plugin/csharp"),
         command: "scip-dotnet",
-        args: &["{root}", "--output", "{output}"],
+        // scip-dotnet's CLI is `scip-dotnet index <.sln|.csproj|dir> --output <out>`.
+        // Without the `index` subcommand the tool treats `{output}` as a stray
+        // positional and exits with "Unrecognized command or argument", so the
+        // direct-analyzer fallback (used when the travsr-lang-csharp driver is
+        // absent) never produced an index. Mirrors java's `index …` form.
+        args: &["index", "{root}", "--output", "{output}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint:

@@ -13,6 +13,29 @@
 
 import * as ts from 'typescript';
 
+/**
+ * Strip a Windows extended-length path prefix (`\\?\`, `\\?\UNC\`) so an emitted
+ * `file://` URI carries a plain absolute path. TypeScript's realpath yields these
+ * verbatim prefixes on Windows; left in the document URI they reach the Rust
+ * ingest as `file://\\?\C:\...`, which never relativizes against the plain project
+ * root, so occurrence paths surfaced as `//?/C:/...` instead of repo-relative. The
+ * Python emitter never hits this (its files come from a plain directory walk), so
+ * only TypeScript was affected. No-op on macOS/Linux, where the prefix never appears.
+ */
+export function stripExtendedLengthPrefix(p: string): string {
+  // TypeScript normalizes paths to forward slashes internally, so a verbatim
+  // project path reaches us as `//?/C:/...` (and `//?/UNC/...`), not the raw
+  // `\\?\C:\...`. Strip BOTH shapes so the emitted `file://` URI is a plain
+  // absolute path the Rust ingest can relativize. No-op on macOS/Linux.
+  for (const unc of ['\\\\?\\UNC\\', '//?/UNC/']) {
+    if (p.startsWith(unc)) return '//' + p.slice(unc.length);
+  }
+  for (const dev of ['\\\\?\\', '//?/']) {
+    if (p.startsWith(dev)) return p.slice(dev.length);
+  }
+  return p;
+}
+
 export class Emitter {
   private idCounter = 0;
   private readonly write: (line: string) => void;
@@ -37,7 +60,7 @@ export class Emitter {
       type: 'vertex',
       label: 'metaData',
       version: '0.4.3',
-      projectRoot: `file://${projectRoot}`,
+      projectRoot: `file://${stripExtendedLengthPrefix(projectRoot)}`,
       positionEncoding: 'utf-16',
       toolInfo: { name: 'travsr-lsif-ts', version: '0.1.0' },
     });
@@ -54,7 +77,7 @@ export class Emitter {
       id,
       type: 'vertex',
       label: 'document',
-      uri: `file://${fileName}`,
+      uri: `file://${stripExtendedLengthPrefix(fileName)}`,
       languageId: 'typescript',
     });
   }

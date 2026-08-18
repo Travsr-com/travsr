@@ -147,6 +147,15 @@ pub struct CatalogResolver {
     /// caller surfaces these as skipped_no_analyzer so `travsr init`/`status`
     /// print the `travsr lang install <lang>` hint.
     unresolvable_shims: Vec<String>,
+    /// G2: languages whose `travsr-lang-*` wrapper is present but whose
+    /// UNDERLYING analyzer (`scip-go`, `scip-dotnet`, `sbt`, …) is not installed
+    /// on this machine. Without this, the wrapper resolved, spawned, emitted
+    /// nothing, and the run was misclassified as `zero_nodes` — telling the user
+    /// "the analyzer is installed, fix your project setup" when the analyzer was
+    /// in fact absent. Surfaced as skipped_no_analyzer so the honest `travsr lang
+    /// install <lang>` hint fires, matching what `lang list` already reports for
+    /// the same machine.
+    missing_tool: Vec<String>,
 }
 
 impl CatalogResolver {
@@ -162,6 +171,14 @@ impl CatalogResolver {
     /// `travsr lang install <lang>` is the fix.
     pub fn unresolvable_shims(&self) -> &[String] {
         &self.unresolvable_shims
+    }
+
+    /// G2: languages whose wrapper is installed but whose underlying analyzer
+    /// tool is not. Caller should copy these into
+    /// `PhaseBOutcome::skipped_no_analyzer` — the fix is `travsr lang install
+    /// <lang>`, not "reinstall the analyzer / fix your project".
+    pub fn missing_tool(&self) -> &[String] {
+        &self.missing_tool
     }
 }
 
@@ -180,6 +197,7 @@ impl CatalogResolver {
         let mut entries = Vec::new();
         let mut needs_approval = Vec::new();
         let mut unresolvable_shims = Vec::new();
+        let mut missing_tool = Vec::new();
 
         tracing::debug!(
             "CatalogResolver: registered languages from disk: {:?}",
@@ -265,6 +283,31 @@ impl CatalogResolver {
                 }
             };
 
+            // G2: the wrapper is on PATH, but does its UNDERLYING analyzer tool
+            // actually resolve on this machine? The `travsr-lang-*` wrapper is a
+            // thin driver — it shells out to `scip-go` / `scip-dotnet` / `sbt` /
+            // etc. If that tool is absent, the wrapper spawns, finds nothing, and
+            // emits zero nodes, which the caller then misreads as "analyzer ran
+            // but found no symbols — fix your project setup". Detect the missing
+            // tool up front and skip with the honest `travsr lang install <lang>`
+            // hint instead, using the SAME presence check as `travsr lang list`
+            // (`travsr_core::exec::tool_available`, which also consults
+            // toolchain-managed dirs like ~/go/bin and ~/.dotnet/tools) so the two
+            // views cannot disagree for the same machine.
+            if !travsr_core::exec::tool_available(catalog_entry.command) {
+                tracing::info!(
+                    lang,
+                    tool = catalog_entry.command,
+                    "Phase B catalog: wrapper '{}' is installed but its analyzer '{}' \
+                     is not — skipping (install: travsr lang install {})",
+                    binary_name,
+                    catalog_entry.command,
+                    lang
+                );
+                missing_tool.push(lang.to_string());
+                continue;
+            }
+
             // Determine sandbox policy.
             let policy = match catalog_entry.sandbox {
                 SandboxRequirement::Standard => SandboxPolicy::Standard,
@@ -346,6 +389,7 @@ impl CatalogResolver {
             entries,
             needs_approval,
             unresolvable_shims,
+            missing_tool,
         }
     }
 }

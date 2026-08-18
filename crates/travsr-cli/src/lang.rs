@@ -200,9 +200,23 @@ fn analyzer_ready(entry: &PhaseBEntry, registered: bool) -> bool {
     let present = if entry.analyzer_bundled() {
         true
     } else {
-        entry.provider_binary.map_or(true, tool_available) && tool_available(entry.command)
+        entry.provider_binary.map_or(true, tool_available) && analyzer_command_present(entry)
     };
     enabled && present
+}
+
+/// Whether the entry's analyzer command resolves on this machine.
+///
+/// Like `tool_available(entry.command)`, but also consults `rustup which` for
+/// rust-analyzer: `rustup component add rust-analyzer` installs it into the
+/// active toolchain's bin dir (`~/.rustup/toolchains/<tc>/bin`), which is not on
+/// PATH and not in `~/.cargo/bin`, so `tool_available` alone can't see it. Every
+/// analyzer-presence decision routes through here so `lang list`, `lang detect`,
+/// `lang status`, `lang install`, and the index-time resolver never disagree.
+fn analyzer_command_present(entry: &PhaseBEntry) -> bool {
+    tool_available(entry.command)
+        || (entry.command == "rust-analyzer"
+            && travsr_indexer::ra_runner::resolve_ra_binary().is_some())
 }
 
 /// The capability-view status for one language, shared by `lang list` (text and
@@ -218,10 +232,38 @@ fn lang_capability_status(
             entry,
             analyzer_ready: analyzer_ready(entry, registered),
             approved,
+            // A language is "not available on this OS" either because its
+            // travsr-lang-* wrapper has no build here (objectivec on non-Apple), or
+            // because its analyzer ships only as a prebuilt binary with no asset for
+            // this platform (scip-clang / scip-ruby / the swift emitter on Windows).
+            // Both mean `travsr lang install <lang>` cannot reach full analysis here,
+            // so the honest line is "not available on <os>", not "run: install".
             unsupported_on: wrapper_unavailable_target(entry)
-                .map(|_| travsr_plugin_host::phase_b::status::os_label().to_string()),
+                .map(|_| travsr_plugin_host::phase_b::status::os_label().to_string())
+                .or_else(|| analyzer_unavailable_os(entry)),
         },
     )
+}
+
+/// `Some(<os>)` when the language's analyzer is installed only from a prebuilt
+/// GitHub-release binary that has no asset for the host platform — so `travsr
+/// lang install <lang>` genuinely cannot provide it here (e.g. scip-clang for
+/// c/cpp, scip-ruby, the swift index emitter, all on Windows). `None` for
+/// analyzers installed via a command or manual step (go, scala's sbt, php's
+/// composer package): those are not asset-gated, so the uniform "run: travsr
+/// lang install <lang>" step still points at a real path.
+fn analyzer_unavailable_os(entry: &PhaseBEntry) -> Option<String> {
+    let target = host_target()?;
+    let no_asset = match &entry.scip_install {
+        ScipInstall::GithubBinary(s) => (s.asset_fn)(s.version_fallback, target).is_none(),
+        ScipInstall::CommandThenGithubGz(_, s) => {
+            (s.asset_fn)(s.version_fallback, target).is_none()
+        }
+        // ZipBinary assets are platform-independent; Command/Manual are not
+        // asset-gated. None of these can be "unavailable for this OS" by asset.
+        _ => false,
+    };
+    no_asset.then(|| travsr_plugin_host::phase_b::status::os_label().to_string())
 }
 
 /// Whether a language's full analysis is turned on for the repo we are standing
@@ -290,7 +332,7 @@ impl RepoState {
         match self {
             RepoState::BuiltinAlwaysOn => "always on",
             RepoState::Enabled => "enabled",
-            RepoState::NeedsAnalyzer => "no analyzer",
+            RepoState::NeedsAnalyzer => "not enabled",
             RepoState::NotEnabled => "not enabled",
             RepoState::NotInRepo => "n/a",
         }
@@ -371,7 +413,7 @@ fn cmd_list(json: bool) -> Result<()> {
                 .map(|c| c.is_approved(entry.language))
                 .unwrap_or(false);
             let provider_on_path = entry.provider_binary.map_or(true, tool_available);
-            let tool_on_path = tool_available(entry.command);
+            let tool_on_path = analyzer_command_present(entry);
             // Honest: the analyzer is installed when it is bundled (python) or its
             // external binary resolves — never just because a language is built in.
             let installed = entry.analyzer_bundled() || (provider_on_path && tool_on_path);
@@ -542,6 +584,22 @@ fn cmd_install(
         );
     }
 
+    // The wrapper builds here, but the analyzer ships only as a prebuilt binary
+    // with no asset for this platform (scip-clang, scip-ruby, the swift emitter on
+    // Windows). Installing the wrapper would register the repo and then dead-end at
+    // "no prebuilt binary", so refuse up front with the honest reason — the same
+    // treatment `lang detect` gives it by omitting it from the install menu.
+    if let Some(os) = analyzer_unavailable_os(entry) {
+        anyhow::bail!(
+            "'{language}' can't reach full analysis on {os}: its analyzer '{}' has \
+             no prebuilt binary for this platform.\n\
+             \n\
+             Structural indexing (symbols, definitions, repo map) still works here \
+             — only call/reference analysis needs that binary.",
+            entry.command
+        );
+    }
+
     // RequiresElevated: a security approval must be on record before install.
     // ADR-017 Rule 1 is the internal policy behind this check — never surface
     // the ADR name in user output; use plain language instead.
@@ -579,13 +637,19 @@ fn cmd_install(
     // Download and install the travsr-lang-* wrapper binary.
     let wrapper_installed = match entry.provider_binary {
         None => true, // builtin — no external wrapper needed
-        Some(bin) if which(bin) && !reinstall => {
+        // G1: the fast-path must see a wrapper installed in ~/.travsr/bin even when
+        // that dir is not on PATH (the default on Windows, common elsewhere).
+        // `which` (PATH only) missed it, so every `lang install` re-downloaded the
+        // wrapper over the network and skipped the version advisory below.
+        // `tool_available` includes ~/.travsr/bin, matching how `lang list` reports
+        // the same wrapper as present.
+        Some(bin) if tool_available(bin) && !reinstall => {
             println!("{bin} already installed.");
             // RFC-025 Point B: presence never re-checks the release the wrapper
             // was pinned to. Surface a below-floor WARN (offline) and a newer-
             // release advisory (best-effort) over the installed wrapper. Never
             // fails install.
-            if let Some(path) = travsr_core::exec::resolve_executable(bin) {
+            if let Some(path) = travsr_core::exec::tool_path(bin) {
                 crate::install::advise_installed_sidecar(
                     entry,
                     &path,
@@ -596,7 +660,7 @@ fn cmd_install(
         }
         Some(bin) => {
             if skip_wrapper {
-                which(bin)
+                tool_available(bin)
             } else {
                 let target =
                     crate::install::current_target().context("determining install target")?;
@@ -640,9 +704,13 @@ fn cmd_install(
 
     // Handle the underlying SCIP tool (scip-go, scip-python, etc.).
     // Builtins are bundled in the travsr binary — no external tool needed.
-    let mut tool_ready = if entry.builtin {
+    let mut tool_ready = if entry.builtin && entry.analyzer_bundled() {
+        // The analyzer ships inside the travsr binary (python/ts/js) — nothing to
+        // install. A builtin whose analyzer is external (rust → rust-analyzer) is
+        // NOT bundled, so it falls through to the install path below instead of
+        // short-circuiting to a false "active" without ever fetching the analyzer.
         true
-    } else if wrapper_installed && (reinstall || !tool_available(entry.command)) {
+    } else if wrapper_installed && (reinstall || !analyzer_command_present(entry)) {
         // UX-4: `--reinstall` must re-run the underlying SCIP tool install even when
         // it is already on PATH, not just the wrapper. Otherwise a user following the
         // documented remedy (`travsr lang install <lang> --reinstall`) to refresh a
@@ -652,7 +720,7 @@ fn cmd_install(
         let interactive = !no_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin());
         install_scip_tool(entry, interactive, yes, override_version)?
     } else {
-        tool_available(entry.command)
+        analyzer_command_present(entry)
     };
 
     // RFC-025 Point A parity: if the underlying tool is present but below its
@@ -691,20 +759,29 @@ fn cmd_install(
         },
     };
     save_config(&config)?;
-    if enabled_here {
+
+    // provider_ready: wrapper_installed already accounts for downloaded wrappers
+    // (including those just placed in ~/.travsr/bin); tool_available covers a
+    // wrapper present in ~/.travsr/bin off PATH, consistent with `lang list`.
+    let provider_ready = match entry.provider_binary {
+        None => true,
+        Some(bin) => wrapper_installed || tool_available(bin),
+    };
+    let full_ready = provider_ready && tool_ready;
+
+    // Only claim "enabled" when full analysis will actually run here. If the
+    // analyzer is still missing, the WrapperOnly branch below states the honest
+    // "set up, but analyzer not installed" instead — saying "Semantic analysis
+    // enabled for this repository" first would contradict `lang status`, which
+    // reads such a language as "not enabled" (analysis off) until the analyzer
+    // lands. The repo trust grant was still recorded either way.
+    if enabled_here && full_ready {
         println!("Semantic analysis enabled for this repository.");
     }
 
-    // provider_ready: check PATH for builtins; wrapper_installed already accounts
-    // for downloaded wrappers (including those just placed in ~/.travsr/bin).
-    let provider_ready = match entry.provider_binary {
-        None => true,
-        Some(bin) => wrapper_installed || which(bin),
-    };
-
-    if !provider_ready || !tool_ready {
+    if !full_ready {
         println!(
-            "'{language}' is set up, but its analyzer '{}' is not installed yet.\n\
+            "'{language}' isn't fully set up yet: its analyzer '{}' is not installed.\n\
              Full cross-file analysis stays off until it is; basic analysis still runs.\n\
              After it installs, run `travsr init` in your repository.",
             entry.command
@@ -735,6 +812,25 @@ fn run_pkg_command(
     interactive: bool,
     yes: bool,
 ) -> Result<CmdOutcome> {
+    // Check the install driver (e.g. `go`, `dotnet`, `npm`) is present BEFORE
+    // offering to run it. Prompting "Run it now? [Y/n]" for `go install ...` when
+    // `go` itself is not installed is a dead-end interaction: the answer cannot
+    // matter, and reaching the failure only after a "yes" reads as a bug. Say so
+    // up front and let the caller fall through to the honest "analyzer not
+    // installed yet" summary. (The spawn below keeps an ErrorKind::NotFound arm as
+    // a fallback for a driver that resolves here but fails to spawn, e.g. one found
+    // only in an extra dir that is not on the child process's PATH.)
+    if !tool_available(cmd_args[0]) {
+        println!(
+            "'{}' is not installed, so '{}' can't be set up automatically.\n\
+             Install it, then re-run:\n\t{}",
+            cmd_args[0],
+            entry.command,
+            cmd_args.join(" ")
+        );
+        return Ok(CmdOutcome::Ran { success: false });
+    }
+
     let do_run = if interactive {
         use std::io::Write as _;
         print!(
@@ -760,10 +856,31 @@ fn run_pkg_command(
     if !do_run {
         return Ok(CmdOutcome::NotRun);
     }
-    let mut child = std::process::Command::new(cmd_args[0])
+    let mut child = match std::process::Command::new(cmd_args[0])
         .args(&cmd_args[1..])
         .spawn()
-        .with_context(|| format!("running '{}'", cmd_args.join(" ")))?;
+    {
+        Ok(child) => child,
+        // The install driver itself (e.g. `go`, `dotnet`) is not on PATH. That is a
+        // normal "can't auto-install here" outcome, not a fatal error — report it
+        // and return so the caller still reaches registration and the honest
+        // "analyzer not installed yet" summary, exactly like every other
+        // missing-analyzer path. Aborting via `?` here is what made `go` the lone
+        // language that skipped that summary (it errored out mid-flow instead).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "'{}' is not installed, so '{}' can't be set up automatically.\n\
+                 Install it manually, then re-run:\n\t{}",
+                cmd_args[0],
+                entry.command,
+                cmd_args.join(" ")
+            );
+            return Ok(CmdOutcome::Ran { success: false });
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("running '{}'", cmd_args.join(" ")));
+        }
+    };
     let status = child.wait()?;
     if status.success() {
         println!("{} installed.", entry.command);
@@ -821,7 +938,16 @@ fn install_scip_tool(
             let driver = cmd_args[0];
             if tool_available(driver) {
                 run_pkg_command(entry, cmd_args, interactive, yes)?;
-                if tool_available(entry.command) {
+                // rustup installs rust-analyzer as a toolchain COMPONENT (into
+                // ~/.rustup/toolchains/<tc>/bin), not onto PATH or ~/.cargo/bin,
+                // so `tool_available` can't see it and would wrongly fall through
+                // to the GitHub download. resolve_ra_binary() also consults
+                // `rustup which`, the cross-platform resolver for a toolchain
+                // component. Non-memoized on purpose: ra_binary_path() may have
+                // cached a pre-install `None` earlier in this process.
+                let ra_installed = entry.command == "rust-analyzer"
+                    && travsr_indexer::ra_runner::resolve_ra_binary().is_some();
+                if tool_available(entry.command) || ra_installed {
                     return Ok(true);
                 }
                 // Driver present but the tool is still missing (declined or the
@@ -986,6 +1112,22 @@ fn install_scip_github_binary(
             if let Some(vpath) = travsr_plugin_host::sidecar_version::version_sidecar_path(&path) {
                 if let Err(e) = std::fs::write(&vpath, format!("{tag}\n")) {
                     tracing::debug!(path = %vpath.display(), error = %e, "could not write version sidecar file");
+                }
+            }
+            // scip-java's asset is a coursier polyglot launcher: a `#!/usr/bin/env
+            // sh` preamble in front of a real JAR. Windows cannot exec the sh
+            // preamble, but the identical file runs as `java -jar <asset>`. Drop a
+            // `.cmd` beside it that launches it through the JVM so a PATHEXT-aware
+            // lookup resolves a runnable `scip-java` on Windows — the bare
+            // downloaded file alone was unrunnable, which is why java installed
+            // "successfully" yet produced nothing. Needs a JVM on PATH, exactly as
+            // any Java project already does.
+            #[cfg(windows)]
+            if spec.install_name == "scip-java" {
+                let cmd_path = path.with_extension("cmd");
+                let script = format!("@echo off\r\njava -jar \"{}\" %*\r\n", path.display());
+                if let Err(e) = std::fs::write(&cmd_path, &script) {
+                    tracing::debug!(path = %cmd_path.display(), error = %e, "could not write scip-java .cmd launcher");
                 }
             }
             if !crate::install::path_contains_travsr_bin() {
@@ -1154,11 +1296,34 @@ fn install_zip_binary(
         }
     };
 
-    // Write wrapper script: #!/bin/sh\nexec <binary_abs> "$@"\n
+    // Write a wrapper the host OS can actually execute, aimed at the launcher
+    // that host ships. The extracted archive carries one launcher per platform in
+    // the same `bin` dir: the `#!/bin/sh` script named by `binary_subpath` on
+    // unix, and a `.bat` of the same stem next to it on Windows. Previously this
+    // ALWAYS wrote a `#!/bin/sh` wrapper pointing at the unix launcher, so on
+    // Windows the installed wrapper was a non-runnable sh script aimed at a
+    // non-runnable launcher — yet the language still reported as installed and
+    // "active". Write a `.cmd` targeting the `.bat` launcher on Windows instead.
     let bin_dir = crate::install::travsr_bin_dir()?;
-    let wrapper = bin_dir.join(spec.install_name);
-    let binary_abs = extract_path.join(spec.binary_subpath);
-    let script = format!("#!/bin/sh\nexec {} \"$@\"\n", binary_abs.display());
+
+    #[cfg(windows)]
+    let (wrapper, script) = {
+        // `kotlin-language-server` -> `kotlin-language-server.bat` in the same dir.
+        let launcher = extract_path.join(spec.binary_subpath).with_extension("bat");
+        // `.cmd` so PATHEXT resolution (and the sandbox's PE-image spawn) treat it
+        // as an executable, matching how every other Windows provider is found.
+        let wrapper = bin_dir.join(format!("{}.cmd", spec.install_name));
+        let script = format!("@echo off\r\n\"{}\" %*\r\n", launcher.display());
+        (wrapper, script)
+    };
+    #[cfg(unix)]
+    let (wrapper, script) = {
+        let binary_abs = extract_path.join(spec.binary_subpath);
+        let wrapper = bin_dir.join(spec.install_name);
+        let script = format!("#!/bin/sh\nexec {} \"$@\"\n", binary_abs.display());
+        (wrapper, script)
+    };
+
     std::fs::write(&wrapper, &script)
         .with_context(|| format!("writing wrapper to {}", wrapper.display()))?;
 
@@ -1195,8 +1360,14 @@ fn cmd_detect(yes: bool) -> Result<()> {
 
     let config = load_config();
 
-    println!("Detected languages in this repo:\n");
-    for (i, lang) in found.iter().enumerate() {
+    // Partition detected languages by whether full analysis can ever run here.
+    // Some analyzers ship only as a prebuilt binary with no build for this
+    // platform (scip-clang for c/cpp, scip-ruby, the swift emitter on Windows).
+    // Installing their wrapper would register the repo and then dead-end at "no
+    // prebuilt binary", so they are shown for context but never offered as an
+    // install target — only `installable` is numbered and selectable.
+    use travsr_plugin_host::phase_b::status::LangStatus;
+    let status_of = |lang: &str| {
         let entry = lookup(lang).expect("lang came from CATALOG");
         let registered = config
             .as_ref()
@@ -1206,29 +1377,61 @@ fn cmd_detect(yes: bool) -> Result<()> {
             .as_ref()
             .map(|c| c.is_approved(lang))
             .unwrap_or(false);
+        lang_capability_status(entry, registered, approved)
+    };
+    let mut installable: Vec<&str> = Vec::new();
+    let mut unavailable: Vec<&str> = Vec::new();
+    for lang in &found {
+        if matches!(status_of(lang), LangStatus::PlatformUnsupported { .. }) {
+            unavailable.push(lang);
+        } else {
+            installable.push(lang);
+        }
+    }
 
+    println!("Detected languages in this repo:\n");
+    for (i, lang) in installable.iter().enumerate() {
+        let entry = lookup(lang).expect("lang came from CATALOG");
         // Same computed status as `lang list`, so the two commands agree exactly.
-        let status = lang_capability_status(entry, registered, approved);
-
         println!(
             "  [{}] {}  ({})  {}",
             i + 1,
             lang,
             entry.extensions.join(", "),
-            status.line()
+            status_of(lang).line()
         );
+    }
+    if !unavailable.is_empty() {
+        println!();
+        println!(
+            "Not installable on {} — the analyzer has no build for this platform \
+             (structural indexing still works):",
+            travsr_plugin_host::phase_b::status::os_label()
+        );
+        for lang in &unavailable {
+            let entry = lookup(lang).expect("lang came from CATALOG");
+            println!("      {}  ({})", lang, entry.extensions.join(", "));
+        }
     }
     println!();
 
-    // `--yes`: install everything detected without prompting. This is the path the
-    // VS Code "Detect & install" button takes — it spawns `lang detect` with no
-    // terminal attached, so without this it would only ever print the list and
+    if installable.is_empty() {
+        println!("Nothing to install on this platform.");
+        return Ok(());
+    }
+
+    // `--yes`: install everything installable without prompting. This is the path
+    // the VS Code "Detect & install" button takes — it spawns `lang detect` with
+    // no terminal attached, so without this it would only ever print the list and
     // install nothing. Each install is non-interactive; an elevated language with
     // no approval on file is skipped by `cmd_install` with a note, never silently
     // reaching the network.
     if yes {
-        let selected: Vec<&str> = found.iter().map(|s| s.as_str()).collect();
-        install_selected(&selected, /*no_interactive*/ true, /*yes*/ true);
+        install_selected(
+            &installable,
+            /*no_interactive*/ true,
+            /*yes*/ true,
+        );
         return Ok(());
     }
 
@@ -1253,13 +1456,13 @@ fn cmd_detect(yes: bool) -> Result<()> {
     }
 
     let selected: Vec<&str> = if input.eq_ignore_ascii_case("a") {
-        found.iter().map(|s| s.as_str()).collect()
+        installable.clone()
     } else {
         let mut sel = Vec::new();
         for part in input.split(',') {
             let part = part.trim();
             match part.parse::<usize>() {
-                Ok(n) if n >= 1 && n <= found.len() => sel.push(found[n - 1].as_str()),
+                Ok(n) if n >= 1 && n <= installable.len() => sel.push(installable[n - 1]),
                 _ => println!("  skipping unrecognised selection: '{part}'"),
             }
         }
@@ -1690,43 +1893,16 @@ fn save_config(config: &LangConfig) -> Result<()> {
     Ok(())
 }
 
-/// #502: PATHEXT-aware — on Windows tools are `scip-go.exe` / `npm.cmd`,
-/// which a bare-name `dir.join(name).is_file()` probe never finds.
-fn which(name: &str) -> bool {
-    travsr_core::exec::resolve_executable(name).is_some()
-}
-
-/// Like `which`, but also checks tool-managed directories not always in PATH:
-/// - $GOBIN (explicit Go binary dir)
-/// - $GOPATH/bin (defaults to ~/go/bin when GOPATH is unset)
-/// - ~/.cargo/bin (Rust toolchain binaries)
+/// Whether `name` resolves on this machine, checking PATH plus the tool-managed
+/// dirs not always on it ($GOBIN, $GOPATH/bin, ~/.cargo/bin, ~/.travsr/bin,
+/// ~/.dotnet/tools) — because `go install`, `rustup component add`, `dotnet tool
+/// install`, and `travsr lang install` each write into their own directory the
+/// current process may not have inherited in PATH.
 ///
-/// Needed because `go install`, `rustup component add`, etc. write into their
-/// own directories which the current process may not have inherited in PATH.
+/// Delegates to the one shared presence check so the index-time Phase B resolver
+/// and `lang list` can never disagree about whether an analyzer is installed.
 fn tool_available(name: &str) -> bool {
-    if which(name) {
-        return true;
-    }
-    // #502: the extra dirs get the same PATHEXT-aware probe as PATH.
-    let mut extra_dirs: Vec<std::path::PathBuf> = Vec::new();
-    // $GOBIN takes precedence over $GOPATH/bin per go toolchain semantics.
-    if let Some(gobin) = std::env::var_os("GOBIN") {
-        extra_dirs.push(std::path::PathBuf::from(gobin));
-    }
-    let gopath = std::env::var_os("GOPATH")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join("go")));
-    if let Some(gp) = gopath {
-        extra_dirs.push(gp.join("bin"));
-    }
-    if let Some(home) = dirs::home_dir() {
-        extra_dirs.push(home.join(".cargo").join("bin"));
-        // ~/.travsr/bin — travsr's own managed directory for downloaded scip-* binaries.
-        extra_dirs.push(home.join(".travsr").join("bin"));
-        // ~/.dotnet/tools — dotnet global tool install location (`dotnet tool install --global`).
-        extra_dirs.push(home.join(".dotnet").join("tools"));
-    }
-    travsr_core::exec::resolve_executable_in(extra_dirs, name).is_some()
+    travsr_core::exec::tool_available(name)
 }
 
 /// RFC-025 Point A parity for the Phase B family: if the underlying `scip-*` /
@@ -1845,14 +2021,16 @@ mod tests {
     fn builtin_without_its_analyzer_is_not_reported_always_on() {
         // Rust is builtin but its analyzer (rust-analyzer) is external and can be
         // missing. The THIS REPO column must not claim "always on" while STATUS
-        // says "partial" — it reports "no analyzer" instead, whose remedy is the
-        // same `travsr lang install rust`.
+        // says "partial" — it reads "not enabled" (matching the other partial
+        // languages), whose remedy is the same `travsr lang install rust`. The
+        // machine tag stays `needs_analyzer` so JSON consumers keep the precise
+        // reason.
         let rust = lookup("rust").expect("rust entry present");
         let missing = RepoState::compute(
             rust, /*registered*/ true, true, true, /*ready*/ false,
         );
         assert_eq!(missing.tag(), "needs_analyzer");
-        assert_eq!(missing.cell(), "no analyzer");
+        assert_eq!(missing.cell(), "not enabled");
 
         // With rust-analyzer present, the builtin is honestly always on.
         let present = RepoState::compute(rust, true, true, true, /*ready*/ true);
@@ -1869,8 +2047,8 @@ mod tests {
 
     #[test]
     fn registered_trusted_but_analyzer_missing_reads_needs_analyzer() {
-        // A non-builtin authorized for the repo but with no analyzer installed is
-        // "no analyzer", not a green "enabled".
+        // A non-builtin authorized for the repo but with no analyzer installed
+        // reads "not enabled" (tag `needs_analyzer`), not a green "enabled".
         let go = lookup("go").expect("go entry present");
         let state = RepoState::compute(
             go, /*registered*/ true, true, /*trusted*/ true, false,

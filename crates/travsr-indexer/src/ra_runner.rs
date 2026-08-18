@@ -25,83 +25,121 @@ use crate::sandbox::{
 
 /// Return the path to the `rust-analyzer` binary, or `None` if unavailable.
 ///
+/// Memoized wrapper over [`resolve_ra_binary`] — the probe runs at most once per
+/// process lifetime. Callers that need a *fresh* answer immediately after
+/// installing rust-analyzer (e.g. the CLI's `lang install rust`, which runs
+/// `rustup component add` and then checks) must call [`resolve_ra_binary`]
+/// directly, since this cache may already hold a pre-install `None`.
+pub fn ra_binary_path() -> Option<std::path::PathBuf> {
+    static RA_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    RA_PATH.get_or_init(resolve_ra_binary).clone()
+}
+
+/// Locate the `rust-analyzer` binary without memoization.
+///
 /// Search order:
 /// 1. `rust-analyzer` on the process PATH.
 /// 2. `$CARGO_HOME/bin/rust-analyzer` — explicit install root.
 /// 3. `$HOME/.cargo/bin/rust-analyzer` — default Cargo (rustup) install location.
 /// 4. `~/.travsr/bin/rust-analyzer` — where `travsr lang install rust` places a
 ///    binary downloaded from GitHub when rustup is absent.
+/// 5. `rustup which rust-analyzer` — the toolchain component. `rustup component
+///    add rust-analyzer` installs the binary into the active toolchain's bin dir
+///    (`~/.rustup/toolchains/<tc>/bin`), which is NOT on PATH and NOT in
+///    `~/.cargo/bin`, so steps 1–4 all miss it. `rustup which` is the
+///    cross-platform resolver for a toolchain-managed component.
 ///
-/// Fallbacks 2–4 ensure LSIF enrichment works even when the daemon's PATH has
+/// Fallbacks 2–5 ensure LSIF enrichment works even when the daemon's PATH has
 /// been stripped to `/usr/bin:/bin:/usr/sbin:/sbin` (e.g. when forked to
 /// background by the CLI where the parent shell had `~/.cargo/bin` on PATH).
 /// The home-relative candidates carry the platform executable suffix so the
 /// Windows `rust-analyzer.exe` is found the same way as the unix binary.
+pub fn resolve_ra_binary() -> Option<std::path::PathBuf> {
+    // 1. PATH probe: preferred — honours user's active toolchain.
+    // #738: require a SUCCESSFUL exit, not merely a spawned process. A
+    // rustup proxy shim is on PATH even when the `rust-analyzer` component
+    // is not installed; `rust-analyzer --version` through it then exits
+    // non-zero. `.status().is_ok()` (process ran at all) treated that as
+    // "available" and later spawned `rust-analyzer lsif`, which the shim
+    // rejected with "Unknown binary ..." — silently skipping LSIF.
+    let on_path = std::process::Command::new("rust-analyzer")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if on_path {
+        return Some(std::path::PathBuf::from("rust-analyzer"));
+    }
+    // 2–4. Explicit home-relative fallbacks survive daemon PATH stripping.
+    // The home anchor MUST match where `travsr lang install rust` wrote the
+    // binary — the installer uses `dirs::home_dir()`, which is `USERPROFILE`
+    // on Windows. So on Windows prefer `USERPROFILE`: a daemon launched from
+    // Git Bash inherits a POSIX-style `HOME` (e.g. `/c/Users/me`) that does
+    // not resolve as a native path, and preferring it would miss the
+    // just-installed binary. On unix `HOME` is the home dir and is used.
+    let exe = std::env::consts::EXE_SUFFIX; // ".exe" on windows, "" elsewhere
+    let ra = format!("rust-analyzer{exe}");
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    } else {
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    };
+    let candidates = [
+        std::env::var_os("CARGO_HOME").map(|h| std::path::PathBuf::from(h).join("bin").join(&ra)),
+        home.clone().map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".cargo")
+                .join("bin")
+                .join(&ra)
+        }),
+        home.map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".travsr")
+                .join("bin")
+                .join(&ra)
+        }),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.exists() {
+            tracing::info!(
+                path = %candidate.display(),
+                "rust-analyzer found off-PATH (cargo home or ~/.travsr/bin)"
+            );
+            return Some(candidate);
+        }
+    }
+    // 5. rustup-managed toolchain component — the last resort, because rustup
+    // installs it outside every path above.
+    if let Some(path) = rustup_which_ra() {
+        tracing::info!(
+            path = %path.display(),
+            "rust-analyzer found via `rustup which` (toolchain component)"
+        );
+        return Some(path);
+    }
+    None
+}
+
+/// Resolve a rustup-managed `rust-analyzer` via `rustup which rust-analyzer`.
 ///
-/// Result is cached via `OnceLock` — the probe runs at most once per process
-/// lifetime.
-pub fn ra_binary_path() -> Option<std::path::PathBuf> {
-    static RA_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    RA_PATH
-        .get_or_init(|| {
-            // 1. PATH probe: preferred — honours user's active toolchain.
-            // #738: require a SUCCESSFUL exit, not merely a spawned process. A
-            // rustup proxy shim is on PATH even when the `rust-analyzer` component
-            // is not installed; `rust-analyzer --version` through it then exits
-            // non-zero. `.status().is_ok()` (process ran at all) treated that as
-            // "available" and later spawned `rust-analyzer lsif`, which the shim
-            // rejected with "Unknown binary ..." — silently skipping LSIF.
-            let on_path = std::process::Command::new("rust-analyzer")
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            if on_path {
-                return Some(std::path::PathBuf::from("rust-analyzer"));
-            }
-            // 2–4. Explicit home-relative fallbacks survive daemon PATH stripping.
-            // The home anchor MUST match where `travsr lang install rust` wrote the
-            // binary — the installer uses `dirs::home_dir()`, which is `USERPROFILE`
-            // on Windows. So on Windows prefer `USERPROFILE`: a daemon launched from
-            // Git Bash inherits a POSIX-style `HOME` (e.g. `/c/Users/me`) that does
-            // not resolve as a native path, and preferring it would miss the
-            // just-installed binary. On unix `HOME` is the home dir and is used.
-            let exe = std::env::consts::EXE_SUFFIX; // ".exe" on windows, "" elsewhere
-            let ra = format!("rust-analyzer{exe}");
-            let home = if cfg!(windows) {
-                std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
-            } else {
-                std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-            };
-            let candidates = [
-                std::env::var_os("CARGO_HOME")
-                    .map(|h| std::path::PathBuf::from(h).join("bin").join(&ra)),
-                home.clone().map(|h| {
-                    std::path::PathBuf::from(h)
-                        .join(".cargo")
-                        .join("bin")
-                        .join(&ra)
-                }),
-                home.map(|h| {
-                    std::path::PathBuf::from(h)
-                        .join(".travsr")
-                        .join("bin")
-                        .join(&ra)
-                }),
-            ];
-            for candidate in candidates.into_iter().flatten() {
-                if candidate.exists() {
-                    tracing::info!(
-                        path = %candidate.display(),
-                        "rust-analyzer found off-PATH (cargo home or ~/.travsr/bin)"
-                    );
-                    return Some(candidate);
-                }
-            }
-            None
-        })
-        .clone()
+/// `rustup which` prints the toolchain binary path and exits 0 when the
+/// component is installed; when it is not, it exits non-zero with
+/// `error: unknown binary '...'` and prints no path. So the exit-success check
+/// is the real gate. The additional `is_file()` check is defense-in-depth
+/// against a path that resolves but no longer exists on disk. Absent rustup
+/// (spawn fails) yields `None`.
+fn rustup_which_ra() -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("rustup")
+        .args(["which", "rust-analyzer"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = std::path::PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+    path.is_file().then_some(path)
 }
 
 /// Return `true` when `rust-analyzer` is available.

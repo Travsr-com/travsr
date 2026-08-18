@@ -176,6 +176,20 @@ impl AppContainerSpawn {
         for path in &self.toolchain.write_paths {
             let _ = ffi::grant_path_access(path, sid.as_psid(), ffi::ACCESS_GENERIC_ALL);
         }
+        // G5: toolchain *bin* dirs (GOPATH/bin, GOROOT/bin, JAVA_HOME/bin,
+        // sbt/dotnet bin) need read+EXECUTE, not just read — otherwise the
+        // AppContainer token finds the toolchain by name (PATH is forwarded) but
+        // cannot map its image, and the analyzer spawns nothing and reports zero
+        // symbols with no error. These are a strict subset of executable
+        // directories (never module/package caches), so the extra right is scoped
+        // to exactly the binaries the analyzer legitimately runs. Best-effort like
+        // the other toolchain grants: a bin dir under a machine-wide tree (Program
+        // Files) may not be re-ACL-able without admin, in which case that binary
+        // stays unrunnable and only the user-writable dirs (e.g. GOPATH/bin) gain
+        // execute — which is still enough for the analyzer itself to run.
+        for path in &self.toolchain.exec_paths {
+            let _ = ffi::grant_path_access(path, sid.as_psid(), ffi::ACCESS_GENERIC_READ_EXECUTE);
+        }
         // PR #577 review: an AppContainer token cannot map an image whose DACL
         // carries no AppContainer ACE — user-profile trees don't carry ALL
         // APPLICATION PACKAGES, and the owner-only hardening of ~/.travsr
