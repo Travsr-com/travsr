@@ -447,12 +447,12 @@ const QUESTION_CATALOGUE: &[(&str, &[QuestionShape])] = &[
         "Find code",
         &[
             QuestionShape {
-                intent: "Where is this, and what is related to it?",
+                intent: "where is {sym} defined?",
                 example: "travsr ask \"{sym}\"",
-                note: "a question works too, not just a name",
+                note: "",
             },
             QuestionShape {
-                intent: "Find text the graph does not model",
+                intent: "where does the text \"{term}\" appear?",
                 example: "travsr pattern \"{term}\"",
                 note: "log strings, TODOs, config keys",
             },
@@ -462,19 +462,19 @@ const QUESTION_CATALOGUE: &[(&str, &[QuestionShape])] = &[
         "Understand impact",
         &[
             QuestionShape {
-                intent: "What calls this?",
+                intent: "what calls {sym}?",
                 example: "travsr graph {sym} --direction callers",
                 note: "",
             },
             QuestionShape {
-                intent: "What breaks if I change it?",
+                intent: "what breaks if I change {sym}?",
                 example: "travsr graph {sym} --direction both",
                 note: "callers and dependencies together",
             },
             QuestionShape {
-                intent: "Every use site, before a rename",
+                intent: "where is {sym} used?",
                 example: "travsr references {sym}",
-                note: "wider than callers: includes types and assignments",
+                note: "every use site, what you want before a rename",
             },
         ],
     ),
@@ -482,17 +482,17 @@ const QUESTION_CATALOGUE: &[(&str, &[QuestionShape])] = &[
         "Check the index",
         &[
             QuestionShape {
-                intent: "Is the graph fresh and healthy?",
+                intent: "is the graph fresh and healthy?",
                 example: "travsr status",
                 note: "",
             },
             QuestionShape {
-                intent: "Which languages resolve calls?",
+                intent: "which languages resolve calls?",
                 example: "travsr lang status",
                 note: "an inactive language means thin results for it",
             },
             QuestionShape {
-                intent: "Why did a result rank that way?",
+                intent: "why did {sym} rank where it did?",
                 example: "travsr explain \"{sym}\" {sym}",
                 note: "which terms matched, which thresholds failed",
             },
@@ -514,32 +514,43 @@ pub fn print_examples(db_path: Option<&std::path::Path>) {
     use std::io::IsTerminal as _;
     let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
 
-    let sym = db_path
-        .and_then(example_symbol)
-        .unwrap_or_else(|| "PaymentService".to_string());
-    // A search term, not a symbol: `pattern` is for text the graph does not
-    // model, so demonstrating it with a symbol name would teach the wrong use.
-    let term = sym.to_lowercase();
+    // Several symbols, not one. Repeating a single name down the whole list reads
+    // as a template with a variable substituted, which is exactly what it is; a
+    // varied set reads as questions about this codebase, which is the point.
+    let symbols = example_symbols(db_path, 6);
+    let grounded = !symbols.is_empty();
+    let symbols = if grounded {
+        symbols
+    } else {
+        vec!["PaymentService".to_string()]
+    };
 
-    println!("{}", pal.bold("What you can ask travsr"));
+    println!("{}", pal.bold("Questions you can ask"));
     println!(
         "{}",
-        pal.dim(&if db_path.is_some() {
-            format!("using {sym}, a real symbol from this repo")
+        pal.dim(&if grounded {
+            "using symbols from this repo, so these are runnable as they are".to_string()
         } else {
             "run `travsr init` first and these fill in with your own symbols".to_string()
         })
     );
 
+    let mut n = 0usize;
     for (group, shapes) in QUESTION_CATALOGUE {
         println!();
         println!("{}", pal.orange(group));
         for s in *shapes {
-            let cmd = s.example.replace("{sym}", &sym).replace("{term}", &term);
-            let painted = paint_command(pal, &cmd, &sym, &term);
-            // Intent first: someone who does not know the commands is scanning
-            // for their question, not for a command name.
-            println!("  {}", s.intent);
+            // Rotate through the available symbols so consecutive lines differ.
+            let sym = &symbols[n % symbols.len()];
+            let term = sym.to_lowercase();
+            n += 1;
+
+            let question = s.intent.replace("{sym}", sym).replace("{term}", &term);
+            let cmd = s.example.replace("{sym}", sym).replace("{term}", &term);
+            let painted = paint_command(pal, &cmd, sym, &term);
+
+            // The question leads, because that is what the reader is scanning for.
+            println!("  {question}");
             if s.note.is_empty() {
                 println!("      {painted}");
             } else {
@@ -581,13 +592,19 @@ fn paint_command(pal: crate::progress::Palette, cmd: &str, sym: &str, term: &str
     out.join(" ")
 }
 
-/// A symbol worth putting in an example: real, in this repo, and not noise.
+/// Up to `want` symbols worth putting in examples: real, in this repo, not noise.
 ///
 /// Ranked by in-degree, because an example that resolves to a leaf with no
-/// callers demonstrates the command without demonstrating an answer. The most
-/// depended-upon symbol is the one whose graph is worth showing.
-fn example_symbol(db_path: &std::path::Path) -> Option<String> {
-    let store = crate::daemon_client::open_read_store(db_path).ok()?;
+/// callers demonstrates the command without demonstrating an answer. Returns
+/// several so the printed list varies; one name repeated down the page reads as a
+/// filled-in template rather than as questions about this codebase.
+fn example_symbols(db_path: Option<&std::path::Path>, want: usize) -> Vec<String> {
+    let Some(db_path) = db_path else {
+        return Vec::new();
+    };
+    let Ok(store) = crate::daemon_client::open_read_store(db_path) else {
+        return Vec::new();
+    };
 
     // Classes and functions only: a file or module node is a valid graph node but
     // a confusing thing to put in `travsr graph <symbol>`.
@@ -603,15 +620,26 @@ fn example_symbol(db_path: &std::path::Path) -> Option<String> {
             && travsr_core::ident::leaf_of(&n.vname.signature).len() >= 4
     });
     if candidates.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     let ids: Vec<travsr_core::NodeId> = candidates.iter().map(|n| n.id).collect();
-    let degrees = store.in_degrees(&ids).ok()?;
-    candidates
-        .into_iter()
-        .max_by_key(|n| degrees.get(&n.id).copied().unwrap_or(0))
-        .map(|n| travsr_core::ident::leaf_of(&n.vname.signature).to_string())
+    let degrees = store.in_degrees(&ids).unwrap_or_default();
+    candidates.sort_by_key(|n| std::cmp::Reverse(degrees.get(&n.id).copied().unwrap_or(0)));
+
+    let mut out: Vec<String> = Vec::new();
+    for n in candidates {
+        let leaf = travsr_core::ident::leaf_of(&n.vname.signature).to_string();
+        // Distinct names only: the same leaf can appear on several nodes, and a
+        // repeated one defeats the reason for collecting more than one.
+        if !out.contains(&leaf) {
+            out.push(leaf);
+        }
+        if out.len() >= want {
+            break;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -663,6 +691,18 @@ mod catalogue_tests {
     fn every_example_renders_with_nothing_left_to_substitute() {
         for (group, shapes) in QUESTION_CATALOGUE {
             for s in *shapes {
+                // The question is templated too, so it gets the same guarantee:
+                // a stray `{sym}` in the text a reader scans is as bad as one in
+                // the command they paste.
+                let asked = s
+                    .intent
+                    .replace("{sym}", "Widget")
+                    .replace("{term}", "widget");
+                assert!(
+                    !asked.contains('{') && !asked.contains('}'),
+                    "{group}: question `{}` left a slot unfilled: {asked}",
+                    s.intent
+                );
                 let rendered = s
                     .example
                     .replace("{sym}", "Widget")
@@ -724,6 +764,28 @@ mod catalogue_tests {
                 assert_eq!(
                     stripped, cmd,
                     "colour changed the command text, not just its appearance"
+                );
+            }
+        }
+    }
+
+    /// Each entry is a question the reader scans for, so it has to read as one.
+    /// The earlier version used labels ("Find a symbol by name"), which describe
+    /// the command rather than the reader's problem, and that is what made the
+    /// list hard to use.
+    #[test]
+    fn every_intent_reads_as_a_question() {
+        for (group, shapes) in QUESTION_CATALOGUE {
+            for s in *shapes {
+                assert!(
+                    s.intent.ends_with('?'),
+                    "{group}: `{}` is a label, not a question",
+                    s.intent
+                );
+                assert!(
+                    s.intent.chars().next().is_some_and(|c| c.is_lowercase()),
+                    "{group}: `{}` should read as spoken text, not a heading",
+                    s.intent
                 );
             }
         }
