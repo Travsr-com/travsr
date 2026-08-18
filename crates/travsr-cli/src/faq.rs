@@ -28,9 +28,11 @@ pub(crate) struct Entry {
     pub lead: &'static str,
     /// Supporting points, each short enough to sit on one line.
     pub points: &'static [&'static str],
-    /// A command that demonstrates or acts on the answer. Empty when there is
-    /// nothing to run, rather than inventing one.
-    pub command: &'static str,
+    /// Commands that act on the answer. Empty when there is nothing to run,
+    /// rather than inventing one. A slice because some answers genuinely have
+    /// several: install has three real routes, and naming one while mentioning
+    /// the others in prose makes the reader go looking for them.
+    pub commands: &'static [&'static str],
 }
 
 const ENTRIES: &[Entry] = &[
@@ -42,7 +44,7 @@ const ENTRIES: &[Entry] = &[
             "structural questions get exact answers, not guesses",
             "the graph updates as you commit",
         ],
-        command: "",
+        commands: &[],
     },
     Entry {
         question: "how is it different from search or vector RAG?",
@@ -52,7 +54,7 @@ const ENTRIES: &[Entry] = &[
             "travsr parses the code and resolves each call to its definition",
             "\"what calls this\" is derived, not inferred",
         ],
-        command: "",
+        commands: &[],
     },
     Entry {
         question: "how does it work?",
@@ -63,13 +65,20 @@ const ENTRIES: &[Entry] = &[
             "retrieval seeds from your query, walks the graph, reranks",
             "the result is packed to fit your token budget",
         ],
-        command: "",
+        commands: &[],
     },
     Entry {
         question: "how do I install it?",
-        lead: "One line. The installer verifies the release signature first.",
-        points: &["npm and building from source also work"],
-        command: "curl -fsSL https://travsr.com/install.sh | sh",
+        lead: "Three routes, all installing the same binary.",
+        points: &[
+            "the installer verifies the release signature before installing",
+            "add -s -- --system to install system-wide",
+        ],
+        commands: &[
+            "curl -fsSL https://travsr.com/install.sh | sh",
+            "npm install -g @travsr.com/travsr",
+            "cargo build --release -p travsr-cli",
+        ],
     },
     Entry {
         question: "how do I start using it on a repo?",
@@ -78,7 +87,7 @@ const ENTRIES: &[Entry] = &[
             "indexes the tracked files",
             "installs a git hook so the graph stays current",
         ],
-        command: "travsr init --semantic",
+        commands: &["travsr init --semantic"],
     },
     Entry {
         question: "which languages does it support?",
@@ -87,7 +96,7 @@ const ENTRIES: &[Entry] = &[
             "native   rust, typescript, javascript, python",
             "others need an analyzer installed",
         ],
-        command: "travsr lang list",
+        commands: &["travsr lang list"],
     },
     Entry {
         question: "does my code leave my machine?",
@@ -97,7 +106,7 @@ const ENTRIES: &[Entry] = &[
             "embedding models run as a local sidecar",
             "network is only for downloading travsr and optional models",
         ],
-        command: "",
+        commands: &[],
     },
     Entry {
         question: "do I need the daemon running?",
@@ -107,7 +116,7 @@ const ENTRIES: &[Entry] = &[
             "the daemon keeps semantic analysis current as files change",
             "and answers faster from a warm store",
         ],
-        command: "travsr daemon start",
+        commands: &["travsr daemon start"],
     },
     Entry {
         question: "how do I connect it to an AI agent?",
@@ -116,7 +125,7 @@ const ENTRIES: &[Entry] = &[
             "detects installed tools and writes their config",
             "add --print first to see what would change",
         ],
-        command: "travsr connect",
+        commands: &["travsr connect"],
     },
     Entry {
         question: "what can I ask about my code?",
@@ -125,7 +134,7 @@ const ENTRIES: &[Entry] = &[
             "what calls it, what it depends on, where it is used",
             "naming a symbol gives the best results",
         ],
-        command: "travsr ask --examples",
+        commands: &["travsr ask --examples"],
     },
     Entry {
         question: "why did it say it found nothing?",
@@ -135,7 +144,7 @@ const ENTRIES: &[Entry] = &[
             "conceptual questions naming no symbol are a known gap",
             "the abstention suggests what to try instead",
         ],
-        command: "",
+        commands: &[],
     },
     Entry {
         question: "where is the data, and how do I remove it?",
@@ -145,9 +154,90 @@ const ENTRIES: &[Entry] = &[
             "~/.travsr   shared binaries and models",
             "the graph is derived from your source and rebuilds",
         ],
-        command: "travsr init",
+        commands: &["travsr init"],
     },
 ];
+
+/// The FAQ entry a free-form question is asking, if any.
+///
+/// Matched by word overlap against the catalogue's own questions rather than a
+/// separate list of phrases. The phrase list was the earlier design and it did
+/// not converge: every round of feedback found a wording it did not contain, and
+/// each fix added exactly that wording. Matching the questions themselves means a
+/// new FAQ entry is reachable from `ask` the moment it is written, with nothing
+/// to keep in sync.
+///
+/// Deliberately strict. Hijacking a real code search is a worse failure than
+/// missing a meta question: the user gets a confident answer to a question they
+/// did not ask, where a miss just runs the search they wanted. So a match needs
+/// most of the question's distinctive words, not a few.
+pub(crate) fn match_question(query: &str) -> Option<&'static Entry> {
+    // A bare word or two is a symbol lookup, not a question. `ask` documents
+    // itself as accepting a bare symbol name, so `travsr ask "install"` is a
+    // search for something called `install`, and answering "here is how to
+    // install travsr" would replace a real search with an unrelated answer.
+    //
+    // Gated on the shape of what was typed rather than on content words: "what is
+    // travsr" reduces to the single word "travsr" once filler is dropped, so
+    // counting content words would reject the catalogue's own questions.
+    let raw_words = query.split_whitespace().count();
+    if raw_words < 3 && !query.trim_end().ends_with('?') {
+        return None;
+    }
+
+    let asked = distinctive_words(query);
+    if asked.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(usize, &'static Entry)> = None;
+    for e in ENTRIES {
+        let want = distinctive_words(e.question);
+        if want.is_empty() {
+            continue;
+        }
+        let hits = want.iter().filter(|w| asked.contains(*w)).count();
+        if hits != want.len() {
+            continue;
+        }
+        // Coverage has to run both ways. Requiring only the catalogue's words
+        // meant "how does it work?" reduced to the single word "work", so
+        // "how does the parser work" matched it and the reader's search was
+        // replaced by an answer about travsr. Requiring most of what *they*
+        // typed to be accounted for keeps an extra subject like "parser" from
+        // being ignored.
+        let covered = asked.iter().filter(|w| want.contains(w)).count();
+        if covered * 5 < asked.len() * 3 {
+            continue;
+        }
+        if best.map_or(true, |(n, _)| hits > n) {
+            best = Some((hits, e));
+        }
+    }
+    best.map(|(_, e)| e)
+}
+
+/// Content words of a question, lowercased, with filler removed.
+///
+/// The filler list is the words that carry no signal in a question ("how", "do",
+/// "I", "the"). What remains is what the question is actually about, which is
+/// what both sides are compared on.
+fn distinctive_words(text: &str) -> Vec<String> {
+    const FILLER: &[&str] = &[
+        "a", "am", "an", "and", "are", "as", "at", "be", "by", "can", "did", "do", "does", "for",
+        "from", "how", "i", "if", "in", "is", "it", "its", "me", "my", "of", "on", "or", "should",
+        "that", "the", "then", "there", "this", "to", "use", "using", "want", "was", "what",
+        "when", "where", "which", "who", "why", "will", "with", "you", "your",
+    ];
+    // Underscore is not a separator here. Splitting it turned `install_hook`
+    // into "install", which matched the install FAQ and hijacked a real symbol
+    // search. A symbol is one token.
+    text.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+        .filter(|w| !FILLER.contains(&w.as_str()))
+        .collect()
+}
 
 /// The FAQ entry whose question is exactly `question`.
 ///
@@ -181,9 +271,11 @@ pub(crate) fn print_entry(e: &Entry, pal: Palette) {
             println!("      {rest}");
         }
     }
-    if !e.command.is_empty() {
+    if !e.commands.is_empty() {
         println!();
-        println!("    {} {}", pal.dim("$"), pal.ident(e.command));
+        for c in e.commands {
+            println!("    {} {}", pal.dim("$"), pal.ident(c));
+        }
     }
 }
 
@@ -279,6 +371,61 @@ mod tests {
         }
     }
 
+    /// Every catalogue question must be reachable by asking it. The point of
+    /// matching the questions themselves is that a new entry works from `ask`
+    /// the moment it is written, with no second list to update.
+    #[test]
+    fn every_catalogue_question_matches_itself() {
+        for e in ENTRIES {
+            let got = super::match_question(e.question)
+                .unwrap_or_else(|| panic!("`{}` does not match itself", e.question));
+            assert_eq!(got.question, e.question);
+        }
+    }
+
+    /// The failure that matters. Hijacking a real search is worse than missing a
+    /// meta question: the reader gets a confident answer to something they did
+    /// not ask, where a miss simply runs the search they wanted.
+    ///
+    /// Each of these was an actual hijack before the matcher required coverage in
+    /// both directions and stopped splitting on underscore. `install_hook` became
+    /// "install" and matched the install entry; "how does the parser work"
+    /// reduced to "work" and matched "how does it work?".
+    #[test]
+    fn code_searches_are_never_hijacked() {
+        for q in [
+            "what calls install_hook",
+            "how does the parser work",
+            "install_creates_only_sh",
+            "NodeId",
+            "repo_languages",
+            "language_distribution",
+            "where is NodeId used",
+            "daemon_client",
+            "run",
+            "what calls data",
+            "how does the daemon work",
+            "install",
+        ] {
+            assert!(
+                super::match_question(q).is_none(),
+                "`{q}` is a code search and must reach retrieval"
+            );
+        }
+    }
+
+    /// A single-word catalogue question is the shape that caused the hijacks: it
+    /// reduces to one token that any sentence containing that token matches.
+    /// Coverage both ways is what makes it safe, so this pins that a question
+    /// carrying only one distinctive word still cannot swallow a longer query.
+    #[test]
+    fn a_longer_query_does_not_match_a_one_word_question() {
+        // "how does it work?" reduces to ["work"].
+        assert!(super::match_question("how does it work").is_some());
+        assert!(super::match_question("how does the scheduler work").is_none());
+        assert!(super::match_question("does the retry work after a crash").is_none());
+    }
+
     #[test]
     fn every_command_is_runnable() {
         use clap::CommandFactory as _;
@@ -292,15 +439,18 @@ mod tests {
             .collect();
 
         for e in ENTRIES {
-            if e.command.is_empty() || !e.command.starts_with("travsr ") {
-                continue; // the installer one-liner is a shell pipeline, not a subcommand
+            for c in e.commands {
+                // Only travsr subcommands are checkable here; the installer
+                // pipeline and the cargo build are not travsr invocations.
+                if !c.starts_with("travsr ") {
+                    continue;
+                }
+                let sub = c.split_whitespace().nth(1).unwrap_or("");
+                assert!(
+                    known.iter().any(|k| k == sub),
+                    "`{c}` names unknown subcommand {sub:?}"
+                );
             }
-            let sub = e.command.split_whitespace().nth(1).unwrap_or("");
-            assert!(
-                known.iter().any(|k| k == sub),
-                "`{}` names unknown subcommand {sub:?}",
-                e.command
-            );
         }
     }
 

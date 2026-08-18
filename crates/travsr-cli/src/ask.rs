@@ -162,6 +162,16 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     //
     // Caught before retrieval rather than after, because retrieval succeeds here.
     // There is no low-confidence signal to hang an abstention on.
+    // A question the FAQ already answers, matched against the FAQ's own questions
+    // rather than a parallel phrase list. Tried first so a new FAQ entry is
+    // reachable from `ask` the moment it is written.
+    if let Some(e) = crate::faq::match_question(query_str) {
+        use std::io::IsTerminal as _;
+        let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
+        crate::faq::print_entry(e, pal);
+        return Ok(());
+    }
+
     if let Some(redirect) = meta_question_redirect(query_str) {
         use std::io::IsTerminal as _;
         let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
