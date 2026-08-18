@@ -435,22 +435,28 @@ mod docs_note_tests {
 /// `(question, command)`. `{sym}` is filled with a real symbol from the reader's
 /// own repository, `{term}` with a lowercased form for text search.
 ///
+/// Diagnostics are deliberately absent. `travsr explain` describes itself as
+/// "a diagnostic for tuning search; not part of normal use", and `fsck` reports
+/// ghost nodes and orphan edges. Both answer questions about travsr's own
+/// internals rather than about the reader's code, and a list of "questions you
+/// can ask" is not where someone should first meet them.
+///
 /// Only `ask` shapes measured to return results are included. `ask` is
 /// graph-grounded, so it answers when the question is anchored to something in
 /// the code and abstains when it is not: "what breaks if I change X" returns
 /// nothing today, which is the known conceptual-query gap, so that question is
 /// routed to `graph` instead of being suggested as an `ask`.
+///
+/// "how does X work" was dropped for the same reason after testing it: it
+/// returns results for some symbols and abstains for others, and a suggestion
+/// that works only sometimes is worse than one fewer. A bare symbol never
+/// abstains, so that is the shape offered for `ask`.
 const FAQ: &[(&str, &str)] = &[
     // Orientation: what someone asks before they know any symbol.
     ("what is this repo written in?", "travsr lang list"),
     ("is the index ready to query?", "travsr status"),
-    ("how big is the graph?", "travsr status"),
     // Finding things.
     ("where is {sym} defined?", "travsr ask \"{sym}\""),
-    (
-        "what is {sym} related to?",
-        "travsr ask \"how does {sym} work\"",
-    ),
     (
         "where does the text \"TODO\" appear?",
         "travsr pattern \"TODO\"",
@@ -472,12 +478,6 @@ const FAQ: &[(&str, &str)] = &[
         "where is {sym} used, before a rename?",
         "travsr references {sym}",
     ),
-    // When the answer looks wrong.
-    (
-        "why did {sym} rank where it did?",
-        "travsr explain \"{sym}\" {sym}",
-    ),
-    ("is anything stale or missing?", "travsr fsck"),
 ];
 
 /// Print the questions, using symbols from the reader's own repository.
@@ -658,6 +658,23 @@ mod faq_tests {
                 known.iter().any(|k| k == sub),
                 "`{command}` names unknown subcommand {sub:?}"
             );
+        }
+    }
+
+    /// Diagnostics stay out of a user-facing list. `explain` describes itself as
+    /// "not part of normal use", and `fsck` reports ghost nodes and orphan edges:
+    /// both are about travsr's own internals rather than the reader's code.
+    /// Pinned because they are easy to add back, being genuinely useful commands.
+    #[test]
+    fn no_internal_diagnostics_are_offered() {
+        for (question, command) in FAQ {
+            for internal in ["explain", "fsck"] {
+                assert!(
+                    !command.contains(&format!("travsr {internal}")),
+                    "`{question}` offers the {internal} diagnostic; it answers a \
+                     question about travsr's internals, not about this codebase"
+                );
+            }
         }
     }
 
