@@ -77,7 +77,7 @@ const RELEASE_VERSION: &str =
     version = RELEASE_VERSION,
     about = "The code graph that lives next to git."
 )]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Command,
 }
@@ -170,10 +170,15 @@ enum Command {
     /// retrieval). Also accepts a bare symbol name.
     Ask {
         /// Natural-language question, or a symbol name, to retrieve context for.
-        query: String,
+        /// Optional only so `--examples` can be used on its own.
+        #[arg(required_unless_present = "examples")]
+        query: Option<String>,
         /// Output format: table (default) or json.
         #[arg(long, value_enum, default_value = "table")]
         format: ask::OutputFormat,
+        /// List the kinds of question travsr can answer, with runnable examples.
+        #[arg(long)]
+        examples: bool,
     },
     /// Show why `travsr ask` ranked (or skipped) results for a query: which
     /// terms matched, which relevance thresholds passed or failed, and the final
@@ -1253,7 +1258,20 @@ async fn run(cli: Cli) -> Result<()> {
             json,
         } => repos::run(prune, remove.as_deref(), json)?,
         Command::Status => status::run()?,
-        Command::Ask { query, format } => ask::run(&query, format)?,
+        Command::Ask {
+            query,
+            format,
+            examples,
+        } => {
+            if examples {
+                ask::print_examples();
+            } else {
+                // `required_unless_present` guarantees a query here; the
+                // `unwrap_or_default` keeps a future flag change from turning
+                // that invariant into a panic.
+                ask::run(&query.unwrap_or_default(), format)?;
+            }
+        }
         Command::Explain {
             query,
             symbol,

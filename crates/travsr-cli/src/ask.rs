@@ -196,7 +196,15 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         // `ask` is natural-language, graph-grounded retrieval — not a symbol-name
         // lookup — so an abstention means "no confidently relevant code found",
         // not "that symbol does not exist". Word it that way to avoid the misread.
-        println!("no grounded match for '{display_query}' in this repo (try rephrasing, or search a symbol name directly)");
+        // "try rephrasing" is not actionable on its own: a user who does not
+        // already know what travsr answers cannot tell what to rephrase towards,
+        // and this path fires most often on exactly the conceptual questions
+        // where they are least sure. Name the catalogue instead.
+        println!(
+            "no grounded match for '{display_query}' in this repo\n\
+             try a symbol name directly, or run `travsr ask --examples` to see \
+             what travsr can answer"
+        );
         // #376 §4.3: doc hits may appear below the abstain message, but never
         // convert it into a match — `payload.matched` stays false and no
         // confidence, coverage or tier label is derived from them. This is the
@@ -398,5 +406,188 @@ mod docs_note_tests {
             super::SECTION_TAGS,
             ["exact", "semantic", "docs", "tests", "relevant"]
         );
+    }
+}
+
+/// The question shapes `travsr ask` and its sibling commands can answer.
+///
+/// Written because the abstention path told users to "try rephrasing" without
+/// saying what to rephrase *towards*. A user who does not already know the
+/// product cannot act on that, and `ask` abstains most often on exactly the
+/// conceptual questions where they are least sure what is supported.
+///
+/// Every entry is a real command against real capabilities. Nothing aspirational:
+/// an example here that does not work would be worse than no catalogue, because
+/// it would send someone to a dead end while looking authoritative.
+struct QuestionShape {
+    /// What the user is actually trying to find out, in their words.
+    intent: &'static str,
+    /// A runnable command, using a placeholder the user substitutes.
+    example: &'static str,
+    /// Why this command rather than `ask`, when that is the better route.
+    note: &'static str,
+}
+
+const QUESTION_CATALOGUE: &[(&str, &[QuestionShape])] = &[
+    (
+        "Find something",
+        &[
+            QuestionShape {
+                intent: "Where is this defined?",
+                example: "travsr ask \"<symbol or description>\"",
+                note: "",
+            },
+            QuestionShape {
+                intent: "Find a symbol by name",
+                example: "travsr ask \"PaymentService\"",
+                note: "a bare name is accepted, not just a question",
+            },
+            QuestionShape {
+                intent: "Find text the graph does not model",
+                example: "travsr pattern \"<regex>\"",
+                note: "log strings, TODOs, config keys",
+            },
+        ],
+    ),
+    (
+        "Understand impact",
+        &[
+            QuestionShape {
+                intent: "What calls this?",
+                example: "travsr graph <symbol> --direction callers",
+                note: "",
+            },
+            QuestionShape {
+                intent: "What does this depend on?",
+                example: "travsr graph <symbol> --direction deps",
+                note: "",
+            },
+            QuestionShape {
+                intent: "What breaks if I change this?",
+                example: "travsr graph <symbol> --direction both",
+                note: "callers and dependencies together",
+            },
+            QuestionShape {
+                intent: "Every use site, with path:line",
+                example: "travsr references <symbol>",
+                note: "wider than callers: includes types and assignments",
+            },
+        ],
+    ),
+    (
+        "Check the index itself",
+        &[
+            QuestionShape {
+                intent: "Is the graph fresh and healthy?",
+                example: "travsr status",
+                note: "",
+            },
+            QuestionShape {
+                intent: "Are there ghost nodes?",
+                example: "travsr fsck",
+                note: "",
+            },
+            QuestionShape {
+                intent: "Which languages have semantic analysis?",
+                example: "travsr lang status",
+                note: "an inactive language means thin results for it",
+            },
+            QuestionShape {
+                intent: "Why did ask rank it that way?",
+                example: "travsr explain \"<query>\" <symbol>",
+                note: "shows which terms matched and which thresholds failed",
+            },
+        ],
+    ),
+];
+
+/// Print the catalogue. Grouped by intent rather than by command, because a user
+/// who does not know the commands cannot look one up by name.
+pub fn print_examples() {
+    println!("What you can ask travsr\n");
+    for (group, shapes) in QUESTION_CATALOGUE {
+        println!("{group}");
+        for s in *shapes {
+            println!("  {}", s.intent);
+            if s.note.is_empty() {
+                println!("    {}", s.example);
+            } else {
+                println!("    {}   ({})", s.example, s.note);
+            }
+        }
+        println!();
+    }
+    println!("`ask` is graph-grounded: it answers from the indexed code, and");
+    println!("abstains rather than guessing when nothing is confidently relevant.");
+    println!("A question about intent or history is usually a question for git,");
+    println!("not for the graph.");
+}
+
+#[cfg(test)]
+mod catalogue_tests {
+    use super::QUESTION_CATALOGUE;
+
+    /// Every example must name a subcommand that exists. A catalogue that sends
+    /// users to a command travsr does not have is worse than no catalogue: #727
+    /// was exactly that failure, where the docs told agents to run `travsr lang
+    /// status` while the subcommand did not exist.
+    #[test]
+    fn every_example_names_a_real_subcommand() {
+        // Taken from clap itself rather than a hand-maintained list, so a renamed
+        // or removed subcommand fails here instead of drifting. A hardcoded list
+        // would have to be remembered, which is the same weakness that let #727
+        // ship: the docs named `travsr lang status` while the CLI did not have it.
+        use clap::CommandFactory as _;
+        let cmd = crate::Cli::command();
+        let known: Vec<String> = cmd
+            .get_subcommands()
+            .flat_map(|c| {
+                std::iter::once(c.get_name().to_string())
+                    .chain(c.get_all_aliases().map(str::to_string))
+            })
+            .collect();
+        assert!(!known.is_empty(), "clap reported no subcommands");
+        for (group, shapes) in QUESTION_CATALOGUE {
+            for s in *shapes {
+                let mut words = s.example.split_whitespace();
+                assert_eq!(words.next(), Some("travsr"), "{group}: {}", s.example);
+                let sub = words.next().unwrap_or("");
+                assert!(
+                    known.iter().any(|k| k == sub),
+                    "{group}: `{}` names unknown subcommand {sub:?}; known: {known:?}",
+                    s.example
+                );
+            }
+        }
+    }
+
+    /// A placeholder the user is meant to replace must look like one. Without
+    /// this, a copy-pasted example silently searches for the literal text.
+    #[test]
+    fn placeholders_are_visibly_placeholders() {
+        for (_, shapes) in QUESTION_CATALOGUE {
+            for s in *shapes {
+                if s.example.contains('<') {
+                    assert!(
+                        s.example.contains('>'),
+                        "unclosed placeholder in `{}`",
+                        s.example
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_catalogue_is_not_empty_and_every_entry_is_filled_in() {
+        assert!(!QUESTION_CATALOGUE.is_empty());
+        for (group, shapes) in QUESTION_CATALOGUE {
+            assert!(!group.is_empty());
+            assert!(!shapes.is_empty(), "{group} has no entries");
+            for s in *shapes {
+                assert!(!s.intent.is_empty(), "{group}: empty intent");
+                assert!(!s.example.is_empty(), "{group}: empty example");
+            }
+        }
     }
 }
