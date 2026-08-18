@@ -24,6 +24,11 @@ pub(crate) struct Entry {
     pub question: &'static str,
     /// One sentence. The answer, if the reader stops here.
     pub lead: &'static str,
+    /// The fuller answer: the reasoning, caveat or consequence behind the
+    /// points. Points say what is true and are quick to scan; on their own they
+    /// read as a list of assertions with nothing joining them, which is the
+    /// feedback this field exists to answer. Prose carries the why.
+    pub detail: &'static str,
     /// Supporting points, each short enough to sit on one line.
     pub points: &'static [&'static str],
     /// An ordered walkthrough, as (what this does, command) pairs. Used where
@@ -42,210 +47,256 @@ const ENTRIES: &[Entry] = &[
     Entry {
         question: "what is travsr?",
         lead: "A code graph that lives next to git.",
+        detail: "Most tools treat a repo as text and search it. Travsr parses it, resolves each reference to the definition it actually points at, and keeps the result as a graph. A question like \"what calls this\" then becomes a traversal with an exact answer, which is how it hands an agent a small, complete slice of the repo instead of a large pile of similar-looking chunks.",
         steps: &[],
         points: &[
-            "every function, class and call is a node or an edge",
-            "structural questions get exact answers, not guesses",
-            "the graph updates as you commit",
+            "every function, class, call and import is a node or an edge",
+            "structural questions get computed answers, not guesses",
+            "the graph rebuilds as you commit, so it matches your checkout",
+            "agents query it over MCP, so it is not just a CLI",
         ],
-        commands: &[],
+        commands: &[
+            "travsr status",
+        ],
     },
     Entry {
         question: "how is it different from search or vector RAG?",
         lead: "It computes relationships instead of approximating them.",
+        detail: "A vector index answers \"what looks like this query\". That works for prose and struggles on code, where the function you need may share no words with your question, and two near-identical helpers may have nothing to do with each other. Travsr answers \"what is connected to this\": a caller three files away is found because an edge says so, not because the wording happened to match.",
         steps: &[],
         points: &[
+            "grep matches text and cannot tell a call from a comment",
             "vector search chunks code and retrieves by similarity",
-            "travsr parses the code and resolves each call to its definition",
-            "\"what calls this\" is derived, not inferred",
+            "similar code is not the same thing as related code",
+            "travsr resolves each call to the definition it points at",
         ],
         commands: &[],
     },
     Entry {
         question: "how does it work?",
         lead: "Two indexing passes, then a retrieval pipeline.",
+        detail: "Phase A is fast and always runs, so the index is usable seconds after init. Phase B is the expensive part and runs in the background via the daemon unless you pass --semantic. Queries work throughout: before Phase B lands you get structure, and after it you get call edges too.",
         steps: &[],
         points: &[
-            "Phase A   tree-sitter parses every tracked file into nodes",
-            "Phase B   resolves calls to the definitions they point at",
-            "retrieval seeds from your query, walks the graph, reranks",
-            "the result is packed to fit your token budget",
+            "Phase A     tree-sitter parses every tracked file into nodes",
+            "Phase B     resolves calls to the definitions they point at",
+            "retrieval   seeds from your query, walks the graph, reranks",
+            "packing     trims the result to the token budget you have",
         ],
-        commands: &[],
+        commands: &[
+            "travsr status",
+        ],
     },
     Entry {
         question: "how do I install it?",
         lead: "Install, then index a repo. Five steps from nothing to a query.",
+        detail: "The installer checks the release signature before it installs anything, and drops the binary somewhere on your PATH for the current user. Nothing else is needed to start: models for semantic search are optional and download later, only if you ask for them.",
         steps: &[
-            (
-                "install the binary (npm and cargo also work)",
-                "curl -fsSL https://travsr.com/install.sh | sh",
-            ),
+            ("install the binary", "curl -fsSL https://travsr.com/install.sh | sh"),
             ("check it is on your PATH", "travsr --version"),
             ("index a repo, from its root", "travsr init --semantic"),
             ("confirm the graph is ready", "travsr status"),
             ("ask it something", "travsr ask \"<a symbol in your code>\""),
         ],
         points: &[
-            "the installer verifies the release signature before installing",
-            "add -s -- --system to install for all users",
-            "npm install -g @travsr.com/travsr",
-            "cargo build --release -p travsr-cli   (from a clone)",
+            "sh -s -- --system   installs for all users, not just you",
+            "npm     npm install -g @travsr.com/travsr",
+            "cargo   cargo build --release -p travsr-cli   (from a clone)",
+            "no daemon, database or account to set up first",
         ],
         commands: &[],
     },
     Entry {
         question: "how do I start using it on a repo?",
-        lead: "Run this from the repo root.",
+        lead: "Run this once from the repo root.",
+        detail: "init is incremental and safe to repeat: a second run picks up only what changed, which is exactly what the git hook does on your behalf after each commit. Reach for --force only after changing a flag that affects analysis, since per-file change detection cannot see that by itself.",
         steps: &[],
         points: &[
-            "indexes the tracked files",
-            "installs a git hook so the graph stays current",
+            "parses every tracked file, skipping whatever git ignores",
+            "installs a hook so the graph follows your commits",
+            "registers the repo so other tools can find it",
+            "--semantic waits for call edges instead of backgrounding them",
         ],
-        commands: &["travsr init --semantic"],
+        commands: &[
+            "travsr init --semantic",
+        ],
     },
     Entry {
         question: "which languages does it support?",
-        lead: "Sixteen for structure; four resolve calls without setup.",
+        lead: "Sixteen parse out of the box; four resolve calls with no setup.",
+        detail: "Structural parsing covers all sixteen: definitions, files, imports and the shape of the code. Resolving a call across files needs a language-specific analyzer, which is why some languages read as partial until you install one. Enabling is per repo even when the analyzer is installed globally, so indexing a new checkout never silently runs something you did not turn on there.",
         steps: &[],
         points: &[
-            "native   rust, typescript, javascript, python",
-            "others need an analyzer installed",
+            "always on   rust, typescript, javascript, python",
+            "one command adds full analysis for go, ruby, php, swift and more",
+            "the rest parse for structure and can be enabled per repo",
+            "travsr lang install <language>   turns one on, inside the repo",
         ],
-        commands: &["travsr lang list"],
+        commands: &[
+            "travsr lang list",
+        ],
     },
     Entry {
         question: "does my code leave my machine?",
         lead: "No. Indexing, storage and queries are all local.",
+        detail: "The cloud tier is opt-in and separate: you deploy it and point at it deliberately. Nothing on the local path calls home, so travsr works on a machine with no network at all once the binary and any models you want are present.",
         steps: &[],
         points: &[
-            "the graph lives in .travsr/ inside your repo",
-            "embedding models run as a local sidecar",
-            "network is only for downloading travsr and optional models",
+            ".travsr/    the graph, inside your repo",
+            "~/.travsr   shared binaries, models and the repo registry",
+            "embedding and reranking models run as local sidecars",
+            "the network is used to download travsr and optional models",
         ],
         commands: &[],
     },
     Entry {
         question: "do I need the daemon running?",
-        lead: "No, but it helps.",
+        lead: "No. Queries work without it; it keeps the graph fresher.",
+        detail: "The git hook already keeps the graph honest at commit boundaries. The daemon narrows the window further, which is what you want when you are asking about code you are still in the middle of writing.",
         steps: &[],
         points: &[
-            "queries work without it, served from the database",
-            "the daemon keeps semantic analysis current as files change",
-            "and answers faster from a warm store",
+            "without it, queries are served from the database as it stands",
+            "with it, edits are picked up as you save, not only on commit",
+            "it runs the background Phase B work after init",
+            "and hosts MCP, so an agent connects without a cold start",
         ],
-        commands: &["travsr daemon start"],
+        commands: &[
+            "travsr daemon start",
+        ],
     },
     Entry {
         question: "how do I connect it to an AI agent?",
         lead: "Travsr speaks MCP, so any agent that supports it can query the graph.",
+        detail: "Run it from the repo you want the agent to see. Start with --print, which changes nothing and shows you exactly what it would write, then run it for real.",
         steps: &[],
         points: &[
-            "detects installed tools and writes their config",
-            "add --print first to see what would change",
+            "detects the coding tools you already have installed",
+            "claude-code is configured for you, in .mcp.json and CLAUDE.md",
+            "cursor and zed get their config printed for you to paste",
+            "travsr connect --print   shows what would change first",
         ],
-        commands: &["travsr connect"],
+        commands: &[
+            "travsr connect",
+        ],
     },
     Entry {
         question: "what is the graph, exactly?",
-        lead: "Nodes are things you write; edges are how they relate.",
+        lead: "Nodes are the things you write; edges are how they relate.",
+        detail: "Identity is a Kythe VName rather than a file offset, so a node survives reformatting, renaming and re-indexing, and two repos can share one identity space. That is what makes cross-repo questions possible at all, and why an answer stays pointing at the right thing while you edit around it.",
         steps: &[],
         points: &[
             "nodes       functions, classes, methods, files, imports",
-            "ref/call    this calls that, the edge most answers rely on",
+            "ref/call    this calls that, the edge most answers lean on",
             "defines     this file or class contains that symbol",
             "depends     this file imports that module",
-            "identity is a Kythe VName, stable across re-indexes and repos",
         ],
-        commands: &["travsr graph <symbol> --direction both"],
+        commands: &[
+            "travsr graph <symbol> --direction both",
+        ],
     },
     Entry {
         question: "how does MCP work?",
-        lead: "MCP is the only way in from outside travsr.",
+        lead: "MCP is the only way into travsr from outside.",
+        detail: "The envelope is the part worth knowing about: repo content arrives labelled as data, so a comment in your source that happens to read like an instruction is not treated as one. There is no REST or GraphQL surface either, which keeps the thing you have to trust down to a single local pipe.",
         steps: &[],
         points: &[
-            "your agent starts `travsr mcp --stdio` and speaks JSON-RPC to it",
+            "your agent launches `travsr mcp --stdio` as a child process",
+            "the two speak JSON-RPC over that process's stdin and stdout",
             "travsr advertises its tools; the agent calls them by name",
             "every response is wrapped in a <travsr-data> envelope",
-            "so repo content reaches the model as data, not instructions",
-            "no REST and no GraphQL, so there is one surface to secure",
         ],
-        commands: &[],
+        commands: &[
+            "travsr mcp --stdio",
+        ],
     },
     Entry {
         question: "how do I connect MCP to my agent?",
-        lead: "One command detects your tools and writes their config.",
+        lead: "One command detects your tools and configures what it can.",
+        detail: "connect records the absolute path of the binary it was run from, so an agent started days later launches the same travsr you tested with. Run it again after moving or upgrading the binary, and remember the agent only reads its config at startup.",
         steps: &[
-            (
-                "see what would change, without writing anything",
-                "travsr connect --print",
-            ),
-            ("write the config for every detected tool", "travsr connect"),
+            ("see what would change, without writing anything", "travsr connect --print"),
+            ("write the config for every tool it can", "travsr connect"),
             ("restart the agent so it re-reads its config", ""),
         ],
         points: &[
-            "recognised today: claude-code, cursor, zed",
-            "one tool only        travsr connect --tool cursor",
-            "undo it later        travsr connect --remove",
+            "recognised today   claude-code, cursor, zed",
+            "claude-code is written for you; the others print config to paste",
+            "one tool only      travsr connect --tool cursor",
+            "undo it later      travsr connect --remove",
         ],
         commands: &[],
     },
     Entry {
         question: "what tools does the MCP server expose?",
-        lead: "Twenty-six, covering structure, search and diagnostics.",
+        lead: "Twenty-six, grouped by the kind of question they answer.",
+        detail: "Your agent lists them itself once connected, so there is nothing to memorise. The grouping matters more than the names: structure tools traverse edges and are exact, search tools rank and can miss, and context tools exist to hand the model real source text with its surroundings attached.",
         steps: &[],
         points: &[
             "structure   get_callers, get_dependencies, get_blast_radius",
             "search      search_symbol, find_references, find_pattern",
             "context     get_context, get_snippets, get_execution_path",
-            "overview    get_repo_map, get_graph_stats, get_graph_json",
-            "your agent lists them itself once connected",
+            "overview    get_repo_map, get_graph_stats, get_lang_status",
         ],
         commands: &[],
     },
     Entry {
         question: "how does the VS Code extension work?",
-        lead: "It runs the same daemon and renders the graph in the editor.",
+        lead: "It drives the same binary and draws the graph in the editor.",
+        detail: "The extension is a client, not a second implementation: it runs the same travsr the CLI does, so what it draws and what `travsr graph` prints cannot disagree. If travsr is not installed yet it offers to download it for you.",
         steps: &[],
         points: &[
             "a Travsr Graph view, plus a Repo Files tree",
-            "callers and blast radius for the symbol under your cursor",
-            "LSP diagnostics overlaid onto the graph",
-            "it drives the same binary, so the graph matches the CLI's",
+            "callers, dependencies and blast radius for the current symbol",
+            "LSP diagnostics overlaid onto the graph nodes",
+            "Check Blast Radius Before Edit, and Copy Graph Context for Chat",
         ],
         commands: &[],
     },
     Entry {
         question: "what can I ask about my code?",
         lead: "Structural questions, anchored to a symbol name.",
+        detail: "ask is graph-grounded, so it answers from edges rather than from wording. Give it a name it can anchor on and it traverses; give it a purely conceptual question with no symbol in it and it may abstain rather than guess.",
         steps: &[],
         points: &[
             "what calls it, what it depends on, where it is used",
-            "naming a symbol gives the best results",
+            "what breaks if I change it, and what path leads to it",
+            "naming a real symbol gives by far the best results",
+            "a bare symbol name is a valid query on its own",
         ],
-        commands: &["travsr ask --examples"],
+        commands: &[
+            "travsr ask --examples",
+        ],
     },
     Entry {
         question: "why did it say it found nothing?",
-        lead: "It abstains rather than returning a low-confidence guess.",
+        lead: "It abstains rather than return a low-confidence guess.",
+        detail: "A confident wrong answer costs more than an empty one, especially when an agent is about to act on it. When it abstains it prints what to try instead, and explain, given the query and a symbol you expected it to return, shows which terms matched and which threshold it fell short of.",
         steps: &[],
         points: &[
-            "an answer you cannot trust is worse than none",
             "conceptual questions naming no symbol are a known gap",
-            "the abstention suggests what to try instead",
+            "a misspelled symbol will not fuzzy-match its way to an answer",
+            "the abstention suggests a narrower command to run",
+            "semantic search widens it, if you indexed with --semantic",
         ],
-        commands: &[],
+        commands: &[
+            "travsr explain \"<your query>\" <symbol>",
+        ],
     },
     Entry {
         question: "where is the data, and how do I remove it?",
-        lead: "Two places, both safe to delete.",
+        lead: "Two directories, both safe to delete.",
+        detail: "There is no uninstall step to run first and nothing outside these two paths. Remove them and travsr is gone; run init again and the graph comes back from your source, because everything in it was derived from your source to begin with.",
         steps: &[],
         points: &[
-            ".travsr/    per-repo graph, inside the repo",
-            "~/.travsr   shared binaries and models",
-            "the graph is derived from your source and rebuilds",
+            ".travsr/    the per-repo graph, inside the repo",
+            "~/.travsr   shared binaries, models and the repo registry",
+            "deleting either loses nothing that cannot be rebuilt",
+            "the .travsr directory only affects the checkout it sits in",
         ],
-        commands: &["travsr init"],
+        commands: &[
+            "rm -rf .travsr",
+            "travsr init --semantic",
+        ],
     },
 ];
 
@@ -344,6 +395,12 @@ pub(crate) fn print_entry(e: &Entry, pal: Palette) {
     for line in wrap(e.lead, 74) {
         println!("  {line}");
     }
+    // The lead is a sentence and the points are a list; run together they read
+    // as one block and the lead stops being the summary it is meant to be.
+    // Steps open with their own blank line, so adding one here would double it.
+    if e.steps.is_empty() && !e.points.is_empty() {
+        println!();
+    }
     for (i, (what, cmd)) in e.steps.iter().enumerate() {
         println!();
         println!("    {} {what}", pal.dim(&format!("{}.", i + 1)));
@@ -370,6 +427,12 @@ pub(crate) fn print_entry(e: &Entry, pal: Palette) {
         }
         for rest in lines {
             println!("      {rest}");
+        }
+    }
+    if !e.detail.is_empty() {
+        println!();
+        for line in wrap(e.detail, 74) {
+            println!("  {line}");
         }
     }
     if !e.commands.is_empty() {
@@ -437,6 +500,22 @@ mod tests {
                 "`{}` has a {}-char lead; that is a paragraph, not a lead",
                 e.question,
                 e.lead.chars().count()
+            );
+        }
+    }
+
+    /// Points state facts; on their own they read as a list of assertions with
+    /// nothing joining them. Every answer owes the reader the reasoning behind
+    /// them, so the prose is required rather than optional, and long enough to
+    /// be an explanation rather than one more restated point.
+    #[test]
+    fn every_entry_explains_itself() {
+        for e in ENTRIES {
+            let n = e.detail.chars().count();
+            assert!(
+                n >= 140,
+                "`{}` has a {n}-char detail; that is another point, not an explanation",
+                e.question
             );
         }
     }
@@ -557,30 +636,62 @@ mod tests {
         }
     }
 
+    /// Every printed command must parse as a real invocation, arguments and all.
+    ///
+    /// This used to check only the subcommand name, which is not enough: a name
+    /// can exist while the line is still unrunnable. `travsr explain "<query>"`
+    /// passed that check and failed for a reader, because `explain` takes a
+    /// query *and* a symbol. Handing someone a command that exits 2 is the same
+    /// dead end as naming a subcommand that does not exist (#727), so the whole
+    /// line goes through clap.
     #[test]
     fn every_command_is_runnable() {
         use clap::CommandFactory as _;
-        let cmd = crate::Cli::command();
-        let known: Vec<String> = cmd
-            .get_subcommands()
-            .flat_map(|c| {
-                std::iter::once(c.get_name().to_string())
-                    .chain(c.get_all_aliases().map(str::to_string))
-            })
-            .collect();
+
+        let check = |c: &str, where_: &str| {
+            // Only travsr invocations are parseable here; the installer
+            // pipeline, the cargo build and `rm` are not.
+            if !c.starts_with("travsr ") {
+                return;
+            }
+            // Split the way a shell would: a quoted placeholder such as
+            // `"<a symbol in your code>"` is one argument, and splitting it on
+            // whitespace would report a false failure.
+            let mut argv: Vec<String> = Vec::new();
+            let mut cur = String::new();
+            let mut quoted = false;
+            for ch in c.chars() {
+                match ch {
+                    '"' => quoted = !quoted,
+                    c if c.is_whitespace() && !quoted => {
+                        if !cur.is_empty() {
+                            argv.push(std::mem::take(&mut cur));
+                        }
+                    }
+                    c => cur.push(c),
+                }
+            }
+            if !cur.is_empty() {
+                argv.push(cur);
+            }
+            if let Err(e) = crate::Cli::command().try_get_matches_from(argv) {
+                // `--version` and `--help` "fail" by printing and exiting, which
+                // is exactly what a reader running them wants.
+                use clap::error::ErrorKind::{DisplayHelp, DisplayVersion};
+                assert!(
+                    matches!(e.kind(), DisplayHelp | DisplayVersion),
+                    "`{c}` in {where_} does not parse: {}",
+                    e.render().to_string().lines().next().unwrap_or_default()
+                );
+            }
+        };
 
         for e in ENTRIES {
             for c in e.commands {
-                // Only travsr subcommands are checkable here; the installer
-                // pipeline and the cargo build are not travsr invocations.
-                if !c.starts_with("travsr ") {
-                    continue;
-                }
-                let sub = c.split_whitespace().nth(1).unwrap_or("");
-                assert!(
-                    known.iter().any(|k| k == sub),
-                    "`{c}` names unknown subcommand {sub:?}"
-                );
+                check(c, e.question);
+            }
+            for (_, c) in e.steps {
+                check(c, e.question);
             }
         }
     }
@@ -588,10 +699,12 @@ mod tests {
     #[test]
     fn wrapping_preserves_every_word() {
         for e in ENTRIES {
-            let joined = wrap(e.lead, 76).join(" ");
-            let before: Vec<&str> = e.lead.split_whitespace().collect();
-            let after: Vec<&str> = joined.split_whitespace().collect();
-            assert_eq!(before, after, "wrapping altered `{}`", e.question);
+            for text in [e.lead, e.detail] {
+                let joined = wrap(text, 76).join(" ");
+                let before: Vec<&str> = text.split_whitespace().collect();
+                let after: Vec<&str> = joined.split_whitespace().collect();
+                assert_eq!(before, after, "wrapping altered `{}`", e.question);
+            }
         }
         // A word longer than the width must survive rather than being split.
         assert_eq!(
@@ -603,7 +716,7 @@ mod tests {
     #[test]
     fn no_line_exceeds_the_wrap_width() {
         for e in ENTRIES {
-            for line in wrap(e.lead, 76) {
+            for line in wrap(e.lead, 76).into_iter().chain(wrap(e.detail, 76)) {
                 let n = line.chars().count();
                 // Only a single over-long word may exceed it.
                 assert!(
