@@ -261,7 +261,9 @@ const ENTRIES: &[Entry] = &[
             "what calls it, what it depends on, where it is used",
             "what breaks if I change it, and what path leads to it",
             "naming a real symbol gives by far the best results",
-            "a bare symbol name is a valid query on its own",
+            "references   every use site, as path:line",
+            "graph        callers and dependencies as a tree",
+            "pattern      grep, but only inside the relevant files",
         ],
         commands: &[
             "travsr ask --examples",
@@ -296,6 +298,117 @@ const ENTRIES: &[Entry] = &[
         commands: &[
             "rm -rf .travsr",
             "travsr init --semantic",
+        ],
+    },
+    Entry {
+        question: "how do I see the logs?",
+        lead: "The daemon writes a log per repo, and one command reads it.",
+        detail: "It reads the file rather than asking the daemon, so it still works after a crash, which is when you need it. One caveat worth knowing before you need it: the log is written at info, so --level debug cannot show you debug lines that were never recorded. Start the daemon with --verbose when you want them.",
+        steps: &[],
+        points: &[
+            "last 50 lines by default; --lines 0 prints all retained history",
+            "-f follows new lines, across the daily rotation",
+            "--level warn, --since 10m and --repo narrow it down",
+            "--json prints the stored lines verbatim, for jq or a collector",
+        ],
+        commands: &[
+            "travsr daemon logs",
+            "travsr daemon logs -f --level warn",
+        ],
+    },
+    Entry {
+        question: "how do I tell if something is broken?",
+        lead: "Three commands, in the order worth trying them.",
+        detail: "status answers the usual question, which is whether the graph is current. fsck is for the rarer one, where the database itself is inconsistent, and it only reports until you pass --fix. explain is for when a query returned nothing you expected: it shows the terms that matched and the threshold that stopped it.",
+        steps: &[
+            ("check the index first", "travsr status"),
+            ("then what the daemon did", "travsr daemon logs --level warn"),
+            ("then the graph itself", "travsr fsck"),
+        ],
+        points: &[
+            "status   is the index current, and did Phase B finish",
+            "logs     what the daemon has been doing, including after a crash",
+            "fsck     ghost nodes and orphan edges; reports until --fix",
+            "explain  why one query ranked or skipped a symbol",
+        ],
+        commands: &[],
+    },
+    Entry {
+        question: "how do I use it across several repos?",
+        lead: "Index each one, then serve them together.",
+        detail: "Node identity is a VName rather than a path, so the same symbol keeps one identity across repositories and a query does not stop at the repo boundary. Every repo you init registers itself, which is what --global reads.",
+        steps: &[],
+        points: &[
+            "travsr init   inside each repo registers it globally",
+            "repos         lists everything registered",
+            "mcp --global  serves all of them from one server",
+            "the registry lives in ~/.travsr/registry.json",
+        ],
+        commands: &[
+            "travsr repos",
+            "travsr mcp --stdio --global",
+        ],
+    },
+    Entry {
+        question: "how do I make search find more?",
+        lead: "Semantic search, a reranker, and synonyms for your own vocabulary.",
+        detail: "These are the reasons a query can come back thin. Embeddings let a question match code that shares no words with it, the reranker reorders what came back by relevance, and synonyms teach it that your team says auth where the code says authenticate. All three are local, and all three are optional.",
+        steps: &[],
+        points: &[
+            "embed status   is semantic search on for this repo",
+            "embed init     downloads a local model and turns it on",
+            "rerank install downloads the cross-encoder that reorders results",
+            "synonym add    teaches it your own terms, up to 200 pairs",
+        ],
+        commands: &[
+            "travsr embed status",
+            "travsr synonym list",
+        ],
+    },
+    Entry {
+        question: "can I run it for a team?",
+        lead: "Yes, over the SSE server, but it is a deliberate step.",
+        detail: "serve binds to loopback by default and speaks plaintext HTTP with bearer tokens, so putting it on a network is something you opt into rather than something that happens by accident. Bind beyond this machine only with a TLS terminator in front of it.",
+        steps: &[],
+        points: &[
+            "stdio is the local transport; SSE is the shared one",
+            "defaults to 127.0.0.1:3000",
+            "--host 0.0.0.0 needs TLS terminating in front of it",
+            "--tenants-dir is required; it keeps tenants' data separate",
+        ],
+        commands: &[
+            "travsr serve --tenants-dir <dir>",
+        ],
+    },
+    Entry {
+        question: "can I use it in CI?",
+        lead: "Yes. Index synchronously, and read the output as JSON.",
+        detail: "The thing to get right in CI is ordering: init backgrounds the expensive pass by default, so a job that queries call edges immediately after it can race the work. --semantic makes init wait, which is what it is for.",
+        steps: &[],
+        points: &[
+            "init --semantic finishes call edges before it returns",
+            "--json on init, status and ask gives machine-readable output",
+            "travsr index emits a graph JSON without touching a repo's .travsr",
+            "no daemon is needed; queries read the database directly",
+        ],
+        commands: &[
+            "travsr init --semantic --json",
+            "travsr index <dir> --output graph.json",
+        ],
+    },
+    Entry {
+        question: "how do I update travsr?",
+        lead: "Re-run whichever way you installed it.",
+        detail: "There is no self-update command, deliberately: a tool that rewrites its own binary is a tool you have to trust more than this one asks you to. Re-running the installer replaces the binary in place and leaves your indexes alone, since the graph is per repo and rebuilds from source anyway.",
+        steps: &[],
+        points: &[
+            "curl -fsSL https://travsr.com/install.sh | sh   replaces it in place",
+            "npm install -g @travsr.com/travsr@latest",
+            "travsr --version   confirms what you are now running",
+            "re-run travsr connect afterwards if the path changed",
+        ],
+        commands: &[
+            "travsr --version",
         ],
     },
 ];
@@ -516,6 +629,62 @@ mod tests {
                 n >= 140,
                 "`{}` has a {n}-char detail; that is another point, not an explanation",
                 e.question
+            );
+        }
+    }
+
+    /// Every command a reader can type must be named by some answer.
+    ///
+    /// The catalogue is the first place someone looks, so a command that appears
+    /// in no answer is one they will only find by reading `--help` line by line.
+    /// `daemon logs` was exactly that until this test was written: a full
+    /// logging surface, with filters and follow, mentioned nowhere.
+    ///
+    /// This checks that the name appears, not that it is well explained, which
+    /// no test can check. Its job is to fail when a *new* command is added and
+    /// the catalogue is not updated to mention it.
+    #[test]
+    fn every_command_is_mentioned_somewhere() {
+        use clap::CommandFactory as _;
+        let cli = crate::Cli::command();
+
+        let mut corpus = String::new();
+        for e in ENTRIES {
+            corpus.push_str(e.question);
+            corpus.push(' ');
+            corpus.push_str(e.lead);
+            corpus.push(' ');
+            corpus.push_str(e.detail);
+            corpus.push(' ');
+            for p in e.points {
+                corpus.push_str(p);
+                corpus.push(' ');
+            }
+            for (w, c) in e.steps {
+                corpus.push_str(w);
+                corpus.push(' ');
+                corpus.push_str(c);
+                corpus.push(' ');
+            }
+            for c in e.commands {
+                corpus.push_str(c);
+                corpus.push(' ');
+            }
+        }
+
+        for sub in cli.get_subcommands() {
+            // `help` is clap's own, and `hook-run` is hidden because the git hook
+            // runs it rather than a person. Neither is a reader's to type.
+            if sub.get_name() == "help" || sub.is_hide_set() {
+                continue;
+            }
+            let name = sub.get_name();
+            let mentioned = corpus
+                .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                .any(|w| w == name);
+            assert!(
+                mentioned,
+                "`travsr {name}` is a command a reader can type, and no answer mentions it"
             );
         }
     }
