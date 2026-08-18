@@ -54,7 +54,8 @@ pub fn toolchain_access(language: &str) -> ToolchainAccess {
     match language {
         "go" => go_access(),
         "dart" => dart_access(),
-        "java" | "kotlin" => java_access(),
+        "java" => java_access(),
+        "kotlin" => kotlin_access(),
         "scala" => scala_access(),
         "php" => php_access(),
         "csharp" => csharp_access(),
@@ -264,7 +265,9 @@ fn tool_bin_dir(tool: &str) -> Option<PathBuf> {
 ///   - `~/.m2`           (read) — Maven local repository
 ///   - `HOME` + `GRADLE_USER_HOME` env vars so Gradle finds its home
 ///
-/// Shared by `"java"` and `"kotlin"` — both invoke `scip-java index`.
+/// Also the base grant set for `kotlin_access`: kotlin-language-server drives
+/// the same Gradle/Maven classpath resolution under the hood, even though it
+/// isn't scip-java itself (see `kotlin_access` for what it additionally needs).
 fn java_access() -> ToolchainAccess {
     let mut read_paths = Vec::new();
     let mut write_paths = Vec::new();
@@ -318,6 +321,28 @@ fn java_access() -> ToolchainAccess {
         exec_paths,
         env,
     }
+}
+
+/// kotlin-language-server (KLS) needs everything `java_access` grants
+/// (JAVA_HOME, `~/.gradle`, `~/.m2`) plus read+execute on its OWN installation
+/// dir. Unlike scip-java, whose runnable file sits directly in `~/.travsr/bin`
+/// (already execute-granted for every language, see `sandbox/windows.rs`),
+/// `travsr lang install kotlin` extracts the server into `~/.travsr/kls/` (see
+/// `ZipBinarySpec::extract_dir`) and the `~/.travsr/bin/kotlin-language-server`
+/// wrapper launches the real binary/`.bat` INSIDE that dir. Neither blanket
+/// grant covers `~/.travsr/kls`, so a sandboxed run used to fail silently at
+/// image load: the wrapper spawned (it lives in the granted `~/.travsr/bin`),
+/// but the launcher it execs, and the jars under `server/lib` it reads, were
+/// both unreachable — 0 nodes, 0 edges, no error surfaced.
+fn kotlin_access() -> ToolchainAccess {
+    let mut access = java_access();
+    if let Some(h) = home() {
+        let kls = h.join(".travsr").join("kls");
+        tracing::debug!(path = %kls.display(), exists = kls.exists(), "kotlin_access: KLS install dir grant (read+execute)");
+        access.read_paths.push(kls.clone());
+        access.exec_paths.push(kls);
+    }
+    access
 }
 
 /// `scip-scala` drives sbt to resolve dependencies. Needs:
