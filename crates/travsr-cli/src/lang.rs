@@ -190,6 +190,15 @@ fn unavailable_status(entry: &PhaseBEntry, target: &str) -> String {
 
 // ── list ──────────────────────────────────────────────────────────────────────
 
+/// Whether a bundled analyzer's hidden interpreter is present. travsr-lsif-ts
+/// and travsr-lsif-py ship as JS files run through `node` — "bundled" only
+/// means the emitter file itself needs no separate install, not that Node.js
+/// is guaranteed to exist on the machine. True when the entry declares no such
+/// hidden driver (nothing to check).
+fn bundled_analyzer_ready(entry: &PhaseBEntry) -> bool {
+    entry.runtime_driver.map_or(true, tool_available)
+}
+
 /// Whether full cross-file semantic can actually run for `entry` on this machine:
 /// the analyzer is present (bundled, or its external binary resolves) AND the
 /// language is enabled (built in, or registered for indexing). One rule for every
@@ -198,7 +207,7 @@ fn unavailable_status(entry: &PhaseBEntry, target: &str) -> String {
 fn analyzer_ready(entry: &PhaseBEntry, registered: bool) -> bool {
     let enabled = entry.builtin || registered;
     let present = if entry.analyzer_bundled() {
-        true
+        bundled_analyzer_ready(entry)
     } else {
         entry.provider_binary.map_or(true, tool_available) && analyzer_command_present(entry)
     };
@@ -214,9 +223,10 @@ fn analyzer_ready(entry: &PhaseBEntry, registered: bool) -> bool {
 /// analyzer-presence decision routes through here so `lang list`, `lang detect`,
 /// `lang status`, `lang install`, and the index-time resolver never disagree.
 fn analyzer_command_present(entry: &PhaseBEntry) -> bool {
-    tool_available(entry.command)
+    let command_present = tool_available(entry.command)
         || (entry.command == "rust-analyzer"
-            && travsr_indexer::ra_runner::resolve_ra_binary().is_some())
+            && travsr_indexer::ra_runner::resolve_ra_binary().is_some());
+    command_present && entry.runtime_driver.map_or(true, tool_available)
 }
 
 /// The capability-view status for one language, shared by `lang list` (text and
@@ -416,7 +426,8 @@ fn cmd_list(json: bool) -> Result<()> {
             let tool_on_path = analyzer_command_present(entry);
             // Honest: the analyzer is installed when it is bundled (python) or its
             // external binary resolves — never just because a language is built in.
-            let installed = entry.analyzer_bundled() || (provider_on_path && tool_on_path);
+            let installed = (entry.analyzer_bundled() && bundled_analyzer_ready(entry))
+                || (provider_on_path && tool_on_path);
             let needs_approval =
                 matches!(entry.sandbox, SandboxRequirement::RequiresElevated) && !approved;
             let package = entry.npm_package.unwrap_or(entry.command);
@@ -447,7 +458,7 @@ fn cmd_list(json: bool) -> Result<()> {
                 analyzer_ready(entry, registered),
             );
             entries.push(format!(
-                r#"{{"language":{},"package":{},"sandbox":{},"status":{},"statusLine":{},"repoState":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{}}}"#,
+                r#"{{"language":{},"package":{},"sandbox":{},"status":{},"statusLine":{},"repoState":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"prerequisites":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{}}}"#,
                 json_str(entry.language),
                 json_str(package),
                 json_str(sandbox),
@@ -461,6 +472,7 @@ fn cmd_list(json: bool) -> Result<()> {
                 json_str(scip_type),
                 json_str(entry.install_hint),
                 json_str(entry.underlying_tool_hint),
+                json_str(entry.prerequisites),
                 json_arr(entry.elevated_hosts),
                 unavailable_on.is_none(),
                 unavailable_on.map_or("null".to_string(), json_str),
@@ -474,8 +486,11 @@ fn cmd_list(json: bool) -> Result<()> {
     // this function and are shared with the JSON branch above.
     let mut any_not_enabled = false;
 
-    println!("{:<12} {:<13} STATUS", "LANGUAGE", "THIS REPO");
-    println!("{}", "-".repeat(60));
+    println!(
+        "{:<12} {:<13} {:<24} STATUS",
+        "LANGUAGE", "THIS REPO", "PREREQUISITES"
+    );
+    println!("{}", "-".repeat(84));
 
     for entry in CATALOG {
         let registered = config
@@ -515,9 +530,10 @@ fn cmd_list(json: bool) -> Result<()> {
         }
 
         println!(
-            "{:<12} {:<13} {}{}",
+            "{:<12} {:<13} {:<24} {}{}",
             entry.language,
             repo_state.cell(),
+            entry.prerequisites,
             status.line(),
             expiry
         );
@@ -644,7 +660,6 @@ fn cmd_install(
         // `tool_available` includes ~/.travsr/bin, matching how `lang list` reports
         // the same wrapper as present.
         Some(bin) if tool_available(bin) && !reinstall => {
-            println!("{bin} already installed.");
             // RFC-025 Point B: presence never re-checks the release the wrapper
             // was pinned to. Surface a below-floor WARN (offline) and a newer-
             // release advisory (best-effort) over the installed wrapper. Never
@@ -693,10 +708,6 @@ fn cmd_install(
                     }
                 }
 
-                if !crate::install::path_contains_travsr_bin() {
-                    println!("\n{}", crate::install::path_hint());
-                }
-
                 true
             }
         }
@@ -705,11 +716,15 @@ fn cmd_install(
     // Handle the underlying SCIP tool (scip-go, scip-python, etc.).
     // Builtins are bundled in the travsr binary — no external tool needed.
     let mut tool_ready = if entry.builtin && entry.analyzer_bundled() {
-        // The analyzer ships inside the travsr binary (python/ts/js) — nothing to
-        // install. A builtin whose analyzer is external (rust → rust-analyzer) is
-        // NOT bundled, so it falls through to the install path below instead of
-        // short-circuiting to a false "active" without ever fetching the analyzer.
-        true
+        // The analyzer file ships inside the travsr binary (python/ts/js) —
+        // nothing to install. But "bundled" is about the file, not its
+        // interpreter: ts/js/python all run through `node`, which still has to
+        // actually be on the machine, or this would claim "active" for an
+        // emitter that will fail to spawn. A builtin whose analyzer is external
+        // (rust → rust-analyzer) is NOT bundled, so it falls through to the
+        // install path below instead of short-circuiting to a false "active"
+        // without ever fetching the analyzer.
+        bundled_analyzer_ready(entry)
     } else if wrapper_installed && (reinstall || !analyzer_command_present(entry)) {
         // UX-4: `--reinstall` must re-run the underlying SCIP tool install even when
         // it is already on PATH, not just the wrapper. Otherwise a user following the
@@ -769,6 +784,14 @@ fn cmd_install(
     };
     let full_ready = provider_ready && tool_ready;
 
+    // One PATH hint per `lang install` run, not one per downloaded binary — the
+    // wrapper and the underlying analyzer used to each print the identical
+    // "add ~/.travsr/bin to your PATH" block back to back when both were fresh
+    // downloads, telling the user the same thing twice in a row.
+    if !crate::install::path_contains_travsr_bin() {
+        println!("\n{}", crate::install::path_hint());
+    }
+
     // Only claim "enabled" when full analysis will actually run here. If the
     // analyzer is still missing, the WrapperOnly branch below states the honest
     // "set up, but analyzer not installed" instead — saying "Semantic analysis
@@ -780,6 +803,33 @@ fn cmd_install(
     }
 
     if !full_ready {
+        // The most common "not ready" cause across every platform (go/npm/dotnet
+        // missing) collapses to one line instead of stacking the generic
+        // "analyzer not installed yet" paragraph on top of it — the driver is the
+        // whole story here, there is nothing else to add.
+        if let ScipInstall::Command(cmd_args) = entry.scip_install {
+            if !tool_available(cmd_args[0]) {
+                println!(
+                    "'{}' is not installed on your machine. Install it, then run \
+                     `travsr lang install {language}` again.",
+                    cmd_args[0]
+                );
+                return Ok(InstallStatus::WrapperOnly);
+            }
+        }
+        // Same one-line treatment for a driver hidden inside a generated
+        // launcher (scip-java / kotlin-language-server both need a JVM on
+        // PATH to run at all, on every platform) — the analyzer file being
+        // present is not the whole story, so don't claim it's "active".
+        if let Some(driver) = entry.runtime_driver {
+            if !tool_available(driver) {
+                println!(
+                    "'{driver}' is not installed on your machine. Install it, then run \
+                     `travsr lang install {language}` again."
+                );
+                return Ok(InstallStatus::WrapperOnly);
+            }
+        }
         println!(
             "'{language}' isn't fully set up yet: its analyzer '{}' is not installed.\n\
              Full cross-file analysis stays off until it is; basic analysis still runs.\n\
@@ -815,19 +865,14 @@ fn run_pkg_command(
     // Check the install driver (e.g. `go`, `dotnet`, `npm`) is present BEFORE
     // offering to run it. Prompting "Run it now? [Y/n]" for `go install ...` when
     // `go` itself is not installed is a dead-end interaction: the answer cannot
-    // matter, and reaching the failure only after a "yes" reads as a bug. Say so
-    // up front and let the caller fall through to the honest "analyzer not
-    // installed yet" summary. (The spawn below keeps an ErrorKind::NotFound arm as
-    // a fallback for a driver that resolves here but fails to spawn, e.g. one found
-    // only in an extra dir that is not on the child process's PATH.)
+    // matter, and reaching the failure only after a "yes" reads as a bug. Stay
+    // quiet here and let the caller (`install`'s `!full_ready` branch) print the
+    // one-line "driver itself is missing" message — it already has to special-
+    // case this to avoid stacking a redundant "analyzer not installed yet"
+    // paragraph on top. (The spawn below keeps an ErrorKind::NotFound arm as a
+    // fallback for a driver that resolves here but fails to spawn, e.g. one
+    // found only in an extra dir that is not on the child process's PATH.)
     if !tool_available(cmd_args[0]) {
-        println!(
-            "'{}' is not installed, so '{}' can't be set up automatically.\n\
-             Install it, then re-run:\n\t{}",
-            cmd_args[0],
-            entry.command,
-            cmd_args.join(" ")
-        );
         return Ok(CmdOutcome::Ran { success: false });
     }
 
@@ -945,9 +990,7 @@ fn install_scip_tool(
                 // `rustup which`, the cross-platform resolver for a toolchain
                 // component. Non-memoized on purpose: ra_binary_path() may have
                 // cached a pre-install `None` earlier in this process.
-                let ra_installed = entry.command == "rust-analyzer"
-                    && travsr_indexer::ra_runner::resolve_ra_binary().is_some();
-                if tool_available(entry.command) || ra_installed {
+                if analyzer_command_present(entry) {
                     return Ok(true);
                 }
                 // Driver present but the tool is still missing (declined or the
@@ -966,15 +1009,15 @@ fn install_scip_tool(
                 );
             }
             install_gz_github_binary(entry, spec, override_version)?;
-            return Ok(tool_available(entry.command));
+            return Ok(analyzer_command_present(entry));
         }
         ScipInstall::GithubBinary(ref spec) => {
             install_scip_github_binary(entry, spec, override_version)?;
-            return Ok(tool_available(entry.command));
+            return Ok(analyzer_command_present(entry));
         }
         ScipInstall::ZipBinary(ref spec) => {
             install_zip_binary(entry, spec, override_version)?;
-            return Ok(tool_available(entry.command));
+            return Ok(analyzer_command_present(entry));
         }
         ScipInstall::Manual => {
             if !entry.underlying_tool_hint.is_empty() {
@@ -1130,9 +1173,6 @@ fn install_scip_github_binary(
                     tracing::debug!(path = %cmd_path.display(), error = %e, "could not write scip-java .cmd launcher");
                 }
             }
-            if !crate::install::path_contains_travsr_bin() {
-                println!("\n{}", crate::install::path_hint());
-            }
         }
         Err(e) => {
             println!(
@@ -1227,9 +1267,6 @@ fn install_gz_github_binary(
                 if let Err(e) = std::fs::write(&vpath, format!("{tag}\n")) {
                     tracing::debug!(path = %vpath.display(), error = %e, "could not write version sidecar file");
                 }
-            }
-            if !crate::install::path_contains_travsr_bin() {
-                println!("\n{}", crate::install::path_hint());
             }
         }
         Err(e) => {
@@ -1335,9 +1372,6 @@ fn install_zip_binary(
     }
 
     println!("{} installed to {}", spec.install_name, wrapper.display());
-    if !crate::install::path_contains_travsr_bin() {
-        println!("\n{}", crate::install::path_hint());
-    }
 
     Ok(())
 }

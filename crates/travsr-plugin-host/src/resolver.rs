@@ -471,7 +471,17 @@ impl PluginResolver for CompositeResolver {
 /// when the daemon was launched with a stripped PATH (launchd, GUI launch, etc.).
 fn which_binary(name: &str) -> Option<String> {
     let host_path = std::env::var_os("PATH").unwrap_or_default();
-    let travsr_bin = dirs::home_dir().map(|h| h.join(".travsr").join("bin"));
+    // TRAVSR_BIN_DIR overrides ~/.travsr/bin — used in tests to isolate from a
+    // real developer machine's actually-installed providers. Plain HOME/
+    // USERPROFILE overrides do not work for this: on Windows, `dirs::home_dir()`
+    // resolves via the OS profile API (SHGetKnownFolderPath), not an env var
+    // read, so it stays pinned to the real profile regardless of what the
+    // process environment says.
+    let travsr_bin = if let Ok(p) = std::env::var("TRAVSR_BIN_DIR") {
+        Some(std::path::PathBuf::from(p))
+    } else {
+        dirs::home_dir().map(|h| h.join(".travsr").join("bin"))
+    };
 
     // Build the augmented search list: ~/.travsr/bin first, then host PATH.
     let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();

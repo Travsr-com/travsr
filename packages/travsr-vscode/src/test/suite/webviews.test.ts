@@ -33,6 +33,7 @@ const LANG: LangInfo = {
   scipInstallType: "GithubBinary",
   installHint: "travsr lang install rust",
   underlyingToolHint: "",
+  prerequisites: "Rust toolchain (cargo)",
   elevatedHosts: [],
 };
 const LOG: LogEntry[] = [
@@ -111,7 +112,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
       status: "active", statusLine: "active", repoState: "always_on",
       installed: true, registered: true, builtin: true, needsApproval: false,
       scipInstallType: "Command", installHint: "travsr lang install rust",
-      underlyingToolHint: "", elevatedHosts: [],
+      underlyingToolHint: "", prerequisites: "", elevatedHosts: [],
     },
     {
       language: "java", package: "scip-java", sandbox: "Elevated",
@@ -119,7 +120,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
       repoState: "not_enabled",
       installed: false, registered: false, builtin: false, needsApproval: true,
       scipInstallType: "GithubBinary", installHint: "travsr lang install java",
-      underlyingToolHint: "", elevatedHosts: ["repo1.maven.org"],
+      underlyingToolHint: "", prerequisites: "JDK, Maven or Gradle", elevatedHosts: ["repo1.maven.org"],
     },
     {
       language: "scala", package: "scip-scala", sandbox: "Elevated",
@@ -127,7 +128,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
       repoState: "not_enabled",
       installed: false, registered: false, builtin: false, needsApproval: false,
       scipInstallType: "Manual", installHint: "travsr lang install scala",
-      underlyingToolHint: "https://docs.scala-lang.org/scip", elevatedHosts: [],
+      underlyingToolHint: "https://docs.scala-lang.org/scip", prerequisites: "JDK, sbt", elevatedHosts: [],
     },
   ];
 
@@ -162,7 +163,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
       repoState: "always_on",
       installed: false, registered: false, builtin: false, needsApproval: false,
       scipInstallType: "Command", installHint: "travsr lang install rust",
-      underlyingToolHint: "", elevatedHosts: [],
+      underlyingToolHint: "", prerequisites: "", elevatedHosts: [],
     }];
     const html = buildLanguagesHtml(indexedWithRust, uninstalledRust);
     assert.ok(html.includes("installLang") && html.includes("Install"));
@@ -202,7 +203,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
       repoState: "needs_analyzer",
       installed: false, registered: true, builtin: true, needsApproval: false,
       scipInstallType: "Command", installHint: "travsr lang install rust",
-      underlyingToolHint: "", elevatedHosts: [],
+      underlyingToolHint: "", prerequisites: "", elevatedHosts: [],
     }];
     const html = buildLanguagesHtml([], rustNoAnalyzer);
     assert.ok(html.includes(">no analyzer<"), "shows 'no analyzer' for a builtin missing its analyzer");

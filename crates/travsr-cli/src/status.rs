@@ -239,6 +239,15 @@ pub fn run() -> anyhow::Result<()> {
                         eprintln!(
                             "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help — it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
                         );
+                        // Name the concrete thing to check rather than leaving
+                        // "a missing SDK or an unbuildable project" as the only
+                        // clue — the catalog already knows what this language's
+                        // analyzer needs from the project.
+                        if let Some(entry) = travsr_plugin_host::phase_b::catalog::lookup(lang) {
+                            if !entry.prerequisites.is_empty() && entry.prerequisites != "none" {
+                                eprintln!("  needs: {}", entry.prerequisites);
+                            }
+                        }
                         // #724 Finding 4: the most common cause of a zero-node
                         // Java run on macOS is scip-java's javac shim crashing
                         // under the stock bash 3.2. Surface the actionable fix.

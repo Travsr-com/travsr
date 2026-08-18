@@ -983,6 +983,9 @@ export interface LangInfo {
   scipInstallType: "GithubBinary" | "Command" | "Manual";
   installHint: string;
   underlyingToolHint: string;
+  /** What the user's project needs for full analysis (e.g. "JDK, Maven or Gradle").
+   *  Empty when the analyzer has no such external dependency. */
+  prerequisites: string;
   elevatedHosts: string[];
 }
 
@@ -1093,10 +1096,16 @@ export function buildLanguagesHtml(
       }[l.repoState];
       const repoBadge = `<span class="badge ${repoCls}" title="${esc(repoTip)}">${repoText}</span>`;
 
+      const prereqText =
+        l.prerequisites && l.prerequisites !== "none"
+          ? `<span style="color:var(--fg-subtle)">${esc(l.prerequisites)}</span>`
+          : `<span style="color:var(--fg-subtle)">—</span>`;
+
       return `<tr>
 <td><span class="mono">${esc(l.language)}</span></td>
 <td>${analysisBadges}</td>
 <td>${repoBadge}</td>
+<td>${prereqText}</td>
 <td>${actionCell}</td></tr>`;
     })
     .join("\n");
@@ -1123,8 +1132,8 @@ ${sub}
 </section>
 <section>
   <h3>Available tools</h3>
-  <table><thead><tr><th>Language</th><th>Semantic</th><th>This repo</th><th>Action</th></tr></thead>
-  <tbody>${availRows || '<tr><td colspan="4" class="empty">No language tools found. Is the travsr binary on PATH?</td></tr>'}</tbody></table>
+  <table><thead><tr><th>Language</th><th>Semantic</th><th>This repo</th><th>Prerequisites</th><th>Action</th></tr></thead>
+  <tbody>${availRows || '<tr><td colspan="5" class="empty">No language tools found. Is the travsr binary on PATH?</td></tr>'}</tbody></table>
 </section>`;
 
   const script = `

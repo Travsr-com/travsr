@@ -2164,7 +2164,7 @@ pub enum AnalysisMode {
 
 /// The one honest "not a language we handle" envelope, shared by every
 /// `get_lang_status` return path so the shape never drifts between them.
-const UNKNOWN_LANG_JSON: &str = r#"{"language":"unknown","status":"unknown","statusLine":"not a supported language","builtin":false,"semantic_available":false,"install_hint":""}"#;
+const UNKNOWN_LANG_JSON: &str = r#"{"language":"unknown","status":"unknown","statusLine":"not a supported language","builtin":false,"semantic_available":false,"install_hint":"","prerequisites":""}"#;
 
 /// Return the set of files transitively affected if the given file changes.
 ///
@@ -2640,13 +2640,14 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
     // stable machine tag; `statusLine` is the exact plain wording every other
     // surface shows, so the extension renders it verbatim instead of re-deriving.
     format!(
-        r#"{{"language":"{lang}","status":"{status_tag}","statusLine":"{status_line}","builtin":{builtin},"semantic_available":{sem},"install_hint":"{hint}","phase_b_commit":{pbc}}}"#,
+        r#"{{"language":"{lang}","status":"{status_tag}","statusLine":"{status_line}","builtin":{builtin},"semantic_available":{sem},"install_hint":"{hint}","prerequisites":"{prereq}","phase_b_commit":{pbc}}}"#,
         lang = meta.language,
         status_tag = status.tag(),
         status_line = status.line(),
         builtin = meta.builtin,
         sem = semantic_available,
         hint = install_hint,
+        prereq = meta.prerequisites,
         pbc = phase_b_commit,
     )
 }

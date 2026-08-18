@@ -246,13 +246,23 @@ fn run_phase_b_with_provider(
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     write_fake_provider(bin_dir.path(), &layout);
 
+    // `which_binary` checks ~/.travsr/bin before PATH — on the real machine
+    // running this test suite that dir can (and, on a dev box that has ever run
+    // `travsr lang install go`, does) already contain a real travsr-lang-go, which
+    // would win over this test's fake PATH-injected provider and silently test
+    // against the wrong binary. Point it at an empty dir so only `layout` is
+    // ever visible, matching a machine with nothing installed globally.
+    let empty_travsr_bin = tempfile::tempdir().expect("empty travsr bin tempdir");
+
     let old_path = std::env::var_os("PATH").unwrap_or_default();
     let mut paths: Vec<std::path::PathBuf> = vec![bin_dir.path().to_path_buf()];
     paths.extend(std::env::split_paths(&old_path));
     let new_path = std::env::join_paths(paths).expect("join PATH");
     let old_lang_toml = std::env::var_os("TRAVSR_LANG_TOML");
+    let old_travsr_bin_dir = std::env::var_os("TRAVSR_BIN_DIR");
     std::env::set_var("PATH", &new_path);
     std::env::set_var("TRAVSR_LANG_TOML", &lang_toml);
+    std::env::set_var("TRAVSR_BIN_DIR", empty_travsr_bin.path());
 
     let repo = tempfile::tempdir().expect("repo tempdir");
     std::fs::write(repo.path().join("main.go"), "package main\n").expect("write go file");
@@ -270,6 +280,10 @@ fn run_phase_b_with_provider(
     match old_lang_toml {
         Some(v) => std::env::set_var("TRAVSR_LANG_TOML", v),
         None => std::env::remove_var("TRAVSR_LANG_TOML"),
+    }
+    match old_travsr_bin_dir {
+        Some(v) => std::env::set_var("TRAVSR_BIN_DIR", v),
+        None => std::env::remove_var("TRAVSR_BIN_DIR"),
     }
 
     outcome

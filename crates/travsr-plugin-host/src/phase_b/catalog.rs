@@ -321,6 +321,23 @@ pub struct PhaseBEntry {
     /// ~/.travsr/share/<provider_binary>/. Used by languages whose sidecar
     /// spawns an external script rather than a compiled tool (e.g. dart).
     pub has_share_assets: bool,
+    /// An interpreter `command` needs to actually run but that presence checks
+    /// never see, because it's baked into a generated launcher rather than
+    /// spelled out in `scip_install` — e.g. scip-java and kotlin-language-server
+    /// both ship as a JAR wrapped in a `.cmd`/shell script that shells out to
+    /// `java`. Checking only `tool_available(command)` finds the launcher file
+    /// and reports "active" even when the JVM itself is missing, which then
+    /// runs and silently produces zero symbols. `None` when `command` has no
+    /// such hidden dependency.
+    pub runtime_driver: Option<&'static str>,
+    /// What the *user's project* needs — not travsr's own analyzer — for full
+    /// analysis to actually produce edges, shown to spare a user from
+    /// reverse-engineering it via a crash trace (see `travsr status`'s "could
+    /// not read or build this project's sources" warning, which names the
+    /// symptom but not the cause). Kept to a few words; empty for languages
+    /// with no such external dependency (their analyzer is fully self-
+    /// contained once installed).
+    pub prerequisites: &'static str,
 }
 
 impl PhaseBEntry {
@@ -358,6 +375,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: true,
         native_phase_b: true,
         has_share_assets: false,
+        runtime_driver: Some("node"),
+        prerequisites: "Node.js",
     },
     PhaseBEntry {
         language: "javascript",
@@ -376,6 +395,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: true,
         native_phase_b: true,
         has_share_assets: false,
+        runtime_driver: Some("node"),
+        prerequisites: "Node.js",
     },
     PhaseBEntry {
         language: "rust",
@@ -407,6 +428,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: true,
         native_phase_b: true,
         has_share_assets: false,
+        runtime_driver: None,
+        prerequisites: "Rust toolchain (cargo)",
     },
     PhaseBEntry {
         language: "go",
@@ -429,14 +452,17 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
+        runtime_driver: None,
+        prerequisites: "Go toolchain",
     },
     PhaseBEntry {
         language: "python",
         npm_package: None,
-        // travsr-lsif-py is bundled with the travsr binary (packages/travsr-lsif-py/).
-        // It is resolved via current_exe walk-up — no PATH install required.
-        // The `command` name is used by `travsr lang list` for display only; the
-        // actual invocation goes through run_lsif_py_emitter() in-process.
+        // travsr-lsif-py is bundled with the travsr binary (packages/travsr-lsif-py/),
+        // resolved via current_exe walk-up — no PATH install required for the
+        // emitter file itself. It is a Node.js/tree-sitter package (see its
+        // package.json), not a Python interpreter, so it still needs `node` on
+        // PATH to actually run — see `runtime_driver` below.
         command: "travsr-lsif-py",
         args: &["--root", "{root}"],
         output_format: OutputFormat::Lsif,
@@ -451,6 +477,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: true,
         native_phase_b: true,
         has_share_assets: false,
+        runtime_driver: Some("node"),
+        prerequisites: "Node.js",
     },
     PhaseBEntry {
         language: "java",
@@ -481,6 +509,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
+        runtime_driver: Some("java"),
+        prerequisites: "JDK, Maven or Gradle",
     },
     PhaseBEntry {
         language: "kotlin",
@@ -516,6 +546,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
+        runtime_driver: Some("java"),
+        prerequisites: "JDK, Maven or Gradle",
     },
     PhaseBEntry {
         language: "scala",
@@ -541,6 +573,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
+        runtime_driver: None,
+        prerequisites: "JDK, sbt",
     },
     PhaseBEntry {
         language: "ruby",
@@ -570,6 +604,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
+        runtime_driver: None,
+        prerequisites: "Ruby, Bundler",
     },
     PhaseBEntry {
         language: "php",
@@ -588,6 +624,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
+        runtime_driver: None,
+        prerequisites: "PHP, Composer",
     },
     PhaseBEntry {
         language: "csharp",
@@ -618,6 +656,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
+        runtime_driver: None,
+        prerequisites: ".NET SDK",
     },
     PhaseBEntry {
         language: "cpp",
@@ -648,6 +688,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
+        runtime_driver: None,
+        prerequisites: "compile_commands.json",
     },
     PhaseBEntry {
         language: "c",
@@ -678,6 +720,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
+        runtime_driver: None,
+        prerequisites: "compile_commands.json",
     },
     PhaseBEntry {
         language: "swift",
@@ -703,6 +747,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
+        runtime_driver: None,
+        prerequisites: "none",
     },
     PhaseBEntry {
         language: "objectivec",
@@ -728,6 +774,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
+        runtime_driver: None,
+        prerequisites: "Xcode CLT (libclang)",
     },
     PhaseBEntry {
         language: "dart",
@@ -760,6 +808,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
+        runtime_driver: None,
+        prerequisites: "pub get (resolved deps)",
     },
 ];
 
