@@ -625,6 +625,22 @@ pub fn print_commands() {
                 None => (*name).to_string(),
             };
             println!("  {:<18} {}", pal.ident(&label), first_sentence(sub));
+
+            // Half the surface is one level down: `daemon logs`, `embed status`,
+            // `lang install`. Listing only the parents hid it, which is how a
+            // logging surface with filters and follow went undocumented. Names
+            // only, since a description each would turn this into fifty lines
+            // and the footer already points at `--help` for the detail.
+            let nested: Vec<&str> = sub
+                .get_subcommands()
+                .filter(|c| c.get_name() != "help" && !c.is_hide_set())
+                .map(clap::Command::get_name)
+                .collect();
+            if !nested.is_empty() {
+                for line in wrap_list(&nested, 55) {
+                    println!("  {:<18} {}", "", pal.dim(&line));
+                }
+            }
         }
     }
 
@@ -637,6 +653,34 @@ pub fn print_commands() {
         "{}",
         pal.dim("`travsr ask --examples` for the questions ask can answer.")
     );
+}
+
+/// Wrap a comma-separated list of names to `width`, for the column it sits in.
+///
+/// `daemon` and `embed` carry eight subcommands each, which is wider than a
+/// terminal once indented, so the list has to fold rather than run off the edge.
+fn wrap_list(names: &[&str], width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for (i, n) in names.iter().enumerate() {
+        let last = i + 1 == names.len();
+        let piece = if last {
+            (*n).to_string()
+        } else {
+            format!("{n},")
+        };
+        if !cur.is_empty() && cur.chars().count() + 1 + piece.chars().count() > width {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(&piece);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 /// The first sentence of a command's help, short enough to sit in a column.
@@ -977,6 +1021,43 @@ mod command_group_tests {
                 cli.get_subcommands().any(|c| &c.get_name() == name),
                 "--cmds lists `{name}`, which is not a subcommand"
             );
+        }
+    }
+
+    /// Nested names sit in a column that starts 21 characters in, so the list
+    /// has to fold to stay inside an 80-column terminal. `daemon` and `embed`
+    /// carry eight each, which overflows a single line on its own.
+    #[test]
+    fn nested_command_lists_fit_the_terminal() {
+        use clap::CommandFactory as _;
+        let cli = crate::Cli::command();
+        for sub in cli.get_subcommands().filter(|c| !c.is_hide_set()) {
+            let nested: Vec<&str> = sub
+                .get_subcommands()
+                .filter(|c| c.get_name() != "help" && !c.is_hide_set())
+                .map(clap::Command::get_name)
+                .collect();
+            if nested.is_empty() {
+                continue;
+            }
+            for line in super::wrap_list(&nested, 55) {
+                let rendered = 2 + 18 + 1 + line.chars().count();
+                assert!(
+                    rendered <= 80,
+                    "`{}` renders a {rendered}-column line: {line}",
+                    sub.get_name()
+                );
+            }
+            // Folding must not lose one. The whole point of the line is that a
+            // reader can see `daemon logs` exists without running --help.
+            let joined = super::wrap_list(&nested, 55).join(" ");
+            for n in &nested {
+                assert!(
+                    joined.split([',', ' ']).any(|w| &w == n),
+                    "`{}` dropped `{n}` when folding",
+                    sub.get_name()
+                );
+            }
         }
     }
 
