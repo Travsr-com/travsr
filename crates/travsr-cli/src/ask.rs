@@ -153,6 +153,24 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     if !db_path.exists() {
         anyhow::bail!("not initialized — run `travsr init`");
     }
+
+    // A question about travsr, or about the repository as a whole, is not a
+    // question the graph can answer. `ask` seeds from the words in the query, so
+    // "what is this repo written in?" matches `var:REPO` and returns a screen of
+    // bench files with confident-looking scores. That is worse than abstaining:
+    // the answer exists, one command away, and the result looks like a real one.
+    //
+    // Caught before retrieval rather than after, because retrieval succeeds here.
+    // There is no low-confidence signal to hang an abstention on.
+    if let Some(redirect) = meta_question_redirect(query_str) {
+        println!("{}", redirect.answer);
+        if !redirect.command.is_empty() {
+            use std::io::IsTerminal as _;
+            let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
+            println!("  {} {}", pal.dim("$"), pal.ident(redirect.command));
+        }
+        return Ok(());
+    }
     // Before either path: `ask` ranks over call edges, so an incomplete Phase B
     // changes the answer, not just its completeness.
     daemon_client::warn_if_call_graph_degraded(&db_path);
@@ -516,6 +534,76 @@ pub fn print_examples(db_path: Option<&std::path::Path>) {
     }
 }
 
+/// A question `ask` cannot answer, and the command that can.
+pub(crate) struct MetaRedirect {
+    pub answer: &'static str,
+    pub command: &'static str,
+}
+
+/// Phrases that mean the question is about travsr or the repository as a whole,
+/// paired with what actually answers them.
+///
+/// Matched as whole phrases rather than keywords, deliberately. A bare "repo" or
+/// "language" appears in plenty of legitimate code questions, and hijacking those
+/// would be a worse failure than the one being fixed: a user asking about a
+/// symbol named `Language` must still get their search.
+const META_QUESTIONS: &[(&[&str], MetaRedirect)] = &[
+    (
+        &[
+            "what is this repo written in",
+            "what languages",
+            "what language is this",
+            "which languages",
+            "tech stack",
+            "what is this codebase written in",
+        ],
+        MetaRedirect {
+            answer: "That is a question about the repository rather than about a symbol in it.",
+            command: "travsr lang list",
+        },
+    ),
+    (
+        &[
+            "how big is",
+            "how many files",
+            "how many nodes",
+            "is the index",
+            "is my index",
+            "is the graph fresh",
+            "is it up to date",
+        ],
+        MetaRedirect {
+            answer: "That is a question about the index rather than about the code.",
+            command: "travsr status",
+        },
+    ),
+    (
+        &[
+            "what is travsr",
+            "how does travsr work",
+            "what does travsr do",
+            "how do i install",
+            "how to install",
+            "who made travsr",
+        ],
+        MetaRedirect {
+            answer: "That is a question about travsr itself.",
+            command: "travsr faq",
+        },
+    ),
+];
+
+/// Route a question about travsr or the repo away from graph retrieval.
+///
+/// Returns `None` for anything else, so an ordinary code question is untouched.
+pub(crate) fn meta_question_redirect(query: &str) -> Option<&'static MetaRedirect> {
+    let q = query.to_lowercase();
+    META_QUESTIONS
+        .iter()
+        .find(|(phrases, _)| phrases.iter().any(|p| q.contains(p)))
+        .map(|(_, r)| r)
+}
+
 /// Colour a rendered command so its shape reads at a glance.
 ///
 /// Three roles, because they answer three different questions for the reader:
@@ -596,6 +684,110 @@ fn example_symbols(db_path: Option<&std::path::Path>, want: usize) -> Vec<String
         }
     }
     out
+}
+
+#[cfg(test)]
+mod meta_question_tests {
+    use super::{meta_question_redirect, META_QUESTIONS};
+
+    /// The reported failure: `ask "what is this repo written in?"` matched the
+    /// word "repo" against `var:REPO` and returned a screen of bench files with
+    /// confident scores. Retrieval succeeds there, so there is no low-confidence
+    /// signal to abstain on; it has to be caught before the search runs.
+    #[test]
+    fn the_reported_question_is_redirected() {
+        let r = meta_question_redirect("what is this repo written in?")
+            .expect("must be recognised as a question about the repo");
+        assert_eq!(r.command, "travsr lang list");
+    }
+
+    #[test]
+    fn questions_about_travsr_itself_go_to_the_faq() {
+        for q in [
+            "what is travsr",
+            "how does travsr work",
+            "how do I install travsr",
+        ] {
+            let r = meta_question_redirect(q).unwrap_or_else(|| panic!("{q} not matched"));
+            assert_eq!(r.command, "travsr faq", "{q}");
+        }
+    }
+
+    #[test]
+    fn questions_about_the_index_go_to_status() {
+        for q in [
+            "how big is the graph",
+            "is my index ready",
+            "is it up to date",
+        ] {
+            let r = meta_question_redirect(q).unwrap_or_else(|| panic!("{q} not matched"));
+            assert_eq!(r.command, "travsr status", "{q}");
+        }
+    }
+
+    /// The failure mode that would be worse than the bug. A user searching for a
+    /// symbol whose name happens to contain "repo" or "language" must still get
+    /// their search: hijacking a real query is a silent wrong answer, where the
+    /// original problem was at least visibly noisy.
+    #[test]
+    fn real_code_questions_are_never_hijacked() {
+        for q in [
+            "repo_languages",
+            "language_distribution",
+            "where is Language defined",
+            "what calls repo_root",
+            "RepoStats",
+            "normalize_repo_root",
+            "how does the parser handle a repo path",
+        ] {
+            assert!(
+                meta_question_redirect(q).is_none(),
+                "`{q}` is a code question and must reach retrieval"
+            );
+        }
+    }
+
+    /// Whole phrases, not keywords. A single word like "repo" or "language" is
+    /// too common in real queries to route on, and this is what keeps the test
+    /// above passing rather than luck.
+    #[test]
+    fn every_trigger_is_a_phrase_not_a_bare_keyword() {
+        for (phrases, redirect) in META_QUESTIONS {
+            assert!(!phrases.is_empty());
+            for p in *phrases {
+                assert!(
+                    p.contains(' '),
+                    "`{p}` is a single word; routing on it would hijack code queries"
+                );
+                assert_eq!(p.to_lowercase(), *p, "`{p}` must be lowercase to match");
+            }
+            assert!(!redirect.answer.is_empty());
+            assert!(!redirect.command.is_empty());
+        }
+    }
+
+    /// Every redirect must name a command that exists, for the same reason the
+    /// other lists do: #727 was a documented command that did not.
+    #[test]
+    fn every_redirect_names_a_real_subcommand() {
+        use clap::CommandFactory as _;
+        let cmd = crate::Cli::command();
+        let known: Vec<String> = cmd
+            .get_subcommands()
+            .flat_map(|c| {
+                std::iter::once(c.get_name().to_string())
+                    .chain(c.get_all_aliases().map(str::to_string))
+            })
+            .collect();
+        for (_, r) in META_QUESTIONS {
+            let sub = r.command.split_whitespace().nth(1).unwrap_or("");
+            assert!(
+                known.iter().any(|k| k == sub),
+                "`{}` names unknown subcommand {sub:?}",
+                r.command
+            );
+        }
+    }
 }
 
 #[cfg(test)]
