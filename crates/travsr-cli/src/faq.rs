@@ -443,6 +443,21 @@ const ENTRIES: &[Entry] = &[
             "travsr --version",
         ],
     },
+    Entry {
+        question: "does travsr cost my agent tokens?",
+        lead: "Nothing of ours is loaded on every turn, by default.",
+        detail: "MCP itself is the cost you cannot avoid: the client sends the model every tool name, description and schema before the conversation starts, and that is what makes the tools callable at all. Travsr used to add a rules file on top, re-read on every turn. That is now opt-in, so a default connect leaves nothing behind that is re-sent. Answers like this one are static text printed by the CLI, so they cost nothing unless a person asks.",
+        steps: &[],
+        points: &[
+            "connect        writes MCP wiring only",
+            "connect --rules  adds the always-on nudge to prefer the graph",
+            "the nudge is worth it if agents reach for grep first",
+            "everything else here is printed on demand, never injected",
+        ],
+        commands: &[
+            "travsr connect --print",
+        ],
+    },
 ];
 
 /// The prefix that says "this is a question about travsr, not about my code".

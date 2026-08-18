@@ -55,6 +55,12 @@ pub struct ConnectOpts {
     pub remove: bool,
     /// Do NOT git-ignore the generated files (opt in to committing them).
     pub commit: bool,
+    /// Also write the always-on rules file that tells an agent to prefer the
+    /// graph over grep. Off by default: that file is re-sent on every turn of
+    /// every conversation, so it is the one part of travsr with a recurring
+    /// token cost, and it is not needed for the tools to work. MCP already
+    /// hands the model every tool name and description.
+    pub rules: bool,
     /// Where the report goes. Never affects what is written.
     pub report: Report,
 }
@@ -66,6 +72,7 @@ impl ConnectOpts {
             dry_run: false,
             remove: false,
             commit: false,
+            rules: false,
             report: Report::Stdout,
         }
     }
@@ -231,6 +238,17 @@ enum Content {
     JsonServer { top_key: &'static str, entry: Value },
     ManagedMd { body: String },
     Owned { text: String },
+}
+
+impl Content {
+    /// Whether this is guidance text rather than MCP wiring.
+    ///
+    /// The wiring is what makes the tools reachable; the guidance is prose an
+    /// agent re-reads every turn. They have different costs, so `connect` treats
+    /// them differently and this is the line between them.
+    fn is_guidance(&self) -> bool {
+        !matches!(self, Content::JsonServer { .. })
+    }
 }
 
 struct Planned {
@@ -1055,6 +1073,13 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         tracked(repo_root, &planned)
     };
 
+    // Guidance is opt-in, because it is the only part of travsr with a per-turn
+    // cost: an always-on rules file is re-read on every turn of every
+    // conversation, where the MCP wiring is read once at startup. Removal is not
+    // filtered, or `--remove` would strand a rules file written by an earlier
+    // run with `--rules`.
+    let wanted = |p: &Planned| opts.remove || opts.rules || !p.content.is_guidance();
+
     for tool in Tool::ALL {
         if let Some(only) = &opts.only {
             if tool.id() != only {
@@ -1065,7 +1090,16 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
             Detection::Auto => {
                 detected = true;
                 say!("{} ({verb}):", tool.id());
-                for planned in tool.plan(repo_root, &cmd) {
+                let full = tool.plan(repo_root, &cmd);
+                let kept: Vec<Planned> = full.into_iter().filter(&wanted).collect();
+                // Codex, Antigravity and Windsurf read their MCP config from a
+                // global file, so a rules file is the *only* thing travsr writes
+                // for them. Filtering it leaves nothing, and a tool heading with
+                // no lines under it reads as a failure rather than a choice.
+                if kept.is_empty() {
+                    say!("  nothing to write; rules are opt-in, pass --rules");
+                }
+                for planned in kept {
                     let disp = rel(repo_root, &planned.path)
                         .unwrap_or_else(|| planned.path.display().to_string());
 
@@ -1906,6 +1940,94 @@ mod tests {
             }
         }
         names
+    }
+
+    /// The point of the whole change: a default `connect` must leave nothing
+    /// behind that an agent re-reads every turn.
+    ///
+    /// Exercised through `run()` rather than `plan()`. Every other test in this
+    /// file calls `plan()`, which still contains the rules entry, so all of them
+    /// kept passing when the filter was added and none of them would have caught
+    /// it being dropped.
+    #[test]
+    fn a_default_connect_writes_no_always_on_guidance() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let repo = d.path();
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(repo.join(".claude")).expect("claude dir");
+
+        let opts = ConnectOpts {
+            only: Some("claude-code".to_string()),
+            dry_run: false,
+            remove: false,
+            commit: false,
+            rules: false,
+            report: Report::Silent,
+        };
+        run(repo, &opts).expect("connect");
+
+        assert!(
+            repo.join(".mcp.json").is_file(),
+            "the MCP wiring is what makes the tools reachable and must still land"
+        );
+        assert!(
+            !repo.join("CLAUDE.md").exists(),
+            "a default connect wrote CLAUDE.md, which is re-read on every turn"
+        );
+    }
+
+    /// And the opt-in still works, or the flag is a lie.
+    #[test]
+    fn rules_writes_the_guidance_when_asked() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let repo = d.path();
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(repo.join(".claude")).expect("claude dir");
+
+        let opts = ConnectOpts {
+            only: Some("claude-code".to_string()),
+            dry_run: false,
+            remove: false,
+            commit: false,
+            rules: true,
+            report: Report::Silent,
+        };
+        run(repo, &opts).expect("connect");
+
+        let md = std::fs::read_to_string(repo.join("CLAUDE.md")).expect("CLAUDE.md");
+        assert!(
+            md.contains(GUIDE_TITLE),
+            "--rules did not write the guidance: {md}"
+        );
+    }
+
+    /// `--remove` must not be filtered, or a rules file written by an earlier
+    /// `--rules` run is stranded: the flag that created it is not the flag that
+    /// deletes it, and the user has no reason to think one is needed.
+    #[test]
+    fn remove_cleans_up_guidance_written_earlier() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let repo = d.path();
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(repo.join(".claude")).expect("claude dir");
+
+        let with_rules = |rules: bool, remove: bool| ConnectOpts {
+            only: Some("claude-code".to_string()),
+            dry_run: false,
+            remove,
+            commit: false,
+            rules,
+            report: Report::Silent,
+        };
+        run(repo, &with_rules(true, false)).expect("connect --rules");
+        assert!(repo.join("CLAUDE.md").is_file(), "setup did not write it");
+
+        run(repo, &with_rules(false, true)).expect("connect --remove");
+        let left = std::fs::read_to_string(repo.join("CLAUDE.md")).unwrap_or_default();
+        assert!(
+            !left.contains(GUIDE_TITLE),
+            "--remove left the guidance behind: {left}"
+        );
     }
 
     /// The guidance is loaded on every turn of every conversation, so its size

@@ -135,6 +135,16 @@ enum Command {
         /// Do not git-ignore generated files (opt in to committing them).
         #[arg(long)]
         commit: bool,
+        /// Also write the always-on rules file that tells the agent to prefer
+        /// the graph over grep.
+        ///
+        /// Off by default. That file is re-read on every turn of every
+        /// conversation, so it is the one part of travsr that costs tokens
+        /// repeatedly, and the tools work without it: MCP already gives the
+        /// model every tool name and description. Turn it on if you want agents
+        /// nudged toward the graph rather than left to choose.
+        #[arg(long)]
+        rules: bool,
     },
     /// Start the Travsr daemon (git hook + file watcher + MCP server).
     Daemon {
@@ -770,6 +780,7 @@ async fn run(cli: Cli) -> Result<()> {
             print,
             remove,
             commit,
+            rules,
         } => {
             let cwd = std::env::current_dir()?;
             // Write command: `connect` creates files in the resolved root, so it
@@ -785,6 +796,7 @@ async fn run(cli: Cli) -> Result<()> {
                     dry_run: print,
                     remove,
                     commit,
+                    rules,
                     report: connect::Report::Stdout,
                 },
             )?;
