@@ -586,7 +586,10 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
         &["ask", "graph", "references", "pattern", "explain"],
     ),
     ("Run in the background", &["daemon", "mcp", "serve"]),
-    ("Inspect", &["status", "repos", "fsck", "index"]),
+    (
+        "Inspect and debug",
+        &["status", "daemon logs", "repos", "fsck", "index"],
+    ),
     ("Tune search", &["embed", "rerank", "synonym", "config"]),
 ];
 
@@ -608,7 +611,12 @@ pub fn print_commands() {
         println!();
         println!("{}", pal.orange(heading));
         for name in *names {
-            let Some(sub) = cli.get_subcommands().find(|c| &c.get_name() == name) else {
+            // A name may be a path. `daemon logs` is the whole logging surface
+            // and appeared only as a bare word in its parent's folded list,
+            // which is not enough to find it if you do not already know it is
+            // there. Naming the path promotes it to a row with a description of
+            // its own, while it stays listed under `daemon` for context.
+            let Some(sub) = resolve_path(&cli, name) else {
                 continue;
             };
             // Only a genuine shorthand is worth showing. `graph` carries eight
@@ -636,7 +644,9 @@ pub fn print_commands() {
                 .filter(|c| c.get_name() != "help" && !c.is_hide_set())
                 .map(clap::Command::get_name)
                 .collect();
-            if !nested.is_empty() {
+            // A promoted path is already a leaf shown for its own sake; listing
+            // its children under it would repeat what its parent row shows.
+            if !nested.is_empty() && !name.contains(' ') {
                 for line in wrap_list(&nested, 55) {
                     println!("  {:<18} {}", "", pal.dim(&line));
                 }
@@ -653,6 +663,18 @@ pub fn print_commands() {
         "{}",
         pal.dim("`travsr ask --examples` for the questions ask can answer.")
     );
+}
+
+/// Resolve a possibly-nested command path such as `daemon logs`.
+///
+/// Returns None for a path naming nothing, which a test turns into a failure
+/// rather than a silently missing row.
+fn resolve_path<'a>(cli: &'a clap::Command, path: &str) -> Option<&'a clap::Command> {
+    let mut cur = cli;
+    for part in path.split_whitespace() {
+        cur = cur.get_subcommands().find(|c| c.get_name() == part)?;
+    }
+    Some(cur)
 }
 
 /// Wrap a comma-separated list of names to `width`, for the column it sits in.
@@ -1003,6 +1025,10 @@ mod command_group_tests {
         deduped.dedup();
         assert_eq!(listed, deduped, "a command is filed under two headings");
 
+        // A promoted path such as `daemon logs` is a row of its own, so the
+        // top-level coverage check below compares on its first word.
+        let top = |n: &str| n.split_whitespace().next().unwrap_or(n).to_string();
+
         for sub in cli.get_subcommands() {
             // clap generates `help`, and `hook-run` is marked hidden because the
             // git hook invokes it rather than a person. `--cmds` lists what a
@@ -1011,15 +1037,19 @@ mod command_group_tests {
                 continue;
             }
             assert!(
-                listed.contains(&sub.get_name()),
+                listed.iter().any(|n| top(n) == sub.get_name()),
                 "`{}` is a real subcommand but no --cmds heading lists it",
                 sub.get_name()
             );
         }
+        // Every listed name must resolve, paths included. A row naming a
+        // command that does not exist is the dead end this whole file guards
+        // against, and a nested path is the easiest way to write one by
+        // mistake: `daemon log` looks right and resolves to nothing.
         for name in &listed {
             assert!(
-                cli.get_subcommands().any(|c| &c.get_name() == name),
-                "--cmds lists `{name}`, which is not a subcommand"
+                super::resolve_path(&cli, name).is_some(),
+                "--cmds lists `{name}`, which resolves to no command"
             );
         }
     }
