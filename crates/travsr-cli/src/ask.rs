@@ -163,11 +163,32 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     // Caught before retrieval rather than after, because retrieval succeeds here.
     // There is no low-confidence signal to hang an abstention on.
     if let Some(redirect) = meta_question_redirect(query_str) {
-        println!("{}", redirect.answer);
-        if !redirect.command.is_empty() {
-            use std::io::IsTerminal as _;
-            let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("  {} {}", pal.dim("$"), pal.ident(redirect.command));
+        use std::io::IsTerminal as _;
+        let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
+        // Answer here rather than naming another command. Someone who typed the
+        // question has already said what they want to know, and "run this other
+        // thing" is a worse response than the answer itself.
+        match redirect.command {
+            "travsr faq" => match crate::faq::entry(redirect.faq_question) {
+                Some(e) => crate::faq::print_entry(e, pal),
+                // Recognised as a travsr question but not one the FAQ covers.
+                None => {
+                    println!("{}", redirect.answer);
+                    println!("  {} {}", pal.dim("$"), pal.ident("travsr faq"));
+                }
+            },
+            "travsr lang list" => {
+                println!("{}", pal.dim(redirect.answer));
+                crate::lang::run(crate::lang::LangCommand::List { json: false })?;
+            }
+            "travsr status" => {
+                println!("{}", pal.dim(redirect.answer));
+                crate::status::run()?;
+            }
+            other => {
+                println!("{}", redirect.answer);
+                println!("  {} {}", pal.dim("$"), pal.ident(other));
+            }
         }
         return Ok(());
     }
@@ -538,6 +559,10 @@ pub fn print_examples(db_path: Option<&std::path::Path>) {
 pub(crate) struct MetaRedirect {
     pub answer: &'static str,
     pub command: &'static str,
+    /// The FAQ question to answer with, verbatim. Empty when the route is served
+    /// by running a command instead. Named explicitly rather than re-derived from
+    /// the user's wording, which does not match the catalogue's.
+    pub faq_question: &'static str,
 }
 
 /// Phrases that mean the question is about travsr or the repository as a whole,
@@ -560,6 +585,7 @@ const META_QUESTIONS: &[(&[&str], MetaRedirect)] = &[
         MetaRedirect {
             answer: "That is a question about the repository rather than about a symbol in it.",
             command: "travsr lang list",
+            faq_question: "",
         },
     ),
     (
@@ -575,20 +601,60 @@ const META_QUESTIONS: &[(&[&str], MetaRedirect)] = &[
         MetaRedirect {
             answer: "That is a question about the index rather than about the code.",
             command: "travsr status",
+            faq_question: "",
         },
     ),
     (
+        &["what is travsr", "what does travsr do"],
+        MetaRedirect {
+            answer: "That is a question about travsr itself.",
+            command: "travsr faq",
+            faq_question: "what is travsr?",
+        },
+    ),
+    (
+        // "how does it work" with no symbol named is, in a travsr session, a
+        // question about travsr. Left ambiguous it abstains and suggests whatever
+        // fuzzy-matches "work", which is worse than answering.
         &[
-            "what is travsr",
             "how does travsr work",
-            "what does travsr do",
-            "how do i install",
-            "how to install",
-            "who made travsr",
+            "how travsr works",
+            "how does it work",
+            "how does this work",
         ],
         MetaRedirect {
             answer: "That is a question about travsr itself.",
             command: "travsr faq",
+            faq_question: "how does it work?",
+        },
+    ),
+    (
+        &["how do i install", "how to install", "installing travsr"],
+        MetaRedirect {
+            answer: "That is a question about travsr itself.",
+            command: "travsr faq",
+            faq_question: "how do I install it?",
+        },
+    ),
+    (
+        &[
+            "does my code leave",
+            "is my code sent",
+            "do you upload",
+            "is it private",
+        ],
+        MetaRedirect {
+            answer: "That is a question about travsr itself.",
+            command: "travsr faq",
+            faq_question: "does my code leave my machine?",
+        },
+    ),
+    (
+        &["do i need the daemon", "is the daemon required"],
+        MetaRedirect {
+            answer: "That is a question about travsr itself.",
+            command: "travsr faq",
+            faq_question: "do I need the daemon running?",
         },
     ),
 ];
@@ -660,6 +726,9 @@ fn example_symbols(db_path: Option<&std::path::Path>, want: usize) -> Vec<String
     }
     candidates.retain(|n| {
         !travsr_core::noise::is_structural_noise(n)
+            // Test entry points and fixtures make poor examples: a reader
+            // pasting one gets a result about the test suite, not about the code.
+            && n.test_role == travsr_core::TestRole::None
             // Very short names make confusing examples even when well connected.
             && travsr_core::ident::leaf_of(&n.vname.signature).len() >= 4
     });
@@ -1028,7 +1097,15 @@ fn nearest_symbol(db_path: &std::path::Path, query: &str) -> Option<String> {
     let hits = store.search_nodes_fuzzy(query).ok()?;
     let leaf = hits
         .iter()
-        .find(|n| !travsr_core::noise::is_structural_noise(n))
+        .find(|n| {
+            // `is_structural_noise` filters test *paths*, but an inline
+            // `#[cfg(test)] mod tests` lives in src/, so a test helper survives
+            // it. Suggesting `works_does_not_match_workspace` as the closest
+            // symbol is worse than suggesting nothing: it is not code the reader
+            // was looking for, and it makes the tool look like it guessed.
+            !travsr_core::noise::is_structural_noise(n)
+                && n.test_role == travsr_core::TestRole::None
+        })
         .or_else(|| hits.first())
         .map(|n| travsr_core::ident::leaf_of(&n.vname.signature).to_string())?;
     (!leaf.is_empty()).then_some(leaf)

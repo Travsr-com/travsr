@@ -18,12 +18,12 @@ use crate::progress::Palette;
 
 /// One question and its answer. Answers are wrapped at print time, so they are
 /// written here as single paragraphs.
-struct Entry {
-    question: &'static str,
-    answer: &'static str,
+pub(crate) struct Entry {
+    pub question: &'static str,
+    pub answer: &'static str,
     /// A command that demonstrates or acts on the answer. Empty when there is
     /// nothing to run, rather than inventing one.
-    command: &'static str,
+    pub command: &'static str,
 }
 
 const ENTRIES: &[Entry] = &[
@@ -113,6 +113,27 @@ const ENTRIES: &[Entry] = &[
         command: "",
     },
 ];
+
+/// The FAQ entry whose question is exactly `question`.
+///
+/// Exact rather than fuzzy: the caller already decided which entry applies, by
+/// matching the phrase the user typed. An earlier version re-derived it by
+/// substring, which silently failed whenever the user's wording differed from
+/// the catalogue's ("how do i install travsr" does not contain "how do I install
+/// it"), and fell back to naming another command instead of answering.
+pub(crate) fn entry(question: &str) -> Option<&'static Entry> {
+    ENTRIES.iter().find(|e| e.question == question)
+}
+
+/// Print one entry, wrapped, with its command when it has one.
+pub(crate) fn print_entry(e: &Entry, pal: Palette) {
+    for line in wrap(e.answer, 76) {
+        println!("{line}");
+    }
+    if !e.command.is_empty() {
+        println!("  {} {}", pal.dim("$"), pal.ident(e.command));
+    }
+}
 
 /// Print the FAQ.
 pub fn run() {
