@@ -171,8 +171,8 @@ enum Command {
     /// retrieval). Also accepts a bare symbol name.
     Ask {
         /// Natural-language question, or a symbol name, to retrieve context for.
-        /// Optional only so `--examples` can be used on its own.
-        #[arg(required_unless_present = "examples")]
+        /// Optional only so `--examples` and `--cmds` can be used on their own.
+        #[arg(required_unless_present_any = ["examples", "cmds"])]
         query: Option<String>,
         /// Output format: table (default) or json.
         #[arg(long, value_enum, default_value = "table")]
@@ -180,6 +180,9 @@ enum Command {
         /// List the kinds of question travsr can answer, with runnable examples.
         #[arg(long)]
         examples: bool,
+        /// List every command travsr supports, grouped by what it is for.
+        #[arg(long)]
+        cmds: bool,
     },
     /// Show why `travsr ask` ranked (or skipped) results for a query: which
     /// terms matched, which relevance thresholds passed or failed, and the final
@@ -1263,8 +1266,13 @@ async fn run(cli: Cli) -> Result<()> {
             query,
             format,
             examples,
+            cmds,
         } => {
-            if examples {
+            if cmds {
+                // Read from clap, so it needs no repository and works before
+                // `init` just as `--examples` does.
+                ask::print_commands();
+            } else if examples {
                 // Best effort: an un-indexed repo, or none at all, falls back to
                 // placeholders rather than failing. `--examples` must work before
                 // `init`, which is exactly when someone is most likely to run it.

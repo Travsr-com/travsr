@@ -558,13 +558,125 @@ pub fn print_examples(db_path: Option<&std::path::Path>) {
         println!("      {}", paint_command(pal, &c, sym));
     }
 
+    println!();
+    println!(
+        "{}",
+        pal.dim("`travsr ask --cmds` for every command travsr supports.")
+    );
+
     if !grounded {
-        println!();
         println!(
             "{}",
             pal.dim("Run `travsr init` first and these fill in with your own symbols.")
         );
     }
+}
+
+/// The command groups printed by `--cmds`, as (heading, subcommand names).
+///
+/// Only the grouping lives here. Every name, alias and description is read from
+/// clap at print time, so this cannot describe a command that does not exist or
+/// go stale when one changes its help text. A test asserts the two sides agree,
+/// which means adding a subcommand fails the build until it is filed under a
+/// heading rather than silently going missing from this list.
+const COMMAND_GROUPS: &[(&str, &[&str])] = &[
+    ("Set up a repo", &["init", "connect", "lang"]),
+    (
+        "Ask about code",
+        &["ask", "graph", "references", "pattern", "explain"],
+    ),
+    ("Run in the background", &["daemon", "mcp", "serve"]),
+    ("Inspect", &["status", "repos", "fsck", "index"]),
+    ("Tune search", &["embed", "rerank", "synonym", "config"]),
+];
+
+/// Print every command travsr supports, grouped by what it is for.
+///
+/// A reader who has just learned `ask` has no way to discover the other twenty
+/// without `--help`, which prints them in declaration order with no shape. The
+/// grouping is the whole point: `mcp` and `serve` mean nothing next to each
+/// other alphabetically and everything under one heading.
+pub fn print_commands() {
+    use clap::CommandFactory as _;
+    use std::io::IsTerminal as _;
+    let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
+    let cli = crate::Cli::command();
+
+    println!("{}", pal.bold("Commands travsr supports"));
+
+    for (heading, names) in COMMAND_GROUPS {
+        println!();
+        println!("{}", pal.orange(heading));
+        for name in *names {
+            let Some(sub) = cli.get_subcommands().find(|c| &c.get_name() == name) else {
+                continue;
+            };
+            // Only a genuine shorthand is worth showing. `graph` carries eight
+            // aliases, all of them MCP tool names in snake and kebab spelling,
+            // and printing them ran the name column past the width of the
+            // terminal. An alias shorter than the command is something a reader
+            // would actually type; the rest are compatibility spellings.
+            let label = match sub
+                .get_all_aliases()
+                .filter(|a| a.len() < name.len())
+                .min_by_key(|a| a.len())
+            {
+                Some(short) => format!("{name}, {short}"),
+                None => (*name).to_string(),
+            };
+            println!("  {:<18} {}", pal.ident(&label), first_sentence(sub));
+        }
+    }
+
+    println!();
+    println!(
+        "{}",
+        pal.dim("`travsr <command> --help` for the flags on any of these.")
+    );
+    println!(
+        "{}",
+        pal.dim("`travsr ask --examples` for the questions ask can answer.")
+    );
+}
+
+/// The first sentence of a command's help, short enough to sit in a column.
+///
+/// clap's `about` runs to a paragraph for several commands, and printing all of
+/// it turns the list into a wall. The first sentence is what a reader scanning
+/// for the right command needs.
+fn first_sentence(sub: &clap::Command) -> String {
+    let about = sub
+        .get_about()
+        .map(ToString::to_string)
+        .unwrap_or_default()
+        .replace('\n', " ");
+    let mut out = match about.split_once(". ") {
+        Some((head, _)) => head.to_string(),
+        None => about.trim_end_matches('.').to_string(),
+    };
+    // Drop a *trailing* parenthetical. Several of these spell out the parts of
+    // a command ("(git hook + file watcher + MCP server)") which is detail for
+    // `--help`, not for a line someone is scanning. Anchored to the end of the
+    // string on purpose: cutting at the first "(" also truncated the ones that
+    // qualify a word mid-sentence, and "Enumerate every use site" lost the
+    // "(path:line) of a symbol across the repo" that made it useful.
+    if out.ends_with(')') {
+        if let Some(i) = out.rfind(" (") {
+            out.truncate(i);
+        }
+    }
+    // Collapse the runs of whitespace left behind by unwrapping the help text.
+    out = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    const WIDTH: usize = 56;
+    if out.chars().count() > WIDTH {
+        out = out.chars().take(WIDTH - 3).collect::<String>();
+        // Cut at a word boundary rather than mid-word.
+        if let Some(i) = out.rfind(' ') {
+            out.truncate(i);
+        }
+        out.push_str("...");
+    }
+    out
 }
 
 /// A question `ask` cannot answer, and the command that can.
@@ -819,6 +931,73 @@ mod meta_question_tests {
                 known.iter().any(|k| k == sub),
                 "`{}` names unknown subcommand {sub:?}",
                 r.command
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod command_group_tests {
+    use super::{first_sentence, COMMAND_GROUPS};
+
+    /// The grouping is the one hand-written part of `--cmds`, so it is the one
+    /// part that can drift. Adding a subcommand without filing it here would
+    /// leave it silently missing from a list that claims to be every command,
+    /// which is the same failure as documenting one that does not exist (#727).
+    #[test]
+    fn every_subcommand_is_listed_exactly_once() {
+        use clap::CommandFactory as _;
+        let cli = crate::Cli::command();
+
+        let mut listed: Vec<&str> = COMMAND_GROUPS
+            .iter()
+            .flat_map(|(_, n)| *n)
+            .copied()
+            .collect();
+        listed.sort_unstable();
+        let mut deduped = listed.clone();
+        deduped.dedup();
+        assert_eq!(listed, deduped, "a command is filed under two headings");
+
+        for sub in cli.get_subcommands() {
+            // clap generates `help`, and `hook-run` is marked hidden because the
+            // git hook invokes it rather than a person. `--cmds` lists what a
+            // reader can usefully type, which is what `--help` shows.
+            if sub.get_name() == "help" || sub.is_hide_set() {
+                continue;
+            }
+            assert!(
+                listed.contains(&sub.get_name()),
+                "`{}` is a real subcommand but no --cmds heading lists it",
+                sub.get_name()
+            );
+        }
+        for name in &listed {
+            assert!(
+                cli.get_subcommands().any(|c| &c.get_name() == name),
+                "--cmds lists `{name}`, which is not a subcommand"
+            );
+        }
+    }
+
+    /// The description column is only useful if it fits beside the name column
+    /// on an 80-column terminal, which is what the truncation is for.
+    #[test]
+    fn descriptions_fit_the_column() {
+        use clap::CommandFactory as _;
+        let cli = crate::Cli::command();
+        for sub in cli.get_subcommands().filter(|c| !c.is_hide_set()) {
+            let d = first_sentence(sub);
+            assert!(
+                d.chars().count() <= 56,
+                "`{}` renders a {}-char description: {d}",
+                sub.get_name(),
+                d.chars().count()
+            );
+            assert!(
+                !d.contains('\n'),
+                "`{}` renders a description with a newline",
+                sub.get_name()
             );
         }
     }
