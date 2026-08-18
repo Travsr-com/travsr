@@ -444,17 +444,32 @@ struct QuestionShape {
 
 const QUESTION_CATALOGUE: &[(&str, &[QuestionShape])] = &[
     (
+        "Start here",
+        &[
+            QuestionShape {
+                intent: "what is this repo written in?",
+                example: "travsr lang list",
+                note: "which languages are here, and which resolve calls",
+            },
+            QuestionShape {
+                intent: "is the index ready to query?",
+                example: "travsr status",
+                note: "size, freshness, and anything degraded",
+            },
+        ],
+    ),
+    (
         "Find code",
         &[
             QuestionShape {
                 intent: "where is {sym} defined?",
                 example: "travsr ask \"{sym}\"",
-                note: "",
+                note: "a question works too, not just a name",
             },
             QuestionShape {
-                intent: "where does the text \"{term}\" appear?",
-                example: "travsr pattern \"{term}\"",
-                note: "log strings, TODOs, config keys",
+                intent: "where does the text \"TODO\" appear?",
+                example: "travsr pattern \"TODO\"",
+                note: "for text, not symbols: log strings, TODOs, config keys",
             },
         ],
     ),
@@ -479,22 +494,17 @@ const QUESTION_CATALOGUE: &[(&str, &[QuestionShape])] = &[
         ],
     ),
     (
-        "Check the index",
+        "When an answer looks wrong",
         &[
-            QuestionShape {
-                intent: "is the graph fresh and healthy?",
-                example: "travsr status",
-                note: "",
-            },
-            QuestionShape {
-                intent: "which languages resolve calls?",
-                example: "travsr lang status",
-                note: "an inactive language means thin results for it",
-            },
             QuestionShape {
                 intent: "why did {sym} rank where it did?",
                 example: "travsr explain \"{sym}\" {sym}",
                 note: "which terms matched, which thresholds failed",
+            },
+            QuestionShape {
+                intent: "is anything missing or stale in the graph?",
+                example: "travsr fsck",
+                note: "ghost nodes left by deletes or checkouts",
             },
         ],
     ),
