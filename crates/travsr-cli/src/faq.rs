@@ -26,6 +26,11 @@ pub(crate) struct Entry {
     pub lead: &'static str,
     /// Supporting points, each short enough to sit on one line.
     pub points: &'static [&'static str],
+    /// An ordered walkthrough, as (what this does, command) pairs. Used where
+    /// the answer is a sequence rather than a fact: a list of commands printed
+    /// as a block loses the order, and "install" is only useful as the whole
+    /// path from nothing to a working query.
+    pub steps: &'static [(&'static str, &'static str)],
     /// Commands that act on the answer. Empty when there is nothing to run,
     /// rather than inventing one. A slice because some answers genuinely have
     /// several: install has three real routes, and naming one while mentioning
@@ -37,6 +42,7 @@ const ENTRIES: &[Entry] = &[
     Entry {
         question: "what is travsr?",
         lead: "A code graph that lives next to git.",
+        steps: &[],
         points: &[
             "every function, class and call is a node or an edge",
             "structural questions get exact answers, not guesses",
@@ -47,6 +53,7 @@ const ENTRIES: &[Entry] = &[
     Entry {
         question: "how is it different from search or vector RAG?",
         lead: "It computes relationships instead of approximating them.",
+        steps: &[],
         points: &[
             "vector search chunks code and retrieves by similarity",
             "travsr parses the code and resolves each call to its definition",
@@ -57,6 +64,7 @@ const ENTRIES: &[Entry] = &[
     Entry {
         question: "how does it work?",
         lead: "Two indexing passes, then a retrieval pipeline.",
+        steps: &[],
         points: &[
             "Phase A   tree-sitter parses every tracked file into nodes",
             "Phase B   resolves calls to the definitions they point at",
@@ -67,20 +75,29 @@ const ENTRIES: &[Entry] = &[
     },
     Entry {
         question: "how do I install it?",
-        lead: "Three routes, all installing the same binary.",
+        lead: "Install, then index a repo. Five steps from nothing to a query.",
+        steps: &[
+            (
+                "install the binary (npm and cargo also work)",
+                "curl -fsSL https://travsr.com/install.sh | sh",
+            ),
+            ("check it is on your PATH", "travsr --version"),
+            ("index a repo, from its root", "travsr init --semantic"),
+            ("confirm the graph is ready", "travsr status"),
+            ("ask it something", "travsr ask \"<a symbol in your code>\""),
+        ],
         points: &[
             "the installer verifies the release signature before installing",
-            "add -s -- --system to install system-wide",
-        ],
-        commands: &[
-            "curl -fsSL https://travsr.com/install.sh | sh",
+            "add -s -- --system to install for all users",
             "npm install -g @travsr.com/travsr",
-            "cargo build --release -p travsr-cli",
+            "cargo build --release -p travsr-cli   (from a clone)",
         ],
+        commands: &[],
     },
     Entry {
         question: "how do I start using it on a repo?",
         lead: "Run this from the repo root.",
+        steps: &[],
         points: &[
             "indexes the tracked files",
             "installs a git hook so the graph stays current",
@@ -90,6 +107,7 @@ const ENTRIES: &[Entry] = &[
     Entry {
         question: "which languages does it support?",
         lead: "Sixteen for structure; four resolve calls without setup.",
+        steps: &[],
         points: &[
             "native   rust, typescript, javascript, python",
             "others need an analyzer installed",
@@ -99,6 +117,7 @@ const ENTRIES: &[Entry] = &[
     Entry {
         question: "does my code leave my machine?",
         lead: "No. Indexing, storage and queries are all local.",
+        steps: &[],
         points: &[
             "the graph lives in .travsr/ inside your repo",
             "embedding models run as a local sidecar",
@@ -109,6 +128,7 @@ const ENTRIES: &[Entry] = &[
     Entry {
         question: "do I need the daemon running?",
         lead: "No, but it helps.",
+        steps: &[],
         points: &[
             "queries work without it, served from the database",
             "the daemon keeps semantic analysis current as files change",
@@ -119,6 +139,7 @@ const ENTRIES: &[Entry] = &[
     Entry {
         question: "how do I connect it to an AI agent?",
         lead: "Travsr speaks MCP, so any agent that supports it can query the graph.",
+        steps: &[],
         points: &[
             "detects installed tools and writes their config",
             "add --print first to see what would change",
@@ -128,6 +149,7 @@ const ENTRIES: &[Entry] = &[
     Entry {
         question: "what can I ask about my code?",
         lead: "Structural questions, anchored to a symbol name.",
+        steps: &[],
         points: &[
             "what calls it, what it depends on, where it is used",
             "naming a symbol gives the best results",
@@ -137,6 +159,7 @@ const ENTRIES: &[Entry] = &[
     Entry {
         question: "why did it say it found nothing?",
         lead: "It abstains rather than returning a low-confidence guess.",
+        steps: &[],
         points: &[
             "an answer you cannot trust is worse than none",
             "conceptual questions naming no symbol are a known gap",
@@ -147,6 +170,7 @@ const ENTRIES: &[Entry] = &[
     Entry {
         question: "where is the data, and how do I remove it?",
         lead: "Two places, both safe to delete.",
+        steps: &[],
         points: &[
             ".travsr/    per-repo graph, inside the repo",
             "~/.travsr   shared binaries and models",
@@ -250,6 +274,14 @@ fn distinctive_words(text: &str) -> Vec<String> {
 pub(crate) fn print_entry(e: &Entry, pal: Palette) {
     for line in wrap(e.lead, 74) {
         println!("  {line}");
+    }
+    for (i, (what, cmd)) in e.steps.iter().enumerate() {
+        println!();
+        println!("    {} {what}", pal.dim(&format!("{}.", i + 1)));
+        println!("       {}", pal.ident(cmd));
+    }
+    if !e.steps.is_empty() && !e.points.is_empty() {
+        println!();
     }
     for p in e.points {
         // Only wrap when it does not fit. `wrap` splits on whitespace, so running
@@ -409,6 +441,47 @@ mod tests {
         assert!(super::match_question("how does it work").is_some());
         assert!(super::match_question("how does the scheduler work").is_none());
         assert!(super::match_question("does the retry work after a crash").is_none());
+    }
+
+    /// Steps are a walkthrough someone follows in order, so each one has to be a
+    /// real command and the sequence has to be complete enough to end somewhere
+    /// useful.
+    #[test]
+    fn steps_are_ordered_real_commands() {
+        use clap::CommandFactory as _;
+        let cmd = crate::Cli::command();
+        let known: Vec<String> = cmd
+            .get_subcommands()
+            .flat_map(|c| {
+                std::iter::once(c.get_name().to_string())
+                    .chain(c.get_all_aliases().map(str::to_string))
+            })
+            .collect();
+
+        for e in ENTRIES {
+            for (what, c) in e.steps {
+                assert!(
+                    !what.is_empty(),
+                    "`{}` has a step with no description",
+                    e.question
+                );
+                assert!(!c.is_empty(), "`{}` has a step with no command", e.question);
+                // The install line is a shell pipeline, not a travsr invocation.
+                if !c.starts_with("travsr ") {
+                    continue;
+                }
+                let sub = c.split_whitespace().nth(1).unwrap_or("");
+                // `travsr --version` is a flag on the root command, not a
+                // subcommand, and is a legitimate step.
+                if sub.starts_with("--") {
+                    continue;
+                }
+                assert!(
+                    known.iter().any(|k| k == sub),
+                    "`{c}` names unknown subcommand {sub:?}"
+                );
+            }
+        }
     }
 
     #[test]
