@@ -9,8 +9,21 @@ use travsr_core::Language;
 use travsr_error::IndexError;
 use travsr_indexer::{hash_file, ParseOutput};
 
+/// Whether a language runs Phase B in-process rather than through a sidecar.
+///
+/// Mirrors the `LangWork` dispatch. Kept as a name list rather than threaded
+/// through `LangResult` because every construction site would otherwise need a
+/// new field; a test pins the two against each other.
+fn is_native_phase_b(lang: &str) -> bool {
+    matches!(
+        lang,
+        "rust" | "typescript" | "javascript" | "python" | "dart"
+    )
+}
+
 /// Per-language Phase B outcome reported by [`PluginIndexer::invoke_phase_b_all`].
 #[derive(Debug, Default, Clone)]
+
 pub struct PhaseBOutcome {
     pub ran: Vec<String>,
     /// Languages P1-gated out because no source files of that type exist in the
@@ -50,6 +63,14 @@ pub struct PhaseBOutcome {
     /// Phase B analyzers legitimately emit edges onto existing Phase A nodes
     /// with no new nodes of their own.
     pub produced_no_nodes: Vec<String>,
+    /// Sidecar languages whose analyzer emitted definitions but no reference
+    /// occurrences of any kind (#724).
+    ///
+    /// Distinct from `produced_no_nodes` because the analyzer did produce
+    /// symbols, so that message would be false. What it did not produce is any
+    /// relationship, which means no call edge can ever be derived: the run reads
+    /// as a success and the graph gains nothing traversable.
+    pub produced_no_references: Vec<String>,
     /// Languages whose sidecar binary responded with a mismatched protocol
     /// version. User-actionable: `travsr lang install <lang>` to upgrade.
     pub version_mismatch: Vec<(String, u32, u32)>,
@@ -1000,13 +1021,24 @@ impl PluginIndexer {
                 // language that produced neither nodes nor edges/refs of any kind,
                 // so an analyzer that produced call edges is not falsely reported
                 // as having "produced no symbols".
-                if r.nodes.is_empty()
-                    && r.edges.is_empty()
+                let no_occurrences = r.edges.is_empty()
                     && r.refs.is_empty()
                     && r.unresolved_calls.is_empty()
-                    && r.positional_refs.is_empty()
-                {
+                    && r.positional_refs.is_empty();
+
+                if r.nodes.is_empty() && no_occurrences {
                     outcome.produced_no_nodes.push(r.lang.clone());
+                } else if no_occurrences && !is_native_phase_b(&r.lang) {
+                    // #724 follow-up: the widened check above is justified for
+                    // native Phase B, where call resolution attaches edges to
+                    // pre-existing tree-sitter nodes and emits no new definition
+                    // nodes, so empty `nodes` is normal. That reasoning does not
+                    // carry to a sidecar: nodes, edges, refs and unresolved calls
+                    // all arrive in one external tool response, so definitions
+                    // without a single occurrence means the tool succeeded and
+                    // dropped every reference. That is #724's Java finding, and
+                    // the widened check hid it, because the nodes were there.
+                    outcome.produced_no_references.push(r.lang.clone());
                 }
                 outcome.ran.push(r.lang);
             } else if let Some((expected, got)) = r.version_mismatch {
@@ -1121,6 +1153,36 @@ fn find_repo_root(abs_path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// #724: a sidecar that returns definitions and not one occurrence.
+    ///
+    /// scip-java did exactly this: Maven succeeded, valid SCIP came back, every
+    /// reference occurrence was dropped, and no Java call edge was ever created.
+    /// The widened #712 check could not see it, because the nodes were present.
+    #[test]
+    fn a_sidecar_with_definitions_but_no_occurrences_is_flagged() {
+        assert!(
+            !super::is_native_phase_b("java"),
+            "java runs through a sidecar, so the stricter rule applies to it"
+        );
+        // Native languages legitimately return no new nodes, so the same shape
+        // must not be flagged for them.
+        for lang in ["rust", "typescript", "python", "javascript", "dart"] {
+            assert!(
+                super::is_native_phase_b(lang),
+                "{lang} resolves in-process and attaches edges to Phase A nodes"
+            );
+        }
+        for lang in [
+            "java", "go", "ruby", "php", "csharp", "kotlin", "scala", "cpp", "c",
+        ] {
+            assert!(
+                !super::is_native_phase_b(lang),
+                "{lang} arrives as one sidecar response, so definitions without \
+                 occurrences means the tool dropped them"
+            );
+        }
+    }
+
     use super::*;
     use crate::phase_b::catalog::CATALOG;
 
