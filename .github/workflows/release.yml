@@ -424,27 +424,41 @@ jobs:
           REL_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # Both halves retry together. Confirming the pointer through the API
+          # and then fetching it once assumes the download redirect is already
+          # consistent with what the API just reported, and if it lags for a
+          # moment a correct release fails the gate. That is the same flakiness
+          # the retries here exist to avoid, so the fetch and the compare sit
+          # inside the loop rather than after it.
           latest=""
+          served=""
           for attempt in 1 2 3 4 5; do
             latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q .tag_name || true)
-            [ "$latest" = "$REL_TAG" ] && break
-            echo "latest is '$latest', waiting for it to become '$REL_TAG' (attempt $attempt)"
+            if [ "$latest" = "$REL_TAG" ]; then
+              # Fetched the way a user reaches it rather than through the tag,
+              # since the redirect is the thing under test.
+              if curl -fsSL -o latest.sh \
+                   "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh" \
+                 && cmp -s latest.sh install.sh; then
+                served="ok"
+                break
+              fi
+              echo "latest names $REL_TAG but does not serve its installer yet (attempt $attempt)"
+            else
+              echo "latest is '$latest', waiting for it to become '$REL_TAG' (attempt $attempt)"
+            fi
             sleep $((attempt * 3))
           done
+
           if [ "$latest" != "$REL_TAG" ]; then
             echo "::error::latest points at '$latest', not the '$REL_TAG' this run published." >&2
             echo "travsr.com/install.sh redirects to releases/latest/download/install.sh," >&2
             echo "so users would be served $latest's installer, not this one." >&2
             exit 1
           fi
-
-          # The pointer resolves; now check what it serves. Fetched the way a
-          # user reaches it rather than through the tag, since the redirect is
-          # the thing under test.
-          curl -fsSL -o latest.sh \
-            "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh"
-          if ! cmp -s latest.sh install.sh; then
+          if [ "$served" != "ok" ]; then
             echo "::error::releases/latest/download/install.sh differs from the installer this run attached." >&2
+            echo "The pointer names $REL_TAG, so this is the served bytes, not the pointer." >&2
             exit 1
           fi
           rm -f latest.sh
@@ -602,8 +616,20 @@ jobs:
       # Benign while the script stays version-independent, and a real bug the
       # moment it is not (a pinned default tag, a channel flag, a baked-in
       # version). Rather than rely on that staying true, take it from the
-      # promoted tag's own tree, which matches how everything else here is
-      # sourced from the release being promoted.
+      # promoted tag's own tree.
+      #
+      # That leaves install.sh sourced differently from everything else here,
+      # and deliberately so: every other promoted asset comes from
+      # `gh release download` against the source *release*, while this one comes
+      # from the source *tag's tree*. Pulling it from the release instead would
+      # propagate whatever install.sh that release happened to carry, which for a
+      # release cut before #706 is master's copy under a new tag, and that is the
+      # bug this exists to stop.
+      #
+      # The cost, accepted: a ref that predates install.sh being tracked cannot
+      # be promoted at all, even when its published release carries a perfectly
+      # good installer asset. Failing loudly there is preferred over promoting a
+      # release whose installer does not correspond to its own tree.
       #
       # Ordered before the tag push deliberately. It needs only the checkout,
       # and running it afterwards meant tripping it left a public tag with no
@@ -728,27 +754,41 @@ jobs:
           REL_TAG: ${{ github.event.inputs.promote_to }}
         run: |
           set -euo pipefail
+          # Both halves retry together. Confirming the pointer through the API
+          # and then fetching it once assumes the download redirect is already
+          # consistent with what the API just reported, and if it lags for a
+          # moment a correct release fails the gate. That is the same flakiness
+          # the retries here exist to avoid, so the fetch and the compare sit
+          # inside the loop rather than after it.
           latest=""
+          served=""
           for attempt in 1 2 3 4 5; do
             latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q .tag_name || true)
-            [ "$latest" = "$REL_TAG" ] && break
-            echo "latest is '$latest', waiting for it to become '$REL_TAG' (attempt $attempt)"
+            if [ "$latest" = "$REL_TAG" ]; then
+              # Fetched the way a user reaches it rather than through the tag,
+              # since the redirect is the thing under test.
+              if curl -fsSL -o latest.sh \
+                   "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh" \
+                 && cmp -s latest.sh install.sh; then
+                served="ok"
+                break
+              fi
+              echo "latest names $REL_TAG but does not serve its installer yet (attempt $attempt)"
+            else
+              echo "latest is '$latest', waiting for it to become '$REL_TAG' (attempt $attempt)"
+            fi
             sleep $((attempt * 3))
           done
+
           if [ "$latest" != "$REL_TAG" ]; then
             echo "::error::latest points at '$latest', not the '$REL_TAG' this run published." >&2
             echo "travsr.com/install.sh redirects to releases/latest/download/install.sh," >&2
             echo "so users would be served $latest's installer, not this one." >&2
             exit 1
           fi
-
-          # The pointer resolves; now check what it serves. Fetched the way a
-          # user reaches it rather than through the tag, since the redirect is
-          # the thing under test.
-          curl -fsSL -o latest.sh \
-            "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh"
-          if ! cmp -s latest.sh install.sh; then
+          if [ "$served" != "ok" ]; then
             echo "::error::releases/latest/download/install.sh differs from the installer this run attached." >&2
+            echo "The pointer names $REL_TAG, so this is the served bytes, not the pointer." >&2
             exit 1
           fi
           rm -f latest.sh
