@@ -341,6 +341,12 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # #713: unmatched entries are skipped silently by default. On this path
+          # install.sh comes from the tagged checkout so it is correct by
+          # construction, but a missing artifact or SHA256SUMS would publish just
+          # as quietly. Every entry here is produced by an earlier step, so an
+          # unmatched one is a broken job rather than an optional asset.
+          fail_on_unmatched_files: true
           files: |
             dist/*.tar.gz
             dist/*.bundle
@@ -349,6 +355,122 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ needs.channel.outputs.prerelease }}
           make_latest: ${{ needs.channel.outputs.channel == 'stable' }}
+
+      # #713: the assertion that matters is not "every glob matched" but "the URL
+      # we tell people to curl works". travsr.com/install.sh redirects to
+      # releases/latest/download/install.sh, so a release that ships without the
+      # asset breaks the single documented install path for everyone, with a green
+      # release and green CI and nothing downstream to notice.
+      #
+      # Checked against the tag rather than `latest`, because a prerelease does
+      # not move `latest` and would otherwise assert someone else's release.
+      - name: Assert the installer is actually downloadable
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Captured before matching, not piped into `grep -q`. With pipefail
+          # set, `grep -q` exits at the first match and the pipeline returns 141
+          # if `gh` writes again after the pipe closes, so a present install.sh
+          # could read as absent. It does not fire today only because `gh`
+          # buffers its output into one write, and `install.sh` sorts first in
+          # the asset list, which is the worst case for that race.
+          for attempt in 1 2 3 4 5; do
+            assets=$(gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
+                       --json assets -q '.assets[].name' || true)
+            if grep -qx 'install.sh' <<<"$assets"; then
+              # Being listed is not the invariant. #714 is that the *bytes*
+              # served are the ones from the promoted ref, so download and
+              # compare rather than trusting the name.
+              # Retried with the listing rather than run once after it. An asset
+              # being listed does not mean it downloads on the first try, and a
+              # transient failure here would fail a correct release, which is the
+              # flakiness this loop exists to absorb.
+              if ! gh release download "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
+                     -p install.sh -O served.sh --clobber; then
+                echo "install.sh is listed on $REL_TAG but did not download (attempt $attempt), retrying"
+                sleep $((attempt * 3))
+                continue
+              fi
+              if ! cmp -s served.sh install.sh; then
+                echo "::error::$REL_TAG serves an install.sh that differs from the one attached." >&2
+                echo "The published asset is what travsr.com/install.sh hands to users," >&2
+                echo "so it has to be byte-identical to the copy this run attached." >&2
+                exit 1
+              fi
+              rm -f served.sh
+              echo "install.sh on $REL_TAG downloads and matches ($(wc -c < install.sh) bytes)"
+              exit 0
+            fi
+            echo "install.sh not visible on $REL_TAG yet (attempt $attempt), retrying"
+            sleep $((attempt * 3))
+          done
+          echo "::error::$REL_TAG has no install.sh asset." >&2
+          echo "travsr.com/install.sh redirects to releases/latest/download/install.sh," >&2
+          echo "so publishing this would 404 the documented one-line installer." >&2
+          exit 1
+
+      # #750: the per-tag assertion above proves the release we just cut serves
+      # the right installer. It does not prove the pointer users actually hit
+      # does, and `travsr.com/install.sh` redirects to
+      # `releases/latest/download/install.sh`, not to any tag.
+      #
+      # Only meaningful when this release claims `latest`, which is the same
+      # condition `make_latest` uses. A prerelease does not move the pointer, so
+      # asserting it there would check somebody else's release.
+      #
+      # This repo has already been bitten here: `latest` sat on v0.11.0 while
+      # v1.0.0-rc.1 existed, so the installer being served was months older than
+      # the newest release.
+      - name: Assert the latest pointer serves this installer
+        if: needs.channel.outputs.channel == 'stable'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Both halves retry together. Confirming the pointer through the API
+          # and then fetching it once assumes the download redirect is already
+          # consistent with what the API just reported, and if it lags for a
+          # moment a correct release fails the gate. That is the same flakiness
+          # the retries here exist to avoid, so the fetch and the compare sit
+          # inside the loop rather than after it.
+          latest=""
+          served=""
+          for attempt in 1 2 3 4 5; do
+            latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q .tag_name || true)
+            if [ "$latest" = "$REL_TAG" ]; then
+              # Fetched the way a user reaches it rather than through the tag,
+              # since the redirect is the thing under test.
+              if curl -fsSL -o latest.sh \
+                   "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh" \
+                 && cmp -s latest.sh install.sh; then
+                served="ok"
+                break
+              fi
+              echo "latest names $REL_TAG but does not serve its installer yet (attempt $attempt)"
+            else
+              echo "latest is '$latest', waiting for it to become '$REL_TAG' (attempt $attempt)"
+            fi
+            sleep $((attempt * 3))
+          done
+
+          if [ "$latest" != "$REL_TAG" ]; then
+            echo "::error::latest points at '$latest', not the '$REL_TAG' this run published." >&2
+            echo "travsr.com/install.sh redirects to releases/latest/download/install.sh," >&2
+            echo "so users would be served the installer from '$latest', not this one." >&2
+            exit 1
+          fi
+          if [ "$served" != "ok" ]; then
+            echo "::error::releases/latest/download/install.sh differs from the installer this run attached." >&2
+            echo "The pointer names $REL_TAG, so this is the served bytes, not the pointer." >&2
+            exit 1
+          fi
+          rm -f latest.sh
+          echo "latest points at $REL_TAG and serves the matching install.sh"
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
@@ -493,6 +615,59 @@ jobs:
               "$t"
           done
 
+      # #714: `install.sh` is the one attached asset that does not come from the
+      # source release, because it is not a build artifact. The checkout above is
+      # the dispatch ref, so attaching the working tree's copy would ship
+      # master's installer under a tag whose tree may hold a different one, and
+      # `releases/<tag>/download/install.sh` would not be a snapshot of `<tag>`.
+      #
+      # Benign while the script stays version-independent, and a real bug the
+      # moment it is not (a pinned default tag, a channel flag, a baked-in
+      # version). Rather than rely on that staying true, take it from the
+      # promoted tag's own tree.
+      #
+      # That leaves install.sh sourced differently from everything else here,
+      # and deliberately so: every other promoted asset comes from
+      # `gh release download` against the source *release*, while this one comes
+      # from the source *tag's tree*. Pulling it from the release instead would
+      # propagate whatever install.sh that release happened to carry, which for a
+      # release cut before #706 is master's copy under a new tag, and that is the
+      # bug this exists to stop.
+      #
+      # The cost, accepted: a ref that predates install.sh being tracked cannot
+      # be promoted at all, even when its published release carries a perfectly
+      # good installer asset. Failing loudly there is preferred over promoting a
+      # release whose installer does not correspond to its own tree.
+      #
+      # Ordered before the tag push deliberately. It needs only the checkout,
+      # and running it afterwards meant tripping it left a public tag with no
+      # release attached, which the next attempt could not recover from:
+      # `fetch-tags: true` refetches that tag, so `git tag` fails on it and the
+      # operator has to delete it by hand before re-running.
+      #
+      # #713: a ref that predates install.sh existing has nothing to extract.
+      # `action-gh-release` defaults `fail_on_unmatched_files: false`, so that
+      # would silently publish a release with no installer, and
+      # travsr.com/install.sh (a redirect to releases/latest/download/install.sh)
+      # would start 404ing for everyone with a green release and green CI.
+      # Failing here is the loud alternative.
+      - name: Take install.sh from the promoted tag's tree
+        shell: bash
+        env:
+          FROM_TAG: ${{ github.event.inputs.promote_from }}
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "$FROM_TAG:install.sh" 2>/dev/null; then
+            echo "::error::$FROM_TAG has no install.sh in its tree." >&2
+            echo "Promoting it would publish a release without the installer that" >&2
+            echo "travsr.com/install.sh redirects to, and the release would still" >&2
+            echo "be green. Promote a ref that carries install.sh." >&2
+            exit 1
+          fi
+          git show "$FROM_TAG:install.sh" > install.sh
+          chmod +x install.sh
+          echo "install.sh taken from $FROM_TAG ($(wc -c < install.sh) bytes)"
+
       - name: Create the promoted tag on the same commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -511,6 +686,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.promote_to }}
+          # #713: a listed file that does not exist is skipped silently by
+          # default. Every entry here is either produced by an earlier step in
+          # this job or asserted above, so an unmatched one means the job is
+          # wrong, not that the asset is optional.
+          fail_on_unmatched_files: true
           files: |
             dist/*.tar.gz
             dist/*.bundle
@@ -519,6 +699,116 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ needs.channel.outputs.prerelease }}
           make_latest: ${{ needs.channel.outputs.channel == 'stable' }}
+
+      - name: Assert the installer is actually downloadable
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL_TAG: ${{ github.event.inputs.promote_to }}
+        run: |
+          set -euo pipefail
+          # Captured before matching, not piped into `grep -q`. With pipefail
+          # set, `grep -q` exits at the first match and the pipeline returns 141
+          # if `gh` writes again after the pipe closes, so a present install.sh
+          # could read as absent. It does not fire today only because `gh`
+          # buffers its output into one write, and `install.sh` sorts first in
+          # the asset list, which is the worst case for that race.
+          for attempt in 1 2 3 4 5; do
+            assets=$(gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
+                       --json assets -q '.assets[].name' || true)
+            if grep -qx 'install.sh' <<<"$assets"; then
+              # Being listed is not the invariant. #714 is that the *bytes*
+              # served are the ones from the promoted ref, so download and
+              # compare rather than trusting the name.
+              # Retried with the listing rather than run once after it. An asset
+              # being listed does not mean it downloads on the first try, and a
+              # transient failure here would fail a correct release, which is the
+              # flakiness this loop exists to absorb.
+              if ! gh release download "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
+                     -p install.sh -O served.sh --clobber; then
+                echo "install.sh is listed on $REL_TAG but did not download (attempt $attempt), retrying"
+                sleep $((attempt * 3))
+                continue
+              fi
+              if ! cmp -s served.sh install.sh; then
+                echo "::error::$REL_TAG serves an install.sh that differs from the one attached." >&2
+                echo "The published asset is what travsr.com/install.sh hands to users," >&2
+                echo "so it has to be byte-identical to the copy this run attached." >&2
+                exit 1
+              fi
+              rm -f served.sh
+              echo "install.sh on $REL_TAG downloads and matches ($(wc -c < install.sh) bytes)"
+              exit 0
+            fi
+            echo "install.sh not visible on $REL_TAG yet (attempt $attempt), retrying"
+            sleep $((attempt * 3))
+          done
+          echo "::error::$REL_TAG has no install.sh asset." >&2
+          echo "This is the promote path, where the ref being promoted may predate" >&2
+          echo "install.sh existing. travsr.com/install.sh redirects to" >&2
+          echo "releases/latest/download/install.sh, so this would 404 the" >&2
+          echo "documented one-line installer." >&2
+          exit 1
+
+      # #750: the per-tag assertion above proves the release we just cut serves
+      # the right installer. It does not prove the pointer users actually hit
+      # does, and `travsr.com/install.sh` redirects to
+      # `releases/latest/download/install.sh`, not to any tag.
+      #
+      # Only meaningful when this release claims `latest`, which is the same
+      # condition `make_latest` uses. A prerelease does not move the pointer, so
+      # asserting it there would check somebody else's release.
+      #
+      # This repo has already been bitten here: `latest` sat on v0.11.0 while
+      # v1.0.0-rc.1 existed, so the installer being served was months older than
+      # the newest release.
+      - name: Assert the latest pointer serves this installer
+        if: needs.channel.outputs.channel == 'stable'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL_TAG: ${{ github.event.inputs.promote_to }}
+        run: |
+          set -euo pipefail
+          # Both halves retry together. Confirming the pointer through the API
+          # and then fetching it once assumes the download redirect is already
+          # consistent with what the API just reported, and if it lags for a
+          # moment a correct release fails the gate. That is the same flakiness
+          # the retries here exist to avoid, so the fetch and the compare sit
+          # inside the loop rather than after it.
+          latest=""
+          served=""
+          for attempt in 1 2 3 4 5; do
+            latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q .tag_name || true)
+            if [ "$latest" = "$REL_TAG" ]; then
+              # Fetched the way a user reaches it rather than through the tag,
+              # since the redirect is the thing under test.
+              if curl -fsSL -o latest.sh \
+                   "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh" \
+                 && cmp -s latest.sh install.sh; then
+                served="ok"
+                break
+              fi
+              echo "latest names $REL_TAG but does not serve its installer yet (attempt $attempt)"
+            else
+              echo "latest is '$latest', waiting for it to become '$REL_TAG' (attempt $attempt)"
+            fi
+            sleep $((attempt * 3))
+          done
+
+          if [ "$latest" != "$REL_TAG" ]; then
+            echo "::error::latest points at '$latest', not the '$REL_TAG' this run published." >&2
+            echo "travsr.com/install.sh redirects to releases/latest/download/install.sh," >&2
+            echo "so users would be served the installer from '$latest', not this one." >&2
+            exit 1
+          fi
+          if [ "$served" != "ok" ]; then
+            echo "::error::releases/latest/download/install.sh differs from the installer this run attached." >&2
+            echo "The pointer names $REL_TAG, so this is the served bytes, not the pointer." >&2
+            exit 1
+          fi
+          rm -f latest.sh
+          echo "latest points at $REL_TAG and serves the matching install.sh"
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
