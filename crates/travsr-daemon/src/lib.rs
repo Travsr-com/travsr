@@ -1267,6 +1267,13 @@ pub fn init_repo_with_progress(
 
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
     // path at query time without threading repo_root through function signatures.
+    //
+    // Re-stamped on every index, not written once. It used to be set at first
+    // init and left alone, so moving the checkout left it naming a directory
+    // that no longer existed and `find_pattern` handed that to `git -C` (#747).
+    // Consumers now fall back to the database's own location, and re-stamping
+    // here means the stored value stops being wrong in the first place: any
+    // re-index from the new path corrects it.
     if let Some(root_str) = repo_root.to_str() {
         store
             .set_meta("repo_root", root_str)

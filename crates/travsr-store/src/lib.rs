@@ -791,6 +791,31 @@ impl Drop for SqliteStore {
 }
 
 impl SqliteStore {
+    /// The repository this store's database sits inside, derived from the
+    /// database's own location rather than from anything recorded at index time.
+    ///
+    /// `meta.repo_root` is stamped once by `init` and never updated, so it names
+    /// wherever the repository lived then. Move the checkout, clone it to a
+    /// second path, mount it at a different point in CI, or rename a home
+    /// directory, and every consumer of that key is handed a path that no longer
+    /// exists (#747). The database travels with the repository, so its own path
+    /// cannot go stale in the same way.
+    ///
+    /// `None` for an in-memory store, which has no location to derive from.
+    pub fn repo_root_from_db_path(&self) -> Option<std::path::PathBuf> {
+        // `<repo>/.travsr/graph.db` -> `<repo>`, and only that shape.
+        //
+        // The directory name is checked rather than assumed. A database opened
+        // from somewhere else (a test fixture, an explicit `--db`) would
+        // otherwise yield whatever happens to sit two levels up, and a confident
+        // wrong root is worse than none: callers would resolve `vname.path`
+        // against an unrelated directory instead of degrading to metadata-only.
+        let dir = self.embed_db_path.as_deref()?.parent()?;
+        if dir.file_name()? != ".travsr" {
+            return None;
+        }
+        dir.parent().map(std::path::Path::to_path_buf)
+    }
     /// Open (or create) a SQLite-backed store at `path`, enabling WAL and
     /// running any pending migrations via [`MigrationRunner`].
     pub fn open(path: &Path) -> Result<Self, StoreError> {
