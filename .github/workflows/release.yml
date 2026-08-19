@@ -404,6 +404,52 @@ jobs:
           echo "so publishing this would 404 the documented one-line installer." >&2
           exit 1
 
+      # #750: the per-tag assertion above proves the release we just cut serves
+      # the right installer. It does not prove the pointer users actually hit
+      # does, and `travsr.com/install.sh` redirects to
+      # `releases/latest/download/install.sh`, not to any tag.
+      #
+      # Only meaningful when this release claims `latest`, which is the same
+      # condition `make_latest` uses. A prerelease does not move the pointer, so
+      # asserting it there would check somebody else's release.
+      #
+      # This repo has already been bitten here: `latest` sat on v0.11.0 while
+      # v1.0.0-rc.1 existed, so the installer being served was months older than
+      # the newest release.
+      - name: Assert the latest pointer serves this installer
+        if: needs.channel.outputs.channel == 'stable'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          latest=""
+          for attempt in 1 2 3 4 5; do
+            latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q .tag_name || true)
+            [ "$latest" = "$REL_TAG" ] && break
+            echo "latest is '$latest', waiting for it to become '$REL_TAG' (attempt $attempt)"
+            sleep $((attempt * 3))
+          done
+          if [ "$latest" != "$REL_TAG" ]; then
+            echo "::error::latest points at '$latest', not the '$REL_TAG' this run published." >&2
+            echo "travsr.com/install.sh redirects to releases/latest/download/install.sh," >&2
+            echo "so users would be served $latest's installer, not this one." >&2
+            exit 1
+          fi
+
+          # The pointer resolves; now check what it serves. Fetched the way a
+          # user reaches it rather than through the tag, since the redirect is
+          # the thing under test.
+          curl -fsSL -o latest.sh \
+            "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh"
+          if ! cmp -s latest.sh install.sh; then
+            echo "::error::releases/latest/download/install.sh differs from the installer this run attached." >&2
+            exit 1
+          fi
+          rm -f latest.sh
+          echo "latest points at $REL_TAG and serves the matching install.sh"
+
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
@@ -661,6 +707,52 @@ jobs:
           echo "releases/latest/download/install.sh, so this would 404 the" >&2
           echo "documented one-line installer." >&2
           exit 1
+
+      # #750: the per-tag assertion above proves the release we just cut serves
+      # the right installer. It does not prove the pointer users actually hit
+      # does, and `travsr.com/install.sh` redirects to
+      # `releases/latest/download/install.sh`, not to any tag.
+      #
+      # Only meaningful when this release claims `latest`, which is the same
+      # condition `make_latest` uses. A prerelease does not move the pointer, so
+      # asserting it there would check somebody else's release.
+      #
+      # This repo has already been bitten here: `latest` sat on v0.11.0 while
+      # v1.0.0-rc.1 existed, so the installer being served was months older than
+      # the newest release.
+      - name: Assert the latest pointer serves this installer
+        if: needs.channel.outputs.channel == 'stable'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL_TAG: ${{ github.event.inputs.promote_to }}
+        run: |
+          set -euo pipefail
+          latest=""
+          for attempt in 1 2 3 4 5; do
+            latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q .tag_name || true)
+            [ "$latest" = "$REL_TAG" ] && break
+            echo "latest is '$latest', waiting for it to become '$REL_TAG' (attempt $attempt)"
+            sleep $((attempt * 3))
+          done
+          if [ "$latest" != "$REL_TAG" ]; then
+            echo "::error::latest points at '$latest', not the '$REL_TAG' this run published." >&2
+            echo "travsr.com/install.sh redirects to releases/latest/download/install.sh," >&2
+            echo "so users would be served $latest's installer, not this one." >&2
+            exit 1
+          fi
+
+          # The pointer resolves; now check what it serves. Fetched the way a
+          # user reaches it rather than through the tag, since the redirect is
+          # the thing under test.
+          curl -fsSL -o latest.sh \
+            "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh"
+          if ! cmp -s latest.sh install.sh; then
+            echo "::error::releases/latest/download/install.sh differs from the installer this run attached." >&2
+            exit 1
+          fi
+          rm -f latest.sh
+          echo "latest points at $REL_TAG and serves the matching install.sh"
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
