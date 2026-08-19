@@ -384,8 +384,16 @@ jobs:
               # Being listed is not the invariant. #714 is that the *bytes*
               # served are the ones from the promoted ref, so download and
               # compare rather than trusting the name.
-              gh release download "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
-                 -p install.sh -O served.sh --clobber
+              # Retried with the listing rather than run once after it. An asset
+              # being listed does not mean it downloads on the first try, and a
+              # transient failure here would fail a correct release, which is the
+              # flakiness this loop exists to absorb.
+              if ! gh release download "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
+                     -p install.sh -O served.sh --clobber; then
+                echo "install.sh is listed on $REL_TAG but did not download (attempt $attempt), retrying"
+                sleep $((attempt * 3))
+                continue
+              fi
               if ! cmp -s served.sh install.sh; then
                 echo "::error::$REL_TAG serves an install.sh that differs from the one attached." >&2
                 echo "The published asset is what travsr.com/install.sh hands to users," >&2
@@ -453,7 +461,7 @@ jobs:
           if [ "$latest" != "$REL_TAG" ]; then
             echo "::error::latest points at '$latest', not the '$REL_TAG' this run published." >&2
             echo "travsr.com/install.sh redirects to releases/latest/download/install.sh," >&2
-            echo "so users would be served $latest's installer, not this one." >&2
+            echo "so users would be served the installer from '$latest', not this one." >&2
             exit 1
           fi
           if [ "$served" != "ok" ]; then
@@ -712,8 +720,16 @@ jobs:
               # Being listed is not the invariant. #714 is that the *bytes*
               # served are the ones from the promoted ref, so download and
               # compare rather than trusting the name.
-              gh release download "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
-                 -p install.sh -O served.sh --clobber
+              # Retried with the listing rather than run once after it. An asset
+              # being listed does not mean it downloads on the first try, and a
+              # transient failure here would fail a correct release, which is the
+              # flakiness this loop exists to absorb.
+              if ! gh release download "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
+                     -p install.sh -O served.sh --clobber; then
+                echo "install.sh is listed on $REL_TAG but did not download (attempt $attempt), retrying"
+                sleep $((attempt * 3))
+                continue
+              fi
               if ! cmp -s served.sh install.sh; then
                 echo "::error::$REL_TAG serves an install.sh that differs from the one attached." >&2
                 echo "The published asset is what travsr.com/install.sh hands to users," >&2
@@ -783,7 +799,7 @@ jobs:
           if [ "$latest" != "$REL_TAG" ]; then
             echo "::error::latest points at '$latest', not the '$REL_TAG' this run published." >&2
             echo "travsr.com/install.sh redirects to releases/latest/download/install.sh," >&2
-            echo "so users would be served $latest's installer, not this one." >&2
+            echo "so users would be served the installer from '$latest', not this one." >&2
             exit 1
           fi
           if [ "$served" != "ok" ]; then
