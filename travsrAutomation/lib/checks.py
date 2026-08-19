@@ -28,6 +28,21 @@ from travsr import (
     verify_sums,
 )
 
+
+# The identity a release signature must carry, character for character what
+# `install.sh` and `release.yml` demand.
+#
+# It pins the workflow *and* the tag ref, not just the repository. A pattern of
+# `^https://github\.com/Travsr-com/travsr/` alone matches any workflow in the
+# repo on any ref, so a signature produced by an unrelated workflow, or by
+# release.yml running off a branch, would satisfy it. A sanity suite that accepts
+# signatures the installer would reject is worse than no check: it reports the
+# supply chain as verified while testing something weaker than what users run.
+COSIGN_IDENTITY = (
+    r"^https://github\.com/Travsr-com/travsr/\.github/workflows/release\.yml"
+    r"@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$"
+)
+
 CheckFn = Callable[["Context"], tuple[Outcome, str]]
 
 
@@ -126,17 +141,21 @@ def check_signatures(ctx: Context) -> tuple[Outcome, str]:
     if shutil.which("cosign") is None:
         return Outcome.SKIP, "cosign not installed, so .bundle signatures were NOT verified"
 
-    bundles = sorted(ctx.artifacts.glob("*.tar.gz.bundle"))
-    if not bundles:
-        return Outcome.SKIP, "the release published no .bundle files to verify"
+    # Driven off the tarballs, not off the bundles. Iterating bundles asks
+    # "is every signature valid", which a release that shipped an artifact with
+    # no signature at all answers yes to. The question worth asking is "is every
+    # artifact signed", and only the tarball list can answer it.
+    blobs = sorted(ctx.artifacts.glob("*.tar.gz"))
+    if not blobs:
+        return Outcome.SKIP, "the release published no .tar.gz artifacts to verify"
 
     import subprocess
 
     verified, problems = 0, []
-    for bundle in bundles:
-        blob = bundle.with_suffix("")  # strip `.bundle`
-        if not blob.is_file():
-            problems.append(f"{bundle.name}: no matching artifact to verify")
+    for blob in blobs:
+        bundle = blob.with_suffix(blob.suffix + ".bundle")
+        if not bundle.is_file():
+            problems.append(f"{blob.name}: published with no .bundle signature")
             continue
         proc = subprocess.run(
             [
@@ -145,7 +164,7 @@ def check_signatures(ctx: Context) -> tuple[Outcome, str]:
                 # Keyless signing: the release workflow uses GitHub OIDC, so the
                 # identity is the workflow itself rather than a key.
                 "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com",
-                "--certificate-identity-regexp", r"^https://github\.com/Travsr-com/travsr/",
+                "--certificate-identity-regexp", COSIGN_IDENTITY,
                 str(blob),
             ],
             capture_output=True, text=True, timeout=300,
@@ -784,13 +803,20 @@ def check_graph_json_is_parseable(ctx: Context) -> tuple[Outcome, str]:
 def check_no_command_panics_on_a_missing_symbol(ctx: Context) -> tuple[Outcome, str]:
     """A symbol that does not exist must be answered, not crashed on."""
     problems = []
+    # `explain` takes <QUERY> <SYMBOL>; the others take one argument. Passing one
+    # to `explain` means clap rejects it and exits 2 before the command ever
+    # reaches the graph, so this check would pass without testing what it claims
+    # to: neither "panicked" nor a timeout trips on a usage error.
     for args in (("references", "zzz_no_such_symbol"),
                  ("graph", "zzz_no_such_symbol"),
                  ("ask", "zzz_no_such_symbol"),
-                 ("explain", "zzz_no_such_symbol")):
+                 ("explain", "zzz_no_such_symbol", "zzz_no_such_symbol")):
         r = ctx.cli.run(*args)
         if "panicked" in r.out:
             problems.append(f"{' '.join(args)} panicked")
         if r.timed_out:
             problems.append(f"{' '.join(args)} hung")
+        # A usage error means the command never ran, so the check proved nothing.
+        if "unexpected argument" in r.out or "required arguments were not provided" in r.out:
+            problems.append(f"{' '.join(args)} was rejected by clap, so nothing was tested:\n{r.out[:200]}")
     return (Outcome.FAIL, "\n".join(problems)) if problems else (Outcome.PASS, "")

@@ -3,18 +3,24 @@
 //!
 //! `travsr status` derives `semantic:` from three meta keys. `phase_b_commit ==
 //! last_commit` with `phase_b_dirty = 1` renders as
-//! `stale (run travsr init to refresh)`. Init's Phase A pass goes through
-//! `reindex_files`, which sets that flag because rewriting a file's Phase A
-//! nodes drops its `ref/call` edges (#583). The daemon's own Phase B path clears
-//! the flag when it advances `phase_b_commit`; the init path stamped the commit
-//! and left the flag set.
+//! `stale (run travsr init --semantic to refresh)`.
 //!
-//! The result was permanent: every later `travsr init` set the flag again on its
-//! Phase A pass and never cleared it, so the remediation the status message named
-//! was the command that reproduced the state. The graph was correct throughout,
-//! which is what made it a status-honesty bug rather than real staleness. This
-//! asserts both halves, since fixing the flag by suppressing the reindex would be
-//! a regression in the other direction.
+//! The flag is set by `reindex_files`, because rewriting a file's Phase A nodes
+//! drops its `ref/call` edges (#583). Init's own indexing does not route through
+//! `reindex_files`, so in the field the flag arrives from the watcher or a
+//! commit hook before the user ever runs `init`, and the tests below have to
+//! stamp it deliberately (see `mark_dirty`).
+//!
+//! The daemon's own Phase B path clears the flag when it advances
+//! `phase_b_commit`; the init path stamped the commit and left the flag set, so
+//! the state was permanent: nothing else cleared it, and the command the status
+//! message named did not either. The graph was correct throughout, which makes
+//! this a status-honesty bug rather than real staleness.
+//!
+//! Both halves are asserted, since fixing the flag by suppressing the reindex
+//! would be a regression in the other direction. Only `--semantic` clears it:
+//! plain `init` defers Phase B, so the edges really are missing there and the
+//! flag is honest, which is why the remedy names `--semantic`.
 
 use std::path::Path;
 use std::process::Command as StdCommand;
