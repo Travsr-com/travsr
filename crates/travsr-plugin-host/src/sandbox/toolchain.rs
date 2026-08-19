@@ -48,6 +48,23 @@ pub struct ToolchainAccess {
     pub env: Vec<(String, String)>,
 }
 
+/// Strip the Windows extended-length verbatim prefix (`\\?\`, `\\?\UNC\`) from a
+/// path. `std::fs::canonicalize` and the daemon's `repo_root` both carry it on
+/// Windows, but the analyzer sidecars (scip-dotnet's `System.Uri`, sbt, …) and
+/// env vars like `DOTNET_ROOT` cannot parse it. No-op on unix and on any
+/// already-clean path.
+pub(crate) fn strip_windows_verbatim(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    match s
+        .strip_prefix(r"\\?\UNC\")
+        .map(|r| format!(r"\\{r}"))
+        .or_else(|| s.strip_prefix(r"\\?\").map(|r| r.to_string()))
+    {
+        Some(stripped) => PathBuf::from(stripped),
+        None => p,
+    }
+}
+
 /// Compute the toolchain grants for a language's Phase B analyzer.
 /// Empty for languages with no out-of-repo toolchain needs.
 pub fn toolchain_access(language: &str) -> ToolchainAccess {
@@ -432,6 +449,45 @@ fn php_access() -> ToolchainAccess {
 ///   - dotnet runtime root (read) — non-standard for Homebrew installs on macOS
 ///   - `DOTNET_ROOT` env — scip-dotnet needs it when dotnet is not in /usr/local
 ///   - `HOME` env var — dotnet uses it for config resolution
+///
+/// Resolve the dotnet install root that holds `host/`, `sdk/`, `shared/` — the
+/// value `DOTNET_ROOT` must point at, and the dir the sandbox must grant read +
+/// execute so scip-dotnet's apphost can load the runtime and shell out to
+/// `dotnet`. Uses `tool_path` (PATHEXT-aware, so `dotnet.exe` resolves on
+/// Windows — the old `dir.join("dotnet")` PATH scan never matched there, leaving
+/// Windows with no DOTNET_ROOT and no exec grant). Only accepts a root that
+/// actually carries an SDK, and falls back to the per-user `~/.dotnet` when
+/// `dotnet` on PATH is a runtime-only host.
+fn dotnet_sdk_root() -> Option<PathBuf> {
+    let exe = travsr_core::exec::tool_path("dotnet")?;
+    // canonicalize resolves symlinks (Homebrew's `bin/dotnet` shim) but adds the
+    // `\\?\` verbatim prefix on Windows — strip it, or dotnet chokes on a
+    // `\\?\`-prefixed DOTNET_ROOT / exec-grant path.
+    let real = strip_windows_verbatim(std::fs::canonicalize(&exe).unwrap_or(exe));
+    let dir = real.parent()?;
+    // Require an actual `sdk/` (not just `host/`): scip-dotnet runs `dotnet
+    // restore`/build, so a runtime-only host root is useless. `C:\Program
+    // Files\dotnet` carries `host/` even when SDK-less, so a `host/` check would
+    // wrongly pick it over a real SDK elsewhere.
+    if dir.join("sdk").is_dir() {
+        return Some(dir.to_path_buf());
+    }
+    // Homebrew macOS: …/Cellar/dotnet/<ver>/bin/dotnet → …/libexec holds the SDK.
+    if let Some(libexec) = dir.parent().map(|p| p.join("libexec")) {
+        if libexec.join("sdk").is_dir() {
+            return Some(libexec);
+        }
+    }
+    // `dotnet` on PATH is a runtime-only host (no SDK): fall back to the per-user
+    // dotnet-install default that actually carries an SDK.
+    if let Some(d) = home().map(|h| h.join(".dotnet")) {
+        if d.join("sdk").is_dir() {
+            return Some(d);
+        }
+    }
+    None
+}
+
 fn csharp_access() -> ToolchainAccess {
     let mut read_paths = Vec::new();
     let mut write_paths = Vec::new();
@@ -465,29 +521,14 @@ fn csharp_access() -> ToolchainAccess {
         }
     }
 
-    // dotnet runtime root — required when dotnet is installed via Homebrew.
-    // Homebrew: /opt/homebrew/bin/dotnet → /opt/homebrew/opt/dotnet/libexec/dotnet
-    // Resolved from DOTNET_ROOT env, or by canonicalizing `which dotnet` → parent dir.
-    // DOTNET_ROOT must point at the directory containing host/, sdk/, shared/.
-    // Homebrew canonical path: …/Cellar/dotnet/<ver>/bin/dotnet
-    //   parent(bin) → parent(install root) → join(libexec) = correct DOTNET_ROOT.
+    // dotnet runtime root (holds host/, sdk/, shared/): honour DOTNET_ROOT if set,
+    // else resolve it via `dotnet_sdk_root` (PATHEXT-aware, so it works on Windows
+    // where scip-dotnet's apphost needs both the exec grant below and the injected
+    // DOTNET_ROOT to locate the runtime; also covers Homebrew's libexec layout).
     let dotnet_root: Option<PathBuf> = std::env::var("DOTNET_ROOT")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| {
-            let exe = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .map(|d| d.join("dotnet"))
-                .find(|p| p.is_file())?;
-            let real = std::fs::canonicalize(&exe).ok()?;
-            let libexec = real.parent()?.parent()?.join("libexec");
-            if libexec.is_dir() {
-                Some(libexec)
-            } else {
-                real.parent()
-                    .and_then(|b| b.parent())
-                    .map(|p| p.to_path_buf())
-            }
-        });
+        .or_else(dotnet_sdk_root);
     if let Some(ref p) = dotnet_root {
         tracing::debug!(path = %p.display(), "csharp_access: DOTNET_ROOT grant (read)");
         read_paths.push(p.clone());
@@ -865,5 +906,39 @@ fn go_access() -> ToolchainAccess {
         write_paths,
         exec_paths,
         env,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_windows_verbatim;
+    use std::path::PathBuf;
+
+    #[test]
+    fn strips_drive_verbatim_prefix() {
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from(r"\\?\C:\Users\home\.dotnet")),
+            PathBuf::from(r"C:\Users\home\.dotnet")
+        );
+    }
+
+    #[test]
+    fn strips_unc_verbatim_prefix_back_to_unc() {
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
+        );
+    }
+
+    #[test]
+    fn no_op_on_clean_paths() {
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from(r"C:\repo")),
+            PathBuf::from(r"C:\repo")
+        );
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from("/home/user/repo")),
+            PathBuf::from("/home/user/repo")
+        );
     }
 }

@@ -792,15 +792,13 @@ fn cmd_install(
         println!("\n{}", crate::install::path_hint());
     }
 
-    // Only claim "enabled" when full analysis will actually run here. If the
-    // analyzer is still missing, the WrapperOnly branch below states the honest
-    // "set up, but analyzer not installed" instead — saying "Semantic analysis
-    // enabled for this repository" first would contradict `lang status`, which
-    // reads such a language as "not enabled" (analysis off) until the analyzer
-    // lands. The repo trust grant was still recorded either way.
-    if enabled_here && full_ready {
-        println!("Semantic analysis enabled for this repository.");
-    }
+    // The success line at the end of this function carries the repo-scope
+    // confirmation ("... on for this repository") when the language was enabled
+    // here AND is fully ready — one line instead of a separate "Semantic
+    // analysis enabled for this repository." above it saying the same thing.
+    // When the analyzer is still missing, the WrapperOnly branch below states
+    // the honest "set up, but analyzer not installed"; the repo trust grant was
+    // recorded either way.
 
     if !full_ready {
         // The most common "not ready" cause across every platform (go/npm/dotnet
@@ -813,6 +811,24 @@ fn cmd_install(
                     "'{}' is not installed on your machine. Install it, then run \
                      `travsr lang install {language}` again.",
                     cmd_args[0]
+                );
+                return Ok(InstallStatus::WrapperOnly);
+            }
+            // Driver present, analyzer still absent, and travsr did NOT attempt an
+            // auto-install (non-interactive without --yes — with --yes or an
+            // interactive prompt it already tried, so a "how to install" nudge
+            // would misread). One actionable block: the install command plus the
+            // --yes shortcut. run_pkg_command stays silent in this mode, so this
+            // is the only message — no stacked hint + generic paragraph.
+            let attempted_auto =
+                yes || (!no_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin()));
+            if !attempted_auto {
+                println!(
+                    "'{language}' isn't fully set up yet: its analyzer '{}' isn't installed.\n\
+                     Install it, or re-run `travsr lang install {language} --yes` to let travsr do it:\n\t{}\n\
+                     Basic analysis still runs until then.",
+                    entry.command,
+                    cmd_args.join(" ")
                 );
                 return Ok(InstallStatus::WrapperOnly);
             }
@@ -839,7 +855,11 @@ fn cmd_install(
         return Ok(InstallStatus::WrapperOnly);
     }
 
-    println!("'{language}' is active — full cross-file analysis is on.");
+    if enabled_here {
+        println!("'{language}' is active — full cross-file analysis is on for this repository.");
+    } else {
+        println!("'{language}' is active — full cross-file analysis is on.");
+    }
     Ok(InstallStatus::FullyReady)
 }
 
@@ -891,11 +911,10 @@ fn run_pkg_command(
         println!("Auto-installing: {}", cmd_args.join(" "));
         true
     } else {
-        println!(
-            "Note: '{}' not found. Install it:\n\n\t{}",
-            entry.command,
-            cmd_args.join(" ")
-        );
+        // Non-interactive without --yes: stay silent. install()'s `!full_ready`
+        // branch prints ONE actionable block for this case (the install command
+        // plus the --yes shortcut). Printing a near-identical "Note: not found"
+        // hint here too just stacked two blocks saying the same thing.
         false
     };
     if !do_run {
@@ -966,15 +985,17 @@ fn install_scip_tool(
         );
     }
     match entry.scip_install {
-        ScipInstall::Command(cmd_args) => {
-            if let CmdOutcome::Ran { success: true } =
-                run_pkg_command(entry, cmd_args, interactive, yes)?
-            {
-                // Trust exit 0: the binary may be in $GOPATH/bin, ~/.cargo/bin,
-                // or another tool-managed dir not yet in the process's PATH.
-                return Ok(true);
-            }
-        }
+        ScipInstall::Command(cmd_args) => match run_pkg_command(entry, cmd_args, interactive, yes)?
+        {
+            // Trust exit 0: the binary may be in $GOPATH/bin, ~/.cargo/bin, or
+            // another tool-managed dir not yet in the process's PATH.
+            CmdOutcome::Ran { success: true } => return Ok(true),
+            // Not run (declined / no --yes) or the command failed: the tool may
+            // still already be present — e.g. `--reinstall` forces this path even
+            // when nothing is missing. Re-check instead of reporting a false "not
+            // installed" (the old code returned false unconditionally here → G4).
+            _ => return Ok(analyzer_command_present(entry)),
+        },
         ScipInstall::CommandThenGithubGz(cmd_args, ref spec) => {
             // Preferred path: the toolchain-managed command (e.g. `rustup
             // component add rust-analyzer`) — version-matched and no

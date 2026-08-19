@@ -841,7 +841,16 @@ impl PluginIndexer {
                                 // crash instead of hanging this scoped thread — no
                                 // bespoke timeout needed here.
                                 let req = travsr_plugin_protocol::InvokeRequest {
-                                    root: repo_root.to_path_buf(),
+                                    // Strip the Windows `\\?\` verbatim prefix ONCE here,
+                                    // for every sidecar: the daemon's repo_root is
+                                    // canonicalized (extended-length) on Windows, and
+                                    // analyzers that build a URI / working-directory from
+                                    // it (scip-dotnet, sbt, KLS) choke on the prefix. This
+                                    // is the systemic counterpart to the per-wrapper strips
+                                    // (kotlin K7, scala S7, csharp) — belt and suspenders.
+                                    root: crate::sandbox::toolchain::strip_windows_verbatim(
+                                        repo_root.to_path_buf(),
+                                    ),
                                     corpus: corpus.to_string(),
                                     scratch: std::path::PathBuf::default(),
                                     // P6 (#329): forward pre-walked file list so the
