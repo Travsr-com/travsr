@@ -243,7 +243,7 @@ mod tests {
         cache.insert(key(2), response_with_nodes(big, 1024));
         assert!(
             cache.get("1.0.0", [1; 32]).is_some(),
-            "refreshing key 2 must not evict key 1; the delta is zero"
+            "refreshing key 2 must not evict key 1 — the delta is zero"
         );
         assert!(cache.get("1.0.0", [2; 32]).is_some());
         assert!(cache.approx_bytes <= MAX_CACHE_BYTES);

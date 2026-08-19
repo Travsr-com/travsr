@@ -133,7 +133,7 @@ function parseNodeLine(raw: string): Omit<ContextNode, "snippet"> | null {
 
   // Split on em-dash separator: '{sig} ({kind}) — {path}[:{line}]'
   // The em-dash character is U+2014.
-  const dashIdx = rest.indexOf(", ");
+  const dashIdx = rest.indexOf(" — ");
   if (dashIdx < 0) return null;
 
   const leftPart = rest.slice(0, dashIdx);
@@ -177,7 +177,7 @@ function parseNodeLine(raw: string): Omit<ContextNode, "snippet"> | null {
 function looksLikeSnippetHeader(line: string): boolean {
   if (!line || line.startsWith(" ") || line.startsWith("\t")) return false;
   if (line.trim().startsWith("[") || line.trim() === "───") return false;
-  return line.includes(", ") && /\s+\(\w+\)/.test(line);
+  return line.includes(" — ") && /\s+\(\w+\)/.test(line);
 }
 
 /** True only for the trailing summary footer "[N symbols, …]". Must NOT match a
@@ -203,7 +203,7 @@ export function parseSnippetsResult(text: string): Map<string, string> {
     if (!looksLikeSnippetHeader(line)) { i++; continue; }
 
     // Parse header: "{sig} ({kind}) — {path} [package: {pkg}]"
-    const dashIdx = trimmed.indexOf(", ");
+    const dashIdx = trimmed.indexOf(" — ");
     if (dashIdx < 0) { i++; continue; }
     const kindM = /^(.+)\s+\(\w+\)$/.exec(trimmed.slice(0, dashIdx).trim());
     if (!kindM) { i++; continue; }
@@ -289,7 +289,7 @@ export function parseContextResult(text: string): ContextResult {
         withSnippets: 0,
         metaTokens: parseInt(footerSimpleM[2], 10),
         snippetTokens: 0,
-        budget: ",",
+        budget: "—",
       };
       i++;
       continue;

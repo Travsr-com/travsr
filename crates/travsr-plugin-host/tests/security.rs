@@ -428,7 +428,7 @@ fn sandbox_repo_root_is_read_only() {
             let _ = spawner.output();
             assert!(
                 !breach_path.exists(),
-                "sandbox allowed write to repo root, FS confinement broken"
+                "sandbox allowed write to repo root — FS confinement broken"
             );
         }
     }
@@ -461,7 +461,7 @@ fn sandbox_scratch_dir_is_writable() {
             let status = spawner.status().expect("spawn");
             assert!(
                 status.success(),
-                "sandbox blocked write to /travsr-scratch, should be writable"
+                "sandbox blocked write to /travsr-scratch — should be writable"
             );
         }
     }

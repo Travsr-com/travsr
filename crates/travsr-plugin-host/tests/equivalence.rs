@@ -60,7 +60,7 @@ fn assert_equivalent(lang: &str, abs_path: &Path, vname_path: &str) {
     assert_eq!(
         old.nodes.len(),
         new.nodes.len(),
-        "{lang}: node count mismatch, old={}, new={}",
+        "{lang}: node count mismatch — old={}, new={}",
         old.nodes.len(),
         new.nodes.len()
     );
@@ -68,7 +68,7 @@ fn assert_equivalent(lang: &str, abs_path: &Path, vname_path: &str) {
     for (i, (o, n)) in old.nodes.iter().zip(new.nodes.iter()).enumerate() {
         assert_eq!(
             o.id, n.id,
-            "{lang}: node[{i}] id mismatch, old={:?} new={:?}\n  old vname={:?}\n  new vname={:?}",
+            "{lang}: node[{i}] id mismatch — old={:?} new={:?}\n  old vname={:?}\n  new vname={:?}",
             o.id, n.id, o.vname, n.vname
         );
         assert_eq!(o.kind, n.kind, "{lang}: node[{i}] kind mismatch");
@@ -79,7 +79,7 @@ fn assert_equivalent(lang: &str, abs_path: &Path, vname_path: &str) {
     assert_eq!(
         old.edges.len(),
         new.edges.len(),
-        "{lang}: edge count mismatch, old={}, new={}",
+        "{lang}: edge count mismatch — old={}, new={}",
         old.edges.len(),
         new.edges.len()
     );

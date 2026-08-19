@@ -957,7 +957,7 @@ export function buildHtmlContent(
 <!-- ── Status bar ───────────────────────────────────────────────────────── -->
 <div id="statusbar" role="status" aria-live="polite">
   <span id="fresh"><span class="dot-pulse" aria-hidden="true"></span><span id="freshText">connecting…</span></span>
-  <span id="statusGraph">,</span>
+  <span id="statusGraph">—</span>
   <span id="noiseBadge" style="display:none" aria-live="polite"></span>
   <span id="diagBadge" style="display:none" aria-live="polite"></span>
   <div class="legend" aria-label="Node type legend">

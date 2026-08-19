@@ -65,7 +65,7 @@ impl Plugin for RustPlugin {
                 }
                 Err(e) => tracing::warn!("rust lsif ingest: {e}"),
             },
-            Ok(None) => tracing::debug!("rust-analyzer not available, native phase_b only"),
+            Ok(None) => tracing::debug!("rust-analyzer not available — native phase_b only"),
             Err(e) => tracing::warn!("rust-analyzer failed: {e}"),
         }
 

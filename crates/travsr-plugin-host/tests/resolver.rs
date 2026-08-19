@@ -55,7 +55,7 @@ fn builtin_resolver_provides_rust_and_typescript() {
     // resolve("go") — not a builtin, must return None.
     assert!(
         resolver.resolve("go").is_none(),
-        "go is not a builtin, must return None"
+        "go is not a builtin — must return None"
     );
 }
 
@@ -266,7 +266,7 @@ fn plugin_spec_standard_policy_is_deny_network() {
         );
         assert!(
             result.is_err(),
-            "Linux sandbox builder must return Err on macOS, no panic"
+            "Linux sandbox builder must return Err on macOS — no panic"
         );
     }
 }
@@ -371,6 +371,6 @@ fn corpus_flows_into_invoke_request() {
 
     assert_eq!(
         req.corpus, corpus,
-        "InvokeRequest.corpus must equal PluginIndexer.corpus, corpus threading broken"
+        "InvokeRequest.corpus must equal PluginIndexer.corpus — corpus threading broken"
     );
 }

@@ -302,10 +302,10 @@ export function buildStatsView(raw: string): StatsView {
       const m = new RegExp(`^${key}:\\s*(.+)$`).exec(l.trim());
       if (m) return m[1];
     }
-    return ",";
+    return "—";
   };
-  let dbSize = ",";
-  let lastIndexed = ",";
+  let dbSize = "—";
+  let lastIndexed = "—";
   const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (root) {
     try {
@@ -940,7 +940,7 @@ export async function readDiagnostics(binary: string, cwd: string): Promise<Diag
       : "warn";
     found.push({
       severity,
-      title: text.replace(/\s*[-,.]?\s*(re-?run|run)\s+`[^`]+`.*$/i, "").trim(),
+      title: text.replace(/\s*[-—.]?\s*(re-?run|run)\s+`[^`]+`.*$/i, "").trim(),
       hint: text,
       command: cmd ? cmd[1] : undefined,
     });
