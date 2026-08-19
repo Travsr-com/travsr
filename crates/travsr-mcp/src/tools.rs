@@ -59,11 +59,11 @@ fn dependency_arg_hint(store: &SqliteStore, file: &str) -> Option<String> {
     }
     match nodes.first() {
         Some(n) => Some(format!(
-            "'{file}' resolved to {} '{}', not a file — get_dependencies takes a repo-relative file path. For a symbol, use get_callers or find_references.",
+            "'{file}' resolved to {} '{}', not a file, get_dependencies takes a repo-relative file path. For a symbol, use get_callers or find_references.",
             n.kind, n.vname.signature
         )),
         None => Some(format!(
-            "no file matched '{file}' — get_dependencies takes a repo-relative file path (run get_repo_map to list files)."
+            "no file matched '{file}', get_dependencies takes a repo-relative file path (run get_repo_map to list files)."
         )),
     }
 }
@@ -187,7 +187,7 @@ fn get_dependencies_raw(store: &SqliteStore, file: &str) -> String {
         .collect();
     if total_deps > DEFAULT_DEPS_TOP_K {
         lines.push(format!(
-            "[showing {DEFAULT_DEPS_TOP_K} of {total_deps} — use get_context for ranked coverage or get_dependencies with transitive=true for the full tree]"
+            "[showing {DEFAULT_DEPS_TOP_K} of {total_deps}; use get_context for ranked coverage or get_dependencies with transitive=true for the full tree]"
         ));
     }
     lines.join("\n")
@@ -218,8 +218,8 @@ fn phase_b_pending(store: &SqliteStore) -> bool {
 /// never disagree about completeness. Returns the note to append, or `None`
 /// when Phase B is complete for the current commit.
 pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
-    const PENDING: &str = "[note: call-graph index incomplete — semantic analysis has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
-    const STALE: &str = "[note: call-graph edges degraded — a background re-index dropped call edges since the last semantic analysis run; empty results are not authoritative. Run `travsr init` to rebuild.]";
+    const PENDING: &str = "[note: call-graph index incomplete, semantic analysis has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
+    const STALE: &str = "[note: call-graph edges degraded, a background re-index dropped call edges since the last semantic analysis run; empty results are not authoritative. Run `travsr init` to rebuild.]";
     let phase_b = store
         .get_meta("phase_b_commit")
         .ok()
@@ -570,7 +570,7 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
                 if !sites.is_empty() {
                     for line in sites {
                         lines.push(format!(
-                            "{tag} {} ({}) — {}:{}",
+                            "{tag} {} ({}) \u{2014} {}:{}",
                             src_node.vname.signature, src_node.kind, src_node.vname.path, line
                         ));
                     }
@@ -582,7 +582,7 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         // report the node's definition line as before.
         let loc = src_node.line.map(|l| format!(":{l}")).unwrap_or_default();
         lines.push(format!(
-            "{tag} {} ({}) — {}{}",
+            "{tag} {} ({}) \u{2014} {}{}",
             src_node.vname.signature, src_node.kind, src_node.vname.path, loc
         ));
     }
@@ -1009,13 +1009,13 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
         }
         RefTarget::Ambiguous(nodes) => {
             let mut out = format!(
-                "'{symbol}' is ambiguous — {} definitions. Re-run with a `path` hint to pick one:\n",
+                "'{symbol}' is ambiguous, {} definitions. Re-run with a `path` hint to pick one:\n",
                 nodes.len()
             );
             for n in nodes.iter().take(MAX_REFERENCE_SITES) {
                 let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
                 out.push_str(&format!(
-                    "  {} ({}) — {}{}\n",
+                    "  {} ({}) \u{2014} {}{}\n",
                     n.vname.signature, n.kind, n.vname.path, loc
                 ));
             }
@@ -1025,7 +1025,7 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
 
     let resolved_loc = target.line.map(|l| format!(":{l}")).unwrap_or_default();
     let header = format!(
-        "resolved: {} ({}) — {}{}",
+        "resolved: {} ({}) \u{2014} {}{}",
         target.vname.signature, target.kind, target.vname.path, resolved_loc
     );
 
@@ -1092,7 +1092,7 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // run finished. Soften first so a crash is never reported as a clean zero.
         if phase_b_lang_crashed(store, lang) {
             return format!(
-                "{header}\n0 recorded reference(s) — not a definitive zero. Semantic \
+                "{header}\n0 recorded reference(s), not a definitive zero. Semantic \
                  analysis for '{lang}' crashed on its last run, so its occurrence \
                  coverage is partial. Run `travsr status` for detail, `travsr init \
                  --semantic --force` to rebuild, or `find_pattern` for a textual search."
@@ -1138,7 +1138,7 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                 store.language_occurrence_coverage(lang).unwrap_or((0, 0));
             let coverage_pct = (100 * files_with_occ).checked_div(files_total).unwrap_or(0) as u32;
             return format!(
-                "{header}\n0 recorded reference(s) — not a definitive zero. No \
+                "{header}\n0 recorded reference(s), not a definitive zero. No \
                  reference occurrences are recorded for '{}' itself, so semantic \
                  analysis may never have covered this file ({files_with_occ} of \
                  {files_total} '{lang}' files in this repo carry occurrence data, \
@@ -1159,7 +1159,7 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                 .is_some_and(|v| !v.is_empty())
         {
             return format!(
-                "{header}\n0 recorded reference(s) — not a definitive zero. This \
+                "{header}\n0 recorded reference(s), not a definitive zero. This \
                  repo's Dart dependencies are not resolved (no \
                  `.dart_tool/package_config.json`), so cross-package references \
                  are not indexed. Run `dart pub get` and re-run `travsr init`, or \
@@ -1190,7 +1190,7 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
     let mut lines = Vec::with_capacity(total + 2);
     lines.push(header.to_string());
     lines.push(format!(
-        "{total} caller definition(s) (exact occurrence lines unavailable for this language — showing caller definitions):"
+        "{total} caller definition(s) (exact occurrence lines unavailable for this language, showing caller definitions):"
     ));
     lines.extend(sites.into_iter().take(MAX_REFERENCE_SITES));
     // #715: these structural caller definitions can also be short if the
@@ -1355,7 +1355,7 @@ pub fn find_pattern_raw(
             .map(|note| format!("no matches. {note}"))
             .unwrap_or_default(),
         GrepOutcome::Error(detail) => format!(
-            "pattern error: {detail} — the pattern is POSIX ERE; use --fixed for a literal \
+            "pattern error: {detail}; the pattern is POSIX ERE; use --fixed for a literal \
              search, or escape metacharacters."
         ),
     }
@@ -2654,7 +2654,10 @@ fn search_symbol_raw(
         .take(MAX_SEARCH_RESULTS)
         .map(|n| {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
-            format!("{} ({}) — {}{loc}", n.vname.signature, n.kind, n.vname.path)
+            format!(
+                "{} ({}) \u{2014} {}{loc}",
+                n.vname.signature, n.kind, n.vname.path
+            )
         })
         .collect();
     lines.join("\n")
@@ -2989,7 +2992,7 @@ fn get_repo_map_raw(store: &SqliteStore, reserve_per_line: usize) -> String {
     // State 1: not indexed. An empty string is indistinguishable to an agent from
     // "empty repo" or "error"; give it an actionable line instead.
     if nodes.is_empty() {
-        return "Repo not indexed by Travsr — run `travsr init` to build the graph.".to_string();
+        return "Repo not indexed by Travsr; run `travsr init` to build the graph.".to_string();
     }
 
     // Directory skeleton from all local file paths → adaptive regions.
@@ -3069,12 +3072,12 @@ fn get_repo_map_raw(store: &SqliteStore, reserve_per_line: usize) -> String {
     let mut header = String::new();
     if fail_open {
         header.push_str(
-            "Repo map — components ranked by code volume (symbols); \
+            "Repo map, components ranked by code volume (symbols); \
              no cross-component dependencies detected.\n",
         );
     } else {
         header.push_str(
-            "Repo map — components ranked by dependents (most load-bearing first); \
+            "Repo map, components ranked by dependents (most load-bearing first); \
              symbols = code volume.\n",
         );
     }
@@ -3082,7 +3085,7 @@ fn get_repo_map_raw(store: &SqliteStore, reserve_per_line: usize) -> String {
     // call-graph data is absent, which affects the tools the agent calls next.
     if !has_refcall {
         header.push_str(
-            "Note: semantic analysis has not run — dependents are from import \
+            "Note: semantic analysis has not run, dependents are from import \
              structure only; call-graph data is unavailable. Commit to run it.\n",
         );
     }
@@ -3508,7 +3511,7 @@ fn get_execution_path_body(
         _ => {
             if diagnose {
                 return format!(
-                    "could not resolve source '{source}' and/or sink '{sink}' — verify the names with search_symbol, or pass full signatures (e.g. fn:charge)."
+                    "could not resolve source '{source}' and/or sink '{sink}', verify the names with search_symbol, or pass full signatures (e.g. fn:charge)."
                 );
             }
             return String::new();
@@ -3540,7 +3543,12 @@ fn get_execution_path_body(
 
     let lines: Vec<String> = path
         .iter()
-        .map(|n| format!("{} ({}) — {}", n.vname.signature, n.kind, n.vname.path))
+        .map(|n| {
+            format!(
+                "{} ({}) \u{2014} {}",
+                n.vname.signature, n.kind, n.vname.path
+            )
+        })
         .collect();
     lines.join("\n")
 }
@@ -4124,23 +4132,23 @@ fn build_context_signals_with_r2(
     }
     if embed_warming {
         parts.push(
-            "[note: semantic embeddings still warming up (sidecar starting) — this result is lexical-only; retry in a few seconds for full semantic ranking]",
+            "[note: semantic embeddings still warming up (sidecar starting); this result is lexical-only; retry in a few seconds for full semantic ranking]",
         );
     } else if has_embed && knn_degraded {
         parts.push(
-            "[note: semantic search degraded — KNN timed out or returned empty; results are lexical only]",
+            "[note: semantic search degraded, KNN timed out or returned empty; results are lexical only]",
         );
     } else if !has_embed && embed_initialized {
         // Phase 1 has run (embed.db exists) but KNN hook not yet active.
         parts.push(
-            "[note: embedding in progress — run `travsr embed status` to check; results improve as index builds]",
+            "[note: embedding in progress; run `travsr embed status` to check; results improve as index builds]",
         );
     } else if !has_embed {
-        parts.push("[note: semantic search disabled — run `travsr embed init` for better results]");
+        parts.push("[note: semantic search disabled; run `travsr embed init` for better results]");
     }
     if phase_b_pending {
         parts.push(
-            "[note: call traversal limited — run `travsr lang install <lang>` to enable call-graph edges]",
+            "[note: call traversal limited; run `travsr lang install <lang>` to enable call-graph edges]",
         );
     }
     parts.join("\n")
@@ -4202,12 +4210,12 @@ fn format_node_line(
     };
     if n.package.is_empty() {
         format!(
-            "{} ({}) — {}{loc}{via}{score_str}",
+            "{} ({}) \u{2014} {}{loc}{via}{score_str}",
             n.vname.signature, n.kind, n.vname.path
         )
     } else {
         format!(
-            "{} ({}) — {}{loc} [package: {}]{via}{score_str}",
+            "{} ({}) \u{2014} {}{loc} [package: {}]{via}{score_str}",
             n.vname.signature, n.kind, n.vname.path, n.package
         )
     }
@@ -4218,8 +4226,8 @@ fn format_node_line(
 /// (vs a per-row badge) and disambiguates the Exact section's non-rerank score.
 fn match_source_header(ms: crate::seed::MatchSource) -> &'static str {
     match ms {
-        crate::seed::MatchSource::Exact => "## exact matches — literal symbol / text (not relevance-ranked)",
-        crate::seed::MatchSource::Semantic => "## related — ranked by relevance",
+        crate::seed::MatchSource::Exact => "## exact matches, literal symbol / text (not relevance-ranked)",
+        crate::seed::MatchSource::Semantic => "## related, ranked by relevance",
         // #376 Phase 2 (§4.1): no raw cosine printed in this section — see
         // build_docs_section's doc comment for why (doc cosines and code
         // cosines are not commensurable; a printed number invites exactly the
@@ -4229,8 +4237,8 @@ fn match_source_header(ms: crate::seed::MatchSource) -> &'static str {
         }
         // #479: test entry points & fixtures, capped and placed below the
         // implementation/design sections so a `#[test]` fn never leads.
-        crate::seed::MatchSource::Tests => "## tests — test entry points & fixtures",
-        crate::seed::MatchSource::Relevant => "## relevant — graph-adjacent context",
+        crate::seed::MatchSource::Tests => "## tests, test entry points & fixtures",
+        crate::seed::MatchSource::Relevant => "## relevant, graph-adjacent context",
     }
 }
 
@@ -4818,7 +4826,7 @@ fn get_context_body(
             tracing::warn!(
                 knn_elapsed_ms,
                 threshold_ms = budget_ms,
-                "knn exceeded circuit-breaker threshold — falling back to FTS seeds"
+                "knn exceeded circuit-breaker threshold, falling back to FTS seeds"
             );
             knn_degraded = true;
             (vec![], std::collections::HashMap::new())
@@ -4879,7 +4887,7 @@ fn get_context_body(
                             format!(" [package: {}]", n.package)
                         };
                         format!(
-                            "  {} ({}) — {}{loc}{pkg}",
+                            "  {} ({}) \u{2014} {}{loc}{pkg}",
                             n.vname.signature, n.kind, n.vname.path
                         )
                     })
@@ -4911,7 +4919,7 @@ fn get_context_body(
     // be relevant. This prevents confident-salad responses (64 nodes returned for
     // "quantum blockchain payment handler" with no graph matches).
     let weak_match_note: Option<&str> = if seed_set.confidence == crate::seed::Confidence::Weak {
-        Some("[note: no strong match found — results are weak/structural and may not be relevant to this query]")
+        Some("[note: no strong match found, results are weak/structural and may not be relevant to this query]")
     } else {
         None
     };
@@ -5250,7 +5258,7 @@ fn get_context_body(
             let n_overflow = n_candidates - n_nodes;
             let min_score: f32 = overflow.last().map(|item| item.1).unwrap_or(0.0);
             let mut msg = format!(
-                "[{n_overflow} more node(s) matched (score \u{2265} {min_score:.2}) — budget exhausted. \
+                "[{n_overflow} more node(s) matched (score \u{2265} {min_score:.2}), budget exhausted. \
                  Use a specific symbol name for deeper coverage, or call \
                  get_blast_radius / get_callers / get_dependencies for complete results.]"
             );
@@ -5269,7 +5277,7 @@ fn get_context_body(
     // Seed-cap signal: emit when eligible candidates exceeded MAX_EMBED_SEEDS.
     let seed_cap_msg: Option<&str> = if seed_cap_fired {
         Some(
-            "[note: query matched more seed candidates than the cap — \
+            "[note: query matched more seed candidates than the cap, \
              consider narrowing the query or calling get_context once per concept]",
         )
     } else {
@@ -5319,7 +5327,7 @@ fn get_context_body(
             }
             if substantial_clusters >= 2 {
                 Some(
-                    "[note: query may span multiple concepts — \
+                    "[note: query may span multiple concepts, \
                      results show the dominant cluster only. \
                      Try one concept per get_context call for complete coverage.]",
                 )
@@ -5403,9 +5411,7 @@ fn get_context_body(
         let repo_root = match store.get_meta("repo_root") {
             Ok(Some(r)) if !r.is_empty() => PathBuf::from(r),
             _ => {
-                tracing::warn!(
-                    "get_context: repo_root not in meta — falling back to metadata-only"
-                );
+                tracing::warn!("get_context: repo_root not in meta, falling back to metadata-only");
                 let mut entries: Vec<(crate::seed::MatchSource, f32, String)> = selected
                     .iter()
                     .map(|n| {
@@ -5436,7 +5442,7 @@ fn get_context_body(
                 );
                 let notes = build_degraded_notes(store, has_embed, embed_warming);
                 let footer = format!(
-                    "[{n_nodes} nodes, ~{total_tokens} tokens — run `travsr init` to enable inline snippets]"
+                    "[{n_nodes} nodes, ~{total_tokens} tokens; run `travsr init` to enable inline snippets]"
                 );
                 return if notes.is_empty() {
                     format!("{retrieval_header}{sanitized}\n\n{footer}")
@@ -5598,7 +5604,7 @@ pub fn embed_knn_probe(store: &SqliteStore, query: &str, k: u32) -> String {
     }
     let knn = match store.embed_knn_fn() {
         Some(f) => f,
-        None => return "[embed KNN unavailable — embeddings not wired]".to_string(),
+        None => return "[embed KNN unavailable, embeddings not wired]".to_string(),
     };
     let pairs = knn(query, k);
     if pairs.is_empty() {
@@ -5669,7 +5675,7 @@ pub fn seed_trace(store: &SqliteStore, query: &str) -> String {
     }
     let knn_fn = match store.embed_knn_fn() {
         Some(f) => f,
-        None => return "[embed KNN unavailable — embeddings not wired]".to_string(),
+        None => return "[embed KNN unavailable, embeddings not wired]".to_string(),
     };
     let mut out = String::new();
 
@@ -7843,7 +7849,7 @@ mod tests {
         );
         assert!(
             !result.contains("other/helper.rb"),
-            "helper.rb requires its own other/animal.rb — must NOT appear for \
+            "helper.rb requires its own other/animal.rb, must NOT appear for \
              ruby/src/animal.rb, got: {result}"
         );
     }
@@ -9224,7 +9230,7 @@ fn get_snippets_body(
     let repo_root = match store.get_meta("repo_root") {
         Ok(Some(r)) if !r.is_empty() => PathBuf::from(r),
         _ => {
-            tracing::warn!("get_snippets: repo_root not in meta — index predates snippet support");
+            tracing::warn!("get_snippets: repo_root not in meta, index predates snippet support");
             return "Snippet data unavailable: run `travsr init` to refresh the index.".to_string();
         }
     };
@@ -9909,7 +9915,7 @@ mod snippet_tests {
         }
         let flat = format_node_line(&seed, "seed", Some(0.80), None, Some("exact-name"), false);
         assert_eq!(
-            flat, "fn:run (function) — a.ts:1 [via: seed · exact-name] [score: 0.80]",
+            flat, "fn:run (function) \u{2014} a.ts:1 [via: seed · exact-name] [score: 0.80]",
             "flag-off render must match the frozen pre-§14 format byte-for-byte"
         );
     }
@@ -11883,7 +11889,7 @@ mod snippet_tests {
         let result = dedup_adjacent_seeds(&store, seeds.clone());
         assert_eq!(
             result, seeds,
-            "b is a caller — must be kept for orthogonal PPR coverage"
+            "b is a caller, must be kept for orthogonal PPR coverage"
         );
     }
 
@@ -13359,7 +13365,7 @@ mod snippet_tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "the call must return once the deadline fires, not wait for the child \
-             to finish on its own — took {:?}",
+             to finish on its own, took {:?}",
             start.elapsed()
         );
     }

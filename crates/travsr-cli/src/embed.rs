@@ -34,7 +34,7 @@ static REINDEX_CANCELLED: AtomicBool = AtomicBool::new(false);
 fn install_reindex_cancel_handler(db_path: &Path) {
     let sentinel = travsr_plugin_host::cancel_sentinel_path(db_path);
     let _ = ctrlc::set_handler(move || {
-        eprintln!("\n^C — cancelling reindex (finishing current batch)...");
+        eprintln!("\n^C, cancelling reindex (finishing current batch)...");
         let _ = std::fs::write(&sentinel, b"");
         REINDEX_CANCELLED.store(true, Ordering::SeqCst);
     });
@@ -134,7 +134,7 @@ pub enum EmbedCommand {
     /// required.
     #[command(
         about = "Change the reindex resource budget and apply it immediately.",
-        long_about = "Change the reindex resource budget and apply it immediately.\n\nPersists the given knob(s) to config (this repo unless `--global`), then gracefully cancels any in-flight reindex and respawns it with the new worker count / priority — resuming from partial work (no node is re-embedded). At least one of `--capacity` / `-j` / `--priority` is required."
+        long_about = "Change the reindex resource budget and apply it immediately.\n\nPersists the given knob(s) to config (this repo unless `--global`), then gracefully cancels any in-flight reindex and respawns it with the new worker count / priority, resuming from partial work (no node is re-embedded). At least one of `--capacity` / `-j` / `--priority` is required."
     )]
     Reconfigure {
         /// Path to graph.db (defaults to .travsr/graph.db in the nearest git root).
@@ -487,11 +487,11 @@ fn prompt_cpu_budget() -> Result<Option<travsr_plugin_host::Capacity>> {
     };
 
     println!("\n  How much CPU should embedding use?{cores_note}");
-    println!("  [1] Full     — all available cores (fastest; default)");
-    println!("  [2] Half     — 50% of cores");
-    println!("  [3] Quarter  — 25% of cores (leaves the machine responsive)");
-    println!("  [4] Auto     — adapt to current system load");
-    println!("  [5] Custom   — enter a percent 1-100");
+    println!("  [1] Full:    all available cores (fastest; default)");
+    println!("  [2] Half:    50% of cores");
+    println!("  [3] Quarter: 25% of cores (leaves the machine responsive)");
+    println!("  [4] Auto:    adapt to current system load");
+    println!("  [5] Custom:  enter a percent 1-100");
     print!("  Choice? (1-5, Enter for Full): ");
     std::io::stdout().flush()?;
 
@@ -510,13 +510,13 @@ fn prompt_cpu_budget() -> Result<Option<travsr_plugin_host::Capacity>> {
             match Capacity::parse(pct.trim()) {
                 Some(c) => Ok(Some(c)),
                 None => {
-                    println!("  (not a valid percent — using Full)");
+                    println!("  (not a valid percent, using Full)");
                     Ok(None)
                 }
             }
         }
         _ => {
-            println!("  (unrecognised — using Full)");
+            println!("  (unrecognised, using Full)");
             Ok(None)
         }
     }
@@ -622,7 +622,7 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
     } else {
         if wants_upgrade {
             println!(
-                "  {} {} is installed without an accelerator; TRAVSR_EMBED_ACCEL={} requests one — reinstalling",
+                "  {} {} is installed without an accelerator; TRAVSR_EMBED_ACCEL={} requests one, reinstalling",
                 pal.green("\u{25cf}"),
                 backend.binary_name,
                 variant.map(|v| v.name).unwrap_or_default()
@@ -906,7 +906,7 @@ fn reindex_after_init(
         .map(|s| s.stats.embedded)
         .unwrap_or(0);
     println!(
-        "  {} {} — {} nodes embedded",
+        "  {} {}, {} nodes embedded",
         pal.green("\u{25cf}"),
         backend.id,
         fmt_count(embedded),
@@ -1140,7 +1140,7 @@ fn select_accel_variant(requested: &str, target: &str) -> Result<Option<&'static
              Unset it to install the CPU build."
         ),
         other => bail!(
-            "unknown TRAVSR_EMBED_ACCEL value '{other}' — expected one of: \
+            "unknown TRAVSR_EMBED_ACCEL value '{other}', expected one of: \
              off, auto, directml, cuda"
         ),
     }
@@ -1366,9 +1366,7 @@ fn run_reindex_locked(
             .map(|n| n.get())
             .unwrap_or(0);
         if cores > 0 && j > cores {
-            eprintln!(
-                "warning: -j {j} exceeds {cores} available cores — may oversubscribe the CPU"
-            );
+            eprintln!("warning: -j {j} exceeds {cores} available cores, may oversubscribe the CPU");
         }
     }
 
@@ -1544,7 +1542,7 @@ pub(crate) fn trigger_reindex_now(
         ) {
             tracing::warn!("resume-embed after reconfigure failed: {e}");
             eprintln!(
-                "warning: could not resume daemon auto-reindex — run `travsr daemon resume-embed`"
+                "warning: could not resume daemon auto-reindex; run `travsr daemon resume-embed`"
             );
         }
     }
@@ -1908,7 +1906,7 @@ fn cmd_status() -> Result<()> {
                     if installed {
                         "\u{2713} installed"
                     } else {
-                        "\u{2717} missing — run `travsr embed init`"
+                        "\u{2717} missing; run `travsr embed init`"
                     }
                 );
                 println!(
@@ -1916,7 +1914,7 @@ fn cmd_status() -> Result<()> {
                     if models_ok {
                         "\u{2713} present"
                     } else {
-                        "\u{2717} missing — run `travsr embed init`"
+                        "\u{2717} missing; run `travsr embed init`"
                     }
                 );
                 (ok, ())
@@ -1939,13 +1937,13 @@ fn cmd_status() -> Result<()> {
             if let Some(g) = global_id.as_deref() {
                 if g != id.as_str() {
                     println!(
-                        "                 (machine default is '{g}' — this repo's setting wins)"
+                        "                 (machine default is '{g}', this repo's setting wins)"
                     );
                 }
             }
         }
         None => {
-            println!("Repo model     : not configured — run `travsr embed init` to activate for this repo");
+            println!("Repo model     : not configured; run `travsr embed init` to activate for this repo");
         }
     }
 
@@ -1954,14 +1952,14 @@ fn cmd_status() -> Result<()> {
         match crate::repo::find_git_root(&cwd) {
             Ok(root) => root.join(".travsr/graph.db"),
             Err(_) => {
-                println!("\n(not inside a travsr repo — run `travsr init` first to see progress)");
+                println!("\n(not inside a travsr repo; run `travsr init` first to see progress)");
                 return Ok(());
             }
         }
     };
 
     if !db_path.exists() {
-        println!("\n(graph.db not found — run `travsr init` first)");
+        println!("\n(graph.db not found; run `travsr init` first)");
         return Ok(());
     }
 
@@ -2022,7 +2020,7 @@ fn cmd_status() -> Result<()> {
     let EmbedStatsWithThreshold { stats, threshold } = query_embed_stats(&db_path, repo_model)?;
 
     if stats.total_symbols == 0 {
-        println!("No symbol nodes found — run `travsr init` to index the repo.");
+        println!("No symbol nodes found; run `travsr init` to index the repo.");
         return Ok(());
     }
 
@@ -2388,7 +2386,7 @@ pub fn hint_activate_if_installed(repo_root: &Path) {
     }
     if embed_binary_installed() {
         println!(
-            "tip: embeddings are installed but not enabled for this repo — run `travsr embed init` to turn on semantic search here"
+            "tip: embeddings are installed but not enabled for this repo; run `travsr embed init` to turn on semantic search here"
         );
     }
 }

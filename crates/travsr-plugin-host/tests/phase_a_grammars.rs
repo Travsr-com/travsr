@@ -48,7 +48,7 @@ trait Logger { def log(): Unit }
     for expected in ["class", "object", "trait", "method", "import"] {
         assert!(
             k.contains(expected),
-            "scala: missing {expected:?} node — got {k:?}"
+            "scala: missing {expected:?} node, got {k:?}"
         );
     }
 }
@@ -66,7 +66,7 @@ int add(int a, int b) { return a + b; }
     for expected in ["struct", "enum", "typedef", "function", "import"] {
         assert!(
             k.contains(expected),
-            "c: missing {expected:?} node — got {k:?}"
+            "c: missing {expected:?} node, got {k:?}"
         );
     }
 }
@@ -85,7 +85,7 @@ int compute(int x) { return x * 2; }
     for expected in ["class", "struct", "namespace", "function", "import"] {
         assert!(
             k.contains(expected),
-            "cpp: missing {expected:?} node — got {k:?}"
+            "cpp: missing {expected:?} node, got {k:?}"
         );
     }
 }
@@ -116,11 +116,11 @@ fn kotlin_typealias_emitted() {
     let s = sigs("typealias Name = String\nclass Foo\n", "kt");
     assert!(
         s.contains("type:Name"),
-        "kotlin: missing type:Name — got {s:?}"
+        "kotlin: missing type:Name, got {s:?}"
     );
     assert!(
         s.contains("class:Foo"),
-        "kotlin: missing class:Foo — got {s:?}"
+        "kotlin: missing class:Foo, got {s:?}"
     );
 }
 
@@ -129,7 +129,7 @@ fn scala_type_definition_emitted() {
     let s = sigs("object O { }\ntype Handler = String => Unit\n", "scala");
     assert!(
         s.contains("type:Handler"),
-        "scala: missing type:Handler — got {s:?}"
+        "scala: missing type:Handler, got {s:?}"
     );
 }
 
@@ -141,11 +141,11 @@ fn csharp_delegate_emitted() {
     );
     assert!(
         s.contains("type:Transformer"),
-        "csharp: missing type:Transformer — got {s:?}"
+        "csharp: missing type:Transformer, got {s:?}"
     );
     assert!(
         s.contains("class:Worker"),
-        "csharp: missing class:Worker — got {s:?}"
+        "csharp: missing class:Worker, got {s:?}"
     );
 }
 
@@ -154,7 +154,7 @@ fn cpp_using_alias_emitted() {
     let s = sigs("using IntVec = int;\nclass Widget { };\n", "cpp");
     assert!(
         s.contains("type:IntVec"),
-        "cpp: missing type:IntVec — got {s:?}"
+        "cpp: missing type:IntVec, got {s:?}"
     );
 }
 
@@ -166,11 +166,11 @@ fn dart_enum_and_typedef_emitted() {
     );
     assert!(
         s.contains("enum:Color"),
-        "dart: missing enum:Color — got {s:?}"
+        "dart: missing enum:Color, got {s:?}"
     );
     assert!(
         s.contains("type:StringMap"),
-        "dart: missing type:StringMap — got {s:?}"
+        "dart: missing type:StringMap, got {s:?}"
     );
 }
 
@@ -188,15 +188,15 @@ fn swift_typealias_and_struct_emitted() {
     );
     assert!(
         s.contains("type:Velocity"),
-        "swift: missing type:Velocity — got {s:?}"
+        "swift: missing type:Velocity, got {s:?}"
     );
     assert!(
         s.contains("struct:Point"),
-        "swift: missing struct:Point — got {s:?}"
+        "swift: missing struct:Point, got {s:?}"
     );
     assert!(
         s.contains("enum:Direction"),
-        "swift: missing enum:Direction — got {s:?}"
+        "swift: missing enum:Direction, got {s:?}"
     );
 }
 
@@ -208,11 +208,11 @@ fn java_record_and_annotation_emitted() {
     );
     assert!(
         s.contains("class:Point"),
-        "java: record must emit class:Point — got {s:?}"
+        "java: record must emit class:Point, got {s:?}"
     );
     assert!(
         s.contains("interface:Marker"),
-        "java: annotation type must emit interface:Marker — got {s:?}"
+        "java: annotation type must emit interface:Marker, got {s:?}"
     );
 }
 
@@ -244,7 +244,7 @@ void freeFunction(void) { }
     for expected in ["file", "class", "impl", "protocol", "function", "import"] {
         assert!(
             k.contains(expected),
-            "objc: missing node kind '{expected}' — got {k:?}"
+            "objc: missing node kind '{expected}', got {k:?}"
         );
     }
 }
@@ -281,7 +281,7 @@ fn objc_class_impl_and_protocol_sigs_emitted() {
     ] {
         assert!(
             s.contains(expected),
-            "objc: missing signature '{expected}' — got {s:?}"
+            "objc: missing signature '{expected}', got {s:?}"
         );
     }
 }

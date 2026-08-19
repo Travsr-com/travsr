@@ -67,7 +67,7 @@ fn print_docs(docs: &[String]) {
         return;
     }
     println!(
-        "── docs — documentation prose: claims about the code, verify behaviour against the code itself ──"
+        "── docs, documentation prose: claims about the code, verify behaviour against the code itself ──"
     );
     for line in docs {
         println!("{line}");
@@ -134,7 +134,7 @@ fn note_cold_path_cannot_render_docs(repo_root: &std::path::Path) {
         return;
     }
     eprintln!(
-        "note: docs.enabled is on, but no travsr daemon is running — this query \
+        "note: docs.enabled is on, but no travsr daemon is running, this query \
          is served by the read-only cold path, which does not load the doc \
          index, so no docs section can appear. Start the daemon with \
          `travsr daemon start`."
@@ -143,7 +143,7 @@ fn note_cold_path_cannot_render_docs(repo_root: &std::path::Path) {
 
 pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     if query_str.trim().is_empty() {
-        anyhow::bail!("search query must not be empty — try: travsr ask \"PaymentService\"");
+        anyhow::bail!("search query must not be empty; try: travsr ask \"PaymentService\"");
     }
     note_docs_flag_is_read_by_the_daemon();
     let cwd = std::env::current_dir().context("getting current directory")?;
@@ -151,7 +151,7 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     let db_path = repo_root.join(".travsr/graph.db");
 
     if !db_path.exists() {
-        anyhow::bail!("not initialized — run `travsr init`");
+        anyhow::bail!("not initialized; run `travsr init`");
     }
     // Before either path: `ask` ranks over call edges, so an incomplete Phase B
     // changes the answer, not just its completeness.
@@ -255,10 +255,10 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             // that may not have run (e.g. KNN timed out → lexical fallback),
             // contradicting the degraded note printed below.
             let header = match tag {
-                "exact" => "── exact matches — literal symbol / text ──",
-                "semantic" => "── related — ranked by relevance ──",
-                "tests" => "── tests — test entry points & fixtures ──",
-                _ => "── relevant — graph-adjacent context ──",
+                "exact" => "── exact matches, literal symbol / text ──",
+                "semantic" => "── related, ranked by relevance ──",
+                "tests" => "── tests, test entry points & fixtures ──",
+                _ => "── relevant, graph-adjacent context ──",
             };
             println!("{header}");
             println!("{}", Table::new(rows));

@@ -31,7 +31,7 @@ pub fn run(cmd: RerankCommand) -> Result<()> {
                 println!("reranker model: installed");
             } else {
                 println!(
-                    "reranker model: not installed — run `travsr rerank install` (the daemon \
+                    "reranker model: not installed; run `travsr rerank install` (the daemon \
                      also auto-fetches it on start unless TRAVSR_NO_RERANK is set)"
                 );
             }

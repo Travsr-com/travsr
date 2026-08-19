@@ -74,7 +74,7 @@ fn resolve_repo_root(start: &Path, mode: WorktreeMode) -> anyhow::Result<PathBuf
             if let Some(root) = registered_ancestor(start) {
                 return Ok(root);
             }
-            anyhow::bail!("not inside a git repository — run `git init` first, then `travsr init`");
+            anyhow::bail!("not inside a git repository; run `git init` first, then `travsr init`");
         }
     }
 }

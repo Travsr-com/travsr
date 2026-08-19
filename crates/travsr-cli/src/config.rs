@@ -120,7 +120,7 @@ fn cmd_set(key: &str, value: &str, repo: bool, now: bool) -> Result<()> {
         let db_path = root.join(".travsr/graph.db");
         anyhow::ensure!(
             db_path.exists(),
-            "graph.db not found at {} — run `travsr init` first",
+            "graph.db not found at {}; run `travsr init` first",
             db_path.display()
         );
         crate::embed::trigger_reindex_now(
@@ -146,16 +146,16 @@ fn cmd_unset(key: &str, repo: bool) -> Result<()> {
         let status = travsr_config::get(key, current_repo_root().as_deref())?;
         match status.value {
             Some(v) => println!(
-                "\u{2713} unset {key} ({where_}) — now {v}  ({})",
+                "\u{2713} unset {key} ({where_}), now {v}  ({})",
                 status.source.label()
             ),
             None => println!(
-                "\u{2713} unset {key} ({where_}) — now {}  (default, unset)",
+                "\u{2713} unset {key} ({where_}), now {}  (default, unset)",
                 status.default_display
             ),
         }
     } else {
-        println!("{key} was not set in the {where_} — nothing to unset");
+        println!("{key} was not set in the {where_}, nothing to unset");
     }
     Ok(())
 }

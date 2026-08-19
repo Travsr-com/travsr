@@ -311,7 +311,7 @@ fn kind_update_reindex_no_duplicate_fts_rows() {
     assert_eq!(
         r.len(),
         1,
-        "exactly one FTS result after kind-update — no stale rows"
+        "exactly one FTS result after kind-update, no stale rows"
     );
 }
 
@@ -788,7 +788,7 @@ fn open_in_memory_twice_is_idempotent() {
     // open_in_memory runs migrations + backfill each time;
     // IF NOT EXISTS guards make the DDL idempotent.
     SqliteStore::open_in_memory().expect("first open");
-    SqliteStore::open_in_memory().expect("second open — must not fail");
+    SqliteStore::open_in_memory().expect("second open, must not fail");
 }
 
 #[test]

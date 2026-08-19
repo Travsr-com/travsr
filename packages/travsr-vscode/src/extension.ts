@@ -105,10 +105,10 @@ export function activate(context: vscode.ExtensionContext): void {
     dbWatcher.onDidCreate(() => {
       if (restartInProgress) return;
       restartInProgress = true;
-      channel.appendLine("graph.db created — reconnecting Travsr daemon…");
+      channel.appendLine("graph.db created, reconnecting Travsr daemon…");
       void doRestart(proxy, context, workspaceRoot, version, channel, onDaemonFailed).then(() => {
         restartInProgress = false;
-        void vscode.window.showInformationMessage("Travsr: graph initialized — daemon reconnected.");
+        void vscode.window.showInformationMessage("Travsr: graph initialized, daemon reconnected.");
         refreshOpenPanels();
       });
     });
@@ -880,12 +880,12 @@ export function buildFileListHtml(
   const tsPill = `<button id="pill-ts"
     style="${mode === "tree-sitter" ? activeStyle : inactiveStyle}"
     onclick="setMode('tree-sitter')"
-    title="Structural analysis — single-file structure and best-effort calls (always available)"
+    title="Structural analysis, single-file structure and best-effort calls (always available)"
     aria-pressed="${mode === "tree-sitter"}"
   >Structural</button>`;
 
   const semTooltip = semanticAvailable
-    ? "Semantic analysis — precise cross-file calls and references"
+    ? "Semantic analysis, precise cross-file calls and references"
     : installHint
       ? `Semantic analysis not yet available. ${installHint}`
       : "Semantic analysis not yet available for this language.";

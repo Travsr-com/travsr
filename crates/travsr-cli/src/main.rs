@@ -722,7 +722,7 @@ fn init_tracing(
                 tracing::warn!(
                     error = %e,
                     otlp_endpoint = %endpoint,
-                    "OTLP exporter init failed — falling back to stderr-only tracing"
+                    "OTLP exporter init failed, falling back to stderr-only tracing"
                 );
             }
         }
@@ -829,7 +829,7 @@ async fn run(cli: Cli) -> Result<()> {
                                         eprintln!("travsr daemon failed to start: {r}")
                                     }
                                     None => eprintln!(
-                                        "travsr daemon failed to start — see `travsr daemon logs`"
+                                        "travsr daemon failed to start; see `travsr daemon logs`"
                                     ),
                                 }
                                 return Ok(());
@@ -1233,11 +1233,11 @@ async fn run(cli: Cli) -> Result<()> {
                         "method": "notifications/message",
                         "params": {
                             "level": "error",
-                            "data": "travsr: not initialized — run `travsr init` first, then retry"
+                            "data": "travsr: not initialized; run `travsr init` first, then retry"
                         }
                     });
                     println!("{err_msg}");
-                    anyhow::bail!("not initialized — run `travsr init` first");
+                    anyhow::bail!("not initialized; run `travsr init` first");
                 }
                 travsr_mcp::serve_stdio(&db_path)?;
             }
@@ -1479,7 +1479,7 @@ fn relay_daemon_startup(
             // is known rather than claiming a failure that may not have
             // happened.
             eprintln!(
-                "[travsr] still starting after {}s — follow it with `travsr daemon logs --follow`",
+                "[travsr] still starting after {}s, follow it with `travsr daemon logs --follow`",
                 STARTUP_RELAY_TIMEOUT.as_secs()
             );
             return;
@@ -1963,7 +1963,7 @@ fn daemon_logs(
         // user to look for `daemon.log` would send them after a file that is
         // never created.
         eprintln!(
-            "no daemon log in {} yet — run `travsr daemon start`",
+            "no daemon log in {} yet; run `travsr daemon start`",
             dir.display()
         );
         return Ok(());
@@ -1995,7 +1995,7 @@ fn daemon_logs(
     // A filter that matched nothing looks exactly like a daemon that logged
     // nothing. Say which it was, on stderr so it never reaches a pipe.
     if shown == 0 && scanned > 0 {
-        eprintln!("no matching lines in the last {scanned} log line(s) — widen the filters");
+        eprintln!("no matching lines in the last {scanned} log line(s), widen the filters");
     }
 
     if !follow {
@@ -2452,7 +2452,7 @@ mod daemon_log_tests {
     fn an_untagged_line_belongs_to_no_repo() {
         // Process-wide lines — session start, reranker fetch — carry no repo,
         // and must not be attributed to whichever one the user asked about.
-        let line = "INFO travsr_mcp::rerank: reranker model absent — auto-fetching";
+        let line = "INFO travsr_mcp::rerank: reranker model absent, auto-fetching";
         assert!(!line_is_for_repo(line, "alpha"));
     }
 

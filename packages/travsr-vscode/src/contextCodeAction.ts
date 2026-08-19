@@ -90,7 +90,7 @@ export async function copyContextForChat(client: McpClient, symbol?: string): Pr
     );
   } catch (err) {
     void vscode.window.showWarningMessage(
-      `Travsr: could not fetch context for "${query}" — ${err instanceof Error ? err.message : String(err)}`
+      `Travsr: could not fetch context for "${query}", ${err instanceof Error ? err.message : String(err)}`
     );
     return;
   }
@@ -105,7 +105,7 @@ export async function copyContextForChat(client: McpClient, symbol?: string): Pr
   const block = `Travsr graph context for "${query}":\n\n${body}\n`;
   await vscode.env.clipboard.writeText(block);
   void vscode.window.showInformationMessage(
-    `Travsr: graph context for "${query}" copied — paste into your chat.`
+    `Travsr: graph context for "${query}" copied, paste into your chat.`
   );
 }
 

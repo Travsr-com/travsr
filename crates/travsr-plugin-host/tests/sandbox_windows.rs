@@ -85,7 +85,7 @@ mod windows_sandbox {
         // AppContainer SID. If exit 0: the container escaped FS isolation.
         assert!(
             !output.status.success() || !target.exists(),
-            "AppContainer allowed write outside scratch — FS confinement broken"
+            "AppContainer allowed write outside scratch, FS confinement broken"
         );
         let _ = std::fs::remove_file(&target); // cleanup if write somehow succeeded
     }

@@ -302,10 +302,10 @@ export function buildStatsView(raw: string): StatsView {
       const m = new RegExp(`^${key}:\\s*(.+)$`).exec(l.trim());
       if (m) return m[1];
     }
-    return "—";
+    return ",";
   };
-  let dbSize = "—";
-  let lastIndexed = "—";
+  let dbSize = ",";
+  let lastIndexed = ",";
   const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (root) {
     try {
@@ -410,7 +410,7 @@ export function buildDepListHtml(
     if (e.path) {
       return `<li class="dep" data-path="${escHtml(e.path)}">${escHtml(e.display)}</li>`;
     }
-    return `<li class="dep-ext" title="External / stdlib — no local file">${escHtml(e.display)}</li>`;
+    return `<li class="dep-ext" title="External / stdlib, no local file">${escHtml(e.display)}</li>`;
   };
   const directRows = direct.map(li).join("\n") || "<li><em>none</em></li>";
   const transitiveBlock = transitive.length
@@ -940,7 +940,7 @@ export async function readDiagnostics(binary: string, cwd: string): Promise<Diag
       : "warn";
     found.push({
       severity,
-      title: text.replace(/\s*[-—.]?\s*(re-?run|run)\s+`[^`]+`.*$/i, "").trim(),
+      title: text.replace(/\s*[-,.]?\s*(re-?run|run)\s+`[^`]+`.*$/i, "").trim(),
       hint: text,
       command: cmd ? cmd[1] : undefined,
     });
@@ -1172,7 +1172,7 @@ export function registerShowLanguages(
           void refresh();
           void vscode.window.showInformationMessage(
             cancelled
-              ? "Detect & install was cancelled — some languages may not be set up. See the Languages panel."
+              ? "Detect & install was cancelled, some languages may not be set up. See the Languages panel."
               : "Detect & install finished. See the Languages panel for per-language status."
           );
         });

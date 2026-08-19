@@ -152,7 +152,7 @@ fn run_with_drain_capped(
             let _ = err_t.join();
             anyhow::bail!(
                 "{name} produced more than {max_stdout_bytes} bytes on stdout \
-                 (MAX_CHILD_OUTPUT_BYTES cap) — killed"
+                 (MAX_CHILD_OUTPUT_BYTES cap), killed"
             );
         }
         match child
@@ -168,7 +168,7 @@ fn run_with_drain_capped(
                 // Join drain threads so they don't dangle after we return.
                 let _ = out_t.join();
                 let _ = err_t.join();
-                anyhow::bail!("{name} timed out after {}s — killed", timeout.as_secs());
+                anyhow::bail!("{name} timed out after {}s, killed", timeout.as_secs());
             }
             None => std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS)),
         }
@@ -182,7 +182,7 @@ fn run_with_drain_capped(
     if overflowed.load(Ordering::Relaxed) {
         anyhow::bail!(
             "{name} produced more than {max_stdout_bytes} bytes on stdout \
-             (MAX_CHILD_OUTPUT_BYTES cap) — output discarded"
+             (MAX_CHILD_OUTPUT_BYTES cap), output discarded"
         );
     }
     Ok((status, stdout, stderr))
@@ -264,7 +264,7 @@ pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
         .with_context(|| {
             format!(
                 "could not run travsr-lsif-ts for {} \
-                 (emitter not found — check TRAVSR_LSIF_TS or reinstall travsr)",
+                 (emitter not found; check TRAVSR_LSIF_TS or reinstall travsr)",
                 tsconfig.display()
             )
         })?;
@@ -318,7 +318,7 @@ pub fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<Option<Vec<u
         Some(p) => p,
         None => {
             tracing::debug!(
-                "scip-python not found on PATH — Python Phase B skipped \
+                "scip-python not found on PATH, Python Phase B skipped \
                  (install: npm install -g @sourcegraph/scip-python)"
             );
             return Ok(None);
@@ -378,7 +378,7 @@ fn read_scip_output_capped(output: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
         .len();
     if len > cap {
         anyhow::bail!(
-            "scip-python output {} is {len} bytes — exceeds the {cap}-byte cap \
+            "scip-python output {} is {len} bytes, exceeds the {cap}-byte cap \
              (MAX_CHILD_OUTPUT_BYTES); refusing to load it into memory",
             output.display()
         );
@@ -464,7 +464,7 @@ pub fn run_lsif_py_emitter(root: &Path) -> anyhow::Result<Option<String>> {
         Ok(c) => c,
         Err(_) => {
             tracing::debug!(
-                "travsr-lsif-py not found — Python LSIF enrichment skipped \
+                "travsr-lsif-py not found, Python LSIF enrichment skipped \
                  (native phase_b tree-sitter edges still active)"
             );
             return Ok(None);
@@ -913,7 +913,7 @@ mod tests {
 
         let result = rx
             .recv_timeout(HARNESS_DEADLINE)
-            .expect("must return within watchdog window — deadlock?");
+            .expect("must return within watchdog window, deadlock?");
         let dump = result.expect("must succeed");
         assert_eq!(dump.len(), 131072, "all 128 KiB must be returned");
     }

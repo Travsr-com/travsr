@@ -8,14 +8,14 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 
-suite("S17-5: settings — schema defaults (regression guard)", () => {
+suite("S17-5: settings, schema defaults (regression guard)", () => {
   test("travsr.telemetry.enabled defaults to false (opt-in, not opt-out)", () => {
     const cfg = vscode.workspace.getConfiguration("travsr");
     const meta = cfg.inspect<boolean>("telemetry.enabled");
     assert.strictEqual(
       meta?.defaultValue,
       false,
-      "telemetry must be opt-in (default false) — changing to true is a privacy regression"
+      "telemetry must be opt-in (default false), changing to true is a privacy regression"
     );
   });
 

@@ -433,11 +433,11 @@ pub(crate) fn rerank(query: &str, candidates: &[&str]) -> Option<Vec<f32>> {
     let scores = match outcome {
         Ok(Ok(scores)) => scores,
         Ok(Err(error)) => {
-            tracing::warn!(%error, "rerank inference failed — falling back to lexical gate");
+            tracing::warn!(%error, "rerank inference failed, falling back to lexical gate");
             return None;
         }
         Err(_) => {
-            tracing::warn!("rerank inference panicked — falling back to lexical gate");
+            tracing::warn!("rerank inference panicked, falling back to lexical gate");
             return None;
         }
     };
@@ -447,7 +447,7 @@ pub(crate) fn rerank(query: &str, candidates: &[&str]) -> Option<Vec<f32>> {
         tracing::warn!(
             elapsed_ms,
             threshold_ms = budget,
-            "rerank exceeded circuit-breaker threshold — discarding scores, falling back to lexical gate"
+            "rerank exceeded circuit-breaker threshold, discarding scores, falling back to lexical gate"
         );
         return None;
     }

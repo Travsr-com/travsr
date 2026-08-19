@@ -181,7 +181,7 @@ fn unavailable_status(entry: &PhaseBEntry, target: &str) -> String {
     let hint = if entry.underlying_tool_hint.is_empty() {
         String::new()
     } else {
-        format!(" — manual setup: {}", entry.underlying_tool_hint)
+        format!(", manual setup: {}", entry.underlying_tool_hint)
     };
     format!(
         "not available on {target} yet ({} ships no prebuilt binary for this platform){hint}",
@@ -538,7 +538,7 @@ fn cmd_install(
             "'{language}' is {}\n\
              \n\
              Structural indexing (symbols, definitions, repo map) still works on \
-             this platform — only call/reference analysis needs this binary.",
+             this platform, only call/reference analysis needs this binary.",
             unavailable_status(entry, target)
         );
     }
@@ -713,7 +713,7 @@ fn cmd_install(
         return Ok(InstallStatus::WrapperOnly);
     }
 
-    println!("'{language}' is active — full cross-file analysis is on.");
+    println!("'{language}' is active, full cross-file analysis is on.");
     Ok(InstallStatus::FullyReady)
 }
 
@@ -1235,7 +1235,7 @@ fn cmd_detect(yes: bool) -> Result<()> {
 
     if !std::io::stdin().is_terminal() {
         println!(
-            "(non-interactive — run `travsr lang install <lang>` to install one, or \
+            "(non-interactive; run `travsr lang install <lang>` to install one, or \
              `travsr lang detect --yes` to set up all detected)"
         );
         return Ok(());
@@ -1287,7 +1287,7 @@ fn install_selected(selected: &[&str], no_interactive: bool, yes: bool) {
         match cmd_install(lang, false, no_interactive, None, false, yes, None) {
             Ok(InstallStatus::FullyReady) => {}
             Ok(InstallStatus::WrapperOnly) => {
-                println!("  {lang}: analyzer not installed yet — full analysis stays off")
+                println!("  {lang}: analyzer not installed yet, full analysis stays off")
             }
             Err(e) => eprintln!("  error: {e:#}"),
         }
@@ -1320,7 +1320,7 @@ fn cmd_remove(language: &str) -> Result<()> {
     let mut config = load_config().unwrap_or_default();
     if config.unregister(language) {
         save_config(&config)?;
-        println!("'{language}' full analysis turned off — basic analysis still runs.");
+        println!("'{language}' full analysis turned off, basic analysis still runs.");
     } else {
         println!("'{language}' was not registered.");
     }

@@ -370,7 +370,7 @@ export function buildSynonymsHtml(pairs: SynonymPair[]): string {
     <input id="term" placeholder="term" style="width:100%">
     <div class="chip-area" id="staged" aria-label="Staged aliases"></div>
     <div style="display:flex;gap:6px;align-items:center">
-      <input id="alias" placeholder="alias — press Enter to stage" style="flex:1">
+      <input id="alias" placeholder="alias, press Enter to stage" style="flex:1">
       <button class="btn primary" id="addBtn" onclick="commitAdd()">Add</button>
     </div>
     <p style="margin:2px 0;font-size:11px;color:var(--fg-subtle)">Press Enter in alias field to stage; Add commits all staged aliases.</p>
@@ -1003,7 +1003,7 @@ export function buildLanguagesHtml(
         .join("\n")
     : `<tr><td colspan="2" class="empty" style="font-style:normal">No language metadata yet.&nbsp; <button class="btn primary" id="initBtn" onclick="initRepo(this)">Initialize this repo</button></td></tr>`;
   const indexedNote = indexed.length
-    ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural analysis — includes test &amp; fixture files.</p>`
+    ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural analysis, includes test &amp; fixture files.</p>`
     : "";
 
   // ── Available section ────────────────────────────────────────────────────────
@@ -1056,7 +1056,7 @@ export function buildLanguagesHtml(
         const docsUrl = rawHint.startsWith("http") ? rawHint.split(/\s/)[0] : "";
         rawAction = docsUrl
           ? `<a href="${esc(docsUrl)}" style="color:var(--green);font-size:12px">Install guide ↗</a>`
-          : `<span style="font-size:11px;color:var(--fg-subtle)">Manual — run:<br><code style="color:var(--fg-muted)">${esc(l.installHint)}</code></span>`;
+          : `<span style="font-size:11px;color:var(--fg-subtle)">Manual; run:<br><code style="color:var(--fg-muted)">${esc(l.installHint)}</code></span>`;
       } else {
         rawAction = `<button class="btn primary" onclick="installLang(this,'${esc(l.language)}')">Install</button>`;
       }
@@ -1085,7 +1085,7 @@ export function buildLanguagesHtml(
             ? "stale"
             : "dim";
       const repoTip = {
-        always_on: "Built in — always on for every repo",
+        always_on: "Built in, always on for every repo",
         enabled: "Full analysis is on for this repo",
         needs_analyzer: `Authorized for this repo, but its analyzer isn't installed yet — only structural analysis runs until it is. Install it: travsr lang install ${l.language}`,
         not_enabled: `Full analysis is off for this repo. Enable it: travsr lang install ${l.language} (run in this repo)`,
@@ -1104,7 +1104,7 @@ export function buildLanguagesHtml(
   // When several repos are open the panel names the one install/detect will
   // target and offers a one-click change, so the destination is never a guess.
   const sub = targetRepo
-    ? `<p class="sub">Target repo: <b>${esc(targetRepo)}</b> — install &amp; detect run here. <a href="#" onclick="pickRepo();return false" style="color:var(--green)">change</a></p>`
+    ? `<p class="sub">Target repo: <b>${esc(targetRepo)}</b>; install &amp; detect run here. <a href="#" onclick="pickRepo();return false" style="color:var(--green)">change</a></p>`
     : `<p class="sub">Indexed languages in this repo and available semantic analysis tools.</p>`;
 
   const body = `

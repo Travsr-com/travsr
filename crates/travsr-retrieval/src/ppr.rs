@@ -26,7 +26,7 @@ pub const MAX_ITERATIONS: u32 = 50;
 // constant change is caught before release. Update the ADR before changing.
 const _: () = assert!(
     MAX_ITERATIONS == 50,
-    "MAX_ITERATIONS changed from ADR-003 value — update ADR-003 first"
+    "MAX_ITERATIONS changed from ADR-003 value, update ADR-003 first"
 );
 
 /// Return ALPHA, overridden by `TRAVSR_PPR_ALPHA` env var if set and parseable.
@@ -387,7 +387,7 @@ fn build_weighted_subgraph<S: Store>(
                 tracing::warn!(
                     visited = visited.len(),
                     limit = MAX_SUBGRAPH_NODES,
-                    "PPR subgraph exceeded node ceiling mid-chunk — truncating BFS"
+                    "PPR subgraph exceeded node ceiling mid-chunk, truncating BFS"
                 );
                 break;
             }
@@ -397,7 +397,7 @@ fn build_weighted_subgraph<S: Store>(
             tracing::warn!(
                 visited = visited.len(),
                 limit = MAX_SUBGRAPH_NODES,
-                "PPR subgraph exceeded node ceiling — truncating BFS"
+                "PPR subgraph exceeded node ceiling, truncating BFS"
             );
             break;
         }
@@ -472,7 +472,7 @@ mod tests {
         std::env::set_var("TRAVSR_PPR_ALPHA", "0.0");
         let v = alpha();
         std::env::remove_var("TRAVSR_PPR_ALPHA");
-        assert_eq!(v, ALPHA, "alpha=0.0 is invalid — must fall back to default");
+        assert_eq!(v, ALPHA, "alpha=0.0 is invalid, must fall back to default");
     }
 
     #[test]
@@ -482,7 +482,7 @@ mod tests {
             std::env::set_var("TRAVSR_PPR_ALPHA", bad);
             let v = alpha();
             std::env::remove_var("TRAVSR_PPR_ALPHA");
-            assert_eq!(v, ALPHA, "alpha={bad} >= 1.0 is invalid — must fall back");
+            assert_eq!(v, ALPHA, "alpha={bad} >= 1.0 is invalid, must fall back");
         }
     }
 

@@ -62,7 +62,7 @@ fn golden_node_count_is_zero() {
     assert_eq!(
         out.nodes.len(),
         0,
-        "ingest_rust must not emit nodes — got {}",
+        "ingest_rust must not emit nodes, got {}",
         out.nodes.len()
     );
 }
@@ -138,7 +138,7 @@ fn corpus_is_stamped_into_caller_vname() {
 
     assert!(
         srcs_a.is_disjoint(&srcs_b),
-        "caller NodeIds must differ across corpora — \
+        "caller NodeIds must differ across corpora, \
          corpus is not being stamped into caller VNames"
     );
 
@@ -147,7 +147,7 @@ fn corpus_is_stamped_into_caller_vname() {
 
     assert!(
         dsts_a.is_disjoint(&dsts_b),
-        "callee NodeIds must also differ across corpora — \
+        "callee NodeIds must also differ across corpora, \
          corpus is not being stamped into callee VNames"
     );
 }

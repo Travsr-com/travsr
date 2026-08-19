@@ -114,7 +114,7 @@ fn bench_rust_warm(c: &mut Criterion) {
 /// Skipped silently when not running from a full workspace checkout.
 fn bench_rust_travsr_core(c: &mut Criterion) {
     let Some(lib_path) = travsr_core_lib() else {
-        eprintln!("bench_rust_travsr_core: skipped — travsr-core/src/lib.rs not found");
+        eprintln!("bench_rust_travsr_core: skipped, travsr-core/src/lib.rs not found");
         return;
     };
     let indexer = Indexer::new();

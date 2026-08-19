@@ -172,7 +172,7 @@ export function registerMcpServerCommand(): vscode.Disposable {
     if (!binaryPath) {
       const action = await vscode.window.showErrorMessage(
         "Travsr: no usable travsr binary found to register. External agents " +
-        "need an absolute path to the native binary — download it, or set " +
+        "need an absolute path to the native binary, download it, or set " +
         "travsr.binaryPath first.",
         "Download",
         "Open Settings"

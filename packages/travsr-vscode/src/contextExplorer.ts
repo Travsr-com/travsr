@@ -518,7 +518,7 @@ pre.raw-fallback{
 <div class="query-row">
   <div class="query-input" id="qi">
     <span class="mag" id="mag-btn" title="Search (Enter)">⌕</span>
-    <input id="q" placeholder="Symbol or question — e.g. PaymentService.charge" autofocus spellcheck="false">
+    <input id="q" placeholder="Symbol or question, e.g. PaymentService.charge" autofocus spellcheck="false">
     <span class="seeded-badge" id="seeded" style="display:none"></span>
   </div>
   <div class="budget-wrap">
@@ -734,7 +734,7 @@ function renderParsed(data, rawText){
     html += \`<div class="abstain weak">
   <h3>◐ Weak match</h3>
   <p>Travsr didn't find a strong graph anchor for this query, so the results below are loosely related — structural neighbours rather than a confident answer.</p>
-  <p class="hint">For a precise result, try a concrete symbol — e.g. <code>PaymentService.charge</code> — or narrow to one concept per query.</p>
+  <p class="hint">For a precise result, try a concrete symbol, e.g. <code>PaymentService.charge</code>, or narrow to one concept per query.</p>
 </div>\`;
   }
 
@@ -821,7 +821,7 @@ function renderNodeList(){
   let html = '';
   if(nodes.length===0){
     html = state.snippetsOnly
-      ? '<p class="empty">No snippets loaded yet — they arrive a moment after the results.</p>'
+      ? '<p class="empty">No snippets loaded yet, they arrive a moment after the results.</p>'
       : '<p class="empty">No nodes.</p>';
   }
   let lastSection = null;
@@ -857,7 +857,7 @@ function renderNodeList(){
     const bodyInner = loaded===undefined
       ? '<div class="snip-loading">loading…</div>'
       : loaded===''
-        ? '<div class="snip-loading">no snippet for this mode — try another mode or open the file.</div>'
+        ? '<div class="snip-loading">no snippet for this mode; try another mode or open the file.</div>'
         : \`<pre>\${esc(loaded)}</pre>\`;
     const expanded = \`<div class="snippet">
     <div class="snip-ctl">\${modeSeg}\${pinBtn}</div>
@@ -995,7 +995,7 @@ window.addEventListener('message', event => {
       scroll.innerHTML = \`<div class="abstain">
   <h3>⚠ No confident match</h3>
   <p>Travsr couldn't resolve your query to a graph anchor with confidence. Rather than return a plausible-looking but unrelated set of nodes, it abstained.</p>
-  <p class="hint">Try a concrete symbol — e.g. <code>PaymentService.charge</code> or "retry logic for failed charges". The resolution detail is shown below.</p>
+  <p class="hint">Try a concrete symbol, e.g. <code>PaymentService.charge</code> or "retry logic for failed charges". The resolution detail is shown below.</p>
 </div><pre class="raw-fallback">\${esc(raw)}</pre>\`;
       legendBox.style.display = 'none';
     } else {

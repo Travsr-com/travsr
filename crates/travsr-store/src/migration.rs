@@ -138,7 +138,7 @@ impl MigrationRunner {
         let v = migration.version();
         assert!(
             !self.migrations.iter().any(|m| m.version() == v),
-            "duplicate migration version {v} registered — each version must be unique"
+            "duplicate migration version {v} registered, each version must be unique"
         );
         self.migrations.push(Box::new(migration));
     }

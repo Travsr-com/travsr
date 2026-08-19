@@ -63,10 +63,7 @@ pub fn run(action: SynonymCommand) -> Result<()> {
         repo::find_git_root_for_write(&cwd)?
     };
     let db_path = repo_root.join(".travsr/graph.db");
-    anyhow::ensure!(
-        db_path.exists(),
-        "not initialized — run `travsr init` first"
-    );
+    anyhow::ensure!(db_path.exists(), "not initialized; run `travsr init` first");
     let mut store = SqliteStore::open(&db_path).context("opening graph store")?;
 
     match action {

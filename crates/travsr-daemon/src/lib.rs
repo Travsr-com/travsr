@@ -916,7 +916,7 @@ pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
         old = ?stored_id,
         new = %active_id,
         ?richness,
-        "embed model changed — regenerating embed_text"
+        "embed model changed, regenerating embed_text"
     );
 
     // NULL all rows so update_embed_texts picks them all up.
@@ -949,7 +949,7 @@ pub fn fsck_repo(
     let db_path = repo_root.join(".travsr/graph.db");
     anyhow::ensure!(
         db_path.exists(),
-        "no graph.db found at {} — run `travsr init` first",
+        "no graph.db found at {}; run `travsr init` first",
         db_path.display()
     );
 
@@ -1008,7 +1008,7 @@ pub fn fsck_repo(
     if orphans > 0 {
         tracing::warn!(
             orphans,
-            "fsck: non-zero orphan edge count — write-path invariant violated"
+            "fsck: non-zero orphan edge count, write-path invariant violated"
         );
     }
 
@@ -1018,7 +1018,7 @@ pub fn fsck_repo(
     if self_loops > 0 {
         tracing::warn!(
             self_loops,
-            "fsck: swept self-referential edges (a symbol pointing at itself) — \
+            "fsck: swept self-referential edges (a symbol pointing at itself), \
              pre-existing database, or a write that bypassed the guard"
         );
     }
@@ -1075,14 +1075,14 @@ pub fn init_repo_with_progress(
         .open(&init_lock_path)
         .with_context(|| format!("opening {}", init_lock_path.display()))?;
     fs2::FileExt::lock_exclusive(&init_lock_file)
-        .context("acquiring init.lock — another `travsr init` may be running for this repo")?;
+        .context("acquiring init.lock, another `travsr init` may be running for this repo")?;
 
     let db_path = travsr_dir.join("graph.db");
     let mut store = SqliteStore::open(&db_path).with_context(|| {
         // M5: distinguish corruption from other open failures so the user knows
         // whether to re-run init (corrupt) vs fix disk space (full).
         let hint = if db_path.exists() {
-            " — if graph.db is corrupted, delete it and re-run `travsr init`"
+            ", if graph.db is corrupted, delete it and re-run `travsr init`"
         } else {
             ""
         };
@@ -1098,7 +1098,7 @@ pub fn init_repo_with_progress(
             tracing::warn!(
                 path = %db_path.display(),
                 err = %e,
-                "failed to restrict index file permissions to 0600 — it may be world-readable"
+                "failed to restrict index file permissions to 0600; it may be world-readable"
             );
         }
     }
@@ -1112,7 +1112,7 @@ pub fn init_repo_with_progress(
         let Some(path_str) = db_path.to_str() else {
             tracing::warn!(
                 path = %db_path.display(),
-                "index file path is not valid UTF-8 — skipping the icacls permission restriction"
+                "index file path is not valid UTF-8, skipping the icacls permission restriction"
             );
             break 'acl;
         };
@@ -1121,7 +1121,7 @@ pub fn init_repo_with_progress(
         if user.is_empty() {
             tracing::warn!(
                 path = %db_path.display(),
-                "USERNAME env var not set — skipping the index file permission restriction on Windows"
+                "USERNAME env var not set, skipping the index file permission restriction on Windows"
             );
             break 'acl;
         }
@@ -1145,12 +1145,12 @@ pub fn init_repo_with_progress(
             Ok(s) => tracing::warn!(
                 path = %db_path.display(),
                 exit_code = ?s.code(),
-                "icacls failed to restrict index file permissions — it may be readable by other users on this machine"
+                "icacls failed to restrict index file permissions; it may be readable by other users on this machine"
             ),
             Err(e) => tracing::warn!(
                 path = %db_path.display(),
                 err = %e,
-                "icacls not available — index file permissions not restricted on Windows"
+                "icacls not available, index file permissions not restricted on Windows"
             ),
         }
     }
@@ -1226,7 +1226,7 @@ pub fn init_repo_with_progress(
         tracing::warn!(
             old = %stored_corpus,
             new = %corpus,
-            "repository identity changed (e.g. its git remote) — purging all graph data for a clean rebuild"
+            "repository identity changed (e.g. its git remote), purging all graph data for a clean rebuild"
         );
         let empty_walked = std::collections::HashSet::<String>::new();
         let purge_policy = travsr_core::SafetyPolicy {
@@ -1237,7 +1237,7 @@ pub fn init_repo_with_progress(
             .reconcile(&empty_walked, &purge_policy, repo_root, &stored_corpus)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("corpus-change global-invalidation purge")?;
-        tracing::info!("identity-change purge complete — rebuilding from scratch");
+        tracing::info!("identity-change purge complete, rebuilding from scratch");
     }
 
     store
@@ -1278,7 +1278,7 @@ pub fn init_repo_with_progress(
         // cause is visible in logs rather than silently degrading.
         tracing::warn!(
             path = %repo_root.display(),
-            "repo_root contains non-UTF-8 bytes — snippet tool will be unavailable for this repo"
+            "repo_root contains non-UTF-8 bytes, snippet tool will be unavailable for this repo"
         );
     }
 
@@ -1354,7 +1354,7 @@ pub fn init_repo_with_progress(
     // conflict-marker noise into graph.db; the user should finish rebasing first.
     if repo_root.join(".git").join("REBASE_HEAD").exists() {
         eprintln!(
-            "warning: a git rebase is in progress — consider finishing or aborting it \
+            "warning: a git rebase is in progress, consider finishing or aborting it \
              before running `travsr init` to avoid indexing conflict markers"
         );
     }
@@ -1406,7 +1406,7 @@ pub fn init_repo_with_progress(
     const LARGE_REPO_THRESHOLD: usize = 200_000;
     if indexable_paths.len() > LARGE_REPO_THRESHOLD {
         eprintln!(
-            "warning: {} source files found — indexing may take several minutes. \
+            "warning: {} source files found, indexing may take several minutes. \
              Add large generated directories to .travsrignore to speed up future runs.",
             indexable_paths.len()
         );
@@ -1529,7 +1529,7 @@ pub fn init_repo_with_progress(
             || msg.contains("database or disk is full")
             || msg.contains("SQLITE_FULL")
         {
-            anyhow::anyhow!("disk is full — free space and re-run `travsr init` (original: {e:#})")
+            anyhow::anyhow!("disk is full, free space and re-run `travsr init` (original: {e:#})")
         } else {
             e
         }
@@ -1566,7 +1566,7 @@ pub fn init_repo_with_progress(
                 ghost_prune_aborted = true;
                 tracing::warn!(
                     reason = report.abort_reason.as_deref().unwrap_or(""),
-                    "init reconcile: ghost prune tripped the mass-delete circuit breaker — \
+                    "init reconcile: ghost prune tripped the mass-delete circuit breaker, \
                      deleted nothing; run `travsr fsck --fix --force` to override"
                 );
             }
@@ -3068,19 +3068,19 @@ fn maybe_spawn_embed(
                 tracing::info!(
                     phase1_done,
                     phase1_total,
-                    "embed_tick: Phase 1 incomplete, no sidecar running — spawning Phase 1"
+                    "embed_tick: Phase 1 incomplete, no sidecar running, spawning Phase 1"
                 );
                 travsr_plugin_host::spawn_background_reindex_phase1(&db_path);
             } else {
                 tracing::debug!(
-                    "embed_tick: Phase 1 pending — waiting for semantic analysis to complete"
+                    "embed_tick: Phase 1 pending, waiting for semantic analysis to complete"
                 );
             }
         } else {
             tracing::debug!(
                 phase1_done,
                 phase1_total,
-                "embed_tick: Phase 1 in progress — deferring Phase 2"
+                "embed_tick: Phase 1 in progress, deferring Phase 2"
             );
         }
         return;
@@ -3111,7 +3111,7 @@ fn maybe_spawn_embed(
 
     tracing::info!(
         phase2_remaining,
-        "embed_tick: Phase 1 complete — spawning Phase 2"
+        "embed_tick: Phase 1 complete, spawning Phase 2"
     );
     if travsr_plugin_host::spawn_background_reindex_phase2(&db_path) {
         phase2_spawned.store(true, Ordering::Relaxed);
@@ -3170,7 +3170,7 @@ fn maybe_spawn_invalidation_pass(db_path: &Path, store: &std::sync::Mutex<Sqlite
     }
     tracing::info!(
         pending,
-        "embed_tick: fully embedded but invalidation pending — spawning verification pass"
+        "embed_tick: fully embedded but invalidation pending, spawning verification pass"
     );
     if travsr_plugin_host::spawn_background_reindex_all(db_path) {
         LAST_INVALIDATION_PENDING.store(pending, Ordering::Relaxed);
@@ -3530,7 +3530,7 @@ pub fn reconcile_tracked_tree(
     ) {
         Ok(report) if report.aborted => tracing::warn!(
             reason = report.abort_reason.as_deref().unwrap_or(""),
-            "tree reconcile: ghost prune tripped the mass-delete circuit breaker — \
+            "tree reconcile: ghost prune tripped the mass-delete circuit breaker, \
              deleted nothing; run `travsr fsck --fix --force` to override"
         ),
         Ok(report) if !report.ghost_paths.is_empty() => tracing::info!(
@@ -3571,7 +3571,7 @@ pub fn reindex_files(
         }
         Err(e) => {
             tracing::warn!(
-                "could not read the index format version: {e} — skipping reindex. \
+                "could not read the index format version: {e}, skipping reindex. \
                  Run `travsr init` to rebuild the index."
             );
             return Ok(Default::default());
@@ -3586,13 +3586,13 @@ pub fn reindex_files(
         Ok(Some(c)) => c,
         Ok(None) => {
             tracing::warn!(
-                "this index has no repository identity recorded — symbol identifiers \
+                "this index has no repository identity recorded, symbol identifiers \
                  may be inconsistent. Run `travsr init` to rebuild it with a stable identity."
             );
             String::new()
         }
         Err(e) => {
-            tracing::warn!("could not read the repository identity: {e} — continuing without one");
+            tracing::warn!("could not read the repository identity: {e}, continuing without one");
             String::new()
         }
     };
@@ -3970,7 +3970,7 @@ fn reconcile_head_drift(
         event = "head.drift.detected",
         stored = %stored,
         head = %head,
-        "last_commit does not match live HEAD (history moved during daemon downtime) — reconciling"
+        "last_commit does not match live HEAD (history moved during daemon downtime), reconciling"
     );
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
     let (dirty, files) = match reconcile_tracked_tree(repo_root, &mut s) {
@@ -7078,7 +7078,7 @@ mod tests {
         assert!(
             cascade.is_empty(),
             "body-only edit (no symbols removed) must return empty DirtySet; \
-             got {} caller(s) — Tier-0 cascade depth-1 bound would be violated",
+             got {} caller(s), Tier-0 cascade depth-1 bound would be violated",
             cascade.len()
         );
     }
@@ -8902,7 +8902,7 @@ impl Daemon {
                                 {
                                     tracing::warn!(
                                         shed = watch_shed,
-                                        "indexer queue full — watch events shed; \
+                                        "indexer queue full, watch events shed; \
                                          head reconcile will cover them"
                                     );
                                     watch_shed = 0;
@@ -8973,7 +8973,7 @@ impl Daemon {
                     }
                     _ = gc_tick.tick() => {
                         tracing::debug!(
-                            "daemon heartbeat — uptime {}s",
+                            "daemon heartbeat, uptime {}s",
                             start_time.elapsed().as_secs()
                         );
                         // #621: HEAD may have moved while the daemon was down
@@ -9003,7 +9003,7 @@ impl Daemon {
                         // for graph.db deletions. Poll every 5 s as the only trigger.
                         if !db_path.exists() {
                             eprintln!(
-                                "travsr daemon: graph.db removed — exiting. Re-run `travsr init` to rebuild."
+                                "travsr daemon: graph.db removed, exiting. Re-run `travsr init` to rebuild."
                             );
                             std::process::exit(0);
                         }
@@ -9098,7 +9098,7 @@ impl Daemon {
                                 {
                                     tracing::warn!(
                                         shed = watch_shed,
-                                        "indexer queue full — watch events shed; \
+                                        "indexer queue full, watch events shed; \
                                          head reconcile will cover them"
                                     );
                                     watch_shed = 0;
@@ -9112,7 +9112,7 @@ impl Daemon {
                     }
                     _ = gc_tick.tick() => {
                         tracing::debug!(
-                            "daemon heartbeat — uptime {}s",
+                            "daemon heartbeat, uptime {}s",
                             start_time.elapsed().as_secs()
                         );
                         // #621: see the unix gc_tick arm — startup + periodic
@@ -9138,7 +9138,7 @@ impl Daemon {
                         // C3: poll every 5 s since .travsr is in SKIP_DIRS.
                         if !db_path.exists() {
                             eprintln!(
-                                "travsr daemon: graph.db removed — exiting. Re-run `travsr init` to rebuild."
+                                "travsr daemon: graph.db removed, exiting. Re-run `travsr init` to rebuild."
                             );
                             std::process::exit(0);
                         }
@@ -9295,7 +9295,7 @@ fn enqueue_dirty_callers(
     if shed > 0 {
         tracing::warn!(
             shed,
-            "Tier-0: indexer queue full — {shed} caller(s) deferred to Phase B / next reconcile"
+            "Tier-0: indexer queue full, {shed} caller(s) deferred to Phase B / next reconcile"
         );
     }
     if total > DIRTY_QUEUE_CAP {
@@ -9485,14 +9485,14 @@ fn handle_control_message(
                     // full tracked set (reindex_files is hash-delta gated, so
                     // this is cheap on an already-fresh graph) instead of
                     // silently reindexing nothing and claiming success.
-                    tracing::warn!(err=%e, "changed_files_from_git failed — falling back to full tracked-file reindex");
+                    tracing::warn!(err=%e, "changed_files_from_git failed, falling back to full tracked-file reindex");
                     match tracked_files_from_git(repo_root) {
                         Ok(p) => p,
                         Err(e2) => {
                             // Both git paths failed: report the failure so
                             // last_commit is NOT stamped and the hook-side
                             // caller learns the reindex did not happen.
-                            tracing::warn!(err=%e2, "tracked-file fallback also failed — reindex skipped");
+                            tracing::warn!(err=%e2, "tracked-file fallback also failed, reindex skipped");
                             return (
                                 ControlResponse::err(format!(
                                     "reindex-commit could not enumerate files: {e2}"
@@ -9757,7 +9757,7 @@ fn handle_control_message(
                         let phase2_total = total.saturating_sub(phase1_total);
                         let pct = (embedded * 100).checked_div(total).unwrap_or(100);
                         format!(
-                            "embedding ({backend_id}): {embedded}/{total} ({pct}%) — \
+                            "embedding ({backend_id}): {embedded}/{total} ({pct}%), \
                              Phase 1: {phase1_done}/{phase1_total} · Phase 2: {phase2_done}/{phase2_total}"
                         )
                     }
@@ -9777,7 +9777,7 @@ fn handle_control_message(
         Ok(ControlMessage::Shutdown) => (ControlResponse::ok(None), true),
         // WS3 (#420): pause auto-reindex and gracefully cancel any in-flight run.
         Ok(ControlMessage::StopEmbed) => {
-            tracing::info!("control: stop-embed — pausing auto-reindex + cancelling in-flight");
+            tracing::info!("control: stop-embed, pausing auto-reindex + cancelling in-flight");
             travsr_plugin_host::pause_embed();
             let was_running = travsr_plugin_host::embed_reindex_in_flight();
             travsr_plugin_host::terminate_inflight_reindex();
@@ -9789,7 +9789,7 @@ fn handle_control_message(
             (ControlResponse::ok(Some(msg.to_string())), false)
         }
         Ok(ControlMessage::ResumeEmbed) => {
-            tracing::info!("control: resume-embed — clearing auto-reindex pause");
+            tracing::info!("control: resume-embed, clearing auto-reindex pause");
             travsr_plugin_host::resume_embed();
             (
                 ControlResponse::ok(Some("embed auto-reindex resumed".to_string())),
@@ -9808,7 +9808,7 @@ fn handle_control_message(
                 // its direct-open path instead of mis-rendering a payload.
                 return (
                     ControlResponse::err(format!(
-                        "query protocol v{protocol} != daemon v{} — falling back",
+                        "query protocol v{protocol} != daemon v{}, falling back",
                         travsr_ipc::QUERY_PROTOCOL_VERSION
                     )),
                     false,
@@ -9860,7 +9860,7 @@ fn handle_control_message(
                         .map(|e| e.to_string())
                         .or_else(|| embed.err().map(|e| e.to_string()))
                         .unwrap_or_default();
-                    tracing::warn!(error = %err, "data_version pragma failed — bypassing query cache");
+                    tracing::warn!(error = %err, "data_version pragma failed, bypassing query cache");
                     None
                 }
             };
@@ -9991,7 +9991,7 @@ pub fn try_inject_embed_hook(
     use travsr_plugin_host::{embed_backends, lookup_embed_backend, EmbedSupervisor};
 
     let Some(home) = dirs::home_dir() else {
-        tracing::debug!("embed hook: HOME not set — skipping");
+        tracing::debug!("embed hook: HOME not set, skipping");
         return None;
     };
 
@@ -10025,7 +10025,7 @@ pub fn try_inject_embed_hook(
             tracing::warn!(
                 stored_model = %stored,
                 plugin_model = %model_id,
-                "embed model_id mismatch — Step 4 disabled. \
+                "embed model_id mismatch, Step 4 disabled. \
                  Run `travsr embed reindex` to rebuild embeddings with the installed model."
             );
             return None;
@@ -10075,7 +10075,7 @@ pub fn try_inject_embed_hook(
         if let Err(e) = write_store.set_meta("current_embed_model", &model_id) {
             tracing::warn!("embed: failed to persist current_embed_model: {e}");
         }
-        tracing::info!(model_id = %model_id, "embed plugin active — Step 4 (semantic ANN) enabled");
+        tracing::info!(model_id = %model_id, "embed plugin active, Step 4 (semantic ANN) enabled");
     }
     Some(supervisor)
 }

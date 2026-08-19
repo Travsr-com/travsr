@@ -407,7 +407,7 @@ impl PluginIndexer {
                 tracing::warn!(
                     lang = %lang,
                     corpus = %self.corpus,
-                    "semantic analysis skipped — not enabled for this repo (run `travsr lang install {lang}` here)"
+                    "semantic analysis skipped, not enabled for this repo (run `travsr lang install {lang}` here)"
                 );
                 outcome.skipped_untrusted_corpus.push(lang.clone());
                 continue;
@@ -472,7 +472,7 @@ impl PluginIndexer {
             if needs_compdb && !inputs.repo_root.join("compile_commands.json").exists() {
                 tracing::debug!(
                     lang = %lang,
-                    "Phase B skipped — scip-clang requires compile_commands.json"
+                    "Phase B skipped, scip-clang requires compile_commands.json"
                 );
                 outcome.skipped_no_compdb.push(lang.clone());
                 continue;
@@ -623,7 +623,7 @@ impl PluginIndexer {
                                     }
                                     Ok(None) => {
                                         tracing::debug!(
-                                            "rust-analyzer not available — native phase_b only"
+                                            "rust-analyzer not available, native phase_b only"
                                         )
                                     }
                                     Err(e) => tracing::warn!("rust-analyzer failed: {e}"),
@@ -791,7 +791,7 @@ impl PluginIndexer {
                                         }
                                     }
                                     Ok(None) => tracing::debug!(
-                                        "travsr-lsif-py not found — native phase_b tree-sitter edges only"
+                                        "travsr-lsif-py not found, native phase_b tree-sitter edges only"
                                     ),
                                     Err(e) => tracing::warn!("travsr-lsif-py failed: {e}"),
                                 }
@@ -898,7 +898,7 @@ impl PluginIndexer {
                                                     lang = %lang,
                                                     expected,
                                                     got,
-                                                    "Phase B: protocol version mismatch — run `travsr lang install {lang}` to upgrade"
+                                                    "Phase B: protocol version mismatch; run `travsr lang install {lang}` to upgrade"
                                                 );
                                                 LangResult {
                                                     lang,
@@ -1162,7 +1162,7 @@ mod tests {
             }
             assert!(
                 catalog_names.contains(v.as_str()),
-                "Language::{}::as_str() = {:?} not found in CATALOG — P1 would silently skip it",
+                "Language::{}::as_str() = {:?} not found in CATALOG, P1 would silently skip it",
                 v.as_str(),
                 v.as_str(),
             );

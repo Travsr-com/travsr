@@ -101,7 +101,7 @@ pub fn run() -> anyhow::Result<()> {
     let db_path = repo_root.join(".travsr").join("graph.db");
 
     if !db_path.exists() {
-        anyhow::bail!("not initialized — run `travsr init`");
+        anyhow::bail!("not initialized; run `travsr init`");
     }
 
     let payload: StatusPayload =
@@ -146,7 +146,7 @@ pub fn run() -> anyhow::Result<()> {
     let sig_v = payload.signature_format_version;
     if sig_v != travsr_core::SIGNATURE_FORMAT_VERSION {
         eprintln!(
-            "warning: this index was built with an older version of travsr (format v{sig_v}, current v{}) — run `travsr init` to rebuild it",
+            "warning: this index was built with an older version of travsr (format v{sig_v}, current v{}); run `travsr init` to rebuild it",
             travsr_core::SIGNATURE_FORMAT_VERSION
         );
     }
@@ -155,7 +155,7 @@ pub fn run() -> anyhow::Result<()> {
     let fts = payload.fts_nodes;
     if fts > 0 && fts != payload.nodes {
         eprintln!(
-            "warning: text search index has {fts} rows but the graph has {} nodes — run `travsr init` to rebuild",
+            "warning: text search index has {fts} rows but the graph has {} nodes; run `travsr init` to rebuild",
             payload.nodes
         );
     }
@@ -173,7 +173,7 @@ pub fn run() -> anyhow::Result<()> {
                 .collect();
             if !untrusted.is_empty() {
                 eprintln!(
-                    "warning: semantic analysis is not enabled for this repository yet ({}) — run `travsr lang install <lang>` here to enable",
+                    "warning: semantic analysis is not enabled for this repository yet ({}); run `travsr lang install <lang>` here to enable",
                     untrusted.join(", ")
                 );
             }
@@ -185,18 +185,18 @@ pub fn run() -> anyhow::Result<()> {
                     // no-op Phase A can make look like it did nothing; `--force`
                     // purges and rebuilds so the retry is unambiguous.
                     ["crashed", lang] => eprintln!(
-                        "warning: semantic analyzer for '{lang}' crashed — fix the tool (e.g. `travsr lang install {lang}`), then re-run `travsr init --semantic --force` to rebuild"
+                        "warning: semantic analyzer for '{lang}' crashed, fix the tool (e.g. `travsr lang install {lang}`), then re-run `travsr init --semantic --force` to rebuild"
                     ),
                     ["version_mismatch", rest] => {
                         let v: Vec<&str> = rest.splitn(3, ':').collect();
                         if let [lang, expected, got] = v.as_slice() {
                             eprintln!(
-                                "warning: the '{lang}' analyzer is out of date (protocol v{got}, expected v{expected}) — run `travsr lang install {lang}`"
+                                "warning: the '{lang}' analyzer is out of date (protocol v{got}, expected v{expected}); run `travsr lang install {lang}`"
                             );
                         }
                     }
                     ["needs_approval", lang] => eprintln!(
-                        "warning: '{lang}' needs a one-time network approval before it can index — run `travsr lang approve {lang}`"
+                        "warning: '{lang}' needs a one-time network approval before it can index; run `travsr lang approve {lang}`"
                     ),
                     // #712: analyzer ran but produced no nodes over the repo's
                     // source files of this language — a silent zero-node result,
@@ -210,7 +210,7 @@ pub fn run() -> anyhow::Result<()> {
                     // which the host now forwards on stderr.
                     ["zero_nodes", lang] => {
                         eprintln!(
-                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help — it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
+                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help, it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
                         );
                         // #724 Finding 4: the most common cause of a zero-node
                         // Java run on macOS is scip-java's javac shim crashing
@@ -243,7 +243,7 @@ pub fn run() -> anyhow::Result<()> {
                     // tree-sitter node — their references attribute to an orphaned
                     // duplicate node instead. `rate` is missed/attempted.
                     ["scip_unification_misses", rate] => eprintln!(
-                        "warning: {rate} semantic definitions did not match their parsed symbol — some references may resolve to a duplicate. Re-run `travsr init --semantic` if it persists."
+                        "warning: {rate} semantic definitions did not match their parsed symbol, some references may resolve to a duplicate. Re-run `travsr init --semantic` if it persists."
                     ),
                     _ => {}
                 }
@@ -265,7 +265,7 @@ pub fn run() -> anyhow::Result<()> {
                     "Re-run `travsr init --allow-unsandboxed` if you trust this repo."
                 };
                 eprintln!(
-                    "warning: Rust is on basic analysis — full cross-file edges (from rust-analyzer) were skipped because they need a security sandbox that is not available here. {remedy}"
+                    "warning: Rust is on basic analysis, full cross-file edges (from rust-analyzer) were skipped because they need a security sandbox that is not available here. {remedy}"
                 );
             }
             // #738: rust-analyzer ran and produced references, but every one was
@@ -273,7 +273,7 @@ pub fn run() -> anyhow::Result<()> {
             // this was the path-normalization bug; if it persists after upgrading,
             // it points at a repo-root/URI mismatch worth reporting.
             "all_refs_dropped" => eprintln!(
-                "warning: Rust is on basic analysis — rust-analyzer produced \
+                "warning: Rust is on basic analysis, rust-analyzer produced \
                  references but none could be matched to indexed symbols, so no \
                  type-resolved call edges were added (structural call edges are \
                  unaffected). Re-run `travsr init --force --allow-unsandboxed \
@@ -288,7 +288,7 @@ pub fn run() -> anyhow::Result<()> {
     if let Some(pkgs) = payload.dart_deps_unresolved.as_deref() {
         if !pkgs.is_empty() {
             eprintln!(
-                "warning: Dart cross-package references are incomplete — these \
+                "warning: Dart cross-package references are incomplete, these \
                  package(s) were indexed without resolved dependencies: {pkgs}. \
                  Run `dart pub get` in each to enable cross-package references \
                  (intra-package references are unaffected)."

@@ -191,7 +191,7 @@ suite("context/parse: parseContextResult", () => {
     assert.strictEqual(p.footer.snippetTokens, 0);
   });
 
-  test("parses no-repo-root footer [N nodes, ~T tokens — run travsr init …]", () => {
+  test("parses no-repo-root footer [N nodes, ~T tokens; run travsr init …]", () => {
     const r = parseContextResult(INIT_NEEDED_FIXTURE);
     assert.ok(isParsed(r), "should parse with init-needed footer");
     const p = r as ParsedContext;

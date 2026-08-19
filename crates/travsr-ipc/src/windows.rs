@@ -108,7 +108,7 @@ impl NamedPipeTransport {
     fn take_file(&mut self) -> anyhow::Result<std::fs::File> {
         self.file.take().ok_or_else(|| {
             anyhow::anyhow!(
-                "named-pipe transport already used — the control plane answers \
+                "named-pipe transport already used, the control plane answers \
                  one request per connection, reconnect for the next one"
             )
         })

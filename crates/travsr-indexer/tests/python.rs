@@ -582,7 +582,7 @@ fn golden_simple_py_stdlib_imports_produce_no_resolves_to_edges() {
     let edges = link_imports_python_fs(&out.nodes, "src/simple.py", "", &fixture_dir());
     assert!(
         edges.is_empty(),
-        "simple.py imports only stdlib — expected 0 ResolvesTo edges, got {}: {edges:#?}",
+        "simple.py imports only stdlib, expected 0 ResolvesTo edges, got {}: {edges:#?}",
         edges.len()
     );
 }

@@ -70,7 +70,7 @@ impl FfiMarker {
         if !is_valid_marker_name(&local_name) {
             tracing::warn!(
                 name = %local_name,
-                "ffi marker local_name failed validation — dropping marker"
+                "ffi marker local_name failed validation, dropping marker"
             );
             return None;
         }
@@ -78,7 +78,7 @@ impl FfiMarker {
             if !is_valid_marker_name(bn) {
                 tracing::warn!(
                     name = %bn,
-                    "ffi marker bound_name failed validation — dropping marker"
+                    "ffi marker bound_name failed validation, dropping marker"
                 );
                 return None;
             }

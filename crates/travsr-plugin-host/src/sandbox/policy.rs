@@ -86,7 +86,7 @@ pub fn validate_permitted_host(host: &str) -> Result<(), String> {
     }
     if h.contains('/') {
         return Err(format!(
-            "permitted host '{host}' must be a bare hostname — no CIDR ranges, paths, or schemes"
+            "permitted host '{host}' must be a bare hostname, no CIDR ranges, paths, or schemes"
         ));
     }
     if h.contains(':') {

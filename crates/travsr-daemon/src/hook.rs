@@ -204,7 +204,7 @@ fn install_one(hooks_dir: &Path, hook: &str, bin: &str) -> anyhow::Result<()> {
             // L6: a backup already exists — the user may have manually restored their
             // original hook over ours. Don't silently overwrite the backup.
             tracing::info!(
-                "{hook} hook modified since last install and {} already exists — \
+                "{hook} hook modified since last install and {} already exists, \
                  overwriting hook only (not re-backing up)",
                 bak_path.display()
             );
@@ -240,7 +240,7 @@ fn install_one(hooks_dir: &Path, hook: &str, bin: &str) -> anyhow::Result<()> {
                 // REPLACES the destination, so re-backing up here would destroy
                 // the original backup.
                 tracing::info!(
-                    "{hook}.cmd hook modified since last install and {} already exists — \
+                    "{hook}.cmd hook modified since last install and {} already exists, \
                      overwriting hook only (not re-backing up)",
                     cmd_bak_path.display()
                 );

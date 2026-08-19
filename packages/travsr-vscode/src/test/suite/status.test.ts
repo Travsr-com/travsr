@@ -24,7 +24,7 @@ function drain(ctx: vscode.ExtensionContext): void {
 
 // ── Status bar position parameter ─────────────────────────────────────────
 
-suite("S17-5: status — createStatusBarItem position parameter", () => {
+suite("S17-5: status, createStatusBarItem position parameter", () => {
   test("position='right' produces StatusBarAlignment.Right", () => {
     const ctx = makeContext();
     const item = createStatusBarItem(ctx, makeMcp(), undefined, "right");
@@ -78,7 +78,7 @@ suite("S17-5: status — createStatusBarItem position parameter", () => {
 
 // ── parseGraphStats / get_graph_stats integration ─────────────────────────
 
-suite("S224: status — parseGraphStats reads node count from get_graph_stats", () => {
+suite("S224: status, parseGraphStats reads node count from get_graph_stats", () => {
   test("node count is parsed from 'nodes: N' line", async () => {
     let called = "";
     const mcp: import("../../mcp").McpClient = {
@@ -119,7 +119,7 @@ suite("S224: status — parseGraphStats reads node count from get_graph_stats", 
 
 // ── saveDebounce — status bar uses get_graph_stats, not get_repo_map ───────
 
-suite("S17-6: status — poll calls get_graph_stats after save", () => {
+suite("S17-6: status, poll calls get_graph_stats after save", () => {
   test("callTool is invoked with 'get_graph_stats', never 'get_repo_map'", async () => {
     const calls: string[] = [];
     const mcp: import("../../mcp").McpClient = {

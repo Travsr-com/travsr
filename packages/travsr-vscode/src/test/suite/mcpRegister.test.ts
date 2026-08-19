@@ -31,7 +31,7 @@ suite("mcpRegister: mergeServerEntry", () => {
     assert.ok("travsr" in servers, "travsr entry must be added");
   });
 
-  test("claude_desktop: idempotent — overwrites existing travsr entry", () => {
+  test("claude_desktop: idempotent, overwrites existing travsr entry", () => {
     const existing = {
       mcpServers: { travsr: { command: "/old/travsr", args: ["mcp"] } },
     };
@@ -72,7 +72,7 @@ suite("mcpRegister: mergeServerEntry", () => {
 
 // ── #498: resolveExportBinaryPath — export boundary validation ─────────────
 
-suite("#498: mcpRegister — resolveExportBinaryPath", () => {
+suite("#498: mcpRegister, resolveExportBinaryPath", () => {
   // Host-semantics-safe absolute paths (assertExecutableBinary checks
   // absoluteness with the host's path.isAbsolute).
   const abs = (...segs: string[]): string => path.resolve(os.tmpdir(), ...segs);
@@ -103,7 +103,7 @@ suite("#498: mcpRegister — resolveExportBinaryPath", () => {
     );
   });
 
-  test("bare 'travsr' configured value is never exported — falls to install dir", () => {
+  test("bare 'travsr' configured value is never exported, falls to install dir", () => {
     const existsFn = (p: string): boolean => p === installPath;
     assert.strictEqual(
       resolveExportBinaryPath("travsr", process.platform, existsFn, never, never),

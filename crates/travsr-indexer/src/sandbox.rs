@@ -208,7 +208,7 @@ fn build_sandboxed_command_impl(
         return fallback(
             program,
             args,
-            "bwrap not found on PATH — install bubblewrap for subprocess isolation",
+            "bwrap not found on PATH; install bubblewrap for subprocess isolation",
         );
     }
 
@@ -613,7 +613,7 @@ mod tests {
             return;
         }
         if !bwrap_available() {
-            eprintln!("SKIP: bwrap installed but namespace isolation unavailable on this runner — sandbox isolation test skipped");
+            eprintln!("SKIP: bwrap installed but namespace isolation unavailable on this runner, sandbox isolation test skipped");
             return;
         }
 
@@ -650,7 +650,7 @@ mod tests {
         // Secondary: the shell should have exited non-zero (EROFS / EPERM).
         assert!(
             !output.status.success(),
-            "sandboxed sh succeeded when writing to a read-only path — \
+            "sandboxed sh succeeded when writing to a read-only path, \
              filesystem isolation is not working"
         );
     }

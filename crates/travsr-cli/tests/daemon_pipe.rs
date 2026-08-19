@@ -84,13 +84,13 @@ fn run_piped_expecting_prompt_eof(
 
     let out = out_rx.recv_timeout(STAGE_DEADLINE).unwrap_or_else(|_| {
         panic!(
-            "travsr {args:?}: stdout never reached EOF within {STAGE_DEADLINE:?} — \
+            "travsr {args:?}: stdout never reached EOF within {STAGE_DEADLINE:?}, \
              the detached daemon inherited this pipe's write handle (#572)"
         )
     });
     let err = err_rx.recv_timeout(STAGE_DEADLINE).unwrap_or_else(|_| {
         panic!(
-            "travsr {args:?}: stderr never reached EOF within {STAGE_DEADLINE:?} — \
+            "travsr {args:?}: stderr never reached EOF within {STAGE_DEADLINE:?}, \
              the detached daemon inherited this pipe's write handle (#572)"
         )
     });
@@ -379,7 +379,7 @@ fn daemon_does_not_inherit_grandparent_pipe_handle() {
     rx.recv_timeout(Duration::from_secs(30))
         .unwrap_or_else(|_| {
             panic!(
-                "side pipe never reached EOF after the CLI exited — the detached \
+                "side pipe never reached EOF after the CLI exited, the detached \
              daemon inherited a non-stdio handle (#572 residual)"
             )
         });

@@ -33,7 +33,7 @@ fn no_denied_corpus(result: &[Node], denied: &[&str]) {
             assert_ne!(
                 n.vname.corpus.as_str(),
                 d,
-                "RBAC LEAK: node {} from corpus '{}' appeared in result — corpus '{}' is denied",
+                "RBAC LEAK: node {} from corpus '{}' appeared in result, corpus '{}' is denied",
                 n.vname.signature,
                 n.vname.corpus,
                 d,

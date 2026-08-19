@@ -142,7 +142,7 @@ pub fn register(exe: &Path, repo_root: &Path) -> anyhow::Result<()> {
 /// Scheduler access — the UX-020 fallback when `schtasks` is unavailable.
 fn startup_dir() -> anyhow::Result<std::path::PathBuf> {
     let appdata = std::env::var_os("APPDATA")
-        .context("APPDATA is not set — cannot locate the Startup folder")?;
+        .context("APPDATA is not set, cannot locate the Startup folder")?;
     Ok(Path::new(&appdata)
         .join("Microsoft")
         .join("Windows")

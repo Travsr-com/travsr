@@ -197,7 +197,7 @@ impl std::fmt::Display for WrapperUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} is not available for {} yet — the travsr-lang release ships no \
+            "{} is not available for {} yet, the travsr-lang release ships no \
              prebuilt binary for this platform",
             self.binary_name, self.target
         )
@@ -1871,7 +1871,7 @@ mod extraction_tests {
         assert!(err.contains("SHA256 mismatch"), "{err}");
         assert!(
             !dest.join("server/bin/tool").exists(),
-            "a mismatching archive must not be extracted at all — the hash gates \
+            "a mismatching archive must not be extracted at all, the hash gates \
              extraction rather than following it"
         );
 

@@ -65,7 +65,7 @@ impl RerankManifest {
                 tracing::warn!(
                     path = %path.display(),
                     %error,
-                    "rerank: malformed model.toml — ignoring, using default floors"
+                    "rerank: malformed model.toml, ignoring, using default floors"
                 );
                 None
             }
@@ -149,7 +149,7 @@ pub fn ensure_manifest(model_dir: &Path) {
         ),
         Err(error) => tracing::warn!(
             %error,
-            "rerank: could not write model.toml — using default floors"
+            "rerank: could not write model.toml, using default floors"
         ),
     }
 }
@@ -164,7 +164,7 @@ pub fn warn_on_sha_mismatch(manifest: &RerankManifest, model_dir: &Path) {
         Ok(actual) if actual != manifest.sha256 => tracing::warn!(
             expected = %manifest.sha256,
             %actual,
-            "rerank: model.toml sha256 does not match model_fp16.onnx — floors may be stale (re-run the floor sweep for this model)"
+            "rerank: model.toml sha256 does not match model_fp16.onnx, floors may be stale (re-run the floor sweep for this model)"
         ),
         Ok(_) => {}
         Err(error) => {

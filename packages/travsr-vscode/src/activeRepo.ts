@@ -145,7 +145,7 @@ export class ActiveRepo {
       void vscode.window.showInformationMessage(
         repos.length === 0
           ? "No git repository is open."
-          : "Only one repository is open — nothing to choose."
+          : "Only one repository is open, nothing to choose."
       );
       return;
     }

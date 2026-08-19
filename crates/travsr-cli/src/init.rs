@@ -98,7 +98,7 @@ pub fn run(
         let check = travsr_store::SqliteStore::open(&db_path)?;
         if check.get_meta("last_commit")?.is_none() {
             println!(
-                "tip: run `git commit` to record a baseline — \
+                "tip: run `git commit` to record a baseline, \
                  `travsr status` will show freshness after your first commit"
             );
         }
@@ -136,7 +136,7 @@ fn maybe_connect(repo_root: &std::path::Path, no_connect: bool, report: crate::c
 fn hint_embed_missing() {
     if travsr_plugin_host::active_backend_id().is_none() {
         println!(
-            "tip: semantic search is not set up — run `travsr embed init` for natural-language queries"
+            "tip: semantic search is not set up; run `travsr embed init` for natural-language queries"
         );
     }
 }
@@ -169,7 +169,7 @@ fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
 
     if !offerable.is_empty() {
         println!(
-            "tip: {} found in this repo — full cross-file analysis is not set up yet:",
+            "tip: {} found in this repo, full cross-file analysis is not set up yet:",
             offerable
                 .iter()
                 .map(|s| s.as_str())
@@ -185,7 +185,7 @@ fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
         // Stated, not silently dropped: basic analysis did cover these files, and
         // the user should know which part is missing and why — in plain words.
         println!(
-            "note: {} found in this repo, but no analyzer is available for {} yet — \
+            "note: {} found in this repo, but no analyzer is available for {} yet, \
              basic analysis covers them, full cross-file analysis does not.",
             unavailable
                 .iter()

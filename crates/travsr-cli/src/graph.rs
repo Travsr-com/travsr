@@ -79,7 +79,7 @@ pub fn run(
     let db_path = repo_root.join(".travsr/graph.db");
 
     if !db_path.exists() {
-        anyhow::bail!("not initialized — run `travsr init`");
+        anyhow::bail!("not initialized; run `travsr init`");
     }
 
     let args = GraphQueryArgs {
@@ -139,17 +139,17 @@ pub fn run(
 
         if truncated {
             eprintln!(
-                "'{query_str}' is ambiguous — showing {limit} of at least {count} definitions. \
+                "'{query_str}' is ambiguous, showing {limit} of at least {count} definitions. \
                  Re-run with a `--path` hint to pick one:"
             );
         } else {
             eprintln!(
-                "'{query_str}' is ambiguous — {count} definitions. Re-run with a `--path` hint to pick one:"
+                "'{query_str}' is ambiguous, {count} definitions. Re-run with a `--path` hint to pick one:"
             );
         }
         for n in candidates.iter().take(limit) {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
-            eprintln!("  {} ({}) — {}{}", n.signature, n.kind, n.path, loc);
+            eprintln!("  {} ({}) \u{2014} {}{}", n.signature, n.kind, n.path, loc);
         }
         if truncated {
             eprintln!("[truncated: additional filtering/narrowing is required]");
@@ -180,7 +180,7 @@ pub fn run(
     render(payload, format, budget)?;
     if manifest_dead_end {
         eprintln!(
-            "note: manifests are configuration inputs — no source file depends on one, so \
+            "note: manifests are configuration inputs, no source file depends on one, so \
              callers are empty. Use `--direction deps` to see what this manifest declares."
         );
     }
@@ -205,7 +205,7 @@ pub fn run_all(format: Format, budget: usize) -> anyhow::Result<()> {
     let db_path = repo_root.join(".travsr/graph.db");
 
     if !db_path.exists() {
-        anyhow::bail!("not initialized — run `travsr init`");
+        anyhow::bail!("not initialized; run `travsr init`");
     }
 
     daemon_client::warn_if_call_graph_degraded(&db_path);

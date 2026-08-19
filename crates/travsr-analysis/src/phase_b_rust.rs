@@ -106,7 +106,7 @@ pub fn extract_native_phase_b(
     let query = match Query::new(&language, CALL_QUERY) {
         Ok(q) => q,
         Err(e) => {
-            tracing::warn!(err = %e, "rust call-site query compile failed — skipping Phase B calls");
+            tracing::warn!(err = %e, "rust call-site query compile failed, skipping Phase B calls");
             return Ok((nodes, edges, unresolved, refs));
         }
     };

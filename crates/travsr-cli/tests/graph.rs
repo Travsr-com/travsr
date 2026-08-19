@@ -97,7 +97,7 @@ fn ambiguous_repo(n: usize) -> tempfile::TempDir {
 fn definition_lines(stderr: &str) -> usize {
     stderr
         .lines()
-        .filter(|l| l.contains("fn:processPayment (function) —"))
+        .filter(|l| l.contains("fn:processPayment (function) \u{2014}"))
         .count()
 }
 
@@ -113,10 +113,10 @@ fn test_graph_cli_ambiguous_2_to_20() {
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(stderr.contains(
-        "'processPayment' is ambiguous — 2 definitions. Re-run with a `--path` hint to pick one:"
+        "'processPayment' is ambiguous, 2 definitions. Re-run with a `--path` hint to pick one:"
     ));
-    assert!(stderr.contains("fn:processPayment (function) — file_a.ts:1"));
-    assert!(stderr.contains("fn:processPayment (function) — file_b.ts:1"));
+    assert!(stderr.contains("fn:processPayment (function) \u{2014} file_a.ts:1"));
+    assert!(stderr.contains("fn:processPayment (function) \u{2014} file_b.ts:1"));
     assert!(stderr.contains("ambiguous symbol query"));
 }
 
@@ -134,7 +134,7 @@ fn test_graph_cli_ambiguous_at_limit_20() {
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(stderr.contains(
-        "'processPayment' is ambiguous — 20 definitions. Re-run with a `--path` hint to pick one:"
+        "'processPayment' is ambiguous, 20 definitions. Re-run with a `--path` hint to pick one:"
     ));
     assert_eq!(definition_lines(&stderr), 20);
     assert!(
@@ -161,7 +161,7 @@ fn test_graph_cli_ambiguous_one_over_limit_21() {
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(stderr.contains(
-        "'processPayment' is ambiguous — showing 20 of at least 21 definitions. \
+        "'processPayment' is ambiguous, showing 20 of at least 21 definitions. \
          Re-run with a `--path` hint to pick one:"
     ));
     assert_eq!(definition_lines(&stderr), 20);
@@ -182,7 +182,7 @@ fn test_graph_cli_ambiguous_more_than_20() {
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(stderr.contains(
-        "'processPayment' is ambiguous — showing 20 of at least 22 definitions. \
+        "'processPayment' is ambiguous, showing 20 of at least 22 definitions. \
          Re-run with a `--path` hint to pick one:"
     ));
     assert_eq!(definition_lines(&stderr), 20);
@@ -207,7 +207,7 @@ fn test_graph_cli_ambiguous_full_signature_tier1() {
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(
-        stderr.contains("is ambiguous — showing 20 of at least 21 definitions."),
+        stderr.contains("is ambiguous, showing 20 of at least 21 definitions."),
         "Tier-1 exact-signature path must report a truncated lower bound, got: {stderr}"
     );
     assert_eq!(definition_lines(&stderr), 20);
@@ -379,8 +379,8 @@ fn test_graph_cli_still_ambiguous_path() {
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(stderr.contains(
-        "'processPayment' is ambiguous — 2 definitions. Re-run with a `--path` hint to pick one:"
+        "'processPayment' is ambiguous, 2 definitions. Re-run with a `--path` hint to pick one:"
     ));
-    assert!(stderr.contains("fn:processPayment (function) — subdir1/file.ts:1"));
-    assert!(stderr.contains("fn:processPayment (function) — subdir2/file.ts:1"));
+    assert!(stderr.contains("fn:processPayment (function) \u{2014} subdir1/file.ts:1"));
+    assert!(stderr.contains("fn:processPayment (function) \u{2014} subdir2/file.ts:1"));
 }

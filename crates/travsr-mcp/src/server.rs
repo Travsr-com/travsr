@@ -474,7 +474,7 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_context",
-                "description": "Retrieve the most relevant context for a query within a token budget. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). Natural-language queries are translated to search terms deterministically — no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata.",
+                "description": "Retrieve the most relevant context for a query within a token budget. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). Natural-language queries are translated to search terms deterministically, no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -615,13 +615,13 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_snippets",
-                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to a condensed structural outline. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the structural outline only. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
+                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to a condensed structural outline. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the structural outline only. Leading docblocks are stripped. Respects a token budget, symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "symbols": {
                             "type": "string",
-                            "description": "Newline- or comma-separated list of symbol names (e.g. 'PaymentService.charge\\nMAX_RETRIES'). Partial matches accepted — the closest matching non-file symbol is used for each name."
+                            "description": "Newline- or comma-separated list of symbol names (e.g. 'PaymentService.charge\\nMAX_RETRIES'). Partial matches accepted, the closest matching non-file symbol is used for each name."
                         },
                         "token_budget": {
                             "type": "integer",
@@ -1068,7 +1068,7 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "search_symbol",
-                "description": "Find symbol definitions matching a name across the indexed graph. Accepts exact symbol names, partial matches, and natural-language queries (e.g. 'auth session validation'). No model or API key required. IMPORTANT: always supply `repo` to avoid cross-repo noise — omit only when explicitly searching across multiple repos. Run repos_list to discover available repo names.",
+                "description": "Find symbol definitions matching a name across the indexed graph. Accepts exact symbol names, partial matches, and natural-language queries (e.g. 'auth session validation'). No model or API key required. IMPORTANT: always supply `repo` to avoid cross-repo noise, omit only when explicitly searching across multiple repos. Run repos_list to discover available repo names.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1082,11 +1082,11 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_repo_map",
-                "description": "Return a structural overview of the indexed repository. IMPORTANT: always supply `repo` — omitting fans out across all indexed repos and produces a very large, hard-to-read response. Run repos_list to discover available repo names.",
+                "description": "Return a structural overview of the indexed repository. IMPORTANT: always supply `repo`, omitting fans out across all indexed repos and produces a very large, hard-to-read response. Run repos_list to discover available repo names.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). IMPORTANT: always supply — omitting fans out across all indexed repos." }
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). IMPORTANT: always supply, omitting fans out across all indexed repos." }
                     },
                     "additionalProperties": false
                 }
@@ -1118,7 +1118,7 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_context",
-                "description": "Retrieve the most relevant context for a query within a token budget. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). Natural-language queries are translated to search terms deterministically — no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata. Supply `repo` to scope to a single codebase; omit only for cross-repo queries.",
+                "description": "Retrieve the most relevant context for a query within a token budget. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). Natural-language queries are translated to search terms deterministically, no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata. Supply `repo` to scope to a single codebase; omit only for cross-repo queries.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1152,13 +1152,13 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_snippets",
-                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to a condensed structural outline. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the structural outline only. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
+                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to a condensed structural outline. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the structural outline only. Leading docblocks are stripped. Respects a token budget, symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "symbols": {
                             "type": "string",
-                            "description": "Newline- or comma-separated list of symbol names (e.g. 'PaymentService.charge\\nMAX_RETRIES'). Partial matches accepted — the closest matching non-file symbol is used for each name."
+                            "description": "Newline- or comma-separated list of symbol names (e.g. 'PaymentService.charge\\nMAX_RETRIES'). Partial matches accepted, the closest matching non-file symbol is used for each name."
                         },
                         "token_budget": {
                             "type": "integer",

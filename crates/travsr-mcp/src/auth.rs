@@ -192,13 +192,13 @@ pub fn fetch_signing_keys() -> anyhow::Result<Vec<[u8; 32]>> {
         // TODO: implement OCI Vault IMDS fetch via reqwest when deploying to OCI.
         // For now, return a clear error so local dev always uses TRAVSR_SIGNING_KEY_HEX.
         anyhow::bail!(
-            "IMDS fetch from OCI Vault is not yet implemented — \
+            "IMDS fetch from OCI Vault is not yet implemented, \
              set TRAVSR_SIGNING_KEY_HEX for local dev"
         );
     }
 
     anyhow::bail!(
-        "no signing key configured — set TRAVSR_SIGNING_KEY_HEX (64-char hex) for local dev"
+        "no signing key configured; set TRAVSR_SIGNING_KEY_HEX (64-char hex) for local dev"
     )
 }
 

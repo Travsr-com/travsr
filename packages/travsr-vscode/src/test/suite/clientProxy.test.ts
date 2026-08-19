@@ -21,7 +21,7 @@ function makeMcpStub(connected = true): McpClient & { disposeCount: number } {
 
 // ── MutableMcpClientProxy: delegation ─────────────────────────────────────────
 
-suite("S17-4: clientProxy — delegation to inner", () => {
+suite("S17-4: clientProxy, delegation to inner", () => {
   test("callTool delegates to current inner", async () => {
     const stub = makeMcpStub();
     stub.callTool = async (_n, _a) => "delegated";
@@ -45,7 +45,7 @@ suite("S17-4: clientProxy — delegation to inner", () => {
 
 // ── MutableMcpClientProxy: swapAndDispose ordering ───────────────────────────
 
-suite("S17-4: clientProxy — swapAndDispose", () => {
+suite("S17-4: clientProxy, swapAndDispose", () => {
   test("listener sees new inner as active when callback fires", () => {
     // Bug caught: if swap happened AFTER dispose, isConnected() would hit
     // a disposed (disconnected) client inside the listener.
@@ -102,7 +102,7 @@ suite("S17-4: clientProxy — swapAndDispose", () => {
 
 // ── MutableMcpClientProxy: onReconnect disposable ────────────────────────────
 
-suite("S17-4: clientProxy — onReconnect disposable", () => {
+suite("S17-4: clientProxy, onReconnect disposable", () => {
   test("disposed listener is NOT called on subsequent swap", () => {
     // Bug caught: if dispose() is a no-op, stale callbacks accumulate and
     // fire on every future swap (e.g. causing duplicate state transitions).
@@ -140,7 +140,7 @@ suite("S17-4: clientProxy — onReconnect disposable", () => {
 // We replicate the same Set-based pattern used in the real implementation
 // so any refactor that breaks the contract is caught here.
 
-suite("S17-4: onDisconnect — disposable removes listener", () => {
+suite("S17-4: onDisconnect, disposable removes listener", () => {
   test("dispose() prevents listener from firing", () => {
     // Inline simulation of StdioMcpClient's disconnectListeners pattern.
     const listeners = new Set<() => void>();
@@ -188,7 +188,7 @@ suite("S17-4: onDisconnect — disposable removes listener", () => {
 
 // ── setOnInvoke ───────────────────────────────────────────────────────────
 
-suite("S17-5: clientProxy — setOnInvoke", () => {
+suite("S17-5: clientProxy, setOnInvoke", () => {
   test("callback fires with the tool name on callTool", async () => {
     const stub = makeMcpStub();
     const proxy = new MutableMcpClientProxy(stub);
@@ -217,7 +217,7 @@ suite("S17-5: clientProxy — setOnInvoke", () => {
     await assert.doesNotReject(proxy.callTool("get_blast_radius"));
   });
 
-  test("callback survives swapAndDispose — it lives on the proxy, not the inner", async () => {
+  test("callback survives swapAndDispose, it lives on the proxy, not the inner", async () => {
     const proxy = new MutableMcpClientProxy(makeMcpStub());
     const seen: string[] = [];
     proxy.setOnInvoke((n) => seen.push(n));
@@ -235,7 +235,7 @@ suite("S17-5: clientProxy — setOnInvoke", () => {
     assert.deepStrictEqual(seen, ["get_callers", "get_blast_radius"]);
   });
 
-  test("second setOnInvoke call replaces first — first callback must not fire", async () => {
+  test("second setOnInvoke call replaces first, first callback must not fire", async () => {
     const proxy = new MutableMcpClientProxy(makeMcpStub());
     let countA = 0;
     let countB = 0;

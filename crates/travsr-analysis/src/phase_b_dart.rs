@@ -170,7 +170,7 @@ pub fn extract_native_phase_b(
     root: &Path,
 ) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<ScipRef>)> {
     let emitter = emitter_path().context(
-        "travsr-dart-index-emitter not found — \
+        "travsr-dart-index-emitter not found, \
          set $TRAVSR_DART_EMITTER or run `travsr lang install dart`",
     )?;
 
