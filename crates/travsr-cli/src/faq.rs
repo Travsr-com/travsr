@@ -1,16 +1,19 @@
-//! `travsr faq` — questions about travsr itself.
+//! Questions about travsr itself, answered by `travsr ask`.
 //!
-//! Distinct from `travsr ask --examples`, which lists questions about the
-//! *indexed code*. This answers questions about the tool: what it is, how it
-//! works, how to install it, where the data goes.
+//! There was a `travsr faq` subcommand once. Two commands meant guessing which
+//! one a question belonged to before asking it, so the catalogue folded into
+//! `ask`: a question about travsr and a question about your code are both just
+//! questions, and `ask` routes them. `ask --examples` lists both kinds, and
+//! `travsr ask "travsr: <question>"` is the spelling that can never be
+//! mistaken for a symbol search.
 //!
-//! Answered offline from constants rather than from the graph. A user asking
-//! "what is travsr" has often not indexed anything yet, and routing these
-//! through retrieval is what produced the failure this exists to fix:
-//! `travsr ask "what is this repo written in?"` matched the words against symbol
-//! names and returned a hundred rows of `var:REPO` and bench files. `ask` is
-//! graph-grounded, so it answers questions about code and cannot answer
-//! questions about the product.
+//! Answered offline from the catalogue rather than from the graph. Someone
+//! asking "what is travsr" has often not indexed anything yet, and routing
+//! these through retrieval is what produced the failure this exists to fix:
+//! `travsr ask "what is this repo written in?"` matched the words against
+//! symbol names and returned a hundred rows of `var:REPO` and bench files.
+//! `ask` is graph-grounded, so it answers questions about code and cannot
+//! answer questions about the product.
 
 use crate::progress::Palette;
 
