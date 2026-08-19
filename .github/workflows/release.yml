@@ -371,10 +371,29 @@ jobs:
           REL_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # Captured before matching, not piped into `grep -q`. With pipefail
+          # set, `grep -q` exits at the first match and the pipeline returns 141
+          # if `gh` writes again after the pipe closes, so a present install.sh
+          # could read as absent. It does not fire today only because `gh`
+          # buffers its output into one write, and `install.sh` sorts first in
+          # the asset list, which is the worst case for that race.
           for attempt in 1 2 3 4 5; do
-            if gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
-                 --json assets -q '.assets[].name' | grep -qx 'install.sh'; then
-              echo "install.sh is attached to $REL_TAG"
+            assets=$(gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
+                       --json assets -q '.assets[].name' || true)
+            if grep -qx 'install.sh' <<<"$assets"; then
+              # Being listed is not the invariant. #714 is that the *bytes*
+              # served are the ones from the promoted ref, so download and
+              # compare rather than trusting the name.
+              gh release download "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
+                 -p install.sh -O served.sh --clobber
+              if ! cmp -s served.sh install.sh; then
+                echo "::error::$REL_TAG serves an install.sh that differs from the one attached." >&2
+                echo "The published asset is what travsr.com/install.sh hands to users," >&2
+                echo "so it has to be byte-identical to the copy this run attached." >&2
+                exit 1
+              fi
+              rm -f served.sh
+              echo "install.sh on $REL_TAG downloads and matches ($(wc -c < install.sh) bytes)"
               exit 0
             fi
             echo "install.sh not visible on $REL_TAG yet (attempt $attempt), retrying"
@@ -528,20 +547,6 @@ jobs:
               "$t"
           done
 
-      - name: Create the promoted tag on the same commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          FROM="${{ github.event.inputs.promote_from }}"
-          TO="${{ github.event.inputs.promote_to }}"
-          SHA=$(git rev-list -n1 "$FROM")
-          git tag "$TO" "$SHA"
-          # Pushed via the default GITHUB_TOKEN: GitHub does not start new
-          # workflow runs for events triggered by that token, so this tag push
-          # does NOT re-enter the `push: tags:` build path. Promotion never rebuilds.
-          git push origin "$TO"
-
       # #714: `install.sh` is the one attached asset that does not come from the
       # source release, because it is not a build artifact. The checkout above is
       # the dispatch ref, so attaching the working tree's copy would ship
@@ -553,6 +558,12 @@ jobs:
       # version). Rather than rely on that staying true, take it from the
       # promoted tag's own tree, which matches how everything else here is
       # sourced from the release being promoted.
+      #
+      # Ordered before the tag push deliberately. It needs only the checkout,
+      # and running it afterwards meant tripping it left a public tag with no
+      # release attached, which the next attempt could not recover from:
+      # `fetch-tags: true` refetches that tag, so `git tag` fails on it and the
+      # operator has to delete it by hand before re-running.
       #
       # #713: a ref that predates install.sh existing has nothing to extract.
       # `action-gh-release` defaults `fail_on_unmatched_files: false`, so that
@@ -576,6 +587,20 @@ jobs:
           git show "$FROM_TAG:install.sh" > install.sh
           chmod +x install.sh
           echo "install.sh taken from $FROM_TAG ($(wc -c < install.sh) bytes)"
+
+      - name: Create the promoted tag on the same commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          FROM="${{ github.event.inputs.promote_from }}"
+          TO="${{ github.event.inputs.promote_to }}"
+          SHA=$(git rev-list -n1 "$FROM")
+          git tag "$TO" "$SHA"
+          # Pushed via the default GITHUB_TOKEN: GitHub does not start new
+          # workflow runs for events triggered by that token, so this tag push
+          # does NOT re-enter the `push: tags:` build path. Promotion never rebuilds.
+          git push origin "$TO"
 
       - name: Create promoted GitHub Release
         uses: softprops/action-gh-release@v2
@@ -602,10 +627,29 @@ jobs:
           REL_TAG: ${{ github.event.inputs.promote_to }}
         run: |
           set -euo pipefail
+          # Captured before matching, not piped into `grep -q`. With pipefail
+          # set, `grep -q` exits at the first match and the pipeline returns 141
+          # if `gh` writes again after the pipe closes, so a present install.sh
+          # could read as absent. It does not fire today only because `gh`
+          # buffers its output into one write, and `install.sh` sorts first in
+          # the asset list, which is the worst case for that race.
           for attempt in 1 2 3 4 5; do
-            if gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
-                 --json assets -q '.assets[].name' | grep -qx 'install.sh'; then
-              echo "install.sh is attached to $REL_TAG"
+            assets=$(gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
+                       --json assets -q '.assets[].name' || true)
+            if grep -qx 'install.sh' <<<"$assets"; then
+              # Being listed is not the invariant. #714 is that the *bytes*
+              # served are the ones from the promoted ref, so download and
+              # compare rather than trusting the name.
+              gh release download "$REL_TAG" --repo "$GITHUB_REPOSITORY" \
+                 -p install.sh -O served.sh --clobber
+              if ! cmp -s served.sh install.sh; then
+                echo "::error::$REL_TAG serves an install.sh that differs from the one attached." >&2
+                echo "The published asset is what travsr.com/install.sh hands to users," >&2
+                echo "so it has to be byte-identical to the copy this run attached." >&2
+                exit 1
+              fi
+              rm -f served.sh
+              echo "install.sh on $REL_TAG downloads and matches ($(wc -c < install.sh) bytes)"
               exit 0
             fi
             echo "install.sh not visible on $REL_TAG yet (attempt $attempt), retrying"
