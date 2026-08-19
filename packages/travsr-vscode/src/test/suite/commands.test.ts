@@ -118,8 +118,8 @@ suite("VSCODE-247: buildStatsView", () => {
   test("missing fields fall back to dash", () => {
     const view = buildStatsView("nodes: 5");
     assert.strictEqual(view.nodes, "5");
-    assert.strictEqual(view.edges, ",");
-    assert.strictEqual(view.schemaVersion, ",");
+    assert.strictEqual(view.edges, "—");
+    assert.strictEqual(view.schemaVersion, "—");
   });
 });
 
