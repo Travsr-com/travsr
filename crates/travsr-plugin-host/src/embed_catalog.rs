@@ -250,10 +250,31 @@ fn contention_message(info_path: &Path) -> String {
     let pid: Option<u32> = pid_str.parse().ok();
 
     if pid.is_some_and(|p| p == std::process::id()) {
+        // Reached only once waiting has stopped, never while it is happening.
+        // `travsr embed gc` takes the lock with plain `try_acquire`, which does
+        // not wait at all, and the retry path surfaces this string only after
+        // its 10s deadline expires; while it is genuinely waiting it logs its
+        // own "retrying" line at debug. So the copy a user sees has to describe
+        // an operation that did not start, not one that is being waited on.
         return format!(
-            "An embed operation ({held_op}) is already running in this same process.\n\
-             Waiting for it to finish; no action is needed."
+            "This process is already running an embed operation ({held_op}), so \
+             this one did not start.\n\
+             Retry once it finishes; nothing needs to be stopped."
         );
+    }
+
+    // A `0` is not a stale pid, it is a corrupt entry: `std::process::id()`
+    // cannot return 0, so nothing we write puts it there. Saying "pid 0 is not
+    // running" is technically true and reads as nonsense, so name the real
+    // condition instead.
+    if pid == Some(0) {
+        return "The embed lock is held, but .travsr/embed.lock.info does not name a \
+                usable pid, so the holder cannot be identified.\n\
+                That file is only written when a lock is taken, so this one is \
+                corrupt or truncated rather than current.\n\
+                No action is needed: the lock is released automatically when its \
+                holder exits."
+            .to_string();
     }
 
     match pid.map(pid_liveness) {
@@ -1840,6 +1861,31 @@ pub fn active_backend_id() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// #745 review: a `0` in the info file produced the full live-holder
+    /// message, naming pid 0 and advising `travsr daemon stop`. `std::process::id()`
+    /// never yields 0, so a 0 there means the file is corrupt, truncated or
+    /// externally written, and it must not be presented as a running holder.
+    #[test]
+    fn a_zero_pid_is_not_reported_as_a_live_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = dir.path().join("embed.lock.info");
+        std::fs::write(&info, "0\treindex\n").unwrap();
+
+        let msg = super::contention_message(&info);
+        assert!(
+            !msg.contains("pid 0"),
+            "must not name pid 0 as the holder: {msg}"
+        );
+        assert!(
+            !msg.contains("travsr daemon stop"),
+            "must not advise stopping a holder it never established: {msg}"
+        );
+        assert!(
+            msg.contains("does not name a usable pid"),
+            "should name the real condition, a corrupt info file: {msg}"
+        );
+    }
+
     use super::*;
 
     /// Serializes tests that mutate the process-global `REINDEX_IN_FLIGHT` /
@@ -2690,9 +2736,17 @@ mod stale_lock_tests {
             &format!("{}\treindex", std::process::id()),
         ));
 
+        // Asserts the meaning, not a phrase. The wording changed in the #745
+        // review: this message is only reached once waiting has stopped, so it
+        // now says the operation did not start rather than that it is being
+        // waited on.
         assert!(
-            msg.contains("same process"),
+            msg.contains("This process is already running"),
             "self-contention must be named as such: {msg}"
+        );
+        assert!(
+            !msg.contains("Waiting for it to finish"),
+            "this is surfaced only after waiting has stopped: {msg}"
         );
         assert!(
             !msg.contains("Another embed operation"),
