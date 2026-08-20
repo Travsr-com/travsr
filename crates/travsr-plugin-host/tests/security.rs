@@ -16,6 +16,8 @@ use travsr_plugin_host::sandbox::policy::SandboxUnavailable;
 #[cfg(target_os = "linux")]
 fn sandbox_standard_allows_network() {
     use travsr_plugin_host::sandbox::linux::build_sandboxed_command;
+    // tempdir() reads TMPDIR; serialise against the env-mutating provider tests.
+    let _env = env_guard();
 
     let repo = tempfile::tempdir().expect("tempdir");
     let scratch = tempfile::tempdir().expect("scratch");
@@ -64,6 +66,8 @@ fn sandbox_standard_allows_network() {
 // 2. Fail-closed — no sandbox → Err(SandboxUnavailable), never an unsandboxed command
 #[test]
 fn sandbox_unavailable_returns_err_not_fallback_command() {
+    // tempdir() reads TMPDIR; serialise against the env-mutating provider tests.
+    let _env = env_guard();
     // On any platform, if sandbox is unavailable we get Err, not a fallback Command.
     // We verify this by calling the wrong-platform builder and checking the type.
     //
@@ -145,9 +149,26 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
 // tests only unit-tested `TrustConfig::is_trusted`, which production never
 // called — they passed while the gate was dead code.
 
-/// Serialises the trust-gate tests: they mutate process-global env
-/// (TRAVSR_LANG_TOML, PATH) which must not interleave.
+/// Serialises every test that reads or writes process-global env.
+///
+/// The provider tests `set_var`/`remove_var` on PATH/TRAVSR_BIN_DIR/
+/// TRAVSR_LANG_TOML; in a multithreaded process that is a data race against any
+/// concurrent `getenv` — including the `env::temp_dir()` lookup inside every
+/// `tempfile::tempdir()` call the sandbox tests make. `setenv` reallocates the
+/// C `environ` array, so a concurrent read can see a corrupted PATH and the
+/// analyzer resolution silently misses the on-PATH stub (`skipped_no_analyzer`).
+/// Env is per-process, so holding this lock across every env-touching test in
+/// this binary removes the race; the pure struct-validation tests take no env
+/// and need no guard. (Other test binaries are separate processes, unaffected.)
 static TRUST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`TRUST_ENV_LOCK`], recovering from a poisoned guard left by an
+/// unrelated test panic (the data being guarded is process env, not test state).
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    TRUST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// How the fake `travsr-lang-go` provider is laid out on the temp PATH dir.
 enum ProviderLayout {
@@ -220,9 +241,7 @@ fn run_phase_b_with_provider(
     trusted_corpora: &[&str],
     layout: ProviderLayout,
 ) -> travsr_plugin_host::PhaseBOutcome {
-    let _guard = TRUST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = env_guard();
 
     // lang.toml: "go" registered; trust list as given.
     let cfg_dir = tempfile::tempdir().expect("cfg tempdir");
@@ -414,6 +433,8 @@ fn cmd_shim_with_packaged_exe_reaches_spawn() {
 #[cfg(target_os = "linux")]
 fn sandbox_repo_root_is_read_only() {
     use travsr_plugin_host::sandbox::linux::build_sandboxed_command;
+    // tempdir() reads TMPDIR; serialise against the env-mutating provider tests.
+    let _env = env_guard();
 
     let repo = tempfile::tempdir().expect("tempdir");
     let scratch = tempfile::tempdir().expect("scratch");
@@ -453,6 +474,8 @@ fn sandbox_repo_root_is_read_only() {
 #[cfg(target_os = "linux")]
 fn sandbox_scratch_dir_is_writable() {
     use travsr_plugin_host::sandbox::linux::build_sandboxed_command;
+    // tempdir() reads TMPDIR; serialise against the env-mutating provider tests.
+    let _env = env_guard();
 
     let repo = tempfile::tempdir().expect("tempdir");
     let scratch = tempfile::tempdir().expect("scratch");
