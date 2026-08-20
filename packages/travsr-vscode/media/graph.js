@@ -19,14 +19,23 @@ const C = {
   err:   '#f4645a',   // red-400     — diagnostics: error
   warn:  '#fcd053',   // gold-300    — diagnostics: warning
 };
+// Own-property lookup with a fallback. A plain-object map must never be indexed
+// directly by a graph-supplied kind: kinds like "constructor" (real, e.g. Java)
+// collide with Object.prototype members, so `map[kind] || fallback` returns the
+// inherited function instead of the fallback. That bogus value was handed to
+// cytoscape as a shape, `nodeShapes[it]` was undefined, and drawNode threw
+// ("reading 'draw' of undefined") — killing the renderer and freezing the panel.
+function fromMap(map, kind, fallback) {
+  return Object.prototype.hasOwnProperty.call(map, kind) ? map[kind] : fallback;
+}
 function nodeColor(kind) {
-  return ({ function: C.fn, class: C.cls, file: C.file, interface: C.iface, var: C.vr, pkg: C.pkg, ghost: '#5a5a5a' })[kind] || '#8f7a6c';
+  return fromMap({ function: C.fn, constructor: C.fn, method: C.fn, class: C.cls, file: C.file, interface: C.iface, var: C.vr, pkg: C.pkg, ghost: '#5a5a5a' }, kind, '#8f7a6c');
 }
 function nodeShape(kind) {
-  return ({ function: 'ellipse', class: 'diamond', file: 'round-rectangle', interface: 'triangle', var: 'round-tag', pkg: 'round-rectangle', ghost: 'round-rectangle' })[kind] || 'ellipse';
+  return fromMap({ function: 'ellipse', constructor: 'ellipse', method: 'ellipse', class: 'diamond', file: 'round-rectangle', interface: 'triangle', var: 'round-tag', pkg: 'round-rectangle', ghost: 'round-rectangle' }, kind, 'ellipse');
 }
 function edgeColor(kind) {
-  return ({ calls: 'rgba(134,223,134,0.28)', imports: 'rgba(72,72,72,0.42)', reads: 'rgba(252,208,83,0.35)' })[kind] || 'rgba(72,72,72,0.42)';
+  return fromMap({ calls: 'rgba(134,223,134,0.28)', imports: 'rgba(72,72,72,0.42)', reads: 'rgba(252,208,83,0.35)' }, kind, 'rgba(72,72,72,0.42)');
 }
 
 // ── Cytoscape init ────────────────────────────────────────────────────────────
@@ -121,11 +130,11 @@ const cy = cytoscape({
         width: e => e.data('wgt') ? Math.min(5, 1 + Math.log2(e.data('wgt')) * 0.7) : 1.3,
         'line-color': e => edgeColor(e.data('kind')),
         'line-fill': 'linear-gradient',
-        'line-gradient-stop-colors': e => ({
+        'line-gradient-stop-colors': e => fromMap({
           calls:   ['rgba(134,223,134,0.10)', 'rgba(134,223,134,0.58)'],
           imports: ['rgba(72,72,72,0.18)', 'rgba(100,100,100,0.52)'],
           reads:   ['rgba(252,208,83,0.10)', 'rgba(252,208,83,0.58)'],
-        })[e.data('kind')] || ['rgba(72,72,72,0.18)', 'rgba(100,100,100,0.52)'],
+        }, e.data('kind'), ['rgba(72,72,72,0.18)', 'rgba(100,100,100,0.52)']),
         'line-gradient-stop-positions': [0, 100],
         'target-arrow-shape': 'triangle', 'arrow-scale': 0.75,
         'target-arrow-color': e => edgeColor(e.data('kind')),
@@ -1235,7 +1244,7 @@ function showDetail(n) {
   detailEl.innerHTML =
     '<div style="display:flex;gap:10px;align-items:center;margin-bottom:4px">' +
       '<div class="node-icon-lg" style="background:' + color + '14;border:2px solid ' + color + ';color:' + color + '">' +
-        (iconMap[d.kind] || '●') +
+        fromMap(iconMap, d.kind, '●') +
       '</div>' +
       '<div>' +
         '<div class="d-sig">' + escHtml(d.label || '') + '</div>' +
