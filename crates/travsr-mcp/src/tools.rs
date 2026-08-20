@@ -2622,9 +2622,14 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
     let semantic_available = store.has_refcall_edges_for_language(meta.language);
 
     // The honest next step when it is not live, in the shared vocabulary:
+    //  - no build for this OS               -> unsupported (never "install", which
+    //                                          would dead-end — same verdict the CLI
+    //                                          `lang list` shows, from one predicate)
     //  - analyzer present but no edges yet  -> rebuild
     //  - analyzer absent                    -> install (same step for every language)
-    let status = if semantic_available {
+    let status = if let Some(os) = travsr_plugin_host::phase_b::platform::unsupported_reason(meta) {
+        LangStatus::PlatformUnsupported { os }
+    } else if semantic_available {
         LangStatus::Active
     } else {
         let next = if analyzer_installed(meta.language) {
@@ -2635,8 +2640,10 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
         LangStatus::Partial { next: Some(next) }
     };
     // `install_hint` stays for backward compatibility; it mirrors the step above.
+    // Empty when there is nothing to install: already live, or no build exists for
+    // this OS (an install step there would just dead-end).
     let install_hint = match &status {
-        LangStatus::Active => String::new(),
+        LangStatus::Active | LangStatus::PlatformUnsupported { .. } => String::new(),
         LangStatus::Partial { next: Some(step) } => step.clone(),
         _ => install_step(meta.language),
     };
@@ -8132,6 +8139,34 @@ mod tests {
         assert!(json.contains(r#""builtin":true"#));
         assert!(json.contains(r#""semantic_available":false"#));
         assert!(json.contains(r#""status":"partial""#), "got: {json}");
+    }
+
+    /// get_lang_status must never tell the user to install a build that does not
+    /// exist for this OS: when the shared platform predicate says a language is
+    /// unavailable here, the status is `unsupported` with no install hint — the
+    /// same verdict `travsr lang list` shows. Gated on the predicate so it is
+    /// correct on every host (objectivec is unavailable off Apple, available on it).
+    #[test]
+    fn get_lang_status_agrees_with_platform_predicate_on_unsupported() {
+        let store = make_store(&[], &[]);
+        let json = get_lang_status(&store, "src/AppDelegate.mm");
+        assert!(json.contains(r#""language":"objectivec""#), "got: {json}");
+        let entry = travsr_plugin_host::phase_b::catalog::lookup("objectivec").unwrap();
+        if travsr_plugin_host::phase_b::platform::unsupported_reason(entry).is_some() {
+            assert!(
+                json.contains(r#""status":"unsupported""#),
+                "unavailable here, must be unsupported, got: {json}"
+            );
+            assert!(
+                json.contains(r#""install_hint":"""#),
+                "no install hint when unsupported, got: {json}"
+            );
+        } else {
+            assert!(
+                json.contains(r#""status":"partial""#) || json.contains(r#""status":"active""#),
+                "available here, must not be unsupported, got: {json}"
+            );
+        }
     }
 
     /// get_lang_status flips to `active` after a RefCall edge is inserted.

@@ -168,32 +168,15 @@ pub fn run(cmd: LangCommand) -> Result<()> {
 
 // ── platform availability (#588) ──────────────────────────────────────────────
 
-/// The host target triple this wrapper's release asset would be named for, or
-/// `None` on a platform travsr has no triple for.
-fn host_target() -> Option<&'static str> {
-    crate::install::current_target().ok()
-}
-
-/// The host target when this entry needs a travsr-lang wrapper that the release
-/// matrix does not publish for it, else `None`.
-///
-/// #588: `current_target()` returning a triple was being read as "the wrapper
-/// exists for this triple". It does not follow — Windows had a triple and zero
-/// published assets — so every `lang install` on Windows offered a setup flow
-/// that ended in a raw 404. Anything that offers, lists or performs a wrapper
-/// install asks this first and states the limitation instead.
-/// Reported only when the wrapper is not already present: a user who built one
-/// themselves and put it on PATH has a working setup, and telling them it is
-/// unavailable would be its own false statement. The gate is about what can be
-/// *downloaded*, not about what can run.
-pub(crate) fn wrapper_unavailable_target(entry: &PhaseBEntry) -> Option<&'static str> {
-    let bin = entry.provider_binary?;
-    let target = host_target()?;
-    if crate::install::wrapper_available(bin, target) || tool_available(bin) {
-        return None;
-    }
-    Some(target)
-}
+// Platform-availability predicates live in `travsr-plugin-host` (the crate both
+// the CLI and the MCP server depend on) so `lang list`, `get_lang_status` and the
+// VS Code panel derive the same verdict from one place and can never drift apart.
+// Re-exported here so existing `crate::lang::…` call sites (and `status.rs`,
+// `init.rs`) are unchanged.
+pub(crate) use travsr_plugin_host::phase_b::platform::{
+    analyzer_unavailable_os, full_analysis_unavailable_here, unsupported_reason,
+    wrapper_unavailable_target,
+};
 
 /// The line shown wherever an unavailable language surfaces: the honest
 /// capability statement plus whatever manual path the catalog records.
@@ -270,9 +253,7 @@ fn lang_capability_status(
             // this platform (scip-clang / scip-ruby / the swift emitter on Windows).
             // Both mean `travsr lang install <lang>` cannot reach full analysis here,
             // so the honest line is "not available on <os>", not "run: install".
-            unsupported_on: wrapper_unavailable_target(entry)
-                .map(|_| travsr_plugin_host::phase_b::status::os_label().to_string())
-                .or_else(|| analyzer_unavailable_os(entry)),
+            unsupported_on: unsupported_reason(entry),
             // On Windows, the analyzers that cannot run isolated are gated on the
             // user's one-time permission instead of the network approval. No effect
             // off Windows.
@@ -289,43 +270,6 @@ fn lang_capability_status(
 fn unsandboxed_consent_present(config: Option<&LangConfig>, language: &str) -> bool {
     config.is_some_and(|c| c.has_unsandboxed_consent(language))
         || travsr_plugin_host::resolver::session_unsandboxed_opt_in()
-}
-
-/// `Some(<os>)` when the language's analyzer is installed only from a prebuilt
-/// GitHub-release binary that has no asset for the host platform — so `travsr
-/// lang install <lang>` genuinely cannot provide it here (e.g. scip-clang for
-/// c/cpp, scip-ruby, the swift index emitter, all on Windows). `None` for
-/// analyzers installed via a command or manual step (go, scala's sbt, php's
-/// composer package): those are not asset-gated, so the uniform "run: travsr
-/// lang install <lang>" step still points at a real path.
-fn analyzer_unavailable_os(entry: &PhaseBEntry) -> Option<String> {
-    let target = host_target()?;
-    let no_asset = match &entry.scip_install {
-        ScipInstall::GithubBinary(s) => (s.asset_fn)(s.version_fallback, target).is_none(),
-        ScipInstall::CommandThenGithubGz(_, s) => {
-            (s.asset_fn)(s.version_fallback, target).is_none()
-        }
-        // ZipBinary assets are platform-independent; Command/Manual are not
-        // asset-gated. None of these can be "unavailable for this OS" by asset.
-        _ => false,
-    };
-    no_asset.then(|| travsr_plugin_host::phase_b::status::os_label().to_string())
-}
-
-/// Whether full (cross-file) analysis can *never* run for this language on the
-/// current platform, because neither its `travsr-lang-*` wrapper nor its analyzer
-/// ships a build here. When true, no `travsr lang install <lang>` invocation can
-/// help — the only honest UX is "not available on <os>; structural analysis still
-/// works". Used to keep every surface from ever offering a command that would just
-/// dead-end. Takes the language string so non-CLI callers (status warnings) need
-/// no `PhaseBEntry` in hand.
-pub(crate) fn full_analysis_unavailable_here(language: &str) -> bool {
-    match lookup(language) {
-        Some(entry) => {
-            wrapper_unavailable_target(entry).is_some() || analyzer_unavailable_os(entry).is_some()
-        }
-        None => false,
-    }
 }
 
 /// Whether a language's full analysis is turned on for the repo we are standing
@@ -493,8 +437,12 @@ fn cmd_list(json: bool) -> Result<()> {
             // #588: `installed:false` alone cannot distinguish "run the install
             // command" from "no build exists for this platform". Consumers that
             // surface an install prompt (the VS Code extension included) need
-            // that difference, so it is stated rather than implied.
-            let unavailable_on = wrapper_unavailable_target(entry);
+            // that difference, so it is stated rather than implied. Uses the same
+            // combined predicate as `statusLine` (wrapper OR analyzer asset), so
+            // `availableOnThisPlatform` can never contradict a `status:unsupported`
+            // line the way it did when it looked at the wrapper alone. The value is
+            // the OS word ("windows"), matching the wording in `statusLine`.
+            let unavailable_on = unsupported_reason(entry);
             // The authoritative status every consumer renders. `status` is a stable
             // machine tag; `statusLine` is the exact human wording used in the CLI,
             // so the extension shows the same words without re-deriving them.
@@ -528,7 +476,7 @@ fn cmd_list(json: bool) -> Result<()> {
                 json_str(entry.effective_prerequisites()),
                 json_arr(entry.elevated_hosts),
                 unavailable_on.is_none(),
-                unavailable_on.map_or("null".to_string(), json_str),
+                unavailable_on.as_deref().map_or("null".to_string(), json_str),
             ));
         }
         println!("[{}]", entries.join(",\n"));
@@ -2293,6 +2241,28 @@ mod tests {
         let go = lookup("go").expect("go entry present");
         let state = RepoState::compute(go, true, true, /*trusted*/ false, /*ready*/ true);
         assert_eq!(state.tag(), "not_enabled");
+    }
+
+    #[test]
+    fn available_on_platform_matches_status_tag_for_every_language() {
+        use super::lang_capability_status;
+        use travsr_plugin_host::phase_b::catalog::CATALOG;
+        use travsr_plugin_host::phase_b::platform::unsupported_reason;
+        for entry in CATALOG {
+            // What `lang list --json` emits for availableOnThisPlatform.
+            let available = unsupported_reason(entry).is_none();
+            // The status tag the same row shows. `unsupported` is the only tag that
+            // means "cannot reach full analysis on this OS"; it comes from the same
+            // predicate, so the boolean can never say "available" while the status
+            // says "unsupported" (the #588 regression this locks out). Approved and
+            // consent are set so a merely-elevated language does not read as
+            // unsupported for an unrelated reason.
+            let status = lang_capability_status(
+                entry, /*registered*/ true, /*approved*/ true, true,
+            );
+            let unsupported = status.tag() == "unsupported";
+            assert_eq!(available, !unsupported, "{}", entry.language);
+        }
     }
 
     #[test]
