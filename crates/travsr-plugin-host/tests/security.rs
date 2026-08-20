@@ -185,26 +185,44 @@ enum ProviderLayout {
     CmdShimWithPackagedExe,
 }
 
+/// Write a directly spawnable executable stub named `name` into `bin_dir`:
+/// an `MZ`-prefixed `.exe` on Windows (a spawn failure still lands in `crashed`,
+/// proving the spawn path ran), an executable `#!/bin/sh` script elsewhere.
+fn write_exec_stub(bin_dir: &std::path::Path, name: &str) {
+    use std::io::Write as _;
+    #[cfg(windows)]
+    let path = bin_dir.join(format!("{name}.exe"));
+    #[cfg(not(windows))]
+    let path = bin_dir.join(name);
+    let mut f = std::fs::File::create(&path).expect("create exec stub");
+    #[cfg(windows)]
+    f.write_all(b"MZ not a real PE").expect("write");
+    #[cfg(not(windows))]
+    f.write_all(b"#!/bin/sh\nexit 0\n").expect("write");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod exec stub");
+    }
+}
+
+/// Stub go's UNDERLYING analyzer (`scip-go`, go's `catalog.command`) onto the
+/// test PATH. Since #743 the resolver's G2 gate skips a language whose wrapper
+/// is present but whose analyzer tool is absent (`tool_available` false), so
+/// without this the fake `travsr-lang-go` wrapper resolves but go is dropped as
+/// `missing_tool` before it ever reaches the trust gate or spawn stage these
+/// tests exercise. Only layouts that are meant to reach spawn need it.
+fn write_fake_analyzer_tool(bin_dir: &std::path::Path) {
+    write_exec_stub(bin_dir, "scip-go");
+}
+
 /// Materialise `layout` inside `bin_dir`.
 fn write_fake_provider(bin_dir: &std::path::Path, layout: &ProviderLayout) {
-    use std::io::Write as _;
     match layout {
         ProviderLayout::NativeStub => {
-            #[cfg(windows)]
-            let fake = bin_dir.join("travsr-lang-go.exe");
-            #[cfg(not(windows))]
-            let fake = bin_dir.join("travsr-lang-go");
-            let mut f = std::fs::File::create(&fake).expect("create fake provider");
-            #[cfg(windows)]
-            f.write_all(b"MZ not a real PE").expect("write");
-            #[cfg(not(windows))]
-            f.write_all(b"#!/bin/sh\nexit 0\n").expect("write");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod fake provider");
-            }
+            write_exec_stub(bin_dir, "travsr-lang-go");
+            write_fake_analyzer_tool(bin_dir);
         }
         #[cfg(windows)]
         ProviderLayout::CmdShimOnly => {
@@ -229,6 +247,7 @@ fn write_fake_provider(bin_dir: &std::path::Path, layout: &ProviderLayout) {
                 .join("travsr-lang-go.exe");
             std::fs::create_dir_all(exe.parent().unwrap()).expect("mk packaged bin dir");
             std::fs::write(&exe, b"MZ not a real PE").expect("write packaged exe");
+            write_fake_analyzer_tool(bin_dir);
         }
     }
 }
