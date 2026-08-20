@@ -133,7 +133,11 @@ pub fn run(
                 .map(|n| {
                     serde_json::json!({
                         "id": n.id.to_string(),
-                        "signature": n.label,
+                        // `signature` is the raw form and round-trips through
+                        // exact-signature resolution (`--path` re-query);
+                        // `label` is the clean display name.
+                        "signature": n.signature,
+                        "label": n.label,
                         "kind": n.kind,
                         "path": n.path,
                         "line": n.line,
@@ -465,7 +469,12 @@ fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow
         .map(|node| {
             serde_json::json!({
                 "id": node.id.to_string(),
-                "signature": node.label,
+                // schema_version 1 documents `signature` as the raw node
+                // signature; keep it raw so distinct overloads / same-named
+                // types in different packages stay distinguishable, and expose
+                // the clean display name as an additive `label` field.
+                "signature": node.signature,
+                "label": node.label,
                 "kind": node.kind,
                 "path": node.path,
                 "language": node.language,
@@ -505,6 +514,10 @@ fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow
                 .map(|l| Cow::Borrowed(*l))
                 .unwrap_or_else(|| travsr_core::display_signature(&e.dst_sig, ""));
             serde_json::json!({
+                // Node ids keep two edges between collapsed-label endpoints
+                // (overloads, same-named types across packages) distinct.
+                "from_id": e.src.to_string(),
+                "to_id": e.dst.to_string(),
                 "from": from,
                 "to": to,
                 "kind": e.kind,

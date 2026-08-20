@@ -6386,8 +6386,26 @@ fn node_json_label(node: &CoreNode) -> String {
             .unwrap_or(&node.vname.path)
             .to_string()
     } else {
-        display_label(node).into_owned()
+        // `display_label` canonicalizes a synthesized scip:/sdb: symbol to a
+        // clean `Type.member` name, but returns a native tree-sitter signature
+        // verbatim (`fn:home`). The visual renderer wants the bare short name
+        // (`home`), which the graph panel and `askSymbol` quick pick have always
+        // shown, so strip the structural `kind:` prefix off native labels.
+        strip_native_kind_prefix(&display_label(node)).to_string()
     }
+}
+
+/// Strip a native tree-sitter `kind:` prefix (`fn:`, `class:`, `method:`,
+/// `interface:`, `import:`) so `fn:home` renders as `home` in the visual graph.
+/// A canonicalized external label (no such prefix) passes through unchanged.
+fn strip_native_kind_prefix(label: &str) -> &str {
+    label
+        .strip_prefix("fn:")
+        .or_else(|| label.strip_prefix("class:"))
+        .or_else(|| label.strip_prefix("method:"))
+        .or_else(|| label.strip_prefix("interface:"))
+        .or_else(|| label.strip_prefix("import:"))
+        .unwrap_or(label)
 }
 
 fn get_graph_json_raw(
@@ -7008,6 +7026,82 @@ fn get_graph_json_global_overview(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The visual graph renderer strips the native `kind:` prefix (`fn:home` →
+    /// `home`), keeps the canonicalized `Type.member` name for synthesized
+    /// external symbols, and shows a file node's basename. The vscode fixture
+    /// (`commands.test.ts`) pins the `fn:bar` → `bar` contract.
+    #[test]
+    fn node_json_label_strips_native_prefix_and_cleans_external() {
+        use travsr_core::{Node, VName};
+        let native = Node::new(
+            VName::new("c", "", "src/foo.rs", "rust", "fn:home"),
+            "function",
+        );
+        assert_eq!(node_json_label(&native), "home");
+
+        let class = Node::new(
+            VName::new("c", "", "src/foo.rs", "rust", "class:Home"),
+            "class",
+        );
+        assert_eq!(node_json_label(&class), "Home");
+
+        let file = Node::new(
+            VName::new("c", "", "src/foo/bar.rs", "rust", "file"),
+            "file",
+        );
+        assert_eq!(node_json_label(&file), "bar.rs");
+
+        // A synthesized external symbol keeps its clean, prefix-free label.
+        let external = Node::new(
+            VName::new(
+                "c",
+                "",
+                "com/demo/Greeter.java",
+                "java",
+                "sdb:com/demo/Greeter#greet().",
+            ),
+            "method",
+        );
+        assert_eq!(node_json_label(&external), "Greeter.greet");
+    }
+
+    /// `find_references_structured` reports a machine-readable `status` that the
+    /// CLI text path branches on for its not-found message. Pin the three the
+    /// store can produce without a semantic index: `not_found`, `resolved`, and
+    /// `ambiguous`.
+    #[test]
+    fn find_references_structured_reports_status() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // Empty store: a name with no definition is a definitive not-found.
+        let miss = find_references_structured(&store, "charge", None);
+        assert_eq!(miss.status, "not_found");
+        assert!(miss.candidates.is_empty());
+
+        // One definition: resolved (zero recorded uses is still `resolved`).
+        store
+            .put_node(&Node::new(
+                VName::new("c", "", "svc.rs", "rust", "fn:charge"),
+                "function",
+            ))
+            .unwrap();
+        let hit = find_references_structured(&store, "charge", None);
+        assert_eq!(hit.status, "resolved");
+        assert!(hit.resolved_to.is_some());
+
+        // Two definitions of the same name in different files: ambiguous.
+        store
+            .put_node(&Node::new(
+                VName::new("c", "", "billing.rs", "rust", "fn:charge"),
+                "function",
+            ))
+            .unwrap();
+        let amb = find_references_structured(&store, "charge", None);
+        assert_eq!(amb.status, "ambiguous");
+        assert!(amb.candidates.len() >= 2);
+    }
 
     /// SEC-002 end-to-end: a path-traversal repo arg must be rejected through
     /// the full get_callers_global → collect_global → validate_mcp_arg pipeline.

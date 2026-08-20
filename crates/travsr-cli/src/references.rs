@@ -77,18 +77,28 @@ pub fn run(symbol: &str, path: Option<String>, format: OutputFormat) -> anyhow::
             println!("{}", serde_json::to_string(&structured)?);
         }
         OutputFormat::Text => {
-            // `find_references` returns the model-facing `<travsr-data>` envelope.
-            // That is noise in CLI output — `ask` and `graph` already strip it — so
-            // present the inner body to the user.
-            let output = travsr_mcp::find_references(&store, symbol, path.as_deref());
-            let body = envelope_body(&output);
-            if body.trim().is_empty() {
-                // An empty body means the name resolved to no definition at all —
-                // distinct from a resolved symbol with zero recorded uses, which
-                // prints its own `resolved: … 0 reference(s)` line.
-                println!("Symbol '{symbol}' was not found.");
+            // Decide not-found from the resolver outcome, never by sniffing the
+            // rendered body: an empty body can be a drift note (`with_head_note`)
+            // or a validation-reject string, and a genuine not-found can carry a
+            // note — so `body.is_empty()` is not a reliable signal.
+            let structured =
+                travsr_mcp::find_references_structured(&store, symbol, path.as_deref());
+            if structured.status == "not_found" && structured.candidates.is_empty() {
+                // Resolver saw no definition (or rejected the argument). Its own
+                // note is the definitive not-found line or an invalid-argument
+                // caveat — distinct from a resolved symbol with zero recorded
+                // uses, which prints its `resolved: … 0 reference(s)` line below.
+                match &structured.note {
+                    Some(note) => println!("{note}"),
+                    None => println!("Symbol '{symbol}' was not found."),
+                }
             } else {
-                println!("{body}");
+                // Resolved / ambiguous / pending / path-miss-with-candidates:
+                // `find_references` returns the model-facing `<travsr-data>`
+                // envelope. That is noise in CLI output — `ask` and `graph`
+                // already strip it — so present the inner body to the user.
+                let output = travsr_mcp::find_references(&store, symbol, path.as_deref());
+                println!("{}", envelope_body(&output));
             }
         }
     }
