@@ -324,7 +324,13 @@ mod tests {
         std::env::set_var("SYSTEMROOT", "C:\\Windows");
         let scratch = std::env::temp_dir();
         let spawn = build_unsandboxed_command("java", &["-version"], &scratch, "java");
-        let SandboxedSpawn::Wrapped(cmd) = spawn else {
+        // Off Windows, `SandboxedSpawn` has only the `Wrapped` variant
+        // (AppContainer is windows-only), so this pattern is irrefutable and rustc
+        // flags the `else` as unreachable. It is refutable on Windows, so allow the
+        // lint only where the pattern cannot fail.
+        #[cfg_attr(not(target_os = "windows"), allow(irrefutable_let_patterns))]
+        let SandboxedSpawn::Wrapped(cmd) = spawn
+        else {
             panic!("unsandboxed command must be a plain wrapped command");
         };
         // A daemon secret is dropped; an allowlisted OS var survives.
