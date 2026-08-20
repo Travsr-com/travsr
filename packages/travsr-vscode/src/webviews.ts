@@ -964,9 +964,17 @@ export interface LangInfo {
   package: string;
   sandbox: "Standard" | "Elevated";
   /** Authoritative status computed by the CLI — render this, never re-derive it.
-   *  `active` = full cross-file analysis is live; `partial` = structure only;
-   *  `needs_approval` = one-time approval required; `unsupported` = no build here. */
-  status: "active" | "partial" | "needs_approval" | "unsupported";
+   *  `active` = full cross-file analysis is live; `partial` = structure only, but
+   *  it can be turned on here; `needs_approval` = one-time network approval
+   *  required first; `needs_consent` = installed, but needs the user's one-time
+   *  permission to run on this OS; `unsupported` = no build for this OS, full
+   *  analysis can never run here (structure still works). */
+  status:
+    | "active"
+    | "partial"
+    | "needs_approval"
+    | "needs_consent"
+    | "unsupported";
   /** The exact plain wording the CLI shows for this status — used as the tooltip. */
   statusLine: string;
   /** Per-repo enablement for the target repo (corpus trust gate), computed by the
@@ -980,6 +988,12 @@ export interface LangInfo {
   registered: boolean;
   builtin: boolean;
   needsApproval: boolean;
+  /** Whether full analysis can run on this OS at all. `false` means no build
+   *  exists here — the panel must never offer an install that would dead-end.
+   *  Consistent with `status === "unsupported"`; both come from one CLI predicate. */
+  availableOnThisPlatform: boolean;
+  /** The OS word ("windows"/"macos"/"linux") when unavailable here, else null. */
+  unavailableTarget: string | null;
   scipInstallType: "GithubBinary" | "Command" | "Manual";
   installHint: string;
   underlyingToolHint: string;
@@ -1016,30 +1030,55 @@ export function buildLanguagesHtml(
     .map((l) => {
       const detected = detectedLangs.has(l.language);
       // Render the CLI's computed status — never re-derive it here, so the panel
-      // can never disagree with `travsr lang list`. `active` means full cross-file
-      // analysis is live; everything else is `partial` (structure still works).
+      // can never disagree with `travsr lang list`.
       const isActive = l.status === "active";
+      // No build for this OS: full analysis can never run here, so the panel must
+      // never offer an install. `status` and `availableOnThisPlatform` come from
+      // one CLI predicate and always agree; check both defensively.
+      const unavailableHere =
+        l.status === "unsupported" || !l.availableOnThisPlatform;
+      const osName =
+        ({ windows: "Windows", macos: "macOS", linux: "Linux" } as Record<string, string>)[
+          l.unavailableTarget ?? ""
+        ] ?? "this platform";
+      // The CLI's needs_consent line names the exact command (`allow-unsandboxed`),
+      // which is fine in a terminal but is internal wording for a panel with a
+      // button. Use plain prose here instead of echoing that line.
+      const permissionTip =
+        `Full analysis for ${l.language} needs your one-time permission to run on ` +
+        `${osName}. It uses your project's own build tools, the same as if you ran ` +
+        `the build yourself. Click to allow and enable it.`;
 
-      // Analysis column: the same word the CLI shows, with its plain line as the
-      // tooltip. No "SCIP/LSIF/Phase B" jargon reaches the user.
-      const semCls =
-        l.status === "active" ? "ok" : l.status === "needs_approval" ? "dim" : "stale";
-      const semText =
-        l.status === "active"
-          ? "active"
-          : l.status === "needs_approval"
-            ? "needs approval"
-            : "partial";
-      const analysisBadges = `<span class="badge ${semCls}" title="${esc(l.statusLine)}">${semText}</span>`;
+      // Analysis column: one word per status, its plain (jargon-free) line as the
+      // tooltip — except needs_consent, whose CLI line names an internal command.
+      const badge = (
+        {
+          active: ["ok", "active"],
+          partial: ["stale", "partial"],
+          needs_approval: ["dim", "needs approval"],
+          needs_consent: ["dim", "needs permission"],
+          unsupported: ["dim", "not available here"],
+        } as Record<string, [string, string]>
+      )[l.status] ?? ["stale", "partial"];
+      const badgeTip = l.status === "needs_consent" ? permissionTip : l.statusLine;
+      const analysisBadges = `<span class="badge ${badge[0]}" title="${esc(badgeTip)}">${badge[1]}</span>`;
 
       // Raw action HTML (used directly when detected or active; wrapped otherwise).
       let rawAction: string;
-      if (isActive && !l.builtin) {
+      if (unavailableHere) {
+        // Honest dead-end: no install offered, structure still works. Tooltip is
+        // the CLI's own plain line ("...not available on windows").
+        rawAction = `<span class="badge dim" title="${esc(l.statusLine)}">Not available on ${esc(osName)}</span>`;
+      } else if (isActive && !l.builtin) {
         rawAction = `<button class="btn danger" onclick="removeLang(this,'${esc(l.language)}')">Disable</button>`;
       } else if (isActive) {
         // A built-in analyzer that is live (e.g. python): nothing to install or turn off.
         rawAction = `<span class="badge ok" title="${esc(l.statusLine)}">on</span>`;
-      } else if (l.needsApproval) {
+      } else if (l.status === "needs_consent") {
+        // Installed, but needs the user's one-time permission to run on this OS.
+        // One click records it and re-indexes — no docs trip, no command to type.
+        rawAction = `<button class="btn primary" title="${esc(permissionTip)}" onclick="grantPermission(this,'${esc(l.language)}')">Allow &amp; enable</button>`;
+      } else if (l.needsApproval || l.status === "needs_approval") {
         rawAction = `<details class="consent">
   <summary>Grant access &amp; Install</summary>
   <div class="consent-body">
@@ -1052,22 +1091,18 @@ export function buildLanguagesHtml(
     <button class="btn primary" onclick="approveLang(this,'${esc(l.language)}')">Grant &amp; Install</button>
   </div>
 </details>`;
-      } else if (l.scipInstallType === "Manual") {
-        // underlyingToolHint may contain trailing prose ("https://... — description").
-        // Extract only the URL token (up to the first whitespace).
-        const rawHint = l.underlyingToolHint ?? "";
-        const docsUrl = rawHint.startsWith("http") ? rawHint.split(/\s/)[0] : "";
-        rawAction = docsUrl
-          ? `<a href="${esc(docsUrl)}" style="color:var(--green);font-size:12px">Install guide ↗</a>`
-          : `<span style="font-size:11px;color:var(--fg-subtle)">Manual — run:<br><code style="color:var(--fg-muted)">${esc(l.installHint)}</code></span>`;
       } else {
+        // partial → installable here. Languages that need an external build tool
+        // (scala, php) land here too: the Prerequisites column already names the
+        // tool, so this is a plain Install, not a redirect to a docs site.
         rawAction = `<button class="btn primary" onclick="installLang(this,'${esc(l.language)}')">Install</button>`;
       }
 
-      // Gate: undetected + inactive non-builtins get a disclosure instead of a direct button.
-      // Builtins always show their badge directly — they're always available regardless of repo.
+      // Gate: undetected + inactive non-builtins get a disclosure instead of a direct
+      // button. Builtins, active languages, and platform-unavailable ones show their
+      // cell directly — the last so "Not available on <OS>" is never buried.
       const actionCell =
-        !detected && !isActive && !l.builtin
+        !unavailableHere && !detected && !isActive && !l.builtin
           ? `<details class="not-here"><summary>Not in this repo</summary><div class="not-here-body">${rawAction}</div></details>`
           : rawAction;
 
@@ -1122,7 +1157,7 @@ ${sub}
 <div class="toolbar">
   <button class="btn" id="detectBtn" onclick="detectLangs(this)">Detect &amp; install</button>
   <button class="btn" id="refreshBtn" onclick="doRefresh(this)" title="Refresh indexed counts (fast)">Refresh</button>
-  <button class="btn" id="reloadBtn" onclick="reloadAvail(this)" title="Re-run travsr lang list to refresh tool status">Reload available tools</button>
+  <button class="btn" id="reloadBtn" onclick="reloadAvail(this)" title="Refresh the list of available analysis tools">Reload available tools</button>
 </div>
 <section>
   <h3>Indexed in this repo</h3>
@@ -1133,7 +1168,7 @@ ${sub}
 <section>
   <h3>Available tools</h3>
   <table><thead><tr><th>Language</th><th>Semantic</th><th>This repo</th><th>Prerequisites</th><th>Action</th></tr></thead>
-  <tbody>${availRows || '<tr><td colspan="5" class="empty">No language tools found. Is the travsr binary on PATH?</td></tr>'}</tbody></table>
+  <tbody>${availRows || '<tr><td colspan="5" class="empty">No analysis tools available yet. Use Reload above to check again.</td></tr>'}</tbody></table>
 </section>`;
 
   const script = `
@@ -1155,6 +1190,10 @@ function approveLang(btn, lang) {
 function removeLang(btn, lang) {
   setLoading(btn, true, 'Disable');
   vscode.postMessage({command:'removeLang', language:lang});
+}
+function grantPermission(btn, lang) {
+  setLoading(btn, true, 'Allow &amp; enable');
+  vscode.postMessage({command:'enableWithPermission', language:lang});
 }
 function detectLangs(btn) {
   setLoading(btn, true, 'Detect &amp; install');
