@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -752,14 +753,198 @@ pub struct RefSite {
     pub line: u32,
 }
 
-/// Human-readable label: path for file nodes (whose `signature` is the
-/// literal `"file"`), signature for everything else.
-pub fn display_label(node: &Node) -> &str {
+/// Human-readable label for a node in `graph` / reference output.
+///
+/// - File nodes (signature is the literal `"file"`): the repo-relative path.
+/// - Nodes synthesized from a raw compiler symbol (a reference whose target has
+///   no tree-sitter node — an implicit constructor, a cross-file external
+///   symbol): a clean `Type.member` name, matching the `Type.member` style
+///   native tree-sitter nodes already use (see [`external_symbol_label`]).
+/// - Everything else: the signature verbatim (native `kind:name` form).
+pub fn display_label(node: &Node) -> Cow<'_, str> {
     if node.kind == "file" && !node.vname.path.is_empty() {
-        &node.vname.path
-    } else {
-        &node.vname.signature
+        return Cow::Borrowed(&node.vname.path);
     }
+    display_signature(&node.vname.signature, &node.vname.path)
+}
+
+/// Clean a raw node signature for display, given the node's path.
+///
+/// This is the signature-level entry point behind [`display_label`], for the
+/// call sites that hold a bare signature string (the `graph --format json` /
+/// DOT renderers) rather than a whole [`Node`]. Non-synthesized signatures are
+/// returned borrowed and unchanged.
+pub fn display_signature<'a>(signature: &'a str, path: &str) -> Cow<'a, str> {
+    match external_symbol_label(signature, path) {
+        Some(clean) => Cow::Owned(clean),
+        None => Cow::Borrowed(signature),
+    }
+}
+
+/// Turn a synthesized external-symbol signature into a clean `Type.member`
+/// name, or return `None` for an ordinary node.
+///
+/// When a Phase B reference points at a symbol that has no tree-sitter node,
+/// the analyzer synthesizes a node named by the raw compiler symbol so the edge
+/// has a destination. Those raw names carry indexer-internal prefixes and the
+/// full package path (`Greeter#`<init>`().`, `com/demo/Main.g.`) that must never
+/// reach a user. This normalizes them to the same short, package-free
+/// `Type.member` form a resolved node would show.
+///
+/// Two synthesis paths use two prefixes for the same concept: scip-reader emits
+/// `scip:{path}:{scip-symbol}` (go, java, c#, c/c++, objc), the scala reader
+/// emits `sdb:{descriptors}`. Everything else (native tree-sitter, kotlin) is
+/// already a clean `kind:name` signature and returns `None` here.
+fn external_symbol_label(signature: &str, path: &str) -> Option<String> {
+    let descriptors = if let Some(rest) = signature.strip_prefix("scip:") {
+        // `{path}:{scip-symbol}` — strip the node's own path (robust to spaces
+        // in the path), then take the descriptor part of the global symbol.
+        let scip_symbol = rest
+            .strip_prefix(path)
+            .and_then(|r| r.strip_prefix(':'))
+            .unwrap_or(rest);
+        scip_descriptor_part(scip_symbol)?
+    } else {
+        // SemanticDB global symbols are descriptors only (no scheme prefix);
+        // a signature without either prefix is already clean.
+        signature.strip_prefix("sdb:")?
+    };
+    descriptors_to_label(descriptors)
+}
+
+/// The descriptor tail of a SCIP global symbol, which is
+/// `<scheme> <manager> <name> <version> <descriptors>` — four whitespace-
+/// separated leading fields, then the descriptors (which may themselves contain
+/// spaces inside backtick-escaped names, so split off exactly four fields rather
+/// than taking the last token).
+fn scip_descriptor_part(scip_symbol: &str) -> Option<&str> {
+    let mut rest = scip_symbol;
+    for _ in 0..4 {
+        rest = rest.split_once(char::is_whitespace)?.1;
+    }
+    Some(rest)
+}
+
+/// Join the type/member names of a SCIP / SemanticDB descriptor string into a
+/// package-free `Type.member` label. Package segments are dropped; an implicit
+/// constructor (`<init>` / `<clinit>`) collapses onto its enclosing type.
+fn descriptors_to_label(descriptors: &str) -> Option<String> {
+    let parts = descriptor_names(descriptors);
+    // Drop package descriptors when anything more specific (a type or member)
+    // remains; a pure-package symbol keeps its segments so it is not blanked.
+    let mut kept: Vec<&str> = parts
+        .iter()
+        .filter(|(_, term)| *term != '/')
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if kept.is_empty() {
+        kept = parts.iter().map(|(name, _)| name.as_str()).collect();
+    }
+    // `<init>`/`<clinit>` are compiler-internal constructor names; the enclosing
+    // type name already identifies the constructor (the node kind says so too).
+    kept.retain(|name| *name != "<init>" && *name != "<clinit>" && !name.is_empty());
+    if kept.is_empty() {
+        return None;
+    }
+    Some(kept.join("."))
+}
+
+/// Split a SCIP / SemanticDB descriptor string into `(name, terminator)` pairs.
+///
+/// Descriptor grammar: a package ends in `/`, a type in `#`, a term in `.`, a
+/// method in `(disambiguator).`, a parameter is `(name)`, a type parameter is
+/// `[name]`. Names may be backtick-escaped (`` `<init>` ``), in which case a
+/// doubled backtick is a literal backtick.
+fn descriptor_names(descriptors: &str) -> Vec<(String, char)> {
+    let mut out = Vec::new();
+    let mut chars = descriptors.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        // Parameter `(name)` / type parameter `[name]`: a bracketed name with no
+        // preceding identifier.
+        if c == '(' || c == '[' {
+            let close = if c == '(' { ')' } else { ']' };
+            chars.next();
+            let mut name = String::new();
+            for ch in chars.by_ref() {
+                if ch == close {
+                    break;
+                }
+                name.push(ch);
+            }
+            out.push((name, close));
+            continue;
+        }
+
+        // A (possibly backtick-escaped) name, then its terminator.
+        let mut name = String::new();
+        if c == '`' {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                if ch == '`' {
+                    if chars.peek() == Some(&'`') {
+                        chars.next();
+                        name.push('`');
+                    } else {
+                        break;
+                    }
+                } else {
+                    name.push(ch);
+                }
+            }
+        } else {
+            while let Some(&ch) = chars.peek() {
+                if matches!(ch, '/' | '#' | '.' | '(' | '[') {
+                    break;
+                }
+                name.push(ch);
+                chars.next();
+            }
+        }
+
+        match chars.peek().copied() {
+            Some('/') => {
+                chars.next();
+                out.push((name, '/'));
+            }
+            Some('#') => {
+                chars.next();
+                out.push((name, '#'));
+            }
+            Some('.') => {
+                chars.next();
+                out.push((name, '.'));
+            }
+            Some('(') => {
+                // Method disambiguator `(...)` followed by `.`: skip the
+                // parenthesized part, then the terminating dot.
+                chars.next();
+                let mut depth = 1;
+                for ch in chars.by_ref() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if chars.peek() == Some(&'.') {
+                    chars.next();
+                }
+                out.push((name, '.'));
+            }
+            _ => {
+                if !name.is_empty() {
+                    out.push((name, '.'));
+                }
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Returns `true` for nodes that carry no developer-facing signal:
@@ -1959,7 +2144,7 @@ mod tests {
     #[test]
     fn display_label_uses_path_for_file_nodes() {
         let n = Node::new(VName::new("", "", "src/lib.rs", "rust", "file"), "file");
-        assert_eq!(display_label(&n), "src/lib.rs");
+        assert_eq!(display_label(&n).as_ref(), "src/lib.rs");
     }
 
     #[test]
@@ -1968,7 +2153,64 @@ mod tests {
             VName::new("", "", "src/lib.rs", "rust", "fn:main"),
             "function",
         );
-        assert_eq!(display_label(&n), "fn:main");
+        assert_eq!(display_label(&n).as_ref(), "fn:main");
+    }
+
+    fn label_of(signature: &str) -> String {
+        label_with_path("p", signature)
+    }
+
+    fn label_with_path(path: &str, signature: &str) -> String {
+        let n = Node::new(VName::new("c", "", path, "java", signature), "definition");
+        display_label(&n).into_owned()
+    }
+
+    #[test]
+    fn display_label_cleans_scip_constructor() {
+        // A synthesized java constructor node (scip-reader path): the raw symbol
+        // carries the indexer prefix, package path, and `<init>`; the label must
+        // collapse to the enclosing type name. The node's own path is stripped
+        // before the descriptor is parsed (here it embeds a space, exercising the
+        // path-strip that a "last whitespace token" heuristic would break on).
+        assert_eq!(
+            label_with_path(
+                "src/main/java/com/My Demo/Greeter.java",
+                "scip:src/main/java/com/My Demo/Greeter.java:semanticdb maven . . com/demo/Greeter#`<init>`()."
+            ),
+            "Greeter"
+        );
+    }
+
+    #[test]
+    fn display_label_cleans_scip_go_method() {
+        // A real multi-field go SCIP symbol (scheme/manager/name/version present),
+        // with a package name that itself contains dots.
+        assert_eq!(
+            label_with_path(
+                "net/http/client.go",
+                "scip:net/http/client.go:scip-go gomod github.com/foo/bar v1.2.0 net/http/Client#Do()."
+            ),
+            "Client.Do"
+        );
+    }
+
+    #[test]
+    fn display_label_cleans_sdb_symbols() {
+        // scala reader path (`sdb:` prefix).
+        assert_eq!(label_of("sdb:com/demo/Greeter#greet()."), "Greeter.greet");
+        assert_eq!(label_of("sdb:com/demo/Main.g."), "Main.g");
+        assert_eq!(label_of("sdb:com/demo/Greeter#`<init>`()."), "Greeter");
+        // A parameter descriptor, if one ever reaches the display layer.
+        assert_eq!(
+            label_of("sdb:com/demo/Greeter#greet().(name)"),
+            "Greeter.greet.name"
+        );
+    }
+
+    #[test]
+    fn display_label_leaves_native_signatures_untouched() {
+        assert_eq!(label_of("method:Greeter.greet"), "method:Greeter.greet");
+        assert_eq!(label_of("class:Main"), "class:Main");
     }
 
     #[test]

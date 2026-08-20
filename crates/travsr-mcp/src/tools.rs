@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use travsr_core::{Node as CoreNode, NodeId};
+use travsr_core::{display_label, Node as CoreNode, NodeId};
 use travsr_retrieval::{
     context_candidates, knapsack, token_cost, EdgeFilter, OpenFilter, MAX_CONTEXT_BUDGET,
     TOKEN_CHARS_PER_TOKEN,
@@ -60,7 +60,7 @@ fn dependency_arg_hint(store: &SqliteStore, file: &str) -> Option<String> {
     match nodes.first() {
         Some(n) => Some(format!(
             "'{file}' resolved to {} '{}', not a file — get_dependencies takes a repo-relative file path. For a symbol, use get_callers or find_references.",
-            n.kind, n.vname.signature
+            n.kind, display_label(n)
         )),
         None => Some(format!(
             "no file matched '{file}' — get_dependencies takes a repo-relative file path (run get_repo_map to list files)."
@@ -128,7 +128,7 @@ fn get_dependencies_transitive_raw(store: &SqliteStore, file: &str, depth: u32) 
         let prefix = "  ↳ ".repeat(hop as usize); // hop 0 = direct → no prefix
         for dst_id in new_dsts {
             if let Some(dst_node) = node_map.get(&dst_id) {
-                lines.push(format!("{prefix}{}", dst_node.vname.signature));
+                lines.push(format!("{prefix}{}", display_label(dst_node)));
                 queue.push_back((dst_id, hop + 1));
             }
         }
@@ -183,7 +183,7 @@ fn get_dependencies_raw(store: &SqliteStore, file: &str) -> String {
         .collect();
     let mut lines: Vec<String> = ids
         .iter()
-        .filter_map(|id| node_map.get(id).map(|n| n.vname.signature.clone()))
+        .filter_map(|id| node_map.get(id).map(|n| display_label(n).into_owned()))
         .collect();
     if total_deps > DEFAULT_DEPS_TOP_K {
         lines.push(format!(
@@ -571,7 +571,10 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
                     for line in sites {
                         lines.push(format!(
                             "{tag} {} ({}) — {}:{}",
-                            src_node.vname.signature, src_node.kind, src_node.vname.path, line
+                            display_label(src_node),
+                            src_node.kind,
+                            src_node.vname.path,
+                            line
                         ));
                     }
                     continue;
@@ -583,7 +586,10 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         let loc = src_node.line.map(|l| format!(":{l}")).unwrap_or_default();
         lines.push(format!(
             "{tag} {} ({}) — {}{}",
-            src_node.vname.signature, src_node.kind, src_node.vname.path, loc
+            display_label(src_node),
+            src_node.kind,
+            src_node.vname.path,
+            loc
         ));
     }
     // #715: a crash in this language's last Phase B run leaves partial coverage
@@ -931,7 +937,10 @@ fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
         let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
         out.push_str(&format!(
             "  {} ({}) \u{2014} {}{}\n",
-            n.vname.signature, n.kind, n.vname.path, loc
+            display_label(n),
+            n.kind,
+            n.vname.path,
+            loc
         ));
     }
     out.push_str("Re-run without `path`, or with a `path` hint that matches one of these.");
@@ -999,7 +1008,7 @@ pub struct ResolvedSymbol {
 impl ResolvedSymbol {
     fn from_node(n: &CoreNode) -> Self {
         Self {
-            signature: n.vname.signature.clone(),
+            signature: display_label(n).into_owned(),
             kind: n.kind.clone(),
             path: n.vname.path.clone(),
             line: n.line,
@@ -1164,7 +1173,10 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
                 let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
                 out.push_str(&format!(
                     "  {} ({}) — {}{}\n",
-                    n.vname.signature, n.kind, n.vname.path, loc
+                    display_label(n),
+                    n.kind,
+                    n.vname.path,
+                    loc
                 ));
             }
             return out.trim_end().to_string();
@@ -1174,7 +1186,10 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
     let resolved_loc = target.line.map(|l| format!(":{l}")).unwrap_or_default();
     let header = format!(
         "resolved: {} ({}) — {}{}",
-        target.vname.signature, target.kind, target.vname.path, resolved_loc
+        display_label(&target),
+        target.kind,
+        target.vname.path,
+        resolved_loc
     );
 
     // Primary path: occurrence sites from edge_sites.
@@ -2803,7 +2818,7 @@ fn search_symbol_raw(
         .take(MAX_SEARCH_RESULTS)
         .map(|n| {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
-            format!("{} ({}) — {}{loc}", n.vname.signature, n.kind, n.vname.path)
+            format!("{} ({}) — {}{loc}", display_label(n), n.kind, n.vname.path)
         })
         .collect();
     lines.join("\n")
@@ -3165,7 +3180,7 @@ fn get_repo_map_raw(store: &SqliteStore, reserve_per_line: usize) -> String {
                 .or_default()
                 .entry(n.vname.path.clone())
                 .or_default()
-                .push(n.vname.signature.clone());
+                .push(display_label(n).into_owned());
         }
     }
     if region_symbols.is_empty() {
@@ -3681,7 +3696,7 @@ fn get_execution_path_body(
         if diagnose {
             return format!(
                 "no path found: '{}' and '{}' both resolved, but no connecting call chain was found within traversal limits.",
-                src.vname.signature, snk.vname.signature
+                display_label(&src), display_label(&snk)
             );
         }
         return String::new();
@@ -3689,7 +3704,7 @@ fn get_execution_path_body(
 
     let lines: Vec<String> = path
         .iter()
-        .map(|n| format!("{} ({}) — {}", n.vname.signature, n.kind, n.vname.path))
+        .map(|n| format!("{} ({}) — {}", display_label(n), n.kind, n.vname.path))
         .collect();
     lines.join("\n")
 }
@@ -4352,12 +4367,17 @@ fn format_node_line(
     if n.package.is_empty() {
         format!(
             "{} ({}) — {}{loc}{via}{score_str}",
-            n.vname.signature, n.kind, n.vname.path
+            display_label(n),
+            n.kind,
+            n.vname.path
         )
     } else {
         format!(
             "{} ({}) — {}{loc} [package: {}]{via}{score_str}",
-            n.vname.signature, n.kind, n.vname.path, n.package
+            display_label(n),
+            n.kind,
+            n.vname.path,
+            n.package
         )
     }
 }
@@ -5029,7 +5049,9 @@ fn get_context_body(
                         };
                         format!(
                             "  {} ({}) — {}{loc}{pkg}",
-                            n.vname.signature, n.kind, n.vname.path
+                            display_label(n),
+                            n.kind,
+                            n.vname.path
                         )
                     })
                     .collect();
@@ -5302,7 +5324,14 @@ fn get_context_body(
     const OVERFLOW_DISPLAY_CAP: usize = 10;
     let overflow_candidates: Vec<(NodeId, f32, String, String)> = items
         .iter()
-        .map(|(n, s)| (n.id, *s, n.vname.signature.clone(), n.vname.path.clone()))
+        .map(|(n, s)| {
+            (
+                n.id,
+                *s,
+                display_label(n).into_owned(),
+                n.vname.path.clone(),
+            )
+        })
         .collect();
     let n_candidates = overflow_candidates.len();
 
@@ -5544,7 +5573,11 @@ fn get_context_body(
     // Seed signatures for `via: <role> of <seed>` rendering. Cheap — seeds ≤ ~40.
     let seed_sig: HashMap<NodeId, String> = store
         .get_nodes(&seed_ids)
-        .map(|ns| ns.into_iter().map(|n| (n.id, n.vname.signature)).collect())
+        .map(|ns| {
+            ns.into_iter()
+                .map(|n| (n.id, display_label(&n).into_owned()))
+                .collect()
+        })
         .unwrap_or_default();
 
     if include_snippets {
@@ -6338,7 +6371,12 @@ fn node_json_id(node: &CoreNode) -> String {
     }
 }
 
-/// Short display label — basename for files, full signature for everything else.
+/// Short display label for the visual graph renderer.
+///
+/// File nodes render as a compact basename (a rendering choice for the graph
+/// panel — a file node never carries a raw compiler symbol). Every other node
+/// uses [`display_label`], the one canonical name shared with the CLI and the
+/// text MCP tools, so the same node reads identically on every surface.
 fn node_json_label(node: &CoreNode) -> String {
     if node.kind == "file" {
         node.vname
@@ -6347,39 +6385,8 @@ fn node_json_label(node: &CoreNode) -> String {
             .next()
             .unwrap_or(&node.vname.path)
             .to_string()
-    } else if node.vname.signature.starts_with("scip:") {
-        // Extract the short name from a scip qualified signature.
-        // "scip:...HomeController#home()." → "home()"
-        // "scip:...HomeController#"        → "HomeController"
-        let sig = &node.vname.signature;
-        if let Some(hash_pos) = sig.rfind('#') {
-            let after = sig[hash_pos + 1..].trim_end_matches('.');
-            if !after.is_empty() {
-                return after.to_string();
-            }
-            let before = &sig[..hash_pos];
-            return before
-                .rsplit(['/', ' '])
-                .next()
-                .unwrap_or(before)
-                .to_string();
-        }
-        sig.to_string()
     } else {
-        // Strip structural prefixes (fn:, class:, method:, interface:, import:)
-        // so "fn:home" displays as "home", "class:HomeController" as "HomeController".
-        let sig = &node.vname.signature;
-        if let Some(rest) = sig
-            .strip_prefix("fn:")
-            .or_else(|| sig.strip_prefix("class:"))
-            .or_else(|| sig.strip_prefix("method:"))
-            .or_else(|| sig.strip_prefix("interface:"))
-            .or_else(|| sig.strip_prefix("import:"))
-        {
-            rest.to_string()
-        } else {
-            sig.clone()
-        }
+        display_label(node).into_owned()
     }
 }
 
@@ -6754,7 +6761,7 @@ fn get_graph_json_raw(
                     .iter()
                     .map(|n| {
                         serde_json::json!({
-                            "signature": n.vname.signature,
+                            "signature": display_label(n),
                             "kind": n.kind,
                             "path": n.vname.path,
                             "line": n.line,
@@ -9454,7 +9461,10 @@ fn get_snippets_body(
     for node in &resolved {
         let header = format!(
             "{} ({}) \u{2014} {} [package: {}]",
-            node.vname.signature, node.kind, node.vname.path, node.package
+            display_label(node),
+            node.kind,
+            node.vname.path,
+            node.package
         );
         let skeleton = |n: &CoreNode| skeleton_for_node_inner(n, &repo_root).map(|s| s.render());
 

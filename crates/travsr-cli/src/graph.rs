@@ -5,6 +5,7 @@
 //! store is opened directly (read-only fast path). Rendering happens here,
 //! from the payload, so both routes produce identical output.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Context as _;
@@ -127,11 +128,23 @@ pub fn run(
         // exit) so "ambiguous, here are the choices" is machine-distinguishable
         // from "the command failed". `truncated` marks `count` as a lower bound.
         if matches!(format, Format::Json) {
+            let candidates_json: Vec<serde_json::Value> = candidates
+                .iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "id": n.id.to_string(),
+                        "signature": n.label,
+                        "kind": n.kind,
+                        "path": n.path,
+                        "line": n.line,
+                    })
+                })
+                .collect();
             let out = serde_json::json!({
                 "status": "ambiguous",
                 "count": count,
                 "truncated": truncated,
-                "candidates": candidates,
+                "candidates": candidates_json,
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
             anyhow::bail!("ambiguous symbol query");
@@ -149,7 +162,7 @@ pub fn run(
         }
         for n in candidates.iter().take(limit) {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
-            eprintln!("  {} ({}) — {}{}", n.signature, n.kind, n.path, loc);
+            eprintln!("  {} ({}) — {}{}", n.label, n.kind, n.path, loc);
         }
         if truncated {
             eprintln!("[truncated: additional filtering/narrowing is required]");
@@ -409,7 +422,7 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
         println!();
         for &nid in ids {
             if let Some(node) = nodes_map.get(&nid) {
-                let label = escape_dot(&format!("{}\n{}", node.signature, node.path));
+                let label = escape_dot(&format!("{}\n{}", node.label, node.path));
                 println!(
                     "    n{nid} [label=\"{label}\" shape={shape} style=filled \
                      fillcolor=\"{fill}\" color=\"{border}\"];",
@@ -452,7 +465,7 @@ fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow
         .map(|node| {
             serde_json::json!({
                 "id": node.id.to_string(),
-                "signature": node.signature,
+                "signature": node.label,
                 "kind": node.kind,
                 "path": node.path,
                 "language": node.language,
@@ -471,14 +484,29 @@ fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow
         )
     });
 
+    // Clean display label per node id; endpoints that are noise nodes (not in
+    // `nodes`) still render, so fall back to cleaning the raw endpoint signature.
+    let label_by_id: HashMap<u64, &str> = payload
+        .nodes
+        .iter()
+        .map(|n| (n.id, n.label.as_str()))
+        .collect();
     let edge_entries: Vec<serde_json::Value> = payload
         .edges
         .iter()
         .filter(|e| !e.src_sig.is_empty() && !e.dst_sig.is_empty())
         .map(|e| {
+            let from = label_by_id
+                .get(&e.src)
+                .map(|l| Cow::Borrowed(*l))
+                .unwrap_or_else(|| travsr_core::display_signature(&e.src_sig, ""));
+            let to = label_by_id
+                .get(&e.dst)
+                .map(|l| Cow::Borrowed(*l))
+                .unwrap_or_else(|| travsr_core::display_signature(&e.dst_sig, ""));
             serde_json::json!({
-                "from": e.src_sig,
-                "to": e.dst_sig,
+                "from": from,
+                "to": to,
                 "kind": e.kind,
                 "provenance": e.provenance,
             })
@@ -488,7 +516,7 @@ fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow
     let mut summary = if let Some(s) = &payload.seed {
         serde_json::json!({
             "mode": "query",
-            "root": s.signature,
+            "root": s.label,
             "root_path": s.path,
             "total_nodes": payload.nodes.len(),
             "total_edges": edge_entries.len(),
