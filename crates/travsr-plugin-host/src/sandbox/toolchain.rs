@@ -65,16 +65,51 @@ pub(crate) fn strip_windows_verbatim(p: PathBuf) -> PathBuf {
     }
 }
 
-/// Whether `language`'s Phase B analyzer must write into the repo root itself,
-/// not just its own toolchain caches (all three sandbox backends bind/grant
-/// the repo read-only by default). True only for scala: `sbt compile` writes
-/// build outputs to `target/` inside the project root — sbt's layout has no
-/// out-of-tree build option — and SemanticDB is enabled via a settings file
-/// (`.travsr-semanticdb.sbt`) dropped alongside `build.sbt`. Every other
-/// language's build tool writes only to its own cache dir (`~/.gradle`,
-/// `~/go/pkg`, …), already covered by `ToolchainAccess::write_paths`.
+/// One repo-relative path a Phase B analyzer must be able to write, with the
+/// rest of the repo root kept read-only (ADR-017 Rule 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoWrite {
+    /// A directory subtree the analyzer writes into (created on the host if
+    /// absent so the writable bind has a mount source).
+    Dir(&'static str),
+    /// A single file the analyzer generates (created empty on the host if absent).
+    File(&'static str),
+}
+
+impl RepoWrite {
+    pub fn subpath(&self) -> &'static str {
+        match self {
+            RepoWrite::Dir(p) | RepoWrite::File(p) => p,
+        }
+    }
+}
+
+/// The exact repo-relative subpaths `language`'s Phase B analyzer must write,
+/// keeping the rest of the repo root read-only. Empty for every language except
+/// scala: `sbt compile` writes build outputs to `target/` and `project/target/`
+/// inside the project (sbt's layout has no out-of-tree build option), and
+/// SemanticDB is enabled via a settings file (`.travsr-semanticdb.sbt`) the
+/// wrapper drops alongside `build.sbt`. Narrowing to these subpaths — rather than
+/// the whole repo root — means a hostile `build.sbt` executed by sbt during
+/// indexing cannot rewrite arbitrary repo files. Every other language's build
+/// tool writes only to its own cache dir (`~/.gradle`, `~/go/pkg`, …), already
+/// covered by `ToolchainAccess::write_paths`.
+pub fn repo_write_subpaths(language: &str) -> &'static [RepoWrite] {
+    match language {
+        "scala" => &[
+            RepoWrite::Dir("target"),
+            RepoWrite::Dir("project/target"),
+            RepoWrite::File(".travsr-semanticdb.sbt"),
+        ],
+        _ => &[],
+    }
+}
+
+/// Whether `language`'s analyzer needs any repo-root write grant at all. Derived
+/// from [`repo_write_subpaths`]; the Windows AppContainer path uses this coarse
+/// bool (scala is `WindowsSandbox::Unsupported` there and never reaches it).
 pub fn needs_repo_write(language: &str) -> bool {
-    matches!(language, "scala")
+    !repo_write_subpaths(language).is_empty()
 }
 
 /// Compute the toolchain grants for a language's Phase B analyzer.

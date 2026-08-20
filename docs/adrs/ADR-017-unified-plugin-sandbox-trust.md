@@ -129,6 +129,62 @@ SandboxPolicy::Standard
 > **Approved by:** _pending Tech Lead sign-off (raised in PR #577 review; drafted
 > 2026-08-05)_
 
+> **Amendment A4 — Windows unsandboxed-by-consent Phase B path (2026-08-20)**
+>
+> Rule 2 forbids any path that runs a plugin subprocess un-sandboxed as a
+> *fallback for a missing sandbox*. This amendment records a **narrow,
+> consent-gated exception** on **Windows only**, where the AppContainer sandbox
+> (Amendment A2) cannot host the JVM/.NET build tools some analyzers must run
+> (Gradle for scip-java, sbt for scala, scip-dotnet for C#). On such hosts the
+> catalog marks the analyzer `WindowsSandbox::Unsupported`, and unamended Rule 2
+> would disable the language entirely.
+>
+> **Scope (all four must hold — the exception is otherwise never taken):**
+> 1. **Windows only.** Linux and macOS keep Rule 2 fail-closed unchanged; there
+>    is no unsandboxed path on those platforms. `decide_windows_sandbox` returns
+>    `Sandboxed` for `!is_windows`.
+> 2. **Unsupported analyzer only.** Taken only when `decide_windows_sandbox` sees
+>    `WindowsSandbox::Unsupported`. Where the Windows sandbox *is* available
+>    (`WindowsSandbox::Supported`), it remains the default and this path is not
+>    reached.
+> 3. **Explicit consent on record.** Off by default. The child spawns only after
+>    a persistent per-language grant (`travsr lang allow-unsandboxed <lang>`,
+>    stored in `~/.travsr/lang.toml`) or a session opt-in (`--allow-unsandboxed`
+>    / `TRAVSR_ALLOW_UNSANDBOXED=1`). With no grant the decision is `NeedsConsent`
+>    and the language is skipped with an honest "needs your permission" status.
+> 4. **Consent is never repo-resident.** The grant lives in the user's
+>    `~/.travsr/` config, never in the indexed repo — a repo cannot opt *itself*
+>    into unsandboxed execution (the Rule 3 invariant is preserved).
+>
+> **Consent semantics.** The grant is the user's informed decision to run that
+> language's own build tool with their own privileges — the same trade-off the
+> project already accepts for the rust `--allow-unsandboxed` LSIF path (the
+> ADR-006 lineage this mirrors). It is **per-language**, not per-corpus; tighter
+> per-corpus granularity and a confirmation prompt on `lang allow-unsandboxed`
+> are tracked as follow-up UX hardening. `travsr lang list` surfaces the language
+> as running by unsandboxed consent.
+>
+> **Env policy.** The unsandboxed child does **not** inherit the daemon's ambient
+> environment. `build_unsandboxed_command` (`sandbox/mod.rs`) calls `env_clear()`
+> and forwards only: (a) the daemon-computed toolchain variables of Amendment A3
+> (`ToolchainAccess::env`); (b) `HOME`, `GRADLE_USER_HOME` and `PATH`, set
+> explicitly; and (c) a fixed allowlist of OS-essential, non-credential variables
+> (`is_allowed_passthrough_env`: `SYSTEMROOT`, `PATHEXT`, `TEMP`, `USERPROFILE`,
+> `APPDATA`, `PROGRAMFILES`, … — matched case-insensitively). The Rule 1
+> credential exclusions (`GITHUB_TOKEN`, `AWS_*`/`GCP_*`/`AZURE_*`, `SSH_*`,
+> `NPM_TOKEN`, `GIT_*`, …) remain **absolute**: they are outside the allowlist and
+> so are dropped, and no daemon secret reaches Gradle/sbt/scip-dotnet.
+>
+> **Residual risk (accepted).** On a consented Windows host the analyzer and the
+> repo build it drives run with the user's privileges, and the Rule 1 filesystem
+> confinement does not apply — the same residual risk already accepted for the
+> rust `--allow-unsandboxed` LSIF path, now extended to the JVM/.NET sidecars on
+> hosts where the sandbox cannot host them. The exception stays bounded by the
+> four scope conditions above and the secret-scrubbed environment.
+>
+> **Approved by:** _pending Principal Security Engineer sign-off (drafted
+> 2026-08-20, PR #743)_
+
 Mechanism by platform (DevOps owns the implementation, Security owns the policy):
 
 | Platform | Primary mechanism | Fallback |
@@ -165,7 +221,7 @@ Approval requirement: any use of `SandboxPolicy::Elevated` must be reviewed and 
 
 ### Rule 2 — Fail-closed (non-negotiable)
 
-If the sandbox mechanism is unavailable on the host (missing `bwrap`, kernel without seccomp, `sandbox-exec` failure), the affected plugin is **disabled** and its files are **not indexed**. There is **no path** that runs a plugin subprocess un-sandboxed as a fallback.
+If the sandbox mechanism is unavailable on the host (missing `bwrap`, kernel without seccomp, `sandbox-exec` failure), the affected plugin is **disabled** and its files are **not indexed**. There is **no path** that runs a plugin subprocess un-sandboxed as a fallback for a missing sandbox. (The one narrow, Windows-only, consent-gated exception — for analyzers the AppContainer sandbox cannot host — is recorded in **Amendment A4** above; it is an explicit user grant, not a silent fallback.)
 
 > The "trust the user's local toolchain because the sandbox tool is missing" fallback **is** the vulnerability. It is forbidden. (Security hard rule; CLAUDE.md #3 local-first.)
 

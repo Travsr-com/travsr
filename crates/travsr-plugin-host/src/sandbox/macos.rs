@@ -50,14 +50,22 @@ pub fn build_sandboxed_command(
         std::fs::canonicalize(scratch_dir).unwrap_or_else(|_| scratch_dir.to_path_buf());
     let repo = repo_canon.to_string_lossy();
     let scratch = scratch_canon.to_string_lossy();
-    // scala's sbt compile writes target/ + a settings file into the repo root
-    // itself (see toolchain::needs_repo_write); every other language's build
-    // tool only needs write access to its own toolchain cache (tc_write_rule).
-    let repo_write_rule = if crate::sandbox::toolchain::needs_repo_write(language) {
-        format!(" (subpath \"{repo}\")")
-    } else {
-        String::new()
-    };
+    // ADR-017 Rule 1: the repo root is read-only. scala's sbt compile writes
+    // build outputs (`target/`, `project/target/`) and a settings file
+    // (`.travsr-semanticdb.sbt`) into the project; grant file-write* on exactly
+    // those subpaths rather than the whole repo root, so a hostile `build.sbt`
+    // executed during indexing cannot rewrite arbitrary repo files. Every other
+    // language writes only to its own toolchain cache (tc_write_rule).
+    let repo_write_rule = crate::sandbox::toolchain::repo_write_subpaths(language)
+        .iter()
+        .map(|entry| {
+            let full = format!("{repo}/{}", entry.subpath());
+            match entry {
+                crate::sandbox::toolchain::RepoWrite::Dir(_) => format!(" (subpath \"{full}\")"),
+                crate::sandbox::toolchain::RepoWrite::File(_) => format!(" (literal \"{full}\")"),
+            }
+        })
+        .collect::<String>();
 
     // Allow reading the directory holding the binary being exec'd. Builtins
     // (current_exe) live under the repo, but external providers (travsr-lang-*,

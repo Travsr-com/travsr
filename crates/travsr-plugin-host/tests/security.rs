@@ -488,6 +488,67 @@ fn sandbox_repo_root_is_read_only() {
     }
 }
 
+// 4b. FS confinement — scala's narrowed repo-write grant opens only its build
+// subpaths (target/), never the whole repo root. A write to a repo-root file
+// outside those subpaths must still be denied; a write into target/ must succeed.
+#[test]
+#[cfg(target_os = "linux")]
+fn sandbox_scala_repo_write_is_narrowed_to_build_subpaths() {
+    use travsr_plugin_host::sandbox::linux::build_sandboxed_command;
+    let _env = env_guard();
+
+    let repo = tempfile::tempdir().expect("tempdir");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let breach_path = repo.path().join("build.sbt"); // repo root, not a write subpath
+    let allowed_path = repo.path().join("target").join("write_test.txt");
+
+    // Breach: writing a repo-root file outside the narrowed subpaths must fail.
+    let breach = build_sandboxed_command(
+        "sh",
+        &[
+            "-c",
+            &format!("echo hostile > {} 2>&1; true", breach_path.display()),
+        ],
+        repo.path(),
+        scratch.path(),
+        &SandboxPolicy::Standard,
+        "scala",
+    );
+    match breach {
+        Err(SandboxUnavailable(ref msg)) => {
+            if std::env::var("CI").is_ok() {
+                panic!("sandbox unavailable in CI: {msg}");
+            }
+            eprintln!("SKIP: {msg}");
+            return;
+        }
+        Ok(spawner) => {
+            let _ = spawner.output();
+            assert!(
+                !breach_path.exists() || std::fs::read_to_string(&breach_path).unwrap_or_default().trim() != "hostile",
+                "scala sandbox allowed a write to a repo-root file outside target/ — narrowing broken"
+            );
+        }
+    }
+
+    // Allowed: writing into target/ (a granted subpath) must succeed.
+    let allowed = build_sandboxed_command(
+        "sh",
+        &["-c", &format!("echo ok > {}", allowed_path.display())],
+        repo.path(),
+        scratch.path(),
+        &SandboxPolicy::Standard,
+        "scala",
+    );
+    if let Ok(spawner) = allowed {
+        let _ = spawner.output();
+        assert!(
+            allowed_path.exists(),
+            "scala sandbox blocked a write into target/ — the narrowed grant must still allow sbt's build outputs"
+        );
+    }
+}
+
 // 5. Scratch dir is writable
 #[test]
 #[cfg(target_os = "linux")]
