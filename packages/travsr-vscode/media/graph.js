@@ -168,6 +168,32 @@ const cy = cytoscape({
   boxSelectionEnabled: false,
 });
 
+// Cytoscape mishandles element ids that contain whitespace, backticks, '#' or
+// brackets. Synthesized external-symbol nodes carry a raw compiler signature in
+// their id (e.g. a Java constructor `...Greeter#`<init>`().`), which broke edge
+// rendering and froze the panel. When any id is unsafe, remap the whole set to
+// compact tokens and rewrite edge endpoints through the same map so nodes and
+// edges stay consistent. Display fields (label/path/line) are untouched, so node
+// names and goto/peek — which key off `path`, never `id` — are unaffected.
+function sanitizeGraphIds(nodes, edges) {
+  const UNSAFE = /[\s`#()[\]]/;
+  if (!nodes.some(n => n && n.id != null && UNSAFE.test(String(n.id)))) {
+    return { nodes, edges };
+  }
+  const idMap = new Map();
+  let counter = 0;
+  const safeId = (raw) => {
+    const key = String(raw);
+    let mapped = idMap.get(key);
+    if (mapped === undefined) { mapped = 'g' + counter++; idMap.set(key, mapped); }
+    return mapped;
+  };
+  return {
+    nodes: nodes.map(n => ({ ...n, id: safeId(n.id) })),
+    edges: edges.map(e => ({ ...e, source: safeId(e.source), target: safeId(e.target) })),
+  };
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let allNodes = [];       // full payload from last render
 let allEdges = [];
@@ -929,8 +955,7 @@ window.addEventListener('message', event => {
 
     // Symbol graph (mode == '' or unknown)
     setViewMode(false);
-    allNodes = (data.nodes || []);
-    allEdges = (data.edges || []);
+    ({ nodes: allNodes, edges: allEdges } = sanitizeGraphIds(data.nodes || [], data.edges || []));
     loadedDepth = depth;
     loadedDirection = direction;
     _disambigRoot = null; // reset on every new query
