@@ -104,6 +104,64 @@ impl SandboxedChild {
     }
 }
 
+/// Build a plain (unsandboxed) child command for a Phase B analyzer.
+///
+/// Used ONLY on Windows, and ONLY for analyzers whose build tools cannot run
+/// inside the isolation layer (`WindowsSandbox::Unsupported`), and ONLY after the
+/// user has granted explicit permission (see `resolver`). The child runs with the
+/// user's own privileges — the same trade-off the project already accepts for the
+/// rust `--allow-unsandboxed` LSIF path.
+///
+/// The toolchain environment (JAVA_HOME, GRADLE_USER_HOME, HOME, …) is forwarded
+/// and `~/.travsr/bin` is prepended to PATH, mirroring what the isolated path sets
+/// up, so the analyzer and the build tool it drives resolve. `scratch` is the cwd
+/// (matching the isolated spawn); the repo root reaches the sidecar via the
+/// InvokeRequest, not the cwd.
+pub fn build_unsandboxed_command(
+    program: &str,
+    args: &[&str],
+    scratch: &std::path::Path,
+    language: &str,
+) -> SandboxedSpawn {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    cmd.current_dir(scratch);
+
+    let access = toolchain::toolchain_access(language);
+    for (k, v) in &access.env {
+        cmd.env(k, v);
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        // The toolchain env helpers key their HOME/cache paths off the `HOME`
+        // variable, which is unset on Windows (it uses `USERPROFILE`), so JVM build
+        // tools like Gradle end up with nowhere to place their home/temp dir. An
+        // unsandboxed child runs as the user, so give it the real home explicitly —
+        // set `HOME` and Gradle's home unless the toolchain env already provided
+        // them. Harmless off Windows, where `HOME` is already correct.
+        let home_str = home.to_string_lossy().into_owned();
+        if !access.env.iter().any(|(k, _)| k == "HOME") {
+            cmd.env("HOME", &home_str);
+        }
+        if !access.env.iter().any(|(k, _)| k == "GRADLE_USER_HOME") {
+            cmd.env("GRADLE_USER_HOME", home.join(".gradle"));
+        }
+
+        // Prepend ~/.travsr/bin so the wrapper's installed siblings (and analyzers
+        // the wrapper shells out to) resolve, matching the isolated path's PATH
+        // handling.
+        let travsr_bin = home.join(".travsr").join("bin");
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs_vec = vec![travsr_bin];
+        dirs_vec.extend(std::env::split_paths(&existing));
+        if let Ok(joined) = std::env::join_paths(dirs_vec) {
+            cmd.env("PATH", joined);
+        }
+    }
+
+    SandboxedSpawn::Wrapped(cmd)
+}
+
 /// Result of `build_sandboxed_command`. Configure stdio, then call `spawn`.
 pub enum SandboxedSpawn {
     /// Linux (bwrap) or macOS (sandbox-exec): wraps the outer wrapper process.

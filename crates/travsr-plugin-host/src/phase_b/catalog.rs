@@ -23,6 +23,24 @@ pub enum SandboxRequirement {
     RequiresElevated,
 }
 
+/// Whether a language's Phase B analyzer can run inside the Windows isolation
+/// layer (AppContainer). Heavyweight JVM build tools (Gradle's forked worker,
+/// sbt's launcher) fail inside it in ways that cannot be worked around from
+/// outside their own code, so those languages must run with the user's own
+/// privileges instead — but only after the user has explicitly permitted it
+/// (see `travsr lang allow-unsandboxed`). This is the single compile-time knob
+/// that marks a language as needing that path; it is a no-op off Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsSandbox {
+    /// The analyzer runs inside the Windows isolation layer like every other
+    /// platform. The default for every language.
+    Supported,
+    /// The analyzer cannot run inside the Windows isolation layer. On Windows it
+    /// is skipped unless the user has granted permission to run it with their own
+    /// privileges; off Windows this variant has no effect.
+    Unsupported,
+}
+
 /// Specifies a pre-built binary that travsr can download from a GitHub release.
 #[derive(Debug, Clone, Copy)]
 pub struct ScipBinarySpec {
@@ -44,6 +62,13 @@ pub struct ScipBinarySpec {
     /// that supplies one is also pinned to `version_fallback` rather than
     /// resolving `releases/latest` — see `install_scip_github_binary`.
     pub sha256_fn: Option<fn(tag: &str, target: &str) -> Option<&'static str>>,
+    /// Windows-only version pin. `Some(tag)` forces exactly `tag` on Windows
+    /// (ignoring `releases/latest`), while mac/linux still track latest. scip-java
+    /// uses this: the current (Kotlin-rewrite) line regressed Windows build
+    /// orchestration, so on Windows travsr pins the last Windows-capable release
+    /// (0.12.x) and drives the build itself (`travsr-lang-java`). `None` elsewhere
+    /// means the platform-independent tag resolution applies on every OS.
+    pub windows_pin: Option<&'static str>,
 }
 
 /// Specifies a zip archive on GitHub Releases that must be extracted rather than
@@ -338,6 +363,12 @@ pub struct PhaseBEntry {
     /// with no such external dependency (their analyzer is fully self-
     /// contained once installed).
     pub prerequisites: &'static str,
+    /// Whether this language's analyzer can run inside the Windows isolation
+    /// layer. `Unsupported` marks the languages whose build tools cannot run
+    /// there (java/scala) so that, on Windows, they run with the user's own
+    /// privileges after explicit permission instead of failing silently inside
+    /// isolation. No effect off Windows. See [`WindowsSandbox`].
+    pub windows_sandbox: WindowsSandbox,
 }
 
 impl PhaseBEntry {
@@ -355,11 +386,20 @@ impl PhaseBEntry {
     pub fn analyzer_bundled(&self) -> bool {
         matches!(self.language, "python" | "typescript" | "javascript")
     }
+
+    /// Whether this language's analyzer cannot run inside the Windows isolation
+    /// layer and therefore needs explicit user permission to run with the user's
+    /// own privileges on Windows. Pure (host-independent) so callers combine it
+    /// with `cfg!(windows)`; the whole mechanism is a no-op off Windows.
+    pub fn windows_sandbox_unsupported(&self) -> bool {
+        matches!(self.windows_sandbox, WindowsSandbox::Unsupported)
+    }
 }
 
 pub static CATALOG: &[PhaseBEntry] = &[
     PhaseBEntry {
         language: "typescript",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/typescript"),
         command: "travsr-lsif-ts",
         args: &["--project", "{tsconfig}"],
@@ -380,6 +420,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "javascript",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/typescript"),
         command: "travsr-lsif-ts",
         args: &["--project", "{tsconfig}"],
@@ -400,6 +441,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "rust",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/rust"),
         command: "rust-analyzer",
         args: &["lsif", "{root}"],
@@ -433,6 +475,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "go",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/go"),
         command: "scip-go",
         args: &["--output", "{output}", "{root}"],
@@ -457,6 +500,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "python",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: None,
         // travsr-lsif-py is bundled with the travsr binary (packages/travsr-lsif-py/),
         // resolved via current_exe walk-up — no PATH install required for the
@@ -482,6 +526,10 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "java",
+        // Gradle's forked worker cannot create its case-sensitivity probe file
+        // inside the Windows isolation layer; on Windows java runs with the
+        // user's own privileges after explicit permission instead.
+        windows_sandbox: WindowsSandbox::Unsupported,
         npm_package: Some("@travsr-plugin/java"),
         command: "scip-java",
         args: &["index", "--output", "{output}", "{root}"],
@@ -503,6 +551,10 @@ pub static CATALOG: &[PhaseBEntry] = &[
             version_fallback: "v0.12.3",
             verify_sha256: true,
             sha256_fn: None,
+            // The Kotlin-rewrite line (0.13.x) dropped Windows build support and
+            // the `index-semanticdb` subcommand; travsr-lang-java's Windows driver
+            // needs 0.12.x. Pin it on Windows; mac/linux keep tracking latest.
+            windows_pin: Some("v0.12.3"),
         }),
         extensions: &[".java"],
         wrapper_version_fallback: "v0.1.0",
@@ -514,6 +566,9 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "kotlin",
+        // KLS (a language server, not a build-tool driver) runs fine inside the
+        // Windows isolation layer — verified producing edges sandboxed.
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/kotlin"),
         // The sidecar drives kotlin-language-server (KLS) over LSP — build-system
         // agnostic: KLS auto-detects Maven or Gradle and resolves the classpath itself.
@@ -551,6 +606,10 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "scala",
+        // sbt's launcher resolves the working directory in a way the Windows
+        // isolation layer rejects; on Windows scala runs with the user's own
+        // privileges after explicit permission instead.
+        windows_sandbox: WindowsSandbox::Unsupported,
         npm_package: Some("@travsr-plugin/scala"),
         // The sidecar injects semanticdbEnabled := true and runs `sbt compile`.
         // scip-scala is not published to any accessible registry.
@@ -578,6 +637,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "ruby",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/ruby"),
         command: "scip-ruby",
         // #712: scip-ruby has no `--index-file-path` option (the flag is
@@ -598,6 +658,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             version_fallback: "scip-ruby-v0.4.7",
             verify_sha256: false,
             sha256_fn: Some(scip_ruby_sha256),
+            windows_pin: None,
         }),
         extensions: &[".rb"],
         wrapper_version_fallback: "v0.1.0",
@@ -609,6 +670,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "php",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/php"),
         command: "scip-php",
         args: &["{root}", "--output", "{output}"],
@@ -629,6 +691,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "csharp",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/csharp"),
         command: "scip-dotnet",
         // scip-dotnet's CLI is `scip-dotnet index <.sln|.csproj|dir> --output <out>`.
@@ -661,6 +724,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "cpp",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/cpp"),
         command: "scip-clang",
         args: &[
@@ -682,6 +746,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             version_fallback: "v0.4.0",
             verify_sha256: false,
             sha256_fn: Some(scip_clang_sha256),
+            windows_pin: None,
         }),
         extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
         wrapper_version_fallback: "v0.1.0",
@@ -693,6 +758,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "c",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/c"),
         command: "scip-clang",
         args: &[
@@ -714,6 +780,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             version_fallback: "v0.4.0",
             verify_sha256: false,
             sha256_fn: Some(scip_clang_sha256),
+            windows_pin: None,
         }),
         extensions: &[".c", ".h"],
         wrapper_version_fallback: "v0.1.0",
@@ -725,6 +792,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "swift",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/swift"),
         command: "travsr-swift-index-emitter",
         args: &[],
@@ -741,6 +809,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             version_fallback: "v0.3.0",
             verify_sha256: true,
             sha256_fn: None,
+            windows_pin: None,
         }),
         extensions: &[".swift"],
         wrapper_version_fallback: "v0.3.0",
@@ -752,6 +821,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "objectivec",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/objectivec"),
         command: "travsr-lang-objectivec",
         args: &[],
@@ -768,6 +838,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             version_fallback: "v0.3.0",
             verify_sha256: true,
             sha256_fn: None,
+            windows_pin: None,
         }),
         extensions: &[".m", ".mm"],
         wrapper_version_fallback: "v0.3.0",
@@ -779,6 +850,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     },
     PhaseBEntry {
         language: "dart",
+        windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/dart"),
         command: "travsr-dart-index-emitter",
         args: &[],
@@ -802,6 +874,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             version_fallback: "v0.3.0",
             verify_sha256: true,
             sha256_fn: None,
+            windows_pin: None,
         }),
         extensions: &[".dart"],
         wrapper_version_fallback: "v0.3.0",
@@ -888,6 +961,36 @@ impl SidecarSpec for PhaseBEntry {
     }
     fn pinned(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod windows_sandbox_tests {
+    use super::{lookup, WindowsSandbox, CATALOG};
+
+    /// Exactly java and scala are marked unsupported inside the Windows isolation
+    /// layer — the two whose build tools cannot run there. Any future addition to
+    /// this set is a deliberate decision that must update this test.
+    #[test]
+    fn only_java_and_scala_are_windows_unsupported() {
+        for e in CATALOG {
+            let expected = matches!(e.language, "java" | "scala");
+            assert_eq!(
+                e.windows_sandbox == WindowsSandbox::Unsupported,
+                expected,
+                "{}: windows_sandbox marker is wrong",
+                e.language
+            );
+        }
+    }
+
+    #[test]
+    fn helper_matches_the_field() {
+        assert!(lookup("java").unwrap().windows_sandbox_unsupported());
+        assert!(lookup("scala").unwrap().windows_sandbox_unsupported());
+        assert!(!lookup("kotlin").unwrap().windows_sandbox_unsupported());
+        assert!(!lookup("go").unwrap().windows_sandbox_unsupported());
+        assert!(!lookup("rust").unwrap().windows_sandbox_unsupported());
     }
 }
 

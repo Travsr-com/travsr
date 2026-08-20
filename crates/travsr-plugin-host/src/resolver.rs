@@ -23,9 +23,10 @@
 //! Fail-closed per ADR-017 Rule 2: `resolve` returns `None` (and logs) rather
 //! than returning an unsandboxed spec or panicking.
 
-use crate::phase_b::catalog::{SandboxRequirement, CATALOG};
+use crate::phase_b::catalog::{SandboxRequirement, WindowsSandbox, CATALOG};
 use crate::sandbox::policy::SandboxPolicy;
 use crate::trust::registered_languages_from_disk;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── PluginSpec ────────────────────────────────────────────────────────────────
 
@@ -48,6 +49,71 @@ pub struct PluginSpec {
     pub args: Vec<String>,
     /// ADR-017 sandbox policy to apply before spawning.
     pub policy: SandboxPolicy,
+    /// Windows only: spawn this analyzer as a plain child with the user's own
+    /// privileges instead of inside the isolation layer. Set only for languages
+    /// whose analyzer cannot run isolated on Windows (`WindowsSandbox::Unsupported`)
+    /// AND for which the user has granted explicit permission. Always false off
+    /// Windows and for every isolated spawn — `policy` is ignored when this is set.
+    pub unsandboxed: bool,
+}
+
+// ── session opt-in (mirrors the rust `--allow-unsandboxed` LSIF precedent) ──────
+
+/// Process-global one-shot permission to run isolation-incompatible analyzers
+/// unsandboxed, set by the CLI `--allow-unsandboxed` flag before indexing. The
+/// persistent per-language grant in `lang.toml` is the primary path (it survives
+/// into the daemon/git-hook reindex); this covers one-shot `travsr init` use.
+static ALLOW_UNSANDBOXED_BY_SESSION: AtomicBool = AtomicBool::new(false);
+
+/// Set the session-wide unsandboxed permission (CLI `--allow-unsandboxed`).
+pub fn set_allow_unsandboxed(val: bool) {
+    ALLOW_UNSANDBOXED_BY_SESSION.store(val, Ordering::Relaxed);
+}
+
+/// Whether a session-wide unsandboxed permission is in effect: the CLI flag above
+/// or `TRAVSR_ALLOW_UNSANDBOXED=1` (the fallback for daemon/hook reindex paths the
+/// flag does not reach, mirroring `TRAVSR_ALLOW_UNSANDBOXED_LSIF`).
+pub fn session_unsandboxed_opt_in() -> bool {
+    ALLOW_UNSANDBOXED_BY_SESSION.load(Ordering::Relaxed)
+        || std::env::var("TRAVSR_ALLOW_UNSANDBOXED")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+}
+
+// ── Windows-unsandboxed spawn decision ──────────────────────────────────────────
+
+/// The three ways a language's Phase B provider can be handled with respect to
+/// the Windows isolation layer. Pure over its inputs so it is unit-testable on
+/// Linux CI without a Windows host.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WindowsSandboxDecision {
+    /// Use the normal isolated spawn (the only outcome off Windows, and for every
+    /// `WindowsSandbox::Supported` language).
+    Sandboxed,
+    /// Windows + isolation-incompatible analyzer + permission on record: spawn as
+    /// a plain child with the user's own privileges.
+    Unsandboxed,
+    /// Windows + isolation-incompatible analyzer + no permission: skip and surface
+    /// the honest "needs your permission" state.
+    NeedsConsent,
+}
+
+/// Decide how an isolation-incompatible analyzer should spawn on this host.
+/// Off Windows, or for a `Supported` language, always `Sandboxed` — the whole
+/// mechanism is a no-op there.
+pub(crate) fn decide_windows_sandbox(
+    windows_sandbox: WindowsSandbox,
+    is_windows: bool,
+    consent: bool,
+) -> WindowsSandboxDecision {
+    if !is_windows || windows_sandbox == WindowsSandbox::Supported {
+        return WindowsSandboxDecision::Sandboxed;
+    }
+    if consent {
+        WindowsSandboxDecision::Unsandboxed
+    } else {
+        WindowsSandboxDecision::NeedsConsent
+    }
 }
 
 // ── PluginResolver trait ──────────────────────────────────────────────────────
@@ -106,6 +172,7 @@ impl PluginResolver for BuiltinResolver {
             program: self.current_exe.clone(),
             args: vec!["__plugin".to_string(), language.to_string()],
             policy: SandboxPolicy::Standard,
+            unsandboxed: false,
         })
     }
 
@@ -122,6 +189,9 @@ struct ResolvedEntry {
     /// Absolute path to the binary (already confirmed on PATH at construction).
     program: String,
     policy: SandboxPolicy,
+    /// Windows only: spawn unsandboxed (plain child, user privileges) because the
+    /// analyzer cannot run isolated here and the user granted permission.
+    unsandboxed: bool,
 }
 
 /// Resolves external `travsr-lang-<lang>` binaries from the static `CATALOG`.
@@ -156,6 +226,12 @@ pub struct CatalogResolver {
     /// install <lang>` hint fires, matching what `lang list` already reports for
     /// the same machine.
     missing_tool: Vec<String>,
+    /// Windows only: languages whose analyzer cannot run inside the isolation
+    /// layer (java/scala) and for which the user has not granted permission to run
+    /// it with their own privileges. Skipped before spawn (never a silent
+    /// zero-node run). Surfaced so `travsr init`/`status` print the exact
+    /// `travsr lang allow-unsandboxed <lang>` step. Always empty off Windows.
+    needs_unsandboxed_consent: Vec<String>,
 }
 
 impl CatalogResolver {
@@ -180,6 +256,15 @@ impl CatalogResolver {
     pub fn missing_tool(&self) -> &[String] {
         &self.missing_tool
     }
+
+    /// Windows only: languages skipped because their analyzer cannot run isolated
+    /// here and the user has not granted permission to run it with their own
+    /// privileges. Caller should copy these into
+    /// `PhaseBOutcome::skipped_needs_consent` — the fix is
+    /// `travsr lang allow-unsandboxed <lang>`.
+    pub fn needs_unsandboxed_consent(&self) -> &[String] {
+        &self.needs_unsandboxed_consent
+    }
 }
 
 impl CatalogResolver {
@@ -198,6 +283,10 @@ impl CatalogResolver {
         let mut needs_approval = Vec::new();
         let mut unresolvable_shims = Vec::new();
         let mut missing_tool = Vec::new();
+        let mut needs_unsandboxed_consent = Vec::new();
+        // Session-wide permission (CLI flag / env) applies to every isolation-
+        // incompatible language; the per-language lang.toml grant is checked below.
+        let session_consent = session_unsandboxed_opt_in();
 
         tracing::debug!(
             "CatalogResolver: registered languages from disk: {:?}",
@@ -308,73 +397,117 @@ impl CatalogResolver {
                 continue;
             }
 
-            // Determine sandbox policy.
-            let policy = match catalog_entry.sandbox {
-                SandboxRequirement::Standard => SandboxPolicy::Standard,
-
-                // NativeIpc: tool needs POSIX IPC queues/shm (e.g. scip-clang) but
-                // not network. macOS sandbox-exec has no valid Seatbelt operation for
-                // mq_open, so we skip sandbox-exec and rely on ulimit caps only.
-                // No PSE approval required — this is a structural constraint, not a
-                // network exception.
-                SandboxRequirement::NativeIpc => SandboxPolicy::NativeIpc,
-
-                SandboxRequirement::RequiresElevated => {
-                    // Must have a recorded PSE approval in lang.toml.
-                    // If the user provided an explicit permitted_hosts override in
-                    // lang.toml, use that; otherwise fall back to the catalog
-                    // defaults from `entry.elevated_hosts`. Either way the
-                    // approved_by/approved_date fields must be non-empty.
-                    let Some(approval) =
-                        lang_config.as_ref().and_then(|cfg| cfg.get_approval(lang))
-                    else {
+            // Windows: analyzers that cannot run inside the isolation layer
+            // (java/scala) take a plain-child path with the user's own privileges,
+            // but only with explicit permission. This decision comes before the
+            // policy computation below and, when it applies, replaces it entirely:
+            // an unsandboxed child already has full privileges (including network),
+            // so the elevated network-approval gate is moot for these languages on
+            // Windows. Off Windows this is always `Sandboxed` (a no-op).
+            let consent = session_consent
+                || lang_config
+                    .as_ref()
+                    .map(|cfg| cfg.has_unsandboxed_consent(lang))
+                    .unwrap_or(false);
+            let unsandboxed =
+                match decide_windows_sandbox(catalog_entry.windows_sandbox, cfg!(windows), consent)
+                {
+                    WindowsSandboxDecision::Sandboxed => false,
+                    WindowsSandboxDecision::Unsandboxed => {
                         tracing::info!(
                             lang,
-                            "'{}' needs network access during indexing but has no security \
+                            "Phase B: '{}' will run with your own privileges (you granted \
+                         permission); it cannot run inside Travsr's isolation on Windows",
+                            lang
+                        );
+                        true
+                    }
+                    WindowsSandboxDecision::NeedsConsent => {
+                        tracing::info!(
+                            lang,
+                            "Phase B: '{}' needs your permission to run on Windows — skipping \
+                         (run: travsr lang allow-unsandboxed {})",
+                            lang,
+                            lang
+                        );
+                        needs_unsandboxed_consent.push(lang.to_string());
+                        continue;
+                    }
+                };
+
+            // Determine sandbox policy. When spawning unsandboxed the policy is
+            // never applied (see `PluginSpec::unsandboxed`), so use the default and
+            // skip the elevated-approval dance entirely.
+            let policy = if unsandboxed {
+                SandboxPolicy::Standard
+            } else {
+                match catalog_entry.sandbox {
+                    SandboxRequirement::Standard => SandboxPolicy::Standard,
+
+                    // NativeIpc: tool needs POSIX IPC queues/shm (e.g. scip-clang) but
+                    // not network. macOS sandbox-exec has no valid Seatbelt operation for
+                    // mq_open, so we skip sandbox-exec and rely on ulimit caps only.
+                    // No PSE approval required — this is a structural constraint, not a
+                    // network exception.
+                    SandboxRequirement::NativeIpc => SandboxPolicy::NativeIpc,
+
+                    SandboxRequirement::RequiresElevated => {
+                        // Must have a recorded PSE approval in lang.toml.
+                        // If the user provided an explicit permitted_hosts override in
+                        // lang.toml, use that; otherwise fall back to the catalog
+                        // defaults from `entry.elevated_hosts`. Either way the
+                        // approved_by/approved_date fields must be non-empty.
+                        let Some(approval) =
+                            lang_config.as_ref().and_then(|cfg| cfg.get_approval(lang))
+                        else {
+                            tracing::info!(
+                                lang,
+                                "'{}' needs network access during indexing but has no security \
                              approval on file — skipping (its semantic analysis stays disabled \
                              until it is approved). Run: travsr lang approve {} \
                              --approved-by <approver-github-handle> --reason \"...\" \
                              --permitted-hosts <hosts>",
-                            lang,
-                            lang
-                        );
-                        needs_approval.push(lang.to_string());
-                        continue;
-                    };
+                                lang,
+                                lang
+                            );
+                            needs_approval.push(lang.to_string());
+                            continue;
+                        };
 
-                    // Use the user-supplied hosts if non-empty; otherwise fall back
-                    // to the catalog-defined defaults for this language.
-                    let permitted_hosts = if !approval.permitted_hosts.is_empty() {
-                        approval.permitted_hosts.clone()
-                    } else {
-                        catalog_entry
-                            .elevated_hosts
-                            .iter()
-                            .map(|h| h.to_string())
-                            .collect()
-                    };
+                        // Use the user-supplied hosts if non-empty; otherwise fall back
+                        // to the catalog-defined defaults for this language.
+                        let permitted_hosts = if !approval.permitted_hosts.is_empty() {
+                            approval.permitted_hosts.clone()
+                        } else {
+                            catalog_entry
+                                .elevated_hosts
+                                .iter()
+                                .map(|h| h.to_string())
+                                .collect()
+                        };
 
-                    let policy = SandboxPolicy::Elevated {
-                        permitted_hosts,
-                        reason: approval.reason.clone(),
-                        approved_by: approval.approved_by.clone(),
-                        approved_date: approval.approved_date.clone(),
-                    };
+                        let policy = SandboxPolicy::Elevated {
+                            permitted_hosts,
+                            reason: approval.reason.clone(),
+                            approved_by: approval.approved_by.clone(),
+                            approved_date: approval.approved_date.clone(),
+                        };
 
-                    // Validate the Elevated policy fields per ADR-017 Rule 1.
-                    // This catches empty approved_by / approved_date.
-                    if let Err(e) = policy.validate() {
-                        tracing::warn!(
-                            lang,
-                            "the security approval for '{}' is incomplete: {} \
+                        // Validate the Elevated policy fields per ADR-017 Rule 1.
+                        // This catches empty approved_by / approved_date.
+                        if let Err(e) = policy.validate() {
+                            tracing::warn!(
+                                lang,
+                                "the security approval for '{}' is incomplete: {} \
                              — skipping (its semantic analysis stays disabled)",
-                            lang,
-                            e
-                        );
-                        continue;
-                    }
+                                lang,
+                                e
+                            );
+                            continue;
+                        }
 
-                    policy
+                        policy
+                    }
                 }
             };
 
@@ -382,6 +515,7 @@ impl CatalogResolver {
                 language: lang.to_string(),
                 program,
                 policy,
+                unsandboxed,
             });
         }
 
@@ -390,6 +524,7 @@ impl CatalogResolver {
             needs_approval,
             unresolvable_shims,
             missing_tool,
+            needs_unsandboxed_consent,
         }
     }
 }
@@ -408,6 +543,7 @@ impl PluginResolver for CatalogResolver {
             program: entry.program.clone(),
             args: vec![],
             policy: entry.policy.clone(),
+            unsandboxed: entry.unsandboxed,
         })
     }
 
@@ -608,6 +744,10 @@ fn embedded_shim_target(
 struct LangConfigFile {
     #[serde(default)]
     elevated_approvals: Vec<ElevatedApprovalRecord>,
+    /// Per-language permission to run an isolation-incompatible analyzer with the
+    /// user's own privileges on Windows (written by `travsr lang allow-unsandboxed`).
+    #[serde(default)]
+    unsandboxed_consent: Vec<UnsandboxedConsentRecord>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -619,11 +759,24 @@ struct ElevatedApprovalRecord {
     approved_date: String,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct UnsandboxedConsentRecord {
+    language: String,
+    // granted_by / granted_date are recorded for auditability by the CLI; the
+    // resolver only needs to know a grant exists, so they are not read here.
+}
+
 impl LangConfigFile {
     fn get_approval(&self, language: &str) -> Option<&ElevatedApprovalRecord> {
         self.elevated_approvals
             .iter()
             .find(|a| a.language == language)
+    }
+
+    fn has_unsandboxed_consent(&self, language: &str) -> bool {
+        self.unsandboxed_consent
+            .iter()
+            .any(|c| c.language == language)
     }
 }
 
@@ -645,6 +798,46 @@ fn load_lang_config() -> Option<LangConfigFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Windows-unsandboxed decision ──────────────────────────────────────────
+    // Pure and host-independent, so both platforms' behaviour is proven on Linux CI.
+
+    #[test]
+    fn supported_language_is_always_sandboxed() {
+        for is_windows in [true, false] {
+            for consent in [true, false] {
+                assert_eq!(
+                    decide_windows_sandbox(WindowsSandbox::Supported, is_windows, consent),
+                    WindowsSandboxDecision::Sandboxed,
+                    "supported must stay sandboxed (windows={is_windows}, consent={consent})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_language_off_windows_is_a_noop() {
+        // Off Windows the marker has no effect: java/scala keep their normal
+        // isolated path regardless of any recorded permission.
+        for consent in [true, false] {
+            assert_eq!(
+                decide_windows_sandbox(WindowsSandbox::Unsupported, false, consent),
+                WindowsSandboxDecision::Sandboxed
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_on_windows_needs_consent_then_runs_unsandboxed() {
+        assert_eq!(
+            decide_windows_sandbox(WindowsSandbox::Unsupported, true, false),
+            WindowsSandboxDecision::NeedsConsent
+        );
+        assert_eq!(
+            decide_windows_sandbox(WindowsSandbox::Unsupported, true, true),
+            WindowsSandboxDecision::Unsandboxed
+        );
+    }
 
     // ── BuiltinResolver ───────────────────────────────────────────────────────
 

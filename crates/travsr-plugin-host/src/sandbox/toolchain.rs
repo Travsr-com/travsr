@@ -65,6 +65,18 @@ pub(crate) fn strip_windows_verbatim(p: PathBuf) -> PathBuf {
     }
 }
 
+/// Whether `language`'s Phase B analyzer must write into the repo root itself,
+/// not just its own toolchain caches (all three sandbox backends bind/grant
+/// the repo read-only by default). True only for scala: `sbt compile` writes
+/// build outputs to `target/` inside the project root — sbt's layout has no
+/// out-of-tree build option — and SemanticDB is enabled via a settings file
+/// (`.travsr-semanticdb.sbt`) dropped alongside `build.sbt`. Every other
+/// language's build tool writes only to its own cache dir (`~/.gradle`,
+/// `~/go/pkg`, …), already covered by `ToolchainAccess::write_paths`.
+pub fn needs_repo_write(language: &str) -> bool {
+    matches!(language, "scala")
+}
+
 /// Compute the toolchain grants for a language's Phase B analyzer.
 /// Empty for languages with no out-of-repo toolchain needs.
 pub fn toolchain_access(language: &str) -> ToolchainAccess {
@@ -362,9 +374,55 @@ fn kotlin_access() -> ToolchainAccess {
     access
 }
 
+/// Coursier's on-disk artifact cache. `lm-coursier` (sbt's library-management
+/// backend since sbt 1.3, still used in 2.x) resolves ordinary project
+/// dependencies — including the `semanticdb-scalac` compiler plugin this
+/// wrapper's settings file pulls in — through Coursier, separate from
+/// `sbt_global_base_dir` below (sbt's own self-bootstrap). Location matches
+/// Coursier's own default `cache-dir`: `%LOCALAPPDATA%\Coursier\cache` on
+/// Windows, `~/Library/Caches/Coursier` on macOS, `$XDG_CACHE_HOME/coursier`
+/// (else `~/.cache/coursier`) on Linux.
+fn coursier_cache_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Coursier").join("cache"))
+    } else if cfg!(target_os = "macos") {
+        home().map(|h| h.join("Library").join("Caches").join("Coursier"))
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home().map(|h| h.join(".cache")))
+            .map(|c| c.join("coursier"))
+    }
+}
+
+/// sbt 2.x's own "global base" — where the `sbt` launcher self-fetches and
+/// caches the actual sbt implementation jar it's about to run
+/// ("[launcher] getting org.scala-sbt sbt <ver>"). This is NOT `~/.sbt`: sbt
+/// 2.x's launcher script (`sbt.bat`/`sbt`) defaults `-Dsbt.global.base` to
+/// `%LOCALAPPDATA%\sbt` on Windows (confirmed by reading the shipped
+/// `sbt.bat`: `else if defined LOCALAPPDATA set _SBT_OPTS=-Dsbt.global.base=
+/// !LOCALAPPDATA!\sbt`) and to `${XDG_CONFIG_HOME:-$HOME/.config}/sbt` on
+/// unix (same default in the `sbt` shell launcher). `boot/`, `cache/`, and the
+/// content-addressed `v2/` store all live directly under this dir. Without
+/// this grant the self-fetch fails with a raw `java.io.IOException: Access is
+/// denied` even though `~/.ivy2`/`~/.sbt`/the Coursier cache above are all
+/// granted — sbt never gets far enough to touch any of those.
+fn sbt_global_base_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("sbt"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home().map(|h| h.join(".config")))
+            .map(|c| c.join("sbt"))
+    }
+}
+
 /// `scip-scala` drives sbt to resolve dependencies. Needs:
-///   - `~/.ivy2` (read)       — Ivy2 artifact cache (sbt's primary resolver)
-///   - `~/.sbt`  (read+write) — sbt home: launchers, plugins, boot dir
+///   - `~/.ivy2` (read)             — Ivy2 artifact cache (sbt's primary resolver)
+///   - `~/.sbt`  (read+write)       — sbt home: launchers, plugins, boot dir
+///   - Coursier cache (read+write) — dependency resolution (see above)
+///   - sbt global base (read+write) — sbt's own self-bootstrap (see above)
 ///   - `HOME` and `SBT_OPTS` env vars
 fn scala_access() -> ToolchainAccess {
     let mut read_paths = Vec::new();
@@ -382,6 +440,18 @@ fn scala_access() -> ToolchainAccess {
         write_paths.push(sbt);
 
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
+    }
+
+    if let Some(cc) = coursier_cache_dir() {
+        tracing::debug!(path = %cc.display(), exists = cc.exists(), "scala_access: coursier cache grant (read+write)");
+        read_paths.push(cc.clone());
+        write_paths.push(cc);
+    }
+
+    if let Some(gb) = sbt_global_base_dir() {
+        tracing::debug!(path = %gb.display(), exists = gb.exists(), "scala_access: sbt global base grant (read+write)");
+        read_paths.push(gb.clone());
+        write_paths.push(gb);
     }
 
     if let Ok(sbt_opts) = std::env::var("SBT_OPTS") {
@@ -443,21 +513,14 @@ fn php_access() -> ToolchainAccess {
     }
 }
 
-/// `scip-dotnet` resolves NuGet packages. Needs:
-///   - NuGet global-packages dir (read+write) — `dotnet restore` downloads new packages here
-///   - `~/.dotnet` (read) — dotnet global tools dir; scip-dotnet binary lives here
-///   - dotnet runtime root (read) — non-standard for Homebrew installs on macOS
-///   - `DOTNET_ROOT` env — scip-dotnet needs it when dotnet is not in /usr/local
-///   - `HOME` env var — dotnet uses it for config resolution
-///
 /// Resolve the dotnet install root that holds `host/`, `sdk/`, `shared/` — the
 /// value `DOTNET_ROOT` must point at, and the dir the sandbox must grant read +
 /// execute so scip-dotnet's apphost can load the runtime and shell out to
 /// `dotnet`. Uses `tool_path` (PATHEXT-aware, so `dotnet.exe` resolves on
 /// Windows — the old `dir.join("dotnet")` PATH scan never matched there, leaving
 /// Windows with no DOTNET_ROOT and no exec grant). Only accepts a root that
-/// actually carries an SDK, and falls back to the per-user `~/.dotnet` when
-/// `dotnet` on PATH is a runtime-only host.
+/// actually carries an SDK/host, and falls back to the per-user
+/// `~/.dotnet` when `dotnet` on PATH is a runtime-only host.
 fn dotnet_sdk_root() -> Option<PathBuf> {
     let exe = travsr_core::exec::tool_path("dotnet")?;
     // canonicalize resolves symlinks (Homebrew's `bin/dotnet` shim) but adds the
@@ -469,6 +532,8 @@ fn dotnet_sdk_root() -> Option<PathBuf> {
     // restore`/build, so a runtime-only host root is useless. `C:\Program
     // Files\dotnet` carries `host/` even when SDK-less, so a `host/` check would
     // wrongly pick it over a real SDK elsewhere.
+    // Standard layout (Windows / dotnet-install / Linux tarball / Program Files):
+    // `dotnet(.exe)` sits directly in the root holding host/ sdk/ shared/.
     if dir.join("sdk").is_dir() {
         return Some(dir.to_path_buf());
     }
@@ -488,6 +553,12 @@ fn dotnet_sdk_root() -> Option<PathBuf> {
     None
 }
 
+/// `scip-dotnet` resolves NuGet packages. Needs:
+///   - NuGet global-packages dir (read+write) — `dotnet restore` downloads new packages here
+///   - `~/.dotnet` (read) — dotnet global tools dir; scip-dotnet binary lives here
+///   - dotnet runtime root (read) — non-standard for Homebrew installs on macOS
+///   - `DOTNET_ROOT` env — scip-dotnet needs it when dotnet is not in /usr/local
+///   - `HOME` env var — dotnet uses it for config resolution
 fn csharp_access() -> ToolchainAccess {
     let mut read_paths = Vec::new();
     let mut write_paths = Vec::new();

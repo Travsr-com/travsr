@@ -98,6 +98,22 @@ pub enum LangCommand {
         #[arg(long, value_delimiter = ',')]
         permitted_hosts: Vec<String>,
     },
+    /// Permit a language's analyzer to run with your own privileges on Windows.
+    ///
+    /// A few analyzers (currently Java and Scala) cannot run inside Travsr's
+    /// isolation on Windows. This records your one-time permission to run them
+    /// with your own privileges instead, so full analysis works. The permission
+    /// is remembered, and re-indexing on commit honours it with no extra step.
+    AllowUnsandboxed {
+        /// Canonical language name (e.g. java, scala).
+        language: String,
+        /// Who is granting the permission (recorded for your own audit trail).
+        #[arg(long)]
+        granted_by: Option<String>,
+        /// Withdraw a permission granted earlier.
+        #[arg(long)]
+        revoke: bool,
+    },
 }
 
 /// Exit code 2: wrapper installed but underlying SCIP tool missing (partial install).
@@ -142,6 +158,11 @@ pub fn run(cmd: LangCommand) -> Result<()> {
             reason,
             permitted_hosts,
         } => cmd_approve(&language, &approved_by, &reason, permitted_hosts),
+        LangCommand::AllowUnsandboxed {
+            language,
+            granted_by,
+            revoke,
+        } => cmd_allow_unsandboxed(&language, granted_by.as_deref(), revoke),
     }
 }
 
@@ -236,6 +257,7 @@ fn lang_capability_status(
     entry: &PhaseBEntry,
     registered: bool,
     approved: bool,
+    consent: bool,
 ) -> travsr_plugin_host::phase_b::status::LangStatus {
     travsr_plugin_host::phase_b::status::capability(
         &travsr_plugin_host::phase_b::status::Capability {
@@ -251,8 +273,22 @@ fn lang_capability_status(
             unsupported_on: wrapper_unavailable_target(entry)
                 .map(|_| travsr_plugin_host::phase_b::status::os_label().to_string())
                 .or_else(|| analyzer_unavailable_os(entry)),
+            // On Windows, the analyzers that cannot run isolated are gated on the
+            // user's one-time permission instead of the network approval. No effect
+            // off Windows.
+            windows_unsandboxed: cfg!(windows) && entry.windows_sandbox_unsupported(),
+            unsandboxed_consent: consent,
         },
     )
+}
+
+/// Whether the user has permitted `entry`'s analyzer to run with their own
+/// privileges: a recorded per-language grant in lang.toml, or the session-wide
+/// `TRAVSR_ALLOW_UNSANDBOXED` opt-in. Mirrors the resolver so `lang list` /
+/// `status` and the index-time decision cannot disagree.
+fn unsandboxed_consent_present(config: Option<&LangConfig>, language: &str) -> bool {
+    config.is_some_and(|c| c.has_unsandboxed_consent(language))
+        || travsr_plugin_host::resolver::session_unsandboxed_opt_in()
 }
 
 /// `Some(<os>)` when the language's analyzer is installed only from a prebuilt
@@ -274,6 +310,22 @@ fn analyzer_unavailable_os(entry: &PhaseBEntry) -> Option<String> {
         _ => false,
     };
     no_asset.then(|| travsr_plugin_host::phase_b::status::os_label().to_string())
+}
+
+/// Whether full (cross-file) analysis can *never* run for this language on the
+/// current platform, because neither its `travsr-lang-*` wrapper nor its analyzer
+/// ships a build here. When true, no `travsr lang install <lang>` invocation can
+/// help — the only honest UX is "not available on <os>; structural analysis still
+/// works". Used to keep every surface from ever offering a command that would just
+/// dead-end. Takes the language string so non-CLI callers (status warnings) need
+/// no `PhaseBEntry` in hand.
+pub(crate) fn full_analysis_unavailable_here(language: &str) -> bool {
+    match lookup(language) {
+        Some(entry) => {
+            wrapper_unavailable_target(entry).is_some() || analyzer_unavailable_os(entry).is_some()
+        }
+        None => false,
+    }
 }
 
 /// Whether a language's full analysis is turned on for the repo we are standing
@@ -446,7 +498,8 @@ fn cmd_list(json: bool) -> Result<()> {
             // The authoritative status every consumer renders. `status` is a stable
             // machine tag; `statusLine` is the exact human wording used in the CLI,
             // so the extension shows the same words without re-deriving them.
-            let status = lang_capability_status(entry, registered, approved);
+            let consent = unsandboxed_consent_present(config.as_ref(), entry.language);
+            let status = lang_capability_status(entry, registered, approved, consent);
             // Per-repo enablement for the repo we are being run in (corpus trust
             // gate). The VS Code panel runs `lang list --json` with the target
             // repo as cwd, so this reflects that repo.
@@ -501,7 +554,8 @@ fn cmd_list(json: bool) -> Result<()> {
 
         // One computed status for every language — the same call `lang detect` and
         // the JSON branch make, so the three can never drift apart again.
-        let status = lang_capability_status(entry, registered, approval.is_some());
+        let consent = unsandboxed_consent_present(config.as_ref(), entry.language);
+        let status = lang_capability_status(entry, registered, approval.is_some(), consent);
 
         // A recorded network approval that has aged past expiry is surfaced in
         // plain words on top of the state — no symbols.
@@ -616,10 +670,17 @@ fn cmd_install(
         );
     }
 
+    // On Windows, the analyzers that cannot run isolated (java/scala) take the
+    // plain-child permission path instead of the network-approval path — running
+    // with the user's own privileges already covers the network the isolated path
+    // would have needed approval for. So skip the approval demand for them here and
+    // let the permission (`travsr lang allow-unsandboxed <lang>`) be the one gate.
+    let windows_unsandboxed = cfg!(windows) && entry.windows_sandbox_unsupported();
+
     // RequiresElevated: a security approval must be on record before install.
     // ADR-017 Rule 1 is the internal policy behind this check — never surface
     // the ADR name in user output; use plain language instead.
-    if entry.sandbox == SandboxRequirement::RequiresElevated {
+    if entry.sandbox == SandboxRequirement::RequiresElevated && !windows_unsandboxed {
         let config = load_config();
         let approved = config
             .as_ref()
@@ -799,7 +860,6 @@ fn cmd_install(
     // When the analyzer is still missing, the WrapperOnly branch below states
     // the honest "set up, but analyzer not installed"; the repo trust grant was
     // recorded either way.
-
     if !full_ready {
         // The most common "not ready" cause across every platform (go/npm/dotnet
         // missing) collapses to one line instead of stacking the generic
@@ -846,6 +906,21 @@ fn cmd_install(
                 return Ok(InstallStatus::WrapperOnly);
             }
         }
+        // Manual (scala/sbt, php/composer): there's nothing travsr can auto-run,
+        // just a pointer to where the tool comes from — one line, not the
+        // generic paragraph below.
+        if matches!(entry.scip_install, ScipInstall::Manual) && !tool_available(entry.command) {
+            print!(
+                "'{}' is not installed. Install it, then run `travsr lang install {language}` again.",
+                entry.command
+            );
+            if entry.underlying_tool_hint.is_empty() {
+                println!();
+            } else {
+                println!("\n\t{}", entry.underlying_tool_hint);
+            }
+            return Ok(InstallStatus::WrapperOnly);
+        }
         println!(
             "'{language}' isn't fully set up yet: its analyzer '{}' is not installed.\n\
              Full cross-file analysis stays off until it is; basic analysis still runs.\n\
@@ -853,6 +928,20 @@ fn cmd_install(
             entry.command
         );
         return Ok(InstallStatus::WrapperOnly);
+    }
+
+    // Windows-only: the analyzer is installed, but it cannot run inside Travsr's
+    // isolation here, so full analysis stays off until the user grants the one-time
+    // permission. Say that honestly instead of claiming "active".
+    if windows_unsandboxed && !config.has_unsandboxed_consent(language) {
+        println!(
+            "'{language}' analyzer is installed. One more step: its build tools can't run \
+             inside Travsr's isolation on Windows, so full analysis needs your permission \
+             to run them with your own privileges.\n\
+             Grant it:  travsr lang allow-unsandboxed {language}\n\
+             Basic analysis runs until then."
+        );
+        return Ok(InstallStatus::FullyReady);
     }
 
     if enabled_here {
@@ -1040,23 +1129,12 @@ fn install_scip_tool(
             install_zip_binary(entry, spec, override_version)?;
             return Ok(analyzer_command_present(entry));
         }
-        ScipInstall::Manual => {
-            if !entry.underlying_tool_hint.is_empty() {
-                println!(
-                    "'{}' is not installed.\n\
-                     \n\
-                     travsr needs it to see calls and references across files for {}\n\
-                     (full cross-file analysis). Without it, only basic single-file\n\
-                     analysis runs.\n\
-                     \n\
-                     Install it, then re-run `travsr lang install {}`.\n\
-                     \n\
-                     How to install it:\n\
-                     \t{}",
-                    entry.command, entry.language, entry.language, entry.underlying_tool_hint
-                );
-            }
-        }
+        // Stay quiet here (like the Command path's run_pkg_command above) and let
+        // the caller (install()'s `!full_ready` branch) print the one-line
+        // "underlying tool is missing" message — otherwise the two stack: this
+        // message plus the near-identical generic "isn't fully set up yet"
+        // paragraph the caller used to always print after it.
+        ScipInstall::Manual => {}
     }
     Ok(false)
 }
@@ -1124,14 +1202,21 @@ fn install_scip_github_binary(
         }
     };
 
+    // Windows compat pin: scip-java's current upstream line dropped Windows build
+    // support, so on Windows the catalog pins it to a Windows-capable tag (0.12.x)
+    // regardless of `releases/latest`. Expressed as a pin so the same
+    // supply-chain-safe resolution applies: no live fetch, and a `--version`
+    // asking for a different tag is refused. mac/linux keep tracking latest.
+    let windows_pin = spec.windows_pin.filter(|_| cfg!(windows));
+
     // #410 M2: an entry carrying a vendored hash is pinned, because the hash is
     // only meaningful against one exact asset — a floating `releases/latest` (or
     // a `--version` override) would move the target out from under it. Everything
     // else honors the override, else fetches latest, else the offline fallback.
     let repo = spec.repo.to_string();
     let tag = resolve_install_tag(
-        spec.sha256_fn.is_some(),
-        spec.version_fallback,
+        spec.sha256_fn.is_some() || windows_pin.is_some(),
+        windows_pin.unwrap_or(spec.version_fallback),
         override_version,
         spec.install_name,
         move || {
@@ -1432,7 +1517,8 @@ fn cmd_detect(yes: bool) -> Result<()> {
             .as_ref()
             .map(|c| c.is_approved(lang))
             .unwrap_or(false);
-        lang_capability_status(entry, registered, approved)
+        let consent = unsandboxed_consent_present(config.as_ref(), lang);
+        lang_capability_status(entry, registered, approved, consent)
     };
     let mut installable: Vec<&str> = Vec::new();
     let mut unavailable: Vec<&str> = Vec::new();
@@ -1626,6 +1712,58 @@ fn cmd_approve(
          only enforced if a host-level firewall or egress proxy backs it.\n\
          Run `travsr lang install {language}` to complete installation.",
         permitted_hosts.join(", ")
+    );
+    Ok(())
+}
+
+// ── allow-unsandboxed (permission to run with the user's own privileges) ──────
+
+fn cmd_allow_unsandboxed(language: &str, granted_by: Option<&str>, revoke: bool) -> Result<()> {
+    let entry =
+        lookup(language).ok_or_else(|| anyhow::anyhow!("Unknown language '{language}'."))?;
+
+    // Only the analyzers that cannot run inside Travsr's isolation need this. For
+    // every other language it would grant privileges for no reason, so refuse it.
+    if !entry.windows_sandbox_unsupported() {
+        anyhow::bail!(
+            "'{language}' already runs inside Travsr's isolation, so it does not need this. \
+             Run `travsr lang install {language}` to set up full analysis."
+        );
+    }
+
+    let mut config = load_config().unwrap_or_default();
+
+    if revoke {
+        if config.revoke_unsandboxed_consent(language) {
+            save_config(&config)?;
+            println!(
+                "Permission for '{language}' withdrawn. Full analysis will pause on \
+                 Windows until you grant it again with `travsr lang allow-unsandboxed {language}`."
+            );
+        } else {
+            println!("No permission was on record for '{language}' — nothing to withdraw.");
+        }
+        return Ok(());
+    }
+
+    let granted_by = granted_by
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("USERNAME").ok())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "user".to_string());
+
+    config.grant_unsandboxed_consent(language, &granted_by);
+    save_config(&config)?;
+
+    // Plain-language explanation of the trade-off — no internal jargon.
+    println!(
+        "Permission recorded: '{language}' analysis may now run with your own privileges \
+         on Windows (its build tools cannot run inside Travsr's isolation there).\n\
+         This lets it download dependencies and run this project's build, the same as if \
+         you ran the build yourself.\n\
+         Re-index to use it now:  travsr init --semantic --force\n\
+         To withdraw it later:    travsr lang allow-unsandboxed {language} --revoke"
     );
     Ok(())
 }
@@ -1846,6 +1984,21 @@ pub(crate) struct LangConfig {
     /// runs inside a repo; also settable via `--corpus` or `travsr config set`.
     #[serde(default)]
     trusted_corpora: Vec<String>,
+    /// Per-language permission to run an analyzer that cannot run inside Travsr's
+    /// isolation (java/scala on Windows) with the user's own privileges. Written by
+    /// `travsr lang allow-unsandboxed`; honoured by the indexer resolver so the
+    /// daemon/git-hook reindex path picks it up with no per-run flag.
+    #[serde(default)]
+    unsandboxed_consent: Vec<UnsandboxedConsent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct UnsandboxedConsent {
+    language: String,
+    /// Who granted the permission (recorded for auditability).
+    granted_by: String,
+    /// ISO-8601 date the permission was granted.
+    granted_date: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1918,6 +2071,28 @@ impl LangConfig {
         if !self.trusted_corpora.iter().any(|c| c == corpus) {
             self.trusted_corpora.push(corpus.to_string());
         }
+    }
+
+    fn has_unsandboxed_consent(&self, language: &str) -> bool {
+        self.unsandboxed_consent
+            .iter()
+            .any(|c| c.language == language)
+    }
+
+    fn grant_unsandboxed_consent(&mut self, language: &str, granted_by: &str) {
+        self.unsandboxed_consent.retain(|c| c.language != language);
+        self.unsandboxed_consent.push(UnsandboxedConsent {
+            language: language.to_string(),
+            granted_by: granted_by.to_string(),
+            granted_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+        });
+    }
+
+    /// Remove any permission for `language`. Returns true if one was present.
+    fn revoke_unsandboxed_consent(&mut self, language: &str) -> bool {
+        let before = self.unsandboxed_consent.len();
+        self.unsandboxed_consent.retain(|c| c.language != language);
+        self.unsandboxed_consent.len() < before
     }
 }
 

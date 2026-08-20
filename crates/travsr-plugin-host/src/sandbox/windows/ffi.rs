@@ -304,6 +304,28 @@ unsafe fn dacl_has_inheritable_allow_ace(dacl: *const ACL, sid: PSID, access_mas
 /// per (repo, SID, mask) persists on the tree; it is intentionally left in
 /// place across spawns — see the issue for the uninstall-cleanup discussion.
 pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io::Result<()> {
+    grant_path_access_impl(path, sid, access_mask, SUB_CONTAINERS_AND_OBJECTS_INHERIT)
+}
+
+/// Grants access to exactly this object, with NO_INHERITANCE (0) — nothing
+/// propagates to children. Used for ancestor-traverse grants (see
+/// `grant_ancestor_traverse`): a plain `grant_path_access` would use
+/// `SUB_CONTAINERS_AND_OBJECTS_INHERIT` and leak the grant to every sibling
+/// under that ancestor, defeating repo isolation.
+pub(super) fn grant_path_access_this_only(
+    path: &Path,
+    sid: PSID,
+    access_mask: u32,
+) -> io::Result<()> {
+    grant_path_access_impl(path, sid, access_mask, 0)
+}
+
+fn grant_path_access_impl(
+    path: &Path,
+    sid: PSID,
+    access_mask: u32,
+    inheritance: u32,
+) -> io::Result<()> {
     let path_wide = path_to_wide(path);
 
     let mut old_dacl = std::ptr::null_mut();
@@ -333,15 +355,20 @@ pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io:
     }
     let _sd_guard = SdGuard(sd);
 
-    // #505: grant already present → skip the subtree rewrite entirely.
-    if unsafe { dacl_has_inheritable_allow_ace(old_dacl, sid, access_mask) } {
+    // #505: grant already present → skip the subtree rewrite entirely. Only
+    // meaningful for the inheriting case (dacl_has_inheritable_allow_ace only
+    // matches (OI)(CI) aces); the this-only grant always re-applies, which is
+    // idempotent and cheap on the short ancestor chains it's used for.
+    if inheritance == SUB_CONTAINERS_AND_OBJECTS_INHERIT
+        && unsafe { dacl_has_inheritable_allow_ace(old_dacl, sid, access_mask) }
+    {
         return Ok(());
     }
 
     let ea = EXPLICIT_ACCESS_W {
         grfAccessPermissions: access_mask,
         grfAccessMode: GRANT_ACCESS,
-        grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        grfInheritance: inheritance,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
@@ -381,6 +408,39 @@ pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io:
         return Err(io::Error::from_raw_os_error(err as i32));
     }
     Ok(())
+}
+
+/// Grants FILE_TRAVERSE (0x0020) — "pass through," not "list contents" — on
+/// every ancestor directory of `path`, non-inherited, so the AppContainer
+/// token can resolve `path`'s canonical/real form.
+///
+/// Windows AppContainer tokens hold no `SeChangeNotifyPrivilege` (the
+/// privilege normal tokens use to bypass per-component traverse checking), so
+/// unlike a regular user process, an AppContainer token needs an explicit
+/// FILE_TRAVERSE grant on EVERY directory between the volume root and the
+/// granted object — not just the object itself — before the OS will resolve
+/// its real path. A direct `CreateFile` open of a fully-qualified path still
+/// works without this (confirmed: reads/writes to files under `repo_root`
+/// succeed throughout), but `GetFinalPathNameByHandleW` — what
+/// `std::fs::canonicalize` and Java NIO's `Path.toRealPath()` both call —
+/// does the full per-component walk and fails with ACCESS_DENIED without it.
+/// Found via sbt 2.x: `--server` mode's `bootServerSocket` derives its IPC
+/// socket identity from `toRealPath()` on the project root, so it hit this
+/// even though the wrapper's file I/O on the same root worked fine.
+///
+/// FILE_TRAVERSE alone (not a GENERIC_* mask) excludes FILE_LIST_DIRECTORY
+/// (0x0001), so this cannot enumerate an ancestor's own contents — sibling
+/// repos under the same parent stay invisible. Best-effort per ancestor: a
+/// directory whose owner isn't the current user (well above the repo, e.g.
+/// close to the volume root) may not be re-ACL-able without admin, in which
+/// case canonicalization stays broken for that specific tool but every other
+/// sandboxed operation (which doesn't need the real/canonical path) is
+/// unaffected.
+pub(super) fn grant_ancestor_traverse(path: &Path, sid: PSID) {
+    const FILE_TRAVERSE: u32 = 0x0000_0020;
+    for ancestor in path.ancestors().skip(1) {
+        let _ = grant_path_access_this_only(ancestor, sid, FILE_TRAVERSE);
+    }
 }
 
 /// #499: owns the storage a `SECURITY_CAPABILITIES` points into, so the

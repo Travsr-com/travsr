@@ -52,6 +52,7 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                 let not_run: Vec<String> = warned_langs(payload, "skipped_no_analyzer")
                     .into_iter()
                     .chain(warned_langs(payload, "needs_approval"))
+                    .chain(warned_langs(payload, "needs_consent"))
                     .collect();
                 if crashed.is_empty() && not_run.is_empty() {
                     "complete".to_string()
@@ -225,6 +226,13 @@ pub fn run() -> anyhow::Result<()> {
                     ["needs_approval", lang] => eprintln!(
                         "warning: '{lang}' needs a one-time network approval before it can index — run `travsr lang approve {lang}`"
                     ),
+                    // Windows only: an analyzer that cannot run inside Travsr's
+                    // isolation and has no permission on record. The one-time
+                    // permission is the only thing standing between it and full
+                    // analysis here.
+                    ["needs_consent", lang] => eprintln!(
+                        "warning: full '{lang}' analysis needs your permission to run — run `travsr lang allow-unsandboxed {lang}`"
+                    ),
                     // #712: analyzer ran but produced no nodes over the repo's
                     // source files of this language — a silent zero-node result,
                     // not a crash. Point at the tool and a rebuild.
@@ -260,9 +268,27 @@ pub fn run() -> anyhow::Result<()> {
                     // #449: languages present in the repo whose Phase B sidecar
                     // never ran, previously a silent skip that left the user
                     // with "0 references" and no explanation.
+                    // A language whose analyzer has no build for this OS can never
+                    // reach full analysis here, so pointing at `travsr lang install`
+                    // (which just dead-ends) is misleading — state the honest
+                    // "not available on this platform" instead.
+                    ["skipped_unregistered", lang]
+                        if crate::lang::full_analysis_unavailable_here(lang) =>
+                    {
+                        eprintln!(
+                            "note: full '{lang}' analysis is not available on this platform — structural analysis still works"
+                        )
+                    }
                     ["skipped_unregistered", lang] => eprintln!(
                         "warning: '{lang}' sources found but full analysis is not set up. Run `travsr lang install {lang}`"
                     ),
+                    ["skipped_no_analyzer", lang]
+                        if crate::lang::full_analysis_unavailable_here(lang) =>
+                    {
+                        eprintln!(
+                            "note: full '{lang}' analysis is not available on this platform — structural analysis still works"
+                        )
+                    }
                     // #414 (ADR-017 Rule 3): registered globally but this repo was
                     // never enabled. Collapsed into one combined line above the
                     // loop (trust is per-repo, so one install fixes all of them).
