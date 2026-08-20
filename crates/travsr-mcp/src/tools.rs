@@ -2662,7 +2662,7 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
         builtin = meta.builtin,
         sem = semantic_available,
         hint = install_hint,
-        prereq = meta.prerequisites,
+        prereq = meta.effective_prerequisites(),
         pbc = phase_b_commit,
     )
 }

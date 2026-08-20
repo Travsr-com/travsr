@@ -252,8 +252,9 @@ pub fn run() -> anyhow::Result<()> {
                         // clue — the catalog already knows what this language's
                         // analyzer needs from the project.
                         if let Some(entry) = travsr_plugin_host::phase_b::catalog::lookup(lang) {
-                            if !entry.prerequisites.is_empty() && entry.prerequisites != "none" {
-                                eprintln!("  needs: {}", entry.prerequisites);
+                            let prereq = entry.effective_prerequisites();
+                            if !prereq.is_empty() && prereq != "none" {
+                                eprintln!("  needs: {prereq}");
                             }
                         }
                         // #724 Finding 4: the most common cause of a zero-node

@@ -394,6 +394,22 @@ impl PhaseBEntry {
     pub fn windows_sandbox_unsupported(&self) -> bool {
         matches!(self.windows_sandbox, WindowsSandbox::Unsupported)
     }
+
+    /// Prerequisites text adjusted for the current platform.
+    ///
+    /// The Java Windows driver builds Gradle projects only — scip-java's Maven
+    /// path is not wired up there, and a Maven project fails with an explicit
+    /// "convert to Gradle, or run on macOS/Linux" message. So on Windows the
+    /// generic "JDK, Maven or Gradle" over-promises Maven; report Gradle only.
+    /// Kotlin (its language server auto-detects either build tool) and every
+    /// other language keep the base string, as does every non-Windows platform.
+    pub fn effective_prerequisites(&self) -> &'static str {
+        if cfg!(windows) && self.language == "java" {
+            "JDK + Gradle"
+        } else {
+            self.prerequisites
+        }
+    }
 }
 
 pub static CATALOG: &[PhaseBEntry] = &[
@@ -991,6 +1007,25 @@ mod windows_sandbox_tests {
         assert!(!lookup("kotlin").unwrap().windows_sandbox_unsupported());
         assert!(!lookup("go").unwrap().windows_sandbox_unsupported());
         assert!(!lookup("rust").unwrap().windows_sandbox_unsupported());
+    }
+
+    #[test]
+    fn java_windows_prerequisite_reports_gradle_only() {
+        let java = lookup("java").unwrap();
+        // The Windows Java driver builds Gradle projects only; the base string
+        // advertises Maven too, which is accurate on macOS/Linux.
+        if cfg!(windows) {
+            assert_eq!(java.effective_prerequisites(), "JDK + Gradle");
+        } else {
+            assert_eq!(java.effective_prerequisites(), "JDK, Maven or Gradle");
+        }
+        // Kotlin's language server auto-detects either build tool on every OS,
+        // so it never diverges by platform.
+        let kotlin = lookup("kotlin").unwrap();
+        assert_eq!(kotlin.effective_prerequisites(), kotlin.prerequisites);
+        // Non-Java entries are platform-invariant.
+        let go = lookup("go").unwrap();
+        assert_eq!(go.effective_prerequisites(), go.prerequisites);
     }
 }
 

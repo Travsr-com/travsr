@@ -525,7 +525,7 @@ fn cmd_list(json: bool) -> Result<()> {
                 json_str(scip_type),
                 json_str(entry.install_hint),
                 json_str(entry.underlying_tool_hint),
-                json_str(entry.prerequisites),
+                json_str(entry.effective_prerequisites()),
                 json_arr(entry.elevated_hosts),
                 unavailable_on.is_none(),
                 unavailable_on.map_or("null".to_string(), json_str),
@@ -587,7 +587,7 @@ fn cmd_list(json: bool) -> Result<()> {
             "{:<12} {:<13} {:<24} {}{}",
             entry.language,
             repo_state.cell(),
-            entry.prerequisites,
+            entry.effective_prerequisites(),
             status.line(),
             expiry
         );
