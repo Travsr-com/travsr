@@ -804,7 +804,7 @@ export function buildHtmlContent(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src ${csp} 'nonce-${nonce}'; style-src ${csp}; img-src ${csp} data:; font-src ${csp};">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src ${csp} 'nonce-${nonce}'; style-src ${csp} 'unsafe-inline'; img-src ${csp} data:; font-src ${csp};">
 <link rel="stylesheet" href="${cssUri}">
 <title>Travsr Graph</title>
 </head>
@@ -885,6 +885,10 @@ export function buildHtmlContent(
 <!-- Hover popup for truncated implementation chips. Outside the bar because
      the chip row clips on both axes once it scrolls. -->
 <div id="db-tip" role="tooltip" aria-hidden="true"></div>
+
+<!-- Node hover tooltip (styled by #tip in graph.css); fixed-position, so it can
+     live at the body root. graph.js positions it on cy mouseover/mousemove. -->
+<div id="tip" role="tooltip" aria-hidden="true"></div>
 
 <!-- ── Blast bar ────────────────────────────────────────────────────────── -->
 <div id="blastbar" style="display:none" role="status" aria-live="polite">

@@ -386,11 +386,11 @@ travsr graph --all --format json
     "kinds": { "file": 1, "function": 2, "import": 2, "variable": 1 }
   },
   "nodes": [
-    { "id": "...", "signature": "fn:activate", "kind": "function",
+    { "id": "...", "signature": "fn:activate", "label": "activate", "kind": "function",
       "path": "src/index.ts", "language": "typescript", "depth_from_seed": 1 }
   ],
   "edges": [
-    { "from": "file", "to": "fn:activate", "kind": "defines/binding" }
+    { "from_id": "...", "to_id": "...", "from": "file", "to": "activate", "kind": "defines/binding" }
   ]
 }
 ```

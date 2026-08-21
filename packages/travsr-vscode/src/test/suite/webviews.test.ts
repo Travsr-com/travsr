@@ -30,9 +30,12 @@ const LANG: LangInfo = {
   registered: true,
   builtin: false,
   needsApproval: false,
+  availableOnThisPlatform: true,
+  unavailableTarget: null,
   scipInstallType: "GithubBinary",
   installHint: "travsr lang install rust",
   underlyingToolHint: "",
+  prerequisites: "Rust toolchain (cargo)",
   elevatedHosts: [],
 };
 const LOG: LogEntry[] = [
@@ -110,24 +113,45 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
       language: "rust", package: "scip-rust", sandbox: "Standard",
       status: "active", statusLine: "active", repoState: "always_on",
       installed: true, registered: true, builtin: true, needsApproval: false,
+      availableOnThisPlatform: true, unavailableTarget: null,
       scipInstallType: "Command", installHint: "travsr lang install rust",
-      underlyingToolHint: "", elevatedHosts: [],
+      underlyingToolHint: "", prerequisites: "", elevatedHosts: [],
     },
     {
       language: "java", package: "scip-java", sandbox: "Elevated",
       status: "needs_approval", statusLine: "needs approval (run: travsr lang install java)",
       repoState: "not_enabled",
       installed: false, registered: false, builtin: false, needsApproval: true,
+      availableOnThisPlatform: true, unavailableTarget: null,
       scipInstallType: "GithubBinary", installHint: "travsr lang install java",
-      underlyingToolHint: "", elevatedHosts: ["repo1.maven.org"],
+      underlyingToolHint: "", prerequisites: "JDK, Maven or Gradle", elevatedHosts: ["repo1.maven.org"],
     },
     {
       language: "scala", package: "scip-scala", sandbox: "Elevated",
       status: "partial", statusLine: "partial (run: travsr lang install scala for full analysis)",
       repoState: "not_enabled",
       installed: false, registered: false, builtin: false, needsApproval: false,
+      availableOnThisPlatform: true, unavailableTarget: null,
       scipInstallType: "Manual", installHint: "travsr lang install scala",
-      underlyingToolHint: "https://docs.scala-lang.org/scip", elevatedHosts: [],
+      underlyingToolHint: "https://docs.scala-lang.org/scip", prerequisites: "JDK, sbt", elevatedHosts: [],
+    },
+    {
+      language: "swift", package: "scip-swift", sandbox: "Standard",
+      status: "unsupported", statusLine: "partial (full analysis not available on windows)",
+      repoState: "not_enabled",
+      installed: false, registered: false, builtin: false, needsApproval: false,
+      availableOnThisPlatform: false, unavailableTarget: "windows",
+      scipInstallType: "GithubBinary", installHint: "travsr lang install swift",
+      underlyingToolHint: "", prerequisites: "", elevatedHosts: [],
+    },
+    {
+      language: "java", package: "scip-java", sandbox: "Elevated",
+      status: "needs_consent", statusLine: "partial (full analysis needs your permission — run: travsr lang allow-unsandboxed java)",
+      repoState: "needs_analyzer",
+      installed: true, registered: true, builtin: false, needsApproval: false,
+      availableOnThisPlatform: true, unavailableTarget: null,
+      scipInstallType: "GithubBinary", installHint: "travsr lang install java",
+      underlyingToolHint: "", prerequisites: "JDK + Gradle", elevatedHosts: ["repo1.maven.org"],
     },
   ];
 
@@ -142,11 +166,20 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     // rust: active built-in analyzer → "on" badge, no Disable button for builtins
     assert.ok(html.includes(">on<"), "active builtin shows an 'on' badge");
     assert.ok(!html.includes('onclick="removeLang'), "builtin has no Disable onclick");
-    // java: needsApproval → consent form (inside not-here disclosure when undetected)
+    // java (needs_approval): consent form (inside not-here disclosure when undetected)
     assert.ok(html.includes("approveLang") && html.includes("Grant"));
     assert.ok(html.includes("repo1.maven.org"), "elevated hosts pre-filled");
-    // scala: Manual → install guide link (inside not-here disclosure when undetected)
-    assert.ok(html.includes("docs.scala-lang.org") || html.includes("Install guide"));
+    // scala (Manual install type): a plain Install button now — never a docs
+    // redirect. The Prerequisites column names the tool it needs instead.
+    assert.ok(html.includes("installLang(this,'scala')"), "scala shows a plain Install, not a docs link");
+    assert.ok(!html.includes("docs.scala-lang.org"), "no redirect to a docs site");
+    assert.ok(!html.includes("Install guide"), "no 'Install guide' link");
+    // swift (unsupported here): no install offered, honest 'Not available' cell.
+    assert.ok(html.includes("Not available on Windows"), "unsupported language shows a disabled 'Not available' cell");
+    assert.ok(!html.includes("installLang(this,'swift')"), "never offers to install an unavailable language");
+    // java (needs_consent): one-click permission, no command echoed.
+    assert.ok(html.includes("grantPermission(this,'java')"), "needs_consent shows an Allow & enable action");
+    assert.ok(html.includes("Allow"), "permission action is labelled in plain words");
   });
   test("undetected+inactive languages are gated behind not-here disclosure", () => {
     // java and scala are not in indexed → get <details class="not-here"> wrapper
@@ -161,8 +194,9 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
       status: "partial", statusLine: "partial (run: travsr lang install rust for full analysis)",
       repoState: "always_on",
       installed: false, registered: false, builtin: false, needsApproval: false,
+      availableOnThisPlatform: true, unavailableTarget: null,
       scipInstallType: "Command", installHint: "travsr lang install rust",
-      underlyingToolHint: "", elevatedHosts: [],
+      underlyingToolHint: "", prerequisites: "", elevatedHosts: [],
     }];
     const html = buildLanguagesHtml(indexedWithRust, uninstalledRust);
     assert.ok(html.includes("installLang") && html.includes("Install"));
@@ -175,9 +209,14 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     // scala: partial → "partial"; java: needs approval → "needs approval"
     assert.ok(html.includes(">partial<"), "partial badge for a language on structure only");
     assert.ok(html.includes(">needs approval<"), "needs-approval badge");
-    // The plain statusLine is the tooltip; no internal jargon leaks.
+    // The plain statusLine is the tooltip; no internal jargon leaks. The
+    // needs_consent line the CLI emits names `allow-unsandboxed`; the panel must
+    // render its own plain wording, never that command.
     assert.ok(html.includes("full analysis"), "plain statusLine used as tooltip");
-    assert.ok(!/SCIP|LSIF|Phase B|Built-in to the travsr/.test(html), "no internal jargon in the panel");
+    assert.ok(
+      !/SCIP|LSIF|Phase B|sandbox|corpus|Built-in to the travsr/i.test(html),
+      "no internal jargon in the panel"
+    );
     assert.ok(html.includes("Semantic"), "Semantic column header present");
   });
   test("This repo column shows per-repo enablement with the CLI's tag", () => {
@@ -201,8 +240,9 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
       status: "partial", statusLine: "partial (run: travsr lang install rust for full analysis)",
       repoState: "needs_analyzer",
       installed: false, registered: true, builtin: true, needsApproval: false,
+      availableOnThisPlatform: true, unavailableTarget: null,
       scipInstallType: "Command", installHint: "travsr lang install rust",
-      underlyingToolHint: "", elevatedHosts: [],
+      underlyingToolHint: "", prerequisites: "", elevatedHosts: [],
     }];
     const html = buildLanguagesHtml([], rustNoAnalyzer);
     assert.ok(html.includes(">no analyzer<"), "shows 'no analyzer' for a builtin missing its analyzer");

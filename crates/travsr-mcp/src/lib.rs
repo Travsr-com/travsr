@@ -30,7 +30,10 @@ pub use sse::{router as sse_router, AppState};
 // Re-exported for the `travsr refs` / `travsr pattern` CLI subcommands (#299),
 // which run the same occurrence-store read as the MCP tools against a locally
 // opened store. The rest of `tools` stays private (MCP-only surface).
-pub use tools::{find_pattern, find_pattern_raw, find_references};
+pub use tools::{
+    find_pattern, find_pattern_raw, find_references, find_references_structured, ResolvedSymbol,
+    StructuredReferences,
+};
 // Re-exported for the `travsr graph` CLI subcommand.
 pub use query::AMBIGUOUS_DISPLAY_LIMIT;
 // #645 WS-B: the CLI `status` surface reuses this exact classifier so the CLI
