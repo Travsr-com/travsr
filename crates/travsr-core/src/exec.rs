@@ -92,6 +92,72 @@ pub fn resolve_executable(name: &str) -> Option<PathBuf> {
     resolve_executable_in(std::env::split_paths(&path), name)
 }
 
+/// The user's home directory from the environment, without a `dirs` dependency.
+///
+/// `USERPROFILE` on Windows, `HOME` elsewhere, each with the other as a
+/// fallback so a POSIX-shell-launched process on Windows (which may export
+/// `HOME`) still resolves. Mirrors the anchor `dirs::home_dir()` picks, which
+/// is where `travsr lang install` writes its managed binaries.
+fn home_dir_from_env() -> Option<PathBuf> {
+    let (primary, secondary) = if cfg!(windows) {
+        ("USERPROFILE", "HOME")
+    } else {
+        ("HOME", "USERPROFILE")
+    };
+    std::env::var_os(primary)
+        .or_else(|| std::env::var_os(secondary))
+        .map(PathBuf::from)
+}
+
+/// The non-PATH directories where toolchain-managed analyzers land, in the
+/// order the go/rust/dotnet toolchains prefer. These are NOT on the daemon's
+/// (or a GUI-launched process's) PATH, so an analyzer installed by its own
+/// toolchain is invisible to a bare PATH probe:
+///   * `$GOBIN` then `$GOPATH/bin` (default `~/go/bin`) — `go install` targets.
+///   * `~/.cargo/bin` — cargo/rustup default.
+///   * `~/.travsr/bin` — travsr's own managed dir for downloaded scip-* binaries.
+///   * `~/.dotnet/tools` — `dotnet tool install --global` target.
+fn extra_tool_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    // $GOBIN takes precedence over $GOPATH/bin per go toolchain semantics.
+    if let Some(gobin) = std::env::var_os("GOBIN") {
+        dirs.push(PathBuf::from(gobin));
+    }
+    let gopath = std::env::var_os("GOPATH")
+        .map(PathBuf::from)
+        .or_else(|| home_dir_from_env().map(|h| h.join("go")));
+    if let Some(gp) = gopath {
+        dirs.push(gp.join("bin"));
+    }
+    if let Some(home) = home_dir_from_env() {
+        dirs.push(home.join(".cargo").join("bin"));
+        dirs.push(home.join(".travsr").join("bin"));
+        dirs.push(home.join(".dotnet").join("tools"));
+    }
+    dirs
+}
+
+/// Whether `name` resolves to a runnable executable on this machine, checking
+/// both `PATH` and the toolchain-managed dirs in [`extra_tool_dirs`].
+///
+/// This is the ONE shared presence check for analyzer/tool binaries. Every
+/// surface that decides "is this analyzer installed?" — `travsr lang list`, the
+/// index-time Phase B resolver, `lang install`'s fast path — must route through
+/// here so they can never disagree for the same machine (the disagreement that
+/// made a missing analyzer render as "installed, fix your project setup").
+pub fn tool_available(name: &str) -> bool {
+    tool_path(name).is_some()
+}
+
+/// Like [`tool_available`], but returns the resolved path. `PATH` wins over the
+/// toolchain-managed dirs, matching [`tool_available`]'s search order, so a
+/// caller that needs the binary itself (e.g. to read its version) resolves the
+/// same file the presence check found — including one that lives only in
+/// `~/.travsr/bin` and is not on `PATH`.
+pub fn tool_path(name: &str) -> Option<PathBuf> {
+    resolve_executable(name).or_else(|| resolve_executable_in(extra_tool_dirs(), name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

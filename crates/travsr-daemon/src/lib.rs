@@ -138,6 +138,10 @@ pub struct PhaseBReport {
     /// Languages that are RequiresElevated but have no PSE approval in lang.toml.
     /// Shown to the user with a `travsr lang approve` call-to-action.
     pub skipped_needs_approval: Vec<String>,
+    /// Windows only: languages whose analyzer cannot run inside the isolation
+    /// layer and have no permission on record. Shown to the user with a
+    /// `travsr lang allow-unsandboxed <lang>` call-to-action.
+    pub skipped_needs_consent: Vec<String>,
     /// Languages whose analyzer spawned but died or errored mid-invoke.
     pub crashed: Vec<String>,
     /// #712: languages whose analyzer ran cleanly but produced zero nodes despite
@@ -2720,6 +2724,12 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_needs_approval {
         warnings.push(format!("needs_approval:{lang}"));
     }
+    // Windows-only: an analyzer that cannot run isolated here and has no
+    // permission on record. Surface the exact `travsr lang allow-unsandboxed
+    // <lang>` fix rather than leaving the language silently absent.
+    for lang in &pb_outcome.skipped_needs_consent {
+        warnings.push(format!("needs_consent:{lang}"));
+    }
     // #449: a language present in the repo whose sidecar is not installed or
     // not registered used to be skipped silently, and the user saw "0 references"
     // with no hint that Phase B never ran. Surface both skip classes so
@@ -2786,6 +2796,7 @@ fn write_phase_b_results(
         skipped_untrusted_corpus: pb_outcome.skipped_untrusted_corpus,
         skipped_no_compdb: pb_outcome.skipped_no_compdb,
         skipped_needs_approval: pb_outcome.skipped_needs_approval,
+        skipped_needs_consent: pb_outcome.skipped_needs_consent,
         crashed: pb_outcome.crashed,
         produced_no_nodes: pb_outcome.produced_no_nodes,
         produced_no_references: pb_outcome.produced_no_references,

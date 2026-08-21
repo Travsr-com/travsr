@@ -581,6 +581,7 @@ pub fn ask_query_with_filter(
         .into_iter()
         .map(|n| {
             let is_primary = primary_seed_ids.contains(&n.id);
+            let signature = display_label(&n).into_owned();
             AskRow {
                 score: crate::seed::display_score(
                     n.id,
@@ -603,7 +604,7 @@ pub fn ask_query_with_filter(
                         .to_string()
                 }),
                 kind: n.kind,
-                signature: n.vname.signature,
+                signature,
                 path: n.vname.path,
                 line: n.line,
             }

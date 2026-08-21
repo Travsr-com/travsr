@@ -16,6 +16,8 @@ use travsr_plugin_host::sandbox::policy::SandboxUnavailable;
 #[cfg(target_os = "linux")]
 fn sandbox_standard_allows_network() {
     use travsr_plugin_host::sandbox::linux::build_sandboxed_command;
+    // tempdir() reads TMPDIR; serialise against the env-mutating provider tests.
+    let _env = env_guard();
 
     let repo = tempfile::tempdir().expect("tempdir");
     let scratch = tempfile::tempdir().expect("scratch");
@@ -64,6 +66,8 @@ fn sandbox_standard_allows_network() {
 // 2. Fail-closed — no sandbox → Err(SandboxUnavailable), never an unsandboxed command
 #[test]
 fn sandbox_unavailable_returns_err_not_fallback_command() {
+    // tempdir() reads TMPDIR; serialise against the env-mutating provider tests.
+    let _env = env_guard();
     // On any platform, if sandbox is unavailable we get Err, not a fallback Command.
     // We verify this by calling the wrong-platform builder and checking the type.
     //
@@ -145,9 +149,26 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
 // tests only unit-tested `TrustConfig::is_trusted`, which production never
 // called — they passed while the gate was dead code.
 
-/// Serialises the trust-gate tests: they mutate process-global env
-/// (TRAVSR_LANG_TOML, PATH) which must not interleave.
+/// Serialises every test that reads or writes process-global env.
+///
+/// The provider tests `set_var`/`remove_var` on PATH/TRAVSR_BIN_DIR/
+/// TRAVSR_LANG_TOML; in a multithreaded process that is a data race against any
+/// concurrent `getenv` — including the `env::temp_dir()` lookup inside every
+/// `tempfile::tempdir()` call the sandbox tests make. `setenv` reallocates the
+/// C `environ` array, so a concurrent read can see a corrupted PATH and the
+/// analyzer resolution silently misses the on-PATH stub (`skipped_no_analyzer`).
+/// Env is per-process, so holding this lock across every env-touching test in
+/// this binary removes the race; the pure struct-validation tests take no env
+/// and need no guard. (Other test binaries are separate processes, unaffected.)
 static TRUST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`TRUST_ENV_LOCK`], recovering from a poisoned guard left by an
+/// unrelated test panic (the data being guarded is process env, not test state).
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    TRUST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// How the fake `travsr-lang-go` provider is laid out on the temp PATH dir.
 enum ProviderLayout {
@@ -164,26 +185,44 @@ enum ProviderLayout {
     CmdShimWithPackagedExe,
 }
 
+/// Write a directly spawnable executable stub named `name` into `bin_dir`:
+/// an `MZ`-prefixed `.exe` on Windows (a spawn failure still lands in `crashed`,
+/// proving the spawn path ran), an executable `#!/bin/sh` script elsewhere.
+fn write_exec_stub(bin_dir: &std::path::Path, name: &str) {
+    use std::io::Write as _;
+    #[cfg(windows)]
+    let path = bin_dir.join(format!("{name}.exe"));
+    #[cfg(not(windows))]
+    let path = bin_dir.join(name);
+    let mut f = std::fs::File::create(&path).expect("create exec stub");
+    #[cfg(windows)]
+    f.write_all(b"MZ not a real PE").expect("write");
+    #[cfg(not(windows))]
+    f.write_all(b"#!/bin/sh\nexit 0\n").expect("write");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod exec stub");
+    }
+}
+
+/// Stub go's UNDERLYING analyzer (`scip-go`, go's `catalog.command`) onto the
+/// test PATH. Since #743 the resolver's G2 gate skips a language whose wrapper
+/// is present but whose analyzer tool is absent (`tool_available` false), so
+/// without this the fake `travsr-lang-go` wrapper resolves but go is dropped as
+/// `missing_tool` before it ever reaches the trust gate or spawn stage these
+/// tests exercise. Only layouts that are meant to reach spawn need it.
+fn write_fake_analyzer_tool(bin_dir: &std::path::Path) {
+    write_exec_stub(bin_dir, "scip-go");
+}
+
 /// Materialise `layout` inside `bin_dir`.
 fn write_fake_provider(bin_dir: &std::path::Path, layout: &ProviderLayout) {
-    use std::io::Write as _;
     match layout {
         ProviderLayout::NativeStub => {
-            #[cfg(windows)]
-            let fake = bin_dir.join("travsr-lang-go.exe");
-            #[cfg(not(windows))]
-            let fake = bin_dir.join("travsr-lang-go");
-            let mut f = std::fs::File::create(&fake).expect("create fake provider");
-            #[cfg(windows)]
-            f.write_all(b"MZ not a real PE").expect("write");
-            #[cfg(not(windows))]
-            f.write_all(b"#!/bin/sh\nexit 0\n").expect("write");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod fake provider");
-            }
+            write_exec_stub(bin_dir, "travsr-lang-go");
+            write_fake_analyzer_tool(bin_dir);
         }
         #[cfg(windows)]
         ProviderLayout::CmdShimOnly => {
@@ -208,6 +247,7 @@ fn write_fake_provider(bin_dir: &std::path::Path, layout: &ProviderLayout) {
                 .join("travsr-lang-go.exe");
             std::fs::create_dir_all(exe.parent().unwrap()).expect("mk packaged bin dir");
             std::fs::write(&exe, b"MZ not a real PE").expect("write packaged exe");
+            write_fake_analyzer_tool(bin_dir);
         }
     }
 }
@@ -220,9 +260,7 @@ fn run_phase_b_with_provider(
     trusted_corpora: &[&str],
     layout: ProviderLayout,
 ) -> travsr_plugin_host::PhaseBOutcome {
-    let _guard = TRUST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = env_guard();
 
     // lang.toml: "go" registered; trust list as given.
     let cfg_dir = tempfile::tempdir().expect("cfg tempdir");
@@ -246,13 +284,23 @@ fn run_phase_b_with_provider(
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     write_fake_provider(bin_dir.path(), &layout);
 
+    // `which_binary` checks ~/.travsr/bin before PATH — on the real machine
+    // running this test suite that dir can (and, on a dev box that has ever run
+    // `travsr lang install go`, does) already contain a real travsr-lang-go, which
+    // would win over this test's fake PATH-injected provider and silently test
+    // against the wrong binary. Point it at an empty dir so only `layout` is
+    // ever visible, matching a machine with nothing installed globally.
+    let empty_travsr_bin = tempfile::tempdir().expect("empty travsr bin tempdir");
+
     let old_path = std::env::var_os("PATH").unwrap_or_default();
     let mut paths: Vec<std::path::PathBuf> = vec![bin_dir.path().to_path_buf()];
     paths.extend(std::env::split_paths(&old_path));
     let new_path = std::env::join_paths(paths).expect("join PATH");
     let old_lang_toml = std::env::var_os("TRAVSR_LANG_TOML");
+    let old_travsr_bin_dir = std::env::var_os("TRAVSR_BIN_DIR");
     std::env::set_var("PATH", &new_path);
     std::env::set_var("TRAVSR_LANG_TOML", &lang_toml);
+    std::env::set_var("TRAVSR_BIN_DIR", empty_travsr_bin.path());
 
     let repo = tempfile::tempdir().expect("repo tempdir");
     std::fs::write(repo.path().join("main.go"), "package main\n").expect("write go file");
@@ -270,6 +318,10 @@ fn run_phase_b_with_provider(
     match old_lang_toml {
         Some(v) => std::env::set_var("TRAVSR_LANG_TOML", v),
         None => std::env::remove_var("TRAVSR_LANG_TOML"),
+    }
+    match old_travsr_bin_dir {
+        Some(v) => std::env::set_var("TRAVSR_BIN_DIR", v),
+        None => std::env::remove_var("TRAVSR_BIN_DIR"),
     }
 
     outcome
@@ -400,6 +452,8 @@ fn cmd_shim_with_packaged_exe_reaches_spawn() {
 #[cfg(target_os = "linux")]
 fn sandbox_repo_root_is_read_only() {
     use travsr_plugin_host::sandbox::linux::build_sandboxed_command;
+    // tempdir() reads TMPDIR; serialise against the env-mutating provider tests.
+    let _env = env_guard();
 
     let repo = tempfile::tempdir().expect("tempdir");
     let scratch = tempfile::tempdir().expect("scratch");
@@ -434,11 +488,74 @@ fn sandbox_repo_root_is_read_only() {
     }
 }
 
+// 4b. FS confinement — scala's narrowed repo-write grant opens only its build
+// subpaths (target/), never the whole repo root. A write to a repo-root file
+// outside those subpaths must still be denied; a write into target/ must succeed.
+#[test]
+#[cfg(target_os = "linux")]
+fn sandbox_scala_repo_write_is_narrowed_to_build_subpaths() {
+    use travsr_plugin_host::sandbox::linux::build_sandboxed_command;
+    let _env = env_guard();
+
+    let repo = tempfile::tempdir().expect("tempdir");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let breach_path = repo.path().join("build.sbt"); // repo root, not a write subpath
+    let allowed_path = repo.path().join("target").join("write_test.txt");
+
+    // Breach: writing a repo-root file outside the narrowed subpaths must fail.
+    let breach = build_sandboxed_command(
+        "sh",
+        &[
+            "-c",
+            &format!("echo hostile > {} 2>&1; true", breach_path.display()),
+        ],
+        repo.path(),
+        scratch.path(),
+        &SandboxPolicy::Standard,
+        "scala",
+    );
+    match breach {
+        Err(SandboxUnavailable(ref msg)) => {
+            if std::env::var("CI").is_ok() {
+                panic!("sandbox unavailable in CI: {msg}");
+            }
+            eprintln!("SKIP: {msg}");
+            return;
+        }
+        Ok(spawner) => {
+            let _ = spawner.output();
+            assert!(
+                !breach_path.exists() || std::fs::read_to_string(&breach_path).unwrap_or_default().trim() != "hostile",
+                "scala sandbox allowed a write to a repo-root file outside target/ — narrowing broken"
+            );
+        }
+    }
+
+    // Allowed: writing into target/ (a granted subpath) must succeed.
+    let allowed = build_sandboxed_command(
+        "sh",
+        &["-c", &format!("echo ok > {}", allowed_path.display())],
+        repo.path(),
+        scratch.path(),
+        &SandboxPolicy::Standard,
+        "scala",
+    );
+    if let Ok(spawner) = allowed {
+        let _ = spawner.output();
+        assert!(
+            allowed_path.exists(),
+            "scala sandbox blocked a write into target/ — the narrowed grant must still allow sbt's build outputs"
+        );
+    }
+}
+
 // 5. Scratch dir is writable
 #[test]
 #[cfg(target_os = "linux")]
 fn sandbox_scratch_dir_is_writable() {
     use travsr_plugin_host::sandbox::linux::build_sandboxed_command;
+    // tempdir() reads TMPDIR; serialise against the env-mutating provider tests.
+    let _env = env_guard();
 
     let repo = tempfile::tempdir().expect("tempdir");
     let scratch = tempfile::tempdir().expect("scratch");

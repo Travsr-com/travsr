@@ -19,14 +19,23 @@ const C = {
   err:   '#f4645a',   // red-400     — diagnostics: error
   warn:  '#fcd053',   // gold-300    — diagnostics: warning
 };
+// Own-property lookup with a fallback. A plain-object map must never be indexed
+// directly by a graph-supplied kind: kinds like "constructor" (real, e.g. Java)
+// collide with Object.prototype members, so `map[kind] || fallback` returns the
+// inherited function instead of the fallback. That bogus value was handed to
+// cytoscape as a shape, `nodeShapes[it]` was undefined, and drawNode threw
+// ("reading 'draw' of undefined") — killing the renderer and freezing the panel.
+function fromMap(map, kind, fallback) {
+  return Object.prototype.hasOwnProperty.call(map, kind) ? map[kind] : fallback;
+}
 function nodeColor(kind) {
-  return ({ function: C.fn, class: C.cls, file: C.file, interface: C.iface, var: C.vr, pkg: C.pkg, ghost: '#5a5a5a' })[kind] || '#8f7a6c';
+  return fromMap({ function: C.fn, constructor: C.fn, method: C.fn, class: C.cls, file: C.file, interface: C.iface, var: C.vr, pkg: C.pkg, ghost: '#5a5a5a' }, kind, '#8f7a6c');
 }
 function nodeShape(kind) {
-  return ({ function: 'ellipse', class: 'diamond', file: 'round-rectangle', interface: 'triangle', var: 'round-tag', pkg: 'round-rectangle', ghost: 'round-rectangle' })[kind] || 'ellipse';
+  return fromMap({ function: 'ellipse', constructor: 'ellipse', method: 'ellipse', class: 'diamond', file: 'round-rectangle', interface: 'triangle', var: 'round-tag', pkg: 'round-rectangle', ghost: 'round-rectangle' }, kind, 'ellipse');
 }
 function edgeColor(kind) {
-  return ({ calls: 'rgba(134,223,134,0.28)', imports: 'rgba(72,72,72,0.42)', reads: 'rgba(252,208,83,0.35)' })[kind] || 'rgba(72,72,72,0.42)';
+  return fromMap({ calls: 'rgba(134,223,134,0.28)', imports: 'rgba(72,72,72,0.42)', reads: 'rgba(252,208,83,0.35)' }, kind, 'rgba(72,72,72,0.42)');
 }
 
 // ── Cytoscape init ────────────────────────────────────────────────────────────
@@ -121,11 +130,11 @@ const cy = cytoscape({
         width: e => e.data('wgt') ? Math.min(5, 1 + Math.log2(e.data('wgt')) * 0.7) : 1.3,
         'line-color': e => edgeColor(e.data('kind')),
         'line-fill': 'linear-gradient',
-        'line-gradient-stop-colors': e => ({
+        'line-gradient-stop-colors': e => fromMap({
           calls:   ['rgba(134,223,134,0.10)', 'rgba(134,223,134,0.58)'],
           imports: ['rgba(72,72,72,0.18)', 'rgba(100,100,100,0.52)'],
           reads:   ['rgba(252,208,83,0.10)', 'rgba(252,208,83,0.58)'],
-        })[e.data('kind')] || ['rgba(72,72,72,0.18)', 'rgba(100,100,100,0.52)'],
+        }, e.data('kind'), ['rgba(72,72,72,0.18)', 'rgba(100,100,100,0.52)']),
         'line-gradient-stop-positions': [0, 100],
         'target-arrow-shape': 'triangle', 'arrow-scale': 0.75,
         'target-arrow-color': e => edgeColor(e.data('kind')),
@@ -167,6 +176,34 @@ const cy = cytoscape({
   autoungrabify: false,
   boxSelectionEnabled: false,
 });
+
+// Cytoscape mishandles element ids that contain whitespace, backticks, '#' or
+// brackets. Synthesized external-symbol nodes carry a raw compiler signature in
+// their id (e.g. a Java constructor `...Greeter#`<init>`().`), which broke edge
+// rendering and froze the panel. When any id is unsafe, remap the whole set to
+// compact tokens and rewrite edge endpoints through the same map so nodes and
+// edges stay consistent. Display fields (label/path/line) are untouched, so node
+// names and goto/peek — which key off `path`, never `id` — are unaffected.
+function sanitizeGraphIds(nodes, edges) {
+  const UNSAFE = /[\s`#()[\]]/;
+  if (!nodes.some(n => n && n.id != null && UNSAFE.test(String(n.id)))) {
+    return { nodes, edges };
+  }
+  const idMap = new Map();
+  let counter = 0;
+  const safeId = (raw) => {
+    const key = String(raw);
+    let mapped = idMap.get(key);
+    if (mapped === undefined) { mapped = 'g' + counter++; idMap.set(key, mapped); }
+    return mapped;
+  };
+  return {
+    // Keep the original id in `realId` so exportJson can emit the true CLI node
+    // id rather than the internal `g0`/`g1` cytoscape-safe handle.
+    nodes: nodes.map(n => ({ ...n, id: safeId(n.id), realId: String(n.id) })),
+    edges: edges.map(e => ({ ...e, source: safeId(e.source), target: safeId(e.target) })),
+  };
+}
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let allNodes = [];       // full payload from last render
@@ -515,7 +552,7 @@ function buildElements() {
     const isHidden = n.kind === 'var' && !varsOn;
     els.push({
       data: {
-        id: n.id, label: disambigLabel(n), kind: n.kind, path: n.path || '',
+        id: n.id, realId: n.realId, label: disambigLabel(n), kind: n.kind, path: n.path || '',
         pkg: n.package || '', score: n.score || 0, line: n.line || 0,
         hop: n.hop || 0, root: !!n.root, degree: d,
         w: n.kind === 'var' ? 42 : sz, h: n.kind === 'var' ? 18 : sz,
@@ -929,8 +966,7 @@ window.addEventListener('message', event => {
 
     // Symbol graph (mode == '' or unknown)
     setViewMode(false);
-    allNodes = (data.nodes || []);
-    allEdges = (data.edges || []);
+    ({ nodes: allNodes, edges: allEdges } = sanitizeGraphIds(data.nodes || [], data.edges || []));
     loadedDepth = depth;
     loadedDirection = direction;
     _disambigRoot = null; // reset on every new query
@@ -1210,7 +1246,7 @@ function showDetail(n) {
   detailEl.innerHTML =
     '<div style="display:flex;gap:10px;align-items:center;margin-bottom:4px">' +
       '<div class="node-icon-lg" style="background:' + color + '14;border:2px solid ' + color + ';color:' + color + '">' +
-        (iconMap[d.kind] || '●') +
+        fromMap(iconMap, d.kind, '●') +
       '</div>' +
       '<div>' +
         '<div class="d-sig">' + escHtml(d.label || '') + '</div>' +
@@ -1276,12 +1312,14 @@ function exportDot() {
 
 function exportJson() {
   const payload = {
+    // Emit the real CLI node id (`realId`), not the cytoscape-safe handle, so an
+    // exported graph's ids line up with `travsr graph --format json`.
     nodes: cy.nodes(':visible').not(':parent').map(n => ({
-      id: n.id(), label: n.data('label'), kind: n.data('kind'),
+      id: n.data('realId') || n.id(), label: n.data('label'), kind: n.data('kind'),
       path: n.data('path'), package: n.data('pkg'), score: n.data('score'), line: n.data('line'),
     })),
     edges: cy.edges(':visible').map(e => ({
-      source: e.data('source'), target: e.data('target'), kind: e.data('kind'),
+      source: e.source().data('realId') || e.data('source'), target: e.target().data('realId') || e.data('target'), kind: e.data('kind'),
     })),
   };
   vscode.postMessage({ command: 'exportJson', json: JSON.stringify(payload, null, 2) });
@@ -2180,6 +2218,23 @@ function renderOverview(data, serverMode, pathPrefix) {
   const realNodes = nodes.filter(n => !n.ghost);
   const ghostNodes = nodes.filter(n => n.ghost);
 
+  // Cytoscape uses element ids inside selectors, so a package-path id with
+  // whitespace / # / ()[] breaks the canvas the same way query mode did before
+  // sanitizeGraphIds. Map every tile/ghost id to a safe canvas handle; the real
+  // path stays in each tile's `_raw` payload, which drill-in navigation reads,
+  // so navigation is unaffected. No-op when all ids are already selector-safe.
+  const _ovMap = new Map();
+  let _ovC = 0;
+  const _ovUnsafe = /[\s`#()[\]]/;
+  const _ovNeedsMap = nodes.some(n => n && n.id != null && _ovUnsafe.test(String(n.id)));
+  const sid = (raw) => {
+    if (!_ovNeedsMap) return String(raw);
+    const key = String(raw);
+    let m = _ovMap.get(key);
+    if (m === undefined) { m = 'o' + _ovC++; _ovMap.set(key, m); }
+    return m;
+  };
+
   cy.elements().remove();
   cy.off('dbltap', 'node');
   cy.off('zoom.overview');
@@ -2195,10 +2250,11 @@ function renderOverview(data, serverMode, pathPrefix) {
   const packed = packTiles(realNodes);
   packed.forEach(t => {
     cy.add({ data: {
-      id: t.id,
+      id: sid(t.id),
       label: (t.label || t.id) + (t.file_count ? '\n' + t.file_count + ' files' : ''),
       kind: t.kind || 'pkg',
       w: t.w, h: t.h, tile: 1, file_count: t.file_count || 0,
+      // Real path preserved for drill-in (tilemapDrillIn reads this, not the id).
       _raw: JSON.stringify({ id: t.id, label: t.label, file_count: t.file_count }),
     }, position: { x: t.x, y: t.y } });
   });
@@ -2206,7 +2262,7 @@ function renderOverview(data, serverMode, pathPrefix) {
   // Ghost port nodes positioned to the right
   const span = packed.length ? Math.max(...packed.map(t => t.x + t.w / 2)) : 300;
   ghostNodes.forEach((g, i) => {
-    cy.add({ data: { id: g.id, label: g.label || g.id, kind: 'ghost', w: 110, h: 46 },
+    cy.add({ data: { id: sid(g.id), label: g.label || g.id, kind: 'ghost', w: 110, h: 46 },
              position: { x: span + 200, y: -60 + i * 96 } });
   });
 
@@ -2214,10 +2270,12 @@ function renderOverview(data, serverMode, pathPrefix) {
   const edgeSeen = new Set();
   edges.forEach(e => {
     if (!e.source || !e.target) return;
-    const key = e.source + '->' + e.target;
+    const src = sid(e.source);
+    const tgt = sid(e.target);
+    const key = src + '->' + tgt;
     if (edgeSeen.has(key)) return;
     edgeSeen.add(key);
-    cy.add({ data: { id: key, source: e.source, target: e.target, kind: 'imports', wgt: e.count || 1 } });
+    cy.add({ data: { id: key, source: src, target: tgt, kind: 'imports', wgt: e.count || 1 } });
   });
 
   cy.layout({ name: 'preset' }).run();

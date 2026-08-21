@@ -88,9 +88,34 @@ pub fn build_sandboxed_command(
     // write to it. bwrap creates the /travsr-scratch mount point in its root
     // tmpfs automatically. A plain --tmpfs would be root-owned and unwritable.
     cmd.args(["--bind", scratch.as_ref(), "/travsr-scratch"]); // writable scratch
+                                                               // ADR-017 Rule 1: the repo root is read-only. A language that must write
+                                                               // build outputs into its own project tree (scala: sbt has no out-of-tree
+                                                               // build) gets writable binds for exactly those subpaths, layered over the
+                                                               // read-only root — never the whole repo. bwrap needs the mount source to
+                                                               // exist, so the host subpath is created first (build-artifact dirs / the
+                                                               // generated settings file — the same paths the analyzer writes anyway).
     cmd.args(["--ro-bind", repo.as_ref(), repo.as_ref()]); // repo: ro
-                                                           // Per-language toolchain caches: read-only module/toolchain dirs, writable
-                                                           // build cache. Bound at their host paths so the GO*/HOME env (set below) resolve.
+    for entry in crate::sandbox::toolchain::repo_write_subpaths(language) {
+        let host = std::path::Path::new(repo.as_ref()).join(entry.subpath());
+        match entry {
+            crate::sandbox::toolchain::RepoWrite::Dir(_) => {
+                let _ = std::fs::create_dir_all(&host);
+            }
+            crate::sandbox::toolchain::RepoWrite::File(_) => {
+                if let Some(parent) = host.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&host);
+            }
+        }
+        let host = host.to_string_lossy();
+        cmd.args(["--bind", host.as_ref(), host.as_ref()]); // writable subpath
+    }
+    // Per-language toolchain caches: read-only module/toolchain dirs, writable
+    // build cache. Bound at their host paths so the GO*/HOME env (set below) resolve.
     for path in &tc.read_paths {
         let p = path.to_string_lossy();
         cmd.args(["--ro-bind-try", p.as_ref(), p.as_ref()]);

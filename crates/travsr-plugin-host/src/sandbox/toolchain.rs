@@ -29,8 +29,87 @@ pub struct ToolchainAccess {
     pub read_paths: Vec<PathBuf>,
     /// Directories the analyzer must be able to **write** (build cache).
     pub write_paths: Vec<PathBuf>,
+    /// Directories the analyzer must be able to **execute** binaries from — the
+    /// genuine toolchain *bin* dirs it shells out to (GOROOT/bin, GOPATH/bin,
+    /// JAVA_HOME/bin, the sbt/dotnet bin dirs). These are ADDITIVE over
+    /// `read_paths`: an exec dir is also listed in `read_paths`, so platforms that
+    /// already grant reads-with-execute (Linux bwrap binds, the macOS profile) are
+    /// unchanged, while the Windows AppContainer — which grants read WITHOUT
+    /// execute by default — adds the execute right only here.
+    ///
+    /// Deliberately EXCLUDES module / package caches (GOMODCACHE, ~/.m2, ~/.ivy2,
+    /// ~/.nuget): those are populated over the network during dependency
+    /// resolution, so granting execute there would let a planted binary run.
+    /// Least-privilege: execute exactly the toolchain, read the caches. The
+    /// residual risk equals the existing `~/.travsr/bin` execute grant — both are
+    /// user-write-only trusted install dirs.
+    pub exec_paths: Vec<PathBuf>,
     /// Env vars to pass through into the otherwise-cleared sandbox env.
     pub env: Vec<(String, String)>,
+}
+
+/// Strip the Windows extended-length verbatim prefix (`\\?\`, `\\?\UNC\`) from a
+/// path. `std::fs::canonicalize` and the daemon's `repo_root` both carry it on
+/// Windows, but the analyzer sidecars (scip-dotnet's `System.Uri`, sbt, …) and
+/// env vars like `DOTNET_ROOT` cannot parse it. No-op on unix and on any
+/// already-clean path.
+pub(crate) fn strip_windows_verbatim(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    match s
+        .strip_prefix(r"\\?\UNC\")
+        .map(|r| format!(r"\\{r}"))
+        .or_else(|| s.strip_prefix(r"\\?\").map(|r| r.to_string()))
+    {
+        Some(stripped) => PathBuf::from(stripped),
+        None => p,
+    }
+}
+
+/// One repo-relative path a Phase B analyzer must be able to write, with the
+/// rest of the repo root kept read-only (ADR-017 Rule 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoWrite {
+    /// A directory subtree the analyzer writes into (created on the host if
+    /// absent so the writable bind has a mount source).
+    Dir(&'static str),
+    /// A single file the analyzer generates (created empty on the host if absent).
+    File(&'static str),
+}
+
+impl RepoWrite {
+    pub fn subpath(&self) -> &'static str {
+        match self {
+            RepoWrite::Dir(p) | RepoWrite::File(p) => p,
+        }
+    }
+}
+
+/// The exact repo-relative subpaths `language`'s Phase B analyzer must write,
+/// keeping the rest of the repo root read-only. Empty for every language except
+/// scala: `sbt compile` writes build outputs to `target/` and `project/target/`
+/// inside the project (sbt's layout has no out-of-tree build option), and
+/// SemanticDB is enabled via a settings file (`.travsr-semanticdb.sbt`) the
+/// wrapper drops alongside `build.sbt`. Narrowing to these subpaths — rather than
+/// the whole repo root — means a hostile `build.sbt` executed by sbt during
+/// indexing cannot rewrite arbitrary repo files. Every other language's build
+/// tool writes only to its own cache dir (`~/.gradle`, `~/go/pkg`, …), already
+/// covered by `ToolchainAccess::write_paths`.
+pub fn repo_write_subpaths(language: &str) -> &'static [RepoWrite] {
+    match language {
+        "scala" => &[
+            RepoWrite::Dir("target"),
+            RepoWrite::Dir("project/target"),
+            RepoWrite::File(".travsr-semanticdb.sbt"),
+        ],
+        _ => &[],
+    }
+}
+
+/// Whether `language`'s analyzer needs any repo-root write grant at all. Derived
+/// from [`repo_write_subpaths`]; the Windows AppContainer path uses this coarse
+/// bool (scala is `WindowsSandbox::Unsupported` there and never reaches it).
+pub fn needs_repo_write(language: &str) -> bool {
+    !repo_write_subpaths(language).is_empty()
 }
 
 /// Compute the toolchain grants for a language's Phase B analyzer.
@@ -39,7 +118,8 @@ pub fn toolchain_access(language: &str) -> ToolchainAccess {
     match language {
         "go" => go_access(),
         "dart" => dart_access(),
-        "java" | "kotlin" => java_access(),
+        "java" => java_access(),
+        "kotlin" => kotlin_access(),
         "scala" => scala_access(),
         "php" => php_access(),
         "csharp" => csharp_access(),
@@ -201,6 +281,7 @@ fn dart_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env,
     }
 }
@@ -209,35 +290,55 @@ fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// Resolve the JDK installation dir (`JAVA_HOME`): the env var if set, else
+/// parsed from `java -XshowSettings:properties`. Shared by the JVM-driven
+/// analyzers (scip-java, sbt) so the sandbox can read the JDK and execute
+/// `JAVA_HOME/bin/java`.
+fn java_home() -> Option<PathBuf> {
+    std::env::var("JAVA_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            // -XshowSettings prints to stderr for the `-version` combination.
+            let output = Command::new("java")
+                .args(["-XshowSettings:properties", "-version"])
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&output.stderr);
+            text.lines()
+                .find(|l| l.contains("java.home"))
+                .and_then(|l| l.split('=').nth(1))
+                .map(|v| PathBuf::from(v.trim()))
+        })
+}
+
+/// The directory a PATH-resolvable tool lives in, symlinks resolved so the REAL
+/// dir is granted. PATHEXT-aware (finds `sbt.bat` on Windows, not just `sbt`).
+/// `None` when the tool is not on PATH.
+fn tool_bin_dir(tool: &str) -> Option<PathBuf> {
+    let exe = travsr_core::exec::resolve_executable(tool)?;
+    std::fs::canonicalize(&exe)
+        .ok()
+        .and_then(|r| r.parent().map(|p| p.to_path_buf()))
+        .or_else(|| exe.parent().map(|p| p.to_path_buf()))
+}
+
 /// `scip-java index` drives Gradle (and Maven) to resolve dependencies. Needs:
 ///   - `JAVA_HOME`       (read) — JDK installation dir
 ///   - `~/.gradle`       (read+write) — Gradle daemon, caches, wrapper downloads
 ///   - `~/.m2`           (read) — Maven local repository
 ///   - `HOME` + `GRADLE_USER_HOME` env vars so Gradle finds its home
 ///
-/// Shared by `"java"` and `"kotlin"` — both invoke `scip-java index`.
+/// Also the base grant set for `kotlin_access`: kotlin-language-server drives
+/// the same Gradle/Maven classpath resolution under the hood, even though it
+/// isn't scip-java itself (see `kotlin_access` for what it additionally needs).
 fn java_access() -> ToolchainAccess {
     let mut read_paths = Vec::new();
     let mut write_paths = Vec::new();
     let mut env = Vec::new();
 
     // JAVA_HOME: env var takes priority; fall back to `java -XshowSettings:properties`.
-    let java_home: Option<PathBuf> =
-        std::env::var("JAVA_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| {
-                // Output goes to stderr for this flag.
-                let output = Command::new("java")
-                    .args(["-XshowSettings:properties", "-version"])
-                    .output()
-                    .ok()?;
-                let text = String::from_utf8_lossy(&output.stderr);
-                text.lines()
-                    .find(|l| l.contains("java.home"))
-                    .and_then(|l| l.split('=').nth(1))
-                    .map(|v| PathBuf::from(v.trim()))
-            });
+    let java_home: Option<PathBuf> = java_home();
     if let Some(ref p) = java_home {
         tracing::debug!(path = %p.display(), "java_access: JAVA_HOME grant");
         read_paths.push(p.clone());
@@ -270,16 +371,93 @@ fn java_access() -> ToolchainAccess {
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
     }
 
+    // G5: scip-java (and kotlin-language-server) drive Gradle/Maven, which invoke
+    // `java`. Grant execute on JAVA_HOME/bin so the sandbox can run it; the JDK
+    // root is already in read_paths. Gradle/Maven caches stay read-only.
+    let mut exec_paths = Vec::new();
+    if let Some(p) = &java_home {
+        exec_paths.push(p.join("bin"));
+    }
+
     ToolchainAccess {
         read_paths,
         write_paths,
+        exec_paths,
         env,
     }
 }
 
+/// kotlin-language-server (KLS) needs everything `java_access` grants
+/// (JAVA_HOME, `~/.gradle`, `~/.m2`) plus read+execute on its OWN installation
+/// dir. Unlike scip-java, whose runnable file sits directly in `~/.travsr/bin`
+/// (already execute-granted for every language, see `sandbox/windows.rs`),
+/// `travsr lang install kotlin` extracts the server into `~/.travsr/kls/` (see
+/// `ZipBinarySpec::extract_dir`) and the `~/.travsr/bin/kotlin-language-server`
+/// wrapper launches the real binary/`.bat` INSIDE that dir. Neither blanket
+/// grant covers `~/.travsr/kls`, so a sandboxed run used to fail silently at
+/// image load: the wrapper spawned (it lives in the granted `~/.travsr/bin`),
+/// but the launcher it execs, and the jars under `server/lib` it reads, were
+/// both unreachable — 0 nodes, 0 edges, no error surfaced.
+fn kotlin_access() -> ToolchainAccess {
+    let mut access = java_access();
+    if let Some(h) = home() {
+        let kls = h.join(".travsr").join("kls");
+        tracing::debug!(path = %kls.display(), exists = kls.exists(), "kotlin_access: KLS install dir grant (read+execute)");
+        access.read_paths.push(kls.clone());
+        access.exec_paths.push(kls);
+    }
+    access
+}
+
+/// Coursier's on-disk artifact cache. `lm-coursier` (sbt's library-management
+/// backend since sbt 1.3, still used in 2.x) resolves ordinary project
+/// dependencies — including the `semanticdb-scalac` compiler plugin this
+/// wrapper's settings file pulls in — through Coursier, separate from
+/// `sbt_global_base_dir` below (sbt's own self-bootstrap). Location matches
+/// Coursier's own default `cache-dir`: `%LOCALAPPDATA%\Coursier\cache` on
+/// Windows, `~/Library/Caches/Coursier` on macOS, `$XDG_CACHE_HOME/coursier`
+/// (else `~/.cache/coursier`) on Linux.
+fn coursier_cache_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Coursier").join("cache"))
+    } else if cfg!(target_os = "macos") {
+        home().map(|h| h.join("Library").join("Caches").join("Coursier"))
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home().map(|h| h.join(".cache")))
+            .map(|c| c.join("coursier"))
+    }
+}
+
+/// sbt 2.x's own "global base" — where the `sbt` launcher self-fetches and
+/// caches the actual sbt implementation jar it's about to run
+/// ("[launcher] getting org.scala-sbt sbt <ver>"). This is NOT `~/.sbt`: sbt
+/// 2.x's launcher script (`sbt.bat`/`sbt`) defaults `-Dsbt.global.base` to
+/// `%LOCALAPPDATA%\sbt` on Windows (confirmed by reading the shipped
+/// `sbt.bat`: `else if defined LOCALAPPDATA set _SBT_OPTS=-Dsbt.global.base=
+/// !LOCALAPPDATA!\sbt`) and to `${XDG_CONFIG_HOME:-$HOME/.config}/sbt` on
+/// unix (same default in the `sbt` shell launcher). `boot/`, `cache/`, and the
+/// content-addressed `v2/` store all live directly under this dir. Without
+/// this grant the self-fetch fails with a raw `java.io.IOException: Access is
+/// denied` even though `~/.ivy2`/`~/.sbt`/the Coursier cache above are all
+/// granted — sbt never gets far enough to touch any of those.
+fn sbt_global_base_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("sbt"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home().map(|h| h.join(".config")))
+            .map(|c| c.join("sbt"))
+    }
+}
+
 /// `scip-scala` drives sbt to resolve dependencies. Needs:
-///   - `~/.ivy2` (read)       — Ivy2 artifact cache (sbt's primary resolver)
-///   - `~/.sbt`  (read+write) — sbt home: launchers, plugins, boot dir
+///   - `~/.ivy2` (read)             — Ivy2 artifact cache (sbt's primary resolver)
+///   - `~/.sbt`  (read+write)       — sbt home: launchers, plugins, boot dir
+///   - Coursier cache (read+write) — dependency resolution (see above)
+///   - sbt global base (read+write) — sbt's own self-bootstrap (see above)
 ///   - `HOME` and `SBT_OPTS` env vars
 fn scala_access() -> ToolchainAccess {
     let mut read_paths = Vec::new();
@@ -299,13 +477,42 @@ fn scala_access() -> ToolchainAccess {
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
     }
 
+    if let Some(cc) = coursier_cache_dir() {
+        tracing::debug!(path = %cc.display(), exists = cc.exists(), "scala_access: coursier cache grant (read+write)");
+        read_paths.push(cc.clone());
+        write_paths.push(cc);
+    }
+
+    if let Some(gb) = sbt_global_base_dir() {
+        tracing::debug!(path = %gb.display(), exists = gb.exists(), "scala_access: sbt global base grant (read+write)");
+        read_paths.push(gb.clone());
+        write_paths.push(gb);
+    }
+
     if let Ok(sbt_opts) = std::env::var("SBT_OPTS") {
         env.push(("SBT_OPTS".to_string(), sbt_opts));
+    }
+
+    // G5: sbt drives the build through the JVM. Grant execute on the sbt
+    // launcher's bin dir and on JAVA_HOME/bin (java); their roots are also
+    // read-granted so the launcher and JDK can be read. Ivy/sbt caches above stay
+    // read-only.
+    let mut exec_paths = Vec::new();
+    if let Some(jh) = java_home() {
+        exec_paths.push(jh.join("bin"));
+        read_paths.push(jh.clone());
+        env.push(("JAVA_HOME".to_string(), jh.to_string_lossy().into_owned()));
+    }
+    if let Some(sbt_bin) = tool_bin_dir("sbt") {
+        tracing::debug!(path = %sbt_bin.display(), "scala_access: sbt bin dir grant (read+execute)");
+        read_paths.push(sbt_bin.clone());
+        exec_paths.push(sbt_bin);
     }
 
     ToolchainAccess {
         read_paths,
         write_paths,
+        exec_paths,
         env,
     }
 }
@@ -336,8 +543,49 @@ fn php_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env,
     }
+}
+
+/// Resolve the dotnet install root that holds `host/`, `sdk/`, `shared/` — the
+/// value `DOTNET_ROOT` must point at, and the dir the sandbox must grant read +
+/// execute so scip-dotnet's apphost can load the runtime and shell out to
+/// `dotnet`. Uses `tool_path` (PATHEXT-aware, so `dotnet.exe` resolves on
+/// Windows — the old `dir.join("dotnet")` PATH scan never matched there, leaving
+/// Windows with no DOTNET_ROOT and no exec grant). Only accepts a root that
+/// actually carries an SDK/host, and falls back to the per-user
+/// `~/.dotnet` when `dotnet` on PATH is a runtime-only host.
+fn dotnet_sdk_root() -> Option<PathBuf> {
+    let exe = travsr_core::exec::tool_path("dotnet")?;
+    // canonicalize resolves symlinks (Homebrew's `bin/dotnet` shim) but adds the
+    // `\\?\` verbatim prefix on Windows — strip it, or dotnet chokes on a
+    // `\\?\`-prefixed DOTNET_ROOT / exec-grant path.
+    let real = strip_windows_verbatim(std::fs::canonicalize(&exe).unwrap_or(exe));
+    let dir = real.parent()?;
+    // Require an actual `sdk/` (not just `host/`): scip-dotnet runs `dotnet
+    // restore`/build, so a runtime-only host root is useless. `C:\Program
+    // Files\dotnet` carries `host/` even when SDK-less, so a `host/` check would
+    // wrongly pick it over a real SDK elsewhere.
+    // Standard layout (Windows / dotnet-install / Linux tarball / Program Files):
+    // `dotnet(.exe)` sits directly in the root holding host/ sdk/ shared/.
+    if dir.join("sdk").is_dir() {
+        return Some(dir.to_path_buf());
+    }
+    // Homebrew macOS: …/Cellar/dotnet/<ver>/bin/dotnet → …/libexec holds the SDK.
+    if let Some(libexec) = dir.parent().map(|p| p.join("libexec")) {
+        if libexec.join("sdk").is_dir() {
+            return Some(libexec);
+        }
+    }
+    // `dotnet` on PATH is a runtime-only host (no SDK): fall back to the per-user
+    // dotnet-install default that actually carries an SDK.
+    if let Some(d) = home().map(|h| h.join(".dotnet")) {
+        if d.join("sdk").is_dir() {
+            return Some(d);
+        }
+    }
+    None
 }
 
 /// `scip-dotnet` resolves NuGet packages. Needs:
@@ -379,29 +627,14 @@ fn csharp_access() -> ToolchainAccess {
         }
     }
 
-    // dotnet runtime root — required when dotnet is installed via Homebrew.
-    // Homebrew: /opt/homebrew/bin/dotnet → /opt/homebrew/opt/dotnet/libexec/dotnet
-    // Resolved from DOTNET_ROOT env, or by canonicalizing `which dotnet` → parent dir.
-    // DOTNET_ROOT must point at the directory containing host/, sdk/, shared/.
-    // Homebrew canonical path: …/Cellar/dotnet/<ver>/bin/dotnet
-    //   parent(bin) → parent(install root) → join(libexec) = correct DOTNET_ROOT.
+    // dotnet runtime root (holds host/, sdk/, shared/): honour DOTNET_ROOT if set,
+    // else resolve it via `dotnet_sdk_root` (PATHEXT-aware, so it works on Windows
+    // where scip-dotnet's apphost needs both the exec grant below and the injected
+    // DOTNET_ROOT to locate the runtime; also covers Homebrew's libexec layout).
     let dotnet_root: Option<PathBuf> = std::env::var("DOTNET_ROOT")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| {
-            let exe = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .map(|d| d.join("dotnet"))
-                .find(|p| p.is_file())?;
-            let real = std::fs::canonicalize(&exe).ok()?;
-            let libexec = real.parent()?.parent()?.join("libexec");
-            if libexec.is_dir() {
-                Some(libexec)
-            } else {
-                real.parent()
-                    .and_then(|b| b.parent())
-                    .map(|p| p.to_path_buf())
-            }
-        });
+        .or_else(dotnet_sdk_root);
     if let Some(ref p) = dotnet_root {
         tracing::debug!(path = %p.display(), "csharp_access: DOTNET_ROOT grant (read)");
         read_paths.push(p.clone());
@@ -412,9 +645,22 @@ fn csharp_access() -> ToolchainAccess {
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
     }
 
+    // G5: scip-dotnet shells out to `dotnet` (in the dotnet root) and is itself a
+    // global tool under ~/.dotnet/tools. Grant execute on both; their parents are
+    // already read-granted. The NuGet package cache stays read/write only — never
+    // executable, since it is filled over the network during restore.
+    let mut exec_paths = Vec::new();
+    if let Some(p) = &dotnet_root {
+        exec_paths.push(p.clone());
+    }
+    if let Some(h) = home() {
+        exec_paths.push(h.join(".dotnet").join("tools"));
+    }
+
     ToolchainAccess {
         read_paths,
         write_paths,
+        exec_paths,
         env,
     }
 }
@@ -456,6 +702,7 @@ fn ruby_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env,
     }
 }
@@ -484,6 +731,7 @@ fn objc_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env: vec![],
     }
 }
@@ -522,6 +770,7 @@ fn swift_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env: vec![],
     }
 }
@@ -561,6 +810,7 @@ fn rust_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env,
     }
 }
@@ -602,6 +852,7 @@ fn typescript_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env,
     }
 }
@@ -640,6 +891,7 @@ fn python_access() -> ToolchainAccess {
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
+        exec_paths: vec![],
         env,
     }
 }
@@ -742,9 +994,57 @@ fn go_access() -> ToolchainAccess {
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
     }
 
+    // G5: the sandbox must EXECUTE the toolchain, not just read it. GOPATH/bin
+    // holds scip-go itself; GOROOT/bin holds go, which scip-go shells out to for
+    // cross-package type resolution. Both are already in read_paths (via their
+    // roots) — listing the bin dirs here adds the execute right the Windows
+    // AppContainer withholds by default. Module/build caches stay read-only.
+    let mut exec_paths = Vec::new();
+    if let Some(p) = &gopath {
+        exec_paths.push(p.join("bin"));
+    }
+    if let Some(p) = &goroot {
+        exec_paths.push(p.join("bin"));
+    }
+
     ToolchainAccess {
         read_paths,
         write_paths,
+        exec_paths,
         env,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_windows_verbatim;
+    use std::path::PathBuf;
+
+    #[test]
+    fn strips_drive_verbatim_prefix() {
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from(r"\\?\C:\Users\home\.dotnet")),
+            PathBuf::from(r"C:\Users\home\.dotnet")
+        );
+    }
+
+    #[test]
+    fn strips_unc_verbatim_prefix_back_to_unc() {
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
+        );
+    }
+
+    #[test]
+    fn no_op_on_clean_paths() {
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from(r"C:\repo")),
+            PathBuf::from(r"C:\repo")
+        );
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from("/home/user/repo")),
+            PathBuf::from("/home/user/repo")
+        );
     }
 }

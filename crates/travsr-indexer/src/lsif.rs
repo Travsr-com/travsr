@@ -397,9 +397,17 @@ fn relative_to_base(base_with_sep: &str, abs_path: &str) -> String {
 /// `X:` drive letter. A Unix path (no drive letter, no backslashes) is returned
 /// unchanged, so downstream comparison is unaffected off Windows.
 fn normalize_path(p: &str) -> String {
+    // Strip the Windows extended-length prefix in BOTH slash shapes. TypeScript
+    // normalizes paths to forward slashes internally, so `travsr-lsif-ts` emits
+    // the verbatim prefix as `//?/` (and `//?/UNC/`), while a backslash producer
+    // (rust-analyzer, the daemon's repo_root) emits `\\?\`. Handling only the
+    // backslash form left every travsr-lsif-ts occurrence path as `//?/C:/...`,
+    // which never relativized and surfaced verbatim in `references`.
     let stripped = p
         .strip_prefix(r"\\?\UNC\")
         .or_else(|| p.strip_prefix(r"\\?\"))
+        .or_else(|| p.strip_prefix("//?/UNC/"))
+        .or_else(|| p.strip_prefix("//?/"))
         .unwrap_or(p);
     let mut s = stripped.replace('\\', "/");
     // Lowercase only a leading `X:` drive letter so a case-mismatched drive
@@ -614,6 +622,30 @@ mod tests {
                 "d:/com.travsr/travsr/crates/travsr-store/src/lib.rs"
             ),
             phase_a_path
+        );
+    }
+
+    #[test]
+    fn make_relative_forward_slash_verbatim_prefix_from_ts_emitter() {
+        // travsr-lsif-ts (via TypeScript) normalizes the Windows verbatim prefix to
+        // FORWARD slashes, so the document URI decodes to `//?/C:/...`. The base is a
+        // plain backslash repo_root. Before this fix `normalize_path` only stripped
+        // the backslash `\\?\` form, so `//?/C:/...` never relativized and every TS
+        // occurrence surfaced as `//?/C:/...` in `references`.
+        let phase_a_path = "src/main.ts";
+        assert_eq!(
+            make_relative(r"C:\proj\app", "//?/C:/proj/app/src/main.ts"),
+            phase_a_path
+        );
+        // Both operands carrying the forward-slash verbatim prefix.
+        assert_eq!(
+            make_relative("//?/C:/proj/app", "//?/C:/proj/app/src/main.ts"),
+            phase_a_path
+        );
+        // UNC forward-slash verbatim form.
+        assert_eq!(
+            make_relative("//?/UNC/server/share/app", "//?/UNC/server/share/app/x.ts"),
+            "x.ts"
         );
     }
 

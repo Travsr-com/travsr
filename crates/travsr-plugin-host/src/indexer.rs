@@ -50,6 +50,11 @@ pub struct PhaseBOutcome {
     /// Languages registered as RequiresElevated but lacking a PSE approval
     /// entry in lang.toml. User-actionable: `travsr lang approve <lang>`.
     pub skipped_needs_approval: Vec<String>,
+    /// Windows only: languages whose analyzer cannot run inside the isolation
+    /// layer (java/scala) and for which the user has not granted permission to run
+    /// it with their own privileges. Skipped before spawn — never a silent
+    /// zero-node run. User-actionable: `travsr lang allow-unsandboxed <lang>`.
+    pub skipped_needs_consent: Vec<String>,
     /// Languages whose analyzer was found and spawned but died or errored
     /// mid-invoke.
     pub crashed: Vec<String>,
@@ -308,15 +313,34 @@ impl PluginIndexer {
         // H5: collect needs_approval before boxing so we can surface it in outcome.
         let catalog = crate::resolver::CatalogResolver::new();
         let needs_approval_langs: Vec<String> = catalog.needs_approval().to_vec();
+        // Windows-only: analyzers that cannot run isolated here and have no
+        // permission on record are skipped before spawn. Surface repo-present ones
+        // so `travsr init`/`status` print the `travsr lang allow-unsandboxed <lang>`
+        // step instead of leaving the language silently absent.
+        let needs_consent_langs: Vec<String> = catalog
+            .needs_unsandboxed_consent()
+            .iter()
+            .filter(|lang| {
+                inputs.present_languages.is_empty()
+                    || inputs.present_languages.contains(lang.as_str())
+            })
+            .cloned()
+            .collect();
         // #573: providers installed only as npm shims are dropped inside the
         // resolver (the AppContainer spawn runs PE images only), which used to
         // leave the language in NO outcome bucket — invisible in `travsr init`
         // and `status`. Surface repo-present ones as skipped_no_analyzer: the
         // native binary IS missing, and the bucket's `travsr lang install
         // <lang>` hint is the fix.
-        let shim_only_langs: Vec<String> = catalog
+        // G2: a wrapper that is installed but whose underlying analyzer tool is
+        // absent is dropped here (rather than spawned into a zero-node run that
+        // reads as "analyzer installed, fix your project"). Same treatment as the
+        // shim case: surface repo-present ones as skipped_no_analyzer so the
+        // `travsr lang install <lang>` hint fires.
+        let no_analyzer_langs: Vec<String> = catalog
             .unresolvable_shims()
             .iter()
+            .chain(catalog.missing_tool())
             .filter(|lang| {
                 inputs.present_languages.is_empty()
                     || inputs.present_languages.contains(lang.as_str())
@@ -334,7 +358,8 @@ impl PluginIndexer {
 
         let mut outcome = PhaseBOutcome {
             skipped_needs_approval: needs_approval_langs,
-            skipped_no_analyzer: shim_only_langs,
+            skipped_no_analyzer: no_analyzer_langs,
+            skipped_needs_consent: needs_consent_langs,
             ..Default::default()
         };
 
@@ -856,7 +881,16 @@ impl PluginIndexer {
                                 // crash instead of hanging this scoped thread — no
                                 // bespoke timeout needed here.
                                 let req = travsr_plugin_protocol::InvokeRequest {
-                                    root: repo_root.to_path_buf(),
+                                    // Strip the Windows `\\?\` verbatim prefix ONCE here,
+                                    // for every sidecar: the daemon's repo_root is
+                                    // canonicalized (extended-length) on Windows, and
+                                    // analyzers that build a URI / working-directory from
+                                    // it (scip-dotnet, sbt, KLS) choke on the prefix. This
+                                    // is the systemic counterpart to the per-wrapper strips
+                                    // (kotlin K7, scala S7, csharp) — belt and suspenders.
+                                    root: crate::sandbox::toolchain::strip_windows_verbatim(
+                                        repo_root.to_path_buf(),
+                                    ),
                                     corpus: corpus.to_string(),
                                     scratch: std::path::PathBuf::default(),
                                     // P6 (#329): forward pre-walked file list so the
