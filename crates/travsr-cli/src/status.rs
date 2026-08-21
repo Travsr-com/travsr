@@ -40,11 +40,31 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                 // any crashed language rather than reporting a flat "complete"
                 // that contradicts the per-language reality and the crash
                 // warning printed below.
+                // Downgrade a flat "complete" when a language that is turned on for
+                // this repo did not run to a completed analysis: it crashed, or it
+                // never ran at all (its analyzer is missing, or it is waiting on a
+                // one-time approval). A run that DID complete and found no symbols
+                // is not counted — 0 nodes is a valid result, not a failure — and
+                // languages the user has not turned on (not trusted / not
+                // registered) are their own separate notice, not a downgrade of the
+                // ones that did run.
                 let crashed = crashed_langs(payload);
-                if crashed.is_empty() {
+                let not_run: Vec<String> = warned_langs(payload, "skipped_no_analyzer")
+                    .into_iter()
+                    .chain(warned_langs(payload, "needs_approval"))
+                    .chain(warned_langs(payload, "needs_consent"))
+                    .collect();
+                if crashed.is_empty() && not_run.is_empty() {
                     "complete".to_string()
                 } else {
-                    format!("partial (crashed: {})", crashed.join(", "))
+                    let mut parts = Vec::new();
+                    if !crashed.is_empty() {
+                        parts.push(format!("crashed: {}", crashed.join(", ")));
+                    }
+                    if !not_run.is_empty() {
+                        parts.push(format!("not run: {}", not_run.join(", ")));
+                    }
+                    format!("partial ({})", parts.join("; "))
                 }
             }
         }
@@ -58,12 +78,20 @@ fn phase_b_state(payload: &StatusPayload) -> String {
 /// `semantic:` field from `complete` to `partial (crashed: …)` so it agrees with
 /// the crash warning and the per-language outcome.
 fn crashed_langs(payload: &StatusPayload) -> Vec<String> {
+    warned_langs(payload, "crashed")
+}
+
+/// Languages named by a `<kind>:<lang>` entry in the `phase_b_warnings` meta, for
+/// the given `kind`. Used to reconcile the `semantic:` field with the per-language
+/// warnings printed below it, so the summary line never contradicts them.
+fn warned_langs(payload: &StatusPayload, kind: &str) -> Vec<String> {
+    let prefix = format!("{kind}:");
     payload
         .phase_b_warnings
         .as_deref()
         .unwrap_or("")
         .split(',')
-        .filter_map(|w| w.strip_prefix("crashed:"))
+        .filter_map(|w| w.strip_prefix(&prefix))
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect()
@@ -198,6 +226,13 @@ pub fn run() -> anyhow::Result<()> {
                     ["needs_approval", lang] => eprintln!(
                         "warning: '{lang}' needs a one-time network approval before it can index; run `travsr lang approve {lang}`"
                     ),
+                    // Windows only: an analyzer that cannot run inside Travsr's
+                    // isolation and has no permission on record. The one-time
+                    // permission is the only thing standing between it and full
+                    // analysis here.
+                    ["needs_consent", lang] => eprintln!(
+                        "warning: full '{lang}' analysis needs your permission to run — run `travsr lang allow-unsandboxed {lang}`"
+                    ),
                     // #712: analyzer ran but produced no nodes over the repo's
                     // source files of this language — a silent zero-node result,
                     // not a crash. Point at the tool and a rebuild.
@@ -212,6 +247,16 @@ pub fn run() -> anyhow::Result<()> {
                         eprintln!(
                             "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help, it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
                         );
+                        // Name the concrete thing to check rather than leaving
+                        // "a missing SDK or an unbuildable project" as the only
+                        // clue — the catalog already knows what this language's
+                        // analyzer needs from the project.
+                        if let Some(entry) = travsr_plugin_host::phase_b::catalog::lookup(lang) {
+                            let prereq = entry.effective_prerequisites();
+                            if !prereq.is_empty() && prereq != "none" {
+                                eprintln!("  needs: {prereq}");
+                            }
+                        }
                         // #724 Finding 4: the most common cause of a zero-node
                         // Java run on macOS is scip-java's javac shim crashing
                         // under the stock bash 3.2. Surface the actionable fix.
@@ -224,9 +269,27 @@ pub fn run() -> anyhow::Result<()> {
                     // #449: languages present in the repo whose Phase B sidecar
                     // never ran, previously a silent skip that left the user
                     // with "0 references" and no explanation.
+                    // A language whose analyzer has no build for this OS can never
+                    // reach full analysis here, so pointing at `travsr lang install`
+                    // (which just dead-ends) is misleading — state the honest
+                    // "not available on this platform" instead.
+                    ["skipped_unregistered", lang]
+                        if crate::lang::full_analysis_unavailable_here(lang) =>
+                    {
+                        eprintln!(
+                            "note: full '{lang}' analysis is not available on this platform — structural analysis still works"
+                        )
+                    }
                     ["skipped_unregistered", lang] => eprintln!(
                         "warning: '{lang}' sources found but full analysis is not set up. Run `travsr lang install {lang}`"
                     ),
+                    ["skipped_no_analyzer", lang]
+                        if crate::lang::full_analysis_unavailable_here(lang) =>
+                    {
+                        eprintln!(
+                            "note: full '{lang}' analysis is not available on this platform — structural analysis still works"
+                        )
+                    }
                     // #414 (ADR-017 Rule 3): registered globally but this repo was
                     // never enabled. Collapsed into one combined line above the
                     // loop (trust is per-repo, so one install fixes all of them).
@@ -397,11 +460,15 @@ mod tests {
     #[test]
     fn phase_b_reports_partial_when_a_language_crashed_but_markers_agree() {
         // #712: the marker advances on a partial run (healthy languages are
-        // queryable at HEAD), so the field must name the crashed language rather
-        // than claiming a flat "complete".
+        // queryable at HEAD), so the field must name the failed language rather
+        // than claiming a flat "complete". A crash and a never-ran (analyzer
+        // missing) both downgrade: neither ran to a completed analysis.
         let mut p = payload("abc", "abc", false);
         p.phase_b_warnings = Some("crashed:objectivec,skipped_no_analyzer:php".into());
-        assert_eq!(phase_b_state(&p), "partial (crashed: objectivec)");
+        assert_eq!(
+            phase_b_state(&p),
+            "partial (crashed: objectivec; not run: php)"
+        );
     }
 
     #[test]
@@ -412,11 +479,31 @@ mod tests {
     }
 
     #[test]
-    fn phase_b_non_crash_warnings_do_not_downgrade_complete() {
-        // Skip classes (no analyzer, needs approval, …) are not crashes and must
-        // not turn a clean "complete" into "partial".
+    fn phase_b_downgrades_when_an_enabled_language_never_ran() {
+        // A language turned on for this repo whose analyzer is missing or is
+        // waiting on approval never ran, so "complete" would contradict the
+        // warning printed below. Both are named under "not run".
         let mut p = payload("abc", "abc", false);
         p.phase_b_warnings = Some("skipped_no_analyzer:php,needs_approval:go".into());
+        assert_eq!(phase_b_state(&p), "partial (not run: php, go)");
+    }
+
+    #[test]
+    fn phase_b_zero_nodes_still_reports_complete() {
+        // A run that COMPLETED and produced no symbols still completed — 0 nodes is
+        // a valid result, not a failure — so it must not downgrade "complete".
+        let mut p = payload("abc", "abc", false);
+        p.phase_b_warnings = Some("zero_nodes:go".into());
+        assert_eq!(phase_b_state(&p), "complete");
+    }
+
+    #[test]
+    fn phase_b_opt_out_languages_do_not_downgrade_complete() {
+        // Languages the user has not turned on for this repo (not trusted / not
+        // registered) are not a failure of the ones that did run — they have their
+        // own separate notice and must not turn "complete" into "partial".
+        let mut p = payload("abc", "abc", false);
+        p.phase_b_warnings = Some("untrusted_corpus:go,skipped_unregistered:php".into());
         assert_eq!(phase_b_state(&p), "complete");
     }
 }

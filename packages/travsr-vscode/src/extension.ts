@@ -332,12 +332,14 @@ export function activate(context: vscode.ExtensionContext): void {
           builtin: boolean;
           semantic_available: boolean;
           install_hint: string;
+          prerequisites: string;
         }
         let langStatus: LangStatus = {
           language: "unknown",
           builtin: false,
           semantic_available: false,
           install_hint: "",
+          prerequisites: "",
         };
         try {
           if (langStatusRaw) {
@@ -359,6 +361,7 @@ export function activate(context: vscode.ExtensionContext): void {
               mode: currentMode,
               semanticAvailable: langStatus.semantic_available,
               installHint: langStatus.install_hint,
+              prerequisites: langStatus.prerequisites,
               loading: false,
             }
           );
@@ -380,6 +383,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 mode: currentMode,
                 semanticAvailable: langStatus.semantic_available,
                 installHint: langStatus.install_hint,
+                prerequisites: langStatus.prerequisites,
                 loading: true,
               }
             );
@@ -842,6 +846,9 @@ interface FileListOpts {
   mode: "tree-sitter" | "semantic";
   semanticAvailable: boolean;
   installHint: string;
+  /** What the user's project needs for full analysis (e.g. "JDK, Maven or Gradle").
+   *  Empty/"none" when the analyzer has no such external dependency. */
+  prerequisites?: string;
   loading?: boolean;
 }
 
@@ -867,7 +874,7 @@ export function buildFileListHtml(
 </body></html>`;
   }
 
-  const { mode, semanticAvailable, installHint, loading = false } = opts;
+  const { mode, semanticAvailable, installHint, prerequisites, loading = false } = opts;
 
   const pillBase =
     "display:inline-block;padding:4px 14px;border-radius:20px;font-size:12px;" +
@@ -905,10 +912,14 @@ export function buildFileListHtml(
         onclick="showInstallHint()"
       >Semantic ▾</button>`;
 
+  const prereqLine =
+    prerequisites && prerequisites !== "none"
+      ? `<div style="margin-top:4px;color:#a89050;">needs: ${escHtml(prerequisites)}</div>`
+      : "";
   const installHintHtml = installHint
     ? `<div id="install-hint" style="display:none;margin-top:8px;padding:8px 12px;` +
       `background:#2d2d00;border:1px solid #888600;border-radius:6px;` +
-      `font-size:12px;color:#e0c060;font-family:monospace;">${escHtml(installHint)}</div>`
+      `font-size:12px;color:#e0c060;font-family:monospace;">${escHtml(installHint)}${prereqLine}</div>`
     : "";
 
   const toggleBar = `

@@ -5,6 +5,7 @@
 //! store is opened directly (read-only fast path). Rendering happens here,
 //! from the payload, so both routes produce identical output.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Context as _;
@@ -127,11 +128,27 @@ pub fn run(
         // exit) so "ambiguous, here are the choices" is machine-distinguishable
         // from "the command failed". `truncated` marks `count` as a lower bound.
         if matches!(format, Format::Json) {
+            let candidates_json: Vec<serde_json::Value> = candidates
+                .iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "id": n.id.to_string(),
+                        // `signature` is the raw form and round-trips through
+                        // exact-signature resolution (`--path` re-query);
+                        // `label` is the clean display name.
+                        "signature": n.signature,
+                        "label": n.label,
+                        "kind": n.kind,
+                        "path": n.path,
+                        "line": n.line,
+                    })
+                })
+                .collect();
             let out = serde_json::json!({
                 "status": "ambiguous",
                 "count": count,
                 "truncated": truncated,
-                "candidates": candidates,
+                "candidates": candidates_json,
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
             anyhow::bail!("ambiguous symbol query");
@@ -149,7 +166,7 @@ pub fn run(
         }
         for n in candidates.iter().take(limit) {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
-            eprintln!("  {} ({}) \u{2014} {}{}", n.signature, n.kind, n.path, loc);
+            eprintln!("  {} ({}) \u{2014} {}{}", n.label, n.kind, n.path, loc);
         }
         if truncated {
             eprintln!("[truncated: additional filtering/narrowing is required]");
@@ -224,34 +241,67 @@ fn render(mut payload: GraphPayload, format: Format, budget: usize) -> anyhow::R
     // #318 O6: token budget — prefix of BFS order, seed always kept.
     let truncated = query::apply_token_budget(&mut payload, budget);
 
+    // A seeded query force-keeps the seed, so `rendered >= 1` even when the budget
+    // could not afford a single neighbour; distinguish "only the queried symbol
+    // fit" from a real partial graph so the footer stays honest for `--budget 1`.
+    let only_seed = payload.seed.is_some() && payload.nodes.len() <= 1;
+
     match format {
         Format::Tree => {
-            if let Some(seed) = &payload.seed {
+            let rendered = if let Some(seed) = &payload.seed {
                 println!("{} ({})", seed.label, seed.kind);
                 print_tree(&payload);
+                payload.nodes.len()
             } else {
                 // --all tree mode: file listing (historic behaviour).
                 let mut files: Vec<&NodeEntry> =
                     payload.nodes.iter().filter(|n| n.kind == "file").collect();
                 files.sort_by(|a, b| a.path.cmp(&b.path));
-                for node in files {
+                for node in &files {
                     println!("{}", node.path);
                 }
-            }
-            if truncated > 0 {
-                println!("… {truncated} more nodes beyond budget (raise with --budget)");
-            }
+                files.len()
+            };
+            print_budget_footer(rendered, truncated, budget, "", only_seed);
         }
         Format::Dot => {
             print_dot(&payload)?;
-            if truncated > 0 {
-                println!("// … {truncated} more nodes beyond budget (raise with --budget)");
-            }
+            print_budget_footer(payload.nodes.len(), truncated, budget, "// ", only_seed);
         }
         Format::Json => print_json(&payload, budget, truncated)?,
     }
 
     Ok(())
+}
+
+/// Footer shown after a budgeted graph render. When some neighbours were shown it
+/// reports how many more were cut; when the budget was too small to show any node
+/// (`--all`) or fit only the force-kept queried symbol (seeded), the "N more"
+/// phrasing is misleading — there is no partial list to extend — so it says the
+/// budget is too small and how to lift it.
+fn print_budget_footer(
+    rendered: usize,
+    truncated: usize,
+    budget: usize,
+    prefix: &str,
+    only_seed: bool,
+) {
+    if truncated == 0 {
+        return;
+    }
+    if rendered == 0 {
+        println!(
+            "{prefix}Budget of {budget} tokens is too small to display any graph nodes, \
+             raise it with --budget (or --budget 0 for no limit)."
+        );
+    } else if only_seed {
+        println!(
+            "{prefix}Budget of {budget} tokens fits only the queried symbol, not its graph, \
+             raise it with --budget (or --budget 0 for no limit)."
+        );
+    } else {
+        println!("{prefix}… {truncated} more nodes beyond budget (raise with --budget)");
+    }
 }
 
 fn print_tree(payload: &GraphPayload) {
@@ -393,7 +443,7 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
         println!();
         for &nid in ids {
             if let Some(node) = nodes_map.get(&nid) {
-                let label = escape_dot(&format!("{}\n{}", node.signature, node.path));
+                let label = escape_dot(&format!("{}\n{}", node.label, node.path));
                 println!(
                     "    n{nid} [label=\"{label}\" shape={shape} style=filled \
                      fillcolor=\"{fill}\" color=\"{border}\"];",
@@ -425,6 +475,19 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
 }
 
 fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow::Result<()> {
+    let out = build_graph_json(payload, budget, truncated)?;
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+/// Build the `graph --format json` document. Split out of [`print_json`] so the
+/// schema_version 1 contract (raw `signature`, additive `label`, edge
+/// `from_id`/`to_id`) can be pinned by a test without capturing stdout.
+fn build_graph_json(
+    payload: &GraphPayload,
+    budget: usize,
+    truncated: usize,
+) -> anyhow::Result<serde_json::Value> {
     let mut kinds: HashMap<String, usize> = HashMap::new();
     for node in &payload.nodes {
         *kinds.entry(node.kind.clone()).or_default() += 1;
@@ -436,7 +499,12 @@ fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow
         .map(|node| {
             serde_json::json!({
                 "id": node.id.to_string(),
+                // schema_version 1 documents `signature` as the raw node
+                // signature; keep it raw so distinct overloads / same-named
+                // types in different packages stay distinguishable, and expose
+                // the clean display name as an additive `label` field.
                 "signature": node.signature,
+                "label": node.label,
                 "kind": node.kind,
                 "path": node.path,
                 "language": node.language,
@@ -455,14 +523,33 @@ fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow
         )
     });
 
+    // Clean display label per node id; endpoints that are noise nodes (not in
+    // `nodes`) still render, so fall back to cleaning the raw endpoint signature.
+    let label_by_id: HashMap<u64, &str> = payload
+        .nodes
+        .iter()
+        .map(|n| (n.id, n.label.as_str()))
+        .collect();
     let edge_entries: Vec<serde_json::Value> = payload
         .edges
         .iter()
         .filter(|e| !e.src_sig.is_empty() && !e.dst_sig.is_empty())
         .map(|e| {
+            let from = label_by_id
+                .get(&e.src)
+                .map(|l| Cow::Borrowed(*l))
+                .unwrap_or_else(|| travsr_core::display_signature(&e.src_sig, ""));
+            let to = label_by_id
+                .get(&e.dst)
+                .map(|l| Cow::Borrowed(*l))
+                .unwrap_or_else(|| travsr_core::display_signature(&e.dst_sig, ""));
             serde_json::json!({
-                "from": e.src_sig,
-                "to": e.dst_sig,
+                // Node ids keep two edges between collapsed-label endpoints
+                // (overloads, same-named types across packages) distinct.
+                "from_id": e.src.to_string(),
+                "to_id": e.dst.to_string(),
+                "from": from,
+                "to": to,
                 "kind": e.kind,
                 "provenance": e.provenance,
             })
@@ -472,7 +559,7 @@ fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow
     let mut summary = if let Some(s) = &payload.seed {
         serde_json::json!({
             "mode": "query",
-            "root": s.signature,
+            "root": s.label,
             "root_path": s.path,
             "total_nodes": payload.nodes.len(),
             "total_edges": edge_entries.len(),
@@ -500,10 +587,87 @@ fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow
         out["coverage"] = serde_json::to_value(cov)?;
     }
 
-    println!("{}", serde_json::to_string_pretty(&out)?);
-    Ok(())
+    Ok(out)
 }
 
 fn escape_dot(s: &str) -> String {
     s.replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use travsr_mcp::query::{EdgeEntry, GraphPayload, NodeEntry};
+
+    fn node(id: u64, sig: &str, label: &str, path: &str) -> NodeEntry {
+        NodeEntry {
+            id,
+            signature: sig.to_string(),
+            kind: "method".to_string(),
+            path: path.to_string(),
+            language: "java".to_string(),
+            depth: 0,
+            label: label.to_string(),
+            tokens: 1,
+            line: Some(3),
+        }
+    }
+
+    /// Pin the schema_version 1 contract the review regressed and this PR
+    /// restored: `signature` stays raw, `label` is the additive clean name, and
+    /// edges carry `from_id`/`to_id` so two edges between collapsed-label
+    /// endpoints (same type name in different packages) stay distinct.
+    #[test]
+    fn graph_json_keeps_raw_signature_and_distinct_edge_ids() {
+        let n1 = node(
+            1,
+            "scip:a/Greeter.java:semanticdb maven . . com/a/Greeter#greet().",
+            "Greeter.greet",
+            "a/Greeter.java",
+        );
+        let n2 = node(
+            2,
+            "scip:b/Greeter.java:semanticdb maven . . com/b/Greeter#greet().",
+            "Greeter.greet",
+            "b/Greeter.java",
+        );
+        let payload = GraphPayload {
+            seed: Some(n1.clone()),
+            nodes: vec![n1, n2],
+            edges: vec![EdgeEntry {
+                src: 1,
+                dst: 2,
+                kind: "ref/call".to_string(),
+                provenance: "scip".to_string(),
+                src_sig: "scip:a/Greeter.java:semanticdb maven . . com/a/Greeter#greet()."
+                    .to_string(),
+                dst_sig: "scip:b/Greeter.java:semanticdb maven . . com/b/Greeter#greet()."
+                    .to_string(),
+            }],
+            tree: vec![],
+            coverage: None,
+            last_commit: None,
+            candidates: None,
+        };
+
+        let out = build_graph_json(&payload, 0, 0).unwrap();
+        assert_eq!(out["schema_version"], 1);
+
+        let nodes = out["nodes"].as_array().unwrap();
+        // `signature` is the raw compiler symbol; `label` is the clean name.
+        assert_eq!(
+            nodes[0]["signature"],
+            "scip:a/Greeter.java:semanticdb maven . . com/a/Greeter#greet()."
+        );
+        assert_eq!(nodes[0]["label"], "Greeter.greet");
+
+        let edges = out["edges"].as_array().unwrap();
+        let e = &edges[0];
+        // Collapsed labels are equal, but the ids keep the two endpoints distinct.
+        assert_eq!(e["from"], "Greeter.greet");
+        assert_eq!(e["to"], "Greeter.greet");
+        assert_eq!(e["from_id"], "1");
+        assert_eq!(e["to_id"], "2");
+        assert_ne!(e["from_id"], e["to_id"]);
+    }
 }

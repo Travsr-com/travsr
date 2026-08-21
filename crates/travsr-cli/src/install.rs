@@ -81,15 +81,18 @@ fn render_download_progress(downloaded: u64, total: Option<u64>) {
 
 /// Returns the Rust target triple for the current machine.
 /// Returns an error on platforms travsr has no target triple for.
+///
+/// Delegates to the one triple table in `travsr-plugin-host` so the download side
+/// (here) and the availability side (`lang list` / `get_lang_status`) can never
+/// disagree about what this host is.
 pub fn current_target() -> Result<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
-        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
-        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
-        ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
-        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
-        (os, arch) => bail!("Unsupported platform: {os}/{arch}"),
-    }
+    travsr_plugin_host::phase_b::platform::current_target().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unsupported platform: {}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })
 }
 
 // ── #588: what the travsr-lang release matrix actually ships ──────────────────
@@ -117,30 +120,13 @@ pub fn current_target() -> Result<&'static str> {
 // against the live release inventory (in the lang-release-drift workflow) so
 // the two cannot drift apart silently again.
 
-/// Target triples a *published* travsr-lang release contains wrappers for.
-///
-/// Not the same as the targets the release workflow can build: a target belongs
-/// here only once a tag has actually shipped it. Travsr-com/travsr-lang#15 added
-/// the `x86_64-pc-windows-msvc` leg and travsr-lang v0.4.0 is the first tag to
-/// carry those assets, so Windows joins the list here; `wrapper_release_drift`
-/// is what proves the claim rather than a reviewer taking it on faith.
-///
-/// A target leaving this list is a supported move, not a rollback hack: drop it
-/// and #588's honest path takes over again — `lang list`, `lang detect` and
-/// `init` report "not available on <triple> yet" instead of offering an install
-/// that 404s.
-pub const WRAPPER_RELEASE_TARGETS: &[&str] = &[
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-pc-windows-msvc",
-];
-
-/// Wrappers built by a macOS-only release job. `travsr-lang-objectivec` links
-/// against libclang and shells out to `xcrun`, so it exists for Apple targets
-/// only — on Linux it 404s for the same reason every wrapper did on Windows.
-const MACOS_ONLY_WRAPPERS: &[&str] = &["travsr-lang-objectivec"];
+// The published-target list (`WRAPPER_RELEASE_TARGETS`) and `wrapper_available`
+// now live in `travsr-plugin-host::phase_b::platform`, single-sourced so the
+// download side here and the availability side (`lang list` / `get_lang_status`)
+// share one release matrix. `wrapper_available` is re-exported below for the
+// download call sites; the list is imported directly where the tests need it.
+// The `wrapper_release_drift` test still checks those exact values against the
+// live release inventory, so the matrix cannot drift from what releases ship.
 
 /// Executable suffix for a target triple: `.exe` on Windows, nothing elsewhere.
 ///
@@ -169,13 +155,9 @@ pub fn wrapper_asset_name(binary_name: &str, target: &str) -> String {
 
 /// True when a *published* travsr-lang release contains `binary_name` for
 /// `target`. Gates the setup offer in `lang list` / `lang install` and the
-/// download itself; `false` means state the limitation, not fail.
-pub fn wrapper_available(binary_name: &str, target: &str) -> bool {
-    if !WRAPPER_RELEASE_TARGETS.contains(&target) {
-        return false;
-    }
-    !MACOS_ONLY_WRAPPERS.contains(&binary_name) || target.ends_with("-apple-darwin")
-}
+/// download itself; `false` means state the limitation, not fail. Single-sourced
+/// in `travsr-plugin-host` (see [`WRAPPER_RELEASE_TARGETS`]).
+pub use travsr_plugin_host::phase_b::platform::wrapper_available;
 
 /// On-disk name of an installed wrapper under `~/.travsr/bin/`.
 pub fn wrapper_install_filename(binary_name: &str, target: &str) -> String {
@@ -1043,6 +1025,7 @@ fn parse_sha256_line(line: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use travsr_plugin_host::phase_b::platform::WRAPPER_RELEASE_TARGETS;
 
     // ── #506: replace_file — displace-aside self-update dance ──────────────
 

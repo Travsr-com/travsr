@@ -1,0 +1,1274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>*{box-sizing:border-box}body{margin:0}img,svg{max-width:100%}</style>
+</head>
+<body>
+<title>Travsr — Architecture & Contribution Map</title>
+
+<style>
+  /* ── Tokens ────────────────────────────────────────────────────────────── */
+  :root {
+    --paper:      #F1F4F4;
+    --panel:      #FFFFFF;
+    --panel-2:    #E7ECEC;
+    --ink:        #111A1D;
+    --ink-soft:   #35464C;
+    --muted:      #667A80;
+    --rule:       #CBD6D6;
+    --rule-soft:  #DEE6E6;
+
+    --write:      #C2571A;
+    --read:       #1B7A8C;
+    --control:    #6E7B3F;
+
+    --write-bg:   #F7EBE2;
+    --read-bg:    #E3EFF2;
+    --control-bg: #ECEFE1;
+
+    --crit:       #B3261E;
+    --gap:        #9A5B00;
+    --win:        #226B45;
+    --crit-bg:    #F8E7E5;
+    --gap-bg:     #F8EFDD;
+    --win-bg:     #E3F0E8;
+
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+    --serif: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", "Source Serif 4", Georgia, serif;
+
+    --s1: 0.375rem; --s2: 0.75rem; --s3: 1.125rem;
+    --s4: 1.75rem;  --s5: 2.75rem; --s6: 4.25rem;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:      #0C1315;
+      --panel:      #131D20;
+      --panel-2:    #1B282B;
+      --ink:        #E6EDED;
+      --ink-soft:   #B4C4C6;
+      --muted:      #7D9296;
+      --rule:       #2A3A3E;
+      --rule-soft:  #1F2E31;
+
+      --write:      #E5843F;
+      --read:       #4FB4CB;
+      --control:    #A8B96A;
+
+      --write-bg:   #241812;
+      --read-bg:    #0F262C;
+      --control-bg: #1D2214;
+
+      --crit:       #F2837A;
+      --gap:        #E0A94A;
+      --win:        #62C08D;
+      --crit-bg:    #2A1614;
+      --gap-bg:     #261D0C;
+      --win-bg:     #10241A;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --paper:#0C1315; --panel:#131D20; --panel-2:#1B282B;
+    --ink:#E6EDED; --ink-soft:#B4C4C6; --muted:#7D9296;
+    --rule:#2A3A3E; --rule-soft:#1F2E31;
+    --write:#E5843F; --read:#4FB4CB; --control:#A8B96A;
+    --write-bg:#241812; --read-bg:#0F262C; --control-bg:#1D2214;
+    --crit:#F2837A; --gap:#E0A94A; --win:#62C08D;
+    --crit-bg:#2A1614; --gap-bg:#261D0C; --win-bg:#10241A;
+  }
+  :root[data-theme="light"] {
+    --paper:#F1F4F4; --panel:#FFFFFF; --panel-2:#E7ECEC;
+    --ink:#111A1D; --ink-soft:#35464C; --muted:#667A80;
+    --rule:#CBD6D6; --rule-soft:#DEE6E6;
+    --write:#C2571A; --read:#1B7A8C; --control:#6E7B3F;
+    --write-bg:#F7EBE2; --read-bg:#E3EFF2; --control-bg:#ECEFE1;
+    --crit:#B3261E; --gap:#9A5B00; --win:#226B45;
+    --crit-bg:#F8E7E5; --gap-bg:#F8EFDD; --win-bg:#E3F0E8;
+  }
+
+  /* ── Base ──────────────────────────────────────────────────────────────── */
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 16.5px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: var(--s5) var(--s3) var(--s6);
+    display: flex;
+    flex-direction: column;
+    gap: var(--s6);
+  }
+  p { max-width: 68ch; }
+  a { color: var(--read); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, button:focus-visible {
+    outline: 2px solid var(--read); outline-offset: 3px; border-radius: 2px;
+  }
+  code, .m { font-family: var(--mono); font-size: 0.86em; }
+  .path {
+    font-family: var(--mono); font-size: 0.82em;
+    color: var(--ink-soft); word-break: break-word;
+  }
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* ── Type scale ────────────────────────────────────────────────────────── */
+  .eyebrow {
+    font-family: var(--mono); font-size: 0.7rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--muted);
+  }
+  h1 {
+    font-family: var(--mono); font-weight: 700;
+    font-size: clamp(2rem, 5.5vw, 3.15rem); line-height: 1.04;
+    letter-spacing: -0.035em; text-wrap: balance; margin: 0;
+  }
+  h2 {
+    font-family: var(--mono); font-weight: 700;
+    font-size: clamp(1.3rem, 3vw, 1.75rem); line-height: 1.15;
+    letter-spacing: -0.02em; text-wrap: balance; margin: 0;
+  }
+  h3 {
+    font-family: var(--mono); font-weight: 650;
+    font-size: 1.02rem; letter-spacing: -0.01em; margin: 0;
+  }
+  .lede { font-size: 1.12rem; color: var(--ink-soft); }
+
+  /* ── Section shell ─────────────────────────────────────────────────────── */
+  section { display: flex; flex-direction: column; gap: var(--s4); }
+  .sec-head { display: flex; flex-direction: column; gap: var(--s1);
+              border-top: 2px solid var(--ink); padding-top: var(--s2); }
+
+  /* ── Header ────────────────────────────────────────────────────────────── */
+  header { display: flex; flex-direction: column; gap: var(--s3); }
+  .thesis {
+    font-family: var(--mono); font-size: clamp(0.95rem, 2.2vw, 1.15rem);
+    line-height: 1.5; letter-spacing: -0.01em; color: var(--ink);
+    border-left: 3px solid var(--read); padding-left: var(--s3); max-width: 62ch;
+  }
+  .stats {
+    display: grid; gap: 1px; background: var(--rule);
+    grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+    border: 1px solid var(--rule);
+  }
+  .stat { background: var(--panel); padding: var(--s2) var(--s2) calc(var(--s2) + 2px); }
+  .stat b {
+    display: block; font-family: var(--mono); font-size: 1.35rem;
+    font-weight: 700; letter-spacing: -0.03em; font-variant-numeric: tabular-nums;
+  }
+  .stat span {
+    font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.11em;
+    text-transform: uppercase; color: var(--muted);
+  }
+
+  /* ── Layer schematic ───────────────────────────────────────────────────── */
+  .layer {
+    border: 1px solid var(--rule); border-left: 4px solid var(--lc, var(--rule));
+    background: var(--panel); display: flex; flex-direction: column;
+  }
+  .layer.write   { --lc: var(--write);   --lbg: var(--write-bg); }
+  .layer.read    { --lc: var(--read);    --lbg: var(--read-bg); }
+  .layer.control { --lc: var(--control); --lbg: var(--control-bg); }
+
+  .layer-head {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s2);
+    padding: var(--s2) var(--s3); background: var(--lbg);
+    border-bottom: 1px solid var(--rule);
+  }
+  .layer-head h3 { color: var(--lc); }
+  .layer-head .note { font-size: 0.92rem; color: var(--ink-soft); flex: 1 1 16ch; }
+
+  .stations {
+    display: grid; gap: 1px; background: var(--rule-soft);
+    grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+  }
+  .station { background: var(--panel); padding: var(--s2) var(--s3) var(--s3); }
+  .station .crate {
+    font-family: var(--mono); font-weight: 650; font-size: 0.9rem;
+    letter-spacing: -0.01em; display: flex; align-items: baseline;
+    justify-content: space-between; gap: var(--s1);
+  }
+  .station .crate em {
+    font-style: normal; font-size: 0.7rem; color: var(--muted);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .station p { font-size: 0.9rem; margin: var(--s1) 0 0; color: var(--ink-soft); }
+  .dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--lc);
+    display: inline-block; margin-right: 7px; vertical-align: 0.12em;
+  }
+
+  /* ── Tables ────────────────────────────────────────────────────────────── */
+  .twrap { overflow-x: auto; border: 1px solid var(--rule); background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; min-width: 640px; }
+  th, td {
+    text-align: left; padding: 9px var(--s2); border-bottom: 1px solid var(--rule-soft);
+    font-size: 0.87rem; vertical-align: top;
+  }
+  th {
+    font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--muted); font-weight: 600;
+    background: var(--panel-2); border-bottom: 1px solid var(--rule);
+    position: sticky; top: 0;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.loc { font-family: var(--mono); font-variant-numeric: tabular-nums;
+           text-align: right; color: var(--muted); white-space: nowrap; }
+  td.file { white-space: nowrap; }
+
+  /* ── Chips ─────────────────────────────────────────────────────────────── */
+  .chip {
+    display: inline-block; font-family: var(--mono); font-size: 0.64rem;
+    font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+    padding: 2px 7px; border: 1px solid currentColor; white-space: nowrap;
+  }
+  .chip.crit { color: var(--crit); background: var(--crit-bg); }
+  .chip.gap  { color: var(--gap);  background: var(--gap-bg); }
+  .chip.win  { color: var(--win);  background: var(--win-bg); }
+  .chip.n    { color: var(--muted); background: transparent; }
+
+  /* ── Trace / pipeline ──────────────────────────────────────────────────── */
+  .trace {
+    border: 1px solid var(--rule); background: var(--panel);
+    display: flex; flex-direction: column;
+  }
+  .trace-head {
+    padding: var(--s2) var(--s3); background: var(--tbg, var(--panel-2));
+    border-bottom: 1px solid var(--rule); display: flex; flex-wrap: wrap;
+    gap: var(--s2); align-items: baseline;
+  }
+  .trace.w { --tbg: var(--write-bg); --tc: var(--write); }
+  .trace.r { --tbg: var(--read-bg);  --tc: var(--read); }
+  .trace-head h3 { color: var(--tc); }
+  .trace-head .note { font-size: 0.9rem; color: var(--ink-soft); }
+  .steps { display: flex; flex-direction: column; }
+  .step {
+    display: grid; grid-template-columns: 2.4rem 1fr; gap: var(--s2);
+    padding: var(--s2) var(--s3); border-bottom: 1px solid var(--rule-soft);
+  }
+  .step:last-child { border-bottom: none; }
+  .step .idx {
+    font-family: var(--mono); font-size: 0.72rem; font-weight: 650;
+    color: var(--tc); font-variant-numeric: tabular-nums; padding-top: 2px;
+  }
+  .step .what { font-family: var(--mono); font-size: 0.86rem; font-weight: 600; }
+  .step .why { font-size: 0.9rem; color: var(--ink-soft); margin: 2px 0 0; max-width: 72ch; }
+
+  /* ── Contribution cards ────────────────────────────────────────────────── */
+  .board { display: flex; flex-direction: column; gap: var(--s3); }
+  .task {
+    border: 1px solid var(--rule); border-left: 4px solid var(--tc, var(--rule));
+    background: var(--panel); display: flex; flex-direction: column;
+  }
+  .task.crit { --tc: var(--crit); }
+  .task.gap  { --tc: var(--gap); }
+  .task.win  { --tc: var(--win); }
+  .task-head {
+    padding: var(--s2) var(--s3); display: flex; flex-wrap: wrap;
+    gap: var(--s2); align-items: baseline; border-bottom: 1px solid var(--rule-soft);
+  }
+  .task-head h3 { flex: 1 1 22ch; }
+  .task-body { padding: var(--s3); display: flex; flex-direction: column; gap: var(--s2); }
+  .task-body p { font-size: 0.94rem; margin: 0; }
+  .kv {
+    display: grid; grid-template-columns: max-content 1fr; gap: 4px var(--s2);
+    font-size: 0.88rem; align-items: baseline;
+  }
+  .kv dt {
+    font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--muted); padding-top: 3px;
+  }
+  .kv dd { margin: 0; }
+
+  pre {
+    font-family: var(--mono); font-size: 0.79rem; line-height: 1.55;
+    background: var(--panel-2); border: 1px solid var(--rule);
+    padding: var(--s2) var(--s3); overflow-x: auto; margin: 0;
+  }
+  pre b { color: var(--read); font-weight: 650; }
+
+  /* ── Diagram plate ─────────────────────────────────────────────────────── */
+  .plate {
+    margin: 0; border: 1px solid var(--rule); background: var(--panel);
+    display: flex; flex-direction: column;
+  }
+  .plate pre.mermaid {
+    background: transparent; border: none; padding: var(--s3) var(--s2);
+    display: flex; justify-content: center; font-size: 1rem;
+  }
+  .plate pre.mermaid svg { max-width: 100%; height: auto; }
+  .plate figcaption {
+    border-top: 1px solid var(--rule-soft); padding: var(--s2) var(--s3);
+    font-size: 0.88rem; color: var(--ink-soft); background: var(--panel-2);
+    max-width: none;
+  }
+
+  /* ── Module tree ───────────────────────────────────────────────────────── */
+  pre.tree {
+    border: none; background: var(--panel); min-width: 660px;
+    font-size: 0.775rem; line-height: 1.62; padding: var(--s3);
+  }
+  pre.tree b { color: var(--ink); font-weight: 700; }
+  pre.tree s {
+    color: var(--muted); text-decoration-color: var(--crit);
+    text-decoration-thickness: 1px;
+  }
+  .strike-note {
+    text-decoration: line-through; text-decoration-color: var(--crit);
+    color: var(--muted);
+  }
+
+  ul { padding-left: 1.15rem; margin: 0; display: flex; flex-direction: column; gap: 5px; }
+  li { font-size: 0.94rem; }
+
+  .cols { display: grid; gap: var(--s3); grid-template-columns: repeat(auto-fit, minmax(275px, 1fr)); }
+  .callout {
+    border: 1px solid var(--rule); border-top: 3px solid var(--gap);
+    background: var(--panel); padding: var(--s3);
+    display: flex; flex-direction: column; gap: var(--s2);
+  }
+  .callout.crit { border-top-color: var(--crit); }
+  .callout.win  { border-top-color: var(--win); }
+  .callout p { font-size: 0.94rem; margin: 0; }
+
+  footer {
+    border-top: 1px solid var(--rule); padding-top: var(--s3);
+    font-family: var(--mono); font-size: 0.72rem; color: var(--muted);
+    display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4);
+  }
+
+  @media (max-width: 640px) {
+    body { font-size: 15.5px; }
+    .wrap { padding: var(--s4) var(--s2) var(--s5); gap: var(--s5); }
+    .step { grid-template-columns: 1.9rem 1fr; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+
+  /* ── offline standalone: inline SVG replacing the two mermaid diagrams ── */
+  svg.dgm { display:block; width:100%; height:auto; min-width:640px; }
+  svg.dgm text { font-family: var(--mono); }
+  svg.dgm .dh { font-size:9.5px; font-weight:700; letter-spacing:.12em; fill: var(--muted); }
+  svg.dgm .dl { font-size:11.5px; font-weight:600; fill: var(--ink); }
+  svg.dgm .ds { font-size:10px; fill: var(--muted); }
+  svg.dgm .dw { font-size:11px; font-weight:600; fill:#fff; }
+  svg.dgm .dws{ font-size:9.5px; fill:#e8eeef; }
+  svg.dgm .dc { fill: var(--panel-2); stroke: var(--rule); stroke-width:1; }
+  svg.dgm .db { fill: var(--panel-2); stroke: var(--read); stroke-width:1.6; }
+  svg.dgm .dd { fill: var(--panel-2); stroke: var(--write); stroke-width:1.6; }
+  svg.dgm .dg { fill:#2E7D4F; stroke:none; }
+  svg.dgm .dn { fill:#4A5A60; stroke:none; }
+  svg.dgm .dt { fill:#1B7A8C; stroke:none; }
+  svg.dgm .dy { fill:#B26B00; stroke:none; }
+  svg.dgm .dr { fill:#B3261E; stroke:none; }
+  svg.dgm .da { stroke: var(--rule); stroke-width:1.4; fill:none; }
+  svg.dgm .dar{ stroke:#B3261E; stroke-width:1.6; fill:none; }
+  .plate figcaption { max-width:none; }
+</style>
+
+<div class="wrap">
+
+  <!-- ══════════ HEADER ══════════ -->
+  <header>
+    <div class="eyebrow">Travsr · Rust workspace · Apache-2.0 · v0.7.0 (binary line v0.11.0)</div>
+    <h1>Architecture &amp;<br>Contribution Map</h1>
+    <p class="thesis">
+      Source code ek deterministic graph hai, unstructured text nahi. Travsr har commit pe
+      wo graph banata hai aur MCP se expose karta hai — taaki AI agent real edges traverse kare,
+      vector chunks se guess na kare.
+    </p>
+    <div class="stats">
+      <div class="stat"><b class="num">15</b><span>crates</span></div>
+      <div class="stat"><b class="num">~82k</b><span>lines rust</span></div>
+      <div class="stat"><b class="num">1,299</b><span>tests</span></div>
+      <div class="stat"><b class="num">16</b><span>languages</span></div>
+      <div class="stat"><b class="num">v20</b><span>db schema</span></div>
+      <div class="stat"><b class="num">37</b><span>rfcs + adrs</span></div>
+      <div class="stat"><b class="num">11</b><span>edge kinds</span></div>
+      <div class="stat"><b class="num">12</b><span>mcp tools</span></div>
+    </div>
+    <p>
+      Ye page do sawaalon ka jawab hai: <em>kaunsi file kya karti hai</em>, aur
+      <em>tum kahan se contribute karna shuru karo</em>. Har number is repo se measure kiya gaya hai —
+      LOC counts me inline <code>#[cfg(test)]</code> modules shaamil hain, kyunki is codebase me
+      tests source ke saath hi rehte hain.
+    </p>
+  </header>
+
+  <!-- ══════════ 1. LAYERS ══════════ -->
+  <section>
+    <div class="sec-head">
+      <div class="eyebrow">01 — Structure</div>
+      <h2>Teen layers</h2>
+    </div>
+    <p>
+      Crates ko alphabetically mat padho — <strong>data ke direction me</strong> padho. Har crate
+      teen me se ek layer pe baithta hai, aur dependency hamesha neeche ki taraf behti hai.
+    </p>
+
+    <div class="layer write">
+      <div class="layer-head">
+        <h3>Write path</h3>
+        <span class="note">Disk pe source → graph.db. Yahan trust boundary aur sandbox rehta hai.</span>
+      </div>
+      <div class="stations">
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>travsr-core</span><em>1,557</em></div>
+          <p>Data model. VName, NodeId, EdgeKind, Node, Edge. Har crate isi pe khada hai.</p>
+        </div>
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>travsr-analysis</span><em>10,602</em></div>
+          <p>Tree-sitter parsers, 16 languages. Sirf travsr-core pe depend karta hai — ye invariant hai.</p>
+        </div>
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>travsr-indexer</span><em>11,827</em></div>
+          <p>Phase A/B orchestration, SCIP/LSIF ingest, import linking, subprocess sandbox.</p>
+        </div>
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>travsr-plugin-host</span><em>11,066</em></div>
+          <p>Trust boundary. Untrusted Phase B tools yahin chalte hain — bwrap / seatbelt / job objects.</p>
+        </div>
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>travsr-store</span><em>9,748</em></div>
+          <p>SQLite + WAL. Schema, 18 migrations, FTS5, batch/staging writes, GC.</p>
+        </div>
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>plugin-protocol / sdk</span><em>747</em></div>
+          <p>Length-prefixed protobuf wire format + thin SDK. Naya language plugin yahin se banega.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="layer read">
+      <div class="layer-head">
+        <h3>Read path</h3>
+        <span class="note">Query → seeds → graph algorithms → token-budgeted context. Product ki quality yahin banti hai.</span>
+      </div>
+      <div class="stations">
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>travsr-retrieval</span><em>3,439</em></div>
+          <p>Algorithms: PPR, PCST, knapsack, k-core, BM25, RBAC filter. Self-contained aur benchmarked.</p>
+        </div>
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>travsr-rerank</span><em>713</em></div>
+          <p>ONNX cross-encoder via tract. K≈30 candidates, 1200ms circuit breaker.</p>
+        </div>
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>travsr-mcp</span><em>17,758</em></div>
+          <p>Sabse bada crate. Seed selection, RRF fusion, abstention, 12 MCP tools, sanitization.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="layer control">
+      <div class="layer-head">
+        <h3>Control plane</h3>
+        <span class="note">Graph ko fresh rakhta hai aur user tak pahunchata hai.</span>
+      </div>
+      <div class="stations">
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>travsr-daemon</span><em>6,063</em></div>
+          <p>Background process — file watcher, git hook dispatch, Phase B scheduler, query cache.</p>
+        </div>
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>travsr-cli</span><em>7,420</em></div>
+          <p><code>travsr</code> binary. clap subcommands: init, ask, graph, mcp, lang, embed, fsck.</p>
+        </div>
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>travsr-ipc</span><em>386</em></div>
+          <p>Unix domain socket / Windows named pipe. CLI ↔ daemon transport.</p>
+        </div>
+        <div class="station">
+          <div class="crate"><span><span class="dot"></span>error / config</span><em>644</em></div>
+          <p>Error taxonomy (ADR-004) aur reindex resource governance config.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════ 2. CODE STRUCTURE ══════════ -->
+  <section>
+    <div class="sec-head">
+      <div class="eyebrow">02 — Code structure</div>
+      <h2>Diagrams</h2>
+    </div>
+
+    <h3>Crate dependency graph</h3>
+    <p>
+      Arrow ka matlab: <em>"ye crate uspe depend karta hai"</em>. <code>travsr-core</code> aur
+      <code>travsr-error</code> pe <strong>sab</strong> depend karte hain — unke 14 arrows draw
+      karne ka koi matlab nahi, isliye alag dikhaye hain. Exact matrix neeche table me hai.
+    </p>
+    <figure class="plate">
+      <svg class="dgm" viewBox="0 0 880 470" role="img" aria-label="Crate dependency tiers">
+        <defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--rule)"/></marker></defs>
+        <text class="dh" x="8" y="16">L6 · BINARY</text>
+        <rect class="dc" x="8" y="24" width="170" height="34" rx="6"/><text class="dl" x="93" y="45" text-anchor="middle">travsr-cli · 7,420</text>
+        <text class="dh" x="8" y="82">L5 · CONTROL</text>
+        <rect class="dc" x="8" y="90" width="170" height="34" rx="6"/><text class="dl" x="93" y="111" text-anchor="middle">travsr-daemon · 6,063</text>
+        <rect class="dc" x="196" y="90" width="150" height="34" rx="6"/><text class="dl" x="271" y="111" text-anchor="middle">travsr-ipc · 386</text>
+        <text class="dh" x="8" y="148">L4 · INTERFACE</text>
+        <rect class="db" x="8" y="156" width="170" height="34" rx="6"/><text class="dl" x="93" y="177" text-anchor="middle">travsr-mcp · 17,758</text>
+        <rect class="dc" x="196" y="156" width="150" height="34" rx="6"/><text class="dl" x="271" y="177" text-anchor="middle">travsr-rerank · 713</text>
+        <text class="dh" x="8" y="214">L3 · TRUST BOUNDARY</text>
+        <rect class="dd" x="8" y="222" width="220" height="34" rx="6"/><text class="dl" x="118" y="243" text-anchor="middle">travsr-plugin-host · 11,066</text>
+        <text class="dh" x="8" y="280">L2</text>
+        <rect class="dc" x="8" y="288" width="180" height="34" rx="6"/><text class="dl" x="98" y="309" text-anchor="middle">travsr-retrieval · 3,439</text>
+        <rect class="dc" x="206" y="288" width="180" height="34" rx="6"/><text class="dl" x="296" y="309" text-anchor="middle">travsr-indexer · 11,827</text>
+        <rect class="dc" x="404" y="288" width="180" height="34" rx="6"/><text class="dl" x="494" y="309" text-anchor="middle">travsr-plugin-sdk · 125</text>
+        <text class="dh" x="8" y="346">L1</text>
+        <rect class="dc" x="8" y="354" width="170" height="34" rx="6"/><text class="dl" x="93" y="375" text-anchor="middle">travsr-store · 9,748</text>
+        <rect class="dc" x="196" y="354" width="180" height="34" rx="6"/><text class="dl" x="286" y="375" text-anchor="middle">travsr-analysis · 10,602</text>
+        <rect class="dc" x="394" y="354" width="200" height="34" rx="6"/><text class="dl" x="494" y="375" text-anchor="middle">travsr-plugin-protocol · 622</text>
+        <rect class="dc" x="612" y="354" width="160" height="34" rx="6"/><text class="dl" x="692" y="375" text-anchor="middle">travsr-config · 516</text>
+        <text class="dh" x="8" y="412">L0 · FOUNDATION</text>
+        <rect class="db" x="8" y="420" width="380" height="34" rx="6"/><text class="dl" x="198" y="441" text-anchor="middle">travsr-core + travsr-error · 1,685 · sab ispe khade hain</text>
+        <path class="da" marker-end="url(#a1)" d="M93,58 L93,88"/>
+        <path class="da" marker-end="url(#a1)" d="M93,124 L93,154"/>
+        <path class="da" marker-end="url(#a1)" d="M93,190 L93,220"/>
+        <path class="da" marker-end="url(#a1)" d="M93,256 L93,286"/>
+        <path class="da" marker-end="url(#a1)" d="M93,322 L93,352"/>
+        <path class="da" marker-end="url(#a1)" d="M93,388 L93,418"/>
+        <path class="da" marker-end="url(#a1)" d="M178,41 L800,41 L800,437 L392,437"/>
+        <text class="ds" x="600" y="34">cli 10 crates pe depend karta hai — poora matrix neeche table me</text>
+      </svg>
+      <figcaption>
+        Do hub hain — <code>travsr-cli</code> (10 deps) aur <code>travsr-daemon</code> (8).
+        Baaki sab neeche ki taraf clean behta hai.
+      </figcaption>
+    </figure>
+
+    <div class="twrap">
+      <table>
+        <thead><tr><th>Crate</th><th>Direct travsr-* dependencies</th><th class="loc">Count</th></tr></thead>
+        <tbody>
+          <tr><td class="file"><code>travsr-core</code></td><td class="path">— (koi nahi)</td><td class="loc">0</td></tr>
+          <tr><td class="file"><code>travsr-error</code></td><td class="path">—</td><td class="loc">0</td></tr>
+          <tr><td class="file"><code>travsr-config</code></td><td class="path">—</td><td class="loc">0</td></tr>
+          <tr><td class="file"><code>travsr-ipc</code></td><td class="path">—</td><td class="loc">0</td></tr>
+          <tr><td class="file"><code>travsr-rerank</code></td><td class="path">—</td><td class="loc">0</td></tr>
+          <tr><td class="file"><code>travsr-analysis</code></td><td class="path">core</td><td class="loc">1</td></tr>
+          <tr><td class="file"><code>travsr-store</code></td><td class="path">core, error</td><td class="loc">2</td></tr>
+          <tr><td class="file"><code>travsr-plugin-protocol</code></td><td class="path">core, error</td><td class="loc">2</td></tr>
+          <tr><td class="file"><code>travsr-plugin-sdk</code></td><td class="path">core, plugin-protocol</td><td class="loc">2</td></tr>
+          <tr><td class="file"><code>travsr-indexer</code></td><td class="path">core, error, analysis</td><td class="loc">3</td></tr>
+          <tr><td class="file"><code>travsr-retrieval</code></td><td class="path">core, error, store</td><td class="loc">3</td></tr>
+          <tr><td class="file"><code>travsr-plugin-host</code></td><td class="path">core, error, config, analysis, indexer, plugin-protocol</td><td class="loc">6</td></tr>
+          <tr><td class="file"><code>travsr-mcp</code></td><td class="path">core, error, analysis, retrieval, rerank, store, plugin-host</td><td class="loc">7</td></tr>
+          <tr><td class="file"><code>travsr-daemon</code></td><td class="path">core, ipc, mcp, indexer, retrieval, store, plugin-host, analysis</td><td class="loc">8</td></tr>
+          <tr><td class="file"><code>travsr-cli</code></td><td class="path">core, config, ipc, indexer, daemon, mcp, store, retrieval, plugin-sdk, plugin-host</td><td class="loc">10</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout" style="border-top-color: var(--write);">
+      <h3>Ek architectural invariant</h3>
+      <p>
+        <code>travsr-analysis</code> ke <code>lib.rs</code> me likha hai:
+        <em>"this crate depends ONLY on travsr-core. No other travsr-* crate may appear in Cargo.toml."</em>
+        Aur <code>travsr-plugin-host</code> ke doc me: <em>"the ONLY crate in the indexer tier that
+        depends on travsr-plugin-protocol."</em> Ye deliberate boundaries hain — trust boundary
+        ek jagah rehti hai, parsing pure rehti hai. PR me inhe todo mat.
+      </p>
+    </div>
+
+    <h3>Module tree — do bade crates</h3>
+    <p>
+      Ye <code>travsr-mcp</code> (read path) aur <code>travsr-indexer</code> + <code>travsr-analysis</code>
+      (write path) ka andar ka structure hai. <span class="strike-note">Strikethrough</span> matlab
+      file disk pe hai par <code>lib.rs</code> me declared nahi — compile hi nahi hoti.
+    </p>
+    <div class="twrap">
+<pre class="tree">crates/
+├─ <b>travsr-mcp/</b>              read path ka dimaag · 17,758
+│  └─ src/
+│     ├─ lib.rs                 module declarations, re-exports for fuzz targets
+│     ├─ server.rs      1,419   JSON-RPC 2.0 stdio · run() @17 · run_global() @639
+│     ├─ protocol.rs            RpcRequest / RpcResponse framing
+│     ├─ <b>tools.rs</b>        8,558   saare 12 MCP tools · get_context_body @3038
+│     ├─ <b>seed.rs</b>         3,758   seed quality engine · confidence · abstention
+│     ├─ query.rs         838   CLI payloads: ask_query, graph_query, status_query
+│     ├─ sse.rs           681   HTTP + SSE transport (RFC-007) · RBAC stub @646
+│     ├─ rerank.rs        566   cross-encoder wrapper + circuit breaker
+│     ├─ sanitize.rs      382   SEC-001 · control chars, tag escape, envelope
+│     ├─ auth.rs          371   JWT signing keys for SSE
+│     └─ session.rs       264   RBAC session model (RFC-006)
+│
+├─ <b>travsr-analysis/</b>         parsing ka canonical ghar · 10,602
+│  └─ src/
+│     ├─ lib.rs                 "depends ONLY on travsr-core" ← invariant
+│     ├─ skeleton.rs    3,147   AST skeleton builder (bade functions ko summarize)
+│     ├─ snippet.rs       486   kind-aware snippet extraction + line caps
+│     ├─ emit.rs                node/edge construction helpers
+│     ├─ generic.rs       155   config-driven Phase A infra (naye languages)
+│     ├─ ffi.rs           196   FFI boundary markers (RFC-005)
+│     ├─ data_format.rs   671   JSON · YAML · TOML · XML → configures edges
+│     ├─ go.rs · rust.rs · python.rs · typescript.rs      hand-crafted Phase A
+│     ├─ java · kotlin · scala · csharp · php · ruby      generic-driven
+│     ├─ swift · dart · cpp · c · objc                    generic-driven
+│     └─ phase_b_{rust,typescript,python,dart}.rs   native Phase B call edges
+│
+└─ <b>travsr-indexer/</b>          orchestration · 11,827 (+ 4,234 dead)
+   └─ src/
+      ├─ lib.rs           741   link_imports @145 · link_imports_rust @204
+      ├─ lsif.rs        1,048   LSIF ingest → edges
+      ├─ runner.rs      1,017   external emitter subprocess drivers
+      ├─ sandbox.rs       678   subprocess isolation
+      ├─ scip_unifier.rs  469   RFC-014 G1/G2/G3 passes
+      ├─ ffi_resolver.rs  384   cross-language FFI edge resolution
+      ├─ ra_runner.rs     331   rust-analyzer driver (ADR-006)
+      ├─ python_lsif.rs   252   scip-python driver · rlimit TODO @133
+      ├─ hash.rs                SHA-256 file hashing (delta re-index)
+      │
+      ├─ <s>emit.rs</s>  <s>go.rs</s>  <s>python.rs</s>  <s>rust.rs</s>          ┐
+      ├─ <s>typescript.rs</s>  <s>phase_b_python.rs</s>                ├ 4,234 lines
+      └─ <s>phase_b_rust.rs</s>  <s>phase_b_typescript.rs</s>          ┘ ORPHANED</pre>
+    </div>
+
+    <h3>Read path — control flow</h3>
+    <figure class="plate">
+      <svg class="dgm" viewBox="0 0 880 430" role="img" aria-label="get_context read path control flow">
+        <defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--rule)"/></marker>
+        <marker id="a2r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#B3261E"/></marker></defs>
+        <rect class="dg" x="8" y="14" width="200" height="34" rx="17"/><text class="dw" x="108" y="35" text-anchor="middle">get_context(query, budget)</text>
+        <rect class="dg" x="8" y="70" width="200" height="38" rx="6"/><text class="dw" x="108" y="88" text-anchor="middle">validate_mcp_arg</text><text class="dws" x="108" y="102" text-anchor="middle">SEC-002</text>
+        <rect class="dn" x="8"   y="132" width="180" height="42" rx="6"/><text class="dw" x="98"  y="150" text-anchor="middle">embed KNN</text><text class="dws" x="98"  y="164" text-anchor="middle">600 ms breaker</text>
+        <rect class="dn" x="206" y="132" width="200" height="42" rx="6"/><text class="dw" x="306" y="150" text-anchor="middle">FTS5 trigram</text><text class="dws" x="306" y="164" text-anchor="middle">search_nodes_fuzzy_scored</text>
+        <rect class="dn" x="424" y="132" width="170" height="42" rx="6"/><text class="dw" x="509" y="150" text-anchor="middle">IDF anchors</text><text class="dws" x="509" y="164" text-anchor="middle">per-token</text>
+        <rect class="dn" x="206" y="200" width="200" height="38" rx="6"/><text class="dw" x="306" y="218" text-anchor="middle">RRF fusion</text><text class="dws" x="306" y="232" text-anchor="middle">seed.rs</text>
+        <polygon class="dy" points="306,262 400,290 306,318 212,290"/><text class="dw" x="306" y="294" text-anchor="middle">confidence?</text>
+        <rect class="dr" x="612" y="268" width="180" height="44" rx="6"/><text class="dw" x="702" y="288" text-anchor="middle">ABSTAIN</text><text class="dws" x="702" y="303" text-anchor="middle">term map return</text>
+        <rect class="dn" x="206" y="342" width="200" height="34" rx="6"/><text class="dw" x="306" y="363" text-anchor="middle">enrich + dedup seeds</text>
+        <rect class="dt" x="8"   y="394" width="150" height="30" rx="6"/><text class="dw" x="83"  y="413" text-anchor="middle">ppr_weighted</text>
+        <rect class="dt" x="176" y="394" width="140" height="30" rx="6"/><text class="dw" x="246" y="413" text-anchor="middle">k-core shells</text>
+        <rect class="dt" x="334" y="394" width="170" height="30" rx="6"/><text class="dw" x="419" y="413" text-anchor="middle">cross-encoder rerank</text>
+        <rect class="dt" x="522" y="394" width="120" height="30" rx="6"/><text class="dw" x="582" y="413" text-anchor="middle">knapsack</text>
+        <rect class="dg" x="660" y="394" width="212" height="30" rx="15"/><text class="dw" x="766" y="413" text-anchor="middle">&lt;travsr-data&gt; envelope</text>
+        <path class="da" marker-end="url(#a2)" d="M108,48 L108,68"/>
+        <path class="da" marker-end="url(#a2)" d="M108,108 L98,130"/>
+        <path class="da" marker-end="url(#a2)" d="M150,108 L306,130"/>
+        <path class="da" marker-end="url(#a2)" d="M180,108 L509,130"/>
+        <path class="da" marker-end="url(#a2)" d="M98,176 L98,198 L204,210"/>
+        <path class="da" marker-end="url(#a2)" d="M306,176 L306,198"/>
+        <path class="da" marker-end="url(#a2)" d="M509,176 L509,198 L408,212"/>
+        <path class="da" marker-end="url(#a2)" d="M306,240 L306,260"/>
+        <path class="dar" marker-end="url(#a2r)" d="M400,290 L610,290"/>
+        <text class="ds" x="450" y="284" fill="#B3261E">None</text>
+        <path class="da" marker-end="url(#a2)" d="M306,318 L306,340"/>
+        <text class="ds" x="316" y="334">Weak / Strong / Exact</text>
+        <path class="da" marker-end="url(#a2)" d="M206,359 L83,359 L83,392"/>
+        <path class="da" marker-end="url(#a2)" d="M158,409 L174,409"/>
+        <path class="da" marker-end="url(#a2)" d="M316,409 L332,409"/>
+        <path class="da" marker-end="url(#a2)" d="M504,409 L520,409"/>
+        <path class="da" marker-end="url(#a2)" d="M642,409 L658,409"/>
+      </svg>
+      <figcaption>
+        Teen seed sources ek RRF fusion me milte hain. Confidence gate hi decide karta hai ki
+        jawab milega ya honest abstention — <strong>yahi product ka core bet hai.</strong>
+      </figcaption>
+    </figure>
+
+    <h3>SQLite schema — graph.db</h3>
+    <p>
+      Base schema (migration v1) me sirf teen tables the. Baaki 18 migrations se aaya —
+      current schema <strong>v20</strong>. <span class="chip n">v#</span> batata hai kaunsi
+      migration me add hua. (<code>v12</code> ek <code>.sql</code> file ke roop me hai par
+      kabhi register nahi hui — sqlite-vec approach thi jo v16 ne replace kar di.)
+    </p>
+    <div class="twrap">
+      <table>
+        <thead><tr><th>Table</th><th>Columns</th><th>Kaam</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="file"><code>nodes</code> <span class="chip n">v1</span></td>
+            <td class="path">id PK · corpus · root · path · language · signature · kind<br>
+              package <span class="chip n">v5</span> · access_corpus <span class="chip n">v7</span> ·
+              line <span class="chip n">v8</span> · end_line <span class="chip n">v13</span> ·
+              shell_number <span class="chip n">v15</span> · embed_text <span class="chip n">v18</span></td>
+            <td>Graph ka har symbol. <code>id</code> = BLAKE3(VName). Unique index (corpus, root, path, language, signature) pe.</td>
+          </tr>
+          <tr>
+            <td class="file"><code>edges</code> <span class="chip n">v1</span></td>
+            <td class="path">src · dst · kind (composite PK)<br>
+              provenance <span class="chip n">v2</span> · language <span class="chip n">v5</span> ·
+              confidence <span class="chip n">v6</span></td>
+            <td>11 typed relations. Indexes (src, kind) aur (dst, kind) pe — forward aur reverse traversal.</td>
+          </tr>
+          <tr>
+            <td class="file"><code>files</code> <span class="chip n">v1</span></td>
+            <td class="path">path PK · sha256 · last_indexed_at</td>
+            <td>Delta re-index ka basis — hash badla toh hi file dobara parse hoti hai.</td>
+          </tr>
+          <tr>
+            <td class="file"><code>meta</code></td>
+            <td class="path">key PK · value</td>
+            <td><code>schema_version</code>, <code>last_commit</code>, <code>signature_format_version</code>. Migration se pehle bnta hai.</td>
+          </tr>
+          <tr>
+            <td class="file"><code>nodes_fts</code> <span class="chip n">v9</span></td>
+            <td class="path">tokens · content='' · tokenize='trigram'</td>
+            <td>Contentless FTS5. Trigram tokenizer — sub-token match aur single-char typo handle karta hai.</td>
+          </tr>
+          <tr>
+            <td class="file"><code>nodes_fts_map</code> <span class="chip n">v9</span></td>
+            <td class="path">node_id PK · tokens</td>
+            <td>Contentless FTS5 se row delete karne ke liye original token string chahiye — ye map wahi rakhta hai. Iske bina index time ke saath corrupt ho jaata.</td>
+          </tr>
+          <tr>
+            <td class="file"><code>symbol_aliases</code> <span class="chip n">v13</span></td>
+            <td class="path">scip_symbol PK · node_id → nodes(id) CASCADE</td>
+            <td>RFC-014 G1 — SCIP symbol string se unified tree-sitter NodeId.</td>
+          </tr>
+          <tr>
+            <td class="file"><code>edge_sites</code> <span class="chip n">v13</span></td>
+            <td class="path">src · dst · kind · line (composite PK, WITHOUT ROWID)</td>
+            <td>Har edge ke call-site line numbers. <code>find_references</code> aur <code>get_callers</code> ka <code>path:line</code> yahin se aata hai.</td>
+          </tr>
+          <tr>
+            <td class="file"><code>sessions</code> <span class="chip n">v7</span></td>
+            <td class="path">id PK · corpus · created · expires</td>
+            <td>RBAC session → corpus scope (RFC-006).</td>
+          </tr>
+          <tr>
+            <td class="file"><code>node_tombstones</code> <span class="chip n">v17</span></td>
+            <td class="path">node_id · deleted_at + AFTER DELETE trigger</td>
+            <td>CDC — embed sidecar ko pata chale kaunse nodes gaye.</td>
+          </tr>
+          <tr>
+            <td class="file"><code>fts_vocab</code> <span class="chip n">v10</span> · <code>fts_synonyms</code> <span class="chip n">v11</span></td>
+            <td class="path">token refcounts · term ↔ alias</td>
+            <td>IDF calculation aur query expansion. <strong>Synonyms ka infra hai par abhi barely use hota hai</strong> — conceptual recall ke liye opportunity.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Ek performance detail jo migration comment me likhi hai: <code>idx_nodes_corpus_path</code>
+      (v13) ke bina G1/G2 unification kubernetes pe <strong>ghanton</strong> leta tha —
+      index ke saath minutes. Monorepo pe millions of probes hote hain, aur har ek full table scan
+      ban jaata tha. Ye batata hai ki is codebase me index decisions kis level pe soche gaye hain.
+    </p>
+  </section>
+
+  <!-- ══════════ 3. FILE TRACKING ══════════ -->
+  <section>
+    <div class="sec-head">
+      <div class="eyebrow">03 — File tracking</div>
+      <h2>Kaunsi file kya karti hai</h2>
+    </div>
+    <p>
+      Sirf wo files jo tum actually khologe. <span class="chip win">start here</span> matlab
+      onboarding ke liye best entry point, <span class="chip gap">hot</span> matlab active
+      development yahan chal raha hai.
+    </p>
+
+    <h3>travsr-core — data model</h3>
+    <div class="twrap">
+      <table>
+        <thead><tr><th>Symbol</th><th class="loc">Line</th><th>Kya hai</th></tr></thead>
+        <tbody>
+          <tr><td class="file"><code>SIGNATURE_FORMAT_VERSION</code></td><td class="loc">31</td><td>Version byte jo NodeId hash me sabse pehle jaata hai. Abhi <code>2</code>. Isko badla = duniya ka har graph.db invalid, full re-index forced.</td></tr>
+          <tr><td class="file"><code>VName</code></td><td class="loc">245</td><td>5-tuple universal address: corpus, root, path, language, signature.</td></tr>
+          <tr><td class="file"><code>VName::id()</code></td><td class="loc">286</td><td>BLAKE3 hash, length-prefixed fields. Length-prefixing NUL-injection ambiguity rokti hai.</td></tr>
+          <tr><td class="file"><code>EdgeKind</code></td><td class="loc">322</td><td>11 typed relations — ref/call, depends, defines/binding, exports, ffi/call…</td></tr>
+          <tr><td class="file"><code>EdgeKind::ppr_weight()</code> <span class="chip gap">hot</span></td><td class="loc">410</td><td>Har edge kind ka PageRank weight. <strong>Yahi PPR ko semantic banata hai.</strong> ADR-003 governed.</td></tr>
+          <tr><td class="file"><code>Node</code></td><td class="loc">452</td><td>id, vname, kind, line, end_line, package, access_corpus.</td></tr>
+          <tr><td class="file"><code>is_noise_node()</code></td><td class="loc">564</td><td>Structural noise ka single source of truth — vendored paths, build caches, SCIP locals.</td></tr>
+          <tr><td class="file"><code>UnresolvedCall</code></td><td class="loc">650</td><td>Phase B ka cross-crate call jo resolve nahi hua — daemon baad me resolve karta hai.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>travsr-mcp — read path ka dimaag</h3>
+    <div class="twrap">
+      <table>
+        <thead><tr><th>File</th><th class="loc">LOC</th><th>Zimmedari</th></tr></thead>
+        <tbody>
+          <tr><td class="file"><code>tools.rs</code> <span class="chip gap">hot</span></td><td class="loc">8,558</td><td>Saare 12 MCP tools. <code>get_context_body</code> @3038 pura pipeline ek function me. <code>kind_boost</code> @2321 per-kind ranking multipliers.</td></tr>
+          <tr><td class="file"><code>seed.rs</code> <span class="chip crit">critical</span></td><td class="loc">3,758</td><td>Seed quality engine. Tokenize → IDF anchors → BM25 → RRF fusion → confidence → abstain. Har threshold env-overridable, comment me measured number.</td></tr>
+          <tr><td class="file"><code>server.rs</code> <span class="chip win">start here</span></td><td class="loc">1,419</td><td>JSON-RPC 2.0 over stdio. <code>run()</code> @17 single-repo, <code>run_global()</code> @639. Tool dispatch @126 aur @731.</td></tr>
+          <tr><td class="file"><code>query.rs</code></td><td class="loc">838</td><td>CLI-facing payloads — <code>ask_query</code>, <code>graph_query</code>, <code>status_query</code>.</td></tr>
+          <tr><td class="file"><code>sse.rs</code></td><td class="loc">681</td><td>HTTP + Server-Sent Events transport (RFC-007). <strong>RBAC yahan stub hai</strong> — line 646.</td></tr>
+          <tr><td class="file"><code>rerank.rs</code></td><td class="loc">566</td><td>Cross-encoder wrapper + circuit breaker + per-model floor manifest.</td></tr>
+          <tr><td class="file"><code>sanitize.rs</code></td><td class="loc">382</td><td>SEC-001: control chars strip, <code>&lt;&gt;</code> escape, <code>&lt;travsr-data&gt;</code> envelope.</td></tr>
+          <tr><td class="file"><code>auth.rs</code></td><td class="loc">371</td><td>JWT signing-key fetch for SSE transport.</td></tr>
+          <tr><td class="file"><code>session.rs</code></td><td class="loc">264</td><td>RBAC session model (RFC-006) — session id → corpus scope.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>travsr-retrieval — algorithms</h3>
+    <div class="twrap">
+      <table>
+        <thead><tr><th>File</th><th class="loc">LOC</th><th>Entry point</th><th>Kaam</th></tr></thead>
+        <tbody>
+          <tr><td class="file"><code>ppr.rs</code> <span class="chip win">start here</span></td><td class="loc">686</td><td class="path">ppr_weighted @136</td><td>Personalized PageRank, edge-kind weighted. alpha/epsilon/max_iterations env-tunable.</td></tr>
+          <tr><td class="file"><code>pcst.rs</code></td><td class="loc">600</td><td class="path">pcst_path @48</td><td>Prize-Collecting Steiner Tree — <code>get_execution_path</code> ke liye. λ selection ADR-007. Proptest suite hai.</td></tr>
+          <tr><td class="file"><code>kcore.rs</code></td><td class="loc">507</td><td class="path">compute_kcore @44</td><td>k-core decomposition — "buried middle" nodes recover karta hai.</td></tr>
+          <tr><td class="file"><code>knapsack.rs</code></td><td class="loc">395</td><td class="path">knapsack @53</td><td>0-1 knapsack, token budget cap. <code>token_cost(node)</code> weight hai.</td></tr>
+          <tr><td class="file"><code>bm25.rs</code></td><td class="loc">213</td><td class="path">bm25_rank_symbols @29</td><td>Full-text ranked retrieval.</td></tr>
+          <tr><td class="file"><code>lib.rs</code></td><td class="loc">202</td><td class="path">bfs @39</td><td>Depth-3 BFS — <code>get_dependencies</code> / <code>get_callers</code> ke liye.</td></tr>
+          <tr><td class="file"><code>rbac.rs</code></td><td class="loc">107</td><td class="path">EdgeFilter trait</td><td><code>OpenFilter</code> vs <code>RbacFilter</code>. Dedicated CI gate hai (rbac-leak-gate.yml).</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>travsr-store — persistence</h3>
+    <div class="twrap">
+      <table>
+        <thead><tr><th>Kya</th><th class="loc">Line</th><th>Detail</th></tr></thead>
+        <tbody>
+          <tr><td class="file"><code>migrations/v1_initial.sql</code></td><td class="loc">—</td><td>Base schema: <code>nodes</code>, <code>edges</code>, <code>files</code>. Bas itna hi — baaki sab 17 migrations se aaya.</td></tr>
+          <tr><td class="file"><code>migration.rs</code></td><td class="loc">481</td><td>Migration runner. <strong>Har <code>up()</code> idempotent hona chahiye</strong> — <code>up()</code> aur <code>set_schema_version</code> ke beech atomicity gap hai.</td></tr>
+          <tr><td class="file"><code>write_file_graphs_batch</code></td><td class="loc">1268</td><td>Phase A ka main write path.</td></tr>
+          <tr><td class="file"><code>write_scip_attributed_batch</code></td><td class="loc">2768</td><td>RFC-014 G2 — ref/call edges ko file node se enclosing function pe re-home karta hai.</td></tr>
+          <tr><td class="file"><code>find_ts_node_for_unification</code></td><td class="loc">3040</td><td>RFC-014 G1 — SCIP symbol ko tree-sitter node pe unify karta hai.</td></tr>
+          <tr><td class="file"><code>flush_staging_to_production</code></td><td class="loc">3404</td><td>Bulk init: staging tables → production, ek transaction me.</td></tr>
+          <tr><td class="file"><code>search_nodes_fuzzy_scored</code></td><td class="loc">4110</td><td>FTS5 fuzzy search with scores — seed selection ka lexical source.</td></tr>
+          <tr><td class="file"><code>reconcile</code> / <code>sweep_orphans</code></td><td class="loc">1837</td><td>Graph GC (issue #402) — <code>travsr fsck</code> yahi call karta hai.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>travsr-daemon &amp; plugin-host</h3>
+    <div class="twrap">
+      <table>
+        <thead><tr><th>File</th><th class="loc">LOC</th><th>Zimmedari</th></tr></thead>
+        <tbody>
+          <tr><td class="file"><code>daemon/lib.rs</code></td><td class="loc">4,313</td><td><code>init_repo_with_progress</code> @759 · <code>reindex_files</code> @2040 · <code>resolve_unresolved_calls</code> @1398 · <code>update_embed_texts</code> @487 · <code>Daemon</code> struct @3329.</td></tr>
+          <tr><td class="file"><code>daemon/hook.rs</code></td><td class="loc">343</td><td>post-commit hook install + dispatch. <code>changed_files_from_git</code>.</td></tr>
+          <tr><td class="file"><code>daemon/phase_b_sched.rs</code></td><td class="loc">332</td><td>Phase A ke baad background Phase B schedule karta hai.</td></tr>
+          <tr><td class="file"><code>daemon/watcher.rs</code></td><td class="loc">328</td><td><code>notify</code>-based file watching.</td></tr>
+          <tr><td class="file"><code>daemon/query_cache.rs</code></td><td class="loc">183</td><td>MCP query result cache.</td></tr>
+          <tr><td class="file"><code>plugin-host/embed_catalog.rs</code></td><td class="loc">1,690</td><td>Config-driven embedding model catalog + auto-calibrated semantic floors.</td></tr>
+          <tr><td class="file"><code>plugin-host/indexer.rs</code></td><td class="loc">935</td><td><code>PluginIndexer</code> — Phase B invocation, bounded I/O.</td></tr>
+          <tr><td class="file"><code>plugin-host/sandbox/</code> <span class="chip crit">critical</span></td><td class="loc">1,530</td><td><code>linux.rs</code> bubblewrap · <code>macos.rs</code> seatbelt · <code>windows.rs</code> job objects · <code>toolchain.rs</code> grants.</td></tr>
+          <tr><td class="file"><code>plugin-host/trust.rs</code></td><td class="loc">104</td><td>Per-corpus trust gate (ADR-017 Rule 3). Phase B sirf explicit grant ke baad spawn hota hai.</td></tr>
+          <tr><td class="file"><code>plugin-host/plugins/*.rs</code> <span class="chip win">start here</span></td><td class="loc">~85 each</td><td>Ek file per language. <strong>Naya language add karne ka template.</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ══════════ 3. TRACES ══════════ -->
+  <section>
+    <div class="sec-head">
+      <div class="eyebrow">04 — Traces</div>
+      <h2>Do raaste, end to end</h2>
+    </div>
+    <p>
+      Ye do traces yaad kar lo — poora system inhi do me hai. Baki sab inka support hai.
+    </p>
+
+    <div class="trace w">
+      <div class="trace-head">
+        <h3>WRITE · <span class="m">travsr init</span></h3>
+        <span class="note">source files → graph.db</span>
+      </div>
+      <div class="steps">
+        <div class="step"><div class="idx">01</div><div>
+          <div class="what">cli/init.rs → daemon::init_repo_with_progress</div>
+          <p class="why">Repo walk, <code>.gitignore</code> + <code>.travsrignore</code> respect karta hai. Bade dep dirs pe prompt.</p>
+        </div></div>
+        <div class="step"><div class="idx">02</div><div>
+          <div class="what">index_paths_parallel <span class="path">daemon/lib.rs:155</span></div>
+          <p class="why">Batched parallel Phase A. Har file → travsr-analysis ka Tree-sitter parser → nodes + edges.</p>
+        </div></div>
+        <div class="step"><div class="idx">03</div><div>
+          <div class="what">link_imports / link_imports_rust <span class="path">indexer/lib.rs:145, 204</span></div>
+          <p class="why">Import specifiers ko target file nodes se jodta hai — <code>resolves-to</code> edges. Isi se cross-file traversal possible hota hai.</p>
+        </div></div>
+        <div class="step"><div class="idx">04</div><div>
+          <div class="what">write_file_graphs_batch <span class="path">store/lib.rs:1268</span></div>
+          <p class="why">Bulk init mode me staging tables me likhta hai, phir ek transaction me flush. FTS rebuild defer hota hai.</p>
+        </div></div>
+        <div class="step"><div class="idx">05</div><div>
+          <div class="what">arm_phase_b_if_pending → background Phase B</div>
+          <p class="why">Sandboxed subprocess me SCIP/LSIF tools chalte hain. Trust grant zaroori hai, warna skip.</p>
+        </div></div>
+        <div class="step"><div class="idx">06</div><div>
+          <div class="what">G1/G2/G3 unification <span class="path">daemon/scip_unifier.rs</span></div>
+          <p class="why">RFC-014. SCIP symbols ko tree-sitter nodes pe unify, ref/call edges ko enclosing function pe re-home, anonymous locals drop. <strong>Isi ke bina graph rich but unreachable rehta hai.</strong></p>
+        </div></div>
+        <div class="step"><div class="idx">07</div><div>
+          <div class="what">install_hook + registry <span class="path">daemon/hook.rs</span></div>
+          <p class="why">post-commit hook install, aur <code>~/.travsr/registry.json</code> me repo register — global MCP mode ke liye.</p>
+        </div></div>
+      </div>
+    </div>
+
+    <div class="trace r">
+      <div class="trace-head">
+        <h3>READ · <span class="m">get_context(query, budget)</span></h3>
+        <span class="note">flagship tool — tools.rs:3038</span>
+      </div>
+      <div class="steps">
+        <div class="step"><div class="idx">01</div><div>
+          <div class="what">validate_mcp_arg</div>
+          <p class="why">SEC-002. <code>../</code>, absolute paths, null bytes, %-encoded traversal — sab reject, store touch karne se pehle.</p>
+        </div></div>
+        <div class="step"><div class="idx">02</div><div>
+          <div class="what">embed warmup + KNN</div>
+          <p class="why">Sidecar thanda ho toh thoda block karo. KNN pe 600ms circuit breaker — over budget = discard, honest "degraded" flag.</p>
+        </div></div>
+        <div class="step"><div class="idx">03</div><div>
+          <div class="what">seed::build_seed_set <span class="path">seed.rs</span></div>
+          <p class="why">Tokenize → per-token IDF-weighted anchors → whole-query BM25 → RRF fusion (KNN teesra source) → coverage + confidence.</p>
+        </div></div>
+        <div class="step"><div class="idx">04</div><div>
+          <div class="what">ABSTAIN GATE</div>
+          <p class="why"><code>Confidence::None</code> → term resolution map return karo, confident salad nahi. <strong>Ye product ka philosophical core hai.</strong></p>
+        </div></div>
+        <div class="step"><div class="idx">05</div><div>
+          <div class="what">enrich_seeds_with_callers → dedup_adjacent_seeds</div>
+          <p class="why">Depth-1 (15) aur depth-2 (10) callers add. Phir structurally adjacent seeds hatao — warna PPR teleport mass dilute hoti hai.</p>
+        </div></div>
+        <div class="step"><div class="idx">06</div><div>
+          <div class="what">ppr_weighted <span class="path">retrieval/ppr.rs:136</span></div>
+          <p class="why">Confidence-weighted personalization vector. Edge weights (ref/call 1.00 … overrides 0.30) walk ko steer karte hain.</p>
+        </div></div>
+        <div class="step"><div class="idx">07</div><div>
+          <div class="what">k-core shells → cross-encoder rerank</div>
+          <p class="why">Buried-middle recovery, phir ONNX rerank top-K≈30 pe (1200ms breaker).</p>
+        </div></div>
+        <div class="step"><div class="idx">08</div><div>
+          <div class="what">knapsack → sanitize → envelope</div>
+          <p class="why">0-1 knapsack se token budget me pack, phir sanitization pipeline aur <code>&lt;travsr-data&gt;</code> wrapper.</p>
+        </div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════ 4. CONTRIBUTION BOARD ══════════ -->
+  <section>
+    <div class="sec-head">
+      <div class="eyebrow">05 — Where to contribute</div>
+      <h2>Kahan se shuru karo</h2>
+    </div>
+    <p>
+      Ye ranking guess nahi hai — <code>bench/report-*.md</code>, code ke TODOs, aur
+      <code>docs/plans/</code> ke status lines se nikli hai. Upar se neeche karo.
+    </p>
+
+    <div class="board">
+
+      <!-- TASK 1 -->
+      <div class="task win">
+        <div class="task-head">
+          <span class="chip win">week 1 · first pr</span>
+          <h3>Dead code hatao — travsr-indexer</h3>
+          <span class="chip n">4,234 lines</span>
+        </div>
+        <div class="task-body">
+          <p>
+            RFC-017 me parsers <code>travsr-indexer</code> se <code>travsr-analysis</code> me move hue the.
+            Purani files delete nahi hui — aur <code>lib.rs</code> me unke <code>mod</code> declarations bhi nahi hain.
+            Matlab ye files <strong>compile hi nahi hoti</strong>. Orphaned hain.
+          </p>
+          <pre>crates/travsr-indexer/src/  — lib.rs me declared NAHI:
+  emit.rs                 go.rs        python.rs      rust.rs
+  typescript.rs           phase_b_python.rs
+  phase_b_rust.rs         phase_b_typescript.rs
+
+<b>go.rs, typescript.rs, phase_b_typescript.rs, phase_b_python.rs</b>
+  → travsr-analysis ki copy se byte-identical
+<b>rust.rs, python.rs, phase_b_rust.rs</b>
+  → diverge ho chuki hain (analysis wali newer hai)
+
+verify: grep -n "^mod \|^pub mod " crates/travsr-indexer/src/lib.rs
+        (no include! or #[path] attrs — maine check kiya)</pre>
+          <dl class="kv">
+            <dt>Kyun</dt><dd>Zero risk, badi cleanup, aur tumhe indexer/analysis boundary sikha dega. Reviewer ko khush karega.</dd>
+            <dt>Dhyan</dt><dd>Delete karne se pehle <code>cargo build --workspace</code> + <code>cargo test --workspace</code> — aur <code>analysis/src/phase_b_rust.rs:1</code> ka <code>SYNC:</code> comment update karo.</dd>
+            <dt>Branch</dt><dd><code>chore/travsr-indexer-drop-orphaned-parsers</code></dd>
+          </dl>
+        </div>
+      </div>
+
+      <!-- TASK 2 -->
+      <div class="task win">
+        <div class="task-head">
+          <span class="chip win">week 1–2</span>
+          <h3>Salad-query leak band karo</h3>
+          <span class="chip n">~20–40 lines</span>
+        </div>
+        <div class="task-body">
+          <p>
+            k8s bench pe 8 me se 4 "salad" queries abstain karne ke bajaye weak results de rahi hain.
+            Generic verbs asli symbols se coincidentally match ho jaate hain.
+          </p>
+          <pre>G2  "insert a credit card payment record"  → weak, fn:verifyTotalEvents     <b>MISS</b>
+G4  "get the current weather forecast"     → weak, fn:startEndpointWatcher  <b>MISS</b>
+G7  (salad)                                → weak, fn:AppArmorProfile       <b>MISS</b>
+G1 G3 G5 G6 G8                             → abstain                       <b>OK</b></pre>
+          <dl class="kv">
+            <dt>Fix</dt><dd><code>seed.rs</code> me gate: agar <em>saare</em> resolved terms ka IDF weight <code>idf_coverage_min()</code> (0.55) se neeche hai → <code>Confidence::None</code>, chahe coverage numerically pass ho raha ho.</dd>
+            <dt>File</dt><dd class="path">crates/travsr-mcp/src/seed.rs — build_seed_set</dd>
+            <dt>Verify</dt><dd><code>node bench/run.mjs</code> before/after. 4 queries flip honi chahiye, aur literal/conceptual regress nahi hone chahiye.</dd>
+            <dt>Kyun pehla</dt><dd>Best impact-to-effort ratio. Aur <code>seed.rs</code> sikhata hai — jo baaki har retrieval kaam ke liye zaroori hai.</dd>
+          </dl>
+        </div>
+      </div>
+
+      <!-- TASK 3 -->
+      <div class="task gap">
+        <div class="task-head">
+          <span class="chip gap">week 2–4 · high value</span>
+          <h3>Conceptual recall — asli problem</h3>
+        </div>
+        <div class="task-body">
+          <p>
+            Literal search perfect hai. Conceptual understanding tooti hui hai. Ye sabse badi
+            product gap hai aur sabse hard bhi.
+          </p>
+          <div class="twrap">
+            <table>
+              <thead><tr><th>Bench</th><th>hit@1</th><th>hit@3</th><th>MRR</th><th>abstain</th><th>cold</th></tr></thead>
+              <tbody>
+                <tr><td>kubernetes/kubernetes</td><td class="num">0.208</td><td class="num">0.25</td><td class="num">0.25</td><td class="num">3/3 ✓</td><td class="num">6,527 ms</td></tr>
+                <tr><td>travsr (self)</td><td class="num">0.292</td><td class="num">0.333</td><td class="num">0.312</td><td class="num">2/3</td><td class="num">2,058 ms</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            k8s pe conceptual queries me <strong>7 out of 8 MISS</strong> — aur 6 to
+            <code>unknown</code> confidence pe abstain hi kar gayin. Root cause
+            <code>docs/plans/model-relative-semantic-floors.md</code> me likha hai:
+            arctic-embed-256 ka poora answerable band ~0.56 pe khatam hota hai, jabki purane
+            absolute floors 0.66 / 0.72 the — matlab floors <em>model jo produce hi nahi kar sakta</em>
+            uske upar baithe the. Auto-calibration add hui, par numbers abhi bhi kam hain.
+            <strong>Kaam adhoora hai.</strong>
+          </p>
+          <dl class="kv">
+            <dt>Angles</dt><dd>
+              <ul>
+                <li>Query expansion — conceptual query ko symbol vocabulary me translate karo. <code>synonym_*</code> tools ka infra pada hai, use nahi ho raha.</li>
+                <li>Richer embed text — docstrings/comments include karo. <code>daemon/lib.rs:487 update_embed_texts</code>.</li>
+                <li>Code-specific embedding model try karo (jina-code, nomic-embed-code).</li>
+                <li>Calibration per-repo karo, sirf per-model nahi.</li>
+              </ul>
+            </dd>
+            <dt>Rule</dt><dd>Ek time pe ek variable badlo, har baar bench chalao. Team ne exactly yahi kiya — <code>report-k8s-arctic-cal.md</code> vs <code>-cal2.md</code> compare kar lo.</dd>
+          </dl>
+        </div>
+      </div>
+
+      <!-- TASK 4 -->
+      <div class="task crit">
+        <div class="task-head">
+          <span class="chip crit">security</span>
+          <h3>SSE transport pe RBAC lagao</h3>
+        </div>
+        <div class="task-body">
+          <pre>crates/travsr-mcp/src/sse.rs:646
+  // TODO(RFC-008 / #197): replace OpenFilter with per-session RbacFilter</pre>
+          <p>
+            RBAC ka poora infra maujood hai — <code>session.rs</code> (RFC-006), <code>retrieval/rbac.rs</code>
+            ka <code>EdgeFilter</code> trait, <code>nodes.access_corpus</code> column (migration v7),
+            aur ek dedicated CI gate. Par SSE path abhi bhi <code>OpenFilter</code> use karta hai —
+            matlab HTTP transport pe access control effectively off hai.
+          </p>
+          <dl class="kv">
+            <dt>Files</dt><dd class="path">mcp/src/sse.rs · mcp/src/session.rs · retrieval/src/rbac.rs</dd>
+            <dt>Test</dt><dd><code>crates/travsr-retrieval/tests/rbac_leak_suite.rs</code> — pattern already set hai, extend karo.</dd>
+          </dl>
+        </div>
+      </div>
+
+      <!-- TASK 5 -->
+      <div class="task gap">
+        <div class="task-head">
+          <span class="chip gap">plans · not started</span>
+          <h3>Likhe hue plans jo bane nahi</h3>
+        </div>
+        <div class="task-body">
+          <div class="twrap">
+            <table>
+              <thead><tr><th>Plan</th><th>Status (file me likha)</th><th>Size</th></tr></thead>
+              <tbody>
+                <tr><td class="path">issue-393-rrf-fusion-cascade-redesign.md</td><td><strong>"Plan (not started)"</strong></td><td>L · 3–4 din</td></tr>
+                <tr><td class="path">issue-323-read-path-perf-audit.md</td><td>"Draft — awaiting sign-off"</td><td>7 bottlenecks</td></tr>
+                <tr><td class="path">embedding-model-selection-and-config-catalog.md</td><td>"implementation pending"</td><td>M</td></tr>
+                <tr><td class="path">sidecar-usearch-option-b.md</td><td>"Draft for sign-off"</td><td>separate repo</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            <strong>#393 sabse juicy hai</strong> — plan me live-confirmed repro likha hai:
+          </p>
+          <pre>travsr ask "workflow"    → 12 rows, sab data_format.rs ki functions
+                           0 of the .github/workflows/*.yml files
+travsr ask "workflows"   → 14 rows, sab .github/workflows/*.yml
+                           0 code symbols</pre>
+          <p>Ek 's' aur poora result set flip. Classic cascade short-circuit — plan me diagnosis already likhi hui hai, sirf implement karna hai.</p>
+        </div>
+      </div>
+
+      <!-- TASK 6 -->
+      <div class="task win">
+        <div class="task-head">
+          <span class="chip win">good first issues</span>
+          <h3>Chhote, saaf tasks</h3>
+        </div>
+        <div class="task-body">
+          <div class="twrap">
+            <table>
+              <thead><tr><th>Task</th><th>Location</th><th>Note</th></tr></thead>
+              <tbody>
+                <tr><td>9 missing fuzz targets</td><td class="path">plugin-host/src/registry.rs:19–29</td><td>java, kotlin, ruby, csharp, php, scala, cpp, c, objectivec. <code>fuzz/</code> me existing target copy karke pattern follow karo.</td></tr>
+                <tr><td>OTLP counter metrics</td><td class="path">mcp/src/server.rs:310, 870</td><td><code>TODO(travsr-060)</code> — hand-rolled counters ko otel Counter se replace.</td></tr>
+                <tr><td>Sandbox rlimits</td><td class="path">indexer/src/python_lsif.rs:133</td><td><code>TODO(S14)</code> — RLIMIT_AS / RLIMIT_CPU / RLIMIT_NOFILE via <code>nix</code>.</td></tr>
+                <tr><td>Naya language plugin</td><td class="path">plugin-host/src/plugins/*.rs</td><td>RFC-011 ka design goal: "ek plugin crate + ek golden fixture". ~85 lines per plugin.</td></tr>
+                <tr><td>VS Code extension</td><td class="path">packages/travsr-vscode</td><td>Rust ke muqable kam invested. Cytoscape graph panel, code lens, hover. Visible impact.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- TASK 7 -->
+      <div class="task gap">
+        <div class="task-head">
+          <span class="chip gap">feature ideas</span>
+          <h3>Naye MCP tools jo missing hain</h3>
+        </div>
+        <div class="task-body">
+          <p>Abhi 12 query tools hain. Ye teen graph me already maujood data expose karenge:</p>
+          <ul>
+            <li><code>get_type_hierarchy</code> — <code>is-implementation</code> + <code>overrides</code> edges pehle se store me hain, koi tool unhe expose nahi karta.</li>
+            <li><code>get_diff_context</code> — git diff do, blast radius lo. <code>docs/rfcs/RFC-016-diagnostic-change-impact.md</code> exist karta hai.</li>
+            <li><code>find_similar</code> — dependency-pattern se structurally similar functions.</li>
+          </ul>
+          <p>
+            Aur ek data gap: <code>edges.confidence</code> column migration v6 me add hua tha,
+            par sirf <code>ffi/call</code> use karta hai. Har edge pe confidence ho sakti hai,
+            aur PPR usse weight kar sakta hai.
+          </p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ══════════ 5. WORKFLOW ══════════ -->
+  <section>
+    <div class="sec-head">
+      <div class="eyebrow">06 — Workflow</div>
+      <h2>Change kaise karo</h2>
+    </div>
+
+    <div class="cols">
+      <div class="callout win">
+        <h3>Setup + dogfood</h3>
+        <pre>cargo build --workspace      <b># 5–10 min pehli baar</b>
+cargo test --workspace       <b># ~1,299 tests</b>
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+
+cargo build --release        <b># bench ko release chahiye</b>
+./target/release/travsr init
+./target/release/travsr ask "how does seed selection work"
+./target/release/travsr graph get_context_body --direction callers</pre>
+        <p>Phir isi repo ko apne editor me MCP server bana lo — Travsr se Travsr pe kaam karoge. <code>docs/dogfooding.md</code>.</p>
+      </div>
+
+      <div class="callout">
+        <h3>Baseline lo — kuch badalne se PEHLE</h3>
+        <pre>node bench/run.mjs
+<b># → bench/results.json, report.md, judge-packets.json</b>
+
+<b># kisi aur repo pe:</b>
+BENCH_REPO=/path/to/kubernetes \
+BENCH_QUERIES=bench/queries-k8s.json \
+BENCH_TARGETS=bench/targets-k8s.json \
+BENCH_LABEL=k8s-mytest \
+node bench/run.mjs</pre>
+        <p><code>report.md</code> ko safe jagah copy karo — ye tumhara <em>before</em> hai. Retrieval PR me before/after table expected hai.</p>
+      </div>
+
+      <div class="callout">
+        <h3>Debug tooling (already bana hua hai)</h3>
+        <pre>RUST_LOG=travsr_mcp=debug,travsr_retrieval=debug \
+  ./target/release/travsr ask "query"
+
+<b># har threshold env se override hota hai</b>
+TRAVSR_SEMANTIC_PROMOTE_STRONG=0.70 …
+TRAVSR_CONFIRM_ANCHOR_FLOOR=0.60 …
+TRAVSR_KNN_BUDGET_MS=2000 …
+
+<b># hidden diagnostic MCP tools (tools/list me nahi)</b>
+seed_trace        <b># pura seed pipeline trace</b>
+embed_knn_probe   <b># raw KNN, koi fusion nahi</b>
+
+./target/release/travsr fsck</pre>
+        <p>Env-override design deliberate hai — recompile kiye bina floors sweep kar sakte ho.</p>
+      </div>
+
+      <div class="callout crit">
+        <h3>Rules jo CI enforce karti hai</h3>
+        <ul>
+          <li><code>crates/</code> me koi <code>unwrap()</code> / <code>expect()</code> — sirf <code>travsr-cli</code> me allowed</li>
+          <li>Libraries me <code>println!</code> nahi — sirf <code>tracing::info!/warn!/debug!</code></li>
+          <li><code>#![forbid(unsafe_code)]</code> — exception ke liye RFC chahiye</li>
+          <li>MSRV 1.75 — koi dep isse upar MSRV nahi maang sakti</li>
+          <li>Branch: <code>feature/&lt;crate&gt;-&lt;desc&gt;</code> · <code>fix/&lt;crate&gt;-&lt;desc&gt;</code> · <code>rfc/&lt;n&gt;-&lt;title&gt;</code></li>
+          <li>Commit: <code>[crate] Issue #NNN — description (#PR)</code></li>
+        </ul>
+        <p>
+          <strong>Cultural rule:</strong> har non-obvious decision ek RFC ya ADR hai (23 + 14).
+          Koi threshold ya weight badalne se pehle grep karo ki kaunsa RFC usko set karta hai —
+          peeche hamesha ek measurement hoti hai.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════ 6. READING ORDER ══════════ -->
+  <section>
+    <div class="sec-head">
+      <div class="eyebrow">07 — Onboarding</div>
+      <h2>Padhne ka order</h2>
+    </div>
+    <div class="twrap">
+      <table>
+        <thead><tr><th class="loc">#</th><th>File / doc</th><th>Kyun</th></tr></thead>
+        <tbody>
+          <tr><td class="loc">1</td><td class="path">crates/travsr-core/src/lib.rs</td><td>Pura data model, 1,557 lines, sab documented. Iske bina kuch samajh nahi aayega.</td></tr>
+          <tr><td class="loc">2</td><td class="path">docs/rfcs/RFC-014-phase-b-symbol-unification.md</td><td>Graph ki sabse badi bug ki kahani — 613k nodes "rich but unreachable".</td></tr>
+          <tr><td class="loc">3</td><td class="path">docs/rfcs/RFC-011-two-transport-plugin-architecture.md</td><td>Plugin + sandbox design. Transport ≠ edge determination.</td></tr>
+          <tr><td class="loc">4</td><td class="path">crates/travsr-mcp/src/tools.rs:3038</td><td><code>get_context_body</code> — pura read pipeline ek function me.</td></tr>
+          <tr><td class="loc">5</td><td class="path">crates/travsr-mcp/src/seed.rs</td><td>Constants section pehle padho — wo code me likha design doc hai.</td></tr>
+          <tr><td class="loc">6</td><td class="path">crates/travsr-retrieval/src/ppr.rs</td><td>Algorithm, self-contained, benchmarked. Safe jagah experiment karne ke liye.</td></tr>
+          <tr><td class="loc">7</td><td class="path">crates/travsr-daemon/src/lib.rs:759</td><td><code>init_repo_with_progress</code> — write path end to end.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="thesis" style="border-left-color: var(--control);">
+      Ek line ka mental model — parse → typed graph in SQLite → query se graph seed karo
+      (lexical + semantic, RRF-fused, abstention gate ke saath) → PageRank bahar → rerank →
+      knapsack se token budget me pack → agent ko real code with real edges do.
+    </p>
+    <p>
+      Product ka core bet <strong>honesty over coverage</strong> hai — isiliye abstention gate hai.
+      Bench data kehta hai ki abstention <em>kaam kar raha hai</em> (nonsense 3/3 ✓) par abhi
+      thoda <em>zyada</em> aggressive hai (conceptual 1/8). Wahi tumhara battlefield hai.
+    </p>
+  </section>
+
+  <footer>
+    <span>Travsr · 15 crates · ~82k LOC</span>
+    <span>Measured from working tree @ 94dd4cd</span>
+    <span>Apache-2.0</span>
+  </footer>
+
+</div>
+
+</body>
+</html>

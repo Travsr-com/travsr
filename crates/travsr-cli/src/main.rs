@@ -303,7 +303,7 @@ enum Command {
         /// Address to bind on. Defaults to loopback: this server speaks
         /// plaintext HTTP with bearer-token auth, so exposing it beyond this
         /// machine should be deliberate. Pass `0.0.0.0` when a TLS terminator
-        /// sits in front (#410).
+        /// sits in front.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// TCP port to bind the SSE server on.
@@ -380,7 +380,7 @@ enum DaemonAction {
     StopEmbed,
     /// Resume background embed reindexing paused by `stop-embed`.
     ResumeEmbed,
-    /// Show the last diagnostics overlay the editor extension reported (#688).
+    /// Show the last diagnostics overlay the editor extension reported.
     ///
     /// Answers "is the VS Code overlay reaching the daemon, and what did it
     /// last see". Held in memory by the running daemon, so a restart clears it.

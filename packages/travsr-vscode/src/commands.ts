@@ -608,6 +608,7 @@ type PanelMessage =
   | { command: "installLang"; language: string }
   | { command: "approveLang"; language: string; approvedBy: string; reason: string; permittedHosts: string }
   | { command: "removeLang"; language: string }
+  | { command: "enableWithPermission"; language: string }
   | { command: "detectLangs" }
   | { command: "reloadAvailable" }
   | { command: "pickRepo" }
@@ -954,18 +955,31 @@ export async function readDiagnostics(binary: string, cwd: string): Promise<Diag
  *  wall-clock timeout is fine here because these do no network I/O, so a hang
  *  means something is wrong and killing it is the right move. Network installs
  *  must NOT use this — see `spawnManagedInstall`. */
-function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutMs = 4_000): Promise<string> {
+/** Run a short lang command and resolve its combined output plus exit code.
+ *  `code` is `null` on timeout or spawn error, so a caller that must confirm a
+ *  command actually succeeded (a security-consent grant) can check `code === 0`
+ *  rather than trust empty output. */
+function spawnLangCommandResult(
+  binary: string,
+  args: string[],
+  cwd?: string,
+  timeoutMs = 4_000
+): Promise<{ out: string; code: number | null }> {
   return new Promise((resolve) => {
     let out = "";
     let resolved = false;
-    const done = (v: string): void => { if (!resolved) { resolved = true; resolve(v); } };
+    const done = (v: { out: string; code: number | null }): void => { if (!resolved) { resolved = true; resolve(v); } };
     const proc = cp.spawn(binary, args, { env: { ...process.env, TERM: "dumb", NO_COLOR: "1" }, ...(cwd ? { cwd } : {}) });
     proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
     proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
-    const timer = setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done(""); }, timeoutMs);
-    proc.on("close", () => { clearTimeout(timer); done(out); });
-    proc.on("error", (e) => { clearTimeout(timer); done(`error: ${e.message}`); });
+    const timer = setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done({ out, code: null }); }, timeoutMs);
+    proc.on("close", (code) => { clearTimeout(timer); done({ out, code }); });
+    proc.on("error", (e) => { clearTimeout(timer); done({ out: `error: ${e.message}`, code: null }); });
   });
+}
+
+function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutMs = 4_000): Promise<string> {
+  return spawnLangCommandResult(binary, args, cwd, timeoutMs).then((r) => r.out);
 }
 
 /** The last non-empty line of CLI output — the final status the command printed
@@ -991,14 +1005,14 @@ function spawnManagedInstall(
   args: string[],
   cwd: string,
   title: string
-): Thenable<{ out: string; cancelled: boolean }> {
+): Thenable<{ out: string; cancelled: boolean; code: number | null }> {
   return vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title, cancellable: true },
     (_progress, token) =>
       new Promise((resolve) => {
         let out = "";
         let settled = false;
-        const finish = (r: { out: string; cancelled: boolean }): void => {
+        const finish = (r: { out: string; cancelled: boolean; code: number | null }): void => {
           if (!settled) { settled = true; resolve(r); }
         };
         const proc = cp.spawn(binary, args, {
@@ -1009,10 +1023,15 @@ function spawnManagedInstall(
         proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
         token.onCancellationRequested(() => {
           try { proc.kill(); } catch { /* ignore */ }
-          finish({ out, cancelled: true });
+          finish({ out, cancelled: true, code: null });
         });
-        proc.on("close", () => finish({ out, cancelled: false }));
-        proc.on("error", (e) => finish({ out: `${out}\nerror: ${e.message}`, cancelled: false }));
+        // Exit code carries meaning: `lang install` exits 2 when the language was
+        // set up but the project build tool it needs (e.g. Gradle, sbt, composer)
+        // is not installed — a partial success the caller reports honestly.
+        proc.on("close", (code) => finish({ out, cancelled: false, code }));
+        proc.on("error", (e) =>
+          finish({ out: `${out}\nerror: ${e.message}`, cancelled: false, code: null })
+        );
       })
   );
 }
@@ -1046,7 +1065,10 @@ export function registerShowLanguages(
   const render = async (): Promise<string> => {
     const langsRaw = await client.callTool("repo_languages");
     if (!availableLoaded) {
-      const raw = await spawnLangCommand(getBinary(), ["lang", "list", "--json"]);
+      // Run in the target repo so the CLI computes the per-repo "This repo" column
+      // (enabled / not enabled / …). Without a cwd it runs outside any repo and
+      // every non-builtin reads "n/a" (no_repo). `current()` never prompts.
+      const raw = await spawnLangCommand(getBinary(), ["lang", "list", "--json"], activeRepo.current());
       cachedAvailable = parseAvailableLanguages(raw);
       availableLoaded = true;
     }
@@ -1063,7 +1085,7 @@ export function registerShowLanguages(
     if (msg.command === "reloadAvailable") {
       availableLoaded = false;
       postStatus('Reloading available tools…');
-      void spawnLangCommand(getBinary(), ["lang", "list", "--json"]).then((raw) => {
+      void spawnLangCommand(getBinary(), ["lang", "list", "--json"], activeRepo.current()).then((raw) => {
         cachedAvailable = parseAvailableLanguages(raw);
         availableLoaded = true;
         postStatus(""); // clear immediately — never couple clear to render()/callTool
@@ -1081,12 +1103,22 @@ export function registerShowLanguages(
         // cwd = the chosen repo so the CLI auto-enables it. Runs under a
         // cancellable progress notification with no wall-clock kill, so a slow
         // download is never cut off mid-flight and reported as a false success.
-        void spawnManagedInstall(getBinary(), args, repo, `Installing ${msg.language}…`).then(({ out, cancelled }) => {
+        void spawnManagedInstall(getBinary(), args, repo, `Installing ${msg.language}…`).then(({ out, cancelled, code }) => {
           availableLoaded = false;
           void refresh();
           if (cancelled) {
             void vscode.window.showWarningMessage(
               `Install of ${msg.language} was cancelled — it may be partly done. Re-run, or run \`travsr lang install ${msg.language}\` in a terminal.`
+            );
+          } else if (code === 2) {
+            // Set up, but the project build tool it needs is not installed, so full
+            // analysis cannot run yet. The CLI already phrases this; name the tool
+            // from the Prerequisites column as a fallback.
+            const need = cachedAvailable.find((x) => x.language === msg.language)?.prerequisites;
+            const needTxt = need && need !== "none" ? ` (${need})` : "";
+            void vscode.window.showWarningMessage(
+              lastLine(out) ||
+                `${msg.language} is set up, but the build tool it needs${needTxt} was not found. Install it, then Reload to get full analysis.`
             );
           } else {
             void vscode.window.showInformationMessage(lastLine(out) || `${msg.language} tool installed.`);
@@ -1136,6 +1168,63 @@ export function registerShowLanguages(
           void vscode.window.showInformationMessage(`Disabled language tool for ${msg.language}.`);
         });
         return;
+      case "enableWithPermission": {
+        // A security-relevant grant: full analysis for this language will run with
+        // the user's own privileges (its build tools cannot run isolated on this
+        // OS). Confirm in plain language first, then record it and re-index so it
+        // takes effect — no command to type.
+        const ok = await vscode.window.showWarningMessage(
+          `Allow full analysis for ${msg.language} to run on this machine?`,
+          {
+            modal: true,
+            detail:
+              "It will use your project's own build tools — the same as if you ran the build yourself — including downloading this project's dependencies. You can withdraw this permission later.",
+          },
+          "Allow"
+        );
+        if (ok !== "Allow") return;
+        const repo = await activeRepo.ensureChosen();
+        if (!repo) return;
+        postStatus(`Enabling ${msg.language}…`);
+        // Record the grant first, and stop if it fails. The modal above is the
+        // explicit user grant, so pass `--yes`: the CLI refuses a non-interactive
+        // grant without it (a VS Code spawn never has a terminal). Check the exit
+        // code — a security-consent step must not report success unless the
+        // permission was actually recorded.
+        const grant = await spawnLangCommandResult(getBinary(), [
+          "lang",
+          "allow-unsandboxed",
+          msg.language,
+          "--yes",
+        ]);
+        if (grant.code !== 0) {
+          postStatus("");
+          void refresh();
+          void vscode.window.showErrorMessage(
+            `Could not enable ${msg.language}: ${lastLine(grant.out) || "the permission was not recorded."}`
+          );
+          return;
+        }
+        const { cancelled } = await spawnManagedInstall(
+          getBinary(),
+          ["init", "--semantic", "--force"],
+          repo,
+          `Enabling ${msg.language}…`
+        );
+        availableLoaded = false;
+        postStatus("");
+        void refresh();
+        if (cancelled) {
+          void vscode.window.showWarningMessage(
+            `Enabling ${msg.language} was cancelled before analysis finished. Use Reload to try again.`
+          );
+        } else {
+          void vscode.window.showInformationMessage(
+            `${msg.language} is enabled. Full analysis will run on the next index.`
+          );
+        }
+        return;
+      }
       case "pickRepo":
         await activeRepo.pick();
         void refresh();
