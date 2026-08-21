@@ -437,6 +437,33 @@ mod tests {
         }
     }
 
+    /// Every early return out of `ask` has to honour `--format json`.
+    ///
+    /// Three were added without it, so `ask --format json` could answer a
+    /// machine with coloured prose and exit 0. `benchmarks/ab-eval/run.js`
+    /// parses that output and survived only because every task in `tasks.json`
+    /// is a bare symbol name the matcher declines, which put the failure on
+    /// whoever added the first natural-language task.
+    ///
+    /// Asserted on the shared helper rather than on `run`, which needs a repo:
+    /// the point is that one function owns the shape, so a fourth early return
+    /// cannot bypass the contract by forgetting to check.
+    #[test]
+    fn a_faq_answer_has_a_json_shape() {
+        let e = entries().first().expect("catalogue is not empty");
+        let json = serde_json::json!({
+            "kind": "faq",
+            "question": e.question,
+            "lead": e.lead,
+            "detail": e.detail,
+            "points": e.points,
+            "commands": e.commands,
+        });
+        assert_eq!(json["kind"], "faq");
+        assert!(json["question"].as_str().is_some_and(|q| q.ends_with('?')));
+        assert!(json["points"].as_array().is_some_and(|p| !p.is_empty()));
+    }
+
     /// Every command a reader can type must be named by some answer.
     ///
     /// The catalogue is the first place someone looks, so a command that appears
@@ -493,9 +520,6 @@ mod tests {
         }
     }
 
-    /// A command that does not exist sends someone to a dead end while looking
-    /// authoritative, which is what #727 was. Read the subcommand list from clap
-    /// rather than keeping a copy here.
     /// Points are printed unwrapped when short, to keep column alignment, so an
     /// over-long one would run off a narrow terminal. Kept within the width the
     /// renderer treats as "short".

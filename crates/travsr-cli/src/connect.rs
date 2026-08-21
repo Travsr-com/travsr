@@ -1078,7 +1078,29 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
     // conversation, where the MCP wiring is read once at startup. Removal is not
     // filtered, or `--remove` would strand a rules file written by an earlier
     // run with `--rules`.
-    let wanted = |p: &Planned| opts.remove || opts.rules || !p.content.is_guidance();
+    // Already written by an earlier run, so keep it current.
+    //
+    // Filtering guidance out unconditionally froze it: `upsert_block` never ran,
+    // so a `<!-- travsr:begin -->` block already in someone's CLAUDE.md kept the
+    // old 2270-character body forever. The token saving this is built around
+    // would have reached only people who had never run `connect`, which is
+    // nobody, while `the_always_on_guidance_stays_small` passed against a
+    // shipped file twice the budget.
+    //
+    // Presence of our block is the test, not presence of the file. CLAUDE.md
+    // usually exists for reasons that have nothing to do with travsr, and
+    // writing guidance into it because it happens to be there would put back the
+    // opt-out this change removed.
+    let already_written = |p: &Planned| match &p.content {
+        Content::ManagedMd { .. } => std::fs::read_to_string(&p.path)
+            .map(|t| t.contains(MD_BEGIN))
+            .unwrap_or(false),
+        // A file travsr owns outright: it exists only because we wrote it.
+        Content::Owned { .. } => p.path.exists(),
+        Content::JsonServer { .. } => false,
+    };
+    let wanted =
+        |p: &Planned| opts.remove || opts.rules || !p.content.is_guidance() || already_written(p);
 
     for tool in Tool::ALL {
         if let Some(only) = &opts.only {
@@ -1973,6 +1995,74 @@ mod tests {
         assert!(
             !repo.join("CLAUDE.md").exists(),
             "a default connect wrote CLAUDE.md, which is re-read on every turn"
+        );
+    }
+
+    /// #746 review: an existing guidance block must be refreshed, not frozen.
+    ///
+    /// Filtering guidance out unconditionally meant `upsert_block` never ran, so
+    /// whoever ran `connect` before this change kept the old body forever and
+    /// the token saving reached nobody who had already connected.
+    #[test]
+    fn an_existing_guidance_block_is_refreshed_without_rules() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let repo = d.path();
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(repo.join(".claude")).expect("claude dir");
+
+        let opts = |rules: bool| ConnectOpts {
+            only: Some("claude-code".to_string()),
+            dry_run: false,
+            remove: false,
+            commit: false,
+            rules,
+            report: Report::Silent,
+        };
+
+        // An earlier run wrote guidance, with a body that is now out of date.
+        run(repo, &opts(true)).expect("connect --rules");
+        let path = repo.join("CLAUDE.md");
+        let stale = std::fs::read_to_string(&path)
+            .expect("CLAUDE.md")
+            .replace(GUIDE_TITLE, "Some older heading we no longer ship");
+        std::fs::write(&path, &stale).expect("write stale body");
+
+        // A default run must bring it back up to date.
+        run(repo, &opts(false)).expect("connect");
+        let after = std::fs::read_to_string(&path).expect("CLAUDE.md");
+        assert!(
+            after.contains(GUIDE_TITLE),
+            "an existing block must be refreshed by a default run: {after}"
+        );
+    }
+
+    /// The other half: a CLAUDE.md that exists for its own reasons must not
+    /// acquire guidance just by being there, or the opt-in is an opt-out.
+    #[test]
+    fn a_users_own_markdown_does_not_acquire_guidance() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let repo = d.path();
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(repo.join(".claude")).expect("claude dir");
+        std::fs::write(repo.join("CLAUDE.md"), "# My own notes\n").expect("write");
+
+        run(
+            repo,
+            &ConnectOpts {
+                only: Some("claude-code".to_string()),
+                dry_run: false,
+                remove: false,
+                commit: false,
+                rules: false,
+                report: Report::Silent,
+            },
+        )
+        .expect("connect");
+
+        let after = std::fs::read_to_string(repo.join("CLAUDE.md")).expect("CLAUDE.md");
+        assert!(
+            !after.contains(MD_BEGIN),
+            "a file we never wrote to must not gain guidance by default: {after}"
         );
     }
 

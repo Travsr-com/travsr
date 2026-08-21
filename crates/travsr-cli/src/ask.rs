@@ -141,6 +141,36 @@ fn note_cold_path_cannot_render_docs(repo_root: &std::path::Path) {
     );
 }
 
+/// Answer a FAQ entry in whichever shape the caller asked for.
+///
+/// Every path out of `ask` has to honour `--format json`. Three early returns
+/// were added without it, so `ask --format json` could answer a machine with
+/// coloured prose and exit 0. `benchmarks/ab-eval/run.js` parses that output,
+/// and it survived only because every task in `tasks.json` is a bare symbol
+/// name that the FAQ matcher declines; the first natural-language task added
+/// there would have broken it, which puts the failure on whoever adds a
+/// benchmark rather than on the change that caused it.
+fn answer_faq(e: &crate::faq::Entry, format: OutputFormat) -> anyhow::Result<()> {
+    use std::io::IsTerminal as _;
+    if matches!(format, OutputFormat::Json) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "kind": "faq",
+                "question": e.question,
+                "lead": e.lead,
+                "detail": e.detail,
+                "points": e.points,
+                "commands": e.commands,
+            })
+        );
+        return Ok(());
+    }
+    let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
+    crate::faq::print_entry(e, pal);
+    Ok(())
+}
+
 pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     if query_str.trim().is_empty() {
         anyhow::bail!("search query must not be empty — try: travsr ask \"PaymentService\"");
@@ -151,15 +181,36 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     // natural phrasing; this is the spelling that cannot be ambiguous, and the
     // one the agent guidance points at.
     if let Some(rest) = crate::faq::strip_namespace(query_str) {
-        use std::io::IsTerminal as _;
-        let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
         match crate::faq::match_namespaced(rest) {
-            Some(e) => crate::faq::print_entry(e, pal),
+            Some(e) => answer_faq(e, format)?,
             // Listing the questions beats "no match": the reader has already
             // said what kind of answer they want, so show what is on offer.
-            None => crate::faq::print_questions(pal),
+            None if matches!(format, OutputFormat::Json) => println!(
+                "{}",
+                serde_json::json!({
+                    "kind": "faq",
+                    "matched": false,
+                    "questions": crate::faq::questions().collect::<Vec<_>>(),
+                })
+            ),
+            None => {
+                use std::io::IsTerminal as _;
+                crate::faq::print_questions(crate::progress::Palette::for_stream(
+                    std::io::stdout().is_terminal(),
+                ))
+            }
         }
         return Ok(());
+    }
+
+    // Matched before the repository is located, not after. This used to sit
+    // below `find_git_root` and the `graph.db` existence check, so
+    // `travsr ask "what is travsr?"` in a fresh clone answered
+    // "not initialized, run travsr init", and outside a git repo it failed in
+    // `find_git_root`. That is precisely the reader the catalogue is written
+    // for: `faq.rs` says so in its own module doc, and the code contradicted it.
+    if let Some(e) = crate::faq::match_question(query_str) {
+        return answer_faq(e, format);
     }
 
     note_docs_flag_is_read_by_the_daemon();
@@ -171,26 +222,31 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         anyhow::bail!("not initialized — run `travsr init`");
     }
 
-    // A question about travsr, or about the repository as a whole, is not a
-    // question the graph can answer. `ask` seeds from the words in the query, so
-    // "what is this repo written in?" matches `var:REPO` and returns a screen of
-    // bench files with confident-looking scores. That is worse than abstaining:
-    // the answer exists, one command away, and the result looks like a real one.
+    // A question about the repository as a whole is not one the graph can
+    // answer. `ask` seeds from the words in the query, so "what is this repo
+    // written in?" matches `var:REPO` and returns a screen of bench files with
+    // confident-looking scores. That is worse than abstaining: the answer exists
+    // one command away, and the result looks like a real one.
     //
-    // Caught before retrieval rather than after, because retrieval succeeds here.
-    // There is no low-confidence signal to hang an abstention on.
-    // A question the FAQ already answers, matched against the FAQ's own questions
-    // rather than a parallel phrase list. Tried first so a new FAQ entry is
-    // reachable from `ask` the moment it is written.
-    if let Some(e) = crate::faq::match_question(query_str) {
-        use std::io::IsTerminal as _;
-        let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
-        crate::faq::print_entry(e, pal);
-        return Ok(());
-    }
-
+    // Caught before retrieval rather than after, because retrieval succeeds
+    // here. There is no low-confidence signal to hang an abstention on.
     if let Some(redirect) = meta_question_redirect(query_str) {
         use std::io::IsTerminal as _;
+        // In JSON mode, name the command instead of running it. This branch
+        // delegates to another command's *human* renderer, with `json: false`
+        // hardcoded for `lang list` and no JSON mode at all in `status`, so
+        // running it would answer a machine-readable request with a table.
+        if matches!(format, OutputFormat::Json) {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "kind": "redirect",
+                    "answer": redirect.answer,
+                    "command": redirect.command,
+                })
+            );
+            return Ok(());
+        }
         let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
         // Answer here rather than naming another command. Someone who typed the
         // question has already said what they want to know, and "run this other
@@ -778,13 +834,23 @@ pub(crate) struct MetaRedirect {
 /// Matched as whole phrases rather than keywords, deliberately. A bare "repo" or
 /// "language" appears in plenty of legitimate code questions, and hijacking those
 /// would be a worse failure than the one being fixed.
+///
+/// Containing a space is not the bar. `contains` matches anywhere in the query,
+/// so a mid-sentence fragment is as generic as a bare keyword: `is the index`
+/// hijacked "where is the index rebuilt after a commit", `how big is` hijacked
+/// "how big is a NodeId", and both are ordinary questions about this codebase.
+/// This path runs before retrieval and returns, so the search the reader wanted
+/// never happens, which is worse than the noisy failure it replaced. Each
+/// trigger now carries enough of its own sentence to be about the repository
+/// rather than about something in it.
 const META_QUESTIONS: &[(&[&str], MetaRedirect)] = &[
     (
         &[
             "what is this repo written in",
-            "what languages",
-            "what language is this",
-            "which languages",
+            "what languages does this repo",
+            "what languages does the repo",
+            "what language is this repo",
+            "what language is this project",
             "tech stack",
             "what is this codebase written in",
         ],
@@ -795,13 +861,15 @@ const META_QUESTIONS: &[(&[&str], MetaRedirect)] = &[
     ),
     (
         &[
-            "how big is",
-            "how many files",
-            "how many nodes",
-            "is the index",
+            "how big is the index",
+            "how big is the graph",
+            "how many files are indexed",
+            "how many nodes are in the graph",
+            "is the index ready",
+            "is the index fresh",
+            "is the index up to date",
             "is my index",
             "is the graph fresh",
-            "is it up to date",
         ],
         MetaRedirect {
             answer: "That is a question about the index rather than about the code.",
@@ -942,12 +1010,17 @@ mod meta_question_tests {
         }
     }
 
+    /// The triggers carry enough of their own sentence to be about the index.
+    /// `is it up to date` used to be one and was dropped in the #746 review:
+    /// `contains` matches it anywhere, so "check if it is up to date before the
+    /// write" would have been answered with a status table instead of searched.
     #[test]
     fn questions_about_the_index_go_to_status() {
         for q in [
             "how big is the graph",
             "is my index ready",
-            "is it up to date",
+            "is the index up to date",
+            "is the graph fresh",
         ] {
             let r = meta_question_redirect(q).unwrap_or_else(|| panic!("{q} not matched"));
             assert_eq!(r.command, "travsr status", "{q}");
@@ -968,6 +1041,15 @@ mod meta_question_tests {
             "RepoStats",
             "normalize_repo_root",
             "how does the parser handle a repo path",
+            // From the #746 review. Each of these hijacked a real search: the
+            // trigger was a mid-sentence fragment, and `contains` matches it
+            // anywhere. This path returns before retrieval, so the reader's
+            // search never ran.
+            "where is the index rebuilt after a commit",
+            "how big is a NodeId",
+            "how many nodes does the PPR walk visit",
+            "which languages does the analysis crate support",
+            "is the index_files helper called twice",
         ] {
             assert!(
                 meta_question_redirect(q).is_none(),
@@ -1183,7 +1265,10 @@ mod faq_tests {
             .collect();
         assert!(!known.is_empty(), "clap reported no subcommands");
 
-        for (_, command) in FAQ {
+        for (_, template) in FAQ {
+            let command = template
+                .replace("{sym}", "PaymentService")
+                .replace("{term}", "payment");
             let mut words = command.split_whitespace();
             assert_eq!(words.next(), Some("travsr"), "`{command}`");
             let sub = words.next().unwrap_or("");
@@ -1191,6 +1276,20 @@ mod faq_tests {
                 known.iter().any(|k| k == sub),
                 "`{command}` names unknown subcommand {sub:?}"
             );
+
+            // The name existing is not enough. `faq.rs` learned this when
+            // `travsr explain "<query>"` passed a name check and still exited 2
+            // for missing its second argument, and this is the list a reader is
+            // most likely to paste from, so it gets the same parse.
+            let argv: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+            if let Err(e) = crate::Cli::command().try_get_matches_from(&argv) {
+                use clap::error::ErrorKind::{DisplayHelp, DisplayVersion};
+                assert!(
+                    matches!(e.kind(), DisplayHelp | DisplayVersion),
+                    "`{command}` does not parse: {}",
+                    e.render().to_string().lines().next().unwrap_or_default()
+                );
+            }
         }
     }
 
@@ -1378,7 +1477,12 @@ fn nearest_symbol(db_path: &std::path::Path, query: &str) -> Option<String> {
             !travsr_core::noise::is_structural_noise(n)
                 && n.test_role == travsr_core::TestRole::None
         })
-        .or_else(|| hits.first())
+        // No `or_else(|| hits.first())` here. `find` returns None only when every
+        // hit is noise or a test, which is exactly the case the filter above
+        // argues against, so falling back to the unfiltered first hit handed
+        // back the very suggestion the comment calls worse than nothing.
+        // `suggest_next` documents the contract: return empty and let the caller
+        // fall back to the catalogue, which it already does.
         .map(|n| travsr_core::ident::leaf_of(&n.vname.signature).to_string())?;
     (!leaf.is_empty()).then_some(leaf)
 }
