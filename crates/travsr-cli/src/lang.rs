@@ -113,6 +113,9 @@ pub enum LangCommand {
         /// Withdraw a permission granted earlier.
         #[arg(long)]
         revoke: bool,
+        /// Skip the confirmation prompt (required to grant non-interactively).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -162,7 +165,8 @@ pub fn run(cmd: LangCommand) -> Result<()> {
             language,
             granted_by,
             revoke,
-        } => cmd_allow_unsandboxed(&language, granted_by.as_deref(), revoke),
+            yes,
+        } => cmd_allow_unsandboxed(&language, granted_by.as_deref(), revoke, yes),
     }
 }
 
@@ -1666,7 +1670,12 @@ fn cmd_approve(
 
 // ── allow-unsandboxed (permission to run with the user's own privileges) ──────
 
-fn cmd_allow_unsandboxed(language: &str, granted_by: Option<&str>, revoke: bool) -> Result<()> {
+fn cmd_allow_unsandboxed(
+    language: &str,
+    granted_by: Option<&str>,
+    revoke: bool,
+    yes: bool,
+) -> Result<()> {
     let entry =
         lookup(language).ok_or_else(|| anyhow::anyhow!("Unknown language '{language}'."))?;
 
@@ -1694,6 +1703,25 @@ fn cmd_allow_unsandboxed(language: &str, granted_by: Option<&str>, revoke: bool)
         return Ok(());
     }
 
+    // Explain the trade-off BEFORE recording anything, then confirm. This grant
+    // lifts Travsr's isolation for one language, so the user must see what they
+    // are agreeing to first — plain language, no internal jargon.
+    println!(
+        "Granting '{language}' permission to run with your own privileges on Windows.\n\
+         Its build tools cannot run inside Travsr's isolation there, so full analysis \
+         needs this.\n\
+         \n\
+         What this allows: when Travsr indexes this project, '{language}' analysis will \
+         download dependencies and run this project's own build with your privileges — \
+         the same as if you ran the build yourself. Only grant it for a project whose \
+         build you trust.\n"
+    );
+
+    if !confirm_unsandboxed_grant(yes)? {
+        println!("No permission recorded for '{language}'.");
+        return Ok(());
+    }
+
     let granted_by = granted_by
         .map(str::to_string)
         .filter(|s| !s.is_empty())
@@ -1704,16 +1732,36 @@ fn cmd_allow_unsandboxed(language: &str, granted_by: Option<&str>, revoke: bool)
     config.grant_unsandboxed_consent(language, &granted_by);
     save_config(&config)?;
 
-    // Plain-language explanation of the trade-off — no internal jargon.
     println!(
-        "Permission recorded: '{language}' analysis may now run with your own privileges \
-         on Windows (its build tools cannot run inside Travsr's isolation there).\n\
-         This lets it download dependencies and run this project's build, the same as if \
-         you ran the build yourself.\n\
+        "Permission recorded for '{language}'.\n\
          Re-index to use it now:  travsr init --semantic --force\n\
          To withdraw it later:    travsr lang allow-unsandboxed {language} --revoke"
     );
     Ok(())
+}
+
+/// Confirm an unsandboxed grant. `--yes` records it non-interactively; otherwise
+/// an interactive terminal is prompted `[y/N]`. With no terminal and no `--yes`
+/// the grant is refused rather than recorded silently, since it relaxes isolation.
+fn confirm_unsandboxed_grant(yes: bool) -> Result<bool> {
+    use std::io::{IsTerminal as _, Write as _};
+    if yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "Refusing to grant this permission without confirmation. Re-run in a terminal, \
+             or pass `--yes` to grant it non-interactively."
+        );
+    }
+    print!("Grant this permission? [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 // ── interactive approval prompt ───────────────────────────────────────────────

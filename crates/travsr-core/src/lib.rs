@@ -797,12 +797,23 @@ pub fn display_signature<'a>(signature: &'a str, path: &str) -> Cow<'a, str> {
 /// already a clean `kind:name` signature and returns `None` here.
 fn external_symbol_label(signature: &str, path: &str) -> Option<String> {
     let descriptors = if let Some(rest) = signature.strip_prefix("scip:") {
-        // `{path}:{scip-symbol}` — strip the node's own path (robust to spaces
-        // in the path), then take the descriptor part of the global symbol.
+        // `{path}:{scip-symbol}`. Prefer stripping the node's own path (robust to
+        // spaces in the path). When the path is empty or does not prefix-match —
+        // the `graph` edge-endpoint renderers call `display_signature(sig, "")`
+        // with no path in hand — fall back to the last `:`: a SCIP global symbol
+        // contains no colon and a repo-relative path does not either, so the tail
+        // after the final colon is the scip symbol even when the path has spaces.
         let scip_symbol = rest
             .strip_prefix(path)
             .and_then(|r| r.strip_prefix(':'))
+            .or_else(|| rest.rsplit_once(':').map(|(_, sym)| sym))
             .unwrap_or(rest);
+        // An anonymous SCIP local (`local <id>`) has no type/member structure, so
+        // `scip_descriptor_part` cannot parse it and it would otherwise fall
+        // through raw. Drop only the `scip:{path}:` noise and keep `local <id>`.
+        if let Some(id) = scip_symbol.strip_prefix("local ") {
+            return Some(format!("local {}", id.trim()));
+        }
         scip_descriptor_part(scip_symbol)?
     } else {
         // SemanticDB global symbols are descriptors only (no scheme prefix);
@@ -2211,6 +2222,70 @@ mod tests {
     fn display_label_leaves_native_signatures_untouched() {
         assert_eq!(label_of("method:Greeter.greet"), "method:Greeter.greet");
         assert_eq!(label_of("class:Main"), "class:Main");
+    }
+
+    #[test]
+    fn display_label_collapses_overload_disambiguator() {
+        // Overloads carry a `(+N)` disambiguator on the method descriptor; the
+        // display name drops it, so `greet().` and `greet(+1).` both read
+        // `Greeter.greet`. The node id (raw signature) is what keeps them
+        // distinct downstream — display is intentionally lossy here.
+        assert_eq!(
+            label_with_path(
+                "src/Greeter.java",
+                "scip:src/Greeter.java:semanticdb maven . . com/demo/Greeter#greet()."
+            ),
+            "Greeter.greet"
+        );
+        assert_eq!(
+            label_with_path(
+                "src/Greeter.java",
+                "scip:src/Greeter.java:semanticdb maven . . com/demo/Greeter#greet(+1)."
+            ),
+            "Greeter.greet"
+        );
+    }
+
+    #[test]
+    fn display_label_drops_package_across_collisions() {
+        // Same type name in two packages collapses to the same package-free
+        // label; identity is preserved by the raw signature, not the label.
+        assert_eq!(label_of("sdb:com/a/Greeter#greet()."), "Greeter.greet");
+        assert_eq!(label_of("sdb:com/b/Greeter#greet()."), "Greeter.greet");
+    }
+
+    #[test]
+    fn display_label_cleans_scip_local() {
+        // An anonymous SCIP local has no type/member structure. Before this fix
+        // it fell through `display_signature` raw as `scip:{path}:local N`; now
+        // only the indexer noise is dropped, keeping the honest `local N`.
+        assert_eq!(
+            label_with_path("src/Greeter.java", "scip:src/Greeter.java:local 4"),
+            "local 4"
+        );
+    }
+
+    #[test]
+    fn display_label_falls_back_on_malformed_scip() {
+        // A scip signature whose global-symbol part has too few fields cannot be
+        // parsed into descriptors; the renderer must fall back to the raw
+        // signature rather than panic or emit an empty label.
+        let sig = "scip:src/Greeter.java:semanticdb maven";
+        assert_eq!(label_with_path("src/Greeter.java", sig), sig);
+    }
+
+    #[test]
+    fn display_signature_empty_path_matches_known_path() {
+        // The `graph` edge-endpoint renderers call `display_signature(sig, "")`
+        // with no path in hand. It must clean identically to the path-aware call,
+        // even when the embedded path contains spaces (which the 4-field split
+        // would otherwise miscount).
+        let sig = "scip:src/My Demo/Greeter.java:semanticdb maven . . com/demo/Greeter#greet().";
+        assert_eq!(
+            display_signature(sig, "src/My Demo/Greeter.java").as_ref(),
+            "Greeter.greet"
+        );
+        assert_eq!(display_signature(sig, "").as_ref(), "Greeter.greet");
     }
 
     #[test]

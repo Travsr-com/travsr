@@ -1131,13 +1131,20 @@ pub fn find_references_structured(
             out.total = sites.len();
             out.truncated = out.total > MAX_REFERENCE_SITES;
             out.references = sites.into_iter().take(MAX_REFERENCE_SITES).collect();
+            // #715 parity with the text path: a crashed last Phase B run leaves
+            // partial coverage under a complete marker, so even a non-empty site
+            // list may be short. Surface the same caveat instead of `note: None`.
+            if phase_b_lang_crashed(store, &target.vname.language) {
+                out.note = Some(crash_caveat(&target.vname.language));
+            }
         }
         _ => {
             // Resolved, but no exact occurrence sites. Carry the text path's honest
             // caveat (degraded coverage vs. genuine zero) as `note`, minus the
-            // header line that `resolved_to` already encodes.
-            out.note = Some(strip_resolved_header(&find_references_raw(
-                store, symbol, path,
+            // header line that `resolved_to` already encodes. Reuse the target we
+            // just resolved rather than re-running resolution.
+            out.note = Some(strip_resolved_header(&references_body_for_target(
+                store, &target,
             )));
         }
     }
@@ -1183,10 +1190,18 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
         }
     };
 
+    references_body_for_target(store, &target)
+}
+
+/// Render the reference body for an already-resolved target: the `resolved:`
+/// header, the occurrence sites, or the honest degraded/zero caveat. Split out
+/// of [`find_references_raw`] so [`find_references_structured`] can reuse the
+/// target it already resolved for its caveat instead of resolving a second time.
+fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String {
     let resolved_loc = target.line.map(|l| format!(":{l}")).unwrap_or_default();
     let header = format!(
         "resolved: {} ({}) — {}{}",
-        display_label(&target),
+        display_label(target),
         target.kind,
         target.vname.path,
         resolved_loc
@@ -1217,11 +1232,11 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
             // Fallback: no occurrence rows for this dst. Degrade to caller
             // definition lines from structural ref/call edges (labelled), so a
             // language not yet feeding edge_sites still returns something useful.
-            reference_fallback_from_edges(store, &target, &header)
+            reference_fallback_from_edges(store, target, &header)
         }
         Err(e) => {
             tracing::warn!("find_references reference_sites error: {e}");
-            reference_fallback_from_edges(store, &target, &header)
+            reference_fallback_from_edges(store, target, &header)
         }
     }
 }

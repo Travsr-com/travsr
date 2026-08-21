@@ -160,9 +160,12 @@ SandboxPolicy::Standard
 > language's own build tool with their own privileges — the same trade-off the
 > project already accepts for the rust `--allow-unsandboxed` LSIF path (the
 > ADR-006 lineage this mirrors). It is **per-language**, not per-corpus; tighter
-> per-corpus granularity and a confirmation prompt on `lang allow-unsandboxed`
-> are tracked as follow-up UX hardening. `travsr lang list` surfaces the language
-> as running by unsandboxed consent.
+> per-corpus granularity is tracked as follow-up UX hardening. `travsr lang
+> allow-unsandboxed` explains the trade-off and requires interactive `[y/N]`
+> confirmation before recording the grant (or an explicit `--yes` to grant it
+> non-interactively; with no terminal and no `--yes` the grant is refused, never
+> recorded silently). `travsr lang list` surfaces the language as running by
+> unsandboxed consent.
 >
 > **Env policy.** The unsandboxed child does **not** inherit the daemon's ambient
 > environment. `build_unsandboxed_command` (`sandbox/mod.rs`) calls `env_clear()`

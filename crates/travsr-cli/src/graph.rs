@@ -241,6 +241,11 @@ fn render(mut payload: GraphPayload, format: Format, budget: usize) -> anyhow::R
     // #318 O6: token budget — prefix of BFS order, seed always kept.
     let truncated = query::apply_token_budget(&mut payload, budget);
 
+    // A seeded query force-keeps the seed, so `rendered >= 1` even when the budget
+    // could not afford a single neighbour; distinguish "only the queried symbol
+    // fit" from a real partial graph so the footer stays honest for `--budget 1`.
+    let only_seed = payload.seed.is_some() && payload.nodes.len() <= 1;
+
     match format {
         Format::Tree => {
             let rendered = if let Some(seed) = &payload.seed {
@@ -257,11 +262,11 @@ fn render(mut payload: GraphPayload, format: Format, budget: usize) -> anyhow::R
                 }
                 files.len()
             };
-            print_budget_footer(rendered, truncated, budget, "");
+            print_budget_footer(rendered, truncated, budget, "", only_seed);
         }
         Format::Dot => {
             print_dot(&payload)?;
-            print_budget_footer(payload.nodes.len(), truncated, budget, "// ");
+            print_budget_footer(payload.nodes.len(), truncated, budget, "// ", only_seed);
         }
         Format::Json => print_json(&payload, budget, truncated)?,
     }
@@ -269,17 +274,29 @@ fn render(mut payload: GraphPayload, format: Format, budget: usize) -> anyhow::R
     Ok(())
 }
 
-/// Footer shown after a budgeted graph render. When some nodes were displayed it
-/// reports how many more were cut; when the budget was too small to display any
-/// node at all, the "N more" phrasing is misleading (there is no partial list to
-/// extend), so it says the budget is too small and how to lift it.
-fn print_budget_footer(rendered: usize, truncated: usize, budget: usize, prefix: &str) {
+/// Footer shown after a budgeted graph render. When some neighbours were shown it
+/// reports how many more were cut; when the budget was too small to show any node
+/// (`--all`) or fit only the force-kept queried symbol (seeded), the "N more"
+/// phrasing is misleading — there is no partial list to extend — so it says the
+/// budget is too small and how to lift it.
+fn print_budget_footer(
+    rendered: usize,
+    truncated: usize,
+    budget: usize,
+    prefix: &str,
+    only_seed: bool,
+) {
     if truncated == 0 {
         return;
     }
     if rendered == 0 {
         println!(
             "{prefix}Budget of {budget} tokens is too small to display any graph nodes — \
+             raise it with --budget (or --budget 0 for no limit)."
+        );
+    } else if only_seed {
+        println!(
+            "{prefix}Budget of {budget} tokens fits only the queried symbol, not its graph — \
              raise it with --budget (or --budget 0 for no limit)."
         );
     } else {
