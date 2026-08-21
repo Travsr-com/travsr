@@ -36,7 +36,8 @@ Every Sidecar-transport spawn (RFC-011 §2) — whether a Phase B SCIP/LSIF invo
 ```
 SandboxPolicy::Standard
   network:    ALLOW             (intentional — see Amendment A1 below)
-  filesystem: repo root         → READ-ONLY
+  filesystem: repo root         → READ-ONLY (narrow build-output exception for
+                                   scala only — see Amendment A5 below)
               scratch tmpdir     → READ-WRITE (per-invocation, removed after)
               everything else    → DENY
   resources:  CPU / RAM / wall-clock caps enforced
@@ -185,8 +186,43 @@ SandboxPolicy::Standard
 > hosts where the sandbox cannot host them. The exception stays bounded by the
 > four scope conditions above and the secret-scrubbed environment.
 >
-> **Approved by:** _pending Principal Security Engineer sign-off (drafted
-> 2026-08-20, PR #743)_
+> **Approved by:** Principal Security Engineer (PSE review 2026-08-21, PR #743).
+> Scope, consent semantics, and env policy reviewed against the implementation
+> (`decide_windows_sandbox`, `build_unsandboxed_command`, the env allowlist tests)
+> and found to match. Windows-only, consent-gated, secret-scrubbed; the residual
+> risk is the same one already accepted for the rust `--allow-unsandboxed` LSIF
+> path (ADR-006 lineage), bounded by the four scope conditions.
+
+> **Amendment A5 — Narrow build-output write for scala (2026-08-21)**
+>
+> Rule 1 pins the repo root READ-ONLY. sbt (the scala Phase B driver) cannot
+> compile without writing its build outputs into the repo tree, so a strict
+> read-only root leaves scala with no working Phase B. Rather than flip the whole
+> root writable, the sandbox grants write to a **typed, fixed allowlist of
+> build-output subpaths only** (`toolchain::repo_write_subpaths("scala")`):
+>
+> ```
+> target/                    (sbt compile output)
+> project/target/            (sbt meta-build output)
+> .travsr-semanticdb.sbt     (the generated SemanticDB-enable settings file)
+> ```
+>
+> Everything else under the repo root stays READ-ONLY on both bwrap (Linux) and
+> Seatbelt (macOS); every other language keeps a fully read-only root
+> (`repo_write_subpaths` returns empty for them). The grant is source-defined and
+> compile-time, so a repo cannot widen it (Rule 3 invariant preserved).
+>
+> **Residual risk (accepted).** A hostile scala repo's own `build.sbt` runs during
+> indexing (that is inherent to compiling it) and can now write under `target/`,
+> `project/target/`, and the one settings file — build directories a compile would
+> write anyway. It still cannot modify source, `.git`, or any path outside those
+> subpaths. Pinned by `sandbox_scala_repo_write_is_narrowed_to_build_subpaths`
+> (Linux, runs bwrap on CI): a repo-root write outside the allowlist is denied, an
+> allowed `target/` write succeeds.
+>
+> **Approved by:** Principal Security Engineer (PSE review 2026-08-21, PR #743).
+> The narrowed subpath grant and its enforcement test were reviewed and found to
+> confine writes to build outputs only, with source and VCS metadata protected.
 
 Mechanism by platform (DevOps owns the implementation, Security owns the policy):
 

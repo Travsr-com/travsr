@@ -198,7 +198,9 @@ function sanitizeGraphIds(nodes, edges) {
     return mapped;
   };
   return {
-    nodes: nodes.map(n => ({ ...n, id: safeId(n.id) })),
+    // Keep the original id in `realId` so exportJson can emit the true CLI node
+    // id rather than the internal `g0`/`g1` cytoscape-safe handle.
+    nodes: nodes.map(n => ({ ...n, id: safeId(n.id), realId: String(n.id) })),
     edges: edges.map(e => ({ ...e, source: safeId(e.source), target: safeId(e.target) })),
   };
 }
@@ -550,7 +552,7 @@ function buildElements() {
     const isHidden = n.kind === 'var' && !varsOn;
     els.push({
       data: {
-        id: n.id, label: disambigLabel(n), kind: n.kind, path: n.path || '',
+        id: n.id, realId: n.realId, label: disambigLabel(n), kind: n.kind, path: n.path || '',
         pkg: n.package || '', score: n.score || 0, line: n.line || 0,
         hop: n.hop || 0, root: !!n.root, degree: d,
         w: n.kind === 'var' ? 42 : sz, h: n.kind === 'var' ? 18 : sz,
@@ -1310,12 +1312,14 @@ function exportDot() {
 
 function exportJson() {
   const payload = {
+    // Emit the real CLI node id (`realId`), not the cytoscape-safe handle, so an
+    // exported graph's ids line up with `travsr graph --format json`.
     nodes: cy.nodes(':visible').not(':parent').map(n => ({
-      id: n.id(), label: n.data('label'), kind: n.data('kind'),
+      id: n.data('realId') || n.id(), label: n.data('label'), kind: n.data('kind'),
       path: n.data('path'), package: n.data('pkg'), score: n.data('score'), line: n.data('line'),
     })),
     edges: cy.edges(':visible').map(e => ({
-      source: e.data('source'), target: e.data('target'), kind: e.data('kind'),
+      source: e.source().data('realId') || e.data('source'), target: e.target().data('realId') || e.data('target'), kind: e.data('kind'),
     })),
   };
   vscode.postMessage({ command: 'exportJson', json: JSON.stringify(payload, null, 2) });
@@ -2214,6 +2218,23 @@ function renderOverview(data, serverMode, pathPrefix) {
   const realNodes = nodes.filter(n => !n.ghost);
   const ghostNodes = nodes.filter(n => n.ghost);
 
+  // Cytoscape uses element ids inside selectors, so a package-path id with
+  // whitespace / # / ()[] breaks the canvas the same way query mode did before
+  // sanitizeGraphIds. Map every tile/ghost id to a safe canvas handle; the real
+  // path stays in each tile's `_raw` payload, which drill-in navigation reads,
+  // so navigation is unaffected. No-op when all ids are already selector-safe.
+  const _ovMap = new Map();
+  let _ovC = 0;
+  const _ovUnsafe = /[\s`#()[\]]/;
+  const _ovNeedsMap = nodes.some(n => n && n.id != null && _ovUnsafe.test(String(n.id)));
+  const sid = (raw) => {
+    if (!_ovNeedsMap) return String(raw);
+    const key = String(raw);
+    let m = _ovMap.get(key);
+    if (m === undefined) { m = 'o' + _ovC++; _ovMap.set(key, m); }
+    return m;
+  };
+
   cy.elements().remove();
   cy.off('dbltap', 'node');
   cy.off('zoom.overview');
@@ -2229,10 +2250,11 @@ function renderOverview(data, serverMode, pathPrefix) {
   const packed = packTiles(realNodes);
   packed.forEach(t => {
     cy.add({ data: {
-      id: t.id,
+      id: sid(t.id),
       label: (t.label || t.id) + (t.file_count ? '\n' + t.file_count + ' files' : ''),
       kind: t.kind || 'pkg',
       w: t.w, h: t.h, tile: 1, file_count: t.file_count || 0,
+      // Real path preserved for drill-in (tilemapDrillIn reads this, not the id).
       _raw: JSON.stringify({ id: t.id, label: t.label, file_count: t.file_count }),
     }, position: { x: t.x, y: t.y } });
   });
@@ -2240,7 +2262,7 @@ function renderOverview(data, serverMode, pathPrefix) {
   // Ghost port nodes positioned to the right
   const span = packed.length ? Math.max(...packed.map(t => t.x + t.w / 2)) : 300;
   ghostNodes.forEach((g, i) => {
-    cy.add({ data: { id: g.id, label: g.label || g.id, kind: 'ghost', w: 110, h: 46 },
+    cy.add({ data: { id: sid(g.id), label: g.label || g.id, kind: 'ghost', w: 110, h: 46 },
              position: { x: span + 200, y: -60 + i * 96 } });
   });
 
@@ -2248,10 +2270,12 @@ function renderOverview(data, serverMode, pathPrefix) {
   const edgeSeen = new Set();
   edges.forEach(e => {
     if (!e.source || !e.target) return;
-    const key = e.source + '->' + e.target;
+    const src = sid(e.source);
+    const tgt = sid(e.target);
+    const key = src + '->' + tgt;
     if (edgeSeen.has(key)) return;
     edgeSeen.add(key);
-    cy.add({ data: { id: key, source: e.source, target: e.target, kind: 'imports', wgt: e.count || 1 } });
+    cy.add({ data: { id: key, source: src, target: tgt, kind: 'imports', wgt: e.count || 1 } });
   });
 
   cy.layout({ name: 'preset' }).run();

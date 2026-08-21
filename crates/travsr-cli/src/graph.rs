@@ -475,6 +475,19 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
 }
 
 fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow::Result<()> {
+    let out = build_graph_json(payload, budget, truncated)?;
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+/// Build the `graph --format json` document. Split out of [`print_json`] so the
+/// schema_version 1 contract (raw `signature`, additive `label`, edge
+/// `from_id`/`to_id`) can be pinned by a test without capturing stdout.
+fn build_graph_json(
+    payload: &GraphPayload,
+    budget: usize,
+    truncated: usize,
+) -> anyhow::Result<serde_json::Value> {
     let mut kinds: HashMap<String, usize> = HashMap::new();
     for node in &payload.nodes {
         *kinds.entry(node.kind.clone()).or_default() += 1;
@@ -574,10 +587,87 @@ fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow
         out["coverage"] = serde_json::to_value(cov)?;
     }
 
-    println!("{}", serde_json::to_string_pretty(&out)?);
-    Ok(())
+    Ok(out)
 }
 
 fn escape_dot(s: &str) -> String {
     s.replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use travsr_mcp::query::{EdgeEntry, GraphPayload, NodeEntry};
+
+    fn node(id: u64, sig: &str, label: &str, path: &str) -> NodeEntry {
+        NodeEntry {
+            id,
+            signature: sig.to_string(),
+            kind: "method".to_string(),
+            path: path.to_string(),
+            language: "java".to_string(),
+            depth: 0,
+            label: label.to_string(),
+            tokens: 1,
+            line: Some(3),
+        }
+    }
+
+    /// Pin the schema_version 1 contract the review regressed and this PR
+    /// restored: `signature` stays raw, `label` is the additive clean name, and
+    /// edges carry `from_id`/`to_id` so two edges between collapsed-label
+    /// endpoints (same type name in different packages) stay distinct.
+    #[test]
+    fn graph_json_keeps_raw_signature_and_distinct_edge_ids() {
+        let n1 = node(
+            1,
+            "scip:a/Greeter.java:semanticdb maven . . com/a/Greeter#greet().",
+            "Greeter.greet",
+            "a/Greeter.java",
+        );
+        let n2 = node(
+            2,
+            "scip:b/Greeter.java:semanticdb maven . . com/b/Greeter#greet().",
+            "Greeter.greet",
+            "b/Greeter.java",
+        );
+        let payload = GraphPayload {
+            seed: Some(n1.clone()),
+            nodes: vec![n1, n2],
+            edges: vec![EdgeEntry {
+                src: 1,
+                dst: 2,
+                kind: "ref/call".to_string(),
+                provenance: "scip".to_string(),
+                src_sig: "scip:a/Greeter.java:semanticdb maven . . com/a/Greeter#greet()."
+                    .to_string(),
+                dst_sig: "scip:b/Greeter.java:semanticdb maven . . com/b/Greeter#greet()."
+                    .to_string(),
+            }],
+            tree: vec![],
+            coverage: None,
+            last_commit: None,
+            candidates: None,
+        };
+
+        let out = build_graph_json(&payload, 0, 0).unwrap();
+        assert_eq!(out["schema_version"], 1);
+
+        let nodes = out["nodes"].as_array().unwrap();
+        // `signature` is the raw compiler symbol; `label` is the clean name.
+        assert_eq!(
+            nodes[0]["signature"],
+            "scip:a/Greeter.java:semanticdb maven . . com/a/Greeter#greet()."
+        );
+        assert_eq!(nodes[0]["label"], "Greeter.greet");
+
+        let edges = out["edges"].as_array().unwrap();
+        let e = &edges[0];
+        // Collapsed labels are equal, but the ids keep the two endpoints distinct.
+        assert_eq!(e["from"], "Greeter.greet");
+        assert_eq!(e["to"], "Greeter.greet");
+        assert_eq!(e["from_id"], "1");
+        assert_eq!(e["to_id"], "2");
+        assert_ne!(e["from_id"], e["to_id"]);
+    }
 }

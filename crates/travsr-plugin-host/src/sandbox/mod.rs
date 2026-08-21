@@ -145,6 +145,11 @@ pub fn build_unsandboxed_command(
         cmd.env(k, v);
     }
 
+    // PATH is (re)applied only inside this block. If `home_dir()` returns None —
+    // an environment with neither HOME nor USERPROFILE — the child inherits no
+    // PATH at all (PATH is deliberately not in the passthrough allowlist). That
+    // fails closed: the build tool simply will not resolve and Phase B produces
+    // nothing, rather than the child running with the daemon's unscrubbed PATH.
     if let Some(home) = dirs::home_dir() {
         // The toolchain env helpers key their HOME/cache paths off the `HOME`
         // variable, which is unset on Windows (it uses `USERPROFILE`), so JVM build
@@ -300,6 +305,17 @@ impl SandboxedSpawn {
 mod tests {
     use super::*;
 
+    /// Process env is shared, so a test that sets/removes vars must not run
+    /// concurrently with another that reads them. Hold this across every
+    /// env-touching test in this binary (recovering from a poisoned guard, since
+    /// the data guarded is process env, not test state).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The unsandboxed passthrough allowlist forwards OS essentials (matched
     /// case-insensitively) but drops credentials the daemon may hold.
     #[test]
@@ -320,6 +336,7 @@ mod tests {
     /// environment, while still forwarding an allowlisted OS variable.
     #[test]
     fn unsandboxed_command_excludes_daemon_secrets() {
+        let _env = env_guard();
         std::env::set_var("TRAVSR_TEST_FAKE_SECRET", "s3cr3t");
         std::env::set_var("SYSTEMROOT", "C:\\Windows");
         let scratch = std::env::temp_dir();
