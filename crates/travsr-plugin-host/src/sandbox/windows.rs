@@ -142,6 +142,10 @@ pub struct AppContainerSpawn {
     /// NOT inherited — `toolchain.env` (JAVA_HOME/GOPATH/…) is forwarded into
     /// it and `~/.travsr/bin` is prepended to PATH, mirroring linux.rs/macos.rs.
     toolchain: crate::sandbox::toolchain::ToolchainAccess,
+    /// Whether the repo root itself needs a write grant (scala's `sbt compile`
+    /// writes `target/` + a settings file into the project root — see
+    /// `toolchain::needs_repo_write`). Every other language stays read-only.
+    repo_write: bool,
     stdin: StdioCfg,
     stdout: StdioCfg,
     stderr: StdioCfg,
@@ -167,7 +171,19 @@ impl AppContainerSpawn {
         // ── 1–4. AppContainer SID, profile, DACL grants, SECURITY_CAPABILITIES ─
         let sid = ffi::derive_appcontainer_sid(&profile)?;
         ffi::ensure_appcontainer_profile(&profile)?;
-        ffi::grant_path_access(&self.repo_root, sid.as_psid(), ffi::ACCESS_GENERIC_READ)?;
+        let repo_access = if self.repo_write {
+            ffi::ACCESS_GENERIC_ALL
+        } else {
+            ffi::ACCESS_GENERIC_READ
+        };
+        ffi::grant_path_access(&self.repo_root, sid.as_psid(), repo_access)?;
+        // A direct CreateFile open of repo_root works from the grant above
+        // alone, but resolving its REAL/canonical path (GetFinalPathNameByHandleW —
+        // what std::fs::canonicalize and Java NIO's Path.toRealPath() both call)
+        // additionally needs FILE_TRAVERSE on every ancestor up to the volume
+        // root, which an AppContainer token doesn't get for free. See
+        // ffi::grant_ancestor_traverse's doc comment (found via sbt 2.x).
+        ffi::grant_ancestor_traverse(&self.repo_root, sid.as_psid());
         ffi::grant_path_access(&self.scratch_dir, sid.as_psid(), ffi::ACCESS_GENERIC_ALL)?;
         // Per-language toolchain caches (best-effort: a missing cache dir is not fatal).
         for path in &self.toolchain.read_paths {
@@ -175,6 +191,20 @@ impl AppContainerSpawn {
         }
         for path in &self.toolchain.write_paths {
             let _ = ffi::grant_path_access(path, sid.as_psid(), ffi::ACCESS_GENERIC_ALL);
+        }
+        // G5: toolchain *bin* dirs (GOPATH/bin, GOROOT/bin, JAVA_HOME/bin,
+        // sbt/dotnet bin) need read+EXECUTE, not just read — otherwise the
+        // AppContainer token finds the toolchain by name (PATH is forwarded) but
+        // cannot map its image, and the analyzer spawns nothing and reports zero
+        // symbols with no error. These are a strict subset of executable
+        // directories (never module/package caches), so the extra right is scoped
+        // to exactly the binaries the analyzer legitimately runs. Best-effort like
+        // the other toolchain grants: a bin dir under a machine-wide tree (Program
+        // Files) may not be re-ACL-able without admin, in which case that binary
+        // stays unrunnable and only the user-writable dirs (e.g. GOPATH/bin) gain
+        // execute — which is still enough for the analyzer itself to run.
+        for path in &self.toolchain.exec_paths {
+            let _ = ffi::grant_path_access(path, sid.as_psid(), ffi::ACCESS_GENERIC_READ_EXECUTE);
         }
         // PR #577 review: an AppContainer token cannot map an image whose DACL
         // carries no AppContainer ACE — user-profile trees don't carry ALL
@@ -273,6 +303,7 @@ pub fn build_sandboxed_command(
         scratch_dir: scratch_dir.to_path_buf(),
         policy: policy.clone(),
         toolchain: crate::sandbox::toolchain::toolchain_access(language),
+        repo_write: crate::sandbox::toolchain::needs_repo_write(language),
         stdin: StdioCfg::Inherit,
         stdout: StdioCfg::Inherit,
         stderr: StdioCfg::Inherit,

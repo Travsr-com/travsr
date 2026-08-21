@@ -36,6 +36,11 @@ pub enum LangStatus {
     /// A one-time security approval must be recorded before this language's
     /// analyzer (which reaches the network while indexing) can be installed.
     NeedsApproval { language: String },
+    /// On Windows only: this language's analyzer cannot run inside Travsr's
+    /// isolation, so it needs the user's one-time permission to run with the
+    /// user's own privileges before full analysis can happen. The analyzer is
+    /// installed and ready — the only thing missing is that permission.
+    NeedsConsent { language: String },
     /// No analyzer build exists for this operating system, so full semantic can
     /// never run here. Structure still works — the rendered line says so.
     PlatformUnsupported { os: String },
@@ -49,6 +54,7 @@ impl LangStatus {
             LangStatus::Active => "active",
             LangStatus::Partial { .. } => "partial",
             LangStatus::NeedsApproval { .. } => "needs_approval",
+            LangStatus::NeedsConsent { .. } => "needs_consent",
             LangStatus::PlatformUnsupported { .. } => "unsupported",
         }
     }
@@ -65,6 +71,12 @@ impl LangStatus {
             LangStatus::Partial { next: None } => "partial".to_string(),
             LangStatus::NeedsApproval { language } => {
                 format!("needs approval (run: travsr lang install {language})")
+            }
+            LangStatus::NeedsConsent { language } => {
+                format!(
+                    "partial (full analysis needs your permission — run: \
+                     travsr lang allow-unsandboxed {language})"
+                )
             }
             LangStatus::PlatformUnsupported { os } => {
                 format!("partial (full analysis not available on {os})")
@@ -109,6 +121,14 @@ pub struct Capability<'a> {
     pub approved: bool,
     /// `Some(os)` when no analyzer build is published for this operating system.
     pub unsupported_on: Option<String>,
+    /// True only on Windows, and only for the languages whose analyzer cannot run
+    /// inside Travsr's isolation (`entry.windows_sandbox_unsupported()`). When set,
+    /// the one-time permission below is the gate for this language instead of the
+    /// network approval. Always false off Windows — the mechanism is a no-op there.
+    pub windows_unsandboxed: bool,
+    /// Whether the user's one-time permission to run this language's analyzer with
+    /// their own privileges is on record. Only consulted when `windows_unsandboxed`.
+    pub unsandboxed_consent: bool,
 }
 
 /// Compute the capability-view status for one language. Same logic for every
@@ -117,6 +137,24 @@ pub fn capability(cap: &Capability) -> LangStatus {
     // No analyzer build for this OS: full can never run here (structure still does).
     if let Some(os) = &cap.unsupported_on {
         return LangStatus::PlatformUnsupported { os: os.clone() };
+    }
+    // Windows: analyzers that cannot run inside Travsr's isolation are gated on the
+    // user's one-time permission to run with their own privileges. That permission
+    // also covers the network access the isolated path would have needed approval
+    // for, so it replaces the approval gate for these languages on Windows. Install
+    // the analyzer first if it is not present yet.
+    if cap.windows_unsandboxed {
+        if !cap.analyzer_ready {
+            return LangStatus::Partial {
+                next: Some(install_step(cap.entry.language)),
+            };
+        }
+        if !cap.unsandboxed_consent {
+            return LangStatus::NeedsConsent {
+                language: cap.entry.language.to_string(),
+            };
+        }
+        return LangStatus::Active;
     }
     // Network-reaching analyzers need a one-time approval before they can install.
     if cap.entry.sandbox == super::catalog::SandboxRequirement::RequiresElevated && !cap.approved {
@@ -145,6 +183,8 @@ mod tests {
             analyzer_ready,
             approved,
             unsupported_on: None,
+            windows_unsandboxed: false,
+            unsandboxed_consent: false,
         })
     }
 
@@ -194,6 +234,8 @@ mod tests {
             analyzer_ready: false,
             approved: false,
             unsupported_on: Some("windows".to_string()),
+            windows_unsandboxed: false,
+            unsandboxed_consent: false,
         });
         assert_eq!(status.tag(), "unsupported");
         // Honest: structure still works, only full analysis is unavailable.
@@ -213,20 +255,74 @@ mod tests {
                 language: "java".into(),
             }
             .line(),
+            LangStatus::NeedsConsent {
+                language: "java".into(),
+            }
+            .line(),
             LangStatus::PlatformUnsupported {
                 os: "windows".into(),
             }
             .line(),
         ];
         for l in lines {
+            // `allow-unsandboxed` is a fixed command name mirroring the existing
+            // `travsr init --allow-unsandboxed` (rust) precedent, not explanatory
+            // jargon. Strip that one literal token before scanning so the guard
+            // still catches any "sandbox" used to describe the mechanism in prose.
+            let prose = l.replace("allow-unsandboxed", "");
             for banned in [
                 "Phase B", "phase b", "sandbox", "SCIP", "LSIF", "built-in", "✓", "⚠", "–",
             ] {
                 assert!(
-                    !l.contains(banned),
+                    !prose.contains(banned),
                     "line {l:?} must not contain {banned:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn windows_unsupported_language_without_consent_needs_consent() {
+        // java on Windows: analyzer installed, no permission on record → the line
+        // asks for the one-time permission and names the exact command.
+        let status = capability(&Capability {
+            entry: lookup("java").expect("known language"),
+            analyzer_ready: true,
+            approved: true,
+            unsupported_on: None,
+            windows_unsandboxed: true,
+            unsandboxed_consent: false,
+        });
+        assert_eq!(status.tag(), "needs_consent");
+        assert!(status.line().starts_with("partial"));
+        assert!(status.line().contains("travsr lang allow-unsandboxed java"));
+    }
+
+    #[test]
+    fn windows_unsupported_language_with_consent_is_active() {
+        let status = capability(&Capability {
+            entry: lookup("scala").expect("known language"),
+            analyzer_ready: true,
+            approved: false, // consent replaces approval on this path
+            unsupported_on: None,
+            windows_unsandboxed: true,
+            unsandboxed_consent: true,
+        });
+        assert_eq!(status, LangStatus::Active);
+    }
+
+    #[test]
+    fn windows_unsupported_language_missing_analyzer_says_install_first() {
+        // No analyzer yet: the honest next step is install, not the permission.
+        let status = capability(&Capability {
+            entry: lookup("java").expect("known language"),
+            analyzer_ready: false,
+            approved: true,
+            unsupported_on: None,
+            windows_unsandboxed: true,
+            unsandboxed_consent: false,
+        });
+        assert_eq!(status.tag(), "partial");
+        assert!(status.line().contains("travsr lang install java"));
     }
 }

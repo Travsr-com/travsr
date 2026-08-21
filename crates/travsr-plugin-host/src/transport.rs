@@ -154,6 +154,7 @@ impl Sidecar {
             scratch.path(),
             &spec.policy,
             &spec.language,
+            spec.unsandboxed,
         )
         .map_err(|e| IndexError::Parse {
             file: format!("plugin:{lang}"),
@@ -268,6 +269,8 @@ impl Sidecar {
         scratch: &std::path::Path,
         policy: &crate::sandbox::policy::SandboxPolicy,
         language: &str,
+        // The unsandboxed path is Windows-only; the resolver never sets it here.
+        _unsandboxed: bool,
     ) -> Result<crate::sandbox::SandboxedSpawn, SandboxUnavailable> {
         crate::sandbox::linux::build_sandboxed_command(
             program, args, repo_root, scratch, policy, language,
@@ -282,6 +285,8 @@ impl Sidecar {
         scratch: &std::path::Path,
         policy: &crate::sandbox::policy::SandboxPolicy,
         language: &str,
+        // The unsandboxed path is Windows-only; the resolver never sets it here.
+        _unsandboxed: bool,
     ) -> Result<crate::sandbox::SandboxedSpawn, SandboxUnavailable> {
         crate::sandbox::macos::build_sandboxed_command(
             program, args, repo_root, scratch, policy, language,
@@ -296,7 +301,16 @@ impl Sidecar {
         scratch: &std::path::Path,
         policy: &crate::sandbox::policy::SandboxPolicy,
         language: &str,
+        unsandboxed: bool,
     ) -> Result<crate::sandbox::SandboxedSpawn, SandboxUnavailable> {
+        // Permission-gated escape hatch for analyzers whose build tools cannot run
+        // inside the isolation layer (java/scala). The resolver sets this only with
+        // explicit user permission; here it means "run as a plain child".
+        if unsandboxed {
+            return Ok(crate::sandbox::build_unsandboxed_command(
+                program, args, scratch, language,
+            ));
+        }
         crate::sandbox::windows::build_sandboxed_command(
             program, args, repo_root, scratch, policy, language,
         )
@@ -310,6 +324,7 @@ impl Sidecar {
         _s: &std::path::Path,
         _policy: &crate::sandbox::policy::SandboxPolicy,
         _language: &str,
+        _unsandboxed: bool,
     ) -> Result<crate::sandbox::SandboxedSpawn, SandboxUnavailable> {
         Err(SandboxUnavailable("unsupported platform".into()))
     }

@@ -20,6 +20,12 @@ pub fn run(
     // Apply the operator opt-in before any indexing begins. This sets a
     // process-global flag consulted by run_ra_lsif via allow_unsandboxed_opt_in().
     travsr_daemon::set_allow_unsandboxed_lsif(allow_unsandboxed_lsif);
+    // The same `--allow-unsandboxed` opt-in also permits, for this one run, the
+    // Phase B analyzers that cannot run inside Travsr's isolation on Windows
+    // (java/scala) to run with the user's own privileges. The persistent
+    // `travsr lang allow-unsandboxed` grant is the primary path; this covers a
+    // one-shot `travsr init`.
+    travsr_plugin_host::resolver::set_allow_unsandboxed(allow_unsandboxed_lsif);
 
     // Live progress so a long indexing run is not mistaken for a hang (#293).
     // Renders to stderr; the summary below stays on stdout.

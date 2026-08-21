@@ -104,6 +104,122 @@ impl SandboxedChild {
     }
 }
 
+/// Build a plain (unsandboxed) child command for a Phase B analyzer.
+///
+/// Used ONLY on Windows, and ONLY for analyzers whose build tools cannot run
+/// inside the isolation layer (`WindowsSandbox::Unsupported`), and ONLY after the
+/// user has granted explicit permission (see `resolver`). The child runs with the
+/// user's own privileges — the same trade-off the project already accepts for the
+/// rust `--allow-unsandboxed` LSIF path.
+///
+/// The toolchain environment (JAVA_HOME, GRADLE_USER_HOME, HOME, …) is forwarded
+/// and `~/.travsr/bin` is prepended to PATH, mirroring what the isolated path sets
+/// up, so the analyzer and the build tool it drives resolve. `scratch` is the cwd
+/// (matching the isolated spawn); the repo root reaches the sidecar via the
+/// InvokeRequest, not the cwd.
+pub fn build_unsandboxed_command(
+    program: &str,
+    args: &[&str],
+    scratch: &std::path::Path,
+    language: &str,
+) -> SandboxedSpawn {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    cmd.current_dir(scratch);
+
+    // Start from an empty environment and forward only an allowlist. The daemon's
+    // own environment can hold credentials (GITHUB_TOKEN, AWS_*, SSH_*, …); an
+    // unsandboxed analyzer drives the repo's own build (Gradle/sbt), so no daemon
+    // secret should reach it. The toolchain env, HOME, GRADLE_USER_HOME and PATH
+    // are re-applied explicitly below from values the toolchain helpers already
+    // captured, so clearing here does not break analyzer/build-tool resolution.
+    cmd.env_clear();
+    for (k, v) in std::env::vars_os() {
+        if k.to_str().is_some_and(is_allowed_passthrough_env) {
+            cmd.env(&k, &v);
+        }
+    }
+
+    let access = toolchain::toolchain_access(language);
+    for (k, v) in &access.env {
+        cmd.env(k, v);
+    }
+
+    // PATH is (re)applied only inside this block. If `home_dir()` returns None —
+    // an environment with neither HOME nor USERPROFILE — the child inherits no
+    // PATH at all (PATH is deliberately not in the passthrough allowlist). That
+    // fails closed: the build tool simply will not resolve and Phase B produces
+    // nothing, rather than the child running with the daemon's unscrubbed PATH.
+    if let Some(home) = dirs::home_dir() {
+        // The toolchain env helpers key their HOME/cache paths off the `HOME`
+        // variable, which is unset on Windows (it uses `USERPROFILE`), so JVM build
+        // tools like Gradle end up with nowhere to place their home/temp dir. An
+        // unsandboxed child runs as the user, so give it the real home explicitly —
+        // set `HOME` and Gradle's home unless the toolchain env already provided
+        // them. Harmless off Windows, where `HOME` is already correct.
+        let home_str = home.to_string_lossy().into_owned();
+        if !access.env.iter().any(|(k, _)| k == "HOME") {
+            cmd.env("HOME", &home_str);
+        }
+        if !access.env.iter().any(|(k, _)| k == "GRADLE_USER_HOME") {
+            cmd.env("GRADLE_USER_HOME", home.join(".gradle"));
+        }
+
+        // Prepend ~/.travsr/bin so the wrapper's installed siblings (and analyzers
+        // the wrapper shells out to) resolve, matching the isolated path's PATH
+        // handling.
+        let travsr_bin = home.join(".travsr").join("bin");
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs_vec = vec![travsr_bin];
+        dirs_vec.extend(std::env::split_paths(&existing));
+        if let Ok(joined) = std::env::join_paths(dirs_vec) {
+            cmd.env("PATH", joined);
+        }
+    }
+
+    SandboxedSpawn::Wrapped(cmd)
+}
+
+/// System environment variables a build tool legitimately needs to start,
+/// forwarded from the daemon's environment to the unsandboxed child. Everything
+/// else — notably any credential the daemon holds (GITHUB_TOKEN, AWS_*, SSH_*, …)
+/// — is dropped. HOME, GRADLE_USER_HOME and PATH are not listed here because
+/// `build_unsandboxed_command` sets them explicitly. Matched case-insensitively
+/// because Windows environment names are case-insensitive.
+fn is_allowed_passthrough_env(name: &str) -> bool {
+    const ALLOW: &[&str] = &[
+        // Windows OS essentials for spawning a process and starting a JVM.
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "USERNAME",
+        "COMPUTERNAME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "ALLUSERSPROFILE",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "COMMONPROGRAMFILES",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "OS",
+        // Locale and temp dir (deterministic tool output; Unix parity).
+        "LANG",
+        "LC_ALL",
+        "TMPDIR",
+    ];
+    ALLOW.iter().any(|a| a.eq_ignore_ascii_case(name))
+}
+
 /// Result of `build_sandboxed_command`. Configure stdio, then call `spawn`.
 pub enum SandboxedSpawn {
     /// Linux (bwrap) or macOS (sandbox-exec): wraps the outer wrapper process.
@@ -182,5 +298,73 @@ impl SandboxedSpawn {
                 ac.spawn()?.wait_with_output()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Process env is shared, so a test that sets/removes vars must not run
+    /// concurrently with another that reads them. Hold this across every
+    /// env-touching test in this binary (recovering from a poisoned guard, since
+    /// the data guarded is process env, not test state).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The unsandboxed passthrough allowlist forwards OS essentials (matched
+    /// case-insensitively) but drops credentials the daemon may hold.
+    #[test]
+    fn passthrough_env_allowlist_drops_secrets() {
+        assert!(is_allowed_passthrough_env("SYSTEMROOT"));
+        assert!(is_allowed_passthrough_env("SystemRoot"));
+        assert!(is_allowed_passthrough_env("PATHEXT"));
+        assert!(is_allowed_passthrough_env("TEMP"));
+
+        assert!(!is_allowed_passthrough_env("GITHUB_TOKEN"));
+        assert!(!is_allowed_passthrough_env("AWS_ACCESS_KEY_ID"));
+        assert!(!is_allowed_passthrough_env("AWS_SECRET_ACCESS_KEY"));
+        assert!(!is_allowed_passthrough_env("SSH_AUTH_SOCK"));
+        assert!(!is_allowed_passthrough_env("NPM_TOKEN"));
+    }
+
+    /// `build_unsandboxed_command` must not leak a daemon secret into the child's
+    /// environment, while still forwarding an allowlisted OS variable.
+    #[test]
+    fn unsandboxed_command_excludes_daemon_secrets() {
+        let _env = env_guard();
+        std::env::set_var("TRAVSR_TEST_FAKE_SECRET", "s3cr3t");
+        std::env::set_var("SYSTEMROOT", "C:\\Windows");
+        let scratch = std::env::temp_dir();
+        let spawn = build_unsandboxed_command("java", &["-version"], &scratch, "java");
+        // Off Windows, `SandboxedSpawn` has only the `Wrapped` variant
+        // (AppContainer is windows-only), so this pattern is irrefutable and rustc
+        // flags the `else` as unreachable. It is refutable on Windows, so allow the
+        // lint only where the pattern cannot fail.
+        #[cfg_attr(not(target_os = "windows"), allow(irrefutable_let_patterns))]
+        let SandboxedSpawn::Wrapped(cmd) = spawn
+        else {
+            panic!("unsandboxed command must be a plain wrapped command");
+        };
+        // A daemon secret is dropped; an allowlisted OS var survives.
+        let mut saw_secret = false;
+        let mut saw_systemroot = false;
+        for (k, _) in cmd.get_envs() {
+            match k.to_str() {
+                Some("TRAVSR_TEST_FAKE_SECRET") => saw_secret = true,
+                Some(s) if s.eq_ignore_ascii_case("SYSTEMROOT") => saw_systemroot = true,
+                _ => {}
+            }
+        }
+        std::env::remove_var("TRAVSR_TEST_FAKE_SECRET");
+        assert!(
+            !saw_secret,
+            "daemon secret must not reach the unsandboxed child"
+        );
+        assert!(saw_systemroot, "allowlisted OS var must be forwarded");
     }
 }

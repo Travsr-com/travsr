@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use travsr_core::{Node as CoreNode, NodeId};
+use travsr_core::{display_label, Node as CoreNode, NodeId};
 use travsr_retrieval::{
     context_candidates, knapsack, token_cost, EdgeFilter, OpenFilter, MAX_CONTEXT_BUDGET,
     TOKEN_CHARS_PER_TOKEN,
@@ -60,7 +60,7 @@ fn dependency_arg_hint(store: &SqliteStore, file: &str) -> Option<String> {
     match nodes.first() {
         Some(n) => Some(format!(
             "'{file}' resolved to {} '{}', not a file — get_dependencies takes a repo-relative file path. For a symbol, use get_callers or find_references.",
-            n.kind, n.vname.signature
+            n.kind, display_label(n)
         )),
         None => Some(format!(
             "no file matched '{file}' — get_dependencies takes a repo-relative file path (run get_repo_map to list files)."
@@ -128,7 +128,7 @@ fn get_dependencies_transitive_raw(store: &SqliteStore, file: &str, depth: u32) 
         let prefix = "  ↳ ".repeat(hop as usize); // hop 0 = direct → no prefix
         for dst_id in new_dsts {
             if let Some(dst_node) = node_map.get(&dst_id) {
-                lines.push(format!("{prefix}{}", dst_node.vname.signature));
+                lines.push(format!("{prefix}{}", display_label(dst_node)));
                 queue.push_back((dst_id, hop + 1));
             }
         }
@@ -183,7 +183,7 @@ fn get_dependencies_raw(store: &SqliteStore, file: &str) -> String {
         .collect();
     let mut lines: Vec<String> = ids
         .iter()
-        .filter_map(|id| node_map.get(id).map(|n| n.vname.signature.clone()))
+        .filter_map(|id| node_map.get(id).map(|n| display_label(n).into_owned()))
         .collect();
     if total_deps > DEFAULT_DEPS_TOP_K {
         lines.push(format!(
@@ -571,7 +571,10 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
                     for line in sites {
                         lines.push(format!(
                             "{tag} {} ({}) — {}:{}",
-                            src_node.vname.signature, src_node.kind, src_node.vname.path, line
+                            display_label(src_node),
+                            src_node.kind,
+                            src_node.vname.path,
+                            line
                         ));
                     }
                     continue;
@@ -583,7 +586,10 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         let loc = src_node.line.map(|l| format!(":{l}")).unwrap_or_default();
         lines.push(format!(
             "{tag} {} ({}) — {}{}",
-            src_node.vname.signature, src_node.kind, src_node.vname.path, loc
+            display_label(src_node),
+            src_node.kind,
+            src_node.vname.path,
+            loc
         ));
     }
     // #715: a crash in this language's last Phase B run leaves partial coverage
@@ -931,7 +937,10 @@ fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
         let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
         out.push_str(&format!(
             "  {} ({}) \u{2014} {}{}\n",
-            n.vname.signature, n.kind, n.vname.path, loc
+            display_label(n),
+            n.kind,
+            n.vname.path,
+            loc
         ));
     }
     out.push_str("Re-run without `path`, or with a `path` hint that matches one of these.");
@@ -987,6 +996,161 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
     wrap_envelope(&with_head_note(store, body))
 }
 
+/// One resolved definition site, for the structured `find_references` result.
+#[derive(serde::Serialize)]
+pub struct ResolvedSymbol {
+    pub signature: String,
+    pub kind: String,
+    pub path: String,
+    pub line: Option<u32>,
+}
+
+impl ResolvedSymbol {
+    fn from_node(n: &CoreNode) -> Self {
+        Self {
+            signature: display_label(n).into_owned(),
+            kind: n.kind.clone(),
+            path: n.vname.path.clone(),
+            line: n.line,
+        }
+    }
+}
+
+/// Machine-readable `find_references` result for the CLI `--format json` path.
+///
+/// The plain [`find_references`] returns the model-facing `<travsr-data>`
+/// envelope, which is a human-readable text blob — unusable as structured data.
+/// This mirrors the same resolution and occurrence lookup but exposes the parts
+/// separately, so a script gets a real `references` array keyed off `symbol` and
+/// `resolved_to` instead of having to parse prose.
+#[derive(serde::Serialize)]
+pub struct StructuredReferences {
+    pub symbol: String,
+    pub path: Option<String>,
+    /// One of: `resolved`, `not_found`, `ambiguous`, `pending`.
+    pub status: &'static str,
+    /// The single definition the symbol resolved to, when `status == resolved`.
+    pub resolved_to: Option<ResolvedSymbol>,
+    /// Candidate definitions when the name is ambiguous, or defined outside a
+    /// `path` hint. Disambiguate by re-running with a `path`.
+    pub candidates: Vec<ResolvedSymbol>,
+    /// Exact occurrence sites (capped at `MAX_REFERENCE_SITES`).
+    pub references: Vec<travsr_core::RefSite>,
+    /// Total occurrence count before the cap; `references.len()` when not truncated.
+    pub total: usize,
+    pub truncated: bool,
+    /// Human caveat when a zero result is not definitive (degraded coverage,
+    /// path-hint miss, still-building index). `null` on a clean answer.
+    pub note: Option<String>,
+}
+
+/// Drop a leading `resolved: …` header line: `resolved_to` already carries it as
+/// structured fields, so it would be redundant inside `note`.
+fn strip_resolved_header(text: &str) -> String {
+    text.strip_prefix("resolved:")
+        .and_then(|rest| rest.split_once('\n'))
+        .map(|(_, body)| body.trim_start().to_string())
+        .unwrap_or_else(|| text.trim().to_string())
+}
+
+/// Structured variant of [`find_references`], consumed by `travsr references
+/// --format json`. Reuses the same resolver and occurrence store as the text
+/// path so the two never disagree on what a symbol resolves to.
+pub fn find_references_structured(
+    store: &SqliteStore,
+    symbol: &str,
+    path: Option<&str>,
+) -> StructuredReferences {
+    let mut out = StructuredReferences {
+        symbol: symbol.to_string(),
+        path: path.map(str::to_string),
+        status: "not_found",
+        resolved_to: None,
+        candidates: Vec::new(),
+        references: Vec::new(),
+        total: 0,
+        truncated: false,
+        note: None,
+    };
+
+    // SEC-002: validate every argument before any store query, as the text path does.
+    if validate_mcp_arg(symbol).is_err() || path.is_some_and(|p| validate_mcp_arg(p).is_err()) {
+        out.note = Some("invalid symbol or path argument".to_string());
+        return out;
+    }
+    if phase_b_pending(store) {
+        out.status = "pending";
+        out.note = Some(
+            "Semantic occurrence index is still building — results are not yet \
+             authoritative. Run `travsr status` to check progress."
+                .to_string(),
+        );
+        return out;
+    }
+
+    let target = match resolve_reference_targets(store, symbol, path) {
+        RefTarget::Unique(n) => n,
+        RefTarget::Ambiguous(nodes) => {
+            out.status = "ambiguous";
+            out.note = Some(format!(
+                "'{symbol}' is ambiguous — {} definitions. Re-run with a `path` hint to pick one.",
+                nodes.len()
+            ));
+            out.candidates = nodes.iter().map(ResolvedSymbol::from_node).collect();
+            return out;
+        }
+        RefTarget::None => {
+            // A `path` hint that filtered out every definition is not a definitive
+            // not-found: re-resolve without it and, if the symbol lives elsewhere,
+            // report those as candidates rather than a bare miss.
+            if let Some(hint) = path {
+                let elsewhere = match resolve_reference_targets(store, symbol, None) {
+                    RefTarget::Unique(n) => vec![n],
+                    RefTarget::Ambiguous(nodes) => nodes,
+                    RefTarget::None => Vec::new(),
+                };
+                if !elsewhere.is_empty() {
+                    out.note = Some(format!(
+                        "Symbol '{symbol}' was not found under path '{hint}', but is \
+                         defined elsewhere (see candidates)."
+                    ));
+                    out.candidates = elsewhere.iter().map(ResolvedSymbol::from_node).collect();
+                    return out;
+                }
+            }
+            out.note = Some(format!("Symbol '{symbol}' was not found."));
+            return out;
+        }
+    };
+
+    out.status = "resolved";
+    out.resolved_to = Some(ResolvedSymbol::from_node(&target));
+
+    match store.reference_sites(target.id) {
+        Ok(sites) if !sites.is_empty() => {
+            out.total = sites.len();
+            out.truncated = out.total > MAX_REFERENCE_SITES;
+            out.references = sites.into_iter().take(MAX_REFERENCE_SITES).collect();
+            // #715 parity with the text path: a crashed last Phase B run leaves
+            // partial coverage under a complete marker, so even a non-empty site
+            // list may be short. Surface the same caveat instead of `note: None`.
+            if phase_b_lang_crashed(store, &target.vname.language) {
+                out.note = Some(crash_caveat(&target.vname.language));
+            }
+        }
+        _ => {
+            // Resolved, but no exact occurrence sites. Carry the text path's honest
+            // caveat (degraded coverage vs. genuine zero) as `note`, minus the
+            // header line that `resolved_to` already encodes. Reuse the target we
+            // just resolved rather than re-running resolution.
+            out.note = Some(strip_resolved_header(&references_body_for_target(
+                store, &target,
+            )));
+        }
+    }
+    out
+}
+
 /// Raw (unsanitized) variant, shared by the global aggregator.
 fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> String {
     let target = match resolve_reference_targets(store, symbol, path) {
@@ -1016,17 +1180,31 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
                 let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
                 out.push_str(&format!(
                     "  {} ({}) — {}{}\n",
-                    n.vname.signature, n.kind, n.vname.path, loc
+                    display_label(n),
+                    n.kind,
+                    n.vname.path,
+                    loc
                 ));
             }
             return out.trim_end().to_string();
         }
     };
 
+    references_body_for_target(store, &target)
+}
+
+/// Render the reference body for an already-resolved target: the `resolved:`
+/// header, the occurrence sites, or the honest degraded/zero caveat. Split out
+/// of [`find_references_raw`] so [`find_references_structured`] can reuse the
+/// target it already resolved for its caveat instead of resolving a second time.
+fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String {
     let resolved_loc = target.line.map(|l| format!(":{l}")).unwrap_or_default();
     let header = format!(
         "resolved: {} ({}) — {}{}",
-        target.vname.signature, target.kind, target.vname.path, resolved_loc
+        display_label(target),
+        target.kind,
+        target.vname.path,
+        resolved_loc
     );
 
     // Primary path: occurrence sites from edge_sites.
@@ -1054,11 +1232,11 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
             // Fallback: no occurrence rows for this dst. Degrade to caller
             // definition lines from structural ref/call edges (labelled), so a
             // language not yet feeding edge_sites still returns something useful.
-            reference_fallback_from_edges(store, &target, &header)
+            reference_fallback_from_edges(store, target, &header)
         }
         Err(e) => {
             tracing::warn!("find_references reference_sites error: {e}");
-            reference_fallback_from_edges(store, &target, &header)
+            reference_fallback_from_edges(store, target, &header)
         }
     }
 }
@@ -2016,7 +2194,7 @@ pub enum AnalysisMode {
 
 /// The one honest "not a language we handle" envelope, shared by every
 /// `get_lang_status` return path so the shape never drifts between them.
-const UNKNOWN_LANG_JSON: &str = r#"{"language":"unknown","status":"unknown","statusLine":"not a supported language","builtin":false,"semantic_available":false,"install_hint":""}"#;
+const UNKNOWN_LANG_JSON: &str = r#"{"language":"unknown","status":"unknown","statusLine":"not a supported language","builtin":false,"semantic_available":false,"install_hint":"","prerequisites":""}"#;
 
 /// Return the set of files transitively affected if the given file changes.
 ///
@@ -2459,9 +2637,14 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
     let semantic_available = store.has_refcall_edges_for_language(meta.language);
 
     // The honest next step when it is not live, in the shared vocabulary:
+    //  - no build for this OS               -> unsupported (never "install", which
+    //                                          would dead-end — same verdict the CLI
+    //                                          `lang list` shows, from one predicate)
     //  - analyzer present but no edges yet  -> rebuild
     //  - analyzer absent                    -> install (same step for every language)
-    let status = if semantic_available {
+    let status = if let Some(os) = travsr_plugin_host::phase_b::platform::unsupported_reason(meta) {
+        LangStatus::PlatformUnsupported { os }
+    } else if semantic_available {
         LangStatus::Active
     } else {
         let next = if analyzer_installed(meta.language) {
@@ -2472,8 +2655,10 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
         LangStatus::Partial { next: Some(next) }
     };
     // `install_hint` stays for backward compatibility; it mirrors the step above.
+    // Empty when there is nothing to install: already live, or no build exists for
+    // this OS (an install step there would just dead-end).
     let install_hint = match &status {
-        LangStatus::Active => String::new(),
+        LangStatus::Active | LangStatus::PlatformUnsupported { .. } => String::new(),
         LangStatus::Partial { next: Some(step) } => step.clone(),
         _ => install_step(meta.language),
     };
@@ -2492,13 +2677,14 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
     // stable machine tag; `statusLine` is the exact plain wording every other
     // surface shows, so the extension renders it verbatim instead of re-deriving.
     format!(
-        r#"{{"language":"{lang}","status":"{status_tag}","statusLine":"{status_line}","builtin":{builtin},"semantic_available":{sem},"install_hint":"{hint}","phase_b_commit":{pbc}}}"#,
+        r#"{{"language":"{lang}","status":"{status_tag}","statusLine":"{status_line}","builtin":{builtin},"semantic_available":{sem},"install_hint":"{hint}","prerequisites":"{prereq}","phase_b_commit":{pbc}}}"#,
         lang = meta.language,
         status_tag = status.tag(),
         status_line = status.line(),
         builtin = meta.builtin,
         sem = semantic_available,
         hint = install_hint,
+        prereq = meta.effective_prerequisites(),
         pbc = phase_b_commit,
     )
 }
@@ -2654,7 +2840,7 @@ fn search_symbol_raw(
         .take(MAX_SEARCH_RESULTS)
         .map(|n| {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
-            format!("{} ({}) — {}{loc}", n.vname.signature, n.kind, n.vname.path)
+            format!("{} ({}) — {}{loc}", display_label(n), n.kind, n.vname.path)
         })
         .collect();
     lines.join("\n")
@@ -3016,7 +3202,7 @@ fn get_repo_map_raw(store: &SqliteStore, reserve_per_line: usize) -> String {
                 .or_default()
                 .entry(n.vname.path.clone())
                 .or_default()
-                .push(n.vname.signature.clone());
+                .push(display_label(n).into_owned());
         }
     }
     if region_symbols.is_empty() {
@@ -3532,7 +3718,7 @@ fn get_execution_path_body(
         if diagnose {
             return format!(
                 "no path found: '{}' and '{}' both resolved, but no connecting call chain was found within traversal limits.",
-                src.vname.signature, snk.vname.signature
+                display_label(&src), display_label(&snk)
             );
         }
         return String::new();
@@ -3540,7 +3726,7 @@ fn get_execution_path_body(
 
     let lines: Vec<String> = path
         .iter()
-        .map(|n| format!("{} ({}) — {}", n.vname.signature, n.kind, n.vname.path))
+        .map(|n| format!("{} ({}) — {}", display_label(n), n.kind, n.vname.path))
         .collect();
     lines.join("\n")
 }
@@ -4203,12 +4389,17 @@ fn format_node_line(
     if n.package.is_empty() {
         format!(
             "{} ({}) — {}{loc}{via}{score_str}",
-            n.vname.signature, n.kind, n.vname.path
+            display_label(n),
+            n.kind,
+            n.vname.path
         )
     } else {
         format!(
             "{} ({}) — {}{loc} [package: {}]{via}{score_str}",
-            n.vname.signature, n.kind, n.vname.path, n.package
+            display_label(n),
+            n.kind,
+            n.vname.path,
+            n.package
         )
     }
 }
@@ -4880,7 +5071,9 @@ fn get_context_body(
                         };
                         format!(
                             "  {} ({}) — {}{loc}{pkg}",
-                            n.vname.signature, n.kind, n.vname.path
+                            display_label(n),
+                            n.kind,
+                            n.vname.path
                         )
                     })
                     .collect();
@@ -5153,7 +5346,14 @@ fn get_context_body(
     const OVERFLOW_DISPLAY_CAP: usize = 10;
     let overflow_candidates: Vec<(NodeId, f32, String, String)> = items
         .iter()
-        .map(|(n, s)| (n.id, *s, n.vname.signature.clone(), n.vname.path.clone()))
+        .map(|(n, s)| {
+            (
+                n.id,
+                *s,
+                display_label(n).into_owned(),
+                n.vname.path.clone(),
+            )
+        })
         .collect();
     let n_candidates = overflow_candidates.len();
 
@@ -5395,7 +5595,11 @@ fn get_context_body(
     // Seed signatures for `via: <role> of <seed>` rendering. Cheap — seeds ≤ ~40.
     let seed_sig: HashMap<NodeId, String> = store
         .get_nodes(&seed_ids)
-        .map(|ns| ns.into_iter().map(|n| (n.id, n.vname.signature)).collect())
+        .map(|ns| {
+            ns.into_iter()
+                .map(|n| (n.id, display_label(&n).into_owned()))
+                .collect()
+        })
         .unwrap_or_default();
 
     if include_snippets {
@@ -6189,7 +6393,12 @@ fn node_json_id(node: &CoreNode) -> String {
     }
 }
 
-/// Short display label — basename for files, full signature for everything else.
+/// Short display label for the visual graph renderer.
+///
+/// File nodes render as a compact basename (a rendering choice for the graph
+/// panel — a file node never carries a raw compiler symbol). Every other node
+/// uses [`display_label`], the one canonical name shared with the CLI and the
+/// text MCP tools, so the same node reads identically on every surface.
 fn node_json_label(node: &CoreNode) -> String {
     if node.kind == "file" {
         node.vname
@@ -6198,40 +6407,27 @@ fn node_json_label(node: &CoreNode) -> String {
             .next()
             .unwrap_or(&node.vname.path)
             .to_string()
-    } else if node.vname.signature.starts_with("scip:") {
-        // Extract the short name from a scip qualified signature.
-        // "scip:...HomeController#home()." → "home()"
-        // "scip:...HomeController#"        → "HomeController"
-        let sig = &node.vname.signature;
-        if let Some(hash_pos) = sig.rfind('#') {
-            let after = sig[hash_pos + 1..].trim_end_matches('.');
-            if !after.is_empty() {
-                return after.to_string();
-            }
-            let before = &sig[..hash_pos];
-            return before
-                .rsplit(['/', ' '])
-                .next()
-                .unwrap_or(before)
-                .to_string();
-        }
-        sig.to_string()
     } else {
-        // Strip structural prefixes (fn:, class:, method:, interface:, import:)
-        // so "fn:home" displays as "home", "class:HomeController" as "HomeController".
-        let sig = &node.vname.signature;
-        if let Some(rest) = sig
-            .strip_prefix("fn:")
-            .or_else(|| sig.strip_prefix("class:"))
-            .or_else(|| sig.strip_prefix("method:"))
-            .or_else(|| sig.strip_prefix("interface:"))
-            .or_else(|| sig.strip_prefix("import:"))
-        {
-            rest.to_string()
-        } else {
-            sig.clone()
-        }
+        // `display_label` canonicalizes a synthesized scip:/sdb: symbol to a
+        // clean `Type.member` name, but returns a native tree-sitter signature
+        // verbatim (`fn:home`). The visual renderer wants the bare short name
+        // (`home`), which the graph panel and `askSymbol` quick pick have always
+        // shown, so strip the structural `kind:` prefix off native labels.
+        strip_native_kind_prefix(&display_label(node)).to_string()
     }
+}
+
+/// Strip a native tree-sitter `kind:` prefix (`fn:`, `class:`, `method:`,
+/// `interface:`, `import:`) so `fn:home` renders as `home` in the visual graph.
+/// A canonicalized external label (no such prefix) passes through unchanged.
+fn strip_native_kind_prefix(label: &str) -> &str {
+    label
+        .strip_prefix("fn:")
+        .or_else(|| label.strip_prefix("class:"))
+        .or_else(|| label.strip_prefix("method:"))
+        .or_else(|| label.strip_prefix("interface:"))
+        .or_else(|| label.strip_prefix("import:"))
+        .unwrap_or(label)
 }
 
 fn get_graph_json_raw(
@@ -6605,7 +6801,7 @@ fn get_graph_json_raw(
                     .iter()
                     .map(|n| {
                         serde_json::json!({
-                            "signature": n.vname.signature,
+                            "signature": display_label(n),
                             "kind": n.kind,
                             "path": n.vname.path,
                             "line": n.line,
@@ -6852,6 +7048,82 @@ fn get_graph_json_global_overview(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The visual graph renderer strips the native `kind:` prefix (`fn:home` →
+    /// `home`), keeps the canonicalized `Type.member` name for synthesized
+    /// external symbols, and shows a file node's basename. The vscode fixture
+    /// (`commands.test.ts`) pins the `fn:bar` → `bar` contract.
+    #[test]
+    fn node_json_label_strips_native_prefix_and_cleans_external() {
+        use travsr_core::{Node, VName};
+        let native = Node::new(
+            VName::new("c", "", "src/foo.rs", "rust", "fn:home"),
+            "function",
+        );
+        assert_eq!(node_json_label(&native), "home");
+
+        let class = Node::new(
+            VName::new("c", "", "src/foo.rs", "rust", "class:Home"),
+            "class",
+        );
+        assert_eq!(node_json_label(&class), "Home");
+
+        let file = Node::new(
+            VName::new("c", "", "src/foo/bar.rs", "rust", "file"),
+            "file",
+        );
+        assert_eq!(node_json_label(&file), "bar.rs");
+
+        // A synthesized external symbol keeps its clean, prefix-free label.
+        let external = Node::new(
+            VName::new(
+                "c",
+                "",
+                "com/demo/Greeter.java",
+                "java",
+                "sdb:com/demo/Greeter#greet().",
+            ),
+            "method",
+        );
+        assert_eq!(node_json_label(&external), "Greeter.greet");
+    }
+
+    /// `find_references_structured` reports a machine-readable `status` that the
+    /// CLI text path branches on for its not-found message. Pin the three the
+    /// store can produce without a semantic index: `not_found`, `resolved`, and
+    /// `ambiguous`.
+    #[test]
+    fn find_references_structured_reports_status() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // Empty store: a name with no definition is a definitive not-found.
+        let miss = find_references_structured(&store, "charge", None);
+        assert_eq!(miss.status, "not_found");
+        assert!(miss.candidates.is_empty());
+
+        // One definition: resolved (zero recorded uses is still `resolved`).
+        store
+            .put_node(&Node::new(
+                VName::new("c", "", "svc.rs", "rust", "fn:charge"),
+                "function",
+            ))
+            .unwrap();
+        let hit = find_references_structured(&store, "charge", None);
+        assert_eq!(hit.status, "resolved");
+        assert!(hit.resolved_to.is_some());
+
+        // Two definitions of the same name in different files: ambiguous.
+        store
+            .put_node(&Node::new(
+                VName::new("c", "", "billing.rs", "rust", "fn:charge"),
+                "function",
+            ))
+            .unwrap();
+        let amb = find_references_structured(&store, "charge", None);
+        assert_eq!(amb.status, "ambiguous");
+        assert!(amb.candidates.len() >= 2);
+    }
 
     /// SEC-002 end-to-end: a path-traversal repo arg must be rejected through
     /// the full get_callers_global → collect_global → validate_mcp_arg pipeline.
@@ -7882,6 +8154,34 @@ mod tests {
         assert!(json.contains(r#""builtin":true"#));
         assert!(json.contains(r#""semantic_available":false"#));
         assert!(json.contains(r#""status":"partial""#), "got: {json}");
+    }
+
+    /// get_lang_status must never tell the user to install a build that does not
+    /// exist for this OS: when the shared platform predicate says a language is
+    /// unavailable here, the status is `unsupported` with no install hint — the
+    /// same verdict `travsr lang list` shows. Gated on the predicate so it is
+    /// correct on every host (objectivec is unavailable off Apple, available on it).
+    #[test]
+    fn get_lang_status_agrees_with_platform_predicate_on_unsupported() {
+        let store = make_store(&[], &[]);
+        let json = get_lang_status(&store, "src/AppDelegate.mm");
+        assert!(json.contains(r#""language":"objectivec""#), "got: {json}");
+        let entry = travsr_plugin_host::phase_b::catalog::lookup("objectivec").unwrap();
+        if travsr_plugin_host::phase_b::platform::unsupported_reason(entry).is_some() {
+            assert!(
+                json.contains(r#""status":"unsupported""#),
+                "unavailable here, must be unsupported, got: {json}"
+            );
+            assert!(
+                json.contains(r#""install_hint":"""#),
+                "no install hint when unsupported, got: {json}"
+            );
+        } else {
+            assert!(
+                json.contains(r#""status":"partial""#) || json.contains(r#""status":"active""#),
+                "available here, must not be unsupported, got: {json}"
+            );
+        }
     }
 
     /// get_lang_status flips to `active` after a RefCall edge is inserted.
@@ -9305,7 +9605,10 @@ fn get_snippets_body(
     for node in &resolved {
         let header = format!(
             "{} ({}) \u{2014} {} [package: {}]",
-            node.vname.signature, node.kind, node.vname.path, node.package
+            display_label(node),
+            node.kind,
+            node.vname.path,
+            node.package
         );
         let skeleton = |n: &CoreNode| skeleton_for_node_inner(n, &repo_root).map(|s| s.render());
 
