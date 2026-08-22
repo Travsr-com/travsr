@@ -87,12 +87,11 @@ fn resolve_single_repo(
 /// writes at init (daemon lib.rs). `None` when absent/empty, a store opened
 /// standalone against a bare db with no daemon-written metadata.
 fn stdio_repo_root(store: &SqliteStore) -> Option<PathBuf> {
-    store
-        .get_meta("repo_root")
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    // Resolved rather than read. The stamp is written once at init and never
+    // updated, so a moved checkout left `get_daemon_logs` reading `<gone>/.travsr`
+    // and returning nothing at all, with `get_index_status` and
+    // `get_graph_health` degrading the same way (#749 review).
+    store.resolve_repo_root()
 }
 
 /// Repo label for the stdio (single-repo) variants: the `corpus` meta value,

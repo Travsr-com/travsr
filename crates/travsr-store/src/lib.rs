@@ -764,6 +764,14 @@ pub struct SqliteStore {
     /// in-memory stores. Used by `embed_progress` to ATTACH embed.db and count
     /// embedded nodes without polluting the graph.db WAL with embedding BLOBs.
     embed_db_path: Option<std::path::PathBuf>,
+    /// This store's own graph.db path. `None` for in-memory stores.
+    ///
+    /// Added because `repo_root_from_db_path` was deriving the repository root
+    /// from `embed_db_path`, which happens to be graph.db's sibling and is
+    /// declared for something else entirely. Relocating embed.db (models already
+    /// live outside the repo) would have silently brought #747 back, and no
+    /// fixture would have caught it (#749 review).
+    db_path: Option<std::path::PathBuf>,
     /// #464 follow-up: persistent read-only connection to the sibling embed.db,
     /// lazily opened on first [`Self::embed_data_version`] call. Persistent
     /// because `PRAGMA data_version` only moves relative to prior reads on the
@@ -802,6 +810,44 @@ impl SqliteStore {
     /// cannot go stale in the same way.
     ///
     /// `None` for an in-memory store, which has no location to derive from.
+    /// The repository root to resolve paths against, live rather than remembered.
+    ///
+    /// Lives here rather than in a caller because there are six readers of
+    /// `meta.repo_root` across `travsr-mcp` alone, and the first version of this
+    /// rule was private to `tools.rs`, so `observability.rs` and `seed.rs` could
+    /// not use it even had they wanted to. A seventh reader added later now gets
+    /// the right behaviour by default instead of by remembering (#749 review).
+    ///
+    /// Precedence, in order:
+    ///
+    /// 1. The derived root, when it is a repository in its own right. A `.travsr`
+    ///    copied into a second checkout still names the first, and that one
+    ///    usually still exists, so preferring the stored value there reads files
+    ///    out of the wrong tree while looking entirely confident.
+    /// 2. The stored value, while it resolves. This is the `--db` case: a
+    ///    database opened from outside any repository is still about the real
+    ///    one, and only the stored value knows where that is.
+    /// 3. Whichever of the two is left.
+    pub fn resolve_repo_root(&self) -> Option<std::path::PathBuf> {
+        let stored = self
+            .get_meta("repo_root")
+            .ok()
+            .flatten()
+            .filter(|r| !r.is_empty())
+            .map(std::path::PathBuf::from);
+        let derived = self.repo_root_from_db_path();
+
+        // `.git` is a directory in a normal checkout and a file in a worktree or
+        // submodule, so `exists` covers both.
+        if derived.as_ref().is_some_and(|d| d.join(".git").exists()) {
+            return derived;
+        }
+        match stored {
+            Some(p) if p.is_dir() => Some(p),
+            stored => derived.or(stored),
+        }
+    }
+
     pub fn repo_root_from_db_path(&self) -> Option<std::path::PathBuf> {
         // `<repo>/.travsr/graph.db` -> `<repo>`, and only that shape.
         //
@@ -810,7 +856,7 @@ impl SqliteStore {
         // otherwise yield whatever happens to sit two levels up, and a confident
         // wrong root is worse than none: callers would resolve `vname.path`
         // against an unrelated directory instead of degrading to metadata-only.
-        let dir = self.embed_db_path.as_deref()?.parent()?;
+        let dir = self.db_path.as_deref()?.parent()?;
         if dir.file_name()? != ".travsr" {
             return None;
         }
@@ -832,6 +878,7 @@ impl SqliteStore {
                 embed_score_hook: None,
                 embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
+                db_path: Some(path.to_path_buf()),
                 embed_meta_conn: std::cell::RefCell::new(None),
                 embed_doc_knn_hook: None,
             };
@@ -900,6 +947,7 @@ impl SqliteStore {
                 embed_score_hook: None,
                 embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
+                db_path: Some(path.to_path_buf()),
                 embed_meta_conn: std::cell::RefCell::new(None),
                 embed_doc_knn_hook: None,
             };
@@ -929,6 +977,7 @@ impl SqliteStore {
                 embed_score_hook: None,
                 embed_readiness: None,
                 embed_db_path: None,
+                db_path: None,
                 embed_meta_conn: std::cell::RefCell::new(None),
                 embed_doc_knn_hook: None,
             };

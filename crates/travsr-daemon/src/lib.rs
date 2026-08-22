@@ -1268,12 +1268,16 @@ pub fn init_repo_with_progress(
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
     // path at query time without threading repo_root through function signatures.
     //
-    // Re-stamped on every index, not written once. It used to be set at first
-    // init and left alone, so moving the checkout left it naming a directory
-    // that no longer existed and `find_pattern` handed that to `git -C` (#747).
-    // Consumers now fall back to the database's own location, and re-stamping
-    // here means the stored value stops being wrong in the first place: any
-    // re-index from the new path corrects it.
+    // Stamped here and only here. `reindex_files`, which the watcher and the
+    // commit hook run, does not write this key, so an incremental reindex after a
+    // move leaves it stale: the self-correction is an explicit `travsr init` from
+    // the new path, not "any re-index".
+    //
+    // My earlier note here claimed this changed from write-once to re-stamped.
+    // It did not: the write was already unconditional on the base, so that
+    // described a fix this diff does not contain (#749 review). Consumers
+    // falling back to the database's own location is what actually covers the
+    // gap.
     if let Some(root_str) = repo_root.to_str() {
         store
             .set_meta("repo_root", root_str)
@@ -3564,6 +3568,16 @@ pub fn reindex_files(
     repo_root: &Path,
     store: &mut SqliteStore,
 ) -> anyhow::Result<travsr_core::DirtySet> {
+    // Keep `repo_root` current. This path runs on every commit and on every
+    // watcher batch, and it already knows the root, so stamping here closes the
+    // window where a moved checkout keeps a stale value until someone runs an
+    // explicit `travsr init` (#749 review). Consumers still fall back to the
+    // database's own location, which covers the first query after a move,
+    // before any reindex has happened.
+    if let Some(root_str) = repo_root.to_str() {
+        let _ = store.set_meta("repo_root", root_str);
+    }
+
     // RFC-002: detect signature format version mismatch before touching the
     // graph. The hook must never block a commit, so return Ok(()) on mismatch
     // and let the user resolve it with `travsr init`.

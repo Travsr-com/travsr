@@ -1241,29 +1241,12 @@ pub fn find_references_global(
 /// Cap on returned grep matches (byte-budget guard).
 const MAX_PATTERN_MATCHES: usize = 500;
 
-/// The repository root to resolve paths against, live rather than remembered.
+/// The repository root to resolve paths against.
 ///
-/// `meta.repo_root` is written once by `init` and never updated, so any change
-/// to the absolute path leaves it naming a directory that is gone: a moved
-/// checkout, a clone that inherited a copied `.travsr/`, a CI mount at a
-/// different point, a renamed home directory. `find_pattern` handed that stale
-/// path to `git -C` and every search failed, including a plain literal (#747).
-///
-/// The stored value still wins when it points at something real, because it is
-/// the true repository even when the database was opened through `--db` from
-/// somewhere else. When it no longer resolves, the database's own location does,
-/// since the database travels with the repository.
+/// Thin now: the rule lives on `SqliteStore` so that every reader of
+/// `meta.repo_root` shares it, not just this file's four (#749 review).
 fn resolve_repo_root(store: &SqliteStore) -> Option<PathBuf> {
-    let stored = store
-        .get_meta("repo_root")
-        .ok()
-        .flatten()
-        .filter(|r| !r.is_empty())
-        .map(PathBuf::from);
-    match stored {
-        Some(p) if p.is_dir() => Some(p),
-        stored => store.repo_root_from_db_path().or(stored),
-    }
+    store.resolve_repo_root()
 }
 
 /// Graph-scoped textual search: `git grep` confined to a bounded file set.
@@ -1384,6 +1367,18 @@ pub fn find_pattern_raw(
                     "pattern error: {detail} — the pattern is POSIX ERE; use --fixed for a \
                      literal search, or escape metacharacters."
                 )
+            } else if detail.contains("cannot change to") || detail.contains("No such file") {
+                // This path knows what happened and used to say nothing about
+                // it: the directory in the message is index metadata, and
+                // `travsr init` is what clears it. Leaving the reader to work
+                // that out was the other half of #747 (#749 review).
+                format!(
+                    "pattern error: {detail}\n\
+                     That path comes from the index, not from your query. It is \
+                     recorded when the repository is indexed, so it is stale if \
+                     the repository has moved. Run `travsr init` from the \
+                     current location to update it."
+                )
             } else {
                 format!("pattern error: {detail}")
             }
@@ -1393,25 +1388,58 @@ pub fn find_pattern_raw(
 
 /// Whether a `git grep` failure is about the pattern rather than the environment.
 ///
-/// Anchored to what git says about a bad regex. Everything else it can fail on
-/// (a working directory that is gone, no repository, a bad pathspec) says
-/// something else, and telling that reader about POSIX ERE sends them to check
-/// a pattern that was never the problem.
+/// Matched against git's own phrasing, not against loose words. The first
+/// version searched the whole stderr for needles like "bracket", "parenthes" and
+/// "repetition", and git quotes the repository path back in its errors, so
+/// `~/dev/bracket-parser` or `~/work/brace-matching` turned a missing-directory
+/// failure back into "check your regex" for exactly the reader this was meant to
+/// stop misleading (#749 review).
+///
+/// Anchored on the phrases git uses to report a bad pattern, each of which
+/// carries enough context that a path cannot fake it.
 fn looks_like_a_regex_complaint(detail: &str) -> bool {
-    let d = detail.to_lowercase();
+    // Only the part of the message git wrote about the pattern. Paths appear
+    // inside quotes, so a needle matching there is matching the user's directory
+    // name rather than git's diagnosis.
+    let without_quoted_paths: String = {
+        let mut out = String::with_capacity(detail.len());
+        let mut in_quote = false;
+        for c in detail.chars() {
+            match c {
+                '\'' => in_quote = !in_quote,
+                _ if !in_quote => out.push(c),
+                _ => {}
+            }
+        }
+        out.to_lowercase()
+    };
+
+    // Git's own wording, collected by running each bad pattern rather than
+    // guessed. My first list was invented and missed every one of these:
+    //
+    //   alpha(  -> parentheses not balanced
+    //   alpha[  -> brackets ([ ]) not balanced
+    //   a{2     -> braces not balanced
+    //   a\      -> trailing backslash (\)
+    //   *a      -> repetition-operator operand invalid
+    //
+    // Each carries enough context that a directory name cannot fake it, which
+    // is what the loose single words could not manage.
     [
+        "not balanced",
+        "trailing backslash",
+        "repetition-operator operand invalid",
         "invalid regular expression",
         "invalid regex",
-        "unmatched",
-        "brace",
-        "bracket",
-        "parenthes",
-        "repetition",
-        "trailing backslash",
-        "regexp",
+        "unmatched [",
+        "unmatched ( or",
+        "unterminated",
+        "invalid preceding regular expression",
+        "invalid back reference",
+        "invalid character class",
     ]
     .iter()
-    .any(|needle| d.contains(needle))
+    .any(|needle| without_quoted_paths.contains(needle))
 }
 
 /// #517 DD-5: constructs that are syntactically valid POSIX ERE atoms (so
@@ -7415,6 +7443,36 @@ mod tests {
         );
     }
 
+    /// #749 review: a `.travsr` copied into a second checkout still names the
+    /// first, and that one usually still exists, so `is_dir()` alone kept
+    /// choosing it. Every read then came out of the original tree while looking
+    /// entirely confident, which is the one failure mode worse than the three
+    /// that fail loudly.
+    #[test]
+    fn a_copied_travsr_dir_resolves_to_the_copy_not_the_original() {
+        let original = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(original.path().join(".git")).unwrap();
+
+        let copy = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(copy.path().join(".git")).unwrap();
+        let travsr_dir = copy.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        let mut store = SqliteStore::open(&travsr_dir.join("graph.db")).unwrap();
+
+        // What `cp -r` leaves behind: the copy's database naming the original,
+        // which is still there.
+        store
+            .set_meta("repo_root", original.path().to_str().unwrap())
+            .unwrap();
+        assert!(original.path().is_dir(), "the original must still exist");
+
+        assert_eq!(
+            resolve_repo_root(&store).as_deref(),
+            Some(copy.path()),
+            "a database inside a repository resolves to that repository"
+        );
+    }
+
     /// The stored value still wins while it resolves: a database opened through
     /// `--db` from outside the repo would otherwise have its root silently
     /// redirected to wherever the file happened to sit.
@@ -7440,20 +7498,42 @@ mod tests {
     /// wrong for a missing directory, and it used to be appended to both.
     #[test]
     fn the_regex_hint_is_offered_only_for_a_regex_failure() {
-        assert!(looks_like_a_regex_complaint(
-            "fatal: invalid regular expression: unmatched ( or \\("
-        ));
-        assert!(looks_like_a_regex_complaint("Unmatched [ or [^"));
-        assert!(
-            !looks_like_a_regex_complaint(
-                "fatal: cannot change to '/Users/me/Desktop/travsr': No such file or directory"
-            ),
-            "a missing working directory is not a pattern problem"
-        );
-        assert!(
-            !looks_like_a_regex_complaint("fatal: not a git repository"),
-            "an unusable repo is not a pattern problem"
-        );
+        for real in [
+            // Collected by running each pattern through git, not invented. My
+            // first list guessed and matched none of them (#749 review).
+            "fatal: command line, 'alpha(': parentheses not balanced",
+            "fatal: command line, 'alpha[': brackets ([ ]) not balanced",
+            "fatal: command line, 'a{2': braces not balanced",
+            "fatal: command line, 'a\\': trailing backslash (\\)",
+            "fatal: command line, '*a': repetition-operator operand invalid",
+            "fatal: invalid regular expression: unmatched ( or \\(",
+            "Unmatched [ or [^",
+            "fatal: unterminated \\{",
+            "trailing backslash on RHS",
+            "Invalid preceding regular expression",
+        ] {
+            assert!(
+                looks_like_a_regex_complaint(real),
+                "git said the pattern is bad: {real}"
+            );
+        }
+
+        for other in [
+            "fatal: cannot change to '/Users/me/Desktop/travsr': No such file or directory",
+            "fatal: not a git repository",
+            // #749 review: the needles used to be ordinary words, and git quotes
+            // the repository path back in its errors, so an entirely reasonable
+            // directory name turned a missing directory into "check your regex".
+            "fatal: cannot change to '/Users/me/dev/bracket-parser': No such file or directory",
+            "fatal: cannot change to '/Users/me/work/brace-matching': No such file or directory",
+            "fatal: cannot change to '/Users/me/src/unterminated-stream': No such file or directory",
+            "fatal: cannot change to '/Users/me/code/repetition-tests': No such file or directory",
+        ] {
+            assert!(
+                !looks_like_a_regex_complaint(other),
+                "not a pattern problem, so the POSIX ERE hint would mislead: {other}"
+            );
+        }
     }
 
     #[test]
