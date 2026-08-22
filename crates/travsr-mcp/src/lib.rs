@@ -63,7 +63,22 @@ use travsr_store::SqliteStore;
 
 pub(crate) const PROTOCOL_VERSION: &str = "2024-11-05";
 pub(crate) const SERVER_NAME: &str = "travsr";
-pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The version reported in `initialize`'s `serverInfo`, over both stdio and SSE.
+///
+/// #728 gave the CLI and the daemon an injected `<version>+<shortsha>` build id
+/// so a tester's build could be identified, but this constant was left on the
+/// crate version. MCP is the only external interface travsr has, so the one
+/// surface an agent actually talks to was the one that could not report which
+/// build it was, which is the ambiguity #728 existed to remove.
+///
+/// `TRAVSR_BUILD_ID` is set by the release job for the whole cargo invocation,
+/// so this crate sees it too. Unset locally, where it falls back to the crate
+/// version exactly as before.
+pub(crate) const SERVER_VERSION: &str = match option_env!("TRAVSR_BUILD_ID") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 /// Start the MCP stdio server backed by the graph database at `db_path`.
 ///

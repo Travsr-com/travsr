@@ -1049,6 +1049,15 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
 /// the existing graph so every file is re-parsed from scratch, even when no file
 /// content changed. Needed because config that affects *semantic* output (e.g.
 /// `--allow-unsandboxed-lsif` toggling whether Rust LSIF edges are built) is not
+/// Counter incremented every time a reindex marks Phase B dirty.
+///
+/// Paired with `phase_b_dirty`, which says *whether* the graph is degraded.
+/// This says *when*, well enough for `init` to distinguish a flag that predates
+/// its run from one that arrived while it was working: the first is stale and
+/// safe to clear, the second describes a real degradation this Phase B did not
+/// cover.
+const PHASE_B_DIRTY_SEQ: &str = "phase_b_dirty_seq";
+
 /// part of the per-file hash delta, so a plain re-init would report "up to date"
 /// without actually rebuilding those edges.
 pub fn init_repo_with_progress(
@@ -1622,6 +1631,21 @@ pub fn init_repo_with_progress(
     let phase_b_already_done = !current_sha.is_empty() && phase_b_commit_stored == current_sha;
     let run_phase_b_inline = semantic || !has_commit;
 
+    // Observed before Phase B starts, compared after it finishes. `init.lock`
+    // serialises two `travsr init` invocations, but not the daemon's watcher,
+    // which is a separate process with its own store. Without this, a save
+    // during Phase B set the flag, init finished a pass that never saw that
+    // edit, and cleared it anyway: `status` then said `complete` over a file
+    // with no `ref/call` edges, and nothing rearmed, because
+    // `arm_phase_b_if_pending` only fires when `last_commit != phase_b_commit`
+    // and this path had just stamped them equal (#742 review).
+    let dirty_seq_before = store
+        .get_meta(PHASE_B_DIRTY_SEQ)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+
     let phase_b_report = if run_phase_b_inline {
         on_progress(InitProgress::Finalizing);
 
@@ -1784,6 +1808,45 @@ pub fn init_repo_with_progress(
             .unwrap_or(false);
         if run_phase_b_inline && phase_b_made_progress {
             let _ = store.set_meta("phase_b_commit", &sha);
+            // #741: clear `phase_b_dirty` too, exactly as the daemon's own Phase B
+            // path does when it advances this marker.
+            //
+            // The flag is set by `reindex_files` on the watcher and hook paths,
+            // because rewriting a file's Phase A nodes drops its `ref/call` edges
+            // (#583). Init's own indexing does not route through `reindex_files`,
+            // so the flag reaching here was set by an earlier watcher or hook
+            // reindex, not by this run. Phase B has just rebuilt those edges, so
+            // by this point the flag describes a degradation that no longer
+            // exists and leaving it set makes `travsr status` report `stale`
+            // over a correct graph.
+            //
+            // Only reachable with `run_phase_b_inline`, which means
+            // `travsr init --semantic` or a repo with no HEAD commit. Plain
+            // `travsr init` defers Phase B and must NOT clear the flag: the edges
+            // really are still missing, so the flag is honest there. That is why
+            // `status.rs` names `travsr init --semantic` as the remedy rather
+            // than `travsr init`.
+            // Only if nothing marked it dirty while this run was working. A
+            // flag that predates this run is stale and safe to clear, which is
+            // the #741 fix; one that arrived mid-run describes a real
+            // degradation this Phase B did not cover, and clearing it would
+            // trade an honest `stale` for a silent false `complete`.
+            let dirty_seq_now = store
+                .get_meta(PHASE_B_DIRTY_SEQ)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            if dirty_seq_now == dirty_seq_before {
+                let _ = store.set_meta("phase_b_dirty", "0");
+            } else {
+                tracing::info!(
+                    dirty_seq_before,
+                    dirty_seq_now,
+                    "phase_b_dirty left set: a reindex marked it while Phase B was running, \
+                     so this pass did not cover that change"
+                );
+            }
         }
     }
 
@@ -3876,6 +3939,18 @@ pub fn reindex_files(
         // instead of reporting `complete`. Cleared by the next completed Phase
         // B run, which is still commit-gated on purpose.
         let _ = store.set_meta("phase_b_dirty", "1");
+        // A monotonic counter beside the flag, so a run that clears the flag can
+        // tell whether anything marked it dirty *while that run was working*.
+        // The flag alone cannot answer that: it is already "1" in the case that
+        // matters, so a before/after comparison of its value sees no change and
+        // clears a degradation that arrived mid-run (#742 review).
+        let seq = store
+            .get_meta(PHASE_B_DIRTY_SEQ)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let _ = store.set_meta(PHASE_B_DIRTY_SEQ, &seq.wrapping_add(1).to_string());
 
         // Recompute k-core shell numbers so they stay fresh after every commit.
         // O(V + E) — fast enough to run inline on the hook path at MVP scale.

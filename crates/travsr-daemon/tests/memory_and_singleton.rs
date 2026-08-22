@@ -133,6 +133,10 @@ async fn rss_flood_under_200mb() {
     git_init(tmp.path());
 
     // init_repo creates the DB, installs the hook, stamps format version.
+    // UX-017: without this, `init_repo` appends this tempdir to the developer's
+    // real ~/.travsr/registry.json, which then lists a directory `tempfile`
+    // deletes on drop.
+    std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
     travsr_daemon::init_repo(tmp.path()).expect("init_repo");
 
     // Baseline RSS — measured after init_repo so the DB is already open and
@@ -216,6 +220,10 @@ async fn rss_flood_under_200mb() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     git_init(tmp.path());
+    // UX-017: without this, `init_repo` appends this tempdir to the developer's
+    // real ~/.travsr/registry.json, which then lists a directory `tempfile`
+    // deletes on drop.
+    std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
     travsr_daemon::init_repo(tmp.path()).expect("init_repo");
 
     let repo_root = tmp.path().to_path_buf();
@@ -271,6 +279,10 @@ async fn rss_flood_under_200mb() {
 async fn daemon_start_twice_single_process() {
     let tmp = tempfile::tempdir().expect("tempdir");
     git_init(tmp.path());
+    // UX-017: without this, `init_repo` appends this tempdir to the developer's
+    // real ~/.travsr/registry.json, which then lists a directory `tempfile`
+    // deletes on drop.
+    std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
     travsr_daemon::init_repo(tmp.path()).expect("init_repo");
 
     let repo_root_1 = tmp.path().to_path_buf();
