@@ -1052,6 +1052,15 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
 /// the existing graph so every file is re-parsed from scratch, even when no file
 /// content changed. Needed because config that affects *semantic* output (e.g.
 /// `--allow-unsandboxed-lsif` toggling whether Rust LSIF edges are built) is not
+/// Counter incremented every time a reindex marks Phase B dirty.
+///
+/// Paired with `phase_b_dirty`, which says *whether* the graph is degraded.
+/// This says *when*, well enough for `init` to distinguish a flag that predates
+/// its run from one that arrived while it was working: the first is stale and
+/// safe to clear, the second describes a real degradation this Phase B did not
+/// cover.
+const PHASE_B_DIRTY_SEQ: &str = "phase_b_dirty_seq";
+
 /// part of the per-file hash delta, so a plain re-init would report "up to date"
 /// without actually rebuilding those edges.
 pub fn init_repo_with_progress(
@@ -1625,6 +1634,21 @@ pub fn init_repo_with_progress(
     let phase_b_already_done = !current_sha.is_empty() && phase_b_commit_stored == current_sha;
     let run_phase_b_inline = semantic || !has_commit;
 
+    // Observed before Phase B starts, compared after it finishes. `init.lock`
+    // serialises two `travsr init` invocations, but not the daemon's watcher,
+    // which is a separate process with its own store. Without this, a save
+    // during Phase B set the flag, init finished a pass that never saw that
+    // edit, and cleared it anyway: `status` then said `complete` over a file
+    // with no `ref/call` edges, and nothing rearmed, because
+    // `arm_phase_b_if_pending` only fires when `last_commit != phase_b_commit`
+    // and this path had just stamped them equal (#742 review).
+    let dirty_seq_before = store
+        .get_meta(PHASE_B_DIRTY_SEQ)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+
     let phase_b_report = if run_phase_b_inline {
         on_progress(InitProgress::Finalizing);
 
@@ -1787,6 +1811,45 @@ pub fn init_repo_with_progress(
             .unwrap_or(false);
         if run_phase_b_inline && phase_b_made_progress {
             let _ = store.set_meta("phase_b_commit", &sha);
+            // #741: clear `phase_b_dirty` too, exactly as the daemon's own Phase B
+            // path does when it advances this marker.
+            //
+            // The flag is set by `reindex_files` on the watcher and hook paths,
+            // because rewriting a file's Phase A nodes drops its `ref/call` edges
+            // (#583). Init's own indexing does not route through `reindex_files`,
+            // so the flag reaching here was set by an earlier watcher or hook
+            // reindex, not by this run. Phase B has just rebuilt those edges, so
+            // by this point the flag describes a degradation that no longer
+            // exists and leaving it set makes `travsr status` report `stale`
+            // over a correct graph.
+            //
+            // Only reachable with `run_phase_b_inline`, which means
+            // `travsr init --semantic` or a repo with no HEAD commit. Plain
+            // `travsr init` defers Phase B and must NOT clear the flag: the edges
+            // really are still missing, so the flag is honest there. That is why
+            // `status.rs` names `travsr init --semantic` as the remedy rather
+            // than `travsr init`.
+            // Only if nothing marked it dirty while this run was working. A
+            // flag that predates this run is stale and safe to clear, which is
+            // the #741 fix; one that arrived mid-run describes a real
+            // degradation this Phase B did not cover, and clearing it would
+            // trade an honest `stale` for a silent false `complete`.
+            let dirty_seq_now = store
+                .get_meta(PHASE_B_DIRTY_SEQ)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            if dirty_seq_now == dirty_seq_before {
+                let _ = store.set_meta("phase_b_dirty", "0");
+            } else {
+                tracing::info!(
+                    dirty_seq_before,
+                    dirty_seq_now,
+                    "phase_b_dirty left set: a reindex marked it while Phase B was running, \
+                     so this pass did not cover that change"
+                );
+            }
         }
     }
 
@@ -3016,6 +3079,71 @@ fn repo_has_objc_sources(repo_root: &Path) -> bool {
 /// Phase 1 silently stalls forever. This function now detects both cases and
 /// re-triggers Phase 1 when: Phase B is complete AND no sidecar is currently
 /// running AND Phase 1 is still incomplete.
+/// #735: single-flight for the 60 s embed tick body.
+///
+/// The tick's `spawn_blocking` closure returns to the select loop immediately,
+/// so nothing stopped tick N+1 from starting while tick N was still running.
+/// The body is not tick-safe under overlap: `regenerate_embed_texts_if_stale`
+/// opens its own store connection (not the shared mutex), and in the
+/// crash-residue state issue #735 describes (a killed reindex left
+/// `embed_text_model_id` stale) every overlapping pass re-ran
+/// `clear_all_embed_texts` + a full-repo parse, un-doing the others' progress.
+/// On a repo where one pass takes longer than the tick interval, passes
+/// accumulated without bound, each holding a full-corpus node/text buffer,
+/// which is unbounded memory growth with no log line to show for it.
+static EMBED_TICK_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII claim on [`EMBED_TICK_RUNNING`]; drop (return or panic) releases it.
+struct EmbedTickGuard;
+
+impl EmbedTickGuard {
+    fn try_acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        EMBED_TICK_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| EmbedTickGuard)
+    }
+}
+
+impl Drop for EmbedTickGuard {
+    fn drop(&mut self) {
+        EMBED_TICK_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// One embed tick: revive a crashed query sidecar, then drive the two-phase
+/// background embedding pipeline. Shared by the unix and windows select arms.
+///
+/// Single-flighted (#735): a tick that fires while the previous one is still
+/// running is skipped; the work is periodic and idempotent, so the next tick
+/// picks up whatever this one would have done. See [`EMBED_TICK_RUNNING`].
+fn run_embed_tick(
+    repo_root: &Path,
+    store: &std::sync::Mutex<SqliteStore>,
+    phase2_spawned: &std::sync::atomic::AtomicBool,
+    supervisor: &std::sync::Mutex<Option<travsr_plugin_host::EmbedSupervisor>>,
+) {
+    let Some(_guard) = EmbedTickGuard::try_acquire() else {
+        tracing::debug!("embed_tick: previous tick still running; skipping this tick");
+        return;
+    };
+    // #736 item 6: revive a crashed sidecar before the spawn check.
+    // maybe_respawn swaps the new child inside the Arc the injected hooks
+    // already hold, so no re-injection is needed; attempts are bounded by
+    // MAX_RESPAWN_ATTEMPTS and this function's single-flight keeps
+    // overlapping ticks off the supervisor mutex.
+    if let Ok(mut guard) = supervisor.lock() {
+        if let Some(s) = guard.as_mut() {
+            if !s.is_active() {
+                s.maybe_respawn();
+            }
+        }
+    }
+    maybe_spawn_embed(repo_root, store, phase2_spawned);
+}
+
 fn maybe_spawn_embed(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
@@ -3824,6 +3952,18 @@ pub fn reindex_files(
         // instead of reporting `complete`. Cleared by the next completed Phase
         // B run, which is still commit-gated on purpose.
         let _ = store.set_meta("phase_b_dirty", "1");
+        // A monotonic counter beside the flag, so a run that clears the flag can
+        // tell whether anything marked it dirty *while that run was working*.
+        // The flag alone cannot answer that: it is already "1" in the case that
+        // matters, so a before/after comparison of its value sees no change and
+        // clears a degradation that arrived mid-run (#742 review).
+        let seq = store
+            .get_meta(PHASE_B_DIRTY_SEQ)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let _ = store.set_meta(PHASE_B_DIRTY_SEQ, &seq.wrapping_add(1).to_string());
 
         // Recompute k-core shell numbers so they stay fresh after every commit.
         // O(V + E) — fast enough to run inline on the hook path at MVP scale.
@@ -4029,6 +4169,37 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
+
+    /// #735: the embed tick body must be single-flight. A tick that fires
+    /// while the previous body still runs used to start a second concurrent
+    /// full-repo embed-text pass; on repos where one pass outlives the tick
+    /// interval those passes piled up without bound (the reported ~3 GB/min).
+    /// One test owns the process-global flag, so no other test may touch it.
+    #[test]
+    fn embed_tick_guard_is_single_flight_and_releases_on_drop() {
+        let first = EmbedTickGuard::try_acquire();
+        assert!(first.is_some(), "an idle tick must acquire");
+        assert!(
+            EmbedTickGuard::try_acquire().is_none(),
+            "an overlapping tick must be refused while the first body runs"
+        );
+        drop(first);
+        let after = EmbedTickGuard::try_acquire();
+        assert!(after.is_some(), "the flag must release when the body ends");
+        drop(after);
+
+        // Panic-safety: an unwinding tick body must release the flag too;
+        // otherwise one crash silences every future embed tick.
+        let result = std::panic::catch_unwind(|| {
+            let _guard = EmbedTickGuard::try_acquire().expect("must acquire");
+            panic!("tick body panicked");
+        });
+        assert!(result.is_err());
+        assert!(
+            EmbedTickGuard::try_acquire().is_some(),
+            "the flag must release even when the tick body panics"
+        );
+    }
 
     #[test]
     fn remap_resolved_sites_redirects_and_drops_self_loops() {
@@ -8688,6 +8859,11 @@ impl Daemon {
         // Polls every 60 s to spawn embed Phase 2 once Phase 1 is complete.
         // Phase 2 must not overlap Phase 1 — both write node_embeddings in embed.db.
         let mut embed_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        // #735: never fire catch-up bursts. The default (Burst) replays every
+        // tick missed while the runtime was stalled back-to-back; combined
+        // with a tick body that used to lack a single-flight guard, a stall
+        // turned into a pile of concurrent full-repo embed-text passes.
+        embed_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let embed_phase2_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
@@ -9075,22 +9251,19 @@ impl Daemon {
                         let store_bg = Arc::clone(&store);
                         let repo_bg = Arc::clone(&repo_root_arc);
                         let p2_flag = Arc::clone(&embed_phase2_spawned);
-                        // #736 item 6: revive a crashed sidecar before the
-                        // spawn check. maybe_respawn swaps the new child inside
-                        // the Arc the injected hooks already hold, so no
-                        // re-injection is needed; attempts are bounded by
-                        // MAX_RESPAWN_ATTEMPTS and the mutex makes overlapping
-                        // ticks single-flight.
                         let supervisor_bg = Arc::clone(&embed_supervisor);
+                        // #735: the body is single-flighted inside
+                        // run_embed_tick: a tick that fires while the
+                        // previous one still runs is skipped, so slow embed
+                        // passes can no longer pile up one blocking task
+                        // (and one full-repo pass) per tick.
                         tokio::task::spawn_blocking(move || {
-                            if let Ok(mut guard) = supervisor_bg.lock() {
-                                if let Some(s) = guard.as_mut() {
-                                    if !s.is_active() {
-                                        s.maybe_respawn();
-                                    }
-                                }
-                            }
-                            maybe_spawn_embed(repo_bg.as_path(), &store_bg, &p2_flag);
+                            run_embed_tick(
+                                repo_bg.as_path(),
+                                &store_bg,
+                                &p2_flag,
+                                &supervisor_bg,
+                            );
                         });
                     }
                     _ = &mut shutdown => {
@@ -9186,22 +9359,16 @@ impl Daemon {
                         let store_bg = Arc::clone(&store);
                         let repo_bg = Arc::clone(&repo_root_arc);
                         let p2_flag = Arc::clone(&embed_phase2_spawned);
-                        // #736 item 6: revive a crashed sidecar before the
-                        // spawn check. maybe_respawn swaps the new child inside
-                        // the Arc the injected hooks already hold, so no
-                        // re-injection is needed; attempts are bounded by
-                        // MAX_RESPAWN_ATTEMPTS and the mutex makes overlapping
-                        // ticks single-flight.
                         let supervisor_bg = Arc::clone(&embed_supervisor);
+                        // #735: see the unix arm; run_embed_tick is
+                        // single-flighted, so overlapping ticks are skipped.
                         tokio::task::spawn_blocking(move || {
-                            if let Ok(mut guard) = supervisor_bg.lock() {
-                                if let Some(s) = guard.as_mut() {
-                                    if !s.is_active() {
-                                        s.maybe_respawn();
-                                    }
-                                }
-                            }
-                            maybe_spawn_embed(repo_bg.as_path(), &store_bg, &p2_flag);
+                            run_embed_tick(
+                                repo_bg.as_path(),
+                                &store_bg,
+                                &p2_flag,
+                                &supervisor_bg,
+                            );
                         });
                     }
                     _ = &mut shutdown => {
