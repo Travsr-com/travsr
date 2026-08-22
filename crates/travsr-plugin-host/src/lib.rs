@@ -107,11 +107,27 @@ pub fn windows_pid_is_alive(pid: u32) -> bool {
 /// site re-opens this amendment". `unsafe` stays confined to
 /// `sandbox/windows/ffi.rs`.
 #[cfg(unix)]
+/// 0 is defined as not alive, and so is any value too large for `pid_t`.
+/// External callers get "is this a live process" and "is this a process id at
+/// all" folded into the same `false`, which is what every current consumer
+/// wants; a caller that needs to tell them apart has to check the value itself.
 pub fn unix_pid_is_alive(pid: u32) -> bool {
     // A PID that does not fit in i32 cannot name a real process on any Unix.
     let Ok(raw) = i32::try_from(pid) else {
         return false;
     };
+    // 0 is not a process id here, it is "every process in my process group", so
+    // `kill(0, None)` always succeeds and 0 would read as alive. Nothing we write
+    // ever stores it (`std::process::id()` cannot return 0), so a 0 in the info
+    // file means the file is corrupt, truncated or externally written, and the
+    // one thing it must not do is name a live holder.
+    //
+    // Only 0 needs excluding. `raw` comes from `i32::try_from(pid)` on a `u32`,
+    // which succeeds only for a non-negative value, so a negative `raw` cannot
+    // reach here and the guard does not pretend to handle one.
+    if raw == 0 {
+        return false;
+    }
     match nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None) {
         Ok(()) => true,
         // The process exists; this user just may not signal it.
@@ -123,6 +139,21 @@ pub fn unix_pid_is_alive(pid: u32) -> bool {
 
 #[cfg(all(test, unix))]
 mod unix_pid_tests {
+    /// #745 review: `kill(0, None)` addresses every process in the caller's
+    /// process group rather than a process named 0, so the permission check
+    /// trivially succeeds and 0 read as alive. That fed the one input still
+    /// reaching the outcome this PR set out to remove: a pid named as the
+    /// holder without having been established as one.
+    #[test]
+    fn pid_zero_and_negatives_are_never_alive() {
+        assert!(
+            !super::unix_pid_is_alive(0),
+            "0 is a process group, not a process, and must not read as a holder"
+        );
+        // i32::MAX + 1 does not fit in a pid_t; anything past it is the same class.
+        assert!(!super::unix_pid_is_alive(u32::MAX));
+    }
+
     /// The regression the round-3 review reported: PID 1 is always alive and
     /// (outside a root-run container) never signallable by the test user, so
     /// it is the canonical `EPERM`-means-alive case. Skips itself when the

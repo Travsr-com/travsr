@@ -69,7 +69,6 @@ impl Palette {
     }
 
     /// Orange `#fb923c` — hot / in-progress (`--color-stale`/`--color-edge-hot`).
-    /// Orange `#fb923c` — hot / in-progress (`--color-stale`/`--color-edge-hot`).
     pub fn orange(self, s: &str) -> String {
         self.paint("38;2;251;146;60", s)
     }
@@ -86,8 +85,17 @@ impl Palette {
         self.paint("2", s)
     }
     /// Bold — the wordmark.
-    fn bold(self, s: &str) -> String {
+    pub fn bold(self, s: &str) -> String {
         self.paint("1", s)
+    }
+    /// Cyan — an identifier the reader is expected to swap for their own.
+    ///
+    /// Basic ANSI (36) rather than the truecolor the brand hues use, deliberately:
+    /// this one has to stay legible against a light terminal background as well as
+    /// a dark one, and the 16-colour codes are remapped by the user's own theme.
+    /// A fixed hex that reads well on charcoal can be near-invisible on white.
+    pub fn ident(self, s: &str) -> String {
+        self.paint("36", s)
     }
 }
 
