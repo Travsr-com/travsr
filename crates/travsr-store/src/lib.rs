@@ -10675,7 +10675,7 @@ mod tests {
         assert_eq!(total, 1, "the aged tombstone must be pruned");
         assert_eq!(
             at_risk, 1,
-            "the node still exists and still has an embedding \u{2014} this is the real risk case"
+            "the node still exists and still has an embedding; this is the real risk case"
         );
     }
 
@@ -10710,7 +10710,7 @@ mod tests {
             assert_eq!(total, 1, "{name}: the aged tombstone must be pruned");
             assert_eq!(
                 at_risk, 1,
-                "{name}: at-risk must be measured on this call too \u{2014} a leaked `edb` \
+                "{name}: at-risk must be measured on this call too; a leaked `edb` \
                  attachment silently degrades it to 0"
             );
         }
@@ -10756,7 +10756,7 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(
             at_risk, 1,
-            "one tombstone, one node, two models \u{2014} at_risk counts nodes, and must never \
+            "one tombstone, one node, two models; at_risk counts nodes, and must never \
              exceed the {total} tombstone(s) pruned"
         );
     }

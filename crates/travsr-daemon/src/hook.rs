@@ -68,6 +68,10 @@ fn branch_checkout_guard_sh(hook: &str) -> &'static str {
 }
 
 fn hook_body(hook: &str, bin: &str) -> String {
+    // PROTOCOL, not prose: the marker line must equal `TRAVSR_MARKER_SH`
+    // byte-for-byte so `install_one` recognises a travsr-installed hook. This is
+    // a raw string, so the em-dash cannot be spelled `\u{2014}`; it is the same
+    // character and must not be swept to other punctuation.
     format!(
         r#"#!/bin/sh
 # installed by travsr — do not edit this line
@@ -81,6 +85,8 @@ exec "$_travsr" hook-run --from-hook --event {hook}
 }
 
 fn chain_hook_body(hook: &str, bin: &str) -> String {
+    // PROTOCOL, not prose: see `hook_body`. The marker line must equal
+    // `TRAVSR_MARKER_SH` byte-for-byte; the em-dash must not be swept.
     format!(
         r#"#!/bin/sh
 # installed by travsr — do not edit this line

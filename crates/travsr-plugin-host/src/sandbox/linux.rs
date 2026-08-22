@@ -55,7 +55,7 @@ pub fn build_sandboxed_command(
             tracing::info!(
                 permitted_hosts = ?permitted_hosts,
                 "network-permitted policy active: this plugin's network isolation is \
-                 intentionally off so it can reach its permitted hosts — enforce the host \
+                 intentionally off so it can reach its permitted hosts; enforce the host \
                  allowlist with egress controls (a firewall or proxy), since bubblewrap has \
                  no per-host network rules"
             );

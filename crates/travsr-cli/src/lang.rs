@@ -1707,7 +1707,7 @@ fn cmd_allow_unsandboxed(
          needs this.\n\
          \n\
          What this allows: when Travsr indexes this project, '{language}' analysis will \
-         download dependencies and run this project's own build with your privileges — \
+         download dependencies and run this project's own build with your privileges, \
          the same as if you ran the build yourself. Only grant it for a project whose \
          build you trust.\n"
     );

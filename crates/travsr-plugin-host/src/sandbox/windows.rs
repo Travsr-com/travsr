@@ -249,7 +249,7 @@ impl AppContainerSpawn {
             tracing::warn!(
                 permitted_hosts = ?permitted_hosts,
                 "network-permitted policy active: Windows AppContainer allows the \
-                 internet-client capability with no per-host filtering — enforce the \
+                 internet-client capability with no per-host filtering; enforce the \
                  permitted hosts with an egress proxy"
             );
         }

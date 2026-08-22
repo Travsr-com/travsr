@@ -130,7 +130,7 @@ pub fn register(exe: &Path, repo_root: &Path) -> anyhow::Result<()> {
             };
             anyhow::bail!(
                 "{why}; Startup-folder fallback also failed ({shim_err:#}). \
-                 The daemon is running now but will not auto-start after logout — \
+                 The daemon is running now but will not auto-start after logout; \
                  start it manually with `travsr daemon start`."
             )
         }

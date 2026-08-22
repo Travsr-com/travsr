@@ -436,7 +436,7 @@ fn cmd_list(json: bool) -> Result<()> {
     } else if active_source == "machine-default" && repo_root_present() {
         println!();
         println!(
-            "Active here is the machine default — this repo has no embedding model \
+            "Active here is the machine default; this repo has no embedding model \
              configured. Run `travsr embed init` inside it to set one."
         );
     }
@@ -502,7 +502,7 @@ fn cmd_init(
                 for b in embed_backends() {
                     let dl_mb: u32 = b.model_files.iter().map(|f| f.size_hint_mb).sum();
                     msg.push_str(&format!(
-                        "  {}  ({} MB download) — {}\n",
+                        "  {}  ({} MB download): {}\n",
                         b.id, dl_mb, b.description
                     ));
                 }
@@ -1392,7 +1392,7 @@ async fn download_embed_binary(
         ),
         None => bail!(
             "binary download failed (404 Not Found): {url}\n\
-             {github_repo} {version} has no prebuilt binary for {target} — \
+             {github_repo} {version} has no prebuilt binary for {target}; \
              this platform may not be supported by that release yet \
              (see https://github.com/{github_repo}/issues)"
         ),

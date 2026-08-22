@@ -1359,7 +1359,7 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
             return format!(
                 "{header}\nOccurrence index unavailable for '{lang}': semantic \
                  analysis recorded no reference occurrences for this \
-                 language in this repo — the result below is not a definitive \
+                 language in this repo; the result below is not a definitive \
                  zero. Run `travsr status` to check progress, or use `find_pattern` \
                  for a textual search."
             );

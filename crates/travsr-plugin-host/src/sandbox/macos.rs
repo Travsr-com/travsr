@@ -143,7 +143,7 @@ pub fn build_sandboxed_command(
             tracing::warn!(
                 permitted_hosts = ?permitted_hosts,
                 "network-permitted policy active: sandbox-exec cannot enforce per-host \
-                 network filtering, so '(allow network*)' is in effect — enforce the \
+                 network filtering, so '(allow network*)' is in effect; enforce the \
                  permitted hosts with a local firewall or egress proxy"
             );
             "(allow network*)".to_string()

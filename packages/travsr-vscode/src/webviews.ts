@@ -1106,7 +1106,7 @@ export function buildLanguagesHtml(
         .join("\n")
     : `<tr><td colspan="2" class="empty" style="font-style:normal">No language metadata yet.&nbsp; <button class="btn primary" id="initBtn" onclick="initRepo(this)">Initialize this repo</button></td></tr>`;
   const indexedNote = indexed.length
-    ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural analysis, includes test &amp; fixture files.</p>`
+    ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural analysis; includes test &amp; fixture files.</p>`
     : "";
 
   // ── Available section ────────────────────────────────────────────────────────
@@ -1263,7 +1263,7 @@ export function buildLanguagesHtml(
   // tools available", which is a claim about the machine rather than about the
   // binary. Say what actually happened.
   const availEmpty = skew
-    ? '<tr><td colspan="5" class="empty">Held back — the resolved travsr is older than this panel expects (see above).</td></tr>'
+    ? '<tr><td colspan="5" class="empty">Held back; the resolved travsr is older than this panel expects (see above).</td></tr>'
     : '<tr><td colspan="5" class="empty">No analysis tools available yet. Use Reload above to check again.</td></tr>';
 
   const body = `

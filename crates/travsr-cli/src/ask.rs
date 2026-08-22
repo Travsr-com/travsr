@@ -99,7 +99,7 @@ fn note_docs_flag_is_read_by_the_daemon() {
     }
     eprintln!(
         "note: TRAVSR_DOCS_ENABLED is read by the process that performs retrieval, \
-         which for `ask` is the travsr daemon — not this command. Prefer the \
+         which for `ask` is the travsr daemon, not this command. Prefer the \
          config key, which the daemon reads whatever environment it was started \
          in: `travsr config set docs.enabled true`."
     );

@@ -313,7 +313,7 @@ export function contractSkewMessage(
       ? `reports no lang-list contract revision (this extension needs ${LANG_CONTRACT_VERSION})`
       : `reports lang-list contract revision ${reportedContract}, but this extension needs ${LANG_CONTRACT_VERSION}`;
   return (
-    `Travsr: the travsr binary at ${binary} is older than this extension expects — it ${rev}. ` +
+    `Travsr: the travsr binary at ${binary} is older than this extension expects; it ${rev}. ` +
     `Missing: ${missingFields.join(", ")}. The Languages panel is held back until a current ` +
     `binary is resolved; indexing and search are unaffected.`
   );

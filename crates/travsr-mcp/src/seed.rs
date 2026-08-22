@@ -6464,7 +6464,7 @@ mod tests {
         assert!(
             resolved < travsr_rerank::DEFAULT_WEAK_FLOOR,
             "the docs lane floor is deliberately below the code lane's WEAK floor \
-             ({resolved} vs {}) — §14.1 measured the doc negative-arm ceiling at \
+             ({resolved} vs {}); §14.1 measured the doc negative-arm ceiling at \
              ~0.002, not ~0.5; borrowing the code floor cost travsr a gold hit",
             travsr_rerank::DEFAULT_WEAK_FLOOR
         );

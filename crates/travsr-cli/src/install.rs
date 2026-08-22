@@ -589,7 +589,7 @@ async fn fetch_verified(
             if actual != expected {
                 bail!(
                     "SHA256 mismatch for {label}: expected {expected}, got {actual}. \
-                     The pinned asset does not match the hash recorded in the catalog — it may \
+                     The pinned asset does not match the hash recorded in the catalog; it may \
                      have been replaced upstream."
                 );
             }
@@ -1657,7 +1657,7 @@ pub(crate) fn verify_and_extract_zip(
         if actual != expected {
             bail!(
                 "SHA256 mismatch for {asset_name} at {tag}: expected {expected}, got {actual}. \
-                 The pinned asset does not match the hash recorded in the catalog — it may have \
+                 The pinned asset does not match the hash recorded in the catalog; it may have \
                  been replaced upstream."
             );
         }

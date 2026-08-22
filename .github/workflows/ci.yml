@@ -177,6 +177,14 @@ jobs:
       - name: verify plugin source hashes (ADR-017 Rule 5)
         run: bash .github/scripts/check-plugin-hashes.sh
 
+  em-dash:
+    name: no em-dash in user-facing strings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check em/en-dash (both literal and \u{2014} spellings)
+        run: bash .github/scripts/check-em-dash.sh
+
   automation-selftest:
     name: automation self-test
     runs-on: ubuntu-latest
