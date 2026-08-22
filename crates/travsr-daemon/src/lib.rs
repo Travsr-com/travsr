@@ -1300,6 +1300,17 @@ pub fn init_repo_with_progress(
 
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
     // path at query time without threading repo_root through function signatures.
+    //
+    // The write here has always been unconditional, so `init` has always
+    // re-stamped. What changed is that `reindex_files`, the path the watcher and
+    // the commit hook run, now stamps the key too, so a moved checkout corrects
+    // itself on any reindex rather than only on an explicit `travsr init`
+    // (#749 review).
+    //
+    // Neither stamp covers the first query after a move, before any reindex has
+    // run. Consumers cover that window by falling back to the database's own
+    // location (`SqliteStore::resolve_repo_root`), which travels with the
+    // repository and so cannot go stale the same way (#747).
     if let Some(root_str) = repo_root.to_str() {
         store
             .set_meta("repo_root", root_str)
@@ -3849,6 +3860,16 @@ pub fn reindex_files(
     repo_root: &Path,
     store: &mut SqliteStore,
 ) -> anyhow::Result<travsr_core::DirtySet> {
+    // Keep `repo_root` current. This path runs on every commit and on every
+    // watcher batch, and it already knows the root, so stamping here closes the
+    // window where a moved checkout keeps a stale value until someone runs an
+    // explicit `travsr init` (#749 review). Consumers still fall back to the
+    // database's own location, which covers the first query after a move,
+    // before any reindex has happened.
+    if let Some(root_str) = repo_root.to_str() {
+        let _ = store.set_meta("repo_root", root_str);
+    }
+
     // RFC-002: detect signature format version mismatch before touching the
     // graph. The hook must never block a commit, so return Ok(()) on mismatch
     // and let the user resolve it with `travsr init`.

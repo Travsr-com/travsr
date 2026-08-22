@@ -614,10 +614,7 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
     // callee's name to recover each site. Requires `repo_root` (stored in meta by
     // init); absent (older indexes) or unresolvable → fall back to the caller's
     // definition line, never worse than before.
-    let repo_root = match store.get_meta("repo_root") {
-        Ok(Some(r)) if !r.is_empty() => Some(PathBuf::from(r)),
-        _ => None,
-    };
+    let repo_root = resolve_repo_root(store);
     let callee_name = simple_name(&seed.vname.signature);
     const MAX_SITES_PER_CALLER: usize = 50;
 
@@ -1497,6 +1494,14 @@ pub fn find_references_global(
 /// Cap on returned grep matches (byte-budget guard).
 const MAX_PATTERN_MATCHES: usize = 500;
 
+/// The repository root to resolve paths against.
+///
+/// Thin now: the rule lives on `SqliteStore` so that every reader of
+/// `meta.repo_root` shares it, not just this file's four (#749 review).
+fn resolve_repo_root(store: &SqliteStore) -> Option<PathBuf> {
+    store.resolve_repo_root()
+}
+
 /// Graph-scoped textual search: `git grep` confined to a bounded file set.
 ///
 /// `scope` selects the search set:
@@ -1555,12 +1560,9 @@ pub fn find_pattern_raw(
         }
     }
 
-    let repo_root = match store.get_meta("repo_root") {
-        Ok(Some(r)) if !r.is_empty() => PathBuf::from(r),
-        _ => {
-            return "Pattern search unavailable: run `travsr init` to record the repo root."
-                .to_string()
-        }
+    let Some(repo_root) = resolve_repo_root(store) else {
+        return "Pattern search unavailable: run `travsr init` to record the repo root."
+            .to_string();
     };
 
     // Resolve the scope into a bounded pathspec list (empty = whole repo).
@@ -1607,11 +1609,105 @@ pub fn find_pattern_raw(
         GrepOutcome::NoMatches => pcre_only_advisory(pattern)
             .map(|note| format!("no matches. {note}"))
             .unwrap_or_default(),
-        GrepOutcome::Error(detail) => format!(
-            "pattern error: {detail} — the pattern is POSIX ERE; use --fixed for a literal \
-             search, or escape metacharacters."
-        ),
+        // The hint is right for a regex failure and wrong for everything else.
+        // Appending it unconditionally sent readers to check their pattern when
+        // the real failure was a missing directory, and `--fixed` reproduced it
+        // exactly (#747). Offer it only when git actually complained about the
+        // pattern.
+        GrepOutcome::Error(detail) => {
+            if looks_like_a_regex_complaint(&detail) {
+                format!(
+                    "pattern error: {detail} — the pattern is POSIX ERE; use --fixed for a \
+                     literal search, or escape metacharacters."
+                )
+            } else if detail.contains("cannot change to") || detail.contains("No such file") {
+                // This path knows what happened and used to say nothing about
+                // it: the directory in the message is index metadata, and
+                // `travsr init` is what clears it. Leaving the reader to work
+                // that out was the other half of #747 (#749 review).
+                format!(
+                    "pattern error: {detail}\n\
+                     That path comes from the index, not from your query. It is \
+                     recorded when the repository is indexed, so it is stale if \
+                     the repository has moved. Run `travsr init` from the \
+                     current location to update it."
+                )
+            } else {
+                format!("pattern error: {detail}")
+            }
+        }
     }
+}
+
+/// Whether a `git grep` failure is about the pattern rather than the environment.
+///
+/// Matched against git's own phrasing, not against loose words. The first
+/// version searched the whole stderr for needles like "bracket", "parenthes" and
+/// "repetition", and git quotes the repository path back in its errors, so
+/// `~/dev/bracket-parser` or `~/work/brace-matching` turned a missing-directory
+/// failure back into "check your regex" for exactly the reader this was meant to
+/// stop misleading (#749 review).
+///
+/// Anchored on the phrases git uses to report a bad pattern, each of which
+/// carries enough context that a path cannot fake it.
+fn looks_like_a_regex_complaint(detail: &str) -> bool {
+    // Only the part of the message git wrote about the pattern. Paths appear
+    // inside quotes, so a needle matching there is matching the user's directory
+    // name rather than git's diagnosis.
+    let without_quoted_paths: String = {
+        let mut out = String::with_capacity(detail.len());
+        let mut in_quote = false;
+        for c in detail.chars() {
+            match c {
+                '\'' => in_quote = !in_quote,
+                _ if !in_quote => out.push(c),
+                _ => {}
+            }
+        }
+        out.to_lowercase()
+    };
+
+    // Git's own wording, collected by running each bad pattern rather than
+    // guessed. My first list was invented and missed every one of these:
+    //
+    //   alpha(  -> parentheses not balanced
+    //   alpha[  -> brackets ([ ]) not balanced
+    //   a{2     -> braces not balanced
+    //   a\      -> trailing backslash (\)
+    //   *a      -> repetition-operator operand invalid
+    //
+    // Those are what BSD's regex reports. glibc words the same failures
+    // differently, so the list has to carry both or the hint goes missing on
+    // Linux, which is where CI and most users are. On git 2.34.1:
+    //
+    //   alpha(     -> Unmatched ( or \(
+    //   alpha[     -> Invalid regular expression
+    //   a{2, a{1,  -> Unmatched \{
+    //   a\         -> Trailing backslash
+    //   *a         -> Invalid preceding regular expression
+    //   [[:foo:]]  -> Invalid character class name
+    //   a\1        -> Invalid back reference
+    //   [z-a]      -> Invalid range end
+    //
+    // Each carries enough context that a directory name cannot fake it, which
+    // is what the loose single words could not manage.
+    [
+        "not balanced",
+        "trailing backslash",
+        "repetition-operator operand invalid",
+        "invalid regular expression",
+        "invalid regex",
+        "unmatched [",
+        "unmatched ( or",
+        "unmatched \\{",
+        "unterminated",
+        "invalid preceding regular expression",
+        "invalid back reference",
+        "invalid character class",
+        "invalid range end",
+    ]
+    .iter()
+    .any(|needle| without_quoted_paths.contains(needle))
 }
 
 /// #517 DD-5: constructs that are syntactically valid POSIX ERE atoms (so
@@ -5692,10 +5788,10 @@ fn get_context_body(
         .unwrap_or_default();
 
     if include_snippets {
-        // Read repo_root. Pre-snippet indexes lack this key → degrade to metadata-only.
-        let repo_root = match store.get_meta("repo_root") {
-            Ok(Some(r)) if !r.is_empty() => PathBuf::from(r),
-            _ => {
+        // Pre-snippet indexes lack this key → degrade to metadata-only.
+        let repo_root = match resolve_repo_root(store) {
+            Some(r) => r,
+            None => {
                 tracing::warn!(
                     "get_context: repo_root not in meta — falling back to metadata-only"
                 );
@@ -7699,6 +7795,138 @@ mod tests {
         );
     }
 
+    /// #747: a repository that moved after being indexed.
+    ///
+    /// `meta.repo_root` is stamped at index time, so it names wherever the repo
+    /// lived then. `find_pattern` handed that to `git -C` and every search
+    /// failed, a plain literal included. The database moved with the repo, so
+    /// its own location still resolves.
+    #[test]
+    fn a_moved_repo_resolves_its_root_from_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let travsr_dir = dir.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        let mut store = SqliteStore::open(&travsr_dir.join("graph.db")).unwrap();
+
+        // The path the repo had when it was indexed, which no longer exists.
+        store
+            .set_meta("repo_root", "/nonexistent/where/it/used/to/live")
+            .unwrap();
+
+        assert_eq!(
+            resolve_repo_root(&store).as_deref(),
+            Some(dir.path()),
+            "a stale repo_root must fall back to where the database actually is"
+        );
+    }
+
+    /// #749 review: a `.travsr` copied into a second checkout still names the
+    /// first, and that one usually still exists, so `is_dir()` alone kept
+    /// choosing it. Every read then came out of the original tree while looking
+    /// entirely confident, which is the one failure mode worse than the three
+    /// that fail loudly.
+    #[test]
+    fn a_copied_travsr_dir_resolves_to_the_copy_not_the_original() {
+        let original = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(original.path().join(".git")).unwrap();
+
+        let copy = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(copy.path().join(".git")).unwrap();
+        let travsr_dir = copy.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        let mut store = SqliteStore::open(&travsr_dir.join("graph.db")).unwrap();
+
+        // What `cp -r` leaves behind: the copy's database naming the original,
+        // which is still there.
+        store
+            .set_meta("repo_root", original.path().to_str().unwrap())
+            .unwrap();
+        assert!(original.path().is_dir(), "the original must still exist");
+
+        assert_eq!(
+            resolve_repo_root(&store).as_deref(),
+            Some(copy.path()),
+            "a database inside a repository resolves to that repository"
+        );
+    }
+
+    /// The stored value still wins while it resolves: a database opened through
+    /// `--db` from outside the repo would otherwise have its root silently
+    /// redirected to wherever the file happened to sit.
+    #[test]
+    fn a_repo_root_that_still_exists_is_preferred() {
+        let repo = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let travsr_dir = elsewhere.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        let mut store = SqliteStore::open(&travsr_dir.join("graph.db")).unwrap();
+        store
+            .set_meta("repo_root", repo.path().to_str().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            resolve_repo_root(&store).as_deref(),
+            Some(repo.path()),
+            "a repo_root that still exists is the real repo and must win"
+        );
+    }
+
+    /// The hint that made #747 hard to read. It is right for a bad pattern and
+    /// wrong for a missing directory, and it used to be appended to both.
+    #[test]
+    fn the_regex_hint_is_offered_only_for_a_regex_failure() {
+        for real in [
+            // Collected by running each pattern through git, not invented. My
+            // first list guessed and matched none of them (#749 review).
+            //
+            // BSD's phrasing:
+            "fatal: command line, 'alpha(': parentheses not balanced",
+            "fatal: command line, 'alpha[': brackets ([ ]) not balanced",
+            "fatal: command line, 'a{2': braces not balanced",
+            "fatal: command line, 'a\\': trailing backslash (\\)",
+            "fatal: command line, '*a': repetition-operator operand invalid",
+            "fatal: invalid regular expression: unmatched ( or \\(",
+            // glibc's phrasing for the same failures, which is what git 2.34.1
+            // on Linux actually prints. Three of these fell through the BSD-only
+            // list, so the hint went missing on the platform CI runs on.
+            "fatal: command line, 'alpha(': Unmatched ( or \\(",
+            "fatal: command line, 'alpha[': Invalid regular expression",
+            "fatal: command line, 'a{2': Unmatched \\{",
+            "fatal: command line, 'a{1,': Unmatched \\{",
+            "fatal: command line, 'a\\': Trailing backslash",
+            "fatal: command line, '*a': Invalid preceding regular expression",
+            "fatal: command line, '[[:foo:]]': Invalid character class name",
+            "fatal: command line, 'a\\1': Invalid back reference",
+            "fatal: command line, '[z-a]': Invalid range end",
+            "Unmatched [ or [^",
+            "fatal: unterminated \\{",
+            "trailing backslash on RHS",
+            "Invalid preceding regular expression",
+        ] {
+            assert!(
+                looks_like_a_regex_complaint(real),
+                "git said the pattern is bad: {real}"
+            );
+        }
+
+        for other in [
+            "fatal: cannot change to '/Users/me/Desktop/travsr': No such file or directory",
+            "fatal: not a git repository",
+            // #749 review: the needles used to be ordinary words, and git quotes
+            // the repository path back in its errors, so an entirely reasonable
+            // directory name turned a missing directory into "check your regex".
+            "fatal: cannot change to '/Users/me/dev/bracket-parser': No such file or directory",
+            "fatal: cannot change to '/Users/me/work/brace-matching': No such file or directory",
+            "fatal: cannot change to '/Users/me/src/unterminated-stream': No such file or directory",
+            "fatal: cannot change to '/Users/me/code/repetition-tests': No such file or directory",
+        ] {
+            assert!(
+                !looks_like_a_regex_complaint(other),
+                "not a pattern problem, so the POSIX ERE hint would mislead: {other}"
+            );
+        }
+    }
+
     #[test]
     fn simple_name_strips_kind_and_scope() {
         assert_eq!(simple_name("fn:SyncPod"), "SyncPod");
@@ -9622,9 +9850,9 @@ fn get_snippets_body(
 ) -> String {
     // Read repo_root from meta — written by init_repo_with_progress.
     // Absent on indexes created before this feature; degrade gracefully.
-    let repo_root = match store.get_meta("repo_root") {
-        Ok(Some(r)) if !r.is_empty() => PathBuf::from(r),
-        _ => {
+    let repo_root = match resolve_repo_root(store) {
+        Some(r) => r,
+        None => {
             tracing::warn!("get_snippets: repo_root not in meta — index predates snippet support");
             return "Snippet data unavailable: run `travsr init` to refresh the index.".to_string();
         }
