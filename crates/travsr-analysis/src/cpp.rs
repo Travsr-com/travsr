@@ -19,6 +19,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (alias_declaration name: (type_identifier) @using.name)
 (function_declarator declarator: (identifier) @fn.name)
 (function_declarator declarator: (field_identifier) @fn.name)
+(field_declaration declarator: (field_identifier) @field.name)
 (preproc_def name: (identifier) @macro.name)
 (preproc_function_def name: (identifier) @macro.name)
 (preproc_include path: (_) @import)
@@ -31,6 +32,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("namespace.name", "namespace", "namespace"),
         ("using.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
+        // #757: data members → `field:Owner.name`. A method's declarator is a
+        // `function_declarator` (captured as `fn.name` above), so only true data
+        // members reach this capture.
+        ("field.name", "field", "field"),
         // N4e: `#define` object-like and function-like macros as first-class nodes.
         ("macro.name", "macro", "macro"),
         ("import", "import", "import"),

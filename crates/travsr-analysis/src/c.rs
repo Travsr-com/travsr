@@ -16,6 +16,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (enum_specifier name: (type_identifier) @enum.name)
 (type_definition declarator: (type_identifier) @typedef.name)
 (function_declarator declarator: (identifier) @fn.name)
+(field_declaration declarator: (field_identifier) @field.name)
 (preproc_def name: (identifier) @macro.name)
 (preproc_function_def name: (identifier) @macro.name)
 (preproc_include path: (_) @import)
@@ -26,12 +27,24 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("enum.name", "enum", "enum"),
         ("typedef.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
+        // #757: named struct/union members → `field:Owner.name`, contained by
+        // their aggregate. A data member's declarator is a bare `field_identifier`
+        // (function-pointer members nest it under `function_declarator`, so those
+        // are not captured here).
+        ("field.name", "field", "field"),
         // N4e: `#define` object-like and function-like macros as first-class nodes.
         ("macro.name", "macro", "macro"),
         ("import", "import", "import"),
     ],
-    // C has no methods; every `fn` capture is a free function.
-    method_containers: &[],
+    // C has no methods, but its aggregates enclose fields (#757): list the
+    // struct/union nodes so `field` captures owner-qualify. Both are emitted as
+    // `struct:Name` (union.name uses the `struct` prefix above), so both map to
+    // the `struct` container prefix. No `fn` capture is ever nested in these, so
+    // this never turns a free function into a method.
+    method_containers: &[
+        ("struct_specifier", "struct"),
+        ("union_specifier", "struct"),
+    ],
     decl_kinds: &["function_definition"],
     type_refinements: &[],
     get_grammar: || tree_sitter::Language::new(tree_sitter_c::LANGUAGE),

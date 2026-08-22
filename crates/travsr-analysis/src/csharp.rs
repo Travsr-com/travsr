@@ -19,6 +19,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (delegate_declaration name: (identifier) @delegate.name)
 (method_declaration name: (identifier) @fn.name)
 (constructor_declaration name: (identifier) @fn.name)
+(field_declaration (variable_declaration (variable_declarator name: (identifier) @field.name)))
+(property_declaration name: (identifier) @field.name)
 (using_directive) @import
 (class_declaration
   (attribute_list (attribute name: (identifier) @_ca))
@@ -39,6 +41,11 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("enum.name", "enum", "enum"),
         ("delegate.name", "delegate", "type"),
         ("fn.name", "function", "fn"),
+        // #757: fields and auto-properties → `field:Owner.name`, contained by
+        // their type. `field_declaration` and `property_declaration` only occur
+        // in a type body, never a method body (locals are
+        // `local_declaration_statement`), so no anchoring is needed.
+        ("field.name", "field", "field"),
         ("import", "import", "import"),
     ],
     method_containers: &[

@@ -33,6 +33,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (method_definition (method_type) . (identifier) @fn.name)
 (method_declaration (method_type) . (identifier) @fn.name)
 (function_definition declarator: (function_declarator declarator: (identifier) @fn.name))
+(instance_variable (struct_declaration (struct_declarator (identifier) @field.name)))
+(property_declaration (struct_declaration (struct_declarator (identifier) @field.name)))
 (preproc_include path: (_) @import)
 (module_import (identifier) @import)
 "#,
@@ -41,6 +43,9 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("impl.name", "impl", "impl"),
         ("protocol.name", "protocol", "protocol"),
         ("fn.name", "function", "fn"),
+        // #757: ivars (`@interface { int _x; }`) and `@property` declarations →
+        // `field:Owner.name`, contained by the interface/implementation.
+        ("field.name", "field", "field"),
         ("import", "import", "import"),
     ],
     method_containers: &[

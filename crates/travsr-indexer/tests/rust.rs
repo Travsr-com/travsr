@@ -242,20 +242,22 @@ fn use_as_clause_indexes_original_path_not_alias() {
 // deliberately — a silent drift is a bug.
 //
 // Fixture: crates/travsr-indexer/tests/fixtures/rust/simple.rs
-// Expected structure (hand-curated, verified 2026-05-23):
-//   file×1  struct×2  enum×1  trait×1  impl×2  module×1  file-module×1
+// Expected structure (hand-curated, verified 2026-05-23; #757 added field×1):
+//   file×1  struct×2  field×1  enum×1  trait×1  impl×2  module×1  file-module×1
 //   function×2  method×3  constant×1  static×1  import×3
-//   = 19 nodes, 18 edges
+//   = 20 nodes, 19 edges
+//   (#757: `struct Config { pub name }` now emits `field:Config.name` + its
+//    containment edge; `struct Worker;` is a unit struct with no fields.)
 
-/// Exact node count for the simple.rs fixture must remain 19.
+/// Exact node count for the simple.rs fixture must remain 20.
 /// Update this number deliberately when the fixture or parser changes.
 #[test]
 fn golden_simple_fixture_node_count() {
     let out = parse_fixture();
     assert_eq!(
         out.nodes.len(),
-        19,
-        "expected exactly 19 nodes from simple.rs — update golden if fixture changed.\n\
+        20,
+        "expected exactly 20 nodes from simple.rs — update golden if fixture changed.\n\
          Actual nodes:\n{}",
         out.nodes
             .iter()
@@ -265,14 +267,14 @@ fn golden_simple_fixture_node_count() {
     );
 }
 
-/// Exact edge count for the simple.rs fixture must remain 18.
+/// Exact edge count for the simple.rs fixture must remain 19.
 #[test]
 fn golden_simple_fixture_edge_count() {
     let out = parse_fixture();
     assert_eq!(
         out.edges.len(),
-        18,
-        "expected exactly 18 edges from simple.rs — update golden if fixture changed."
+        19,
+        "expected exactly 19 edges from simple.rs — update golden if fixture changed."
     );
 }
 
@@ -285,6 +287,7 @@ fn golden_simple_fixture_all_expected_nodes_present() {
     let expected: &[(&str, &str)] = &[
         ("file", "file"),
         ("struct", "struct:Config"),
+        ("field", "field:Config.name"),
         ("struct", "struct:Worker"),
         ("enum", "enum:Status"),
         ("trait", "trait:Processor"),
@@ -364,6 +367,7 @@ fn golden_simple_fixture_no_unexpected_nodes() {
     let expected_sigs: std::collections::BTreeSet<&str> = [
         "file",
         "struct:Config",
+        "field:Config.name",
         "struct:Worker",
         "enum:Status",
         "trait:Processor",

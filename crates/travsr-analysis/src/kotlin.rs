@@ -15,6 +15,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (object_declaration name: (identifier) @object.name)
 (function_declaration name: (identifier) @fn.name)
 (type_alias (identifier) @typealias.name)
+(class_body (property_declaration (variable_declaration (identifier) @field.name)))
 (import) @import
 (function_declaration
   (modifiers (annotation (user_type (identifier) @_ka)))
@@ -26,6 +27,9 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("object.name", "object", "class"),
         ("fn.name", "function", "fn"),
         ("typealias.name", "type", "type"),
+        // #757: class/object properties → `field:Owner.name`. Anchored to
+        // `class_body` so local `val`/`var` in function bodies are not captured.
+        ("field.name", "field", "field"),
         ("import", "import", "import"),
     ],
     method_containers: &[

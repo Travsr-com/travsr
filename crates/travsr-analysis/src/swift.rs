@@ -49,10 +49,13 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("fn.name", "function", "fn"),
         ("init.name", "init", "fn"),
         ("import", "import", "import"),
-        // #449: properties (`static let shared`) gives `ClassC.shared` a
-        // tree-sitter node so the Phase B field node unifies onto it and dotted
-        // queries resolve.
-        ("var.name", "field", "var"),
+        // #449/#757: properties (`static let shared`, `var count`) become
+        // owner-qualified `field:Type.name` nodes (was unqualified `var:name`,
+        // which collided when two types shared a property name). The generic
+        // hook parents them to their enclosing type; the SCIP/index unifier
+        // now maps `Type.name` field references onto `field:Type.name`
+        // (candidate_signatures, #757).
+        ("var.name", "field", "field"),
     ],
     method_containers: &[
         ("class_declaration", "class"),
@@ -160,8 +163,10 @@ mod tests {
 
     #[test]
     fn parse_property_declaration() {
-        // #449: `static let shared` must produce a field node (sig `var:shared`)
-        // so Phase B `swift::ClassC.shared` unifies and dotted queries resolve.
+        // #449/#757: `static let shared` / `var count` produce owner-qualified
+        // field nodes (`field:ClassC.shared`) contained by their type, so Phase B
+        // `swift::ClassC.shared` unifies (candidate_signatures now yields
+        // `field:ClassC.shared`) and dotted queries resolve.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("singleton.swift");
         std::fs::write(
@@ -173,8 +178,60 @@ mod tests {
         let fields: Vec<&travsr_core::Node> =
             out.nodes.iter().filter(|n| n.kind == "field").collect();
         let sigs: Vec<&str> = fields.iter().map(|n| n.vname.signature.as_str()).collect();
-        assert!(sigs.contains(&"var:shared"), "got field sigs: {sigs:?}");
-        assert!(sigs.contains(&"var:count"), "got field sigs: {sigs:?}");
+        assert!(
+            sigs.contains(&"field:ClassC.shared"),
+            "got field sigs: {sigs:?}"
+        );
+        assert!(
+            sigs.contains(&"field:ClassC.count"),
+            "got field sigs: {sigs:?}"
+        );
+
+        // Containment: field edges parent to the type node, not the file.
+        let class_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "class:ClassC")
+            .expect("class:ClassC node")
+            .id;
+        let shared_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "field:ClassC.shared")
+            .unwrap()
+            .id;
+        assert!(
+            out.edges.iter().any(|e| e.src == class_id
+                && e.dst == shared_id
+                && e.kind == travsr_core::EdgeKind::DefinesBinding),
+            "field must be contained by its type"
+        );
+    }
+
+    #[test]
+    fn two_swift_types_same_property_no_collision() {
+        // #757 Tier-B fix: two types each with a `count` property must NOT
+        // collapse to one `var:count` VName. Owner-qualification keeps them
+        // distinct (`field:A.count` / `field:B.count`).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collide.swift");
+        std::fs::write(
+            &path,
+            "class A {\n    var count: Int = 0\n}\nstruct B {\n    var count: Int = 0\n}\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "collide.swift").unwrap();
+        let a = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "field:A.count")
+            .expect("field:A.count");
+        let b = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "field:B.count")
+            .expect("field:B.count");
+        assert_ne!(a.id, b.id, "owner-qualified fields must be distinct nodes");
     }
 
     // L2: an `init` declaration must emit a bare `method:Cat.init` node, not the

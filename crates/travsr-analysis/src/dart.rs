@@ -19,6 +19,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (enum_declaration      name: (identifier) @enum.name)
 (type_alias . (type_identifier) @typedef.name)
 (function_signature    name: (identifier) @fn.name)
+(class_body (class_member (declaration (initialized_identifier_list (initialized_identifier name: (identifier) @field.name)))))
 (import_or_export)     @import
 "#,
     capture_kinds: &[
@@ -28,6 +29,9 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("enum.name", "enum", "enum"),
         ("typedef.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
+        // #757: instance fields → `field:Owner.name`. Anchored under `class_body`
+        // so local variables in method bodies are not captured.
+        ("field.name", "field", "field"),
         ("import", "import", "import"),
     ],
     method_containers: &[
