@@ -615,9 +615,11 @@ fn cache_key_is_daemon_computed() {
     );
 }
 
-// 7. RequiresElevated catalog entries are correctly classified
+// 7. RequiresElevated catalog entries are correctly classified. Elevated
+// network access is auto-granted for local use (ADR-017 amendment); the runtime
+// Elevated sandbox requirement is retained, only the human approval gate is gone.
 #[test]
-fn elevated_languages_require_pse_approval() {
+fn elevated_languages_keep_elevated_sandbox_requirement() {
     for lang in &["java", "kotlin", "csharp", "scala"] {
         let entry = lookup(lang).unwrap_or_else(|| panic!("{lang} not in catalog"));
         assert_eq!(

@@ -8,7 +8,7 @@
  *   travsr.showExecutionPath PCST path between two symbols, rendered in the graph
  *   travsr.showRepos         registry manager webview
  *   travsr.showGraphStats    graph metrics dashboard webview
- *   travsr.showLanguages     indexed + available languages, install/approve from UI
+ *   travsr.showLanguages     indexed + available languages, install from UI
  *
  * Pure helpers (stripEnvelope, parsers, openAtLine) are exported for unit tests.
  */
@@ -606,7 +606,6 @@ type PanelMessage =
   | { command: "prune" }
   | { command: "remove"; name: string }
   | { command: "installLang"; language: string }
-  | { command: "approveLang"; language: string; approvedBy: string; reason: string; permittedHosts: string }
   | { command: "removeLang"; language: string }
   | { command: "enableWithPermission"; language: string }
   | { command: "detectLangs" }
@@ -1038,8 +1037,8 @@ function spawnManagedInstall(
 
 /**
  * travsr.showLanguages — Languages panel: indexed node counts from the graph +
- * available SCIP tools from `travsr lang list --json`, with one-click install,
- * elevated consent form, and disable.
+ * available SCIP tools from `travsr lang list --json`, with one-click install
+ * and disable.
  */
 export function registerShowLanguages(
   client: McpClient,
@@ -1120,43 +1119,20 @@ export function registerShowLanguages(
               lastLine(out) ||
                 `${msg.language} is set up, but the build tool it needs${needTxt} was not found. Install it, then Reload to get full analysis.`
             );
+          } else if (code !== 0) {
+            // Any other non-zero (or signal) exit is a real failure. Report it as
+            // an error, not a success toast — e.g. an older CLI that still has the
+            // elevated-approval gate bails with code 1, which must not be reported
+            // as "installed".
+            void vscode.window.showErrorMessage(
+              `Install of ${msg.language} failed. ${
+                lastLine(out) || `Run \`travsr lang install ${msg.language}\` in a terminal for details.`
+              }`
+            );
           } else {
             void vscode.window.showInformationMessage(lastLine(out) || `${msg.language} tool installed.`);
           }
         });
-        return;
-      }
-      case "approveLang": {
-        const m = msg as { command: "approveLang"; language: string; approvedBy: string; reason: string; permittedHosts: string };
-        if (!m.approvedBy || !m.reason) {
-          void vscode.window.showWarningMessage("Approver handle and reason are required.");
-          return;
-        }
-        const approveArgs = [
-          "lang", "approve", m.language,
-          "--approved-by", m.approvedBy,
-          "--reason", m.reason,
-          "--permitted-hosts", m.permittedHosts || "",
-        ];
-        const repo = await activeRepo.ensureChosen();
-        if (!repo) return;
-        const installArgs = ["lang", "install", m.language, "--no-interactive", "--yes"];
-        // Record the approval (local, fast), then install under a cancellable
-        // progress notification — the install reaches the network, so it must not
-        // be governed by a fixed timer.
-        void spawnLangCommand(getBinary(), approveArgs)
-          .then(() => spawnManagedInstall(getBinary(), installArgs, repo, `Installing ${m.language} with approval…`))
-          .then(({ out, cancelled }) => {
-            availableLoaded = false;
-            void refresh();
-            if (cancelled) {
-              void vscode.window.showWarningMessage(
-                `Install of ${m.language} was cancelled; it may be partly done. Re-run, or run \`travsr lang install ${m.language}\` in a terminal.`
-              );
-            } else {
-              void vscode.window.showInformationMessage(lastLine(out) || `${m.language} installed with elevated approval.`);
-            }
-          });
         return;
       }
       case "removeLang":

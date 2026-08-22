@@ -965,10 +965,11 @@ export interface LangInfo {
   sandbox: "Standard" | "Elevated";
   /** Authoritative status computed by the CLI, render this, never re-derive it.
    *  `active` = full cross-file analysis is live; `partial` = structure only, but
-   *  it can be turned on here; `needs_approval` = one-time network approval
-   *  required first; `needs_consent` = installed, but needs the user's one-time
-   *  permission to run on this OS; `unsupported` = no build for this OS, full
-   *  analysis can never run here (structure still works). */
+   *  it can be turned on here; `needs_approval` = retained only to parse JSON from
+   *  an older CLI (elevated access is auto-granted now, so a current CLI never
+   *  emits it, and it renders as a plain Install); `needs_consent` = installed, but
+   *  needs the user's one-time permission to run on this OS; `unsupported` = no
+   *  build for this OS, full analysis can never run here (structure still works). */
   status:
     | "active"
     | "partial"
@@ -1003,7 +1004,7 @@ export interface LangInfo {
   elevatedHosts: string[];
 }
 
-/** Languages panel: indexed section + available section with install/approve actions. */
+/** Languages panel: indexed section + available section with install actions. */
 export function buildLanguagesHtml(
   indexed: LangCount[],
   available: LangInfo[],
@@ -1078,23 +1079,13 @@ export function buildLanguagesHtml(
         // Installed, but needs the user's one-time permission to run on this OS.
         // One click records it and re-indexes — no docs trip, no command to type.
         rawAction = `<button class="btn primary" title="${esc(permissionTip)}" onclick="grantPermission(this,'${esc(l.language)}')">Allow &amp; enable</button>`;
-      } else if (l.needsApproval || l.status === "needs_approval") {
-        rawAction = `<details class="consent">
-  <summary>Grant access &amp; Install</summary>
-  <div class="consent-body">
-    <label>Approver GitHub handle</label>
-    <input id="by_${esc(l.language)}" placeholder="your-github-handle">
-    <label>Reason (one sentence)</label>
-    <input id="reason_${esc(l.language)}" placeholder="e.g. Enable Java cross-file analysis for service indexing">
-    <label>Permitted hosts (comma-separated)</label>
-    <input id="hosts_${esc(l.language)}" value="${esc(l.elevatedHosts.join(","))}" placeholder="${esc(l.elevatedHosts.join(","))}">
-    <button class="btn primary" onclick="approveLang(this,'${esc(l.language)}')">Grant &amp; Install</button>
-  </div>
-</details>`;
       } else {
-        // partial → installable here. Languages that need an external build tool
-        // (scala, php) land here too: the Prerequisites column already names the
-        // tool, so this is a plain Install, not a redirect to a docs site.
+        // partial → installable here. Elevated languages (java, kotlin, scala,
+        // csharp) land here too now that elevated access is auto-granted for local
+        // use (ADR-017 amendment): they show a plain Install, no consent form.
+        // Languages that need an external build tool (scala, php) also land here:
+        // the Prerequisites column already names the tool, so this is a plain
+        // Install, not a redirect to a docs site.
         rawAction = `<button class="btn primary" onclick="installLang(this,'${esc(l.language)}')">Install</button>`;
       }
 
@@ -1178,14 +1169,6 @@ function pickRepo() {
 function installLang(btn, lang) {
   setLoading(btn, true, 'Install');
   vscode.postMessage({command:'installLang', language:lang});
-}
-function approveLang(btn, lang) {
-  setLoading(btn, true, 'Grant & Install');
-  vscode.postMessage({command:'approveLang', language:lang,
-    approvedBy: (document.getElementById('by_'+lang)||{}).value||'',
-    reason: (document.getElementById('reason_'+lang)||{}).value||'',
-    permittedHosts: (document.getElementById('hosts_'+lang)||{}).value||''
-  });
 }
 function removeLang(btn, lang) {
   setLoading(btn, true, 'Disable');

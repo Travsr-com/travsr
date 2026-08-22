@@ -155,10 +155,12 @@ fn composite_resolver_builtin_takes_priority() {
 
 // ── Test 5 ────────────────────────────────────────────────────────────────────
 
-/// RequiresElevated languages (java, etc.) are skipped gracefully when no PSE
-/// approval exists in lang.toml — resolve() returns None, never panics.
+/// RequiresElevated languages (java, etc.) are auto-granted for local use
+/// (ADR-017 amendment): they are never bucketed into `needs_approval`, and a
+/// clean env with no lang.toml resolves gracefully (java simply isn't
+/// registered) rather than panicking.
 #[test]
-fn elevated_language_without_approval_skips_gracefully() {
+fn elevated_language_is_never_gated_on_approval() {
     // Confirm java is RequiresElevated in the catalog.
     let java_entry = CATALOG
         .iter()
@@ -174,8 +176,8 @@ fn elevated_language_without_approval_skips_gracefully() {
         "java must have a provider_binary"
     );
 
-    // CatalogResolver in a clean env (no lang.toml / no java approval) must
-    // return None for java — not panic.
+    // CatalogResolver in a clean env (no lang.toml) must not panic and must
+    // never report java as needing approval — the approval gate is removed.
     // Point TRAVSR_LANG_TOML at a nonexistent path so neither
     // registered_languages_from_disk() nor load_lang_config() can see the
     // developer's real ~/.travsr/lang.toml during testing.
@@ -189,11 +191,13 @@ fn elevated_language_without_approval_skips_gracefully() {
     let resolver = CatalogResolver::new();
     std::env::remove_var("TRAVSR_LANG_TOML");
     drop(_guard);
-    let result = resolver.resolve("java");
     assert!(
-        result.is_none(),
-        "java without PSE approval must resolve to None (fail-closed, ADR-017 Rule 2)"
+        resolver.needs_approval().is_empty(),
+        "no language may be reported as needing approval now that elevated \
+         access is auto-granted"
     );
+    // Unregistered java resolves to None (not registered), never a panic.
+    let _ = resolver.resolve("java");
 }
 
 // ── Test 6 ────────────────────────────────────────────────────────────────────

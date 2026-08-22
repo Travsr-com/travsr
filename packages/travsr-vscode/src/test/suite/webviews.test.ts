@@ -119,9 +119,9 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     },
     {
       language: "java", package: "scip-java", sandbox: "Elevated",
-      status: "needs_approval", statusLine: "needs approval (run: travsr lang install java)",
+      status: "partial", statusLine: "partial (run: travsr lang install java for full analysis)",
       repoState: "not_enabled",
-      installed: false, registered: false, builtin: false, needsApproval: true,
+      installed: false, registered: false, builtin: false, needsApproval: false,
       availableOnThisPlatform: true, unavailableTarget: null,
       scipInstallType: "GithubBinary", installHint: "travsr lang install java",
       underlyingToolHint: "", prerequisites: "JDK, Maven or Gradle", elevatedHosts: ["repo1.maven.org"],
@@ -166,9 +166,11 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     // rust: active built-in analyzer → "on" badge, no Disable button for builtins
     assert.ok(html.includes(">on<"), "active builtin shows an 'on' badge");
     assert.ok(!html.includes('onclick="removeLang'), "builtin has no Disable onclick");
-    // java (needs_approval): consent form (inside not-here disclosure when undetected)
-    assert.ok(html.includes("approveLang") && html.includes("Grant"));
-    assert.ok(html.includes("repo1.maven.org"), "elevated hosts pre-filled");
+    // java (elevated, auto-granted): a plain Install button — no consent form,
+    // no approveLang message, no "Grant" text.
+    assert.ok(html.includes("installLang(this,'java')"), "elevated java shows a plain Install");
+    assert.ok(!html.includes("approveLang"), "no consent-form approve action");
+    assert.ok(!html.includes("Grant &amp; Install"), "no Grant & Install consent form");
     // scala (Manual install type): a plain Install button now — never a docs
     // redirect. The Prerequisites column names the tool it needs instead.
     assert.ok(html.includes("installLang(this,'scala')"), "scala shows a plain Install, not a docs link");
@@ -206,9 +208,9 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     const html = buildLanguagesHtml(indexed, available);
     // rust: active → "active" badge
     assert.ok(html.includes(">active<"), "active badge for a live language");
-    // scala: partial → "partial"; java: needs approval → "needs approval"
+    // scala/java: partial → "partial"; the installed java fixture is needs_consent.
     assert.ok(html.includes(">partial<"), "partial badge for a language on structure only");
-    assert.ok(html.includes(">needs approval<"), "needs-approval badge");
+    assert.ok(html.includes(">needs permission<"), "needs-consent badge");
     // The plain statusLine is the tooltip; no internal jargon leaks. The
     // needs_consent line the CLI emits names `allow-unsandboxed`; the panel must
     // render its own plain wording, never that command.
