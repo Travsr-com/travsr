@@ -188,7 +188,10 @@ export class TravsrTreeDataProvider
       const lines = stripEnvelope(raw).split("\n").map((l) => l.trim()).filter(Boolean);
       return lines.map((line) => {
         // Format: "[call] fn:bar (function) — src/bar.ts"
-        const m = /^(\[[^\]]+\])\s+(\S+)(?:\s+\([^)]+\))?\s+,\s+(.+)$/.exec(
+        // PROTOCOL, not prose: `get_callers` and friends print
+        // `<sig> (<kind>) — <path>` and this splits on that exact
+        // separator, so a punctuation sweep that reaches it breaks it.
+        const m = /^(\[[^\]]+\])\s+(\S+)(?:\s+\([^)]+\))?\s+—\s+(.+)$/.exec(
           line
         );
         if (m) {

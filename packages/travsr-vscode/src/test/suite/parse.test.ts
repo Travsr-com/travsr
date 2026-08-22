@@ -93,15 +93,15 @@ const GROUPED_FIXTURE = `[index commit: 36acbbcb753, embeddings: on]
 [retrieval: exact+semantic | coverage 4/6 | confidence: strong ]
 
 ## exact, literal symbol / FTS match (not reranked)
-fn:knapsack (function), crates/travsr-retrieval/src/knapsack.rs:53 [score: 0.98]
-fn:solve (function), crates/travsr-retrieval/src/knapsack.rs:71 [score: 0.90]
+fn:knapsack (function) — crates/travsr-retrieval/src/knapsack.rs:53 [score: 0.98]
+fn:solve (function) — crates/travsr-retrieval/src/knapsack.rs:71 [score: 0.90]
 ## semantic, cross-encoder ranked
-fn:token_budget (function), crates/travsr-retrieval/src/budget.rs:12 [score: 0.55]
+fn:token_budget (function) — crates/travsr-retrieval/src/budget.rs:12 [score: 0.55]
 ## tests, test entry points & fixtures
-fn:token_budget_keeps_prefix (function), crates/travsr-retrieval/src/knapsack.rs:210 [score: 0.40]
+fn:token_budget_keeps_prefix (function) — crates/travsr-retrieval/src/knapsack.rs:210 [score: 0.40]
 ## relevant, graph-adjacent context
-fn:seeded_store (function), crates/travsr-mcp/src/query.rs:682 [via: dependency of fn:token_budget] [score: 0.00]
-method:SqliteStore.open (method), crates/travsr-store/src/lib.rs:744 [via: caller of fn:knapsack] [score: 0.00]
+fn:seeded_store (function) — crates/travsr-mcp/src/query.rs:682 [via: dependency of fn:token_budget] [score: 0.00]
+method:SqliteStore.open (method) — crates/travsr-store/src/lib.rs:744 [via: caller of fn:knapsack] [score: 0.00]
 
 [6 nodes, ~150 tokens]
 `;
@@ -271,13 +271,13 @@ suite("context/parse: parseContextResult", () => {
 // ── parseSnippetsResult ───────────────────────────────────────────────────────
 
 // Note: syncPodNow body has an internal blank line — the parser must NOT split here.
-const SNIPPETS_FIXTURE = `fn:isSyncPodWorthy (function), pkg/kubelet/kubelet.go [package: ]
+const SNIPPETS_FIXTURE = `fn:isSyncPodWorthy (function) — pkg/kubelet/kubelet.go [package: ]
 ───
 func isSyncPodWorthy(pod *v1.Pod) bool {
 \treturn pod.Spec.ActiveDeadlineSeconds != nil
 }
 
-method:Kubelet.syncPodNow (method), pkg/kubelet/kubelet.go [package: ]
+method:Kubelet.syncPodNow (method) — pkg/kubelet/kubelet.go [package: ]
 ───
 func (kl *Kubelet) syncPodNow(ctx context.Context, pod *v1.Pod) {
 \tkl.probeManager.UpdatePodStartupReadinessIfNeeded(pod)
@@ -315,7 +315,7 @@ suite("context/parse: parseSnippetsResult", () => {
   // Regression: skeleton bodies open with "[skeleton: …]" and code lines can
   // start with "[" — the body collector must not treat those as the footer.
   test("keeps a skeleton body that opens with [skeleton: …]", () => {
-    const fixture = `fn:kind_boost (function), crates/travsr-mcp/src/tools.rs [package: ]
+    const fixture = `fn:kind_boost (function) — crates/travsr-mcp/src/tools.rs [package: ]
 ───
 [skeleton: function]
 pub(crate) fn kind_boost(kind: &str, language: &str) -> f32

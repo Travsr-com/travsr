@@ -141,7 +141,7 @@ function parseNodeLine(raw: string): Omit<ContextNode, "snippet"> | null {
   if (dashIdx < 0) return null;
 
   const leftPart = rest.slice(0, dashIdx);
-  const rightPart = rest.slice(dashIdx + 3); // skip ', '
+  const rightPart = rest.slice(dashIdx + 3); // skip ' — '
 
   // Extract kind from left part: last ' (word)' — greedy match for sig
   const kindM = /^(.+)\s+\((\w+)\)$/.exec(leftPart.trim());
