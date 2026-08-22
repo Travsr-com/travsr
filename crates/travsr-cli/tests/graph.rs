@@ -50,6 +50,7 @@ fn init_repo() -> tempfile::TempDir {
 
     Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .arg("init")
         .assert()
@@ -85,6 +86,7 @@ fn ambiguous_repo(n: usize) -> tempfile::TempDir {
 
     Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .arg("init")
         .assert()
@@ -106,6 +108,7 @@ fn test_graph_cli_ambiguous_2_to_20() {
     let repo = init_repo();
     let assert = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(repo.path())
         .args(["graph", "processPayment"])
         .assert()
@@ -127,6 +130,7 @@ fn test_graph_cli_ambiguous_at_limit_20() {
     let repo = ambiguous_repo(20);
     let assert = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(repo.path())
         .args(["graph", "processPayment"])
         .assert()
@@ -154,6 +158,7 @@ fn test_graph_cli_ambiguous_one_over_limit_21() {
     let repo = ambiguous_repo(21);
     let assert = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(repo.path())
         .args(["graph", "processPayment"])
         .assert()
@@ -175,6 +180,7 @@ fn test_graph_cli_ambiguous_more_than_20() {
     let repo = ambiguous_repo(22);
     let assert = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(repo.path())
         .args(["graph", "processPayment"])
         .assert()
@@ -200,6 +206,7 @@ fn test_graph_cli_ambiguous_full_signature_tier1() {
     let repo = ambiguous_repo(25);
     let assert = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(repo.path())
         .args(["graph", "fn:processPayment"])
         .assert()
@@ -222,6 +229,7 @@ fn test_graph_cli_ambiguous_json() {
     let repo = ambiguous_repo(3);
     let assert = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(repo.path())
         .args(["graph", "processPayment", "--format", "json"])
         .assert()
@@ -267,6 +275,7 @@ fn test_graph_cli_ambiguous_file_name() {
         .expect("git commit");
     Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .arg("init")
         .assert()
@@ -275,6 +284,7 @@ fn test_graph_cli_ambiguous_file_name() {
     // Bare file name: ambiguous, both files listed, no arbitrary pick.
     let assert = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .args(["graph", "service.ts"])
         .assert()
@@ -296,6 +306,7 @@ fn test_graph_cli_ambiguous_file_name() {
     // A `--path` pin resolves to one file and renders.
     Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .args(["graph", "service.ts", "--path", "pkg_a/service.ts"])
         .assert()
@@ -307,6 +318,7 @@ fn test_graph_cli_disambiguated_path() {
     let repo = init_repo();
     let assert = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(repo.path())
         .args(["graph", "processPayment", "--path", "file_b.ts"])
         .assert()
@@ -321,6 +333,7 @@ fn test_graph_cli_invalid_path() {
     let repo = init_repo();
     let assert = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(repo.path())
         .args(["graph", "processPayment", "--path", "nonexistent.ts"])
         .assert()
@@ -365,6 +378,7 @@ fn test_graph_cli_still_ambiguous_path() {
 
     Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .arg("init")
         .assert()
@@ -372,6 +386,7 @@ fn test_graph_cli_still_ambiguous_path() {
 
     let assert = Command::cargo_bin("travsr")
         .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
         .args(["graph", "processPayment", "--path", "file.ts"])
         .assert()

@@ -80,7 +80,20 @@ fn mark_dirty(db: &Path) {
 /// reaches the code under test. An earlier version of this file used
 /// `init_repo`, and both tests passed with the fix reverted because their
 /// assertions were guarded behind a marker that was never stamped.
+/// `init_repo_with_progress` registers the repo unless this is set, so without
+/// it these tests append tempdir paths to the developer's real
+/// `~/.travsr/registry.json`, which `travsr repos` and `travsr mcp --global`
+/// then list after `tempfile` has deleted the directories.
+///
+/// Set from every test rather than once, because `set_var` is process-global and
+/// these run in parallel; writing the same value from each is safe. This is the
+/// pattern the travsr-cli integration tests already use.
+fn disable_registry() {
+    std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+}
+
 fn init_semantic(root: &Path) {
+    disable_registry();
     travsr_daemon::init_repo_with_progress(root, None, true, false, &mut |_| {})
         .expect("init_repo_with_progress(semantic = true)");
 }
@@ -260,4 +273,72 @@ fn the_remediation_names_a_command_that_works() {
         "the old message named plain `travsr init`, which defers Phase B and so \
          cannot clear the flag: running it returns the user to the same message"
     );
+}
+
+/// #742 review: a reindex that lands *while* Phase B is running must not have
+/// its flag cleared by that Phase B.
+///
+/// `init.lock` serialises two `travsr init` invocations; it does not exclude the
+/// watcher, which is a separate process with its own store. Init reads the file
+/// set, the user saves a file, the watcher rewrites that file's Phase A nodes
+/// and drops its `ref/call` edges, and init then finishes a pass that never saw
+/// the edit and clears the flag anyway.
+///
+/// The bump has to land inside init's window, between it reading the counter and
+/// it clearing the flag. Bumping beforehand simply becomes init's own baseline,
+/// which is what my first version of this test did: it failed for that reason
+/// rather than because the fix was missing. A bumper thread wins the race
+/// reliably, since the window spans a whole Phase B pass.
+///
+/// Comparing the flag's *value* would not catch this at all: it is already "1"
+/// in the case that matters, so before and after look identical.
+#[test]
+fn a_reindex_during_phase_b_keeps_the_flag_set() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    git_init(root);
+    std::fs::write(root.join("a.ts"), "export function a() { return 1; }\n").unwrap();
+    commit_all(root, "init");
+
+    let db = root.join(".travsr/graph.db");
+    init_semantic(root);
+    mark_dirty(&db);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bumper = {
+        let stop = std::sync::Arc::clone(&stop);
+        let db = db.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                bump_dirty_seq(&db);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        })
+    };
+
+    init_semantic(root);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    bumper.join().expect("bumper thread");
+
+    assert!(
+        reads_as_dirty(&db),
+        "a mark that arrived while Phase B was running must survive it: clearing \
+         it reports `complete` over a file with no ref/call edges, and nothing \
+         rearms until the next commit"
+    );
+}
+
+/// Read the counter `reindex_files` bumps beside the flag.
+fn dirty_seq(db: &Path) -> u64 {
+    meta(db, "phase_b_dirty_seq")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Stand in for the watcher having marked the graph dirty.
+fn bump_dirty_seq(db: &Path) {
+    let next = dirty_seq(db) + 1;
+    if let Ok(mut store) = travsr_store::SqliteStore::open(db) {
+        let _ = store.set_meta("phase_b_dirty_seq", &next.to_string());
+    }
 }

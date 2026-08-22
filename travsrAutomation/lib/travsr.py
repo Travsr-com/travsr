@@ -84,7 +84,11 @@ class Travsr:
     # ── convenience accessors ────────────────────────────────────────────────
 
     def version(self) -> str:
-        return self.run("--version").out.strip()
+        # stdout only. `out` folds stderr in, so any note the CLI happens to
+        # print would become part of the version string and fail an equality
+        # check for a reason that has nothing to do with the version (#742
+        # review).
+        return self.run("--version").stdout.strip()
 
     def status(self) -> str:
         return self.run("status").out
@@ -202,11 +206,19 @@ def verify_sums(dest: Path) -> tuple[list[str], list[str]]:
     if not sums.exists():
         return [], ["SHA256SUMS not present in the release"]
     verified, problems = [], []
+    listed: set[str] = set()
     for line in sums.read_text().splitlines():
+        if not line.strip():
+            continue
         parts = line.split()
         if len(parts) != 2:
+            # Not silent. A line we cannot parse is a line we did not check, and
+            # a filename containing a space lands here too, so dropping it
+            # quietly is how an unchecked artifact reads as verified.
+            problems.append(f"SHA256SUMS: cannot parse line {line.strip()!r}")
             continue
         want, name = parts[0], Path(parts[1]).name
+        listed.add(name)
         f = dest / name
         if not f.exists():
             problems.append(f"{name}: listed in SHA256SUMS but not downloaded")
@@ -216,6 +228,15 @@ def verify_sums(dest: Path) -> tuple[list[str], list[str]]:
             verified.append(name)
         else:
             problems.append(f"{name}: sha256 {got[:12]} != recorded {want[:12]}")
+    # Reconciled the other way too. Driving only off SHA256SUMS asks "is every
+    # listed file intact", which a release that shipped a tarball with no
+    # checksum line answers yes to: the file is simply absent from the loop.
+    # `check_signatures` makes the same argument about bundles, and the blind
+    # spot is identical here (#742 review).
+    for tgz in sorted(dest.glob("*.tar.gz")):
+        if tgz.name not in listed:
+            problems.append(f"{tgz.name}: published but absent from SHA256SUMS")
+
     return verified, problems
 
 

@@ -38,6 +38,31 @@ from travsr import (
 # release.yml running off a branch, would satisfy it. A sanity suite that accepts
 # signatures the installer would reject is worse than no check: it reports the
 # supply chain as verified while testing something weaker than what users run.
+def _installer_cosign_identity() -> str | None:
+    """The pattern `install.sh` actually uses, read at runtime.
+
+    `release.yml` requires this pattern be kept identical across install.sh,
+    release.yml and SECURITY.md. This file is a fourth copy, and nothing pointed
+    at it, so a tag-grammar change (an `-alpha.N` channel, say) would update the
+    three named places and silently leave this one behind: the suite would then
+    fail every artifact of that release, or, if only this copy were widened,
+    accept signatures the installer rejects on a user's machine (#742 review).
+
+    Returns None when install.sh is not beside us, which is the `--tag` case run
+    from outside a checkout. The constant still applies there; only the drift
+    check needs the file.
+    """
+    import re as _re
+
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / "install.sh"
+        if candidate.is_file():
+            m = _re.search(r"--certificate-identity-regexp\s+'([^']+)'", candidate.read_text())
+            return m.group(1) if m else None
+    return None
+
+
 COSIGN_IDENTITY = (
     r"^https://github\.com/Travsr-com/travsr/\.github/workflows/release\.yml"
     r"@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$"
@@ -372,6 +397,31 @@ def check_no_false_zero_symbol_warning(ctx: Context) -> tuple[Outcome, str]:
     return Outcome.FAIL, "\n".join(offenders[:3])
 
 
+def _ensure_discount_symbol(ctx: Context) -> None:
+    """Create and commit `applyDiscount`, once, whoever asks first.
+
+    Three checks query this symbol and only one used to create it, so running a
+    single one of them through `--filter` reported "a symbol committed after the
+    last index is missing, which is real staleness" for a symbol that had never
+    been written. That is the misdiagnosis `_ensure_indexed` exists to prevent
+    for the other phases, and both the README and `--filter`'s own help text
+    present per-check runs as supported (#742 review).
+
+    Idempotent, so the checks stay independent and the ordinary full-suite run
+    behaves exactly as before.
+    """
+    _ensure_indexed(ctx)
+    payment = ctx.fixture.root / "src" / "payment.ts"
+    if payment.exists() and "applyDiscount" in payment.read_text():
+        return
+    ctx.fixture.append(
+        "src/payment.ts",
+        "\nexport function applyDiscount(c: number): number { return c - 1; }\n",
+    )
+    ctx.fixture.commit("edit a source file")
+    ctx.cli.run("init", "--semantic")
+
+
 def check_marker_recovers_after_commit(ctx: Context) -> tuple[Outcome, str]:
     """#741: the marker must return to `complete` after a source commit + reindex.
 
@@ -379,13 +429,7 @@ def check_marker_recovers_after_commit(ctx: Context) -> tuple[Outcome, str]:
     where the marker lies and the graph is correct, so asserting only one of the
     two would either miss it or misattribute it.
     """
-    _ensure_indexed(ctx)
-    ctx.fixture.append(
-        "src/payment.ts",
-        "\nexport function applyDiscount(c: number): number { return c - 1; }\n",
-    )
-    ctx.fixture.commit("edit a source file")
-    ctx.cli.run("init", "--semantic")
+    _ensure_discount_symbol(ctx)
     state = ctx.cli.semantic_state()
     if state.startswith("complete"):
         return Outcome.PASS, ""
@@ -397,6 +441,7 @@ def check_marker_recovers_after_commit(ctx: Context) -> tuple[Outcome, str]:
 
 def check_new_symbol_is_indexed(ctx: Context) -> tuple[Outcome, str]:
     """Data freshness, asserted separately from the marker (see #741)."""
+    _ensure_discount_symbol(ctx)
     r = ctx.cli.run("references", "applyDiscount")
     if "src/payment.ts" not in r.answer:
         return Outcome.FAIL, (
@@ -569,17 +614,33 @@ def check_mcp_server_version_matches_cli(ctx: Context) -> tuple[Outcome, str]:
     `travsr --version` reports the injected build id, but `serverInfo.version`
     comes from the crate version. An agent talking over MCP therefore cannot tell
     which build it is attached to, which is the exact ambiguity #728 removed from
-    the CLI. Skipped for a local build, which legitimately has no injected id.
+    the CLI.
+
+    The equality runs in every mode. Only the assertion that the version carries
+    an injected id needs a published artifact.
     """
-    if ctx.artifacts is None:
-        return Outcome.SKIP, "local build has no injected build id to compare against"
     cli_version = ctx.cli.version().replace("travsr", "").strip()
     with _mcp(ctx) as c:
         server_version = c.initialize().get("serverInfo", {}).get("version", "")
+
+    # The equality holds in both modes, and it is the assertion that guards the
+    # #728 change to `travsr-mcp`. Skipping it for a local build left that change
+    # unguarded in the only mode CI runs on a PR, so reverting the `option_env!`
+    # match would have stayed green until a release was published (#742 review).
     if server_version != cli_version:
         return Outcome.FAIL, (
             f"MCP serverInfo.version is {server_version!r} but the CLI reports "
             f"{cli_version!r}; an agent cannot identify the build it is talking to"
+        )
+
+    # Only the *shape* of an injected id needs a published artifact. A local
+    # build has none, so that half stays --tag-only.
+    if ctx.artifacts is None:
+        return Outcome.PASS, f"{server_version} (matches the CLI; no injected id to check locally)"
+    if "+" not in server_version:
+        return Outcome.FAIL, (
+            f"a published build reports {server_version!r}, which carries no "
+            f"build id; #728 requires the commit to be identifiable"
         )
     return Outcome.PASS, server_version
 

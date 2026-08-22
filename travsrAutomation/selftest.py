@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from checks import _corpus_from_hint  # noqa: E402
 from report import Outcome, Report, Result  # noqa: E402
-from travsr import BUILD_ID_RE, Run, build_id_in_binary  # noqa: E402
+from travsr import BUILD_ID_RE, Run, build_id_in_binary, verify_sums  # noqa: E402
 
 
 class CorpusHintParsing(unittest.TestCase):
@@ -221,6 +221,74 @@ class Summariser(unittest.TestCase):
         out = render({"subject": "x", "totals": {"pass": 5, "fail": 0, "skip": 0}, "results": []}, "l")
         self.assertIn("5 passed, 0 failed, 0 skipped", out)
         self.assertNotIn("Failures", out)
+
+
+class CosignIdentityDrift(unittest.TestCase):
+    """#742 review: this file is a fourth copy of a pattern release.yml requires
+    be kept identical, and nothing pointed at it.
+
+    The gate the reviewer asked for. If install.sh's grammar changes and this
+    constant does not, the suite would either fail every artifact of the new
+    channel or, if widened alone, accept signatures the installer rejects.
+    """
+
+    def test_matches_the_pattern_install_sh_uses(self):
+        from checks import COSIGN_IDENTITY, _installer_cosign_identity
+
+        found = _installer_cosign_identity()
+        if found is None:
+            self.skipTest("install.sh not beside this checkout")
+        self.assertEqual(
+            found,
+            COSIGN_IDENTITY,
+            "the sanity suite must demand exactly what install.sh demands; a "
+            "gate looser than the client it protects is worse than no gate",
+        )
+
+
+class ChecksumCoverage(unittest.TestCase):
+    """#742 review: an artifact with no checksum line must not read as verified.
+
+    Driving the loop off SHA256SUMS asks "is every listed file intact", which a
+    release that shipped a tarball without a checksum answers yes to, because
+    that file never enters the loop. `check_signatures` makes the same argument
+    about bundles; the blind spot was identical here.
+    """
+
+    def _dir(self):
+        import hashlib
+        import tempfile
+
+        d = Path(tempfile.mkdtemp())
+        (d / "a.tar.gz").write_bytes(b"aaa")
+        (d / "b.tar.gz").write_bytes(b"bbb")
+        return d, hashlib.sha256(b"aaa").hexdigest(), hashlib.sha256(b"bbb").hexdigest()
+
+    def test_a_tarball_missing_from_sha256sums_is_a_problem(self):
+        d, ha, _ = self._dir()
+        (d / "SHA256SUMS").write_text(f"{ha}  a.tar.gz\n")
+        verified, problems = verify_sums(d)
+        self.assertEqual(verified, ["a.tar.gz"])
+        self.assertTrue(
+            any("b.tar.gz" in p and "absent from SHA256SUMS" in p for p in problems),
+            f"an unchecksummed artifact must be reported: {problems}",
+        )
+
+    def test_a_fully_listed_release_is_clean(self):
+        d, ha, hb = self._dir()
+        (d / "SHA256SUMS").write_text(f"{ha}  a.tar.gz\n{hb}  b.tar.gz\n")
+        verified, problems = verify_sums(d)
+        self.assertEqual(sorted(verified), ["a.tar.gz", "b.tar.gz"])
+        self.assertEqual(problems, [])
+
+    def test_an_unparseable_line_is_reported_not_dropped(self):
+        d, ha, hb = self._dir()
+        (d / "SHA256SUMS").write_text(f"{ha}  a.tar.gz\n{hb}  b with space.tar.gz\n")
+        _, problems = verify_sums(d)
+        self.assertTrue(
+            any("cannot parse line" in p for p in problems),
+            f"a line we cannot parse is a line we did not check: {problems}",
+        )
 
 
 class CheckRegistry(unittest.TestCase):
