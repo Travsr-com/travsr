@@ -1484,13 +1484,7 @@ pub(crate) fn suggest_next(db_path: &std::path::Path, query: &str) -> Vec<Sugges
     for (keys, template, why) in INTENT_ROUTES {
         if keys.iter().any(|k| lower.contains(k)) {
             out.push(Suggestion {
-                // Quotes stripped: the template wraps `{q}` in double quotes, so a
-                // query containing one produced `travsr explain "why is "charge" not
-                // showing" <symbol>`, which the shell splits into three words
-                // (#746 review).
-                command: template
-                    .replace("{sym}", &sym_slot)
-                    .replace("{q}", &query.replace('"', "")),
+                command: render_route(template, &sym_slot, query),
                 why: (*why).to_string(),
                 ident: sym_slot.clone(),
             });
@@ -1513,6 +1507,19 @@ pub(crate) fn suggest_next(db_path: &std::path::Path, query: &str) -> Vec<Sugges
     }
 
     out
+}
+
+/// Render one `INTENT_ROUTES` template into a runnable command.
+///
+/// Owns the `{q}` substitution so there is exactly one place that strips
+/// quotes, and so a test can drive the real thing. The template wraps `{q}` in
+/// double quotes, so a query containing one produced `travsr explain "why is
+/// "charge" not showing" <symbol>`, which the shell splits into three words
+/// (#746 review).
+fn render_route(template: &str, sym: &str, query: &str) -> String {
+    template
+        .replace("{sym}", sym)
+        .replace("{q}", &query.replace('"', ""))
 }
 
 /// The closest indexed symbol to `query`, or `None` when nothing is close.
@@ -1561,9 +1568,8 @@ fn distinctive_term(query: &str) -> Option<String> {
 
 #[cfg(test)]
 mod suggestion_tests {
-    use super::{distinctive_term, INTENT_ROUTES};
+    use super::{distinctive_term, render_route, INTENT_ROUTES};
 
-    /// Every route must produce a runnable command, not a template with an
     /// Split a rendered command the way a shell would, so a quoted argument
     /// stays one word.
     fn shell_words(line: &str) -> Vec<String> {
@@ -1586,16 +1592,33 @@ mod suggestion_tests {
         out
     }
 
+    /// Every route must produce a runnable command, not a template with an
     /// unsubstituted slot left in it.
+    ///
+    /// Rendered through `render_route`, not through a copy of its body: the
+    /// previous fixture stripped the quotes itself before substituting, so the
+    /// production strip was never executed and deleting it kept the suite green
+    /// (#746 review).
     #[test]
     fn routes_have_no_unsubstituted_slots_after_rendering() {
+        // One UNBALANCED quote, deliberately. A balanced pair is harmless:
+        // the shell concatenates `"why is "charge" missing"` straight back into
+        // a single word, so a fixture built from one cannot fail. A lone quote
+        // closes the template's own and lets the rest split (#746 review).
+        let raw = r#"why is "charge missing"#;
         for (_, template, _) in INTENT_ROUTES {
-            // A query carrying a quote, deliberately: the old fixture used
-            // `"a query"` with none, so it rendered the exact template that
-            // produced a broken command and passed over it (#746 review).
-            let rendered = template
-                .replace("{sym}", "Foo")
-                .replace("{q}", &"why is \"charge\" missing".replace('"', ""));
+            let rendered = render_route(template, "Foo", raw);
+            // The load-bearing check, for the routes that actually carry the
+            // query: it has to come back out as ONE word. Without the strip in
+            // `render_route` the inner quote closes the template's own, and
+            // this same query arrives as three.
+            if template.contains("{q}") {
+                assert!(
+                    shell_words(&rendered).contains(&"why is charge missing".to_string()),
+                    "the query did not survive as a single shell word: {rendered} -> {:?}",
+                    shell_words(&rendered)
+                );
+            }
             assert!(
                 !rendered.contains('{') && !rendered.contains('}'),
                 "template `{template}` left a slot unfilled: {rendered}"
