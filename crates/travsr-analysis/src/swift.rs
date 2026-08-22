@@ -22,6 +22,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (init_declaration "init" @init.name)
 (import_declaration)  @import
 (class_body (property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name)))
+(enum_class_body (property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name)))
 (function_declaration
   (modifiers (attribute (user_type (type_identifier) @_swa)))
   name: (simple_identifier) @test.entry
@@ -258,6 +259,30 @@ mod tests {
             field_sigs,
             vec!["field:Cat.name"],
             "only the stored property is a field; got {field_sigs:?}"
+        );
+    }
+
+    #[test]
+    fn enum_property_is_a_qualified_field() {
+        // #757 re-review: Swift enum bodies parse as `enum_class_body`, not
+        // `class_body`, so anchoring the property capture to `class_body` alone
+        // dropped enum properties master had emitted (as unqualified `var:c`).
+        // The `enum_class_body` anchor recovers them, owner-qualified from the
+        // enclosing `class_declaration` (`field:E.c`).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.swift");
+        std::fs::write(&path, "enum E {\n  var c: Int { 0 }\n}\n").unwrap();
+        let out = parse("corp", &path, "e.swift").unwrap();
+        let field_sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "field")
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert_eq!(
+            field_sigs,
+            vec!["field:E.c"],
+            "enum property must be an owner-qualified field; got {field_sigs:?}"
         );
     }
 

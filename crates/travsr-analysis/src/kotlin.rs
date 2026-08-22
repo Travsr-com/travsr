@@ -16,6 +16,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (function_declaration name: (identifier) @fn.name)
 (type_alias (identifier) @typealias.name)
 (class_body (property_declaration (variable_declaration (identifier) @field.name)))
+(enum_class_body (property_declaration (variable_declaration (identifier) @field.name)))
 (import) @import
 (function_declaration
   (modifiers (annotation (user_type (identifier) @_ka)))
@@ -161,6 +162,28 @@ mod tests {
                 "{sig} emitted more than once"
             );
         }
+    }
+
+    #[test]
+    fn enum_class_property_is_a_qualified_field() {
+        // #757 re-review: Kotlin's `enum class` body is `enum_class_body`, not
+        // `class_body`, so anchoring the property capture to `class_body` alone
+        // dropped enum-class properties. The `enum_class_body` anchor recovers
+        // them, owner-qualified from the enclosing `class_declaration`
+        // (`field:E.d`). Enum entries (`X`) are `enum_entry`, not
+        // `property_declaration`, so they are not captured.
+        let out = parse_src("e.kt", "enum class E {\n    X;\n    val d = 4\n}\n");
+        let field_sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "field")
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert_eq!(
+            field_sigs,
+            vec!["field:E.d"],
+            "enum-class property must be an owner-qualified field; got {field_sigs:?}"
+        );
     }
 
     #[test]
