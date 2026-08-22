@@ -392,7 +392,7 @@ body{background:var(--bg);color:var(--fg);font-family:var(--font-sans);
 .abstain p{font-size:12px;color:var(--linen-300);margin-bottom:4px}
 .abstain .hint{font-size:11px;color:var(--fg-muted)}
 .abstain code{font-family:var(--font-mono);background:var(--ch-700);padding:1px 5px;border-radius:var(--r-sm);color:var(--linen-200)}
-/* weak match — softer than a true abstain: results WERE returned, just loosely related */
+/* weak match, softer than a true abstain: results WERE returned, just loosely related */
 .abstain.weak{background:var(--orange-deep);border-color:var(--orange-400)}
 .abstain.weak h3{color:var(--orange-400)}
 
@@ -665,7 +665,7 @@ function extractLever(note){
 function noteTitle(note){
   // strip outer [note: ...] wrapper
   const inner = note.replace(/^\[note:\s*/,'').replace(/\]$/,'');
-  const dashIdx = inner.indexOf(' — ');
+  const dashIdx = inner.indexOf(', ');
   if(dashIdx>=0) return { title: inner.slice(0,dashIdx), detail: inner.slice(dashIdx+3) };
   return { title: inner, detail: '' };
 }
@@ -716,7 +716,7 @@ function renderParsed(data, rawText){
     document.getElementById('save-pct').textContent = over ? '↑ over budget' : '';
     document.getElementById('save-pct').style.color = over ? 'var(--orange-400)' : '';
     document.getElementById('base-tok-txt').textContent = over
-      ? 'exact text matches are always shown in full — the budget only limits the ranked-by-relevance results'
+      ? 'exact text matches are always shown in full, the budget only limits the ranked-by-relevance results'
       : 'tokens of context';
     document.getElementById('tok-fill').style.width = Math.min(100,Math.round(totalTok/budget*100))+'%';
     document.getElementById('tok-fill').style.background = over
@@ -733,7 +733,7 @@ function renderParsed(data, rawText){
   if(isAbstain){
     html += \`<div class="abstain weak">
   <h3>◐ Weak match</h3>
-  <p>Travsr didn't find a strong graph anchor for this query, so the results below are loosely related — structural neighbours rather than a confident answer.</p>
+  <p>Travsr didn't find a strong graph anchor for this query, so the results below are loosely related, structural neighbours rather than a confident answer.</p>
   <p class="hint">For a precise result, try a concrete symbol, e.g. <code>PaymentService.charge</code>, or narrow to one concept per query.</p>
 </div>\`;
   }
@@ -751,7 +751,7 @@ function renderParsed(data, rawText){
   }
 
   // results header + filter bar (node rows are rendered by renderNodeList)
-  const tierLabel = h.tier==='embed' ? 'via graph traversal — not vector similarity' : 'via lexical + graph traversal';
+  const tierLabel = h.tier==='embed' ? 'via graph traversal, not vector similarity' : 'via lexical + graph traversal';
   html += \`<div class="results-hdr">
   <span>\${f.nodes} node\${f.nodes!==1?'s':''} · <span id="snip-count">loading…</span> with snippets</span>
   <span>\${esc(tierLabel)}</span>
@@ -901,7 +901,7 @@ function renderNodeList(){
         const m = b.getAttribute('data-mode');
         if(state.mode[sig]===m && state.snippets[sig]) return;
         state.mode[sig] = m;
-        delete state.snippets[sig];   // force reload — different mode, different body
+        delete state.snippets[sig];   // force reload, different mode, different body
         state.openSigs.add(sig);
         renderNodeList();
         vscode.postMessage({ command:'fetchSnippet', sig, mode:m });

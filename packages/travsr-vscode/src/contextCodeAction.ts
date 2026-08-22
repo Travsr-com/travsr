@@ -20,7 +20,7 @@ import { BLAST_RADIUS_SELECTOR } from "./codelens";
 
 const COPY_COMMAND = "travsr.copyContextForChat";
 
-/** Token budget for the pulled context — shared with the Context Explorer default. */
+/** Token budget for the pulled context, shared with the Context Explorer default. */
 function contextTokenBudget(): number {
   const raw = vscode.workspace.getConfiguration("travsr").get<number>("contextTokenBudget", 2000);
   return Number.isFinite(raw) && raw >= 500 ? Math.floor(raw) : 2000;

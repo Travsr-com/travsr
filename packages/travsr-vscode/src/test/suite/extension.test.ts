@@ -150,7 +150,7 @@ suite("VSCODE-203: CallersHoverProvider", () => {
   test("hover shows '… and N more' when callers exceed 5", async () => {
     const callerLines = Array.from(
       { length: 8 },
-      (_, i) => `[call] fn:fn${i} (function) — src/f${i}.ts`
+      (_, i) => `[call] fn:fn${i} (function), src/f${i}.ts`
     ).join("\n");
     const mcp = makeMcp({
       get_callers: callerLines,

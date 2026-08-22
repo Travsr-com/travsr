@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
+// PROTOCOL, not prose: this exact line is written into the user's git hooks and
+// matched later to recognise travsr's own. Rewording it orphans every hook
+// already installed, which is why it is spelled as an escape and left alone by
+// punctuation sweeps.
 const TRAVSR_MARKER_SH: &str = "# installed by travsr \u{2014} do not edit this line";
 #[cfg(windows)]
 const TRAVSR_MARKER_CMD: &str = "@rem installed by travsr \u{2014} do not edit this line";

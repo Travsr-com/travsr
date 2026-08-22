@@ -329,7 +329,7 @@ ${script}
 </body></html>`;
 }
 
-/** Instant loading placeholder — shown before the first async render completes. */
+/** Instant loading placeholder, shown before the first async render completes. */
 export function buildPanelLoadingHtml(title: string): string {
   return webviewShell(
     title,
@@ -963,7 +963,7 @@ export interface LangInfo {
   language: string;
   package: string;
   sandbox: "Standard" | "Elevated";
-  /** Authoritative status computed by the CLI — render this, never re-derive it.
+  /** Authoritative status computed by the CLI, render this, never re-derive it.
    *  `active` = full cross-file analysis is live; `partial` = structure only, but
    *  it can be turned on here; `needs_approval` = one-time network approval
    *  required first; `needs_consent` = installed, but needs the user's one-time
@@ -975,7 +975,7 @@ export interface LangInfo {
     | "needs_approval"
     | "needs_consent"
     | "unsupported";
-  /** The exact plain wording the CLI shows for this status — used as the tooltip. */
+  /** The exact plain wording the CLI shows for this status, used as the tooltip. */
   statusLine: string;
   /** Per-repo enablement for the target repo (corpus trust gate), computed by the
    *  CLI. `always_on` = builtin, no per-repo step; `enabled` = on for this repo;
@@ -1125,7 +1125,7 @@ export function buildLanguagesHtml(
       const repoTip = {
         always_on: "Built in, always on for every repo",
         enabled: "Full analysis is on for this repo",
-        needs_analyzer: `Authorized for this repo, but its analyzer isn't installed yet — only structural analysis runs until it is. Install it: travsr lang install ${l.language}`,
+        needs_analyzer: `Authorized for this repo, but its analyzer isn't installed yet, only structural analysis runs until it is. Install it: travsr lang install ${l.language}`,
         not_enabled: `Full analysis is off for this repo. Enable it: travsr lang install ${l.language} (run in this repo)`,
         no_repo: "Open a repo to see per-repo status",
       }[l.repoState];

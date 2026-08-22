@@ -5,7 +5,7 @@
 
 [[backend]]
 id               = "arctic-embed-m-v1.5"
-description      = "Recommended. Best retrieval accuracy in our benchmarks (hit@1 0.94). Snowflake arctic-embed, standard BERT — full speed, Apache-2.0. 768-dim."
+description      = "Recommended. Best retrieval accuracy in our benchmarks (hit@1 0.94). Snowflake arctic-embed, standard BERT, full speed, Apache-2.0. 768-dim."
 dim              = 768
 params_m         = 109
 mteb             = 65.0

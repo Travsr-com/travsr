@@ -1402,7 +1402,7 @@ fn run_reindex_locked(
 
     if REINDEX_CANCELLED.load(Ordering::SeqCst) {
         println!(
-            "\u{2717} Reindex cancelled \u{2014} partial embeddings preserved. \
+            "\u{2717} Reindex cancelled; partial embeddings preserved. \
              Run `travsr embed reindex` to resume and make them searchable."
         );
         return Ok(());
@@ -1983,7 +1983,7 @@ fn cmd_status() -> Result<()> {
                 let hnsw_bytes_mb: f64 = hnsw_paths.iter().filter_map(|p| file_size_mb(p)).sum();
                 let total_mb = vec_bytes as f64 / 1_048_576.0 + hnsw_bytes_mb;
                 println!(
-                    "Reclaimable    : {} vectors + {} index file{} from {} inactive model{} ({total_mb:.1} MB) \u{2014} travsr embed gc",
+                    "Reclaimable    : {} vectors + {} index file{} from {} inactive model{} ({total_mb:.1} MB); reclaim with travsr embed gc",
                     fmt_count(vec_count),
                     hnsw_paths.len(),
                     if hnsw_paths.len() == 1 { "" } else { "s" },
@@ -2240,7 +2240,7 @@ fn cmd_gc(apply: bool, keep: Vec<String>) -> Result<()> {
         .collect();
 
     if reclaimable.is_empty() {
-        println!("Nothing to reclaim \u{2014} every embedded model is in the keep-set.");
+        println!("Nothing to reclaim: every embedded model is in the keep-set.");
         return Ok(());
     }
 
@@ -2327,9 +2327,9 @@ fn cmd_gc(apply: bool, keep: Vec<String>) -> Result<()> {
     );
     if let Some(reason) = vacuum_skipped {
         println!(
-            "  warning: VACUUM skipped ({reason}) \u{2014} rows were deleted but embed.db's size \
+            "  warning: VACUUM skipped ({reason}), rows were deleted but embed.db's size \
              on disk is unchanged. Re-run `travsr embed gc --apply` later to shrink it (it is \
-             idempotent \u{2014} nothing left to delete will report zero). A running daemon or \
+             idempotent, nothing left to delete will report zero). A running daemon or \
              MCP server holding embed.db open is the usual cause: travsr daemon stop"
         );
     }

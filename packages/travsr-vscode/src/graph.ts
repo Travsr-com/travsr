@@ -393,7 +393,7 @@ export class GraphPanel {
 
   private readonly panel: vscode.WebviewPanel;
   private disposables: vscode.Disposable[] = [];
-  /** Nodes in the graph as currently rendered — the overlay's input set. */
+  /** Nodes in the graph as currently rendered, the overlay's input set. */
   private renderedNodes: GraphNode[] = [];
   /** Last report sent to the daemon, so an unchanged one is not resent. */
   private lastReportedDiagnostics = "";
@@ -916,7 +916,7 @@ export function buildHtmlContent(
     <ul id="node-search-results" role="listbox"></ul>
   </div>
 
-  <!-- Tile-map for repo-map LOD overview (P3) — hidden until mode='overview' -->
+  <!-- Tile-map for repo-map LOD overview (P3), hidden until mode='overview' -->
   <div id="tilemap" role="grid" aria-label="Repository package overview">
     <canvas id="tilemap-edges" aria-hidden="true"></canvas>
     <div id="tilemap-tiles"></div>

@@ -59,7 +59,7 @@ export class DirNode extends vscode.TreeItem {
         : `${fileCount}`;
     this.tooltip =
       dependents !== undefined
-        ? `${prefix} — ${dependents} components depend on this (${fileCount} files)`
+        ? `${prefix}, ${dependents} components depend on this (${fileCount} files)`
         : `${prefix} (${fileCount} files)`;
     this.iconPath = new vscode.ThemeIcon("folder");
     this.contextValue = "travsrDir";

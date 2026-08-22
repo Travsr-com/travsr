@@ -308,7 +308,7 @@ impl CatalogResolver {
             if !registered.iter().any(|r| r == lang) {
                 tracing::debug!(
                     lang,
-                    "CatalogResolver: '{}' not in registered list — skipping",
+                    "CatalogResolver: '{}' not in registered list, skipping",
                     lang
                 );
                 continue;
@@ -325,7 +325,7 @@ impl CatalogResolver {
                 tracing::info!(
                     lang,
                     binary = binary_name,
-                    "Phase B catalog: binary not on PATH — skipping (install: {})",
+                    "Phase B catalog: binary not on PATH, skipping (install: {})",
                     catalog_entry.install_hint
                 );
                 continue;
@@ -388,7 +388,7 @@ impl CatalogResolver {
                     lang,
                     tool = catalog_entry.command,
                     "Phase B catalog: wrapper '{}' is installed but its analyzer '{}' \
-                     is not — skipping (install: travsr lang install {})",
+                     is not, skipping (install: travsr lang install {})",
                     binary_name,
                     catalog_entry.command,
                     lang
@@ -425,7 +425,7 @@ impl CatalogResolver {
                     WindowsSandboxDecision::NeedsConsent => {
                         tracing::info!(
                             lang,
-                            "Phase B: '{}' needs your permission to run on Windows — skipping \
+                            "Phase B: '{}' needs your permission to run on Windows, skipping \
                          (run: travsr lang allow-unsandboxed {})",
                             lang,
                             lang
@@ -499,7 +499,7 @@ impl CatalogResolver {
                             tracing::warn!(
                                 lang,
                                 "the security approval for '{}' is incomplete: {} \
-                             — skipping (its semantic analysis stays disabled)",
+, skipping (its semantic analysis stays disabled)",
                                 lang,
                                 e
                             );

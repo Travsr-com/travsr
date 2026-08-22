@@ -85,17 +85,17 @@ function getHtml(): string {
 
   <p>
     Travsr builds a deterministic graph of your codebase on every git commit.
-    Instead of guessing from text chunks, your AI tools traverse real structure —
-    call edges, import edges, type references — and return exactly the context
+    Instead of guessing from text chunks, your AI tools traverse real structure,
+    call edges, import edges, type references, and return exactly the context
     they need.
   </p>
 
   <h2>Features in this extension</h2>
   <ul>
-    <li><strong>Status bar</strong> — live graph health at the bottom of VS Code</li>
-    <li><strong>Blast radius code lens</strong> — how many files break if this file changes</li>
-    <li><strong>Callers hover</strong> — hover any symbol to see what calls it</li>
-    <li><strong>Graph panel</strong> — Activity Bar view with live dependencies and callers for the active symbol</li>
+    <li><strong>Status bar</strong>, live graph health at the bottom of VS Code</li>
+    <li><strong>Blast radius code lens</strong>, how many files break if this file changes</li>
+    <li><strong>Callers hover</strong>, hover any symbol to see what calls it</li>
+    <li><strong>Graph panel</strong>, Activity Bar view with live dependencies and callers for the active symbol</li>
   </ul>
 
   <h2>Getting started</h2>

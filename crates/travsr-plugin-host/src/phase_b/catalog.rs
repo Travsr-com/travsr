@@ -527,7 +527,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["--root", "{root}"],
         output_format: OutputFormat::Lsif,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "bundled — ships with travsr (packages/travsr-lsif-py)",
+        install_hint: "bundled, ships with travsr (packages/travsr-lsif-py)",
         underlying_tool_hint: "",
         provider_binary: None,
         elevated_hosts: &[],
@@ -551,8 +551,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["index", "--output", "{output}", "{root}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
-        install_hint: "travsr lang install java  (security approval required — run interactively)",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-java/releases — download scip-java-<version> and place in ~/.travsr/bin/scip-java (chmod +x)",
+        install_hint: "travsr lang install java  (security approval required; run interactively)",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-java/releases; download scip-java-<version> and place in ~/.travsr/bin/scip-java (chmod +x)",
         provider_binary: Some("travsr-lang-java"),
         elevated_hosts: &[
             "repo1.maven.org",
@@ -593,7 +593,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint:
-            "travsr lang install kotlin  (security approval required — run interactively)",
+            "travsr lang install kotlin  (security approval required; run interactively)",
         underlying_tool_hint: "travsr lang install kotlin  (auto-installs kotlin-language-server)",
         provider_binary: Some("travsr-lang-kotlin"),
         elevated_hosts: &[
@@ -633,8 +633,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &[],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
-        install_hint: "travsr lang install scala  (security approval required — run interactively)",
-        underlying_tool_hint: "https://www.scala-sbt.org/download.html — install sbt (usually already present in Scala projects)",
+        install_hint: "travsr lang install scala  (security approval required; run interactively)",
+        underlying_tool_hint: "https://www.scala-sbt.org/download.html; install sbt (usually already present in Scala projects)",
         provider_binary: Some("travsr-lang-scala"),
         elevated_hosts: &[
             "repo1.maven.org",
@@ -664,7 +664,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "travsr lang install ruby  (experimental)",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-ruby/releases — download scip-ruby-arm64-darwin or scip-ruby-x86_64-linux and place in ~/.travsr/bin/scip-ruby (chmod +x)",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-ruby/releases; download scip-ruby-arm64-darwin or scip-ruby-x86_64-linux and place in ~/.travsr/bin/scip-ruby (chmod +x)",
         provider_binary: Some("travsr-lang-ruby"),
         elevated_hosts: &[],
         scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
@@ -693,7 +693,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "travsr lang install php",
-        underlying_tool_hint: "https://github.com/davidrjenni/scip-php — community indexer: composer require --dev davidrjenni/scip-php (then use vendor/bin/scip-php)",
+        underlying_tool_hint: "https://github.com/davidrjenni/scip-php, community indexer: composer require --dev davidrjenni/scip-php (then use vendor/bin/scip-php)",
         provider_binary: Some("travsr-lang-php"),
         elevated_hosts: &[],
         scip_install: ScipInstall::Manual,
@@ -719,7 +719,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint:
-            "travsr lang install csharp  (security approval required — run interactively)",
+            "travsr lang install csharp  (security approval required; run interactively)",
         underlying_tool_hint: "dotnet tool install --global scip-dotnet",
         provider_binary: Some("travsr-lang-csharp"),
         elevated_hosts: &["api.nuget.org", "www.nuget.org"],
@@ -752,7 +752,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::NativeIpc,
         install_hint: "travsr lang install cpp  (requires compile_commands.json)",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases — download scip-clang-arm64-darwin or scip-clang-x86_64-linux and place in ~/.travsr/bin/scip-clang (chmod +x)",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases; download scip-clang-arm64-darwin or scip-clang-x86_64-linux and place in ~/.travsr/bin/scip-clang (chmod +x)",
         provider_binary: Some("travsr-lang-cpp"),
         elevated_hosts: &[],
         scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
@@ -786,7 +786,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::NativeIpc,
         install_hint: "travsr lang install c  (requires compile_commands.json)",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases — download scip-clang-arm64-darwin or scip-clang-x86_64-linux and place in ~/.travsr/bin/scip-clang (chmod +x)",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases; download scip-clang-arm64-darwin or scip-clang-x86_64-linux and place in ~/.travsr/bin/scip-clang (chmod +x)",
         provider_binary: Some("travsr-lang-c"),
         elevated_hosts: &[],
         scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
@@ -1068,7 +1068,7 @@ mod vendored_hash_tests {
                 }
                 assert!(
                     f("some-other-tag", target).is_none(),
-                    "{}: a hash was returned for a tag the entry is not pinned to — \
+                    "{}: a hash was returned for a tag the entry is not pinned to, \
                      it would be checked against the wrong asset",
                     e.language
                 );

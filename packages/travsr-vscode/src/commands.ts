@@ -128,7 +128,7 @@ export function parseSynonymList(raw: string): SynonymPair[] {
  */
 export function parseExecutionPath(raw: string): GraphData {
   const inner = stripEnvelope(raw);
-  const lineRe = /^(?:\[[^\]]+\]\s*)?(.+?)\s+\((\w+)\)\s+—\s+(.+)$/;
+  const lineRe = /^(?:\[[^\]]+\]\s*)?(.+?)\s+\((\w+)\)\s+,\s+(.+)$/;
   const nodes: GraphNode[] = [];
   for (const line of inner.split("\n")) {
     const t = line.trim();
@@ -390,7 +390,7 @@ export function resolveDepSpec(
   return undefined;
 }
 
-/** An entry in the dep list webview — resolved path is clickable, absent = dimmed. */
+/** An entry in the dep list webview, resolved path is clickable, absent = dimmed. */
 export interface DepEntry {
   display: string;
   path?: string;
@@ -619,7 +619,7 @@ type PanelMessage =
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
 
-/** Re-render every open managed panel — call after an external `travsr init` updates graph.db. */
+/** Re-render every open managed panel, call after an external `travsr init` updates graph.db. */
 export function refreshOpenPanels(): void {
   for (const { refresh } of managedPanels.values()) {
     void refresh();
@@ -656,7 +656,7 @@ function openManagedPanel(
       panel.webview.html = override ?? await render();
     } catch {
       // Render failed — show an error state so the status bar is never orphaned.
-      panel.webview.html = buildPanelLoadingHtml(`${title} (error — try reopening)`);
+      panel.webview.html = buildPanelLoadingHtml(`${title} (error; try reopening)`);
     }
   };
   // Sends a status update into the live webview HTML (cleared on next full re-render).
@@ -866,7 +866,7 @@ export function registerShowDependencies(client: McpClient): vscode.Disposable {
 
     const panel = vscode.window.createWebviewPanel(
       "travsrDependencies",
-      `Dependencies — ${target}`,
+      `Dependencies, ${target}`,
       vscode.ViewColumn.Beside,
       { enableScripts: true, localResourceRoots: [] }
     );
@@ -941,7 +941,7 @@ export async function readDiagnostics(binary: string, cwd: string): Promise<Diag
       : "warn";
     found.push({
       severity,
-      title: text.replace(/\s*[-—.]?\s*(re-?run|run)\s+`[^`]+`.*$/i, "").trim(),
+      title: text.replace(/\s*[-,.]?\s*(re-?run|run)\s+`[^`]+`.*$/i, "").trim(),
       hint: text,
       command: cmd ? cmd[1] : undefined,
     });
@@ -982,7 +982,7 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
   return spawnLangCommandResult(binary, args, cwd, timeoutMs).then((r) => r.out);
 }
 
-/** The last non-empty line of CLI output — the final status the command printed
+/** The last non-empty line of CLI output, the final status the command printed
  *  (e.g. "'rust' is active — full cross-file analysis is on."). Empty when the
  *  command printed nothing. */
 function lastLine(s: string): string {
@@ -1088,7 +1088,7 @@ export function registerShowLanguages(
       void spawnLangCommand(getBinary(), ["lang", "list", "--json"], activeRepo.current()).then((raw) => {
         cachedAvailable = parseAvailableLanguages(raw);
         availableLoaded = true;
-        postStatus(""); // clear immediately — never couple clear to render()/callTool
+        postStatus(""); // clear immediately, never couple clear to render()/callTool
         void refresh();
       });
       return;
@@ -1108,7 +1108,7 @@ export function registerShowLanguages(
           void refresh();
           if (cancelled) {
             void vscode.window.showWarningMessage(
-              `Install of ${msg.language} was cancelled — it may be partly done. Re-run, or run \`travsr lang install ${msg.language}\` in a terminal.`
+              `Install of ${msg.language} was cancelled; it may be partly done. Re-run, or run \`travsr lang install ${msg.language}\` in a terminal.`
             );
           } else if (code === 2) {
             // Set up, but the project build tool it needs is not installed, so full
@@ -1151,7 +1151,7 @@ export function registerShowLanguages(
             void refresh();
             if (cancelled) {
               void vscode.window.showWarningMessage(
-                `Install of ${m.language} was cancelled — it may be partly done. Re-run, or run \`travsr lang install ${m.language}\` in a terminal.`
+                `Install of ${m.language} was cancelled; it may be partly done. Re-run, or run \`travsr lang install ${m.language}\` in a terminal.`
               );
             } else {
               void vscode.window.showInformationMessage(lastLine(out) || `${m.language} installed with elevated approval.`);
@@ -1178,7 +1178,7 @@ export function registerShowLanguages(
           {
             modal: true,
             detail:
-              "It will use your project's own build tools — the same as if you ran the build yourself — including downloading this project's dependencies. You can withdraw this permission later.",
+              "It will use your project's own build tools, the same as if you ran the build yourself, including downloading this project's dependencies. You can withdraw this permission later.",
           },
           "Allow"
         );

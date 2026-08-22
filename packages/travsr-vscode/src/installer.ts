@@ -35,7 +35,7 @@ export function resolveTargetTriple(
   const triple = TARGET_MAP[platform]?.[arch];
   if (!triple) {
     throw new Error(
-      `Unsupported platform/arch: ${platform}/${arch} — no prebuilt travsr ` +
+      `Unsupported platform/arch: ${platform}/${arch}, no prebuilt travsr ` +
       `binary is published for this target`
     );
   }
@@ -288,7 +288,7 @@ export function assertExecutableBinary(
     if (!binary.toLowerCase().endsWith(".exe")) {
       throw new Error(
         `travsr binary on Windows must end in .exe, got: ${binary}. ` +
-        `.cmd/.bat shims are not supported — point travsr.binaryPath at the ` +
+        `.cmd/.bat shims are not supported, point travsr.binaryPath at the ` +
         `packaged travsr.exe under node_modules\\@travsr.com\\travsr\\bin, ` +
         `or reinstall via the extension.`
       );

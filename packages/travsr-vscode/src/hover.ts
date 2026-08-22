@@ -41,10 +41,10 @@ interface HoverData {
 function formatCallerLine(line: string): string {
   // Input: "[call] fn:bar (function) — src/bar.ts"
   // Output: "`[call] fn:bar — src/bar.ts`"
-  const m = /^(\[(?:call|structural)\])\s+(\S+)\s+\([^)]+\)\s+—\s+(.+)$/.exec(
+  const m = /^(\[(?:call|structural)\])\s+(\S+)\s+\([^)]+\)\s+,\s+(.+)$/.exec(
     line
   );
-  if (m) return `\`${m[1]} ${m[2]} — ${m[3]}\``;
+  if (m) return `\`${m[1]} ${m[2]}, ${m[3]}\``;
   return `\`${line}\``;
 }
 

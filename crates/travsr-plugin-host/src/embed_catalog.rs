@@ -387,10 +387,10 @@ pub fn terminate_inflight_reindex() {
         .clone();
 
     if let Some(ref path) = sentinel {
-        tracing::info!(pid, sentinel = %path.display(), "embed: writing cancel sentinel — graceful drain");
+        tracing::info!(pid, sentinel = %path.display(), "embed: writing cancel sentinel, graceful drain");
         // Empty marker file; the sidecar polls for its existence.
         if let Err(e) = std::fs::write(path, b"") {
-            tracing::warn!(err = %e, "embed: failed to write cancel sentinel — will hard-kill");
+            tracing::warn!(err = %e, "embed: failed to write cancel sentinel, will hard-kill");
         } else {
             // Grace poll: wait for the sidecar (any spawn surface clears
             // REINDEX_CHILD_PID via ReindexPidGuard on exit) to drain and exit.
@@ -406,7 +406,7 @@ pub fn terminate_inflight_reindex() {
             tracing::warn!(
                 pid,
                 grace_secs = CANCEL_GRACE_SECS,
-                "embed: sidecar did not drain within grace window — force-killing"
+                "embed: sidecar did not drain within grace window, force-killing"
             );
         }
     }
@@ -681,7 +681,7 @@ fn ensure_model_descriptor(model_dir: &Path, backend: &EmbedBackend) {
         Ok(()) => tracing::info!(
             model = %backend.id,
             path = %toml.display(),
-            "embed: migrated pre-descriptor install — wrote missing model.toml"
+            "embed: migrated pre-descriptor install, wrote missing model.toml"
         ),
         Err(e) => tracing::warn!(
             model = %backend.id,
@@ -1185,7 +1185,7 @@ fn run_parallel_reindex(
                         stalled_secs = stalled,
                         embedded = last_count,
                         stderr = %tail,
-                        "embed: reindex sidecar made no progress — killing"
+                        "embed: reindex sidecar made no progress, killing"
                     );
                     let _ = child.kill();
                     let _ = child.wait();
@@ -1203,7 +1203,7 @@ fn run_parallel_reindex(
                             ceiling_secs = ceiling,
                             embedded = last_count,
                             stderr = %tail,
-                            "embed: reindex sidecar hit hard wall-clock ceiling — killing"
+                            "embed: reindex sidecar hit hard wall-clock ceiling, killing"
                         );
                         let _ = child.kill();
                         let _ = child.wait();
@@ -1241,11 +1241,11 @@ pub fn embed_reindex_in_flight() -> bool {
 /// repo size while always embedding the structurally most important nodes first.
 pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
     if embed_paused() {
-        tracing::debug!("embed Phase 1: auto-reindex paused (stop-embed) — skipping");
+        tracing::debug!("embed Phase 1: auto-reindex paused (stop-embed), skipping");
         return false;
     }
     let Some(guard) = ReindexInFlightGuard::try_acquire() else {
-        tracing::debug!("embed Phase 1: reindex already in-flight — skipping");
+        tracing::debug!("embed Phase 1: reindex already in-flight, skipping");
         return false;
     };
     let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path).ready() else {
@@ -1286,11 +1286,11 @@ pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
 /// complementary and together cover all symbol nodes.
 pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
     if embed_paused() {
-        tracing::debug!("embed Phase 2: auto-reindex paused (stop-embed) — skipping");
+        tracing::debug!("embed Phase 2: auto-reindex paused (stop-embed), skipping");
         return false;
     }
     let Some(guard) = ReindexInFlightGuard::try_acquire() else {
-        tracing::debug!("embed Phase 2: reindex already in-flight — skipping");
+        tracing::debug!("embed Phase 2: reindex already in-flight, skipping");
         return false;
     };
     let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path).ready() else {
@@ -1304,7 +1304,7 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
             PhaseFilter::Phase2 { threshold }
         }
         None => {
-            tracing::warn!("embed Phase 2: k-core data missing — embedding all remaining nodes");
+            tracing::warn!("embed Phase 2: k-core data missing, embedding all remaining nodes");
             PhaseFilter::All
         }
     };
@@ -1332,11 +1332,11 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
 /// as a detached background thread. Returns true if launched.
 pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
     if embed_paused() {
-        tracing::debug!("embed reindex-all: auto-reindex paused (stop-embed) — skipping");
+        tracing::debug!("embed reindex-all: auto-reindex paused (stop-embed), skipping");
         return false;
     }
     let Some(guard) = ReindexInFlightGuard::try_acquire() else {
-        tracing::debug!("embed reindex-all: reindex already in-flight — skipping");
+        tracing::debug!("embed reindex-all: reindex already in-flight, skipping");
         return false;
     };
     let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path).ready() else {

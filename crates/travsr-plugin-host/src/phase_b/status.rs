@@ -74,7 +74,7 @@ impl LangStatus {
             }
             LangStatus::NeedsConsent { language } => {
                 format!(
-                    "partial (full analysis needs your permission — run: \
+                    "partial (full analysis needs your permission; run: \
                      travsr lang allow-unsandboxed {language})"
                 )
             }

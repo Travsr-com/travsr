@@ -214,7 +214,7 @@ export function registerMcpServerCommand(): vscode.Disposable {
         existing = JSON.parse(fs.readFileSync(target.configPath, "utf8")) as Record<string, unknown>;
       } catch {
         void vscode.window.showErrorMessage(
-          `Travsr: could not parse ${target.configPath} — fix JSON errors first.`
+          `Travsr: could not parse ${target.configPath}, fix JSON errors first.`
         );
         return;
       }

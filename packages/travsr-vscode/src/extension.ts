@@ -303,7 +303,7 @@ export function activate(context: vscode.ExtensionContext): void {
         // so re-fetch here to avoid passing undefined to buildFileListHtml.
         const panel = vscode.window.createWebviewPanel(
           "travsrBlastRadius",
-          `Blast radius — ${file}`,
+          `Blast radius, ${file}`,
           vscode.ViewColumn.Beside,
           { localResourceRoots: [], enableScripts: true }
         );
@@ -415,7 +415,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const lines = parseEnvelope(raw);
         const panel = vscode.window.createWebviewPanel(
           "travsrCallers",
-          `Callers — ${symbol}`,
+          `Callers, ${symbol}`,
           vscode.ViewColumn.Beside,
           { localResourceRoots: [] }
         );
@@ -495,7 +495,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const files = parseEnvelope(raw);
       const count = files.length;
       if (count === 0) {
-        void vscode.window.showInformationMessage(`Travsr: ${file} has no dependents — safe to edit.`);
+        void vscode.window.showInformationMessage(`Travsr: ${file} has no dependents, safe to edit.`);
         return;
       }
       const label = `${file}: ${count} file${count !== 1 ? "s" : ""} depend on this`;
@@ -574,7 +574,7 @@ async function checkBinaryAndPrompt(
   if (configured && configured !== "travsr" && fs.existsSync(configured)) {
     try {
       assertExecutableBinary(configured);
-      return; // valid — nothing to do
+      return; // valid, nothing to do
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       channel.appendLine(`Configured travsr.binaryPath is not usable: ${msg}`);
@@ -584,7 +584,7 @@ async function checkBinaryAndPrompt(
         channel.appendLine(`Resolved npm shim to native binary: ${resolved}`);
         await adoptBinary(resolved, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
         void vscode.window.showInformationMessage(
-          `Travsr: travsr.binaryPath pointed at an npm shim — switched to the native binary at ${resolved}.`
+          `Travsr: travsr.binaryPath pointed at an npm shim, switched to the native binary at ${resolved}.`
         );
         return;
       }
@@ -649,8 +649,8 @@ async function checkBinaryAndPrompt(
   }
 
   const promptMsg = cmdShim
-    ? `travsr.cmd detected on PATH but the VS Code extension requires the native binary — Download v${DOWNLOAD_VERSION}?`
-    : `Travsr binary not found — Download v${DOWNLOAD_VERSION}?`;
+    ? `travsr.cmd detected on PATH but the VS Code extension requires the native binary, Download v${DOWNLOAD_VERSION}?`
+    : `Travsr binary not found, Download v${DOWNLOAD_VERSION}?`;
   const choice = await vscode.window.showInformationMessage(
     promptMsg,
     "Download",
@@ -754,7 +754,7 @@ function wireDisconnectHandler(
   onDisconnect?: () => void
 ): void {
   const sub = client.onDisconnect(async () => {
-    sub.dispose(); // one-shot — prevents double-firing on explicit restart
+    sub.dispose(); // one-shot, prevents double-firing on explicit restart
     onDisconnect?.();
     const action = await vscode.window.showWarningMessage(
       "Travsr daemon offline",
@@ -802,7 +802,7 @@ async function reindexNow(
     try {
       assertExecutableBinary(configured);
     } catch (e) {
-      void vscode.window.showErrorMessage(`Travsr: invalid binaryPath — ${(e as Error).message}`);
+      void vscode.window.showErrorMessage(`Travsr: invalid binaryPath, ${(e as Error).message}`);
       return;
     }
   }

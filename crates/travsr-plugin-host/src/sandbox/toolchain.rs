@@ -237,7 +237,7 @@ fn dart_access() -> ToolchainAccess {
             tracing::debug!(path = %dir.display(), "dart_access: granting read on emitter dir");
             read_paths.push(dir);
         } else {
-            tracing::debug!(path = %dir.display(), "dart_access: emitter dir does not exist — not granted");
+            tracing::debug!(path = %dir.display(), "dart_access: emitter dir does not exist, not granted");
         }
     }
 
@@ -267,7 +267,7 @@ fn dart_access() -> ToolchainAccess {
         } else {
             tracing::debug!(
                 path = %emitter_bin.display(),
-                "dart_access: travsr-dart-index-emitter not found — TRAVSR_DART_EMITTER not set"
+                "dart_access: travsr-dart-index-emitter not found, TRAVSR_DART_EMITTER not set"
             );
         }
     }
@@ -749,7 +749,7 @@ fn swift_access() -> ToolchainAccess {
         tracing::debug!(path = %sdk.display(), exists = sdk.exists(), "swift_access: Xcode SDK grant (read, defensive)");
         read_paths.push(sdk);
     } else {
-        tracing::debug!("swift_access: xcrun not found — no SDK path granted");
+        tracing::debug!("swift_access: xcrun not found, no SDK path granted");
     }
 
     // Swift toolchain bin dir — for dynamically loaded stdlib components.

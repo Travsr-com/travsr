@@ -59,11 +59,11 @@ fn dependency_arg_hint(store: &SqliteStore, file: &str) -> Option<String> {
     }
     match nodes.first() {
         Some(n) => Some(format!(
-            "'{file}' resolved to {} '{}', not a file, get_dependencies takes a repo-relative file path. For a symbol, use get_callers or find_references.",
+            "'{file}' resolved to {} '{}', not a file; get_dependencies takes a repo-relative file path. For a symbol, use get_callers or find_references.",
             n.kind, display_label(n)
         )),
         None => Some(format!(
-            "no file matched '{file}', get_dependencies takes a repo-relative file path (run get_repo_map to list files)."
+            "no file matched '{file}'; get_dependencies takes a repo-relative file path (run get_repo_map to list files)."
         )),
     }
 }
@@ -218,8 +218,8 @@ fn phase_b_pending(store: &SqliteStore) -> bool {
 /// never disagree about completeness. Returns the note to append, or `None`
 /// when Phase B is complete for the current commit.
 pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
-    const PENDING: &str = "[note: call-graph index incomplete, semantic analysis has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
-    const STALE: &str = "[note: call-graph edges degraded, a background re-index dropped call edges since the last semantic analysis run; empty results are not authoritative. Run `travsr init` to rebuild.]";
+    const PENDING: &str = "[note: call-graph index incomplete; semantic analysis has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
+    const STALE: &str = "[note: call-graph edges degraded; a background re-index dropped call edges since the last semantic analysis run; empty results are not authoritative. Run `travsr init` to rebuild.]";
     let phase_b = store
         .get_meta("phase_b_commit")
         .ok()
@@ -1533,7 +1533,7 @@ pub fn find_pattern_raw(
             .map(|note| format!("no matches. {note}"))
             .unwrap_or_default(),
         GrepOutcome::Error(detail) => format!(
-            "pattern error: {detail}; the pattern is POSIX ERE; use --fixed for a literal \
+            "pattern error: {detail}. The pattern is POSIX ERE; use --fixed for a literal \
              search, or escape metacharacters."
         ),
     }
