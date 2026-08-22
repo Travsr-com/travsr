@@ -214,10 +214,19 @@ fn phase_b_pending(store: &SqliteStore) -> bool {
 ///  - `phase_b_dirty` set (#583: a watcher reindex dropped a file's call edges
 ///    without moving HEAD).
 ///
+/// A third state (#755 Part B item 4): the markers agree and nothing is dirty —
+/// the index IS current — but a language turned on for this repo never produced
+/// call edges, because its analyzer is missing, it crashed, or it is waiting on a
+/// one-time approval or permission. `travsr status` already says so
+/// ("semantic: partial (not run: php)"), but a per-query answer said nothing, so
+/// an empty `callers`/`graph` result read as "no callers" rather than "this
+/// language was not analyzed". That is the same misleading abstention the two
+/// notes above exist to prevent, from a different cause.
+///
 /// Mirrors `travsr status`'s freshness classification so the tools and the CLI
 /// never disagree about completeness. Returns the note to append, or `None`
 /// when Phase B is complete for the current commit.
-pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
+pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
     const PENDING: &str = "[note: call-graph index incomplete; semantic analysis has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
     const STALE: &str = "[note: call-graph edges degraded; a background re-index dropped call edges since the last semantic analysis run; empty results are not authoritative. Run `travsr init` to rebuild.]";
     let phase_b = store
@@ -232,11 +241,65 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
         .filter(|s| !s.is_empty());
     let dirty = store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1");
     match (phase_b, last) {
-        (None, Some(_)) => Some(PENDING),
-        (Some(pb), Some(lc)) if pb != lc => Some(PENDING),
-        _ if dirty => Some(STALE),
-        _ => None,
+        (None, Some(_)) => Some(PENDING.to_string()),
+        (Some(pb), Some(lc)) if pb != lc => Some(PENDING.to_string()),
+        _ if dirty => Some(STALE.to_string()),
+        // Current index, but not every language in it was analyzed.
+        _ => phase_b_unanalyzed_note(store),
     }
+}
+
+/// Languages whose Phase B never produced call/ref edges on the last run, per
+/// the `phase_b_warnings` meta (#755).
+///
+/// The classes are exactly the ones `travsr status` downgrades `complete` to
+/// `partial` for (`travsr-cli/src/status.rs::phase_b_state`): a crash, a missing
+/// analyzer, or a pending approval/permission. Deliberately NOT the
+/// `skipped_unregistered` / `untrusted_corpus` classes — those mean the user has
+/// not turned the language on, which `status` reports as its own notice rather
+/// than as a degradation of the languages that did run. Keeping the two sets
+/// equal is what stops this note and the `semantic:` line from contradicting
+/// each other.
+///
+/// `zero_nodes` is likewise excluded: an analyzer that ran and found nothing is a
+/// valid answer, not missing coverage.
+fn phase_b_unanalyzed_note(store: &SqliteStore) -> Option<String> {
+    const CLASSES: &[&str] = &[
+        "crashed",
+        "skipped_no_analyzer",
+        "needs_approval",
+        "needs_consent",
+    ];
+    let warnings = store.get_meta("phase_b_warnings").ok().flatten()?;
+    let mut langs: Vec<&str> = Vec::new();
+    for warn in warnings.split(',') {
+        let warn = warn.trim();
+        let Some((class, rest)) = warn.split_once(':') else {
+            continue;
+        };
+        if !CLASSES.contains(&class) {
+            continue;
+        }
+        // `version_mismatch` and friends carry `lang:extra`; take the language.
+        let lang = rest.split(':').next().unwrap_or(rest);
+        if !lang.is_empty() && !langs.contains(&lang) {
+            langs.push(lang);
+        }
+    }
+    if langs.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "[note: no call edges were produced for {} on the last semantic analysis run, \
+         so an empty result here is not authoritative for {}. Run `travsr status` for the \
+         reason and the fix.]",
+        langs.join(", "),
+        if langs.len() == 1 {
+            "that language"
+        } else {
+            "those languages"
+        }
+    ))
 }
 
 /// #645 WS-B: the stdio server's launch directory — the caller's checkout.
@@ -357,7 +420,7 @@ fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> S
         .unwrap_or_default();
     let mut out = body;
     for note in [
-        phase_b_degraded_note(store).map(str::to_string),
+        phase_b_degraded_note(store),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
     ]
     .into_iter()
@@ -424,7 +487,7 @@ fn read_note_signals(store: &SqliteStore, head: Option<&str>) -> Vec<serde_json:
         .flatten()
         .unwrap_or_default();
     [
-        phase_b_degraded_note(store).map(str::to_string),
+        phase_b_degraded_note(store),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
     ]
     .into_iter()
@@ -1037,7 +1100,15 @@ pub struct StructuredReferences {
     /// Exact occurrence sites (capped at `MAX_REFERENCE_SITES`).
     pub references: Vec<travsr_core::RefSite>,
     /// Total occurrence count before the cap; `references.len()` when not truncated.
-    pub total: usize,
+    ///
+    /// `null` when no count was taken at all, i.e. whenever `status != "resolved"`
+    /// (#755 Part B item 9). It used to be a flat `0` there, so an `ambiguous`
+    /// answer — which carries `candidates` and a "re-run with a path hint" note,
+    /// and says nothing about how many uses exist — serialized identically to a
+    /// symbol that genuinely has no references. A script keying on `total` alone
+    /// read that as a confident zero. `null` is not `0` in any consumer, so the
+    /// same script now fails visibly instead of concluding the wrong thing.
+    pub total: Option<usize>,
     pub truncated: bool,
     /// Human caveat when a zero result is not definitive (degraded coverage,
     /// path-hint miss, still-building index). `null` on a clean answer.
@@ -1068,7 +1139,7 @@ pub fn find_references_structured(
         resolved_to: None,
         candidates: Vec::new(),
         references: Vec::new(),
-        total: 0,
+        total: None,
         truncated: false,
         note: None,
     };
@@ -1128,8 +1199,9 @@ pub fn find_references_structured(
 
     match store.reference_sites(target.id) {
         Ok(sites) if !sites.is_empty() => {
-            out.total = sites.len();
-            out.truncated = out.total > MAX_REFERENCE_SITES;
+            let total = sites.len();
+            out.total = Some(total);
+            out.truncated = total > MAX_REFERENCE_SITES;
             out.references = sites.into_iter().take(MAX_REFERENCE_SITES).collect();
             // #715 parity with the text path: a crashed last Phase B run leaves
             // partial coverage under a complete marker, so even a non-empty site
@@ -1139,10 +1211,13 @@ pub fn find_references_structured(
             }
         }
         _ => {
-            // Resolved, but no exact occurrence sites. Carry the text path's honest
-            // caveat (degraded coverage vs. genuine zero) as `note`, minus the
-            // header line that `resolved_to` already encodes. Reuse the target we
-            // just resolved rather than re-running resolution.
+            // Resolved, but no exact occurrence sites. This IS a real count, so
+            // `total` is an explicit `Some(0)` — the one case where zero is the
+            // answer (#755 Part B item 9). Carry the text path's honest caveat
+            // (degraded coverage vs. genuine zero) as `note`, minus the header line
+            // that `resolved_to` already encodes. Reuse the target we just resolved
+            // rather than re-running resolution.
+            out.total = Some(0);
             out.note = Some(strip_resolved_header(&references_body_for_target(
                 store, &target,
             )));
@@ -3599,10 +3674,12 @@ pub fn repos_remove(name: &str) -> String {
 
 /// Find a traversal path from `source` symbol to `sink` symbol through the graph.
 ///
-/// Uses PCST (Prize-Collecting Steiner Tree) approximation when a path exists.
-/// A result that does not reach the sink (pcst_path's BFS fallback on
-/// disconnected graphs) is reported as "no path found" rather than relayed
-/// as if it were a path (#620).
+/// Uses a Dijkstra shortest path plus a λ-corridor around it (`pcst_path`, whose
+/// name predates #527 — it is not a Prize-Collecting Steiner Tree approximation,
+/// and describing it as one here contradicted the algorithm and the tool
+/// description; #755 Part B item 5). A result that does not reach the sink
+/// (`pcst_path`'s BFS fallback on disconnected graphs) is reported as "no path
+/// found" rather than relayed as if it were a path (#620).
 ///
 /// Output format (one line per node on path):
 ///   `fn:charge (function) — src/payment.ts`
@@ -3691,15 +3768,27 @@ fn get_execution_path_body(
         }
     };
 
-    // SEC P0: both failure modes (not found and access denied) land here and
-    // produce the same message, which names neither the failing endpoint nor
-    // the reason — no existence oracle.
+    // #755 Part B item 6: say WHICH endpoint failed. The old message hedged with
+    // "source X and/or sink Y" even when only one side was bad, so the caller had
+    // to re-probe each side separately to learn what to fix.
+    //
+    // SEC P0 is preserved: both failure modes (not found and access denied) still
+    // land in the same branch and produce byte-identical text for a given side, so
+    // the message never says WHY a side failed. Naming the side leaks nothing an
+    // existence oracle needs — "sink 'X' did not resolve" is emitted identically
+    // for a nonexistent X and for an X the caller may not see, which is exactly
+    // the indistinguishability `get_execution_path_denied_matches_not_found` pins.
     let (src, snk) = match (src_node, sink_node) {
         (Some(a), Some(b)) => (a, b),
-        _ => {
+        (src_opt, sink_opt) => {
             if diagnose {
+                let which = match (src_opt.is_some(), sink_opt.is_some()) {
+                    (false, true) => format!("source '{source}'"),
+                    (true, false) => format!("sink '{sink}'"),
+                    _ => format!("source '{source}' or sink '{sink}'"),
+                };
                 return format!(
-                    "could not resolve source '{source}' and/or sink '{sink}', verify the names with search_symbol, or pass full signatures (e.g. fn:charge)."
+                    "could not resolve {which}, verify the names with search_symbol, or pass full signatures (e.g. fn:charge)."
                 );
             }
             return String::new();
@@ -14112,5 +14201,427 @@ mod snippet_tests {
             "a pending message carrying an ETA has reappeared in tools.rs; call \
              phase_b_pending_json instead of writing a new literal"
         );
+    }
+}
+
+/// #755 Part B: the per-query "this language was not analyzed" note (item 4),
+/// naming the failing endpoint in `get_execution_path` (item 6), and `total`
+/// no longer conflating "no count taken" with a real zero (item 9).
+#[cfg(test)]
+mod issue_755_tests {
+    use super::*;
+
+    fn store_at_head() -> travsr_store::SqliteStore {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Markers agree and nothing is dirty: the index IS current, which is
+        // exactly the state where the old code had nothing to say.
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store
+    }
+
+    fn with_warnings(warnings: &str) -> travsr_store::SqliteStore {
+        let mut store = store_at_head();
+        store.set_meta("phase_b_warnings", warnings).unwrap();
+        store
+    }
+
+    // -- item 4: a missing analyzer must not read as "no callers" --------------
+
+    /// The reported repro: a php repo on a host with no scip-php. The index is
+    /// current, so neither the pending nor the stale note fires, and every
+    /// `graph`/`callers` query used to answer with nothing at all.
+    #[test]
+    fn a_missing_analyzer_produces_a_per_query_note() {
+        let store = with_warnings("skipped_no_analyzer:php");
+        let note = phase_b_degraded_note(&store).expect("a skipped language must be surfaced");
+        assert!(
+            note.contains("php"),
+            "the note must name the language; got: {note}"
+        );
+        assert!(
+            note.contains("no call edges"),
+            "the note must say what is missing, not just that something is; got: {note}"
+        );
+        assert!(
+            note.contains("not authoritative"),
+            "the note exists to stop an empty result being trusted; got: {note}"
+        );
+        assert!(
+            note.contains("that language"),
+            "one language takes the singular; got: {note}"
+        );
+    }
+
+    /// A crashed analyzer is the same harm from a different cause.
+    #[test]
+    fn a_crashed_analyzer_produces_a_per_query_note() {
+        let store = with_warnings("crashed:objectivec");
+        let note = phase_b_degraded_note(&store).expect("a crash must be surfaced");
+        assert!(note.contains("objectivec"), "got: {note}");
+    }
+
+    /// So are the two "waiting on the user" states.
+    #[test]
+    fn pending_approval_and_consent_produce_a_per_query_note() {
+        for warn in ["needs_approval:java", "needs_consent:scala"] {
+            let store = with_warnings(warn);
+            let note =
+                phase_b_degraded_note(&store).unwrap_or_else(|| panic!("{warn} must be surfaced"));
+            assert!(
+                note.contains(warn.split(':').nth(1).unwrap()),
+                "got: {note}"
+            );
+        }
+    }
+
+    /// Several languages are listed once each, in the plural.
+    #[test]
+    fn several_unanalyzed_languages_are_listed_and_deduped() {
+        let store = with_warnings("skipped_no_analyzer:php,crashed:php,needs_approval:java");
+        let note = phase_b_degraded_note(&store).expect("must fire");
+        assert!(note.contains("php") && note.contains("java"), "got: {note}");
+        assert_eq!(
+            note.matches("php").count(),
+            1,
+            "a language named by two classes must still appear once; got: {note}"
+        );
+        assert!(
+            note.contains("those languages"),
+            "more than one language takes the plural; got: {note}"
+        );
+    }
+
+    // -- item 4, negative: must not fire on healthy or not-turned-on states ---
+
+    /// An analyzer that ran and found nothing is a valid answer, not missing
+    /// coverage. Warning here would put a caveat on every query in a repo whose
+    /// go files genuinely define nothing callable.
+    #[test]
+    fn a_zero_node_run_is_not_treated_as_unanalyzed() {
+        let store = with_warnings("zero_nodes:go");
+        assert!(
+            phase_b_degraded_note(&store).is_none(),
+            "a completed run that found nothing is not degraded coverage"
+        );
+    }
+
+    /// Languages the user has not turned on are their own notice in `travsr
+    /// status`, not a downgrade of the ones that did run. Including them here
+    /// would make this note and the `semantic:` line disagree.
+    #[test]
+    fn languages_the_user_never_enabled_do_not_trigger_the_note() {
+        for warn in [
+            "skipped_unregistered:php",
+            "untrusted_corpus:go",
+            "skipped_no_compdb:cpp",
+        ] {
+            let store = with_warnings(warn);
+            assert!(
+                phase_b_degraded_note(&store).is_none(),
+                "{warn} must not degrade the languages that did run"
+            );
+        }
+    }
+
+    /// A repo-level warning that names no language must not be mistaken for one.
+    #[test]
+    fn a_non_per_language_warning_is_ignored() {
+        let store = with_warnings("scip_unification_misses:3/900");
+        assert!(phase_b_degraded_note(&store).is_none());
+    }
+
+    /// An empty or absent warnings key is the healthy case and stays silent --
+    /// the behaviour the pre-existing #617 tests pin, unchanged.
+    #[test]
+    fn a_clean_run_stays_silent() {
+        assert!(phase_b_degraded_note(&store_at_head()).is_none());
+        assert!(phase_b_degraded_note(&with_warnings("")).is_none());
+        assert!(phase_b_degraded_note(&with_warnings(",,")).is_none());
+    }
+
+    /// Malformed entries must not panic or invent a language.
+    #[test]
+    fn malformed_warning_entries_are_skipped() {
+        for warn in ["skipped_no_analyzer:", "skipped_no_analyzer", ":php", ":"] {
+            let store = with_warnings(warn);
+            assert!(
+                phase_b_degraded_note(&store).is_none(),
+                "{warn} names no language, so there is nothing to report"
+            );
+        }
+    }
+
+    /// A `class:lang:extra` entry (the `version_mismatch` shape) is not in the
+    /// reported set, so it stays out -- but must not disturb a sibling entry.
+    #[test]
+    fn an_extra_field_entry_does_not_disturb_the_reported_set() {
+        let store = with_warnings("version_mismatch:go:1.2:1.1,skipped_no_analyzer:php");
+        let note = phase_b_degraded_note(&store).expect("php must still be reported");
+        assert!(note.contains("php"), "got: {note}");
+        assert!(
+            !note.contains("go"),
+            "version_mismatch is not in the reported set; got: {note}"
+        );
+    }
+
+    /// Precedence: a stale or pending index is the bigger fact and keeps its own
+    /// wording. Reporting "php was not analyzed" while the whole index is behind
+    /// HEAD would point at the wrong problem.
+    #[test]
+    fn a_pending_or_stale_index_keeps_its_own_note() {
+        let mut behind = travsr_store::SqliteStore::open_in_memory().unwrap();
+        behind.set_meta("last_commit", "def").unwrap();
+        behind.set_meta("phase_b_commit", "abc").unwrap();
+        behind
+            .set_meta("phase_b_warnings", "skipped_no_analyzer:php")
+            .unwrap();
+        let note = phase_b_degraded_note(&behind).expect("must fire");
+        assert!(note.contains("call-graph index incomplete"), "got: {note}");
+
+        let mut dirty = store_at_head();
+        dirty.set_meta("phase_b_dirty", "1").unwrap();
+        dirty
+            .set_meta("phase_b_warnings", "skipped_no_analyzer:php")
+            .unwrap();
+        let note = phase_b_degraded_note(&dirty).expect("must fire");
+        assert!(note.contains("call-graph edges degraded"), "got: {note}");
+    }
+
+    /// The note has to reach an actual query, not just the helper: this is the
+    /// `get_callers` path the issue reports as silent.
+    #[test]
+    fn get_callers_carries_the_unanalyzed_note() {
+        use travsr_core::{Node, VName};
+        let mut store = with_warnings("skipped_no_analyzer:php");
+        let n = Node::new(
+            VName::new("t", "", "src/a.php", "php", "fn:describe"),
+            "function",
+        );
+        store.put_node(&n).unwrap();
+        let out = get_callers(&store, "describe");
+        assert!(
+            out.contains("no call edges were produced for php"),
+            "an empty caller list must say why; got: {out}"
+        );
+    }
+
+    // -- item 6: name the endpoint that actually failed -----------------------
+
+    fn two_node_store() -> travsr_store::SqliteStore {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for sig in ["fn:alpha", "fn:beta"] {
+            let n = Node::new(
+                VName::new("t", "", "src/a.ts", "typescript", sig),
+                "function",
+            );
+            store.put_node(&n).unwrap();
+        }
+        store
+    }
+
+    /// The reported repro: only the source is bad. The old message hedged with
+    /// "source X and/or sink Y", so the caller could not tell which name to fix.
+    #[test]
+    fn a_bad_source_names_the_source_only() {
+        let store = two_node_store();
+        let out = get_execution_path(&store, "NoSuchSym", "beta");
+        assert!(
+            out.contains("could not resolve source 'NoSuchSym'"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("sink 'beta'"),
+            "the sink resolved, so naming it sends the reader after the wrong name; got: {out}"
+        );
+    }
+
+    /// The mirror case.
+    #[test]
+    fn a_bad_sink_names_the_sink_only() {
+        let store = two_node_store();
+        let out = get_execution_path(&store, "alpha", "NoSuchSym");
+        assert!(
+            out.contains("could not resolve sink 'NoSuchSym'"),
+            "got: {out}"
+        );
+        assert!(!out.contains("source 'alpha'"), "got: {out}");
+    }
+
+    /// Both bad: both are named, because both do need fixing.
+    #[test]
+    fn two_bad_endpoints_name_both() {
+        let store = two_node_store();
+        let out = get_execution_path(&store, "NoSuchA", "NoSuchB");
+        assert!(out.contains("source 'NoSuchA'"), "got: {out}");
+        assert!(out.contains("sink 'NoSuchB'"), "got: {out}");
+    }
+
+    /// SEC P0 must survive naming the side. A denied endpoint and a nonexistent
+    /// one still produce byte-identical text once the echoed query is normalized
+    /// -- naming WHICH side failed leaks nothing, because "did not resolve" is
+    /// emitted the same way for both reasons.
+    #[test]
+    fn naming_the_side_does_not_create_an_existence_oracle() {
+        use travsr_core::{Node, VName};
+        use travsr_retrieval::RbacFilter;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for sig in ["fn:alpha", "fn:beta"] {
+            let n = Node::new(
+                VName::new("public", "", "src/a.ts", "typescript", sig),
+                "function",
+            );
+            store.put_node(&n).unwrap();
+        }
+        let secret = Node::new(
+            VName::new("secret", "", "src/s.ts", "typescript", "fn:hidden"),
+            "function",
+        );
+        store.put_node(&secret).unwrap();
+        let filter = RbacFilter::new(["public"]);
+        // `hidden` exists but is denied; `absent` does not exist at all.
+        let denied = get_execution_path_authed(&store, "alpha", "hidden", &filter);
+        let missing = get_execution_path_authed(&store, "alpha", "absent", &filter);
+        assert_eq!(
+            denied.replace("hidden", "X"),
+            missing.replace("absent", "X"),
+            "a denied sink and a nonexistent sink must be indistinguishable"
+        );
+        assert!(
+            denied.contains("sink"),
+            "the side is still named; got: {denied}"
+        );
+        assert!(
+            !denied.contains("denied") && !denied.contains("permission"),
+            "the reason must never be stated; got: {denied}"
+        );
+    }
+
+    /// Two resolvable-but-disconnected endpoints keep the distinct no-path
+    /// message: naming the side must not swallow the case where both resolved.
+    #[test]
+    fn resolved_but_disconnected_still_says_no_path_found() {
+        let store = two_node_store();
+        let out = get_execution_path(&store, "alpha", "beta");
+        assert!(out.contains("no path found"), "got: {out}");
+        assert!(!out.contains("could not resolve"), "got: {out}");
+    }
+
+    // -- item 9: `total` must not report a zero it never counted --------------
+
+    fn refs_store() -> travsr_store::SqliteStore {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store
+    }
+
+    /// The reported repro: `speak` is defined on three classes, so the answer is
+    /// "ambiguous, here are the candidates" -- it says nothing about how many
+    /// uses exist. `total: 0` claimed it did.
+    #[test]
+    fn an_ambiguous_symbol_reports_no_count_rather_than_zero() {
+        use travsr_core::{Node, VName};
+        let mut store = refs_store();
+        for path in ["src/animal.rb", "src/cat.rb", "src/dog.rb"] {
+            let n = Node::new(VName::new("t", "", path, "ruby", "fn:speak"), "method");
+            store.put_node(&n).unwrap();
+        }
+        let got = find_references_structured(&store, "speak", None);
+        assert_eq!(got.status, "ambiguous");
+        assert!(
+            !got.candidates.is_empty(),
+            "candidates must still be listed"
+        );
+        assert_eq!(
+            got.total, None,
+            "no occurrence count was taken, so `total` must not assert one"
+        );
+        let json = serde_json::to_value(&got).unwrap();
+        assert!(
+            json["total"].is_null(),
+            "`total` must serialize as null, which no consumer reads as 0; got: {json}"
+        );
+    }
+
+    /// A symbol that does not exist also took no count.
+    #[test]
+    fn a_missing_symbol_reports_no_count() {
+        let store = refs_store();
+        let got = find_references_structured(&store, "zzz_nope", None);
+        assert_eq!(got.status, "not_found");
+        assert_eq!(got.total, None);
+    }
+
+    /// Nor did a still-building index.
+    #[test]
+    fn a_pending_index_reports_no_count() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        let got = find_references_structured(&store, "speak", None);
+        assert_eq!(got.status, "pending");
+        assert_eq!(got.total, None);
+    }
+
+    /// An invalid argument took no count either.
+    #[test]
+    fn a_rejected_argument_reports_no_count() {
+        let store = refs_store();
+        let got = find_references_structured(&store, "../../etc/passwd", None);
+        assert_eq!(got.total, None);
+    }
+
+    /// The one case where zero IS the answer: the symbol resolved uniquely and
+    /// has no recorded uses. This must stay a real `0`, or the change would just
+    /// move the ambiguity somewhere else.
+    #[test]
+    fn a_resolved_symbol_with_no_uses_reports_a_real_zero() {
+        use travsr_core::{Node, VName};
+        let mut store = refs_store();
+        let n = Node::new(
+            VName::new("t", "", "src/a.rb", "ruby", "fn:lonely"),
+            "method",
+        );
+        store.put_node(&n).unwrap();
+        let got = find_references_structured(&store, "lonely", None);
+        assert_eq!(got.status, "resolved");
+        assert_eq!(
+            got.total,
+            Some(0),
+            "a unique definition with no uses genuinely has zero references"
+        );
+        let json = serde_json::to_value(&got).unwrap();
+        assert_eq!(json["total"], serde_json::json!(0));
+    }
+
+    /// And a symbol with real uses still reports the real count -- the change
+    /// must not turn every count into `null`.
+    #[test]
+    fn a_resolved_symbol_with_uses_reports_the_count() {
+        use travsr_core::{Node, VName};
+        let mut store = refs_store();
+        let cat = Node::new(VName::new("t", "", "src/cat.rb", "ruby", "file"), "file");
+        let dog = Node::new(VName::new("t", "", "src/dog.rb", "ruby", "file"), "file");
+        let target = Node::new(
+            VName::new("t", "", "src/animal.rb", "ruby", "fn:speak"),
+            "method",
+        );
+        store.put_node(&cat).unwrap();
+        store.put_node(&dog).unwrap();
+        store.put_node(&target).unwrap();
+        store
+            .record_edge_sites(&[(cat.id, target.id, 4), (dog.id, target.id, 7)])
+            .unwrap();
+        let got = find_references_structured(&store, "speak", None);
+        assert_eq!(got.status, "resolved");
+        assert_eq!(
+            got.total,
+            Some(2),
+            "two recorded use sites must still be counted"
+        );
+        assert!(!got.truncated);
+        let json = serde_json::to_value(&got).unwrap();
+        assert_eq!(json["total"], serde_json::json!(2));
     }
 }
