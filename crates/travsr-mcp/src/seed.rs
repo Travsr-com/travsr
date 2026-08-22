@@ -686,12 +686,10 @@ pub(crate) fn doc_floor() -> f32 {
 /// `None` degrades to global-config-and-env only, which is correct: an
 /// in-memory or path-less store has no repo layer to read.
 fn config_repo_root(store: &SqliteStore) -> Option<std::path::PathBuf> {
-    store
-        .get_meta("repo_root")
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
+    // A stale root means `<repo>/.travsr/config.toml` is not found, so the repo
+    // layer silently drops out of the layered config and retrieval runs on
+    // global-and-env defaults with no error and no log line (#749 review).
+    store.resolve_repo_root()
 }
 
 /// Plan §4.2: "cap the section at 3 entries."
@@ -2832,10 +2830,10 @@ pub(crate) fn build_seed_set(
     let mut max_rerank_score: Option<f32> = None;
     if !seeds.is_empty() && !g1_bypass {
         let topk = crate::rerank::rerank_topk();
-        let repo_root = match store.get_meta("repo_root") {
-            Ok(Some(r)) if !r.is_empty() => Some(std::path::PathBuf::from(r)),
-            _ => None,
-        };
+        // A stale root resolves to `Some(gone)` rather than `None` here, so the
+        // snippet reads fail and the cross-encoder scores candidates on empty
+        // text: search quality degrades with nothing surfaced (#749 review).
+        let repo_root = store.resolve_repo_root();
         let take_n = seeds.len().min(topk);
         let candidate_ids: Vec<NodeId> = seeds[..take_n].iter().map(|s| s.node).collect();
         if let Ok(candidate_nodes) = store.get_nodes(&candidate_ids) {

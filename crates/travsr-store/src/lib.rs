@@ -764,6 +764,14 @@ pub struct SqliteStore {
     /// in-memory stores. Used by `embed_progress` to ATTACH embed.db and count
     /// embedded nodes without polluting the graph.db WAL with embedding BLOBs.
     embed_db_path: Option<std::path::PathBuf>,
+    /// This store's own graph.db path. `None` for in-memory stores.
+    ///
+    /// Added because `repo_root_from_db_path` was deriving the repository root
+    /// from `embed_db_path`, which happens to be graph.db's sibling and is
+    /// declared for something else entirely. Relocating embed.db (models already
+    /// live outside the repo) would have silently brought #747 back, and no
+    /// fixture would have caught it (#749 review).
+    db_path: Option<std::path::PathBuf>,
     /// #464 follow-up: persistent read-only connection to the sibling embed.db,
     /// lazily opened on first [`Self::embed_data_version`] call. Persistent
     /// because `PRAGMA data_version` only moves relative to prior reads on the
@@ -791,6 +799,77 @@ impl Drop for SqliteStore {
 }
 
 impl SqliteStore {
+    /// The repository root to resolve paths against, live rather than remembered.
+    ///
+    /// `meta.repo_root` is stamped by `init` and by `reindex_files`, so it names
+    /// wherever the repository lived at the last index. Move the checkout, clone
+    /// it to a second path, mount it at a different point in CI, or rename a home
+    /// directory, and every consumer of that key is handed a path that no longer
+    /// exists until something reindexes (#747). The database travels with the
+    /// repository, so its own location covers that window.
+    ///
+    /// `None` only when there is neither a recorded value nor a derivable one:
+    /// an in-memory store, or a database outside a `.travsr` directory, with no
+    /// `repo_root` in meta. A store with nothing to derive from still returns a
+    /// recorded value, whether or not that path still resolves, since there is
+    /// nothing to contradict it.
+    ///
+    /// Lives here rather than in a caller because there are six readers of
+    /// `meta.repo_root` across `travsr-mcp` alone, and the first version of this
+    /// rule was private to `tools.rs`, so `observability.rs` and `seed.rs` could
+    /// not use it even had they wanted to. A seventh reader added later now gets
+    /// the right behaviour by default instead of by remembering (#749 review).
+    ///
+    /// Precedence, in order:
+    ///
+    /// 1. The derived root, when it is a repository in its own right. A `.travsr`
+    ///    copied into a second checkout still names the first, and that one
+    ///    usually still exists, so preferring the stored value there reads files
+    ///    out of the wrong tree while looking entirely confident.
+    /// 2. The stored value, while it resolves. This is the `--db` case: a
+    ///    database opened from outside any repository is still about the real
+    ///    one, and only the stored value knows where that is.
+    /// 3. Whichever of the two is left.
+    pub fn resolve_repo_root(&self) -> Option<std::path::PathBuf> {
+        let stored = self
+            .get_meta("repo_root")
+            .ok()
+            .flatten()
+            .filter(|r| !r.is_empty())
+            .map(std::path::PathBuf::from);
+        let derived = self.repo_root_from_db_path();
+
+        // `.git` is a directory in a normal checkout and a file in a worktree or
+        // submodule, so `exists` covers both.
+        if derived.as_ref().is_some_and(|d| d.join(".git").exists()) {
+            return derived;
+        }
+        match stored {
+            Some(p) if p.is_dir() => Some(p),
+            stored => derived.or(stored),
+        }
+    }
+
+    /// The repository this store's database sits inside, derived from the
+    /// database's own location rather than from anything recorded at index time.
+    ///
+    /// `None` for an in-memory store, which has no location to derive from, and
+    /// for any database not sitting at `<repo>/.travsr/graph.db`.
+    pub fn repo_root_from_db_path(&self) -> Option<std::path::PathBuf> {
+        // `<repo>/.travsr/graph.db` -> `<repo>`, and only that shape.
+        //
+        // The directory name is checked rather than assumed. A database opened
+        // from somewhere else (a test fixture, an explicit `--db`) would
+        // otherwise yield whatever happens to sit two levels up, and a confident
+        // wrong root is worse than none: callers would resolve `vname.path`
+        // against an unrelated directory instead of degrading to metadata-only.
+        let dir = self.db_path.as_deref()?.parent()?;
+        if dir.file_name()? != ".travsr" {
+            return None;
+        }
+        dir.parent().map(std::path::Path::to_path_buf)
+    }
+
     /// Open (or create) a SQLite-backed store at `path`, enabling WAL and
     /// running any pending migrations via [`MigrationRunner`].
     pub fn open(path: &Path) -> Result<Self, StoreError> {
@@ -807,6 +886,7 @@ impl SqliteStore {
                 embed_score_hook: None,
                 embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
+                db_path: Some(path.to_path_buf()),
                 embed_meta_conn: std::cell::RefCell::new(None),
                 embed_doc_knn_hook: None,
             };
@@ -875,6 +955,7 @@ impl SqliteStore {
                 embed_score_hook: None,
                 embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
+                db_path: Some(path.to_path_buf()),
                 embed_meta_conn: std::cell::RefCell::new(None),
                 embed_doc_knn_hook: None,
             };
@@ -904,6 +985,7 @@ impl SqliteStore {
                 embed_score_hook: None,
                 embed_readiness: None,
                 embed_db_path: None,
+                db_path: None,
                 embed_meta_conn: std::cell::RefCell::new(None),
                 embed_doc_knn_hook: None,
             };
@@ -7482,6 +7564,41 @@ fn byte_trigram_jaccard(a: &str, b: &str) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    /// #749 review: the `.travsr` name check had no direct test in the crate
+    /// that owns it. Its only coverage was incidental, in a `travsr-mcp`
+    /// snippets test whose fixture happens to keep a non-`.travsr` layout, so
+    /// normalising that fixture for consistency would have silently deleted it.
+    #[test]
+    fn a_database_outside_a_travsr_dir_yields_no_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(&dir.path().join("graph.db")).unwrap();
+        assert_eq!(
+            store.repo_root_from_db_path(),
+            None,
+            "deriving a root from any database location invents a confident \
+             wrong answer, which is worse than none"
+        );
+    }
+
+    #[test]
+    fn a_database_inside_a_travsr_dir_yields_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let travsr_dir = dir.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        let store = SqliteStore::open(&travsr_dir.join("graph.db")).unwrap();
+        assert_eq!(
+            store.repo_root_from_db_path().as_deref(),
+            Some(dir.path()),
+            "`<repo>/.travsr/graph.db` derives `<repo>`"
+        );
+    }
+
+    #[test]
+    fn an_in_memory_store_has_no_root_to_derive() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert_eq!(store.repo_root_from_db_path(), None);
+    }
+
     use super::*;
     use travsr_core::VName;
 
