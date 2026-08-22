@@ -34,8 +34,10 @@ pub struct PhaseBOutcome {
     /// compile_commands.json (e.g. via `bear` or CMake's
     /// `CMAKE_EXPORT_COMPILE_COMMANDS`).
     pub skipped_no_compdb: Vec<String>,
-    /// Languages registered as RequiresElevated but lacking a PSE approval
-    /// entry in lang.toml. User-actionable: `travsr lang approve <lang>`.
+    /// Vestigial since elevated access became auto-granted for local use
+    /// (ADR-017 Amendment A5): RequiresElevated languages are no longer gated on
+    /// a PSE approval, so the resolver never populates this. Retained as contract
+    /// surface (always empty) for downstream consumers that still read it.
     pub skipped_needs_approval: Vec<String>,
     /// Windows only: languages whose analyzer cannot run inside the isolation
     /// layer (java/scala) and for which the user has not granted permission to run

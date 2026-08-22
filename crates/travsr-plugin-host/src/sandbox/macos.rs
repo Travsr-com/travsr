@@ -207,14 +207,16 @@ pub fn build_sandboxed_command(
 
     // For Elevated policy, the JVM (and other complex runtimes) have unbounded
     // system requirements that cannot be enumerated in a Seatbelt profile without
-    // playing endless whack-a-mole. The user already granted explicit PSE approval
-    // for Elevated — skip sandbox-exec and run the program directly with ulimits.
+    // playing endless whack-a-mole. Elevated access is auto-granted for local use
+    // (ADR-017 Amendment A5) — skip sandbox-exec and run the program directly with
+    // ulimits.
     let mut cmd = match policy {
         SandboxPolicy::Elevated { .. } => {
             tracing::debug!(
                 language,
                 "network-permitted policy on macOS: skipping sandbox-exec, running the \
-                 sidecar directly (a security approval is on file; resource-capped via ulimit)"
+                 sidecar directly (elevated access auto-granted for local use; \
+                 resource-capped via ulimit)"
             );
             let quoted_args = args
                 .iter()
