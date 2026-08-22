@@ -128,7 +128,7 @@ unicode-segmentation = "1"
 ctrlc            = "3"
 tracing-appender = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-dirs = "5"
+dirs = "6"
 toml        = "0.8"
 yaml-rust2  = "0.9"
 quick-xml   = "0.41"
