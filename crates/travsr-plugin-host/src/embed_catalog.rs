@@ -364,7 +364,7 @@ impl EmbedOpLock {
             }
             Err(e) => {
                 return Err(anyhow::Error::new(e).context(format!(
-                    "opening the embed lock at {} \u{2014} refusing to run an embed operation \
+                    "opening the embed lock at {}, refusing to run an embed operation \
                      without it",
                     lock_path.display()
                 )));

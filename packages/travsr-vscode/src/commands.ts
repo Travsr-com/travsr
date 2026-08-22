@@ -943,7 +943,7 @@ export async function readDiagnostics(binary: string, cwd: string): Promise<Diag
       : "warn";
     found.push({
       severity,
-      title: text.replace(/\s*[-,.]?\s*(re-?run|run)\s+`[^`]+`.*$/i, "").trim(),
+      title: text.replace(/\s*[-—,;.]?\s*(re-?run|run)\s+`[^`]+`.*$/i, "").trim(),
       hint: text,
       command: cmd ? cmd[1] : undefined,
     });

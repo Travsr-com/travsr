@@ -468,7 +468,7 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
             }
             for lang in &report.skipped_needs_consent {
                 println!(
-                    "  {} full analysis for {lang} needs your permission — run `travsr lang allow-unsandboxed {lang}` to enable",
+                    "  {} full analysis for {lang} needs your permission; run `travsr lang allow-unsandboxed {lang}` to enable",
                     pal.dim("ℹ"),
                 );
             }
