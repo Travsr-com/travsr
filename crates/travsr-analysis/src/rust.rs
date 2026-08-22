@@ -46,6 +46,7 @@ const QUERIES: &str = "
 (static_item name: (identifier) @static.name)
 (type_item name: (type_identifier) @type.name)
 (union_item name: (type_identifier) @union.name)
+(field_declaration name: (field_identifier) @field.name)
 (use_declaration) @use.decl
 ";
 
@@ -285,6 +286,25 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     output.edges.push(emit::defines_edge(file_id, node.id));
                     output.nodes.push(node);
                 }
+                "field.name" => {
+                    // #757: named struct fields become `field:Owner.name` nodes,
+                    // owner-qualified (collision-free per Invariant #1) and
+                    // contained by their struct — mirroring the Go path
+                    // (`field:Struct.name`). Only named `struct` fields are in
+                    // scope for v1: `rust_struct_field_owner` returns `None` for
+                    // tuple structs (no `field_declaration`), enum-variant fields
+                    // (owner would be the variant, not the enum), and union fields.
+                    let Some(owner) = rust_struct_field_owner(capture.node, source.as_slice())
+                    else {
+                        continue;
+                    };
+                    let struct_id = rust_struct_node(corpus, vname_path, &owner).id;
+                    let node = rust_field_node(corpus, vname_path, &owner, text)
+                        .with_line(line)
+                        .with_end_line(line);
+                    output.edges.push(emit::defines_edge(struct_id, node.id));
+                    output.nodes.push(node);
+                }
                 "use.decl" => {
                     // Walk the full use-tree to extract every leaf path, including
                     // grouped imports (`use std::{fmt, io}`) and renames.
@@ -338,6 +358,32 @@ fn has_impl_or_trait_ancestor(node: tree_sitter::Node<'_>) -> bool {
         current = n.parent();
     }
     false
+}
+
+/// #757: resolve the owning struct name for a `field_identifier` capture, or
+/// `None` when the field is not a named `struct` member (v1 scope). In
+/// tree-sitter-rust a named struct field is exactly:
+/// `field_identifier → field_declaration → field_declaration_list → struct_item`.
+/// Tuple structs use `ordered_field_declaration_list` (no `field_declaration`,
+/// so the capture never fires), and enum-variant / union fields resolve to an
+/// owner node that is not a `struct_item`, so they are skipped here.
+fn rust_struct_field_owner(name_node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let field_decl = name_node.parent()?; // field_declaration
+    let list = field_decl.parent()?; // field_declaration_list
+    let owner = list.parent()?; // struct_item (or enum_variant / union_item)
+    if owner.kind() != "struct_item" {
+        return None;
+    }
+    let name = owner
+        .child_by_field_name("name")?
+        .utf8_text(source)
+        .ok()?
+        .trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
 }
 
 /// #479: the `#[…]` attributes attached to `item` — its immediately-preceding
@@ -566,6 +612,15 @@ fn rust_struct_node(corpus: &str, path: &str, name: &str) -> Node {
     Node::new(
         rust_vname(corpus, path, &format!("struct:{name}")),
         "struct",
+    )
+}
+
+/// #757: a named struct field. Owner-qualified (`field:Owner.name`) so two
+/// structs with a same-named field never collide, mirroring the Go path.
+fn rust_field_node(corpus: &str, path: &str, owner: &str, field: &str) -> Node {
+    Node::new(
+        rust_vname(corpus, path, &format!("field:{owner}.{field}")),
+        "field",
     )
 }
 
@@ -834,6 +889,93 @@ mod tests {
 
     fn fixture_path() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust/simple.rs")
+    }
+
+    // #757: named struct fields emit owner-qualified `field:Owner.name` nodes
+    // contained by their struct, mirroring the Go path.
+    #[test]
+    fn named_struct_fields_emit_field_nodes_and_containment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.rs");
+        std::fs::write(&path, b"struct S {\n    a: u32,\n    pub b: String,\n}\n").unwrap();
+        let out = parse("", &path, "s.rs").unwrap();
+
+        let field = |sig: &str| out.nodes.iter().find(|n| n.vname.signature == sig);
+        let a = field("field:S.a").expect("field:S.a node");
+        let b = field("field:S.b").expect("field:S.b node");
+        assert_eq!(a.kind, "field");
+        assert_eq!(b.kind, "field");
+
+        let struct_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "struct:S")
+            .expect("struct:S node")
+            .id;
+        assert!(
+            out.edges
+                .iter()
+                .any(|e| e.src == struct_id && e.dst == a.id && e.kind == EdgeKind::DefinesBinding),
+            "expected struct:S → field:S.a containment edge"
+        );
+    }
+
+    #[test]
+    fn tuple_struct_emits_no_field_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.rs");
+        std::fs::write(&path, b"struct T(u32, String);\n").unwrap();
+        let out = parse("", &path, "t.rs").unwrap();
+        assert!(
+            !out.nodes.iter().any(|n| n.kind == "field"),
+            "tuple struct fields have no field_declaration, so no field node"
+        );
+    }
+
+    #[test]
+    fn two_structs_same_field_name_no_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.rs");
+        std::fs::write(
+            &path,
+            b"struct A {\n    n: u8,\n}\nstruct B {\n    n: u8,\n}\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "c.rs").unwrap();
+        let a = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "field:A.n")
+            .expect("field:A.n");
+        let b = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "field:B.n")
+            .expect("field:B.n");
+        assert_ne!(a.id, b.id, "owner-qualified fields must be distinct nodes");
+    }
+
+    #[test]
+    fn enum_variant_and_union_fields_are_out_of_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.rs");
+        std::fs::write(
+            &path,
+            b"enum E {\n    V { x: u32 },\n}\nunion U {\n    f: u32,\n}\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "e.rs").unwrap();
+        // v1 scope is named struct fields only; enum-variant and union members
+        // resolve to a non-`struct_item` owner and are skipped.
+        assert!(
+            !out.nodes.iter().any(|n| n.kind == "field"),
+            "no field nodes for enum-variant / union members in v1, got {:?}",
+            out.nodes
+                .iter()
+                .filter(|n| n.kind == "field")
+                .map(|n| &n.vname.signature)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

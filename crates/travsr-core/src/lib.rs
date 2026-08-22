@@ -409,6 +409,12 @@ pub enum EdgeKind {
     /// Call-site reference. Corresponds to Kythe `%kythe/edge/ref/call`.
     #[serde(rename = "ref/call")]
     RefCall,
+    /// Field-access reference: a read or write of a struct/class field
+    /// (`x.foo`), as distinct from a call. Kept separate from `RefCall` so a
+    /// field read never appears as a caller in `get_callers` / `get_blast_radius`
+    /// while still surfacing as a use-site in `find_references` (#757).
+    #[serde(rename = "ref/field")]
+    RefField,
     /// Definition-binding edge (parent → child in the AST).
     #[serde(rename = "defines/binding")]
     DefinesBinding,
@@ -451,6 +457,7 @@ impl EdgeKind {
         match self {
             Self::Depends => "depends",
             Self::RefCall => "ref/call",
+            Self::RefField => "ref/field",
             Self::DefinesBinding => "defines/binding",
             Self::Exports => "exports",
             Self::ResolvesTo => "resolves-to",
@@ -493,6 +500,9 @@ impl EdgeKind {
     pub fn ppr_weight(self) -> f32 {
         match self {
             Self::RefCall => 1.00,
+            // A field read is a genuine data-usage link but weaker than a call;
+            // sits alongside a file import in signal strength (#757).
+            Self::RefField => 0.50,
             Self::DefinesBinding => 0.70,
             Self::Exports => 0.60,
             Self::Depends => 0.50,
@@ -512,6 +522,7 @@ impl EdgeKind {
         match s {
             "depends" => Some(Self::Depends),
             "ref/call" => Some(Self::RefCall),
+            "ref/field" => Some(Self::RefField),
             "defines/binding" => Some(Self::DefinesBinding),
             "exports" => Some(Self::Exports),
             "resolves-to" => Some(Self::ResolvesTo),

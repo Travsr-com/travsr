@@ -1278,6 +1278,21 @@ pub fn init_repo_with_progress(
             .reconcile(&empty_walked, &purge_policy, repo_root, &corpus)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("--force full-graph purge")?;
+        // #757 audit: `reconcile` only prunes nodes for files absent from disk,
+        // so on-disk files keep their nodes AND their `files` content-hash rows.
+        // The hash-delta below would then skip every unchanged file, leaving the
+        // whole point of `--force` (re-parse with the current analyzer, even
+        // when file bytes are unchanged) unmet — it reported "up to date" over an
+        // index an older binary built. Clearing the hash cache makes every file
+        // look new, so `--force` genuinely re-parses the repo.
+        let cleared = store
+            .clear_file_hashes()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("--force clearing file hash cache")?;
+        tracing::info!(
+            cleared,
+            "--force: cleared file hash cache for full re-parse"
+        );
     }
 
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
@@ -1736,9 +1751,16 @@ pub fn init_repo_with_progress(
             // (and their callee nodes) are in the store. #299 F2: remap dst ids
             // through the unification alias map first so a site never points at a
             // SCIP node that `write_phase_b_results` dropped.
-            let resolved_sites = remap_resolved_sites(resolved_sites, &alias_map);
-            if let Err(e) = store.record_edge_sites(&resolved_sites) {
+            // #757: separate field-access occurrences (recorded as 'ref/field')
+            // from call occurrences ('ref/call') before remap+write.
+            let (call_sites, field_sites) = split_field_sites(&resolved, resolved_sites);
+            let call_sites = remap_resolved_sites(call_sites, &alias_map);
+            let field_sites = remap_resolved_sites(field_sites, &alias_map);
+            if let Err(e) = store.record_edge_sites(&call_sites) {
                 tracing::warn!("recording cross-crate edge_sites: {e:#}");
+            }
+            if let Err(e) = store.record_field_sites(&field_sites) {
+                tracing::warn!("recording field-access edge_sites: {e:#}");
             }
             // E1: label-only reconcile of edge languages to their endpoints
             // (the schema default 'typescript' otherwise mislabels every edge).
@@ -2231,6 +2253,45 @@ fn resolve_unresolved_calls(
             .push((*id, path.as_str(), lang.as_str()));
     }
 
+    // #757: field-access references (`x.foo`). Extraction emits these as an
+    // UnresolvedCall whose `callee_sig` is `field:{name}` with the recovered
+    // receiver type in `recv_type` — the same positive-type-evidence contract
+    // the method path uses (#529/#604/#606). Resolve each against the exact
+    // Phase A field node `field:{T}.{name}`; without a recovered `T`, or when
+    // that exact node is absent, fail closed (a field read carries no other
+    // disambiguating signal, and a bare name is not evidence of the owner).
+    let field_recv_qualified_sigs: Vec<String> = {
+        let mut v: Vec<String> = unresolved
+            .iter()
+            .filter(|u| u.callee_sig.starts_with("field:"))
+            .filter_map(|u| {
+                u.recv_type
+                    .as_ref()
+                    .map(|t| format!("field:{t}.{}", leaf_of(&u.callee_sig)))
+            })
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let field_recv_candidates = store
+        .nodes_by_signatures(&field_recv_qualified_sigs)
+        .unwrap_or_else(|e| {
+            tracing::warn!("resolve_unresolved_calls: field recv_type lookup failed: {e}");
+            Vec::new()
+        });
+    let mut by_field_recv_sig: std::collections::HashMap<
+        &str,
+        Vec<(travsr_core::NodeId, &str, &str)>,
+    > = std::collections::HashMap::new();
+    for (id, sig, path, lang) in &field_recv_candidates {
+        by_field_recv_sig.entry(sig.as_str()).or_default().push((
+            *id,
+            path.as_str(),
+            lang.as_str(),
+        ));
+    }
+
     let recv_type_probe_sigs: Vec<String> = {
         let mut types: Vec<&str> = unresolved
             .iter()
@@ -2297,6 +2358,50 @@ fn resolve_unresolved_calls(
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
     let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
     for u in unresolved {
+        // #757: field-access reference (`x.foo`). Handled ahead of the call
+        // paths below because it is not a call: it resolves to the exact Phase A
+        // field node via the recovered receiver type and emits a `RefField`
+        // edge (kept out of the `ref/call` set so it never reads as a caller).
+        // Fail-closed contract mirrors #604/#606: only a recovered `recv_type`
+        // that names an existing `field:{T}.{name}` node produces an edge.
+        if u.callee_sig.starts_with("field:") {
+            let Some(t) = u.recv_type.as_deref() else {
+                continue;
+            };
+            let qsig = format!("field:{t}.{}", leaf_of(&u.callee_sig));
+            let Some(cands) = by_field_recv_sig.get(qsig.as_str()) else {
+                continue;
+            };
+            let caller_lang = caller_langs.get(&u.src).map(String::as_str).unwrap_or("");
+            let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
+            // E4: a field ref must resolve within the caller's own language.
+            let lang_scoped: Vec<&(travsr_core::NodeId, &str, &str)> = cands
+                .iter()
+                .filter(|(_, _, lang)| caller_lang.is_empty() || *lang == caller_lang)
+                .collect();
+            // CO-A1: a field read carries no crate hint, so an ambiguous
+            // `field:{T}.{name}` signature is not evidence of its target. Two
+            // same-named types produce the same signature (even two
+            // function-local `struct Config { active }` in one file), and
+            // neither the language filter above nor `call_target_reachable`
+            // below can separate same-language, same-crate candidates — so
+            // emitting an edge per candidate fabricates a use-site onto each.
+            // Fail closed unless exactly one survives, mirroring the CO-A1 gate
+            // the call path applies below.
+            if lang_scoped.len() != 1 {
+                continue;
+            }
+            let (dst, path, _lang) = lang_scoped[0];
+            if u.src != *dst && call_target_reachable(caller_path, path, &crates) {
+                edges.push(travsr_core::Edge::new(
+                    u.src,
+                    *dst,
+                    travsr_core::EdgeKind::RefField,
+                ));
+                sites.push((u.src, *dst, u.caller_line));
+            }
+            continue;
+        }
         // E7: E3's positional rust-analyzer LSIF path resolves the same call
         // sites at 99.89% precision; where it already covered this exact site,
         // its `scip` edge supersedes the native leaf-guess heuristic (~8% precise
@@ -2864,6 +2969,33 @@ fn write_phase_b_results(
         version_mismatch: pb_outcome.version_mismatch,
     };
     (report, alias_map)
+}
+
+/// A resolved occurrence row: `(src caller node, dst target node, 1-based line)`.
+type SiteRow = (travsr_core::NodeId, travsr_core::NodeId, u32);
+
+/// #757: split resolved occurrence sites into call sites (`ref/call`) and
+/// field-access sites (`ref/field`) by matching each site's `(src, dst)` against
+/// the `RefField` edges the resolver produced. A `dst` node is either a callable
+/// or a field, so the pair → kind mapping is unambiguous. Returns
+/// `(call_sites, field_sites)`. Partition before any alias remap so the pairs
+/// (taken from the pre-remap resolved edges) line up with the pre-remap sites.
+fn split_field_sites(
+    resolved_edges: &[travsr_core::Edge],
+    sites: Vec<SiteRow>,
+) -> (Vec<SiteRow>, Vec<SiteRow>) {
+    let field_pairs: std::collections::HashSet<(travsr_core::NodeId, travsr_core::NodeId)> =
+        resolved_edges
+            .iter()
+            .filter(|e| e.kind == travsr_core::EdgeKind::RefField)
+            .map(|e| (e.src, e.dst))
+            .collect();
+    if field_pairs.is_empty() {
+        return (sites, Vec::new());
+    }
+    sites
+        .into_iter()
+        .partition(|(s, d, _)| !field_pairs.contains(&(*s, *d)))
 }
 
 /// #299 F2: remap `resolved_sites.dst` through the unification alias map and
@@ -3504,9 +3636,15 @@ fn run_background_phase_b_inner(
     // #299 WS-4: record cross-crate call occurrence lines after their edges land.
     // #299 F2: remap dst ids through the unification alias map so a site never
     // points at a SCIP node that unification dropped.
-    let resolved_sites = remap_resolved_sites(resolved_sites, &alias_map);
-    if let Err(e) = s.record_edge_sites(&resolved_sites) {
+    // #757: split field-access occurrences from calls before remap+write.
+    let (call_sites, field_sites) = split_field_sites(&resolved, resolved_sites);
+    let call_sites = remap_resolved_sites(call_sites, &alias_map);
+    let field_sites = remap_resolved_sites(field_sites, &alias_map);
+    if let Err(e) = s.record_edge_sites(&call_sites) {
         tracing::warn!("recording cross-crate edge_sites: {e:#}");
+    }
+    if let Err(e) = s.record_field_sites(&field_sites) {
+        tracing::warn!("recording field-access edge_sites: {e:#}");
     }
     // E1: reconcile edge languages to their endpoints (label-only).
     if let Err(e) = s.reconcile_edge_languages() {
@@ -4452,6 +4590,211 @@ mod tests {
             "method call must not resolve to an unrelated free function: {edges:?}"
         );
         assert!(sites.is_empty());
+    }
+
+    // ── #757: field-access reference resolution ──────────────────────────
+
+    /// Resolve a single field-access `UnresolvedCall` (`method:Store.f` reads
+    /// `field:conn` with the given recovered receiver type) against `store`.
+    /// The caller node must already be seeded in `store` for its path/language.
+    fn resolve_one_field_ref(
+        store: &SqliteStore,
+        recv_type: Option<&str>,
+    ) -> (
+        Vec<travsr_core::Edge>,
+        Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
+    ) {
+        use travsr_core::{Node, VName};
+        let caller = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "method:Store.f",
+            ),
+            "method",
+        );
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "field:conn".to_string(),
+            alt_callee_sig: None,
+            hint_crate: None,
+            caller_line: 9,
+            is_method_call: false,
+            recv_type: recv_type.map(str::to_string),
+        }];
+        resolve_unresolved_calls(
+            store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        )
+    }
+
+    #[test]
+    fn field_ref_resolves_to_exact_field_node() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "method:Store.f",
+            ),
+            "method",
+        );
+        store.put_node(&caller).unwrap();
+        let field = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "field:Store.conn",
+            ),
+            "field",
+        );
+        store.put_node(&field).unwrap();
+
+        let (edges, sites) = resolve_one_field_ref(&store, Some("Store"));
+        assert_eq!(edges.len(), 1, "one field ref edge: {edges:?}");
+        assert_eq!(edges[0].src, caller.id);
+        assert_eq!(edges[0].dst, field.id);
+        assert_eq!(
+            edges[0].kind,
+            travsr_core::EdgeKind::RefField,
+            "field read must be ref/field, never ref/call"
+        );
+        assert_eq!(sites, vec![(caller.id, field.id, 9)]);
+    }
+
+    #[test]
+    fn field_ref_without_recv_type_fails_closed() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "method:Store.f",
+            ),
+            "method",
+        );
+        store.put_node(&caller).unwrap();
+        let field = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "field:Store.conn",
+            ),
+            "field",
+        );
+        store.put_node(&field).unwrap();
+
+        let (edges, sites) = resolve_one_field_ref(&store, None);
+        assert!(edges.is_empty(), "no recv_type → no edge: {edges:?}");
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn field_ref_absent_field_node_fails_closed() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "method:Store.f",
+            ),
+            "method",
+        );
+        store.put_node(&caller).unwrap();
+        // No `field:Store.conn` node seeded → the exact lookup misses.
+        let (edges, sites) = resolve_one_field_ref(&store, Some("Store"));
+        assert!(edges.is_empty(), "missing field node → no edge: {edges:?}");
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn field_ref_ambiguous_signature_fails_closed() {
+        // #757 re-review (CO-A1): a field read carries no crate hint, so an
+        // ambiguous `field:{T}.{name}` signature is not evidence of its target.
+        // `nodes_by_signatures` matches by signature alone, so two distinct
+        // types both named `Config` yield two `field:Config.active` nodes; the
+        // language filter and `call_target_reachable` cannot separate two
+        // same-language, same-crate candidates. Emitting an edge per candidate
+        // would fabricate a use-site onto each — the exact route the call
+        // path's CO-A1 gate exists to close. Fail closed unless exactly one
+        // candidate survives.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "method:Store.f",
+            ),
+            "method",
+        );
+        store.put_node(&caller).unwrap();
+        // Two `Config` types in the same crate, different files → two distinct
+        // field nodes sharing the signature `field:Config.active`, both
+        // reachable from and same-language as the caller.
+        for p in ["crates/crate-a/src/one.rs", "crates/crate-a/src/two.rs"] {
+            let field = Node::new(
+                VName::new("", "", p, "rust", "field:Config.active"),
+                "field",
+            );
+            store.put_node(&field).unwrap();
+        }
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "field:active".to_string(),
+            alt_callee_sig: None,
+            hint_crate: None,
+            caller_line: 9,
+            is_method_call: false,
+            recv_type: Some("Config".to_string()),
+        }];
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "ambiguous field signature must fabricate no edge: {edges:?}"
+        );
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn split_field_sites_partitions_by_ref_field_edges() {
+        use travsr_core::{Edge, EdgeKind, NodeId};
+        let (a, b, c, d) = (NodeId(1), NodeId(2), NodeId(3), NodeId(4));
+        let edges = vec![
+            Edge::new(a, b, EdgeKind::RefCall),
+            Edge::new(a, c, EdgeKind::RefField),
+        ];
+        let sites = vec![(a, b, 10), (a, c, 20), (a, d, 30)];
+        let (calls, fields) = split_field_sites(&edges, sites);
+        // b is a call target, c is a field; d has no field edge → treated as call.
+        assert_eq!(calls, vec![(a, b, 10), (a, d, 30)]);
+        assert_eq!(fields, vec![(a, c, 20)]);
     }
 
     #[test]

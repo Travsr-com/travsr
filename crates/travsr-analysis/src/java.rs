@@ -24,6 +24,7 @@ const QUERIES: &str = r#"
 (annotation_type_declaration name: (identifier) @annotation.name)
 (method_declaration name: (identifier) @method.name)
 (constructor_declaration name: (identifier) @constructor.name)
+(field_declaration declarator: (variable_declarator name: (identifier) @field.name))
 (import_declaration) @import
 "#;
 
@@ -199,6 +200,35 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         }
                     }
                 }
+                "field.name" => {
+                    // #757: fields → owner-qualified `field:Type.name` contained
+                    // by their type (collision-free per Invariant #1). Locals use
+                    // `local_variable_declaration`, not `field_declaration`, so
+                    // this only fires for real members. A `field_declaration`
+                    // never appears outside a type body; if `java_enclosing_type`
+                    // somehow returns `None`, the field is dropped rather than
+                    // leaked to the file as an unqualified collision.
+                    if let Some((prefix, ty)) = java_enclosing_type(cap.node, &source) {
+                        let vn = VName::new(
+                            corpus,
+                            "",
+                            vname_path,
+                            "java",
+                            format!("field:{ty}.{text}"),
+                        );
+                        let parent =
+                            VName::new(corpus, "", vname_path, "java", format!("{prefix}:{ty}"))
+                                .id();
+                        push(
+                            &mut nodes,
+                            &mut edges,
+                            Node::new(vn, "field")
+                                .with_line(line)
+                                .with_end_line(end_line),
+                            parent,
+                        );
+                    }
+                }
                 "constructor.name" => {
                     let (sig, parent) = match java_enclosing_type(cap.node, &source) {
                         Some((prefix, ty)) => (
@@ -367,6 +397,60 @@ mod tests {
         assert!(kinds.contains(&"constructor"));
         assert!(kinds.contains(&"import"));
         assert!(out.ffi_markers.is_empty(), "no JNI markers in pure Java");
+    }
+
+    #[test]
+    fn fields_emit_owner_qualified_nodes_and_containment() {
+        // #757: instance/static fields → `field:Owner.name` contained by the
+        // type; multi-declarator `int a, b;` emits one field per name; a local
+        // variable inside a method is NOT a field.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Model.java");
+        std::fs::write(
+            &path,
+            "public class Model {\n\
+             \x20 private int count;\n\
+             \x20 static String a, b;\n\
+             \x20 void m() { int local = 1; }\n\
+             }\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "Model.java").unwrap();
+        let field_sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "field")
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(
+            field_sigs.contains(&"field:Model.count"),
+            "got {field_sigs:?}"
+        );
+        assert!(field_sigs.contains(&"field:Model.a"), "got {field_sigs:?}");
+        assert!(field_sigs.contains(&"field:Model.b"), "got {field_sigs:?}");
+        assert!(
+            !field_sigs.iter().any(|s| s.contains("local")),
+            "local variable must not be a field, got {field_sigs:?}"
+        );
+
+        let class_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "class:Model")
+            .unwrap()
+            .id;
+        let count_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "field:Model.count")
+            .unwrap()
+            .id;
+        assert!(
+            out.edges.iter().any(|e| e.src == class_id
+                && e.dst == count_id
+                && e.kind == EdgeKind::DefinesBinding),
+            "field must be contained by its class"
+        );
     }
 
     #[test]

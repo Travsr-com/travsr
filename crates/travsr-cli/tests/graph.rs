@@ -115,9 +115,12 @@ fn test_graph_cli_ambiguous_2_to_20() {
         .failure();
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-    assert!(stderr.contains(
-        "'processPayment' is ambiguous — 2 definitions. Re-run with a `--path` hint to pick one:"
-    ));
+    assert!(stderr.contains("'processPayment' is ambiguous — 2 definitions."));
+    // #757: the message now also names the exact-signature escape hatch.
+    assert!(
+        stderr.contains("exact signatures listed below (e.g. `fn:processPayment`)"),
+        "ambiguity message must name the exact-signature escape hatch: {stderr}"
+    );
     assert!(stderr.contains("fn:processPayment (function) — file_a.ts:1"));
     assert!(stderr.contains("fn:processPayment (function) — file_b.ts:1"));
     assert!(stderr.contains("ambiguous symbol query"));
@@ -137,9 +140,8 @@ fn test_graph_cli_ambiguous_at_limit_20() {
         .failure();
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-    assert!(stderr.contains(
-        "'processPayment' is ambiguous — 20 definitions. Re-run with a `--path` hint to pick one:"
-    ));
+    assert!(stderr.contains("'processPayment' is ambiguous — 20 definitions."));
+    assert!(stderr.contains("exact signatures listed below (e.g. `fn:processPayment`)"));
     assert_eq!(definition_lines(&stderr), 20);
     assert!(
         !stderr.contains("[truncated:"),
@@ -165,10 +167,10 @@ fn test_graph_cli_ambiguous_one_over_limit_21() {
         .failure();
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-    assert!(stderr.contains(
-        "'processPayment' is ambiguous — showing 20 of at least 21 definitions. \
-         Re-run with a `--path` hint to pick one:"
-    ));
+    assert!(
+        stderr.contains("'processPayment' is ambiguous — showing 20 of at least 21 definitions.")
+    );
+    assert!(stderr.contains("exact signatures listed below"));
     assert_eq!(definition_lines(&stderr), 20);
     assert!(stderr.contains("[truncated: additional filtering/narrowing is required]"));
     assert!(stderr.contains("ambiguous symbol query"));
@@ -187,10 +189,10 @@ fn test_graph_cli_ambiguous_more_than_20() {
         .failure();
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-    assert!(stderr.contains(
-        "'processPayment' is ambiguous — showing 20 of at least 22 definitions. \
-         Re-run with a `--path` hint to pick one:"
-    ));
+    assert!(
+        stderr.contains("'processPayment' is ambiguous — showing 20 of at least 22 definitions.")
+    );
+    assert!(stderr.contains("exact signatures listed below"));
     assert_eq!(definition_lines(&stderr), 20);
     assert!(stderr.contains("[truncated: additional filtering/narrowing is required]"));
     assert!(stderr.contains("ambiguous symbol query"));
@@ -393,9 +395,64 @@ fn test_graph_cli_still_ambiguous_path() {
         .failure();
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-    assert!(stderr.contains(
-        "'processPayment' is ambiguous — 2 definitions. Re-run with a `--path` hint to pick one:"
-    ));
+    assert!(stderr.contains("'processPayment' is ambiguous — 2 definitions."));
+    assert!(stderr.contains("exact signatures listed below"));
     assert!(stderr.contains("fn:processPayment (function) — subdir1/file.ts:1"));
     assert!(stderr.contains("fn:processPayment (function) — subdir2/file.ts:1"));
+}
+
+/// #757: a struct and its own impl block live in ONE file, so `--path` cannot
+/// disambiguate them. The message must name the exact-signature escape hatch,
+/// and re-running with `struct:Name` must resolve uniquely (Tier-1 exact match).
+#[test]
+fn test_graph_cli_same_file_struct_vs_impl_resolves_by_signature() {
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(
+        tmp.path().join("cfg.rs"),
+        "pub struct LangConfig {\n    pub name: String,\n}\n\
+         impl LangConfig {\n    pub fn new() -> Self {\n        \
+         LangConfig { name: String::new() }\n    }\n}\n",
+    )
+    .unwrap();
+    for args in [&["add", "-A"][..], &["commit", "-qm", "init"][..]] {
+        StdCommand::new("git")
+            .args(args)
+            .current_dir(tmp.path())
+            .status()
+            .expect("git");
+    }
+    Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .current_dir(tmp.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    // Bare name is ambiguous (struct + impl, same path) and points at the
+    // exact-signature escape hatch.
+    let ambiguous = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .current_dir(tmp.path())
+        .args(["graph", "LangConfig", "--direction", "both"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&ambiguous.get_output().stderr);
+    assert!(stderr.contains("is ambiguous"), "got: {stderr}");
+    assert!(
+        stderr.contains("exact signatures listed below (e.g. `struct:LangConfig`)")
+            || stderr.contains("exact signatures listed below (e.g. `impl:LangConfig`)"),
+        "must name a re-runnable exact signature: {stderr}"
+    );
+
+    // The exact signature resolves uniquely (documented escape hatch).
+    Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .current_dir(tmp.path())
+        .args(["graph", "struct:LangConfig", "--direction", "both"])
+        .assert()
+        .success();
 }

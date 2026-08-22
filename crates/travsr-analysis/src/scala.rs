@@ -16,6 +16,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (trait_definition name: (_) @trait.name)
 (function_definition name: (_) @fn.name)
 (type_definition name: (type_identifier) @typedef.name)
+(template_body (val_definition pattern: (identifier) @field.name))
+(template_body (var_definition pattern: (identifier) @field.name))
 (import_declaration) @import
 (function_definition
   (annotation name: (type_identifier) @_sa)
@@ -28,6 +30,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("trait.name", "trait", "class"),
         ("fn.name", "function", "fn"),
         ("typedef.name", "type", "type"),
+        // #757: class/object/trait `val`/`var` members → `field:Owner.name`.
+        // Anchored to `template_body` so local `val`s in method bodies are not
+        // captured.
+        ("field.name", "field", "field"),
         ("import", "import", "import"),
     ],
     method_containers: &[

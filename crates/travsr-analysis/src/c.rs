@@ -16,6 +16,9 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (enum_specifier name: (type_identifier) @enum.name)
 (type_definition declarator: (type_identifier) @typedef.name)
 (function_declarator declarator: (identifier) @fn.name)
+(field_declaration declarator: (field_identifier) @field.name)
+(field_declaration declarator: (pointer_declarator declarator: (field_identifier) @field.name))
+(field_declaration declarator: (array_declarator declarator: (field_identifier) @field.name))
 (preproc_def name: (identifier) @macro.name)
 (preproc_function_def name: (identifier) @macro.name)
 (preproc_include path: (_) @import)
@@ -26,12 +29,25 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("enum.name", "enum", "enum"),
         ("typedef.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
+        // #757: named struct/union members → `field:Owner.name`, contained by
+        // their aggregate. A data member's declarator is a bare `field_identifier`,
+        // or nests one under a `pointer_declarator` (`char* name;`) / `array_declarator`
+        // (`int buf[4];`) — all three are captured. Function-pointer members nest it
+        // under `function_declarator` and are deliberately not captured.
+        ("field.name", "field", "field"),
         // N4e: `#define` object-like and function-like macros as first-class nodes.
         ("macro.name", "macro", "macro"),
         ("import", "import", "import"),
     ],
-    // C has no methods; every `fn` capture is a free function.
-    method_containers: &[],
+    // C has no methods, but its aggregates enclose fields (#757): list the
+    // struct/union nodes so `field` captures owner-qualify. Both are emitted as
+    // `struct:Name` (union.name uses the `struct` prefix above), so both map to
+    // the `struct` container prefix. No `fn` capture is ever nested in these, so
+    // this never turns a free function into a method.
+    method_containers: &[
+        ("struct_specifier", "struct"),
+        ("union_specifier", "struct"),
+    ],
     decl_kinds: &["function_definition"],
     type_refinements: &[],
     get_grammar: || tree_sitter::Language::new(tree_sitter_c::LANGUAGE),
@@ -67,6 +83,66 @@ mod tests {
         assert!(kinds.contains(&"file"), "file node present");
         assert!(kinds.contains(&"struct"), "struct node present");
         assert!(kinds.contains(&"function"), "function node present");
+    }
+
+    #[test]
+    fn named_struct_fields_are_owner_qualified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("named.c");
+        std::fs::write(&path, "struct Point { int x; int y; };\n").unwrap();
+        let out = parse("corp", &path, "named.c").unwrap();
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "field")
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(sigs.contains(&"field:Point.x"), "got {sigs:?}");
+        assert!(sigs.contains(&"field:Point.y"), "got {sigs:?}");
+    }
+
+    #[test]
+    fn anonymous_typedef_struct_fields_qualify_by_typedef_name() {
+        // #757 audit: `typedef struct { .. } Animal;` has an anonymous
+        // struct_specifier, so its fields used to orphan as unqualified
+        // `field:age` (colliding across every such struct). They must qualify
+        // by the typedef name (`field:Animal.age`) and be contained by the
+        // `type:Animal` node the typedef emits.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anon.c");
+        std::fs::write(
+            &path,
+            "typedef struct {\n  char* name;\n  int age;\n} Animal;\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "anon.c").unwrap();
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "field")
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(sigs.contains(&"field:Animal.age"), "got {sigs:?}");
+        assert!(sigs.contains(&"field:Animal.name"), "got {sigs:?}");
+        // Contained by the typedef node that actually exists in the graph.
+        let type_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "type:Animal")
+            .expect("type:Animal node")
+            .id;
+        let field_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "field:Animal.age")
+            .unwrap()
+            .id;
+        assert!(
+            out.edges.iter().any(|e| e.src == type_id
+                && e.dst == field_id
+                && e.kind == travsr_core::EdgeKind::DefinesBinding),
+            "field must be contained by its typedef type node"
+        );
     }
 
     #[test]

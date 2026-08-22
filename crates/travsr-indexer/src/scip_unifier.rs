@@ -168,7 +168,8 @@ fn strip_backticks(s: &str) -> &str {
 ///              `extension:` is deliberately omitted — an extension is not a
 ///              SCIP definition target and must not steal the extended type's
 ///              unification.)
-///   terms:     `var:` `const:` `static:`
+///   terms:     `field:C.n` (owner-qualified field, #757), `var:` `const:`
+///              `static:` (unqualified package/global terms)
 pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
     let name = parsed.name;
     match parsed.kind {
@@ -211,10 +212,22 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
         .iter()
         .map(|p| format!("{p}:{name}"))
         .collect(),
-        "variable" => ["var", "const", "static"]
-            .iter()
-            .map(|p| format!("{p}:{name}"))
-            .collect(),
+        "variable" => {
+            // #757: an owner-qualified field node (`field:Owner.name`, emitted
+            // by every declaration-language Phase A parser) is the most-specific
+            // target for a SCIP field reference (`Type#name.`,
+            // `swift::Type.name`). Try it first when a container is known, then
+            // fall back to the unqualified term prefixes some parsers still emit
+            // for package-level vars/consts.
+            let mut sigs = Vec::with_capacity(4);
+            if let Some(c) = parsed.container {
+                sigs.push(format!("field:{c}.{name}"));
+            }
+            sigs.push(format!("var:{name}"));
+            sigs.push(format!("const:{name}"));
+            sigs.push(format!("static:{name}"));
+            sigs
+        }
         _ => Vec::new(),
     }
 }
@@ -607,6 +620,23 @@ mod tests {
     fn candidates_variable() {
         let sigs = candidate_signatures(&parsed(None, "MAX_LEN", "variable"));
         assert_eq!(sigs, vec!["var:MAX_LEN", "const:MAX_LEN", "static:MAX_LEN"]);
+    }
+
+    #[test]
+    fn candidates_variable_with_container_prefers_field() {
+        // #757: a field reference `Session#name.` must unify onto the
+        // owner-qualified Phase A field node `field:Session.name` first, then
+        // fall back to the unqualified term prefixes.
+        let sigs = candidate_signatures(&parsed(Some("Session"), "name", "variable"));
+        assert_eq!(
+            sigs,
+            vec![
+                "field:Session.name",
+                "var:name",
+                "const:name",
+                "static:name"
+            ]
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (enum_declaration name: (name) @enum.name)
 (function_definition name: (name) @fn.name)
 (method_declaration name: (name) @fn.name)
+(property_declaration (property_element name: (variable_name (name) @field.name)))
 (namespace_use_clause) @import
 (class_declaration
   (base_clause (name) @_pb)
@@ -36,6 +37,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("trait.name", "trait", "trait"),
         ("enum.name", "enum", "enum"),
         ("fn.name", "function", "fn"),
+        // #757: class/interface/trait/enum properties → `field:Owner.name`.
+        ("field.name", "field", "field"),
         ("import", "import", "import"),
     ],
     method_containers: &[

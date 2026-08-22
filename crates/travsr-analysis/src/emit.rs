@@ -22,6 +22,15 @@ pub fn method_node(corpus: &str, path: &str, class_name: &str, method_name: &str
     )
 }
 
+/// #757: a class field / interface member, owner-qualified so two owners with a
+/// same-named member never collide (`field:Owner.name`).
+pub fn field_node(corpus: &str, path: &str, owner_name: &str, field_name: &str) -> Node {
+    Node::new(
+        ts_vname(corpus, path, &format!("field:{owner_name}.{field_name}")),
+        "field",
+    )
+}
+
 pub fn interface_node(corpus: &str, path: &str, iface_name: &str) -> Node {
     Node::new(
         ts_vname(corpus, path, &format!("interface:{iface_name}")),
