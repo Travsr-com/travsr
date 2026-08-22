@@ -28,6 +28,10 @@ out/
 .vscode-test/
 .vscode/
 
+# Python (travsrAutomation is stdlib-only; bytecode is never committed)
+__pycache__/
+*.py[cod]
+
 # Editor / OS
 .idea/
 .DS_Store

@@ -6,7 +6,22 @@ on:
       - master
       - main
   pull_request:
+  # A published release is the only time the release-artifact sanity job has
+  # something to download, so it is a trigger here rather than in a separate
+  # workflow. The other jobs run too, which is a few extra runner minutes once
+  # per release; `preflight` in release.yml already required them green on the
+  # tagged commit, so treat it as confirmation rather than new signal.
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      sanity_tag:
+        description: 'Release tag to verify with the sanity suite (e.g. v1.0.0-rc.1). Leave blank to skip.'
+        required: false
+      sanity_with_cpp:
+        description: 'Sanity: also exercise c/c++ (needs the scip-clang sidecar on the runner)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -161,6 +176,151 @@ jobs:
       - uses: actions/checkout@v4
       - name: verify plugin source hashes (ADR-017 Rule 5)
         run: bash .github/scripts/check-plugin-hashes.sh
+
+  automation-selftest:
+    name: automation self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Stdlib only and no travsr binary, so this costs seconds and can gate every
+      # PR. It guards the harness itself, which has had real bugs: a corpus name
+      # scraped with a stray backtick that was written to the caller's own config,
+      # and a state-dependent skip that silently disabled every c/c++ check on the
+      # machines that had run it most. A checker whose failures are silent is worse
+      # than no checker.
+      - name: travsrAutomation self-test
+        run: python3 travsrAutomation/selftest.py
+
+  automation-regression:
+    name: automation regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: automation-regression
+
+      # Debug, not release: this indexes a 7-file fixture, so compile time
+      # dominates and a release build would roughly double the job for no signal.
+      - name: Build travsr
+        run: cargo build -p travsr-cli --bin travsr
+
+      # No --with-cpp: c/c++ need the scip-clang sidecar, which is not installed
+      # on a runner. The suite reports those as SKIP rather than passing them
+      # silently, which is why --strict-skip is not used here.
+      #
+      # Native Phase B (rust, typescript, python) needs no sidecar, so the
+      # cross-language and honesty phases are real coverage on a bare runner.
+      - name: Run the regression suite
+        run: |
+          python3 travsrAutomation/run.py \
+            --binary target/debug/travsr \
+            --json sanity.json \
+            --junit sanity.xml
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: automation-regression-results
+          path: |
+            sanity.json
+            sanity.xml
+          if-no-files-found: warn
+
+  automation-sanity:
+    name: automation sanity (${{ matrix.os }})
+    # Only when there is a published artifact to check: a release event, or a
+    # dispatch that named a tag. Skipped on every push and pull request, because
+    # `--tag` has nothing to download there.
+    if: github.event_name == 'release' || github.event.inputs.sanity_tag != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both, deliberately. The functional phases only ever execute the host's
+        # own binary, so a single runner would leave the other platform's artifact
+        # verified by byte inspection alone.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every `${{ }}` below is bound through `env:` rather than interpolated
+      # into the script body. GitHub substitutes those expressions into the shell
+      # source before bash ever parses it, so a dispatch input or a tag name of
+      # the form `x"; curl ... | sh; #` would execute as script, not data, in a
+      # job that runs `gh` with a repo token. `set -euo pipefail` is no defence:
+      # the injected text IS the script.
+      - name: Resolve the tag under test
+        id: t
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.sanity_tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$RELEASE_TAG}"
+          [ -n "$TAG" ] || { echo "no tag to verify" >&2; exit 1; }
+          # A tag is a git ref, so anything outside this set is not one, and
+          # rejecting it here keeps the value from reaching `gh` at all.
+          case "$TAG" in
+            *[!A-Za-z0-9._/-]*) echo "refusing tag with unexpected characters: $TAG" >&2; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "verifying $TAG"
+
+      # Downloads the release with `gh`, which is preinstalled on hosted runners.
+      #
+      # No --strict-skip: cosign and the c/c++ sidecars are legitimately absent on
+      # a bare runner, and the suite lists every skip in its summary rather than
+      # folding one into a pass, so failing on those would make this red for
+      # reasons that are not about the release.
+      - name: Sanity suite against the published artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SANITY_TAG: ${{ steps.t.outputs.tag }}
+          WITH_CPP: ${{ github.event.inputs.sanity_with_cpp }}
+          OS_LABEL: ${{ matrix.os }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [ "$WITH_CPP" = "true" ]; then
+            EXTRA="--with-cpp"
+          fi
+          python3 travsrAutomation/run.py \
+            --tag "$SANITY_TAG" \
+            $EXTRA \
+            --json "sanity-$OS_LABEL.json" \
+            --junit "sanity-$OS_LABEL.xml"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: automation-sanity-${{ matrix.os }}
+          path: |
+            sanity-${{ matrix.os }}.json
+            sanity-${{ matrix.os }}.xml
+          if-no-files-found: warn
+
+      # A published release that fails this is worth surfacing beyond a red check,
+      # since by then users can already download it.
+      - name: Summarise
+        if: always()
+        shell: bash
+        env:
+          OS_LABEL: ${{ matrix.os }}
+        run: |
+          F="sanity-$OS_LABEL.json"
+          if [ ! -f "$F" ]; then
+            echo "### Release sanity produced no results on $OS_LABEL" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 travsrAutomation/summarise.py "$F" "$OS_LABEL" >> "$GITHUB_STEP_SUMMARY"
 
   build-id:
     name: release build id
