@@ -80,9 +80,22 @@ pub enum EmbedCommand {
     /// Activates the backend on success.
     Init {
         /// Backend ID to install (run `travsr embed list` to see options).
-        /// Defaults to the first catalog entry (currently bge-small-en-v1.5).
+        /// Without this, an interactive terminal prompts; `--yes` picks the
+        /// recommended default instead.
         #[arg(long)]
         backend: Option<String>,
+        // #755 Part B item 8. The doc comment below is rendered verbatim by clap
+        // into `embed init --help`, so it carries no issue number and no internal
+        // vocabulary — only what a user needs to decide whether to pass the flag.
+        // The reason it exists: the backend menu was the only thing standing
+        // between a script and a working embedding install, and there was no way
+        // to answer it non-interactively.
+        /// Install the recommended embedding model without prompting.
+        ///
+        /// Use this in scripts and CI, where there is no terminal to answer the
+        /// model menu. `--backend` still wins when both are given.
+        #[arg(long, visible_alias = "no-interactive")]
+        yes: bool,
         /// Re-download even if already installed.
         #[arg(long)]
         reinstall: bool,
@@ -202,6 +215,7 @@ pub fn run(cmd: EmbedCommand) -> Result<()> {
         EmbedCommand::List { json } => cmd_list(json),
         EmbedCommand::Init {
             backend,
+            yes,
             reinstall,
             capacity,
             jobs,
@@ -212,7 +226,7 @@ pub fn run(cmd: EmbedCommand) -> Result<()> {
                 max_workers: jobs,
                 priority: priority.map(Into::into),
             };
-            cmd_init(backend.as_deref(), reinstall, overrides)
+            cmd_init(backend.as_deref(), yes, reinstall, overrides)
         }
         EmbedCommand::Reindex {
             db,
@@ -287,6 +301,43 @@ fn cmd_calibrate(db_override: Option<PathBuf>) -> Result<()> {
 
 // ── list ──────────────────────────────────────────────────────────────────────
 
+/// Which config layer decided the active embedding model, and what the other
+/// layer holds when the two disagree (#755 Part B item 7).
+#[derive(Debug, PartialEq, Eq)]
+struct ActiveLayer<'a> {
+    /// `"repo"`, `"machine-default"`, or `"none"`.
+    source: &'static str,
+    /// The machine default, only when a repo setting is overriding a *different*
+    /// one. `None` when they agree or when only one layer is set — a footnote
+    /// explaining a divergence that does not exist is noise.
+    overridden: Option<&'a str>,
+}
+
+/// Classify the active-model resolution so `embed list` can name its source.
+///
+/// `embed list` and `embed status` resolve identically (repo wins over the
+/// machine default, #482/#483), but `list` marked a row "active" without saying
+/// which layer that came from. Running `list` outside a repo and `status` inside
+/// one then named two different models with nothing on screen to explain it —
+/// which is what #755 Part B item 7 reports as the two commands "disagreeing".
+/// `status` already spells the divergence out in words; this is the same fact,
+/// computed once and testable without a repo on disk.
+fn active_layer<'a>(repo: Option<&'a str>, global: Option<&'a str>) -> ActiveLayer<'a> {
+    ActiveLayer {
+        source: if repo.is_some() {
+            "repo"
+        } else if global.is_some() {
+            "machine-default"
+        } else {
+            "none"
+        },
+        overridden: match (repo, global) {
+            (Some(r), Some(g)) if r != g => Some(g),
+            _ => None,
+        },
+    }
+}
+
 fn cmd_list(json: bool) -> Result<()> {
     // Same resolution `status` uses (repo config wins over the machine
     // default) so the two surfaces can never name different active models
@@ -297,7 +348,11 @@ fn cmd_list(json: bool) -> Result<()> {
         .and_then(|c| crate::repo::find_git_root(c).ok());
     let repo_active_id = repo_root.and_then(|r| travsr_plugin_host::repo_backend_id(&r));
     let global_id = load_config().and_then(|c| c.active);
-    let active = repo_active_id.or(global_id);
+    let active = repo_active_id.clone().or(global_id.clone());
+    let ActiveLayer {
+        source: active_source,
+        overridden,
+    } = active_layer(repo_active_id.as_deref(), global_id.as_deref());
 
     if json {
         let entries: Vec<String> = embed_backends()
@@ -306,7 +361,7 @@ fn cmd_list(json: bool) -> Result<()> {
                 let installed = model_files_installed(b);
                 let is_active = active.as_deref() == Some(b.id.as_str());
                 format!(
-                    r#"{{"id":"{}","description":"{}","dim":{},"params_m":{},"mteb":{:.1},"ram_mb":{},"download_mb":{},"installed":{},"active":{}}}"#,
+                    r#"{{"id":"{}","description":"{}","dim":{},"params_m":{},"mteb":{:.1},"ram_mb":{},"download_mb":{},"installed":{},"active":{},"activeSource":"{}","machineDefault":{}}}"#,
                     b.id,
                     b.description,
                     b.output_dim(),
@@ -315,7 +370,16 @@ fn cmd_list(json: bool) -> Result<()> {
                     b.ram_mb,
                     b.model_files.iter().map(|f| f.size_hint_mb).sum::<u32>(),
                     installed,
-                    is_active
+                    is_active,
+                    if is_active { active_source } else { "none" },
+                    // #755 review: unlike every other value on this line, this one
+                    // is read back out of a config file the user edits by hand, so a
+                    // quote, a backslash or a control character in it would emit
+                    // JSON no consumer can parse. Shares `lang.rs`'s escaper rather
+                    // than growing a second, weaker one here.
+                    global_id
+                        .as_deref()
+                        .map_or("null".to_string(), crate::lang::json_str)
                 )
             })
             .collect();
@@ -332,7 +396,7 @@ fn cmd_list(json: bool) -> Result<()> {
         let installed = model_files_installed(b);
         let is_active = active.as_deref() == Some(b.id.as_str());
         let status = if installed && is_active {
-            format!("\u{2713} active  {}", b.description)
+            format!("\u{2713} active ({active_source})  {}", b.description)
         } else if installed {
             format!("installed  {}", b.description)
         } else {
@@ -360,13 +424,51 @@ fn cmd_list(json: bool) -> Result<()> {
             status,
         );
     }
+    // #755 Part B item 7: the same explanation `embed status` prints, so the two
+    // surfaces cannot be read as disagreeing about which model is active. Only
+    // when they actually diverge — a matching pair needs no footnote.
+    if let Some(g) = overridden {
+        println!();
+        println!(
+            "This repo's setting wins for retrieval; the machine default is '{g}'. \
+             `travsr embed status` reports the same pair."
+        );
+    } else if active_source == "machine-default" && repo_root_present() {
+        println!();
+        println!(
+            "Active here is the machine default — this repo has no embedding model \
+             configured. Run `travsr embed init` inside it to set one."
+        );
+    }
     Ok(())
+}
+
+/// The backend `--yes` installs (#755 Part B item 8): the first catalog entry,
+/// which is the one the catalog orders as the recommended default and the one
+/// `--backend`'s help has always named. Errors rather than panicking on an empty
+/// catalog — a build with no embedding backends is a build error, not a crash the
+/// user should see.
+fn recommended_embed_backend() -> Result<&'static EmbedBackend> {
+    embed_backends()
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no embedding backends are available in this build"))
+}
+
+/// Whether the caller is inside a git repo, for the `embed list` footnote above.
+/// Separate from the resolution path so the footnote can distinguish "no repo
+/// setting" from "no repo at all" without re-plumbing `cmd_list`'s locals.
+fn repo_root_present() -> bool {
+    std::env::current_dir()
+        .ok()
+        .and_then(|c| crate::repo::find_git_root(&c).ok())
+        .is_some()
 }
 
 // ── init ──────────────────────────────────────────────────────────────────────
 
 fn cmd_init(
     backend_id: Option<&str>,
+    yes: bool,
     reinstall: bool,
     mut overrides: travsr_plugin_host::EmbedOverrides,
 ) -> Result<()> {
@@ -376,17 +478,35 @@ fn cmd_init(
         Some(id) => lookup_embed_backend(id).ok_or_else(|| {
             anyhow::anyhow!("Unknown backend '{id}'. Run `travsr embed list` to see options.")
         })?,
+        // #755 Part B item 8: `--yes` answers the menu with the recommended entry
+        // — the first in the catalog, which is also what the `--backend` help has
+        // always named as the default. This is the one path that lets a script or
+        // CI job finish an embedding install.
+        None if yes => recommended_embed_backend()?,
         None => {
             use std::io::IsTerminal as _;
             if !std::io::stdin().is_terminal() {
-                // Non-interactive: list and exit without selecting.
-                println!("Available embedding models (run with --backend <id> to install):\n");
+                // #755 Part B item 8: this used to print the menu and return
+                // `Ok(())`. Nothing was installed, but the exit code said success,
+                // so a CI step "passed" with embeddings still off — the failure
+                // only surfaced later as an empty semantic search. Name the two
+                // ways to answer the menu and fail, so the script stops here.
+                let mut msg = String::from(
+                    "`embed init` needs a backend chosen, and this shell is not \
+                     interactive so the menu cannot be answered.\n\n\
+                     Pick one:\n  \
+                     travsr embed init --yes                 # install the recommended model\n  \
+                     travsr embed init --backend <id>        # install a specific model\n\n\
+                     Available models:\n",
+                );
                 for b in embed_backends() {
                     let dl_mb: u32 = b.model_files.iter().map(|f| f.size_hint_mb).sum();
-                    println!("  {}  ({} MB download)", b.id, dl_mb);
-                    println!("  {}\n", b.description);
+                    msg.push_str(&format!(
+                        "  {}  ({} MB download) — {}\n",
+                        b.id, dl_mb, b.description
+                    ));
                 }
-                return Ok(());
+                anyhow::bail!(msg);
             }
             match pick_backend_interactive()? {
                 Some(b) => b,
@@ -2530,5 +2650,130 @@ mod accel_tests {
     #[test]
     fn a_sidecar_that_cannot_answer_is_not_reinstalled() {
         assert!(!wants_upgrade(true, None));
+    }
+}
+
+/// #755 Part B items 7 and 8: what `embed list` says about where "active" came
+/// from, and what `embed init` does when nobody can answer its menu.
+#[cfg(test)]
+mod issue_755_tests {
+    use super::*;
+
+    // ── item 7: `embed list` and `embed status` must not read as disagreeing ──
+
+    /// The reported case: a repo pins one model while the machine default is
+    /// another. `list` used to mark a row "active" with nothing saying which
+    /// layer won, so it looked like it contradicted `status`.
+    #[test]
+    fn a_repo_setting_that_overrides_the_machine_default_is_named_as_such() {
+        let got = active_layer(Some("bge-small-en-v1.5"), Some("arctic-embed-m-v1.5"));
+        assert_eq!(got.source, "repo");
+        assert_eq!(
+            got.overridden,
+            Some("arctic-embed-m-v1.5"),
+            "the value the other layer holds must be nameable, so the footnote can \
+             say what `status` says"
+        );
+    }
+
+    /// Both layers agreeing is the common case and needs no footnote — an
+    /// explanation of a divergence that does not exist is noise.
+    #[test]
+    fn matching_layers_report_the_repo_and_no_divergence() {
+        let got = active_layer(Some("bge-small-en-v1.5"), Some("bge-small-en-v1.5"));
+        assert_eq!(got.source, "repo");
+        assert_eq!(got.overridden, None);
+    }
+
+    /// Outside a repo (or in a repo with no embedding config) the machine
+    /// default IS the answer — and saying so is exactly what stops it from
+    /// being read as this repo's setting.
+    #[test]
+    fn with_no_repo_setting_the_machine_default_is_named_as_the_source() {
+        let got = active_layer(None, Some("arctic-embed-m-v1.5"));
+        assert_eq!(got.source, "machine-default");
+        assert_eq!(
+            got.overridden, None,
+            "nothing is being overridden when only one layer is set"
+        );
+    }
+
+    /// A repo setting with no machine default at all: still the repo's, still
+    /// nothing overridden.
+    #[test]
+    fn a_repo_setting_with_no_machine_default_reports_repo() {
+        let got = active_layer(Some("bge-small-en-v1.5"), None);
+        assert_eq!(got.source, "repo");
+        assert_eq!(got.overridden, None);
+    }
+
+    /// Neither layer set: no model is active, and no layer may be credited for
+    /// one. This is the row-marking input that must never print "active".
+    #[test]
+    fn no_configuration_anywhere_reports_none() {
+        let got = active_layer(None, None);
+        assert_eq!(got.source, "none");
+        assert_eq!(got.overridden, None);
+    }
+
+    // ── item 8: `embed init` must be answerable without a terminal ────────────
+
+    /// #755 review: `machineDefault` is the only value on the `embed list --json`
+    /// row that comes from a file the user edits by hand, so it must go through
+    /// full JSON escaping. Raw interpolation made a quote or a control character
+    /// in the config's `active` key emit output no consumer can parse.
+    #[test]
+    fn the_machine_default_is_json_escaped() {
+        use crate::lang::json_str;
+        // The exact hostile shapes a hand-edited config can hold.
+        assert_eq!(json_str(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(json_str(r"a\b"), r#""a\\b""#);
+        assert_eq!(json_str("a\nb"), r#""a\nb""#);
+        assert_eq!(json_str("a\u{01}b"), r#""a\u0001b""#);
+        // And the output stays parseable when embedded in the row.
+        let row = format!(r#"{{"machineDefault":{}}}"#, json_str("we\"ird\\model\n"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&row).expect("an escaped row must still parse");
+        assert_eq!(parsed["machineDefault"], "we\"ird\\model\n");
+    }
+
+    /// An absent machine default is JSON `null`, not the string "null" — a
+    /// consumer distinguishing "unset" from a model literally named null needs
+    /// that. Guards the `map_or` branch the escaper now sits behind.
+    #[test]
+    fn an_absent_machine_default_is_json_null() {
+        let global: Option<&str> = None;
+        let rendered = global.map_or("null".to_string(), crate::lang::json_str);
+        let row = format!(r#"{{"machineDefault":{rendered}}}"#);
+        let parsed: serde_json::Value = serde_json::from_str(&row).unwrap();
+        assert!(parsed["machineDefault"].is_null());
+    }
+
+    /// `--yes` has to resolve to a real catalog entry or the flag is a dead end.
+    #[test]
+    fn yes_resolves_to_the_first_catalog_entry() {
+        let picked = recommended_embed_backend().expect("catalog must not be empty");
+        assert_eq!(
+            picked.id,
+            embed_backends()[0].id,
+            "`--yes` must install the recommended entry, which is the one the \
+             `--backend` help names as the default"
+        );
+    }
+
+    /// The recommended entry must be installable, not just present: `--yes`
+    /// promising an install that cannot download anything is the same dead end
+    /// as the menu it replaces.
+    #[test]
+    fn the_recommended_backend_has_model_files_to_download() {
+        let picked = recommended_embed_backend().expect("catalog must not be empty");
+        assert!(
+            !picked.model_files.is_empty(),
+            "the recommended backend must declare model files to fetch"
+        );
+        assert!(
+            !picked.id.is_empty() && !picked.description.is_empty(),
+            "the recommended backend must be nameable in output"
+        );
     }
 }

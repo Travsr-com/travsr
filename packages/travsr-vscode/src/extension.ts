@@ -37,7 +37,13 @@ import {
   EVT_MCP_INVOKED,
   EVT_DAEMON_FAILED,
 } from "./telemetry";
-import { registerParityCommands, refreshOpenPanels, stripEnvelope } from "./commands";
+import {
+  registerParityCommands,
+  refreshOpenPanels,
+  stripEnvelope,
+  probeLangListContract,
+  contractSkewMessage,
+} from "./commands";
 import { ContextExplorerPanel, getSymbolAtCursor } from "./contextExplorer";
 import { registerMcpServerCommand } from "./mcpRegister";
 import { registerContextCodeAction } from "./contextCodeAction";
@@ -574,6 +580,14 @@ async function checkBinaryAndPrompt(
   if (configured && configured !== "travsr" && fs.existsSync(configured)) {
     try {
       assertExecutableBinary(configured);
+      // #755: no contract probe here. `lang list --json` sweeps PATH for every
+      // catalog entry and takes seconds, and this branch runs on EVERY
+      // activation once a path is persisted — paying that at startup forever, to
+      // re-learn a fact about a binary the user chose themselves, is the wrong
+      // trade. The steps below probe because each of them runs at most once (they
+      // persist the path they picked, so the next activation lands here), and the
+      // Languages panel re-checks the shape from the payload it already fetches,
+      // which covers this branch at no extra cost.
       return; // valid — nothing to do
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -597,6 +611,7 @@ async function checkBinaryAndPrompt(
   const installPath = resolveInstallPath(resolveInstallDir());
   if (fs.existsSync(installPath)) {
     await adoptBinary(installPath, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
+    await warnIfContractSkewed(installPath, channel);
     return;
   }
 
@@ -606,10 +621,15 @@ async function checkBinaryAndPrompt(
   //    absolute path, persist it, and reconnect (same pattern as step 2).
   //    resolveOnPath prefers .exe hits and skips .cmd/.bat shims; shim-only
   //    installs fall through to the npm-shim resolution in step 4 (#486).
+  //    #755: PATH is where a stale npm-bundled binary gets picked up. Adopt it
+  //    (structural indexing and search work fine on it), then say plainly that
+  //    it is behind — auto-detection landing on an older binary silently is the
+  //    reported bug, not the adoption itself.
   const onPath = resolveOnPath("travsr");
   if (onPath) {
     channel.appendLine(`Resolved travsr on PATH: ${onPath}`);
     await adoptBinary(onPath, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
+    await warnIfContractSkewed(onPath, channel);
     return;
   }
 
@@ -624,6 +644,9 @@ async function checkBinaryAndPrompt(
       void vscode.window.showInformationMessage(
         `Travsr: using the native binary from your npm install at ${resolved}.`
       );
+      // #755: the npm package pins its download to the npm package's own version,
+      // so this is exactly the binary that lags the extension's contract. Check it.
+      await warnIfContractSkewed(resolved, channel);
       return;
     }
   }
@@ -658,6 +681,52 @@ async function checkBinaryAndPrompt(
   );
   if (choice === "Download") {
     await runDownloadFlow(proxy, context, workspaceRoot, version, channel, onDaemonFailed);
+  }
+}
+
+/**
+ * #755: name a resolved binary whose `lang list --json` predates the fields the
+ * extension reads, and offer the two things that fix it.
+ *
+ * The gate is the JSON shape, not the version string: the npm-bundled build and
+ * a current one both self-report `1.0.0` (the npm one only adds a `+<sha>` build
+ * suffix), so comparing versions cannot see the skew that actually breaks the
+ * panel. Advisory only — every other feature works on the older binary, so this
+ * must never block activation or refuse to adopt.
+ *
+ * Called only from the auto-detection steps, each of which persists the path it
+ * picked and therefore runs at most once per machine. The probe spawns the CLI
+ * and is not cheap, so it must not land on a path that repeats every activation.
+ */
+async function warnIfContractSkewed(
+  binary: string,
+  channel: vscode.OutputChannel
+): Promise<void> {
+  let probe: { missingFields: string[]; reportedContract?: number };
+  try {
+    probe = await probeLangListContract(binary);
+  } catch (e) {
+    // A probe that itself fails is not evidence the binary is stale.
+    channel.appendLine(
+      `Could not probe lang-list contract for ${binary}: ${e instanceof Error ? e.message : String(e)}`
+    );
+    return;
+  }
+  if (probe.missingFields.length === 0) return;
+  const msg = contractSkewMessage(binary, probe.missingFields, probe.reportedContract);
+  channel.appendLine(msg);
+  const action = await vscode.window.showWarningMessage(
+    msg,
+    `Download v${DOWNLOAD_VERSION}`,
+    "Open Settings"
+  );
+  if (action === "Open Settings") {
+    await vscode.commands.executeCommand(
+      "workbench.action.openSettings",
+      "travsr.binaryPath"
+    );
+  } else if (action === `Download v${DOWNLOAD_VERSION}`) {
+    await vscode.commands.executeCommand("travsr.downloadBinary");
   }
 }
 
