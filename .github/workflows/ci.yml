@@ -138,24 +138,35 @@ jobs:
         run: npm test
 
   msrv:
-    name: MSRV (rust 1.75)
+    name: MSRV (rust 1.88)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # To bump MSRV: update rust-version in Cargo.toml, update the toolchain
-      # version below, and add a changelog entry.
-      - name: Install Rust toolchain (1.75.0)
-        uses: dtolnay/rust-toolchain@1.75.0
+      # version below AND the RUSTUP_TOOLCHAIN value in the check step (both,
+      # they are not linked), and add a changelog entry.
+      - name: Install Rust toolchain (1.88.0)
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
           key: msrv
 
+      # RUSTUP_TOOLCHAIN is mandatory here, do not remove it. The repo root has
+      # a rust-toolchain.toml pinning `channel = "stable"`, and a directory
+      # override outranks the default toolchain that dtolnay/rust-toolchain
+      # sets. Without this env the step silently ran `cargo check` on stable,
+      # so this job reported success for the entire time it claimed to verify
+      # 1.75 while the lockfile had long since drifted past it. The env var
+      # outranks the override file and is the only thing that makes this job
+      # test what its name says.
       - name: Check workspace compiles on MSRV
         run: cargo check --workspace
+        env:
+          RUSTUP_TOOLCHAIN: 1.88.0
 
   deny:
     name: cargo-deny
@@ -168,6 +179,29 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories licenses bans sources
+
+      # fuzz/ is a separate workspace with its own Cargo.lock (isolated so
+      # cargo-fuzz can use nightly), so the run above never sees it. That gap
+      # let a vulnerable quinn-proto sit in fuzz/Cargo.lock while the root
+      # lockfile was already patched. Reuses the root deny.toml. Advisories
+      # only: the fuzz package itself is unpublished and carries no license
+      # field, which the licenses check would reject.
+      #
+      # RUSTUP_TOOLCHAIN neutralizes fuzz/rust-toolchain.toml, which pins
+      # nightly for cargo-fuzz's sanitizer flags. cargo-deny only reads the
+      # manifest and lockfile, so it does not need nightly, and without this
+      # the step made the container install a whole nightly toolchain and then
+      # failed its crates-index fetch looking for `stable`, degrading to
+      # "unable to check for yanked crates" while still exiting 0. rustup
+      # auto-installs whatever this names, matching the root step above.
+      - name: Check advisories (fuzz workspace)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: fuzz/Cargo.toml
+          command: check advisories
+          arguments: --all-features --config deny.toml
+        env:
+          RUSTUP_TOOLCHAIN: stable
 
   plugin-hashes:
     name: plugin-hashes.lock

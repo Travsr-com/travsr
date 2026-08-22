@@ -506,7 +506,7 @@ git clone https://github.com/Travsr-com/travsr
 cd travsr
 
 # Build (SQLite backend)
-cargo build --release   # requires Rust 1.75+
+cargo build --release   # requires Rust 1.88+
 
 # Override the npm-installed binary with a local build
 cp target/release/travsr $(which travsr)
@@ -517,7 +517,7 @@ export TRAVSR_BINARY=/path/to/travsr/target/release/travsr
 **Platform support:** macOS (x86\_64 + arm64), Linux (x86\_64 + aarch64), Windows (x86\_64).
 Pre-built binaries are available on the [Releases](https://github.com/Travsr-com/travsr/releases) page.
 
-**MSRV:** Rust 1.75 (verified in CI on every commit).
+**MSRV:** Rust 1.88 (verified in CI on every commit).
 
 ---
 
