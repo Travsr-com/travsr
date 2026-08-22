@@ -203,6 +203,19 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: stable
 
+  advisory-expiry:
+    name: advisory ignore expiry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Deliberately on PR CI rather than the nightly. osv-scanner.toml feeds
+      # gate-osv in release.yml, so a lapsed ignore blocks promotions, and the
+      # nightly is not a reliable place to learn that: four scheduled
+      # workflows were chronically red when this was added (OSV Scan alone had
+      # failed 76 nightlies running). Warns at 60 days, fails at 14.
+      - name: warn before an osv-scanner ignore lapses
+        run: bash .github/scripts/check-advisory-expiry.sh
+
   plugin-hashes:
     name: plugin-hashes.lock
     runs-on: ubuntu-latest

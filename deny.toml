@@ -12,6 +12,17 @@ ignore = [
     # build-time-only proc-macro dep pulled in by tabled_derive (via tabled).
     # Zero runtime attack surface. Revisit when tabled_derive migrates to
     # manyhow or proc-macro2-diagnostics.
+    #
+    # Deliberately has no expiry here, unlike osv-scanner.toml, which expires
+    # the same ID on 2026-11-30. That is not drift. OSV is wired into
+    # release.yml as gate-osv, so letting it lapse there forces a triage at
+    # promotion time; duplicating the deadline here would only turn every
+    # local `cargo deny` run red without adding a decision point. The real
+    # driver is not security but a dated build break: proc-macro-error2 trips
+    # E0365, which rust-lang/rust#127909 makes a hard error. If that lands
+    # before tabled_derive moves, this entry stops being sufficient and the
+    # dep has to go (tabled is only travsr-cli/src/repos.rs and ask.rs, two
+    # derive sites), or be patched via [patch.crates-io].
     { id = "RUSTSEC-2026-0173", reason = "build-time proc-macro only, no runtime exposure" },
     # paste is unmaintained/archived by its author (RUSTSEC-2024-0436). Pure
     # compile-time token-pasting proc-macro, zero generated runtime logic
