@@ -9,8 +9,58 @@ use travsr_core::Language;
 use travsr_error::IndexError;
 use travsr_indexer::{hash_file, ParseOutput};
 
+/// How a language's Phase B result should be read when it carries no
+/// occurrences.
+///
+/// Named after the property that matters rather than after native-versus-
+/// sidecar, which is what let `dart` onto the exemption list: dart is dispatched
+/// in-process, but only to avoid a nested-subprocess SIGABRT, and its emitter
+/// returns nodes, edges and refs as one external bundle exactly like a sidecar.
+/// Under the old name its placement looked plausible; under this one it is
+/// obviously wrong (#752 review).
+#[derive(Debug, PartialEq, Eq)]
+enum EmptyOutput {
+    /// Nothing at all: no nodes and no occurrences. #712.
+    NoNodes,
+    /// Definitions but not one occurrence, from an analyzer that cannot
+    /// legitimately return that. #724.
+    NoReferences,
+    /// Nothing to report.
+    Fine,
+}
+
+/// Whether this analyzer can legitimately return definitions and no occurrences.
+///
+/// True for rust, typescript, javascript and python, whose Phase B attaches call
+/// edges to pre-existing tree-sitter nodes and has a degraded-but-successful
+/// mode: rust-analyzer or the LSIF pass is unavailable, the run still returns
+/// `ran: true` with structural nodes and no occurrences, and flagging that would
+/// misfire.
+///
+/// Not dart. Its `Err` branch sets `crashed: true, ran: false`, so a dart run
+/// either produces its whole bundle or is already reported as a crash; there is
+/// no legitimate path to definitions-without-occurrences, which is precisely the
+/// state this check exists to catch.
+fn may_report_zero_occurrences(lang: &str) -> bool {
+    matches!(lang, "rust" | "typescript" | "javascript" | "python")
+}
+
+/// Classify one language's Phase B result. Split out so it can be tested
+/// directly: the behaviour this adds had no assertion, only the helper it calls
+/// did (#752 review).
+fn classify_empty_output(lang: &str, nodes_empty: bool, no_occurrences: bool) -> EmptyOutput {
+    if nodes_empty && no_occurrences {
+        EmptyOutput::NoNodes
+    } else if no_occurrences && !may_report_zero_occurrences(lang) {
+        EmptyOutput::NoReferences
+    } else {
+        EmptyOutput::Fine
+    }
+}
+
 /// Per-language Phase B outcome reported by [`PluginIndexer::invoke_phase_b_all`].
 #[derive(Debug, Default, Clone)]
+
 pub struct PhaseBOutcome {
     pub ran: Vec<String>,
     /// Languages P1-gated out because no source files of that type exist in the
@@ -57,6 +107,14 @@ pub struct PhaseBOutcome {
     /// Phase B analyzers legitimately emit edges onto existing Phase A nodes
     /// with no new nodes of their own.
     pub produced_no_nodes: Vec<String>,
+    /// Sidecar languages whose analyzer emitted definitions but no reference
+    /// occurrences of any kind (#724).
+    ///
+    /// Distinct from `produced_no_nodes` because the analyzer did produce
+    /// symbols, so that message would be false. What it did not produce is any
+    /// relationship, which means no call edge can ever be derived: the run reads
+    /// as a success and the graph gains nothing traversable.
+    pub produced_no_references: Vec<String>,
     /// Languages whose sidecar binary responded with a mismatched protocol
     /// version. User-actionable: `travsr lang install <lang>` to upgrade.
     pub version_mismatch: Vec<(String, u32, u32)>,
@@ -1036,13 +1094,17 @@ impl PluginIndexer {
                 // language that produced neither nodes nor edges/refs of any kind,
                 // so an analyzer that produced call edges is not falsely reported
                 // as having "produced no symbols".
-                if r.nodes.is_empty()
-                    && r.edges.is_empty()
+                let no_occurrences = r.edges.is_empty()
                     && r.refs.is_empty()
                     && r.unresolved_calls.is_empty()
-                    && r.positional_refs.is_empty()
-                {
-                    outcome.produced_no_nodes.push(r.lang.clone());
+                    && r.positional_refs.is_empty();
+
+                match classify_empty_output(&r.lang, r.nodes.is_empty(), no_occurrences) {
+                    EmptyOutput::NoNodes => outcome.produced_no_nodes.push(r.lang.clone()),
+                    EmptyOutput::NoReferences => {
+                        outcome.produced_no_references.push(r.lang.clone())
+                    }
+                    EmptyOutput::Fine => {}
                 }
                 outcome.ran.push(r.lang);
             } else if let Some((expected, got)) = r.version_mismatch {
@@ -1157,6 +1219,56 @@ fn find_repo_root(abs_path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// The behaviour this change adds, as a table.
+    ///
+    /// The previous test compared `is_native_phase_b` against two hardcoded
+    /// arrays restating the same names the function matched on, so it asserted
+    /// the function agreed with itself and could not have caught the drift it
+    /// was described as catching (#752 review). These assert the decision
+    /// instead, including that #712's behaviour survived the restructuring.
+    #[test]
+    fn an_empty_result_is_classified_by_what_the_analyzer_could_have_produced() {
+        use super::{classify_empty_output, EmptyOutput};
+
+        // #712, unchanged: nothing at all, from anyone.
+        assert_eq!(
+            classify_empty_output("java", true, true),
+            EmptyOutput::NoNodes
+        );
+        assert_eq!(
+            classify_empty_output("rust", true, true),
+            EmptyOutput::NoNodes
+        );
+
+        // #724: definitions and no occurrences, from an analyzer that cannot
+        // legitimately return that. This is scip-java's shape.
+        assert_eq!(
+            classify_empty_output("java", false, true),
+            EmptyOutput::NoReferences
+        );
+        // Dart belongs here: its emitter returns one bundle, and its failure
+        // mode is already `crashed`, so there is no honest path to this state.
+        assert_eq!(
+            classify_empty_output("dart", false, true),
+            EmptyOutput::NoReferences
+        );
+
+        // Native resolution attaches edges to existing nodes, so definitions
+        // without occurrences is a real degraded-but-successful run.
+        for native in ["rust", "typescript", "javascript", "python"] {
+            assert_eq!(
+                classify_empty_output(native, false, true),
+                EmptyOutput::Fine,
+                "{native} has a degraded-but-successful mode; flagging it misfires"
+            );
+        }
+
+        // Occurrences present: nothing to report, from anyone.
+        for lang in ["java", "rust", "dart", "go"] {
+            assert_eq!(classify_empty_output(lang, false, false), EmptyOutput::Fine);
+        }
+    }
+
     use super::*;
     use crate::phase_b::catalog::CATALOG;
 

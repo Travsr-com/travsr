@@ -351,6 +351,54 @@ fn decode_phase_b_warnings(
                     ),
                 );
             }
+            // #752 review: `zero_nodes` and `needs_consent` were handled by
+            // `travsr status` and fell through here, which is the exact failure
+            // this list's own doc describes: they reached the availability
+            // ladder and could surface as a terminal `done`. Both predate this
+            // change; `zero_nodes` is the class `no_references` is modelled on,
+            // so shipping its sibling while leaving it silent made no sense.
+            "zero_nodes" => {
+                out.insert(
+                    rest.to_string(),
+                    (
+                        "failed",
+                        format!(
+                            "semantic analyzer for '{rest}' ran but found no symbols despite \
+                             '{rest}' sources being present, re-run \
+                             `travsr init --semantic --force` after fixing the project setup"
+                        ),
+                    ),
+                );
+            }
+            "needs_consent" => {
+                out.insert(
+                    rest.to_string(),
+                    (
+                        "unavailable",
+                        format!(
+                            "'{rest}' analysis needs security approval before it can run, \
+                             run `travsr lang install {rest}` interactively to grant it"
+                        ),
+                    ),
+                );
+            }
+            // #724: the analyzer succeeded and returned definitions, but not one
+            // reference occurrence, so no call edge can be derived from it. An
+            // agent asking whether the index is healthy was told it is, which is
+            // the silence this class exists to break (#752 review).
+            "no_references" => {
+                out.insert(
+                    rest.to_string(),
+                    (
+                        "failed",
+                        format!(
+                            "semantic analyzer for '{rest}' produced definitions but no \
+                             references, so no call edges came from it, re-run \
+                             `travsr init --semantic --force` to retry"
+                        ),
+                    ),
+                );
+            }
             "version_mismatch" => {
                 let v: Vec<&str> = rest.splitn(3, ':').collect();
                 if let [lang, expected, got] = v[..] {
@@ -2351,6 +2399,9 @@ mod tests {
             "skipped_no_analyzer",
             "skipped_no_compdb",
             "untrusted_corpus",
+            "no_references",
+            "zero_nodes",
+            "needs_consent",
         ] {
             // `version_mismatch` carries `lang:expected:got`, the rest `lang`.
             let warning = if class == "version_mismatch" {
