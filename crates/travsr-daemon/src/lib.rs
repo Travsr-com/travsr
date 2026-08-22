@@ -3003,6 +3003,71 @@ fn repo_has_objc_sources(repo_root: &Path) -> bool {
 /// Phase 1 silently stalls forever. This function now detects both cases and
 /// re-triggers Phase 1 when: Phase B is complete AND no sidecar is currently
 /// running AND Phase 1 is still incomplete.
+/// #735: single-flight for the 60 s embed tick body.
+///
+/// The tick's `spawn_blocking` closure returns to the select loop immediately,
+/// so nothing stopped tick N+1 from starting while tick N was still running.
+/// The body is not tick-safe under overlap: `regenerate_embed_texts_if_stale`
+/// opens its own store connection (not the shared mutex), and in the
+/// crash-residue state issue #735 describes (a killed reindex left
+/// `embed_text_model_id` stale) every overlapping pass re-ran
+/// `clear_all_embed_texts` + a full-repo parse, un-doing the others' progress.
+/// On a repo where one pass takes longer than the tick interval, passes
+/// accumulated without bound, each holding a full-corpus node/text buffer,
+/// which is unbounded memory growth with no log line to show for it.
+static EMBED_TICK_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII claim on [`EMBED_TICK_RUNNING`]; drop (return or panic) releases it.
+struct EmbedTickGuard;
+
+impl EmbedTickGuard {
+    fn try_acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        EMBED_TICK_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| EmbedTickGuard)
+    }
+}
+
+impl Drop for EmbedTickGuard {
+    fn drop(&mut self) {
+        EMBED_TICK_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// One embed tick: revive a crashed query sidecar, then drive the two-phase
+/// background embedding pipeline. Shared by the unix and windows select arms.
+///
+/// Single-flighted (#735): a tick that fires while the previous one is still
+/// running is skipped; the work is periodic and idempotent, so the next tick
+/// picks up whatever this one would have done. See [`EMBED_TICK_RUNNING`].
+fn run_embed_tick(
+    repo_root: &Path,
+    store: &std::sync::Mutex<SqliteStore>,
+    phase2_spawned: &std::sync::atomic::AtomicBool,
+    supervisor: &std::sync::Mutex<Option<travsr_plugin_host::EmbedSupervisor>>,
+) {
+    let Some(_guard) = EmbedTickGuard::try_acquire() else {
+        tracing::debug!("embed_tick: previous tick still running; skipping this tick");
+        return;
+    };
+    // #736 item 6: revive a crashed sidecar before the spawn check.
+    // maybe_respawn swaps the new child inside the Arc the injected hooks
+    // already hold, so no re-injection is needed; attempts are bounded by
+    // MAX_RESPAWN_ATTEMPTS and this function's single-flight keeps
+    // overlapping ticks off the supervisor mutex.
+    if let Ok(mut guard) = supervisor.lock() {
+        if let Some(s) = guard.as_mut() {
+            if !s.is_active() {
+                s.maybe_respawn();
+            }
+        }
+    }
+    maybe_spawn_embed(repo_root, store, phase2_spawned);
+}
+
 fn maybe_spawn_embed(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
@@ -4016,6 +4081,37 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
+
+    /// #735: the embed tick body must be single-flight. A tick that fires
+    /// while the previous body still runs used to start a second concurrent
+    /// full-repo embed-text pass; on repos where one pass outlives the tick
+    /// interval those passes piled up without bound (the reported ~3 GB/min).
+    /// One test owns the process-global flag, so no other test may touch it.
+    #[test]
+    fn embed_tick_guard_is_single_flight_and_releases_on_drop() {
+        let first = EmbedTickGuard::try_acquire();
+        assert!(first.is_some(), "an idle tick must acquire");
+        assert!(
+            EmbedTickGuard::try_acquire().is_none(),
+            "an overlapping tick must be refused while the first body runs"
+        );
+        drop(first);
+        let after = EmbedTickGuard::try_acquire();
+        assert!(after.is_some(), "the flag must release when the body ends");
+        drop(after);
+
+        // Panic-safety: an unwinding tick body must release the flag too;
+        // otherwise one crash silences every future embed tick.
+        let result = std::panic::catch_unwind(|| {
+            let _guard = EmbedTickGuard::try_acquire().expect("must acquire");
+            panic!("tick body panicked");
+        });
+        assert!(result.is_err());
+        assert!(
+            EmbedTickGuard::try_acquire().is_some(),
+            "the flag must release even when the tick body panics"
+        );
+    }
 
     #[test]
     fn remap_resolved_sites_redirects_and_drops_self_loops() {
@@ -8675,6 +8771,11 @@ impl Daemon {
         // Polls every 60 s to spawn embed Phase 2 once Phase 1 is complete.
         // Phase 2 must not overlap Phase 1 — both write node_embeddings in embed.db.
         let mut embed_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        // #735: never fire catch-up bursts. The default (Burst) replays every
+        // tick missed while the runtime was stalled back-to-back; combined
+        // with a tick body that used to lack a single-flight guard, a stall
+        // turned into a pile of concurrent full-repo embed-text passes.
+        embed_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let embed_phase2_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
@@ -9062,22 +9163,19 @@ impl Daemon {
                         let store_bg = Arc::clone(&store);
                         let repo_bg = Arc::clone(&repo_root_arc);
                         let p2_flag = Arc::clone(&embed_phase2_spawned);
-                        // #736 item 6: revive a crashed sidecar before the
-                        // spawn check. maybe_respawn swaps the new child inside
-                        // the Arc the injected hooks already hold, so no
-                        // re-injection is needed; attempts are bounded by
-                        // MAX_RESPAWN_ATTEMPTS and the mutex makes overlapping
-                        // ticks single-flight.
                         let supervisor_bg = Arc::clone(&embed_supervisor);
+                        // #735: the body is single-flighted inside
+                        // run_embed_tick: a tick that fires while the
+                        // previous one still runs is skipped, so slow embed
+                        // passes can no longer pile up one blocking task
+                        // (and one full-repo pass) per tick.
                         tokio::task::spawn_blocking(move || {
-                            if let Ok(mut guard) = supervisor_bg.lock() {
-                                if let Some(s) = guard.as_mut() {
-                                    if !s.is_active() {
-                                        s.maybe_respawn();
-                                    }
-                                }
-                            }
-                            maybe_spawn_embed(repo_bg.as_path(), &store_bg, &p2_flag);
+                            run_embed_tick(
+                                repo_bg.as_path(),
+                                &store_bg,
+                                &p2_flag,
+                                &supervisor_bg,
+                            );
                         });
                     }
                     _ = &mut shutdown => {
@@ -9173,22 +9271,16 @@ impl Daemon {
                         let store_bg = Arc::clone(&store);
                         let repo_bg = Arc::clone(&repo_root_arc);
                         let p2_flag = Arc::clone(&embed_phase2_spawned);
-                        // #736 item 6: revive a crashed sidecar before the
-                        // spawn check. maybe_respawn swaps the new child inside
-                        // the Arc the injected hooks already hold, so no
-                        // re-injection is needed; attempts are bounded by
-                        // MAX_RESPAWN_ATTEMPTS and the mutex makes overlapping
-                        // ticks single-flight.
                         let supervisor_bg = Arc::clone(&embed_supervisor);
+                        // #735: see the unix arm; run_embed_tick is
+                        // single-flighted, so overlapping ticks are skipped.
                         tokio::task::spawn_blocking(move || {
-                            if let Ok(mut guard) = supervisor_bg.lock() {
-                                if let Some(s) = guard.as_mut() {
-                                    if !s.is_active() {
-                                        s.maybe_respawn();
-                                    }
-                                }
-                            }
-                            maybe_spawn_embed(repo_bg.as_path(), &store_bg, &p2_flag);
+                            run_embed_tick(
+                                repo_bg.as_path(),
+                                &store_bg,
+                                &p2_flag,
+                                &supervisor_bg,
+                            );
                         });
                     }
                     _ = &mut shutdown => {
