@@ -27,8 +27,9 @@ pub enum LangCommand {
     /// Set up full cross-file analysis (calls and references) for a language.
     ///
     /// Downloads the language's analyzer into ~/.travsr/bin/ and turns on full
-    /// analysis for it. For languages that reach the network while analyzing
-    /// (Java, Kotlin, Scala, C#), a one-time security approval step is included.
+    /// analysis for it. Some analyzers reach the network while indexing (Java,
+    /// Kotlin, Scala, C#); their elevated access is auto-granted for local use
+    /// (ADR-017 Amendment A5), so no approval step is required.
     Install {
         /// Language name (e.g. rust, go, python).
         language: String,

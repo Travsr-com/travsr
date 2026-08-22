@@ -33,8 +33,10 @@ pub enum LangStatus {
     /// exists on this machine (e.g. `travsr lang install go`); `None` when there
     /// is nothing the user can do here.
     Partial { next: Option<String> },
-    /// A one-time security approval must be recorded before this language's
-    /// analyzer (which reaches the network while indexing) can be installed.
+    /// Vestigial since elevated access became auto-granted for local use
+    /// (ADR-017 Amendment A5): network-reaching analyzers (Java, Kotlin, Scala,
+    /// C#) are no longer gated on a recorded approval, so this build never
+    /// constructs this variant. Retained for the MCP/JSON tag contract.
     NeedsApproval { language: String },
     /// On Windows only: this language's analyzer cannot run inside Travsr's
     /// isolation, so it needs the user's one-time permission to run with the
