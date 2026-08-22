@@ -35,7 +35,7 @@ const ABSTAIN_FIXTURE = `[index commit: def5678a, embeddings: off]
 [retrieval: fts | coverage 0/3 | confidence: none ]
 
 [0 nodes, 0 with snippets, ~0 metadata-tokens + ~0 snippet-tokens (2000 budget)]
-[note: no strong match found — results are weak/structural and may not be relevant to this query]
+[note: no strong match found, results are weak/structural and may not be relevant to this query]
 `;
 
 const DEGRADED_FIXTURE = `[index commit: abc1234f, embeddings: off]
@@ -44,8 +44,8 @@ const DEGRADED_FIXTURE = `[index commit: abc1234f, embeddings: off]
 foo (function) — src/foo.ts:10 [via: seed] [score: 0.80]
 
 [1 nodes, 0 with snippets, ~40 metadata-tokens + ~0 snippet-tokens (2000 budget)]
-[note: semantic search disabled — run \`travsr embed init\` for better results]
-[note: call traversal limited — run \`travsr lang install <lang>\` to enable call-graph edges]
+[note: semantic search disabled; run \`travsr embed init\` for better results]
+[note: call traversal limited; run \`travsr lang install <lang>\` to enable call-graph edges]
 `;
 
 const NO_LINE_FIXTURE = `[index commit: aaabbb11, embeddings: on]
@@ -72,7 +72,7 @@ const INIT_NEEDED_FIXTURE = `[index commit: 36acbbcb753, embeddings: off]
 
 fn:isSyncPodWorthy (function) — pkg/kubelet/kubelet.go:3462 [via: seed] [score: 0.03]
 
-[2 nodes, ~42 tokens — run \`travsr init\` to enable inline snippets]
+[2 nodes, ~42 tokens; run \`travsr init\` to enable inline snippets]
 `;
 
 // Phase 1 done (embed.db exists) but KNN hook not yet active — "in progress" note
@@ -82,7 +82,7 @@ const EMBED_PROGRESS_FIXTURE = `[index commit: abc1234f, embeddings: off]
 foo (function) — src/foo.ts:10 [via: seed] [score: 0.80]
 
 [1 nodes, 0 with snippets, ~40 metadata-tokens + ~0 snippet-tokens (2000 budget)]
-[note: embedding in progress — run \`travsr embed status\` to check; results improve as index builds]
+[note: embedding in progress; run \`travsr embed status\` to check; results improve as index builds]
 `;
 
 // RFC-022 §14 flag-on shape: match-source sections (## exact/semantic/relevant),
@@ -92,14 +92,14 @@ foo (function) — src/foo.ts:10 [via: seed] [score: 0.80]
 const GROUPED_FIXTURE = `[index commit: 36acbbcb753, embeddings: on]
 [retrieval: exact+semantic | coverage 4/6 | confidence: strong ]
 
-## exact — literal symbol / FTS match (not reranked)
+## exact, literal symbol / FTS match (not reranked)
 fn:knapsack (function) — crates/travsr-retrieval/src/knapsack.rs:53 [score: 0.98]
 fn:solve (function) — crates/travsr-retrieval/src/knapsack.rs:71 [score: 0.90]
-## semantic — cross-encoder ranked
+## semantic, cross-encoder ranked
 fn:token_budget (function) — crates/travsr-retrieval/src/budget.rs:12 [score: 0.55]
-## tests — test entry points & fixtures
+## tests, test entry points & fixtures
 fn:token_budget_keeps_prefix (function) — crates/travsr-retrieval/src/knapsack.rs:210 [score: 0.40]
-## relevant — graph-adjacent context
+## relevant, graph-adjacent context
 fn:seeded_store (function) — crates/travsr-mcp/src/query.rs:682 [via: dependency of fn:token_budget] [score: 0.00]
 method:SqliteStore.open (method) — crates/travsr-store/src/lib.rs:744 [via: caller of fn:knapsack] [score: 0.00]
 
@@ -191,7 +191,7 @@ suite("context/parse: parseContextResult", () => {
     assert.strictEqual(p.footer.snippetTokens, 0);
   });
 
-  test("parses no-repo-root footer [N nodes, ~T tokens — run travsr init …]", () => {
+  test("parses no-repo-root footer [N nodes, ~T tokens; run travsr init …]", () => {
     const r = parseContextResult(INIT_NEEDED_FIXTURE);
     assert.ok(isParsed(r), "should parse with init-needed footer");
     const p = r as ParsedContext;

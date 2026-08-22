@@ -434,7 +434,7 @@ pub fn tools_list() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars). Partial and NL queries are supported." },
+                        "name": { "type": "string", "description": "Symbol name or natural-language query (1-200 chars). Partial and NL queries are supported." },
                         "exact": { "type": "boolean", "description": "If true, drops loose substring matches and keeps only exact, word-boundary, and prefix matches. Use for short or common names to cut noise." }
                     },
                     "required": ["name"],
@@ -474,12 +474,12 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_context",
-                "description": "Retrieve the most relevant context for a query within a token budget. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). Natural-language queries are translated to search terms deterministically — no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata.",
+                "description": "Retrieve the most relevant context for a query within a token budget. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). Natural-language queries are translated to search terms deterministically, no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars)" },
-                        "token_budget": { "type": "integer", "description": "Hard token budget (100–32000). Defaults to 4096 if omitted." },
+                        "query": { "type": "string", "description": "Symbol name or natural-language query (1-200 chars)" },
+                        "token_budget": { "type": "integer", "description": "Hard token budget (100-32000). Defaults to 4096 if omitted." },
                         "include_snippets": { "type": "boolean", "description": "When true, appends the actual source body of each selected symbol (kind-aware, docblock-stripped). Defaults to false." },
                         "snippet_budget": { "type": "integer", "description": "Optional separate token budget for the appended snippets. When omitted, snippets share the main token_budget (best-effort, stops before overflow). When provided, snippet retrieval uses this independent ceiling and does not affect node selection." }
                     },
@@ -493,7 +493,7 @@ pub fn tools_list() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name (1–200 chars). Resolved exact-first: full signature (e.g. 'fn:charge'), then exact bare name; substring matching is only a fallback when neither matches, so prefer the exact name for a precise single-root graph. May be empty when kind_filter is 'file' or mode is 'overview'." },
+                        "query": { "type": "string", "description": "Symbol name (1-200 chars). Resolved exact-first: full signature (e.g. 'fn:charge'), then exact bare name; substring matching is only a fallback when neither matches, so prefer the exact name for a precise single-root graph. May be empty when kind_filter is 'file' or mode is 'overview'." },
                         "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
@@ -615,13 +615,13 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_snippets",
-                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to a condensed structural outline. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the structural outline only. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
+                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to a condensed structural outline. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the structural outline only. Leading docblocks are stripped. Respects a token budget; symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "symbols": {
                             "type": "string",
-                            "description": "Newline- or comma-separated list of symbol names (e.g. 'PaymentService.charge\\nMAX_RETRIES'). Partial matches accepted — the closest matching non-file symbol is used for each name."
+                            "description": "Newline- or comma-separated list of symbol names (e.g. 'PaymentService.charge\\nMAX_RETRIES'). Partial matches accepted, the closest matching non-file symbol is used for each name."
                         },
                         "token_budget": {
                             "type": "integer",
@@ -1068,11 +1068,11 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "search_symbol",
-                "description": "Find symbol definitions matching a name across the indexed graph. Accepts exact symbol names, partial matches, and natural-language queries (e.g. 'auth session validation'). No model or API key required. IMPORTANT: always supply `repo` to avoid cross-repo noise — omit only when explicitly searching across multiple repos. Run repos_list to discover available repo names.",
+                "description": "Find symbol definitions matching a name across the indexed graph. Accepts exact symbol names, partial matches, and natural-language queries (e.g. 'auth session validation'). No model or API key required. IMPORTANT: always supply `repo` to avoid cross-repo noise, omit only when explicitly searching across multiple repos. Run repos_list to discover available repo names.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars). Partial and NL queries are supported." },
+                        "name": { "type": "string", "description": "Symbol name or natural-language query (1-200 chars). Partial and NL queries are supported." },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). IMPORTANT: always supply to avoid cross-repo noise; omit only when explicitly searching across multiple repos." },
                         "exact": { "type": "boolean", "description": "If true, drops loose substring matches and keeps only exact, word-boundary, and prefix matches. Use for short or common names to cut noise." }
                     },
@@ -1082,11 +1082,11 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_repo_map",
-                "description": "Return a structural overview of the indexed repository. IMPORTANT: always supply `repo` — omitting fans out across all indexed repos and produces a very large, hard-to-read response. Run repos_list to discover available repo names.",
+                "description": "Return a structural overview of the indexed repository. IMPORTANT: always supply `repo`, omitting fans out across all indexed repos and produces a very large, hard-to-read response. Run repos_list to discover available repo names.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). IMPORTANT: always supply — omitting fans out across all indexed repos." }
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). IMPORTANT: always supply, omitting fans out across all indexed repos." }
                     },
                     "additionalProperties": false
                 }
@@ -1118,12 +1118,12 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_context",
-                "description": "Retrieve the most relevant context for a query within a token budget. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). Natural-language queries are translated to search terms deterministically — no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata. Supply `repo` to scope to a single codebase; omit only for cross-repo queries.",
+                "description": "Retrieve the most relevant context for a query within a token budget. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). Natural-language queries are translated to search terms deterministically, no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata. Supply `repo` to scope to a single codebase; omit only for cross-repo queries.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars)" },
-                        "token_budget": { "type": "integer", "description": "Hard token budget (100–32000). Defaults to 4096 if omitted." },
+                        "query": { "type": "string", "description": "Symbol name or natural-language query (1-200 chars)" },
+                        "token_budget": { "type": "integer", "description": "Hard token budget (100-32000). Defaults to 4096 if omitted." },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." },
                         "include_snippets": { "type": "boolean", "description": "When true, appends the actual source body of each selected symbol (kind-aware, docblock-stripped). Defaults to false." },
                         "snippet_budget": { "type": "integer", "description": "Optional separate token budget for the appended snippets. When omitted, snippets share the main token_budget (best-effort, stops before overflow). When provided, snippet retrieval uses this independent ceiling and does not affect node selection." }
@@ -1138,7 +1138,7 @@ pub fn tools_list_global() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name (1–200 chars). Resolved exact-first: full signature (e.g. 'fn:charge'), then exact bare name; substring matching is only a fallback when neither matches, so prefer the exact name for a precise single-root graph. May be empty when kind_filter is 'file' or mode is 'overview'." },
+                        "query": { "type": "string", "description": "Symbol name (1-200 chars). Resolved exact-first: full signature (e.g. 'fn:charge'), then exact bare name; substring matching is only a fallback when neither matches, so prefer the exact name for a precise single-root graph. May be empty when kind_filter is 'file' or mode is 'overview'." },
                         "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
@@ -1152,13 +1152,13 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_snippets",
-                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to a condensed structural outline. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the structural outline only. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
+                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to a condensed structural outline. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the structural outline only. Leading docblocks are stripped. Respects a token budget; symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "symbols": {
                             "type": "string",
-                            "description": "Newline- or comma-separated list of symbol names (e.g. 'PaymentService.charge\\nMAX_RETRIES'). Partial matches accepted — the closest matching non-file symbol is used for each name."
+                            "description": "Newline- or comma-separated list of symbol names (e.g. 'PaymentService.charge\\nMAX_RETRIES'). Partial matches accepted, the closest matching non-file symbol is used for each name."
                         },
                         "token_budget": {
                             "type": "integer",
@@ -1252,7 +1252,7 @@ fn handle_prompts_get(id: serde_json::Value, name: &str) -> String {
                     "role": "user",
                     "content": {
                         "type": "text",
-                        "text": "Rewrite the following query into a short (1–4 word) \
+                        "text": "Rewrite the following query into a short (1-4 word) \
                                  code-symbol search term that would appear in function \
                                  names, class names, or file names:\n\n{{query}}"
                     }

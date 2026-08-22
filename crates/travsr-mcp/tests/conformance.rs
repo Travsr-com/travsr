@@ -158,7 +158,7 @@ fn mcp_get_callers_returns_text_content() {
     let text = content["text"].as_str().unwrap_or("");
     assert!(
         !text.is_empty(),
-        "PaymentService has an edge to charge — result must be non-empty"
+        "PaymentService has an edge to charge, result must be non-empty"
     );
 }
 

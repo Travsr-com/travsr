@@ -334,7 +334,7 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
     let emit_ghost_note = || {
         if stats.ghost_prune_aborted {
             println!(
-                "  {} ghost sweep skipped — an unusual number of indexed files \
+                "  {} ghost sweep skipped, an unusual number of indexed files \
                  vanished at once, so nothing was pruned; run \
                  `travsr fsck --fix --force` if that was intentional",
                 pal.orange("⚠"),
@@ -415,7 +415,7 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                 // call edges in the background for the current commit — so this is
                 // genuinely "in progress", not commit-gated.
                 println!(
-                    "  {} semantic call edges are indexing in the background — run `travsr status` to check progress",
+                    "  {} semantic call edges are indexing in the background; run `travsr status` to check progress",
                     pal.dim("ℹ"),
                 );
             } else {
@@ -423,7 +423,7 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                 // B waits for one. The git-commit hook starts a daemon, or the user
                 // can build the edges now, synchronously.
                 println!(
-                    "  {} semantic call edges will build once a daemon is running — your next `git commit` starts one, or run `travsr init --semantic` to build them now",
+                    "  {} semantic call edges will build once a daemon is running, your next `git commit` starts one, or run `travsr init --semantic` to build them now",
                     pal.dim("ℹ"),
                 );
             }
@@ -450,7 +450,7 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
             if !report.produced_no_nodes.is_empty() {
                 let langs = report.produced_no_nodes.join(", ");
                 println!(
-                    "  {} semantic analyzer ran but produced no symbols for: {langs} — see `travsr status` for why",
+                    "  {} semantic analyzer ran but produced no symbols for: {langs}; see `travsr status` for why",
                     pal.orange("⚠"),
                 );
                 if report.produced_no_nodes.iter().any(|l| l == "java") {
@@ -472,34 +472,34 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
             if !report.skipped_no_analyzer.is_empty() {
                 let langs = report.skipped_no_analyzer.join(", ");
                 println!(
-                    "  {} no semantic analyzer for: {langs} — run `travsr lang install <lang>` to enable",
+                    "  {} no semantic analyzer for: {langs}; run `travsr lang install <lang>` to enable",
                     pal.dim("ℹ"),
                 );
             }
             for lang in &report.skipped_needs_consent {
                 println!(
-                    "  {} full analysis for {lang} needs your permission — run `travsr lang allow-unsandboxed {lang}` to enable",
+                    "  {} full analysis for {lang} needs your permission; run `travsr lang allow-unsandboxed {lang}` to enable",
                     pal.dim("ℹ"),
                 );
             }
             if !report.skipped_untrusted_corpus.is_empty() {
                 let langs = report.skipped_untrusted_corpus.join(", ");
                 println!(
-                    "  {} semantic analysis not enabled here for: {langs} — run `travsr lang install <lang>` in this repository to enable",
+                    "  {} semantic analysis not enabled here for: {langs}; run `travsr lang install <lang>` in this repository to enable",
                     pal.dim("ℹ"),
                 );
             }
             if !report.skipped_no_compdb.is_empty() {
                 let langs = report.skipped_no_compdb.join(", ");
                 println!(
-                    "  {} no compile_commands.json for: {langs} — generate one to enable semantic analysis",
+                    "  {} no compile_commands.json for: {langs}, generate one to enable semantic analysis",
                     pal.dim("ℹ"),
                 );
             }
             if !report.crashed.is_empty() {
                 let langs = report.crashed.join(", ");
                 println!(
-                    "  {} semantic analysis failed for: {langs} — rerun with RUST_LOG=travsr_plugin_host=debug",
+                    "  {} semantic analysis failed for: {langs}, rerun with RUST_LOG=travsr_plugin_host=debug",
                     pal.dim("⚠"),
                 );
             }
@@ -508,7 +508,7 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
 
     if stats.travsrignore_scaffolded {
         println!(
-            "  {} created .travsrignore — customize to exclude generated dirs, vendored deps, etc.",
+            "  {} created .travsrignore, customize to exclude generated dirs, vendored deps, etc.",
             pal.dim("ℹ"),
         );
     }
@@ -639,7 +639,7 @@ impl LiveBar {
             let _ = std::io::stderr().flush();
         } else if done_state {
             eprintln!(
-                "  {} complete — {} embedded in {}",
+                "  {} complete, {} embedded in {}",
                 self.label,
                 commas(done),
                 elapsed

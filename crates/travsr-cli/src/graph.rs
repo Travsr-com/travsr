@@ -80,7 +80,7 @@ pub fn run(
     let db_path = repo_root.join(".travsr/graph.db");
 
     if !db_path.exists() {
-        anyhow::bail!("not initialized — run `travsr init`");
+        anyhow::bail!("not initialized; run `travsr init`");
     }
 
     let args = GraphQueryArgs {
@@ -169,11 +169,11 @@ pub fn run(
         };
         if truncated {
             eprintln!(
-                "'{query_str}' is ambiguous — showing {limit} of at least {count} definitions. \
+                "'{query_str}' is ambiguous, showing {limit} of at least {count} definitions. \
                  {escape_hatch}"
             );
         } else {
-            eprintln!("'{query_str}' is ambiguous — {count} definitions. {escape_hatch}");
+            eprintln!("'{query_str}' is ambiguous, {count} definitions. {escape_hatch}");
         }
         for n in candidates.iter().take(limit) {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
@@ -181,10 +181,10 @@ pub fn run(
             // *not* the re-runnable token. Append the exact signature whenever it
             // differs from the label so there is always a copy-pasteable query.
             if n.signature == n.label {
-                eprintln!("  {} ({}) — {}{}", n.label, n.kind, n.path, loc);
+                eprintln!("  {} ({}) \u{2014} {}{}", n.label, n.kind, n.path, loc);
             } else {
                 eprintln!(
-                    "  {} ({}) — {}{}   [re-run: {}]",
+                    "  {} ({}) \u{2014} {}{}   [re-run: {}]",
                     n.label, n.kind, n.path, loc, n.signature
                 );
             }
@@ -218,7 +218,7 @@ pub fn run(
     render(payload, format, budget)?;
     if manifest_dead_end {
         eprintln!(
-            "note: manifests are configuration inputs — no source file depends on one, so \
+            "note: manifests are configuration inputs, no source file depends on one, so \
              callers are empty. Use `--direction deps` to see what this manifest declares."
         );
     }
@@ -243,7 +243,7 @@ pub fn run_all(format: Format, budget: usize) -> anyhow::Result<()> {
     let db_path = repo_root.join(".travsr/graph.db");
 
     if !db_path.exists() {
-        anyhow::bail!("not initialized — run `travsr init`");
+        anyhow::bail!("not initialized; run `travsr init`");
     }
 
     daemon_client::warn_if_call_graph_degraded(&db_path);
@@ -312,12 +312,12 @@ fn print_budget_footer(
     }
     if rendered == 0 {
         println!(
-            "{prefix}Budget of {budget} tokens is too small to display any graph nodes — \
+            "{prefix}Budget of {budget} tokens is too small to display any graph nodes, \
              raise it with --budget (or --budget 0 for no limit)."
         );
     } else if only_seed {
         println!(
-            "{prefix}Budget of {budget} tokens fits only the queried symbol, not its graph — \
+            "{prefix}Budget of {budget} tokens fits only the queried symbol, not its graph, \
              raise it with --budget (or --budget 0 for no limit)."
         );
     } else {

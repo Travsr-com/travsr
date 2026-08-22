@@ -177,7 +177,7 @@ impl RingBuffer {
             tracing::debug!(
                 bytes = entry.2.len(),
                 max_bytes,
-                "SSE replay entry exceeds the ring budget — not buffered"
+                "SSE replay entry exceeds the ring budget, not buffered"
             );
             return;
         }

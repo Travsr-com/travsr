@@ -25,7 +25,7 @@ function makeTelemetryStub() {
 
 // ── Event name constants ───────────────────────────────────────────────────
 
-suite("S17-5: telemetry — event name constants (regression guard)", () => {
+suite("S17-5: telemetry, event name constants (regression guard)", () => {
   test("EVT_ACTIVATED has exact value 'extension.activated'", () => {
     assert.strictEqual(EVT_ACTIVATED, "extension.activated");
   });
@@ -41,7 +41,7 @@ suite("S17-5: telemetry — event name constants (regression guard)", () => {
 
 // ── createTelemetryReporter ────────────────────────────────────────────────
 
-suite("S17-5: telemetry — createTelemetryReporter", () => {
+suite("S17-5: telemetry, createTelemetryReporter", () => {
   test("returns null when enabled=false", () => {
     const result = createTelemetryReporter(false);
     assert.strictEqual(result, null);
@@ -64,12 +64,12 @@ suite("S17-5: telemetry — createTelemetryReporter", () => {
 
 // ── sendEvent ─────────────────────────────────────────────────────────────
 
-suite("S17-5: telemetry — sendEvent", () => {
+suite("S17-5: telemetry, sendEvent", () => {
   test("sendEvent(null, EVT_ACTIVATED) does not throw", () => {
     assert.doesNotThrow(() => sendEvent(null, EVT_ACTIVATED));
   });
 
-  test("sendEvent(null, ...) is a no-op — sendTelemetryEvent is never reached", () => {
+  test("sendEvent(null, ...) is a no-op, sendTelemetryEvent is never reached", () => {
     // Pass null explicitly — no stub involved. The preceding doesNotThrow test
     // already confirms null-path safety; this test ensures the null-guard is
     // what prevents dispatch (not some other reason) by verifying a real stub

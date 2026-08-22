@@ -131,6 +131,9 @@ export function parseSynonymList(raw: string): SynonymPair[] {
  */
 export function parseExecutionPath(raw: string): GraphData {
   const inner = stripEnvelope(raw);
+  // PROTOCOL, not prose: `get_callers` and friends print
+  // `<sig> (<kind>) — <path>` and this splits on that exact
+  // separator, so a punctuation sweep that reaches it breaks it.
   const lineRe = /^(?:\[[^\]]+\]\s*)?(.+?)\s+\((\w+)\)\s+—\s+(.+)$/;
   const nodes: GraphNode[] = [];
   for (const line of inner.split("\n")) {
@@ -310,7 +313,7 @@ export function contractSkewMessage(
       ? `reports no lang-list contract revision (this extension needs ${LANG_CONTRACT_VERSION})`
       : `reports lang-list contract revision ${reportedContract}, but this extension needs ${LANG_CONTRACT_VERSION}`;
   return (
-    `Travsr: the travsr binary at ${binary} is older than this extension expects — it ${rev}. ` +
+    `Travsr: the travsr binary at ${binary} is older than this extension expects; it ${rev}. ` +
     `Missing: ${missingFields.join(", ")}. The Languages panel is held back until a current ` +
     `binary is resolved; indexing and search are unaffected.`
   );
@@ -523,7 +526,7 @@ export function resolveDepSpec(
   return undefined;
 }
 
-/** An entry in the dep list webview — resolved path is clickable, absent = dimmed. */
+/** An entry in the dep list webview, resolved path is clickable, absent = dimmed. */
 export interface DepEntry {
   display: string;
   path?: string;
@@ -543,7 +546,7 @@ export function buildDepListHtml(
     if (e.path) {
       return `<li class="dep" data-path="${escHtml(e.path)}">${escHtml(e.display)}</li>`;
     }
-    return `<li class="dep-ext" title="External / stdlib — no local file">${escHtml(e.display)}</li>`;
+    return `<li class="dep-ext" title="External / stdlib, no local file">${escHtml(e.display)}</li>`;
   };
   const directRows = direct.map(li).join("\n") || "<li><em>none</em></li>";
   const transitiveBlock = transitive.length
@@ -753,7 +756,7 @@ type PanelMessage =
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
 
-/** Re-render every open managed panel — call after an external `travsr init` updates graph.db. */
+/** Re-render every open managed panel, call after an external `travsr init` updates graph.db. */
 export function refreshOpenPanels(): void {
   for (const { refresh } of managedPanels.values()) {
     void refresh();
@@ -790,7 +793,7 @@ function openManagedPanel(
       panel.webview.html = override ?? await render();
     } catch {
       // Render failed — show an error state so the status bar is never orphaned.
-      panel.webview.html = buildPanelLoadingHtml(`${title} (error — try reopening)`);
+      panel.webview.html = buildPanelLoadingHtml(`${title} (error; try reopening)`);
     }
   };
   // Sends a status update into the live webview HTML (cleared on next full re-render).
@@ -1000,7 +1003,7 @@ export function registerShowDependencies(client: McpClient): vscode.Disposable {
 
     const panel = vscode.window.createWebviewPanel(
       "travsrDependencies",
-      `Dependencies — ${target}`,
+      `Dependencies, ${target}`,
       vscode.ViewColumn.Beside,
       { enableScripts: true, localResourceRoots: [] }
     );
@@ -1075,7 +1078,7 @@ export async function readDiagnostics(binary: string, cwd: string): Promise<Diag
       : "warn";
     found.push({
       severity,
-      title: text.replace(/\s*[-—.]?\s*(re-?run|run)\s+`[^`]+`.*$/i, "").trim(),
+      title: text.replace(/\s*[-—,;.]?\s*(re-?run|run)\s+`[^`]+`.*$/i, "").trim(),
       hint: text,
       command: cmd ? cmd[1] : undefined,
     });
@@ -1124,7 +1127,7 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
   return spawnLangCommandResult(binary, args, cwd, timeoutMs).then((r) => r.out);
 }
 
-/** The last non-empty line of CLI output — the final status the command printed
+/** The last non-empty line of CLI output, the final status the command printed
  *  (e.g. "'rust' is active — full cross-file analysis is on."). Empty when the
  *  command printed nothing. */
 function lastLine(s: string): string {
@@ -1271,7 +1274,7 @@ export function registerShowLanguages(
       availableLoaded = false;
       postStatus('Reloading available tools…');
       void loadAvailable().then(() => {
-        postStatus(""); // clear immediately — never couple clear to render()/callTool
+        postStatus(""); // clear immediately, never couple clear to render()/callTool
         void refresh();
       });
       return;
@@ -1307,7 +1310,7 @@ export function registerShowLanguages(
           void refresh();
           if (cancelled) {
             void vscode.window.showWarningMessage(
-              `Install of ${msg.language} was cancelled — it may be partly done. Re-run, or run \`travsr lang install ${msg.language}\` in a terminal.`
+              `Install of ${msg.language} was cancelled; it may be partly done. Re-run, or run \`travsr lang install ${msg.language}\` in a terminal.`
             );
           } else if (code === 2) {
             // Set up, but the project build tool it needs is not installed, so full
@@ -1354,7 +1357,7 @@ export function registerShowLanguages(
           {
             modal: true,
             detail:
-              "It will use your project's own build tools — the same as if you ran the build yourself — including downloading this project's dependencies. You can withdraw this permission later.",
+              "It will use your project's own build tools, the same as if you ran the build yourself, including downloading this project's dependencies. You can withdraw this permission later.",
           },
           "Allow"
         );
@@ -1437,7 +1440,7 @@ export function registerShowLanguages(
           void refresh();
           void vscode.window.showInformationMessage(
             cancelled
-              ? "Detect & install was cancelled — some languages may not be set up. See the Languages panel."
+              ? "Detect & install was cancelled, some languages may not be set up. See the Languages panel."
               : "Detect & install finished. See the Languages panel for per-language status."
           );
         });

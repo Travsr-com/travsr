@@ -198,7 +198,7 @@ pub fn pcst_path(
         tracing::debug!(
             src = source.0,
             sink = sink.0,
-            "pcst: no path found — falling back to BFS"
+            "pcst: no path found, falling back to BFS"
         );
         return bfs_fallback(store, source, filter, token_budget);
     };

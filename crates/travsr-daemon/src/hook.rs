@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
+// PROTOCOL, not prose: this exact line is written into the user's git hooks and
+// matched later to recognise travsr's own. Rewording it orphans every hook
+// already installed, which is why it is spelled as an escape and left alone by
+// punctuation sweeps.
 const TRAVSR_MARKER_SH: &str = "# installed by travsr \u{2014} do not edit this line";
 #[cfg(windows)]
 const TRAVSR_MARKER_CMD: &str = "@rem installed by travsr \u{2014} do not edit this line";
@@ -64,6 +68,10 @@ fn branch_checkout_guard_sh(hook: &str) -> &'static str {
 }
 
 fn hook_body(hook: &str, bin: &str) -> String {
+    // PROTOCOL, not prose: the marker line must equal `TRAVSR_MARKER_SH`
+    // byte-for-byte so `install_one` recognises a travsr-installed hook. This is
+    // a raw string, so the em-dash cannot be spelled `\u{2014}`; it is the same
+    // character and must not be swept to other punctuation.
     format!(
         r#"#!/bin/sh
 # installed by travsr — do not edit this line
@@ -77,6 +85,8 @@ exec "$_travsr" hook-run --from-hook --event {hook}
 }
 
 fn chain_hook_body(hook: &str, bin: &str) -> String {
+    // PROTOCOL, not prose: see `hook_body`. The marker line must equal
+    // `TRAVSR_MARKER_SH` byte-for-byte; the em-dash must not be swept.
     format!(
         r#"#!/bin/sh
 # installed by travsr — do not edit this line
@@ -204,7 +214,7 @@ fn install_one(hooks_dir: &Path, hook: &str, bin: &str) -> anyhow::Result<()> {
             // L6: a backup already exists — the user may have manually restored their
             // original hook over ours. Don't silently overwrite the backup.
             tracing::info!(
-                "{hook} hook modified since last install and {} already exists — \
+                "{hook} hook modified since last install and {} already exists, \
                  overwriting hook only (not re-backing up)",
                 bak_path.display()
             );
@@ -240,7 +250,7 @@ fn install_one(hooks_dir: &Path, hook: &str, bin: &str) -> anyhow::Result<()> {
                 // REPLACES the destination, so re-backing up here would destroy
                 // the original backup.
                 tracing::info!(
-                    "{hook}.cmd hook modified since last install and {} already exists — \
+                    "{hook}.cmd hook modified since last install and {} already exists, \
                      overwriting hook only (not re-backing up)",
                     cmd_bak_path.display()
                 );

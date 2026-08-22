@@ -99,7 +99,7 @@ fn lsif_ingest_1k_symbols_under_30s() {
     // Performance gate: must complete in < 30 s on any CI runner
     assert!(
         elapsed.as_secs() < 30,
-        "LSIF ingest of 1k symbols took {}ms — exceeds 30s budget",
+        "LSIF ingest of 1k symbols took {}ms, exceeds 30s budget",
         elapsed.as_millis()
     );
 }

@@ -82,7 +82,7 @@ suite("VSCODE-247: parseExecutionPath", () => {
     assert.strictEqual(data.edges[0].source, "fn:a");
     assert.strictEqual(data.edges[0].target, "fn:b");
   });
-  test("tolerates lines without the `(kind) — path` shape", () => {
+  test("tolerates lines without the `(kind), path` shape", () => {
     const data = parseExecutionPath("just-a-signature");
     assert.strictEqual(data.nodes.length, 1);
     assert.strictEqual(data.nodes[0].id, "just-a-signature");
@@ -182,7 +182,7 @@ suite("VSCODE-247: buildDepListHtml", () => {
     assert.ok(html.includes("<details>"));
     assert.ok(html.includes('data-path="src/b.ts"'));
   });
-  test("all-external direct deps — no data-path attributes", () => {
+  test("all-external direct deps, no data-path attributes", () => {
     const html = buildDepListHtml("Deps", [{ display: "vscode" }, { display: "fs" }], []);
     assert.ok(!html.includes("data-path="), "no clickable paths for external deps");
     assert.ok(html.includes("dep-ext"));

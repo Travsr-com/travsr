@@ -78,7 +78,7 @@ pub fn parse(
     };
     let Ok(text) = String::from_utf8(bytes) else {
         tracing::debug!(
-            "markdown: non-UTF-8 content at {:?} — file node only, no chunks",
+            "markdown: non-UTF-8 content at {:?}, file node only, no chunks",
             abs_path
         );
         return Ok(out);

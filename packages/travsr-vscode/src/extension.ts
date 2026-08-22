@@ -111,10 +111,10 @@ export function activate(context: vscode.ExtensionContext): void {
     dbWatcher.onDidCreate(() => {
       if (restartInProgress) return;
       restartInProgress = true;
-      channel.appendLine("graph.db created — reconnecting Travsr daemon…");
+      channel.appendLine("graph.db created, reconnecting Travsr daemon…");
       void doRestart(proxy, context, workspaceRoot, version, channel, onDaemonFailed).then(() => {
         restartInProgress = false;
-        void vscode.window.showInformationMessage("Travsr: graph initialized — daemon reconnected.");
+        void vscode.window.showInformationMessage("Travsr: graph initialized, daemon reconnected.");
         refreshOpenPanels();
       });
     });
@@ -309,7 +309,7 @@ export function activate(context: vscode.ExtensionContext): void {
         // so re-fetch here to avoid passing undefined to buildFileListHtml.
         const panel = vscode.window.createWebviewPanel(
           "travsrBlastRadius",
-          `Blast radius — ${file}`,
+          `Blast radius, ${file}`,
           vscode.ViewColumn.Beside,
           { localResourceRoots: [], enableScripts: true }
         );
@@ -421,7 +421,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const lines = parseEnvelope(raw);
         const panel = vscode.window.createWebviewPanel(
           "travsrCallers",
-          `Callers — ${symbol}`,
+          `Callers, ${symbol}`,
           vscode.ViewColumn.Beside,
           { localResourceRoots: [] }
         );
@@ -501,7 +501,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const files = parseEnvelope(raw);
       const count = files.length;
       if (count === 0) {
-        void vscode.window.showInformationMessage(`Travsr: ${file} has no dependents — safe to edit.`);
+        void vscode.window.showInformationMessage(`Travsr: ${file} has no dependents, safe to edit.`);
         return;
       }
       const label = `${file}: ${count} file${count !== 1 ? "s" : ""} depend on this`;
@@ -582,13 +582,13 @@ async function checkBinaryAndPrompt(
       assertExecutableBinary(configured);
       // #755: no contract probe here. `lang list --json` sweeps PATH for every
       // catalog entry and takes seconds, and this branch runs on EVERY
-      // activation once a path is persisted — paying that at startup forever, to
+      // activation once a path is persisted; paying that at startup forever, to
       // re-learn a fact about a binary the user chose themselves, is the wrong
       // trade. The steps below probe because each of them runs at most once (they
       // persist the path they picked, so the next activation lands here), and the
       // Languages panel re-checks the shape from the payload it already fetches,
       // which covers this branch at no extra cost.
-      return; // valid — nothing to do
+      return; // valid, nothing to do
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       channel.appendLine(`Configured travsr.binaryPath is not usable: ${msg}`);
@@ -598,7 +598,7 @@ async function checkBinaryAndPrompt(
         channel.appendLine(`Resolved npm shim to native binary: ${resolved}`);
         await adoptBinary(resolved, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
         void vscode.window.showInformationMessage(
-          `Travsr: travsr.binaryPath pointed at an npm shim — switched to the native binary at ${resolved}.`
+          `Travsr: travsr.binaryPath pointed at an npm shim, switched to the native binary at ${resolved}.`
         );
         return;
       }
@@ -672,8 +672,8 @@ async function checkBinaryAndPrompt(
   }
 
   const promptMsg = cmdShim
-    ? `travsr.cmd detected on PATH but the VS Code extension requires the native binary — Download v${DOWNLOAD_VERSION}?`
-    : `Travsr binary not found — Download v${DOWNLOAD_VERSION}?`;
+    ? `travsr.cmd detected on PATH but the VS Code extension requires the native binary, Download v${DOWNLOAD_VERSION}?`
+    : `Travsr binary not found, Download v${DOWNLOAD_VERSION}?`;
   const choice = await vscode.window.showInformationMessage(
     promptMsg,
     "Download",
@@ -823,7 +823,7 @@ function wireDisconnectHandler(
   onDisconnect?: () => void
 ): void {
   const sub = client.onDisconnect(async () => {
-    sub.dispose(); // one-shot — prevents double-firing on explicit restart
+    sub.dispose(); // one-shot, prevents double-firing on explicit restart
     onDisconnect?.();
     const action = await vscode.window.showWarningMessage(
       "Travsr daemon offline",
@@ -871,7 +871,7 @@ async function reindexNow(
     try {
       assertExecutableBinary(configured);
     } catch (e) {
-      void vscode.window.showErrorMessage(`Travsr: invalid binaryPath — ${(e as Error).message}`);
+      void vscode.window.showErrorMessage(`Travsr: invalid binaryPath, ${(e as Error).message}`);
       return;
     }
   }
@@ -956,12 +956,12 @@ export function buildFileListHtml(
   const tsPill = `<button id="pill-ts"
     style="${mode === "tree-sitter" ? activeStyle : inactiveStyle}"
     onclick="setMode('tree-sitter')"
-    title="Structural analysis — single-file structure and best-effort calls (always available)"
+    title="Structural analysis, single-file structure and best-effort calls (always available)"
     aria-pressed="${mode === "tree-sitter"}"
   >Structural</button>`;
 
   const semTooltip = semanticAvailable
-    ? "Semantic analysis — precise cross-file calls and references"
+    ? "Semantic analysis, precise cross-file calls and references"
     : installHint
       ? `Semantic analysis not yet available. ${installHint}`
       : "Semantic analysis not yet available for this language.";

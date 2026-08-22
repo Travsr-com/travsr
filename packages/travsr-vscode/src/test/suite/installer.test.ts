@@ -22,7 +22,7 @@ import {
 
 // ── resolveTargetTriple ────────────────────────────────────────────────────
 
-suite("VSCODE-205: installer — resolveTargetTriple", () => {
+suite("VSCODE-205: installer, resolveTargetTriple", () => {
   test("linux/x64 → x86_64-unknown-linux-gnu", () => {
     assert.strictEqual(resolveTargetTriple("linux", "x64"), "x86_64-unknown-linux-gnu");
   });
@@ -70,7 +70,7 @@ suite("VSCODE-205: installer — resolveTargetTriple", () => {
 
 // ── #497: isDownloadSupported — prompt gating ──────────────────────────────
 
-suite("#497: installer — isDownloadSupported", () => {
+suite("#497: installer, isDownloadSupported", () => {
   test("true for every published release target", () => {
     assert.strictEqual(isDownloadSupported("linux", "x64"), true);
     assert.strictEqual(isDownloadSupported("linux", "arm64"), true);
@@ -79,7 +79,7 @@ suite("#497: installer — isDownloadSupported", () => {
     assert.strictEqual(isDownloadSupported("win32", "x64"), true);
   });
 
-  test("false for win32/arm64 — no published artifact", () => {
+  test("false for win32/arm64, no published artifact", () => {
     assert.strictEqual(isDownloadSupported("win32", "arm64"), false);
   });
 
@@ -96,7 +96,7 @@ suite("#497: installer — isDownloadSupported", () => {
 
 // ── resolveInstallDir ──────────────────────────────────────────────────────
 
-suite("VSCODE-205: installer — resolveInstallDir", () => {
+suite("VSCODE-205: installer, resolveInstallDir", () => {
   test("returns path ending in .travsr/bin", () => {
     const dir = resolveInstallDir();
     assert.ok(
@@ -113,7 +113,7 @@ suite("VSCODE-205: installer — resolveInstallDir", () => {
 
 // ── resolveInstallPath ─────────────────────────────────────────────────────
 
-suite("VSCODE-205: installer — resolveInstallPath", () => {
+suite("VSCODE-205: installer, resolveInstallPath", () => {
   test("unix (linux): filename is 'travsr'", () => {
     const p = resolveInstallPath("/home/user/.travsr/bin", "linux");
     assert.ok(p.endsWith(`${path.sep}travsr`), `unexpected: ${p}`);
@@ -133,7 +133,7 @@ suite("VSCODE-205: installer — resolveInstallPath", () => {
 
 // ── buildDownloadUrl ───────────────────────────────────────────────────────
 
-suite("VSCODE-205: installer — buildDownloadUrl", () => {
+suite("VSCODE-205: installer, buildDownloadUrl", () => {
   test("url contains version and triple", () => {
     const url = buildDownloadUrl("0.5.0", "x86_64-unknown-linux-gnu");
     assert.ok(url.includes("v0.5.0"), `version missing: ${url}`);
@@ -161,7 +161,7 @@ suite("VSCODE-205: installer — buildDownloadUrl", () => {
 
 // ── buildSumsUrl ───────────────────────────────────────────────────────────
 
-suite("VSCODE-205: installer — buildSumsUrl", () => {
+suite("VSCODE-205: installer, buildSumsUrl", () => {
   test("url points to SHA256SUMS under the correct release tag", () => {
     const url = buildSumsUrl("0.5.0");
     assert.ok(url.includes("v0.5.0"), `version missing: ${url}`);
@@ -176,7 +176,7 @@ function makeSums(tarName: string, tarball: Buffer): Buffer {
   return Buffer.from(`${hash}  ${tarName}\n`, "utf8");
 }
 
-suite("VSCODE-205: installer — verifyChecksum", () => {
+suite("VSCODE-205: installer, verifyChecksum", () => {
   test("passes when checksum matches", () => {
     const tarball = Buffer.from("fake tarball contents");
     const tarName = "travsr-v0.5.0-x86_64-unknown-linux-gnu.tar.gz";
@@ -279,7 +279,7 @@ suite("VSCODE-205: installer — verifyChecksum", () => {
 
 // ── WS1: checkOnPath — Windows .cmd discrimination ────────────────────────
 
-suite("WS1: checkOnPath — Windows .cmd discrimination", () => {
+suite("WS1: checkOnPath, Windows .cmd discrimination", () => {
   test("returns false for nonexistent binary on all platforms", () => {
     assert.strictEqual(checkOnPath("__travsr_definitely_not_on_path_xyz__"), false);
   });
@@ -307,7 +307,7 @@ suite("WS1: checkOnPath — Windows .cmd discrimination", () => {
 
 // ── #495: pickPathCandidate / resolveOnPath — PATH auto-detect ────────────
 
-suite("#495: installer — pickPathCandidate", () => {
+suite("#495: installer, pickPathCandidate", () => {
   // Candidates are built with host path semantics: assertExecutableBinary
   // checks absoluteness with the host's path.isAbsolute, so hardcoded
   // Windows-style paths would be skipped as non-absolute on POSIX runners.
@@ -349,7 +349,7 @@ suite("#495: installer — pickPathCandidate", () => {
   });
 });
 
-suite("#495: installer — resolveOnPath", () => {
+suite("#495: installer, resolveOnPath", () => {
   test("returns null for a binary not on PATH", () => {
     assert.strictEqual(resolveOnPath("__travsr_definitely_not_on_path_xyz__"), null);
   });
@@ -379,7 +379,7 @@ suite("#495: installer — resolveOnPath", () => {
 
 // ── #486: resolveNpmShimExe — npm shim → packaged native binary ───────────
 
-suite("#486: installer — resolveNpmShimExe", () => {
+suite("#486: installer, resolveNpmShimExe", () => {
   /** Build <tmp>/travsr.cmd + <tmp>/node_modules/@travsr.com/travsr/bin/<binName>. */
   function makeNpmPrefix(binName: string | null): { prefix: string; shim: string; exe: string } {
     const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "travsr-shim-"));

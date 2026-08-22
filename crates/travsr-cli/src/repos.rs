@@ -27,7 +27,7 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
             }
             registry::UnregisterResult::Ambiguous(paths) => {
                 println!(
-                    "'{name}' matches {} repos — re-run with the full path:",
+                    "'{name}' matches {} repos, re-run with the full path:",
                     paths.len()
                 );
                 for p in &paths {
@@ -41,7 +41,7 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
     if prune {
         let removed = registry::prune()?;
         if removed.is_empty() {
-            println!("registry is clean — no stale repos to prune");
+            println!("registry is clean, no stale repos to prune");
         } else {
             println!("pruned {} stale repo(s):", removed.len());
             for name in &removed {
@@ -83,7 +83,7 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
     }
 
     if repos.is_empty() {
-        println!("no repos registered — run `travsr init` in a repo first");
+        println!("no repos registered; run `travsr init` in a repo first");
         return Ok(());
     }
 
@@ -105,7 +105,7 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
     println!("{}", Table::new(rows));
     if stale > 0 {
         println!(
-            "\n{stale} stale entr{} (db missing) — run `travsr repos --prune` to remove",
+            "\n{stale} stale entr{} (db missing); run `travsr repos --prune` to remove",
             if stale == 1 { "y" } else { "ies" }
         );
     }

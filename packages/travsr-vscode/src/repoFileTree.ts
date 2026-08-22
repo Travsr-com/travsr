@@ -59,7 +59,7 @@ export class DirNode extends vscode.TreeItem {
         : `${fileCount}`;
     this.tooltip =
       dependents !== undefined
-        ? `${prefix} — ${dependents} components depend on this (${fileCount} files)`
+        ? `${prefix}, ${dependents} components depend on this (${fileCount} files)`
         : `${prefix} (${fileCount} files)`;
     this.iconPath = new vscode.ThemeIcon("folder");
     this.contextValue = "travsrDir";
@@ -181,7 +181,7 @@ export class TravsrRepoFileTreeProvider
     } catch {
       qp.dispose();
       void vscode.window.showWarningMessage(
-        "Travsr: file search unavailable — daemon not connected"
+        "Travsr: file search unavailable, daemon not connected"
       );
     }
   }
@@ -211,7 +211,7 @@ export class TravsrRepoFileTreeProvider
     );
 
     if (!pkgNodes.length) {
-      return [new PlaceholderNode("No indexed files — run travsr init")];
+      return [new PlaceholderNode("No indexed files; run travsr init")];
     }
 
     // Rank by dependents (most load-bearing first), then file count — mirrors

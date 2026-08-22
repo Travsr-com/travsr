@@ -188,6 +188,9 @@ export class TravsrTreeDataProvider
       const lines = stripEnvelope(raw).split("\n").map((l) => l.trim()).filter(Boolean);
       return lines.map((line) => {
         // Format: "[call] fn:bar (function) — src/bar.ts"
+        // PROTOCOL, not prose: `get_callers` and friends print
+        // `<sig> (<kind>) — <path>` and this splits on that exact
+        // separator, so a punctuation sweep that reaches it breaks it.
         const m = /^(\[[^\]]+\])\s+(\S+)(?:\s+\([^)]+\))?\s+—\s+(.+)$/.exec(
           line
         );
@@ -213,6 +216,6 @@ export class TravsrTreeDataProvider
     for (const ext of [".ts", ".tsx", ".js", ".jsx"]) {
       if (fs.existsSync(base + ext)) return base + ext;
     }
-    return undefined; // dep could not be resolved — no navigation is better than a wrong path
+    return undefined; // dep could not be resolved, no navigation is better than a wrong path
   }
 }

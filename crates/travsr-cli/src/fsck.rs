@@ -55,7 +55,7 @@ pub fn run(fix: bool, json: bool, force: bool) -> anyhow::Result<()> {
 
     if report.ghost_paths.is_empty() {
         if fix {
-            println!("graph is clean — no ghost nodes found");
+            println!("graph is clean, no ghost nodes found");
         } else {
             println!("no ghost nodes detected (run with --fix to repair)");
         }

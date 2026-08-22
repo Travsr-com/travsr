@@ -133,6 +133,10 @@ function parseNodeLine(raw: string): Omit<ContextNode, "snippet"> | null {
 
   // Split on em-dash separator: '{sig} ({kind}) — {path}[:{line}]'
   // The em-dash character is U+2014.
+  // PROTOCOL, not prose: the node-header wire format. `get_context` and
+  // friends print `<sig> (<kind>) — <path>` and this splits on that exact
+  // separator, so a punctuation sweep that reaches it breaks the round trip
+  // (see ff1436ee). The Rust side spells it `\u{2014}` with the same note.
   const dashIdx = rest.indexOf(" — ");
   if (dashIdx < 0) return null;
 
@@ -177,6 +181,10 @@ function parseNodeLine(raw: string): Omit<ContextNode, "snippet"> | null {
 function looksLikeSnippetHeader(line: string): boolean {
   if (!line || line.startsWith(" ") || line.startsWith("\t")) return false;
   if (line.trim().startsWith("[") || line.trim() === "───") return false;
+  // PROTOCOL, not prose: the node-header wire format. `get_context` and
+  // friends print `<sig> (<kind>) — <path>` and this splits on that exact
+  // separator, so a punctuation sweep that reaches it breaks the round trip
+  // (see ff1436ee). The Rust side spells it `\u{2014}` with the same note.
   return line.includes(" — ") && /\s+\(\w+\)/.test(line);
 }
 
@@ -203,6 +211,10 @@ export function parseSnippetsResult(text: string): Map<string, string> {
     if (!looksLikeSnippetHeader(line)) { i++; continue; }
 
     // Parse header: "{sig} ({kind}) — {path} [package: {pkg}]"
+    // PROTOCOL, not prose: the node-header wire format. `get_context` and
+    // friends print `<sig> (<kind>) — <path>` and this splits on that exact
+    // separator, so a punctuation sweep that reaches it breaks the round trip
+    // (see ff1436ee). The Rust side spells it `\u{2014}` with the same note.
     const dashIdx = trimmed.indexOf(" — ");
     if (dashIdx < 0) { i++; continue; }
     const kindM = /^(.+)\s+\(\w+\)$/.exec(trimmed.slice(0, dashIdx).trim());

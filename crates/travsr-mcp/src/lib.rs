@@ -227,7 +227,7 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
                         readiness_bg.mark_ready();
                         tracing::info!(
                             model_id = %mid,
-                            "embed plugin active — Step 4 (semantic ANN) enabled"
+                            "embed plugin active, Step 4 (semantic ANN) enabled"
                         );
                     }
                 }
@@ -284,5 +284,5 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
         }
     });
     store.set_embed_score_hook(meta_score);
-    tracing::info!("embed plugin hook installed (lazy — sidecar starting in background)");
+    tracing::info!("embed plugin hook installed (lazy, sidecar starting in background)");
 }

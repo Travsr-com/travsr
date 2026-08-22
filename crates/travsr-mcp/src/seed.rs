@@ -3262,7 +3262,7 @@ pub(crate) fn abstain_message(seed_set: &SeedSet, query: &str) -> String {
     if max_guesses > 0 && !seed_set.seeds.is_empty() {
         msg.push_str(&format!(
             "\n[The core of your query isn't in this repo. \
-             Showing closest {} guess(es) only — treat these as speculative.]\n",
+             Showing closest {} guess(es) only, treat these as speculative.]\n",
             seed_set.seeds.len().min(max_guesses)
         ));
     }
@@ -5837,7 +5837,7 @@ mod tests {
             if !t.is_anchor_emit {
                 assert_eq!(
                     t.anchors_emitted, 0,
-                    "token {:?} was suppressed before the anchor loop, so it emitted nothing — \
+                    "token {:?} was suppressed before the anchor loop, so it emitted nothing, \
                      reporting a non-zero count would attribute a relevance drop to capacity",
                     t.token
                 );
@@ -5888,12 +5888,12 @@ mod tests {
         let legs = report.legs.expect("legs must be Some when node_found");
         assert!(
             legs.trigram.is_some(),
-            "fn:walk must show a trigram (substring) match on 'wal' — that's \
+            "fn:walk must show a trigram (substring) match on 'wal', that's \
              the actual mechanism, and explain exists to surface it"
         );
         assert!(
             legs.word.is_none(),
-            "fn:walk must NOT show a word-leg match — 'wal' is not a word \
+            "fn:walk must NOT show a word-leg match, 'wal' is not a word \
              segment of 'walk', only a substring of it"
         );
         assert!(
@@ -6040,7 +6040,7 @@ mod tests {
         assert!(
             matches!(seed_set.confidence, Confidence::Strong | Confidence::Exact),
             "an exact camelCase symbol-name query must not collapse to a weak \
-             confidence, let alone abstain — got {:?}, seeds: {:?}",
+             confidence, let alone abstain, got {:?}, seeds: {:?}",
             seed_set.confidence,
             seed_set
                 .seeds
@@ -6462,7 +6462,7 @@ mod tests {
         assert!(
             resolved < travsr_rerank::DEFAULT_WEAK_FLOOR,
             "the docs lane floor is deliberately below the code lane's WEAK floor \
-             ({resolved} vs {}) — §14.1 measured the doc negative-arm ceiling at \
+             ({resolved} vs {}); §14.1 measured the doc negative-arm ceiling at \
              ~0.002, not ~0.5; borrowing the code floor cost travsr a gold hit",
             travsr_rerank::DEFAULT_WEAK_FLOOR
         );

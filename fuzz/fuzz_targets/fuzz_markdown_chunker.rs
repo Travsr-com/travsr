@@ -74,7 +74,7 @@ fuzz_target!(|data: &[u8]| {
         );
         assert!(
             anchors.insert(c.anchor.as_str()),
-            "duplicate anchor {:?} — the two chunks collapse to one NodeId",
+            "duplicate anchor {:?}; the two chunks collapse to one NodeId",
             c.anchor
         );
         prev_end = c.line_end;

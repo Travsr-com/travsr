@@ -226,7 +226,7 @@ suite("VSCODE-203: CallersHoverProvider", () => {
 
 // ── VSCODE-208: welcome panel dedup ────────────────────────────────────────
 
-suite("VSCODE-208: showWelcome dedup — re-running command reveals existing panel", () => {
+suite("VSCODE-208: showWelcome dedup, re-running command reveals existing panel", () => {
   test("showWelcome called twice does not throw and returns cleanly", () => {
     // In the test environment WebviewPanel is fully stubbed; calling showWelcome
     // twice exercises the currentPanel branch without crashing.
@@ -236,7 +236,7 @@ suite("VSCODE-208: showWelcome dedup — re-running command reveals existing pan
 
 // ── VSCODE-204: MCP 10 s timeout ───────────────────────────────────────────
 
-suite("VSCODE-204: StdioMcpClient — callTool returns '' when daemon never responds", () => {
+suite("VSCODE-204: StdioMcpClient, callTool returns '' when daemon never responds", () => {
   test("dispose() cancels pending timers without throwing", () => {
     // Construct a client that is never connected; dispose() must not throw even
     // when pendingTimers contains entries (regression guard for the timer-leak fix).

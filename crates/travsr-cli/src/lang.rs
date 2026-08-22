@@ -169,7 +169,7 @@ fn unavailable_status(entry: &PhaseBEntry, target: &str) -> String {
     let hint = if entry.underlying_tool_hint.is_empty() {
         String::new()
     } else {
-        format!(" — manual setup: {}", entry.underlying_tool_hint)
+        format!(", manual setup: {}", entry.underlying_tool_hint)
     };
     format!(
         "not available on {target} yet ({} ships no prebuilt binary for this platform){hint}",
@@ -591,7 +591,7 @@ fn cmd_install(
             "'{language}' is {}\n\
              \n\
              Structural indexing (symbols, definitions, repo map) still works on \
-             this platform — only call/reference analysis needs this binary.",
+             this platform, only call/reference analysis needs this binary.",
             unavailable_status(entry, target)
         );
     }
@@ -607,7 +607,7 @@ fn cmd_install(
              no prebuilt binary for this platform.\n\
              \n\
              Structural indexing (symbols, definitions, repo map) still works here \
-             — only call/reference analysis needs that binary.",
+, only call/reference analysis needs that binary.",
             entry.command
         );
     }
@@ -880,9 +880,9 @@ fn cmd_install(
     }
 
     if enabled_here {
-        println!("'{language}' is active — full cross-file analysis is on for this repository.");
+        println!("'{language}' is active, full cross-file analysis is on for this repository.");
     } else {
-        println!("'{language}' is active — full cross-file analysis is on.");
+        println!("'{language}' is active, full cross-file analysis is on.");
     }
     Ok(InstallStatus::FullyReady)
 }
@@ -1540,7 +1540,7 @@ fn cmd_detect(yes: bool) -> Result<()> {
     if !unavailable.is_empty() {
         println!();
         println!(
-            "Not installable on {} — the analyzer has no build for this platform \
+            "Not installable on {}; the analyzer has no build for this platform \
              (structural indexing still works):",
             travsr_plugin_host::phase_b::status::os_label()
         );
@@ -1572,7 +1572,7 @@ fn cmd_detect(yes: bool) -> Result<()> {
 
     if !std::io::stdin().is_terminal() {
         println!(
-            "(non-interactive — run `travsr lang install <lang>` to install one, or \
+            "(non-interactive; run `travsr lang install <lang>` to install one, or \
              `travsr lang detect --yes` to set up all detected)"
         );
         return Ok(());
@@ -1624,7 +1624,7 @@ fn install_selected(selected: &[&str], no_interactive: bool, yes: bool) {
         match cmd_install(lang, false, no_interactive, None, false, yes, None) {
             Ok(InstallStatus::FullyReady) => {}
             Ok(InstallStatus::WrapperOnly) => {
-                println!("  {lang}: analyzer not installed yet — full analysis stays off")
+                println!("  {lang}: analyzer not installed yet, full analysis stays off")
             }
             Err(e) => eprintln!("  error: {e:#}"),
         }
@@ -1656,7 +1656,7 @@ fn cmd_remove(language: &str) -> Result<()> {
     let mut config = load_config().unwrap_or_default();
     if config.unregister(language) {
         save_config(&config)?;
-        println!("'{language}' full analysis turned off — basic analysis still runs.");
+        println!("'{language}' full analysis turned off, basic analysis still runs.");
     } else {
         println!("'{language}' was not registered.");
     }
@@ -1693,7 +1693,7 @@ fn cmd_allow_unsandboxed(
                  Windows until you grant it again with `travsr lang allow-unsandboxed {language}`."
             );
         } else {
-            println!("No permission was on record for '{language}' — nothing to withdraw.");
+            println!("No permission was on record for '{language}', nothing to withdraw.");
         }
         return Ok(());
     }
@@ -1707,7 +1707,7 @@ fn cmd_allow_unsandboxed(
          needs this.\n\
          \n\
          What this allows: when Travsr indexes this project, '{language}' analysis will \
-         download dependencies and run this project's own build with your privileges — \
+         download dependencies and run this project's own build with your privileges, \
          the same as if you ran the build yourself. Only grant it for a project whose \
          build you trust.\n"
     );

@@ -79,7 +79,7 @@ fn restrict_to_owner_windows(path: &Path) {
     let Some(path_str) = path.to_str() else {
         tracing::warn!(
             path = %path.display(),
-            "path is not valid UTF-8 — skipping icacls permission restriction"
+            "path is not valid UTF-8, skipping icacls permission restriction"
         );
         return;
     };
@@ -87,7 +87,7 @@ fn restrict_to_owner_windows(path: &Path) {
     if user.is_empty() {
         tracing::warn!(
             path = %path.display(),
-            "USERNAME env var not set — skipping permission restriction on Windows"
+            "USERNAME env var not set, skipping permission restriction on Windows"
         );
         return;
     }
@@ -112,12 +112,12 @@ fn restrict_to_owner_windows(path: &Path) {
         Ok(s) => tracing::warn!(
             path = %path.display(),
             exit_code = ?s.code(),
-            "icacls failed to restrict permissions — may be readable by other users on this machine"
+            "icacls failed to restrict permissions, may be readable by other users on this machine"
         ),
         Err(e) => tracing::warn!(
             path = %path.display(),
             err = %e,
-            "icacls not available — permissions not restricted on Windows"
+            "icacls not available, permissions not restricted on Windows"
         ),
     }
 }
@@ -145,7 +145,7 @@ pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
             tracing::warn!(
                 path = %travsr_home.display(),
                 err = %e,
-                "failed to restrict ~/.travsr/ permissions to 0700 — directory may be world-readable"
+                "failed to restrict ~/.travsr/ permissions to 0700, directory may be world-readable"
             );
         }
     }
@@ -361,7 +361,7 @@ fn write_registry_atomic(path: &Path, repos: &HashMap<String, PathBuf>) -> anyho
             tracing::warn!(
                 path = %path.display(),
                 err = %e,
-                "failed to restrict registry.json permissions to 0600 — file may be world-readable"
+                "failed to restrict registry.json permissions to 0600, file may be world-readable"
             );
         }
     }

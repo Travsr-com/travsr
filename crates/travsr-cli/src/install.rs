@@ -179,7 +179,7 @@ impl std::fmt::Display for WrapperUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} is not available for {} yet — the travsr-lang release ships no \
+            "{} is not available for {} yet, the travsr-lang release ships no \
              prebuilt binary for this platform",
             self.binary_name, self.target
         )
@@ -589,7 +589,7 @@ async fn fetch_verified(
             if actual != expected {
                 bail!(
                     "SHA256 mismatch for {label}: expected {expected}, got {actual}. \
-                     The pinned asset does not match the hash recorded in the catalog — it may \
+                     The pinned asset does not match the hash recorded in the catalog; it may \
                      have been replaced upstream."
                 );
             }
@@ -1657,7 +1657,7 @@ pub(crate) fn verify_and_extract_zip(
         if actual != expected {
             bail!(
                 "SHA256 mismatch for {asset_name} at {tag}: expected {expected}, got {actual}. \
-                 The pinned asset does not match the hash recorded in the catalog — it may have \
+                 The pinned asset does not match the hash recorded in the catalog; it may have \
                  been replaced upstream."
             );
         }
@@ -1854,7 +1854,7 @@ mod extraction_tests {
         assert!(err.contains("SHA256 mismatch"), "{err}");
         assert!(
             !dest.join("server/bin/tool").exists(),
-            "a mismatching archive must not be extracted at all — the hash gates \
+            "a mismatching archive must not be extracted at all, the hash gates \
              extraction rather than following it"
         );
 

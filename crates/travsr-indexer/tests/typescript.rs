@@ -36,10 +36,7 @@ fn interface_type_alias_enum_emitted() {
         "enum:Color",
         "class:Base",
     ] {
-        assert!(
-            sigs.contains(&expected),
-            "missing {expected} — got {sigs:?}"
-        );
+        assert!(sigs.contains(&expected), "missing {expected}, got {sigs:?}");
     }
 }
 

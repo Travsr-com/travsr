@@ -257,7 +257,7 @@ fn golden_simple_fixture_node_count() {
     assert_eq!(
         out.nodes.len(),
         20,
-        "expected exactly 20 nodes from simple.rs — update golden if fixture changed.\n\
+        "expected exactly 20 nodes from simple.rs, update golden if fixture changed.\n\
          Actual nodes:\n{}",
         out.nodes
             .iter()
@@ -274,7 +274,7 @@ fn golden_simple_fixture_edge_count() {
     assert_eq!(
         out.edges.len(),
         19,
-        "expected exactly 19 edges from simple.rs — update golden if fixture changed."
+        "expected exactly 19 edges from simple.rs, update golden if fixture changed."
     );
 }
 
@@ -335,7 +335,7 @@ fn golden_simple_fixture_no_duplicate_node_ids() {
     assert_eq!(
         ids.len(),
         before,
-        "duplicate NodeIds detected in simple.rs output — dedup in rust::parse() may be broken"
+        "duplicate NodeIds detected in simple.rs output, dedup in rust::parse() may be broken"
     );
 }
 
@@ -451,7 +451,7 @@ fn smoke_index_travsr_core_lib() {
     // Skip gracefully if running in an environment without the full workspace
     // (e.g. a vendor-only CI that only ships travsr-indexer).
     if !core_lib.exists() {
-        eprintln!("smoke_index_travsr_core_lib: skipped — {core_lib:?} not found");
+        eprintln!("smoke_index_travsr_core_lib: skipped, {core_lib:?} not found");
         return;
     }
 

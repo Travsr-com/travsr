@@ -337,7 +337,7 @@ ${script}
 </body></html>`;
 }
 
-/** Instant loading placeholder — shown before the first async render completes. */
+/** Instant loading placeholder, shown before the first async render completes. */
 export function buildPanelLoadingHtml(title: string): string {
   return webviewShell(
     title,
@@ -378,7 +378,7 @@ export function buildSynonymsHtml(pairs: SynonymPair[]): string {
     <input id="term" placeholder="term" style="width:100%">
     <div class="chip-area" id="staged" aria-label="Staged aliases"></div>
     <div style="display:flex;gap:6px;align-items:center">
-      <input id="alias" placeholder="alias — press Enter to stage" style="flex:1">
+      <input id="alias" placeholder="alias, press Enter to stage" style="flex:1">
       <button class="btn primary" id="addBtn" onclick="commitAdd()">Add</button>
     </div>
     <p style="margin:2px 0;font-size:11px;color:var(--fg-subtle)">Press Enter in alias field to stage; Add commits all staged aliases.</p>
@@ -971,7 +971,7 @@ export interface LangInfo {
   language: string;
   package: string;
   sandbox: "Standard" | "Elevated";
-  /** Authoritative status computed by the CLI — render this, never re-derive it.
+  /** Authoritative status computed by the CLI, render this, never re-derive it.
    *  `active` = full cross-file analysis is live; `partial` = structure only, but
    *  it can be turned on here; `needs_approval` = retained only to parse JSON from
    *  an older CLI (elevated access is auto-granted now, so a current CLI never
@@ -984,7 +984,7 @@ export interface LangInfo {
     | "needs_approval"
     | "needs_consent"
     | "unsupported";
-  /** The exact plain wording the CLI shows for this status — used as the tooltip. */
+  /** The exact plain wording the CLI shows for this status, used as the tooltip. */
   statusLine: string;
   /** Per-repo enablement for the target repo (corpus trust gate), computed by the
    *  CLI. `always_on` = builtin, no per-repo step; `enabled` = on for this repo;
@@ -1106,7 +1106,7 @@ export function buildLanguagesHtml(
         .join("\n")
     : `<tr><td colspan="2" class="empty" style="font-style:normal">No language metadata yet.&nbsp; <button class="btn primary" id="initBtn" onclick="initRepo(this)">Initialize this repo</button></td></tr>`;
   const indexedNote = indexed.length
-    ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural analysis — includes test &amp; fixture files.</p>`
+    ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural analysis; includes test &amp; fixture files.</p>`
     : "";
 
   // ── Available section ────────────────────────────────────────────────────────
@@ -1226,9 +1226,9 @@ export function buildLanguagesHtml(
             : "dim";
       const repoTip =
         {
-          always_on: "Built in — always on for every repo",
+          always_on: "Built in, always on for every repo",
           enabled: "Full analysis is on for this repo",
-          needs_analyzer: `Authorized for this repo, but its analyzer isn't installed yet — only structural analysis runs until it is. Install it: travsr lang install ${l.language}`,
+          needs_analyzer: `Authorized for this repo, but its analyzer isn't installed yet, only structural analysis runs until it is. Install it: travsr lang install ${l.language}`,
           not_enabled: `Full analysis is off for this repo. Enable it: travsr lang install ${l.language} (run in this repo)`,
           no_repo: "Open a repo to see per-repo status",
         }[l.repoState] ??
@@ -1242,7 +1242,7 @@ export function buildLanguagesHtml(
           ? `<span style="color:var(--fg-subtle)" title="travsr did not report prerequisites for ${esc(l.language)}.">unknown</span>`
           : l.prerequisites && l.prerequisites !== "none"
             ? `<span style="color:var(--fg-subtle)">${esc(l.prerequisites)}</span>`
-            : `<span style="color:var(--fg-subtle)">—</span>`;
+            : `<span style="color:var(--fg-subtle)">-</span>`;
 
       return `<tr>
 <td><span class="mono">${esc(l.language)}</span></td>
@@ -1256,14 +1256,14 @@ export function buildLanguagesHtml(
   // When several repos are open the panel names the one install/detect will
   // target and offers a one-click change, so the destination is never a guess.
   const sub = targetRepo
-    ? `<p class="sub">Target repo: <b>${esc(targetRepo)}</b> — install &amp; detect run here. <a href="#" onclick="pickRepo();return false" style="color:var(--green)">change</a></p>`
+    ? `<p class="sub">Target repo: <b>${esc(targetRepo)}</b>; install &amp; detect run here. <a href="#" onclick="pickRepo();return false" style="color:var(--green)">change</a></p>`
     : `<p class="sub">Indexed languages in this repo and available semantic analysis tools.</p>`;
 
   // #755: with a skewed payload the empty-table placeholder would read as "no
   // tools available", which is a claim about the machine rather than about the
   // binary. Say what actually happened.
   const availEmpty = skew
-    ? '<tr><td colspan="5" class="empty">Held back — the resolved travsr is older than this panel expects (see above).</td></tr>'
+    ? '<tr><td colspan="5" class="empty">Held back; the resolved travsr is older than this panel expects (see above).</td></tr>'
     : '<tr><td colspan="5" class="empty">No analysis tools available yet. Use Reload above to check again.</td></tr>';
 
   const body = `

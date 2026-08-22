@@ -36,14 +36,14 @@ pub fn parse_python_with_pyright(
     let pyright = match find_pyright() {
         Some(p) => p,
         None => {
-            tracing::debug!("pyright not found on PATH — skipping semantic enrichment");
+            tracing::debug!("pyright not found on PATH, skipping semantic enrichment");
             return Ok(ParseOutput::default());
         }
     };
 
     // Warn once per session that pyright runs unsandboxed (SEC P1-A5).
     tracing::warn!(
-        "pyright is running without OS sandboxing — see docs/security/python-indexing-risks.md"
+        "pyright is running without OS sandboxing; see docs/security/python-indexing-risks.md"
     );
 
     let json_bytes = match run_pyright(&pyright, path, timeout) {

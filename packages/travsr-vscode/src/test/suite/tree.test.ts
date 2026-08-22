@@ -46,7 +46,7 @@ function setFile(
 
 // ── suite ──────────────────────────────────────────────────────────────────
 
-suite("VSCODE-204: TravsrTreeDataProvider — root", () => {
+suite("VSCODE-204: TravsrTreeDataProvider, root", () => {
   test("getChildren(undefined) returns deps and callers sections", async () => {
     const provider = new TravsrTreeDataProvider(makeMcp(), makeContext());
     const children = await provider.getChildren(undefined);
@@ -70,7 +70,7 @@ suite("VSCODE-204: TravsrTreeDataProvider — root", () => {
   });
 });
 
-suite("VSCODE-204: TravsrTreeDataProvider — Dependencies section", () => {
+suite("VSCODE-204: TravsrTreeDataProvider, Dependencies section", () => {
   test("returns placeholder when no active file", async () => {
     const provider = new TravsrTreeDataProvider(makeMcp(), makeContext());
     setFile(provider, undefined);
@@ -161,7 +161,7 @@ suite("VSCODE-204: TravsrTreeDataProvider — Dependencies section", () => {
   });
 });
 
-suite("VSCODE-204: TravsrTreeDataProvider — Callers section", () => {
+suite("VSCODE-204: TravsrTreeDataProvider, Callers section", () => {
   test("returns placeholder when no active symbol", async () => {
     const provider = new TravsrTreeDataProvider(makeMcp(), makeContext());
     setSymbol(provider, undefined);
@@ -185,7 +185,7 @@ suite("VSCODE-204: TravsrTreeDataProvider — Callers section", () => {
     assert.ok((children[0].label as string).includes("No callers found"));
   });
 
-  test("parses [call] fn:bar — src/bar.ts format correctly", async () => {
+  test("parses [call] fn:bar, src/bar.ts format correctly", async () => {
     const provider = new TravsrTreeDataProvider(
       makeMcp({
         get_callers:
@@ -240,7 +240,7 @@ suite("VSCODE-204: TravsrTreeDataProvider — Callers section", () => {
   });
 });
 
-suite("VSCODE-204: TravsrTreeDataProvider — edge cases", () => {
+suite("VSCODE-204: TravsrTreeDataProvider, edge cases", () => {
   test("dep line with space after colon still gets open-file command (dep is trimmed)", async () => {
     const provider = new TravsrTreeDataProvider(
       makeMcp({ get_dependencies: "import: ./mcp\n" }),
@@ -295,7 +295,7 @@ suite("VSCODE-204: TravsrTreeDataProvider — edge cases", () => {
   });
 });
 
-suite("VSCODE-204: TravsrTreeDataProvider — refresh", () => {
+suite("VSCODE-204: TravsrTreeDataProvider, refresh", () => {
   test("refresh() fires onDidChangeTreeData", (done) => {
     const provider = new TravsrTreeDataProvider(makeMcp(), makeContext());
     provider.onDidChangeTreeData(() => done());
@@ -311,7 +311,7 @@ suite("VSCODE-204: TravsrTreeDataProvider — refresh", () => {
 
 // ── envelope stripping ─────────────────────────────────────────────────────
 
-suite("VSCODE-204: TravsrTreeDataProvider — <travsr-data> envelope stripping", () => {
+suite("VSCODE-204: TravsrTreeDataProvider, <travsr-data> envelope stripping", () => {
   // Helper to wrap a payload in the MCP server envelope.
   function wrap(payload: string): string {
     return `<travsr-data>\n${payload}\n</travsr-data>`;

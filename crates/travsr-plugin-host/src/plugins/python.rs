@@ -69,7 +69,7 @@ impl Plugin for PythonPlugin {
                 Err(e) => tracing::warn!("python lsif ingest: {e}"),
             },
             Ok(None) => {
-                tracing::debug!("travsr-lsif-py not found — native phase_b tree-sitter edges only")
+                tracing::debug!("travsr-lsif-py not found, native phase_b tree-sitter edges only")
             }
             Err(e) => tracing::warn!("travsr-lsif-py failed: {e}"),
         }

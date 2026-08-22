@@ -23,13 +23,13 @@ pub fn run(
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     if pattern.trim().is_empty() {
-        anyhow::bail!("pattern must not be empty — try: travsr pattern FlagSourceHash");
+        anyhow::bail!("pattern must not be empty; try: travsr pattern FlagSourceHash");
     }
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = find_git_root(&cwd)?;
     let db_path = repo_root.join(".travsr/graph.db");
     if !db_path.exists() {
-        anyhow::bail!("not initialized — run `travsr init`");
+        anyhow::bail!("not initialized; run `travsr init`");
     }
 
     let store = daemon_client::open_read_store(&db_path)?;

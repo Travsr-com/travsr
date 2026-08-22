@@ -64,14 +64,14 @@ pub async fn run(host: String, port: u16, tenants_dir: PathBuf) -> anyhow::Resul
                 tracing::debug!(
                     tenant = %tenant_id,
                     path = %path.display(),
-                    "tenant directory has no .travsr/graph.db — skipped"
+                    "tenant directory has no .travsr/graph.db, skipped"
                 );
             }
         }
     } else {
         tracing::warn!(
             path = %tenants_dir.display(),
-            "tenants_dir does not exist or is not a directory — starting with zero tenants"
+            "tenants_dir does not exist or is not a directory, starting with zero tenants"
         );
     }
 
@@ -96,7 +96,7 @@ pub async fn run(host: String, port: u16, tenants_dir: PathBuf) -> anyhow::Resul
     if !is_loopback(&host) {
         tracing::warn!(
             %host,
-            "binding a non-loopback address with plaintext HTTP — bearer tokens will \
+            "binding a non-loopback address with plaintext HTTP, bearer tokens will \
              cross the network in cleartext unless a TLS terminator sits in front"
         );
     }
@@ -104,7 +104,7 @@ pub async fn run(host: String, port: u16, tenants_dir: PathBuf) -> anyhow::Resul
     // knows exactly what to do rather than seeing a raw EADDRINUSE error.
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::AddrInUse {
-            anyhow::anyhow!("cannot bind to {addr}: {e} — try --port <other>")
+            anyhow::anyhow!("cannot bind to {addr}: {e}; try --port <other>")
         } else {
             anyhow::anyhow!("cannot bind to {addr}: {e}")
         }

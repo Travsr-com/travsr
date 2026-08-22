@@ -88,7 +88,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         Some(t) => t,
         None => {
             tracing::warn!(
-                "parse timed out for {} after {}s — emitting file node only",
+                "parse timed out for {} after {}s, emitting file node only",
                 abs_path.display(),
                 PARSE_TIMEOUT_MICROS / 1_000_000
             );
@@ -1236,7 +1236,7 @@ mod tests {
             out.nodes
                 .iter()
                 .any(|n| n.vname.signature == "method:Worker.process" && n.kind == "method"),
-            "expected method:Worker.process — impl Trait for Type must use the implementing type"
+            "expected method:Worker.process, impl Trait for Type must use the implementing type"
         );
     }
 

@@ -146,7 +146,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     },
     {
       language: "java", package: "scip-java", sandbox: "Elevated",
-      status: "needs_consent", statusLine: "partial (full analysis needs your permission — run: travsr lang allow-unsandboxed java)",
+      status: "needs_consent", statusLine: "partial (full analysis needs your permission; run: travsr lang allow-unsandboxed java)",
       repoState: "needs_analyzer",
       installed: true, registered: true, builtin: false, needsApproval: false,
       availableOnThisPlatform: true, unavailableTarget: null,
@@ -330,7 +330,7 @@ suite("codicon syntax never reaches webview HTML", () => {
       const hit = html.match(CODICON);
       assert.ok(
         hit === null,
-        `${name} leaks codicon syntax into HTML: ${hit?.[0]} — drop it, a webview cannot render it`,
+        `${name} leaks codicon syntax into HTML: ${hit?.[0]}, drop it, a webview cannot render it`,
       );
     }
   });

@@ -382,7 +382,7 @@ pub fn ask_query_with_filter(
             tracing::warn!(
                 knn_elapsed_ms,
                 threshold_ms = budget_ms,
-                "ask_query knn exceeded circuit-breaker — falling back to FTS seeds"
+                "ask_query knn exceeded circuit-breaker, falling back to FTS seeds"
             );
             knn_pairs = vec![];
             knn_oracle = std::collections::HashMap::new();
@@ -977,7 +977,7 @@ pub fn graph_all_payload(store: &SqliteStore) -> anyhow::Result<GraphPayload> {
     // L7: cap at GRAPH_ALL_NODE_LIMIT to prevent OOM on very large repos.
     if all.len() > GRAPH_ALL_NODE_LIMIT {
         eprintln!(
-            "warning: graph has {} nodes — showing first {} only. \
+            "warning: graph has {} nodes, showing first {} only. \
              Use `travsr graph <symbol>` for focused traversal.",
             all.len(),
             GRAPH_ALL_NODE_LIMIT
@@ -1248,7 +1248,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{direction:?}: tree step to the caller missing"));
             assert!(
                 caller_step.incoming,
-                "{direction:?}: caller tree step not tagged incoming — the \
+                "{direction:?}: caller tree step not tagged incoming, the \
                  tree renderer would draw the in-edge as outgoing"
             );
         }

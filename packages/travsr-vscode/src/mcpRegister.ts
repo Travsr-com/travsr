@@ -172,7 +172,7 @@ export function registerMcpServerCommand(): vscode.Disposable {
     if (!binaryPath) {
       const action = await vscode.window.showErrorMessage(
         "Travsr: no usable travsr binary found to register. External agents " +
-        "need an absolute path to the native binary — download it, or set " +
+        "need an absolute path to the native binary, download it, or set " +
         "travsr.binaryPath first.",
         "Download",
         "Open Settings"
@@ -214,7 +214,7 @@ export function registerMcpServerCommand(): vscode.Disposable {
         existing = JSON.parse(fs.readFileSync(target.configPath, "utf8")) as Record<string, unknown>;
       } catch {
         void vscode.window.showErrorMessage(
-          `Travsr: could not parse ${target.configPath} — fix JSON errors first.`
+          `Travsr: could not parse ${target.configPath}, fix JSON errors first.`
         );
         return;
       }

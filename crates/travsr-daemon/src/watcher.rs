@@ -268,7 +268,7 @@ pub fn spawn(
                                             tracing::warn!(
                                                 dropped = dropped_total,
                                                 cap = MAX_PENDING,
-                                                "watcher debounce table full — new paths \
+                                                "watcher debounce table full, new paths \
                                                  dropped (run `travsr init` to reconcile)"
                                             );
                                         }

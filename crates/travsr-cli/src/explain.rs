@@ -41,7 +41,7 @@ fn print_disposition(label: &str, d: &ExplainDisposition) {
         );
         match d.rerank_score {
             Some(r) => println!("    rerank score: {r:.4}"),
-            None => println!("    rerank score: (none — not reranked)"),
+            None => println!("    rerank score: (none, not reranked)"),
         }
     } else {
         println!("    in seed set: no");
@@ -59,7 +59,7 @@ pub fn run(query_str: &str, symbol: &str, format: OutputFormat) -> anyhow::Resul
     let repo_root = find_git_root(&cwd)?;
     let db_path = repo_root.join(".travsr/graph.db");
     if !db_path.exists() {
-        anyhow::bail!("not initialized — run `travsr init`");
+        anyhow::bail!("not initialized; run `travsr init`");
     }
 
     let mut store = daemon_client::open_read_store(&db_path)?;
@@ -82,7 +82,7 @@ pub fn run(query_str: &str, symbol: &str, format: OutputFormat) -> anyhow::Resul
         return Ok(());
     }
     println!(
-        "node:   {} — {}",
+        "node:   {}, {}",
         report.target_signature.as_deref().unwrap_or("?"),
         report.target_path.as_deref().unwrap_or("?")
     );
@@ -133,7 +133,7 @@ pub fn run(query_str: &str, symbol: &str, format: OutputFormat) -> anyhow::Resul
         // actively wrong in another.
         if t.is_anchor_emit && t.symbol_freq > t.anchors_emitted {
             println!(
-                "      note: names {} symbols, {} became anchors — {} did not reach the anchor set",
+                "      note: names {} symbols, {} became anchors, {} did not reach the anchor set",
                 t.symbol_freq,
                 t.anchors_emitted,
                 t.symbol_freq - t.anchors_emitted

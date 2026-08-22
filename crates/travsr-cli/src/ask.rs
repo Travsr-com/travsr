@@ -67,7 +67,7 @@ fn print_docs(docs: &[String]) {
         return;
     }
     println!(
-        "── docs — documentation prose: claims about the code, verify behaviour against the code itself ──"
+        "── docs, documentation prose: claims about the code, verify behaviour against the code itself ──"
     );
     for line in docs {
         println!("{line}");
@@ -99,7 +99,7 @@ fn note_docs_flag_is_read_by_the_daemon() {
     }
     eprintln!(
         "note: TRAVSR_DOCS_ENABLED is read by the process that performs retrieval, \
-         which for `ask` is the travsr daemon — not this command. Prefer the \
+         which for `ask` is the travsr daemon, not this command. Prefer the \
          config key, which the daemon reads whatever environment it was started \
          in: `travsr config set docs.enabled true`."
     );
@@ -134,7 +134,7 @@ fn note_cold_path_cannot_render_docs(repo_root: &std::path::Path) {
         return;
     }
     eprintln!(
-        "note: docs.enabled is on, but no travsr daemon is running — this query \
+        "note: docs.enabled is on, but no travsr daemon is running, this query \
          is served by the read-only cold path, which does not load the doc \
          index, so no docs section can appear. Start the daemon with \
          `travsr daemon start`."
@@ -178,7 +178,7 @@ fn answer_faq(e: &crate::faq::Entry, format: OutputFormat) -> anyhow::Result<()>
 
 pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     if query_str.trim().is_empty() {
-        anyhow::bail!("search query must not be empty — try: travsr ask \"PaymentService\"");
+        anyhow::bail!("search query must not be empty; try: travsr ask \"PaymentService\"");
     }
     // The explicit route, checked before the repository is even located: a
     // question about travsr is answerable with no index, which is exactly when
@@ -224,7 +224,7 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     let db_path = repo_root.join(".travsr/graph.db");
 
     if !db_path.exists() {
-        anyhow::bail!("not initialized — run `travsr init`");
+        anyhow::bail!("not initialized; run `travsr init`");
     }
 
     // A question about the repository as a whole is not one the graph can
@@ -399,10 +399,10 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             // that may not have run (e.g. KNN timed out → lexical fallback),
             // contradicting the degraded note printed below.
             let header = match tag {
-                "exact" => "── exact matches — literal symbol / text ──",
-                "semantic" => "── related — ranked by relevance ──",
-                "tests" => "── tests — test entry points & fixtures ──",
-                _ => "── relevant — graph-adjacent context ──",
+                "exact" => "── exact matches, literal symbol / text ──",
+                "semantic" => "── related, ranked by relevance ──",
+                "tests" => "── tests, test entry points & fixtures ──",
+                _ => "── relevant, graph-adjacent context ──",
             };
             println!("{header}");
             println!("{}", Table::new(rows));

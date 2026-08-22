@@ -79,7 +79,7 @@ function assertUnderRoot(resolvedPath: string, repoRoot: string, context: string
     throw new Error(
       `SEC-003: ${context} "${resolvedPath}" resolves outside ` +
         `the project root "${repoRoot}". ` +
-        'Refusing to process — this path may be attempting to read ' +
+        'Refusing to process; this path may be attempting to read ' +
         'files outside the project.'
     );
   }

@@ -271,7 +271,7 @@ pub fn skeleton_for_node(node: &Node, repo_root: &Path) -> Option<AstSkeleton> {
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
     if !canon_abs.starts_with(&canon_root) {
-        tracing::warn!(path = %p, "skeleton_for_node: path escapes repo_root — skipping");
+        tracing::warn!(path = %p, "skeleton_for_node: path escapes repo_root, skipping");
         return None;
     }
 

@@ -64,7 +64,7 @@ export function blastCommand(file: string, files: string[], threshold: number): 
   const plural = count !== 1 ? "s" : "";
   const title =
     count >= threshold
-      ? `⚠️ high blast: ${formatBlastCount(count)} file${plural} — review before editing`
+      ? `⚠️ high blast: ${formatBlastCount(count)} file${plural}; review before editing`
       : `🩻 blast: ${formatBlastCount(count)} file${plural}`;
   return { title, command: "travsr.showBlastRadius", arguments: [file, files] };
 }

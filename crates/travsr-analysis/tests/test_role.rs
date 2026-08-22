@@ -255,9 +255,7 @@ fn golden_test_roles() {
                 .nodes
                 .iter()
                 .find(|n| n.vname.signature == c.sig)
-                .unwrap_or_else(|| {
-                    panic!("{:?}: missing node `{}` — have {have:?}", f.lang, c.sig)
-                });
+                .unwrap_or_else(|| panic!("{:?}: missing node `{}`, have {have:?}", f.lang, c.sig));
             assert_eq!(
                 node.test_role, c.role,
                 "{:?}: `{}` expected {:?}, got {:?}",

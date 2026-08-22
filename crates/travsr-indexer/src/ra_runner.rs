@@ -169,7 +169,7 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
     let ra_path = match ra_binary_path() {
         Some(p) => p,
         None => {
-            tracing::info!("rust-analyzer not found — skipping Rust's full cross-file analysis");
+            tracing::info!("rust-analyzer not found, skipping Rust's full cross-file analysis");
             return Ok(None);
         }
     };
@@ -217,7 +217,7 @@ fn spawn_or_skip_ra(
                 tracing::warn!(
                     repo = %repo_root.display(),
                     reason,
-                    "rust-analyzer skipped — no OS sandbox available and \
+                    "rust-analyzer skipped, no OS sandbox available and \
                      --allow-unsandboxed not set; Rust falls back to structural \
                      analysis only. {recovery}"
                 );
@@ -232,7 +232,7 @@ fn spawn_or_skip_ra(
             tracing::warn!(
                 repo = %repo_root.display(),
                 reason,
-                "rust-analyzer will run without OS sandboxing — the --allow-unsandboxed \
+                "rust-analyzer will run without OS sandboxing, the --allow-unsandboxed \
                  opt-in was acknowledged. Make sure you trust this repository."
             );
         }
@@ -348,7 +348,7 @@ mod tests {
         );
         assert!(
             !sentinel.exists(),
-            "sentinel file must not exist — spawn_or_skip_ra called cmd.spawn() \
+            "sentinel file must not exist, spawn_or_skip_ra called cmd.spawn() \
              despite Unavailable sandbox and allow_unsandboxed=false (SEV-2 regression)"
         );
     }
