@@ -351,4 +351,3 @@ fn read_dirty_seq(store: &mut travsr_store::SqliteStore) -> u64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
 }
-
