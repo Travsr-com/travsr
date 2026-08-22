@@ -7487,6 +7487,41 @@ fn byte_trigram_jaccard(a: &str, b: &str) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    /// #749 review: the `.travsr` name check had no direct test in the crate
+    /// that owns it. Its only coverage was incidental, in a `travsr-mcp`
+    /// snippets test whose fixture happens to keep a non-`.travsr` layout, so
+    /// normalising that fixture for consistency would have silently deleted it.
+    #[test]
+    fn a_database_outside_a_travsr_dir_yields_no_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(&dir.path().join("graph.db")).unwrap();
+        assert_eq!(
+            store.repo_root_from_db_path(),
+            None,
+            "deriving a root from any database location invents a confident \
+             wrong answer, which is worse than none"
+        );
+    }
+
+    #[test]
+    fn a_database_inside_a_travsr_dir_yields_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let travsr_dir = dir.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        let store = SqliteStore::open(&travsr_dir.join("graph.db")).unwrap();
+        assert_eq!(
+            store.repo_root_from_db_path().as_deref(),
+            Some(dir.path()),
+            "`<repo>/.travsr/graph.db` derives `<repo>`"
+        );
+    }
+
+    #[test]
+    fn an_in_memory_store_has_no_root_to_derive() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert_eq!(store.repo_root_from_db_path(), None);
+    }
+
     use super::*;
     use travsr_core::VName;
 
