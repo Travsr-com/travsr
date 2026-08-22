@@ -8,7 +8,7 @@
  *   travsr.showExecutionPath PCST path between two symbols, rendered in the graph
  *   travsr.showRepos         registry manager webview
  *   travsr.showGraphStats    graph metrics dashboard webview
- *   travsr.showLanguages     indexed + available languages, install/approve from UI
+ *   travsr.showLanguages     indexed + available languages, install from UI
  *
  * Pure helpers (stripEnvelope, parsers, openAtLine) are exported for unit tests.
  */
@@ -606,7 +606,6 @@ type PanelMessage =
   | { command: "prune" }
   | { command: "remove"; name: string }
   | { command: "installLang"; language: string }
-  | { command: "approveLang"; language: string; approvedBy: string; reason: string; permittedHosts: string }
   | { command: "removeLang"; language: string }
   | { command: "enableWithPermission"; language: string }
   | { command: "detectLangs" }
@@ -1124,39 +1123,6 @@ export function registerShowLanguages(
             void vscode.window.showInformationMessage(lastLine(out) || `${msg.language} tool installed.`);
           }
         });
-        return;
-      }
-      case "approveLang": {
-        const m = msg as { command: "approveLang"; language: string; approvedBy: string; reason: string; permittedHosts: string };
-        if (!m.approvedBy || !m.reason) {
-          void vscode.window.showWarningMessage("Approver handle and reason are required.");
-          return;
-        }
-        const approveArgs = [
-          "lang", "approve", m.language,
-          "--approved-by", m.approvedBy,
-          "--reason", m.reason,
-          "--permitted-hosts", m.permittedHosts || "",
-        ];
-        const repo = await activeRepo.ensureChosen();
-        if (!repo) return;
-        const installArgs = ["lang", "install", m.language, "--no-interactive", "--yes"];
-        // Record the approval (local, fast), then install under a cancellable
-        // progress notification — the install reaches the network, so it must not
-        // be governed by a fixed timer.
-        void spawnLangCommand(getBinary(), approveArgs)
-          .then(() => spawnManagedInstall(getBinary(), installArgs, repo, `Installing ${m.language} with approval…`))
-          .then(({ out, cancelled }) => {
-            availableLoaded = false;
-            void refresh();
-            if (cancelled) {
-              void vscode.window.showWarningMessage(
-                `Install of ${m.language} was cancelled — it may be partly done. Re-run, or run \`travsr lang install ${m.language}\` in a terminal.`
-              );
-            } else {
-              void vscode.window.showInformationMessage(lastLine(out) || `${m.language} installed with elevated approval.`);
-            }
-          });
         return;
       }
       case "removeLang":
