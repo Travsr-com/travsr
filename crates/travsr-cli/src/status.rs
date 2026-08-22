@@ -248,7 +248,7 @@ pub fn run() -> anyhow::Result<()> {
                     // success, which is what makes it worth saying out loud.
                     ["no_references", lang] => {
                         eprintln!(
-                            "warning: '{lang}' analysis produced definitions but no references, so no call edges came from it. The analyzer reported success, so this is its output being incomplete rather than a crash — re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see its own diagnostics"
+                            "warning: '{lang}' analysis produced definitions but no references, so no call edges came from it. The analyzer reported success, so this is its output being incomplete rather than a crash. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see its own diagnostics"
                         );
                     }
                     ["zero_nodes", lang] => {
