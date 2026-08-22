@@ -799,18 +799,20 @@ impl Drop for SqliteStore {
 }
 
 impl SqliteStore {
-    /// The repository this store's database sits inside, derived from the
-    /// database's own location rather than from anything recorded at index time.
-    ///
-    /// `meta.repo_root` is stamped once by `init` and never updated, so it names
-    /// wherever the repository lived then. Move the checkout, clone it to a
-    /// second path, mount it at a different point in CI, or rename a home
-    /// directory, and every consumer of that key is handed a path that no longer
-    /// exists (#747). The database travels with the repository, so its own path
-    /// cannot go stale in the same way.
-    ///
-    /// `None` for an in-memory store, which has no location to derive from.
     /// The repository root to resolve paths against, live rather than remembered.
+    ///
+    /// `meta.repo_root` is stamped by `init` and by `reindex_files`, so it names
+    /// wherever the repository lived at the last index. Move the checkout, clone
+    /// it to a second path, mount it at a different point in CI, or rename a home
+    /// directory, and every consumer of that key is handed a path that no longer
+    /// exists until something reindexes (#747). The database travels with the
+    /// repository, so its own location covers that window.
+    ///
+    /// `None` only when there is neither a recorded value nor a derivable one:
+    /// an in-memory store, or a database outside a `.travsr` directory, with no
+    /// `repo_root` in meta. A store with nothing to derive from still returns a
+    /// recorded value, whether or not that path still resolves, since there is
+    /// nothing to contradict it.
     ///
     /// Lives here rather than in a caller because there are six readers of
     /// `meta.repo_root` across `travsr-mcp` alone, and the first version of this
@@ -848,6 +850,11 @@ impl SqliteStore {
         }
     }
 
+    /// The repository this store's database sits inside, derived from the
+    /// database's own location rather than from anything recorded at index time.
+    ///
+    /// `None` for an in-memory store, which has no location to derive from, and
+    /// for any database not sitting at `<repo>/.travsr/graph.db`.
     pub fn repo_root_from_db_path(&self) -> Option<std::path::PathBuf> {
         // `<repo>/.travsr/graph.db` -> `<repo>`, and only that shape.
         //
@@ -862,6 +869,7 @@ impl SqliteStore {
         }
         dir.parent().map(std::path::Path::to_path_buf)
     }
+
     /// Open (or create) a SQLite-backed store at `path`, enabling WAL and
     /// running any pending migrations via [`MigrationRunner`].
     pub fn open(path: &Path) -> Result<Self, StoreError> {

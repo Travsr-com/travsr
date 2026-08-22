@@ -1268,16 +1268,16 @@ pub fn init_repo_with_progress(
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
     // path at query time without threading repo_root through function signatures.
     //
-    // Stamped here and only here. `reindex_files`, which the watcher and the
-    // commit hook run, does not write this key, so an incremental reindex after a
-    // move leaves it stale: the self-correction is an explicit `travsr init` from
-    // the new path, not "any re-index".
+    // The write here has always been unconditional, so `init` has always
+    // re-stamped. What changed is that `reindex_files`, the path the watcher and
+    // the commit hook run, now stamps the key too, so a moved checkout corrects
+    // itself on any reindex rather than only on an explicit `travsr init`
+    // (#749 review).
     //
-    // My earlier note here claimed this changed from write-once to re-stamped.
-    // It did not: the write was already unconditional on the base, so that
-    // described a fix this diff does not contain (#749 review). Consumers
-    // falling back to the database's own location is what actually covers the
-    // gap.
+    // Neither stamp covers the first query after a move, before any reindex has
+    // run. Consumers cover that window by falling back to the database's own
+    // location (`SqliteStore::resolve_repo_root`), which travels with the
+    // repository and so cannot go stale the same way (#747).
     if let Some(root_str) = repo_root.to_str() {
         store
             .set_meta("repo_root", root_str)
