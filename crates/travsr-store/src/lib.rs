@@ -3869,28 +3869,44 @@ LIMIT ?4",
             // rather than persist it. This gate is what lets the positional
             // rust-analyzer LSIF path (W3b) and any external-symbol reference
             // fail closed instead of leaving the 34% dangling this plan removes.
-            let callee_exists = tx
+            // Fetch the callee's kind (not just existence): #757 records a
+            // reference onto a `field` node under `ref/field` instead of
+            // `ref/call`, matching the native Rust field-ref path, so a field
+            // read never appears as a caller in `get_callers`/blast-radius.
+            let callee_kind: Option<String> = tx
                 .query_row(
-                    "SELECT 1 FROM nodes WHERE id = ?1",
+                    "SELECT kind FROM nodes WHERE id = ?1",
                     params![callee_id],
-                    |_| Ok(()),
+                    |row| row.get(0),
                 )
                 .optional()
-                .context("write_scip_attributed_batch: callee existence check")?
-                .is_some();
-            if !callee_exists {
+                .context("write_scip_attributed_batch: callee existence check")?;
+            let Some(callee_kind) = callee_kind else {
+                // E3 (W3a): callee resolves to no node — a genuine unresolved
+                // symbol (external/stdlib, or a positional miss). Fail closed:
+                // a dangling ref would pollute get_callers/blast-radius.
                 continue;
-            }
+            };
+            let is_field = callee_kind == "field";
 
-            // #650: only genuine calls create a call-graph `ref/call` edge, so
+            // #650/#757: only genuine calls create a call-graph `ref/call` edge, so
             // `get_callers` / blast-radius / PageRank stay a call graph and never
-            // gain a `src == dst` self-loop or a spurious non-call edge. Non-call
-            // references (type annotations, `self`/`Self`, path segments) still
-            // record their occurrence below so `find_references` enumerates every
-            // use site (issue #299). `is_call` defaults to true for call-scoped
-            // producers (native tree-sitter, bundled emitters), so their edges are
-            // unchanged.
-            if scip_ref.is_call {
+            // gain a `src == dst` self-loop or a spurious non-call edge. A field
+            // read is not a call: emit a `ref/field` edge (also excluded from the
+            // call graph) so it is symmetric with the native Rust path. Other
+            // non-call references (type annotations, `self`/`Self`, path segments)
+            // still record only their occurrence below so `find_references`
+            // enumerates every use site (issue #299). `is_call` defaults to true
+            // for call-scoped producers (native tree-sitter, bundled emitters).
+            if is_field {
+                tx.execute(
+                    "INSERT INTO edges(src, dst, kind, provenance, confidence) \
+                     VALUES(?1, ?2, 'ref/field', 'scip', NULL) \
+                     ON CONFLICT(src, dst, kind) DO UPDATE SET provenance = 'scip'",
+                    params![caller_id, callee_id],
+                )
+                .context("write_scip_attributed_batch: insert field edge")?;
+            } else if scip_ref.is_call {
                 tx.execute(
                     "INSERT INTO edges(src, dst, kind, provenance, confidence) \
                      VALUES(?1, ?2, 'ref/call', 'scip', NULL) \
@@ -3900,11 +3916,13 @@ LIMIT ?4",
                 .context("write_scip_attributed_batch: insert edge")?;
             }
 
-            // O4: record call-site line evidence. Written for every reference
-            // (call or not) so `find_references` covers non-call use sites too.
+            // O4: record the occurrence line for every reference (call, field, or
+            // other non-call) so `find_references` covers all use sites. Field
+            // occurrences go under `ref/field`; everything else under `ref/call`.
+            let site_kind = if is_field { "ref/field" } else { "ref/call" };
             tx.execute(
-                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, 'ref/call', ?3)",
-                params![caller_id, callee_id, occ_line],
+                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, ?3, ?4)",
+                params![caller_id, callee_id, site_kind, occ_line],
             )
             .context("write_scip_attributed_batch: insert edge_site")?;
         }
@@ -10337,6 +10355,61 @@ mod tests {
             ],
             "must return cross-file ref/call + resolves-to pairs, excluding same-file"
         );
+    }
+
+    #[test]
+    fn scip_reference_onto_field_node_is_ref_field_not_ref_call() {
+        // #757: a SCIP reference whose callee is a `field` node (go/java field
+        // access, e.g. `z.animals`) must be recorded as `ref/field`, matching the
+        // native Rust path, so it surfaces in find_references but never in the
+        // ref/call caller set.
+        let corpus = "c";
+        let path = "src/zoo.go";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new(corpus, "", path, "go", "method:Zoo.Add"),
+            "method",
+        )
+        .with_line(1)
+        .with_end_line(10);
+        let field = Node::new(
+            VName::new(corpus, "", path, "go", "field:Zoo.animals"),
+            "field",
+        );
+        store
+            .write_scip_attributed_batch(corpus, &[caller.clone(), field.clone()], &[])
+            .unwrap();
+
+        let refs = vec![travsr_core::ScipRef {
+            caller_path: path.to_string(),
+            caller_line: 5,
+            callee_id: field.id,
+            // Even if a producer marks it a call, a field callee is never a call.
+            is_call: true,
+        }];
+        store
+            .write_scip_attributed_batch(corpus, &[], &refs)
+            .unwrap();
+
+        // Edge is ref/field, and there is NO ref/call edge onto the field.
+        let all_edges = store.all_edges().unwrap();
+        assert!(
+            all_edges
+                .iter()
+                .any(|(_, d, k, _)| *d == field.id && k == "ref/field"),
+            "expected a ref/field edge onto the field: {all_edges:?}"
+        );
+        assert!(
+            !all_edges
+                .iter()
+                .any(|(_, d, k, _)| *d == field.id && k == "ref/call"),
+            "field must never get a ref/call edge: {all_edges:?}"
+        );
+        // find_references still returns the occurrence.
+        let sites = store.reference_sites(field.id).unwrap();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].line, 5);
     }
 
     // P4 golden test: grouped span fetch produces identical (ref → enclosing_id) mapping
