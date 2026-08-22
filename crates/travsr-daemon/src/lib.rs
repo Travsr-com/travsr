@@ -135,8 +135,10 @@ pub struct PhaseBReport {
     /// Languages that need a `compile_commands.json` at the repo root
     /// (scip-clang, for `c`/`cpp`) but don't have one (L5a).
     pub skipped_no_compdb: Vec<String>,
-    /// Languages that are RequiresElevated but have no PSE approval in lang.toml.
-    /// Shown to the user with a `travsr lang approve` call-to-action.
+    /// Vestigial since elevated access became auto-granted for local use
+    /// (ADR-017 Amendment A5): RequiresElevated languages are no longer gated on
+    /// a PSE approval, so this is always empty. Retained as contract surface for
+    /// consumers that still read it.
     pub skipped_needs_approval: Vec<String>,
     /// Windows only: languages whose analyzer cannot run inside the isolation
     /// layer and have no permission on record. Shown to the user with a
