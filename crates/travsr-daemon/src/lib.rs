@@ -2374,19 +2374,31 @@ fn resolve_unresolved_calls(
             };
             let caller_lang = caller_langs.get(&u.src).map(String::as_str).unwrap_or("");
             let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
-            for (dst, path, lang) in cands {
-                // E4: a field ref must resolve within the caller's own language.
-                if !caller_lang.is_empty() && *lang != caller_lang {
-                    continue;
-                }
-                if u.src != *dst && call_target_reachable(caller_path, path, &crates) {
-                    edges.push(travsr_core::Edge::new(
-                        u.src,
-                        *dst,
-                        travsr_core::EdgeKind::RefField,
-                    ));
-                    sites.push((u.src, *dst, u.caller_line));
-                }
+            // E4: a field ref must resolve within the caller's own language.
+            let lang_scoped: Vec<&(travsr_core::NodeId, &str, &str)> = cands
+                .iter()
+                .filter(|(_, _, lang)| caller_lang.is_empty() || *lang == caller_lang)
+                .collect();
+            // CO-A1: a field read carries no crate hint, so an ambiguous
+            // `field:{T}.{name}` signature is not evidence of its target. Two
+            // same-named types produce the same signature (even two
+            // function-local `struct Config { active }` in one file), and
+            // neither the language filter above nor `call_target_reachable`
+            // below can separate same-language, same-crate candidates — so
+            // emitting an edge per candidate fabricates a use-site onto each.
+            // Fail closed unless exactly one survives, mirroring the CO-A1 gate
+            // the call path applies below.
+            if lang_scoped.len() != 1 {
+                continue;
+            }
+            let (dst, path, _lang) = lang_scoped[0];
+            if u.src != *dst && call_target_reachable(caller_path, path, &crates) {
+                edges.push(travsr_core::Edge::new(
+                    u.src,
+                    *dst,
+                    travsr_core::EdgeKind::RefField,
+                ));
+                sites.push((u.src, *dst, u.caller_line));
             }
             continue;
         }
@@ -4710,6 +4722,63 @@ mod tests {
         // No `field:Store.conn` node seeded → the exact lookup misses.
         let (edges, sites) = resolve_one_field_ref(&store, Some("Store"));
         assert!(edges.is_empty(), "missing field node → no edge: {edges:?}");
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn field_ref_ambiguous_signature_fails_closed() {
+        // #757 re-review (CO-A1): a field read carries no crate hint, so an
+        // ambiguous `field:{T}.{name}` signature is not evidence of its target.
+        // `nodes_by_signatures` matches by signature alone, so two distinct
+        // types both named `Config` yield two `field:Config.active` nodes; the
+        // language filter and `call_target_reachable` cannot separate two
+        // same-language, same-crate candidates. Emitting an edge per candidate
+        // would fabricate a use-site onto each — the exact route the call
+        // path's CO-A1 gate exists to close. Fail closed unless exactly one
+        // candidate survives.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "method:Store.f",
+            ),
+            "method",
+        );
+        store.put_node(&caller).unwrap();
+        // Two `Config` types in the same crate, different files → two distinct
+        // field nodes sharing the signature `field:Config.active`, both
+        // reachable from and same-language as the caller.
+        for p in ["crates/crate-a/src/one.rs", "crates/crate-a/src/two.rs"] {
+            let field = Node::new(
+                VName::new("", "", p, "rust", "field:Config.active"),
+                "field",
+            );
+            store.put_node(&field).unwrap();
+        }
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "field:active".to_string(),
+            alt_callee_sig: None,
+            hint_crate: None,
+            caller_line: 9,
+            is_method_call: false,
+            recv_type: Some("Config".to_string()),
+        }];
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "ambiguous field signature must fabricate no edge: {edges:?}"
+        );
         assert!(sites.is_empty());
     }
 
