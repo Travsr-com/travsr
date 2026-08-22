@@ -41,7 +41,9 @@ reason = "paste 1.0.15 is unmaintained (archived by its author), not vulnerable.
 # A permanent ignore would bury a known future outage, so this one lapses and
 # forces a re-look. When it does lapse, OSV Scan goes red again and gate-osv
 # blocks promotions: that is intended, but it means this date must be triaged
-# rather than mechanically extended. Escape hatch if upstream is still stuck:
+# rather than mechanically extended. You should not first learn about it at
+# promotion time: .github/scripts/check-advisory-expiry.sh runs on every PR and
+# warns 60 days out, then fails the build 14 days out. Escape hatch if upstream is still stuck:
 # tabled appears in only two files (travsr-cli/src/repos.rs, ask.rs) with two
 # derive sites, or patch tabled_derive via [patch.crates-io].
 [[IgnoredVulns]]
