@@ -10,9 +10,6 @@ use travsr_plugin_host::phase_b::catalog::{
     lookup, GzBinarySpec, PhaseBEntry, SandboxRequirement, ScipBinarySpec, ScipInstall,
     ZipBinarySpec, CATALOG,
 };
-use travsr_plugin_host::sandbox::policy::validate_permitted_host;
-
-const APPROVAL_EXPIRY_DAYS: i64 = 365;
 
 #[derive(Debug, Subcommand)]
 pub enum LangCommand {
@@ -82,22 +79,6 @@ pub enum LangCommand {
         /// Language name.
         language: String,
     },
-    /// Record security approval for a language that needs network access during indexing.
-    /// Must be run before `travsr lang install` for Java, Kotlin, C#, Scala.
-    Approve {
-        /// Canonical language name (e.g. java, csharp).
-        language: String,
-        /// GitHub handle of the approver.
-        #[arg(long)]
-        approved_by: String,
-        /// One-sentence justification (recorded in config).
-        #[arg(long)]
-        reason: String,
-        /// Comma-separated list of permitted network hosts.
-        /// Example: repo1.maven.org,repo.maven.apache.org,plugins.gradle.org
-        #[arg(long, value_delimiter = ',')]
-        permitted_hosts: Vec<String>,
-    },
     /// Permit a language's analyzer to run with your own privileges on Windows.
     ///
     /// A few analyzers (currently Java and Scala) cannot run inside Travsr's
@@ -155,12 +136,6 @@ pub fn run(cmd: LangCommand) -> Result<()> {
         LangCommand::Detect { yes } => cmd_detect(yes),
         LangCommand::Add { language, corpus } => cmd_add(&language, corpus.as_deref()),
         LangCommand::Remove { language } => cmd_remove(&language),
-        LangCommand::Approve {
-            language,
-            approved_by,
-            reason,
-            permitted_hosts,
-        } => cmd_approve(&language, &approved_by, &reason, permitted_hosts),
         LangCommand::AllowUnsandboxed {
             language,
             granted_by,
@@ -243,14 +218,15 @@ fn analyzer_command_present(entry: &PhaseBEntry) -> bool {
 fn lang_capability_status(
     entry: &PhaseBEntry,
     registered: bool,
-    approved: bool,
     consent: bool,
 ) -> travsr_plugin_host::phase_b::status::LangStatus {
     travsr_plugin_host::phase_b::status::capability(
         &travsr_plugin_host::phase_b::status::Capability {
             entry,
             analyzer_ready: analyzer_ready(entry, registered),
-            approved,
+            // Elevated access is auto-granted for local use (ADR-017 amendment);
+            // `capability()` no longer reads this, so it is always true.
+            approved: true,
             // A language is "not available on this OS" either because its
             // travsr-lang-* wrapper has no build here (objectivec on non-Apple), or
             // because its analyzer ships only as a prebuilt binary with no asset for
@@ -393,7 +369,6 @@ fn json_arr(items: &[&str]) -> String {
 
 fn cmd_list(json: bool) -> Result<()> {
     let config = load_config();
-    let today = chrono::Local::now().date_naive();
 
     // Per-repo enablement (corpus trust gate): languages install globally, but
     // full analysis only runs in a repo whose corpus carries the trust grant.
@@ -418,18 +393,16 @@ fn cmd_list(json: bool) -> Result<()> {
                 .as_ref()
                 .map(|c| c.is_registered(entry.language))
                 .unwrap_or(false);
-            let approved = config
-                .as_ref()
-                .map(|c| c.is_approved(entry.language))
-                .unwrap_or(false);
             let provider_on_path = entry.provider_binary.map_or(true, tool_available);
             let tool_on_path = analyzer_command_present(entry);
             // Honest: the analyzer is installed when it is bundled (python) or its
             // external binary resolves — never just because a language is built in.
             let installed = (entry.analyzer_bundled() && bundled_analyzer_ready(entry))
                 || (provider_on_path && tool_on_path);
-            let needs_approval =
-                matches!(entry.sandbox, SandboxRequirement::RequiresElevated) && !approved;
+            // Elevated access is auto-granted for local use (ADR-017 amendment), so
+            // no language ever needs approval. The `needsApproval` field is kept as a
+            // constant false so an older extension parsing this JSON keeps working.
+            let needs_approval = false;
             let package = entry.npm_package.unwrap_or(entry.command);
             let scip_type = match entry.scip_install {
                 ScipInstall::GithubBinary(_) => "GithubBinary",
@@ -451,7 +424,7 @@ fn cmd_list(json: bool) -> Result<()> {
             // machine tag; `statusLine` is the exact human wording used in the CLI,
             // so the extension shows the same words without re-deriving them.
             let consent = unsandboxed_consent_present(config.as_ref(), entry.language);
-            let status = lang_capability_status(entry, registered, approved, consent);
+            let status = lang_capability_status(entry, registered, consent);
             // Per-repo enablement for the repo we are being run in (corpus trust
             // gate). The VS Code panel runs `lang list --json` with the target
             // repo as cwd, so this reflects that repo.
@@ -502,26 +475,10 @@ fn cmd_list(json: bool) -> Result<()> {
             .as_ref()
             .map(|c| c.is_registered(entry.language))
             .unwrap_or(false);
-        let approval = config.as_ref().and_then(|c| c.get_approval(entry.language));
-
         // One computed status for every language — the same call `lang detect` and
         // the JSON branch make, so the three can never drift apart again.
         let consent = unsandboxed_consent_present(config.as_ref(), entry.language);
-        let status = lang_capability_status(entry, registered, approval.is_some(), consent);
-
-        // A recorded network approval that has aged past expiry is surfaced in
-        // plain words on top of the state — no symbols.
-        let expiry = approval
-            .as_ref()
-            .and_then(|a| chrono::NaiveDate::parse_from_str(&a.approved_date, "%Y-%m-%d").ok())
-            .filter(|d| (today - *d).num_days() > APPROVAL_EXPIRY_DAYS)
-            .map(|_| {
-                format!(
-                    "  (approval expired, run: travsr lang install {})",
-                    entry.language
-                )
-            })
-            .unwrap_or_default();
+        let status = lang_capability_status(entry, registered, consent);
 
         // Is full analysis turned on for the repo we are in? (corpus trust gate)
         let repo_state = RepoState::compute(
@@ -536,12 +493,11 @@ fn cmd_list(json: bool) -> Result<()> {
         }
 
         println!(
-            "{:<12} {:<13} {:<24} {}{}",
+            "{:<12} {:<13} {:<24} {}",
             entry.language,
             repo_state.cell(),
             entry.effective_prerequisites(),
             status.line(),
-            expiry
         );
     }
 
@@ -623,45 +579,11 @@ fn cmd_install(
     }
 
     // On Windows, the analyzers that cannot run isolated (java/scala) take the
-    // plain-child permission path instead of the network-approval path — running
-    // with the user's own privileges already covers the network the isolated path
-    // would have needed approval for. So skip the approval demand for them here and
-    // let the permission (`travsr lang allow-unsandboxed <lang>`) be the one gate.
+    // plain-child permission path (`travsr lang allow-unsandboxed <lang>`); the
+    // consent gate for that is checked further below. Elevated network access for
+    // RequiresElevated languages is otherwise auto-granted for local use (ADR-017
+    // amendment), so there is no install-time approval demand here anymore.
     let windows_unsandboxed = cfg!(windows) && entry.windows_sandbox_unsupported();
-
-    // RequiresElevated: a security approval must be on record before install.
-    // ADR-017 Rule 1 is the internal policy behind this check — never surface
-    // the ADR name in user output; use plain language instead.
-    if entry.sandbox == SandboxRequirement::RequiresElevated && !windows_unsandboxed {
-        let config = load_config();
-        let approved = config
-            .as_ref()
-            .map(|c| c.is_approved(language))
-            .unwrap_or(false);
-
-        if !approved {
-            let interactive =
-                !no_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin());
-            if interactive {
-                inline_approval_prompt(entry, language)?;
-            } else {
-                anyhow::bail!(
-                    "'{language}' needs network access during indexing to resolve dependencies.\n\
-                     A security approval must be recorded before it can be installed.\n\
-                     \n\
-                     Run interactively (without --no-interactive) to approve inline, or:\n\
-                     \n\
-                     travsr lang approve {language} \\\n\
-                     \t--approved-by <approver-github-handle> \\\n\
-                     \t--reason \"<one-sentence justification>\" \\\n\
-                     \t--permitted-hosts {}\n\
-                     \n\
-                     Then re-run: travsr lang install {language}",
-                    entry.elevated_hosts.join(",")
-                );
-            }
-        }
-    }
 
     // Download and install the travsr-lang-* wrapper binary.
     let wrapper_installed = match entry.provider_binary {
@@ -1465,12 +1387,8 @@ fn cmd_detect(yes: bool) -> Result<()> {
             .as_ref()
             .map(|c| c.is_registered(lang))
             .unwrap_or(false);
-        let approved = config
-            .as_ref()
-            .map(|c| c.is_approved(lang))
-            .unwrap_or(false);
         let consent = unsandboxed_consent_present(config.as_ref(), lang);
-        lang_capability_status(entry, registered, approved, consent)
+        lang_capability_status(entry, registered, consent)
     };
     let mut installable: Vec<&str> = Vec::new();
     let mut unavailable: Vec<&str> = Vec::new();
@@ -1516,9 +1434,8 @@ fn cmd_detect(yes: bool) -> Result<()> {
     // `--yes`: install everything installable without prompting. This is the path
     // the VS Code "Detect & install" button takes — it spawns `lang detect` with
     // no terminal attached, so without this it would only ever print the list and
-    // install nothing. Each install is non-interactive; an elevated language with
-    // no approval on file is skipped by `cmd_install` with a note, never silently
-    // reaching the network.
+    // install nothing. Each install is non-interactive; elevated languages install
+    // with no approval step now that elevated access is auto-granted for local use.
     if yes {
         install_selected(
             &installable,
@@ -1595,9 +1512,8 @@ fn install_selected(selected: &[&str], no_interactive: bool, yes: bool) {
 /// `add` predates `install` and used to fetch the analyzer via `npm install -g`.
 /// Distribution moved to GitHub-release binaries (see `cmd_install`), so the npm
 /// path is gone: `add` now just forwards to `install`, which downloads the right
-/// binary, handles elevated approval interactively, and auto-enables the current
-/// repo. Kept as an alias because existing docs and muscle memory still reach for
-/// it.
+/// binary and auto-enables the current repo. Kept as an alias because existing
+/// docs and muscle memory still reach for it.
 fn cmd_add(language: &str, corpus: Option<&str>) -> Result<()> {
     cmd_install(language, false, false, corpus, false, false, None).map(|_| ())
 }
@@ -1619,52 +1535,6 @@ fn cmd_remove(language: &str) -> Result<()> {
     } else {
         println!("'{language}' was not registered.");
     }
-    Ok(())
-}
-
-// ── approve ───────────────────────────────────────────────────────────────────
-
-fn cmd_approve(
-    language: &str,
-    approved_by: &str,
-    reason: &str,
-    permitted_hosts: Vec<String>,
-) -> Result<()> {
-    let entry =
-        lookup(language).ok_or_else(|| anyhow::anyhow!("Unknown language '{language}'."))?;
-
-    if entry.sandbox != SandboxRequirement::RequiresElevated {
-        anyhow::bail!(
-            "'{language}' does not need network access during indexing, so no approval \
-             is required. Run `travsr lang install {language}` directly."
-        );
-    }
-
-    anyhow::ensure!(!approved_by.is_empty(), "--approved-by must not be empty");
-    anyhow::ensure!(!reason.is_empty(), "--reason must not be empty");
-    anyhow::ensure!(
-        !permitted_hosts.is_empty(),
-        "--permitted-hosts must not be empty for languages that need network access.\n\
-         Example: --permitted-hosts repo1.maven.org,repo.maven.apache.org,plugins.gradle.org"
-    );
-    // ADR-017 Rule 1: explicit allowlist only — no wildcards, no CIDR ranges.
-    for host in &permitted_hosts {
-        validate_permitted_host(host)
-            .map_err(|e| anyhow::anyhow!("invalid --permitted-hosts entry '{host}': {e}"))?;
-    }
-
-    let mut config = load_config().unwrap_or_default();
-    config.approve(language, approved_by, reason, permitted_hosts.clone());
-    save_config(&config)?;
-
-    println!(
-        "Security approval recorded for '{language}'.\n\
-         Permitted hosts: {}\n\
-         note: the sandbox does not filter traffic per host — this allowlist is\n\
-         only enforced if a host-level firewall or egress proxy backs it.\n\
-         Run `travsr lang install {language}` to complete installation.",
-        permitted_hosts.join(", ")
-    );
     Ok(())
 }
 
@@ -1762,81 +1632,6 @@ fn confirm_unsandboxed_grant(yes: bool) -> Result<bool> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
-}
-
-// ── interactive approval prompt ───────────────────────────────────────────────
-
-/// Interactively collect security approval for a RequiresElevated language.
-/// Called from cmd_install when stdin is a TTY and approval is not yet on record.
-///
-/// User-facing strings use plain language — no "ADR-017" in output.
-/// The ADR-017 Rule 1 policy is explained in code comments for developers.
-fn inline_approval_prompt(
-    entry: &travsr_plugin_host::phase_b::catalog::PhaseBEntry,
-    language: &str,
-) -> Result<()> {
-    use std::io::Write as _;
-
-    println!(
-        "'{language}' needs network access during indexing to resolve dependencies.\n\
-         A security approval must be recorded before it can be enabled.\n\
-         \n\
-         Network hosts that will be contacted:\n{}",
-        entry
-            .elevated_hosts
-            .iter()
-            .map(|h| format!("  - {h}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    println!();
-
-    let approved_by = prompt_field("Approver's GitHub handle: ")?;
-    let reason = prompt_field("One-sentence justification: ")?;
-
-    let default_hosts = entry.elevated_hosts.join(",");
-    print!("Permitted hosts (comma-separated) [{default_hosts}]: ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    let hosts_str = answer.trim();
-    let permitted_hosts: Vec<String> = if hosts_str.is_empty() {
-        entry.elevated_hosts.iter().map(|s| s.to_string()).collect()
-    } else {
-        hosts_str.split(',').map(|s| s.trim().to_string()).collect()
-    };
-
-    // ADR-017 Rule 1: each host must be a plain FQDN — no wildcards, no CIDR.
-    for host in &permitted_hosts {
-        validate_permitted_host(host).map_err(|e| anyhow::anyhow!("invalid host '{host}': {e}"))?;
-    }
-
-    let mut config = load_config().unwrap_or_default();
-    config.approve(language, &approved_by, &reason, permitted_hosts.clone());
-    save_config(&config)?;
-
-    println!(
-        "Approval recorded. Permitted hosts: {}\n\
-         note: the sandbox does not filter traffic per host — this allowlist is\n\
-         only enforced if a host-level firewall or egress proxy backs it.\n",
-        permitted_hosts.join(", ")
-    );
-    Ok(())
-}
-
-fn prompt_field(prompt: &str) -> Result<String> {
-    use std::io::Write as _;
-    loop {
-        print!("{prompt}");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let val = answer.trim().to_string();
-        if !val.is_empty() {
-            return Ok(val);
-        }
-        println!("  (cannot be empty, please try again)");
-    }
 }
 
 // ── language detection ────────────────────────────────────────────────────────
@@ -1974,8 +1769,6 @@ fn fetch_version_with_fallback(fallback: &str) -> String {
 pub(crate) struct LangConfig {
     #[serde(default)]
     registered: Vec<String>,
-    #[serde(default)]
-    elevated_approvals: Vec<ElevatedApproval>,
     /// Repos enabled for Phase B, keyed by corpus id. Auto-added when `install`
     /// runs inside a repo; also settable via `--corpus` or `travsr config set`.
     #[serde(default)]
@@ -1997,19 +1790,6 @@ struct UnsandboxedConsent {
     granted_date: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct ElevatedApproval {
-    language: String,
-    approved_by: String,
-    reason: String,
-    /// Explicit permitted network hosts.
-    // ADR-017 Rule 1: explicit allowlist only — stored verbatim from user input
-    // after validation by validate_permitted_host().
-    permitted_hosts: Vec<String>,
-    /// ISO-8601 date. Re-review required after 12 months.
-    approved_date: String,
-}
-
 impl LangConfig {
     pub(crate) fn is_registered(&self, language: &str) -> bool {
         self.registered.iter().any(|l| l == language)
@@ -2022,18 +1802,6 @@ impl LangConfig {
         self.trusted_corpora.iter().any(|c| c == corpus)
     }
 
-    fn is_approved(&self, language: &str) -> bool {
-        self.elevated_approvals
-            .iter()
-            .any(|a| a.language == language)
-    }
-
-    fn get_approval(&self, language: &str) -> Option<&ElevatedApproval> {
-        self.elevated_approvals
-            .iter()
-            .find(|a| a.language == language)
-    }
-
     fn register(&mut self, language: &str) {
         if !self.is_registered(language) {
             self.registered.push(language.to_string());
@@ -2044,23 +1812,6 @@ impl LangConfig {
         let before = self.registered.len();
         self.registered.retain(|l| l != language);
         self.registered.len() < before
-    }
-
-    fn approve(
-        &mut self,
-        language: &str,
-        approved_by: &str,
-        reason: &str,
-        permitted_hosts: Vec<String>,
-    ) {
-        self.elevated_approvals.retain(|a| a.language != language);
-        self.elevated_approvals.push(ElevatedApproval {
-            language: language.to_string(),
-            approved_by: approved_by.to_string(),
-            reason: reason.to_string(),
-            permitted_hosts,
-            approved_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
-        });
     }
 
     fn trust_corpus(&mut self, corpus: &str) {
@@ -2302,12 +2053,11 @@ mod tests {
             // The status tag the same row shows. `unsupported` is the only tag that
             // means "cannot reach full analysis on this OS"; it comes from the same
             // predicate, so the boolean can never say "available" while the status
-            // says "unsupported" (the #588 regression this locks out). Approved and
-            // consent are set so a merely-elevated language does not read as
-            // unsupported for an unrelated reason.
-            let status = lang_capability_status(
-                entry, /*registered*/ true, /*approved*/ true, true,
-            );
+            // says "unsupported" (the #588 regression this locks out). Consent is
+            // set so a merely-elevated language does not read as unsupported for an
+            // unrelated reason.
+            let status =
+                lang_capability_status(entry, /*registered*/ true, /*consent*/ true);
             let unsupported = status.tag() == "unsupported";
             assert_eq!(available, !unsupported, "{}", entry.language);
         }

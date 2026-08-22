@@ -42,16 +42,14 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                 // warning printed below.
                 // Downgrade a flat "complete" when a language that is turned on for
                 // this repo did not run to a completed analysis: it crashed, or it
-                // never ran at all (its analyzer is missing, or it is waiting on a
-                // one-time approval). A run that DID complete and found no symbols
-                // is not counted — 0 nodes is a valid result, not a failure — and
-                // languages the user has not turned on (not trusted / not
-                // registered) are their own separate notice, not a downgrade of the
-                // ones that did run.
+                // never ran at all (its analyzer is missing). A run that DID complete
+                // and found no symbols is not counted — 0 nodes is a valid result,
+                // not a failure — and languages the user has not turned on (not
+                // trusted / not registered) are their own separate notice, not a
+                // downgrade of the ones that did run.
                 let crashed = crashed_langs(payload);
                 let not_run: Vec<String> = warned_langs(payload, "skipped_no_analyzer")
                     .into_iter()
-                    .chain(warned_langs(payload, "needs_approval"))
                     .chain(warned_langs(payload, "needs_consent"))
                     .collect();
                 if crashed.is_empty() && not_run.is_empty() {
@@ -223,9 +221,6 @@ pub fn run() -> anyhow::Result<()> {
                             );
                         }
                     }
-                    ["needs_approval", lang] => eprintln!(
-                        "warning: '{lang}' needs a one-time network approval before it can index — run `travsr lang approve {lang}`"
-                    ),
                     // Windows only: an analyzer that cannot run inside Travsr's
                     // isolation and has no permission on record. The one-time
                     // permission is the only thing standing between it and full
@@ -481,10 +476,11 @@ mod tests {
     #[test]
     fn phase_b_downgrades_when_an_enabled_language_never_ran() {
         // A language turned on for this repo whose analyzer is missing or is
-        // waiting on approval never ran, so "complete" would contradict the
-        // warning printed below. Both are named under "not run".
+        // waiting on the user's unsandboxed-run permission never ran, so
+        // "complete" would contradict the warning printed below. Both are named
+        // under "not run".
         let mut p = payload("abc", "abc", false);
-        p.phase_b_warnings = Some("skipped_no_analyzer:php,needs_approval:go".into());
+        p.phase_b_warnings = Some("skipped_no_analyzer:php,needs_consent:go".into());
         assert_eq!(phase_b_state(&p), "partial (not run: php, go)");
     }
 
