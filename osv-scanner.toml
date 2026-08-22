@@ -1,0 +1,42 @@
+# osv-scanner configuration
+#
+# Applies to Cargo.lock in this directory only. osv-scanner does NOT propagate a
+# config to child directories, so this file governs the root workspace lockfile
+# and nothing else (see .github/workflows/osv-scan.yml, which also scans
+# packages/travsr-lsif-ts/package-lock.json with no config of its own).
+#
+# Why this file exists: osv-scanner exits non-zero on ANY finding and has no
+# knowledge of deny.toml, so every advisory the project has deliberately
+# triaged and accepted still failed the OSV Scan job. That job had been red on
+# every nightly run since 2026-06-07, and because release.yml wires it in as
+# `gate-osv` for any non-beta promotion, it would have blocked the
+# v1.0.0-rc.1 to v1.0.0 promotion outright.
+#
+# Keep this list in sync with the ignore[] block in deny.toml. Both files
+# encode the same decisions for two different scanners; if one is updated and
+# the other is not, cargo-deny and OSV will disagree on identical input.
+# Only advisories with NO upstream fix belong here. Anything fixable gets
+# fixed instead, which is why RUSTSEC-2026-0009 (time) is absent: it was
+# resolved by moving to time 0.3.55 rather than suppressed.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "paste 1.0.15 is unmaintained (archived by its author), not vulnerable. Compile-time token-pasting proc-macro with zero generated runtime logic beyond macro expansion, so nothing of it ships in the travsr binary and no runtime input can reach it. No patched release exists to move to. Since tract 0.22 migrated to the maintained pastey fork, tokenizers 0.21 is the only remaining path (directly and via macro_rules_attribute). Revisit when tokenizers drops it."
+
+# Deliberately expires. proc-macro-error2 is not a security problem, but it is
+# a dated build problem: it does `pub use proc_macro;`, which triggers E0365
+# (extern crate proc_macro is private and cannot be re-exported). rustc already
+# reports this as a future-incompatibility, and rust-lang/rust#127909 will make
+# it a hard error, at which point travsr stops compiling on that toolchain
+# until tabled_derive fixes it upstream. tabled 0.21.0 is the newest release
+# and still pins tabled_derive 0.11.0, so there is nothing to upgrade to today.
+# A permanent ignore would bury a known future outage, so this one lapses and
+# forces a re-look. When it does lapse, OSV Scan goes red again and gate-osv
+# blocks promotions: that is intended, but it means this date must be triaged
+# rather than mechanically extended. Escape hatch if upstream is still stuck:
+# tabled appears in only two files (travsr-cli/src/repos.rs, ask.rs) with two
+# derive sites, or patch tabled_derive via [patch.crates-io].
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0173"
+ignoreUntil = 2026-11-30
+reason = "proc-macro-error2 2.0.1 is unmaintained, not vulnerable. Build-time-only proc-macro reached via tabled_derive (via tabled), so it has no runtime attack surface. No patched release exists and tabled 0.21.0, the newest, still pins the affected tabled_derive 0.11.0. Expiry is deliberate: this crate will become a hard compile error via E0365 (rust-lang/rust#127909) and must not be silently forgiven."
