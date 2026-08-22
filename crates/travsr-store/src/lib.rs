@@ -4047,9 +4047,15 @@ LIMIT ?4",
                 // `dst` on the same `path:line` (e.g. overlapping macro spans),
                 // which the `(src, dst, kind, line)` PK does not dedup. Collapse
                 // to unique occurrence locations before returning.
+                // #757: field-access use-sites are recorded with kind
+                // 'ref/field' (a field read is not a call), so a field node's
+                // references live under that kind. Include both so
+                // `find_references <field>` returns real occurrences while
+                // `get_callers` (which reads the ref/call *edge* set, not
+                // edge_sites) stays free of field reads.
                 "SELECT DISTINCT n.path AS path, es.line AS line \
                  FROM edge_sites es JOIN nodes n ON n.id = es.src \
-                 WHERE es.dst = ?1 AND es.kind = 'ref/call' \
+                 WHERE es.dst = ?1 AND es.kind IN ('ref/call', 'ref/field') \
                  ORDER BY n.path, es.line",
             )
             .context("preparing reference_sites query")?;
@@ -4229,6 +4235,35 @@ LIMIT ?4",
             .context("record_edge_sites: insert")?;
         }
         tx.commit().context("record_edge_sites: commit")
+    }
+
+    /// Record field-access occurrence lines under the `ref/field` kind (#757).
+    ///
+    /// A field read (`x.foo`) is a genuine use-site but not a call, so it is
+    /// stored distinctly from `ref/call`: `find_references` returns it (its
+    /// query spans both kinds) while `get_callers` / `get_blast_radius`, which
+    /// traverse the `ref/call` *edge* set, never surface it as a caller. Skips
+    /// unknown (`line == 0`) and self-loop rows for the same reasons
+    /// [`Self::record_edge_sites`] does.
+    pub fn record_field_sites(&mut self, sites: &[(NodeId, NodeId, u32)]) -> anyhow::Result<()> {
+        if sites.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .context("record_field_sites: begin")?;
+        for &(src, dst, line) in sites {
+            if line == 0 || src == dst {
+                continue;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, 'ref/field', ?3)",
+                params![node_id_to_i64(src), node_id_to_i64(dst), line as i64],
+            )
+            .context("record_field_sites: insert")?;
+        }
+        tx.commit().context("record_field_sites: commit")
     }
 
     /// G1: Register a mapping from a raw SCIP symbol string to a unified tree-sitter `NodeId`.
@@ -8038,6 +8073,71 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reference_sites_includes_ref_field_occurrences() {
+        // #757: a field node's use-sites are recorded under kind 'ref/field'
+        // (a read is not a call). find_references must surface them, so
+        // reference_sites spans both 'ref/call' and 'ref/field'.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "user.rs", "rust", "method:User.run"),
+            "method",
+        );
+        let field = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "store.rs", "rust", "field:Store.conn"),
+            "field",
+        );
+        store.put_node(&caller).unwrap();
+        store.put_node(&field).unwrap();
+
+        store
+            .record_field_sites(&[(caller.id, field.id, 14)])
+            .unwrap();
+
+        // Stored under 'ref/field', not 'ref/call'.
+        let call_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM edge_sites WHERE kind = 'ref/call'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(call_rows, 0, "field ref must not be a ref/call row");
+
+        let sites = store.reference_sites(field.id).unwrap();
+        assert_eq!(
+            sites,
+            vec![travsr_core::RefSite {
+                path: "user.rs".into(),
+                line: 14
+            }]
+        );
+    }
+
+    #[test]
+    fn record_field_sites_skips_zero_line_and_self_loop() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "field:A.x"),
+            "field",
+        );
+        let m = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "b.rs", "rust", "method:B.f"),
+            "method",
+        );
+        store.put_node(&n).unwrap();
+        store.put_node(&m).unwrap();
+        store
+            .record_field_sites(&[(m.id, n.id, 0), (n.id, n.id, 5)])
+            .unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM edge_sites", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "zero-line and self-loop rows are skipped");
     }
 
     #[test]

@@ -6363,6 +6363,7 @@ fn edge_kind_str(kind: &travsr_core::EdgeKind) -> &'static str {
     match kind {
         EdgeKind::DefinesBinding => "defines",
         EdgeKind::RefCall => "calls",
+        EdgeKind::RefField => "field-ref",
         EdgeKind::Depends => "imports",
         EdgeKind::ResolvesTo => "resolves-to",
         EdgeKind::Exports => "exports",
