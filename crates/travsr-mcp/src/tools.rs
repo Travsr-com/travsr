@@ -1423,6 +1423,19 @@ fn looks_like_a_regex_complaint(detail: &str) -> bool {
     //   a\      -> trailing backslash (\)
     //   *a      -> repetition-operator operand invalid
     //
+    // Those are what BSD's regex reports. glibc words the same failures
+    // differently, so the list has to carry both or the hint goes missing on
+    // Linux, which is where CI and most users are. On git 2.34.1:
+    //
+    //   alpha(     -> Unmatched ( or \(
+    //   alpha[     -> Invalid regular expression
+    //   a{2, a{1,  -> Unmatched \{
+    //   a\         -> Trailing backslash
+    //   *a         -> Invalid preceding regular expression
+    //   [[:foo:]]  -> Invalid character class name
+    //   a\1        -> Invalid back reference
+    //   [z-a]      -> Invalid range end
+    //
     // Each carries enough context that a directory name cannot fake it, which
     // is what the loose single words could not manage.
     [
@@ -1433,10 +1446,12 @@ fn looks_like_a_regex_complaint(detail: &str) -> bool {
         "invalid regex",
         "unmatched [",
         "unmatched ( or",
+        "unmatched \\{",
         "unterminated",
         "invalid preceding regular expression",
         "invalid back reference",
         "invalid character class",
+        "invalid range end",
     ]
     .iter()
     .any(|needle| without_quoted_paths.contains(needle))
@@ -7501,12 +7516,26 @@ mod tests {
         for real in [
             // Collected by running each pattern through git, not invented. My
             // first list guessed and matched none of them (#749 review).
+            //
+            // BSD's phrasing:
             "fatal: command line, 'alpha(': parentheses not balanced",
             "fatal: command line, 'alpha[': brackets ([ ]) not balanced",
             "fatal: command line, 'a{2': braces not balanced",
             "fatal: command line, 'a\\': trailing backslash (\\)",
             "fatal: command line, '*a': repetition-operator operand invalid",
             "fatal: invalid regular expression: unmatched ( or \\(",
+            // glibc's phrasing for the same failures, which is what git 2.34.1
+            // on Linux actually prints. Three of these fell through the BSD-only
+            // list, so the hint went missing on the platform CI runs on.
+            "fatal: command line, 'alpha(': Unmatched ( or \\(",
+            "fatal: command line, 'alpha[': Invalid regular expression",
+            "fatal: command line, 'a{2': Unmatched \\{",
+            "fatal: command line, 'a{1,': Unmatched \\{",
+            "fatal: command line, 'a\\': Trailing backslash",
+            "fatal: command line, '*a': Invalid preceding regular expression",
+            "fatal: command line, '[[:foo:]]': Invalid character class name",
+            "fatal: command line, 'a\\1': Invalid back reference",
+            "fatal: command line, '[z-a]': Invalid range end",
             "Unmatched [ or [^",
             "fatal: unterminated \\{",
             "trailing backslash on RHS",
