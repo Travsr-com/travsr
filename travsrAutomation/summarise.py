@@ -43,7 +43,7 @@ def render(payload: dict, label: str) -> str:
             issues = r.get("issues") or []
             tag = " (#" + ", #".join(issues) + ")" if issues else ""
             detail = (r.get("detail") or "").strip().splitlines()
-            first = f" — {detail[0]}" if detail else ""
+            first = f": {detail[0]}" if detail else ""
             out.append(f"- `{r.get('phase', '?')}` {r.get('name', '?')}{tag}{first}")
     out.append("")
     return "\n".join(out)
