@@ -125,8 +125,11 @@ pub(crate) fn decide_windows_sandbox(
 pub trait PluginResolver: Send + Sync {
     /// Returns `None` if the language is not providable:
     ///   - binary not on PATH (external), or
-    ///   - policy validation failed, or
-    ///   - `RequiresElevated` without a recorded PSE approval in `lang.toml`.
+    ///   - policy validation failed.
+    ///
+    /// `RequiresElevated` languages are no longer gated: elevated access is
+    /// auto-granted for local use (ADR-017 Amendment A5), so their `Elevated`
+    /// policy is synthesized unconditionally from the catalog `elevated_hosts`.
     ///
     /// Callers log the skip and continue — fail-closed per ADR-017 Rule 2.
     fn resolve(&self, language: &str) -> Option<PluginSpec>;
@@ -199,8 +202,11 @@ struct ResolvedEntry {
 /// Filters by:
 /// 1. Language is registered in `~/.travsr/lang.toml` (written by `travsr lang add`).
 /// 2. Binary named by `PhaseBEntry::command` is found on PATH.
-/// 3. `RequiresElevated` languages: a valid PSE approval record exists in
-///    `lang.toml` and passes `SandboxPolicy::validate()`.
+///
+/// `RequiresElevated` languages are no longer gated on a PSE approval record:
+/// elevated access is auto-granted for local use (ADR-017 Amendment A5). Their
+/// `Elevated` policy is synthesized unconditionally from the catalog
+/// `elevated_hosts` and still passes `SandboxPolicy::validate()`.
 ///
 /// All disk reads and PATH searches happen in `new()` — the resolver is then
 /// immutable for the duration of one indexing run.

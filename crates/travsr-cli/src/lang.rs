@@ -1779,6 +1779,14 @@ pub(crate) struct LangConfig {
     /// daemon/git-hook reindex path picks it up with no per-run flag.
     #[serde(default)]
     unsandboxed_consent: Vec<UnsandboxedConsent>,
+    /// Vestigial: elevated access is auto-granted for local use now (ADR-017
+    /// Amendment A5), so nothing writes this. Kept as an opaque round-trip so an
+    /// upgrade-then-save does not silently destroy a pre-upgrade user's recorded
+    /// `[[elevated_approvals]]` audit block (which they still need if they roll
+    /// back). Placed last so the array-of-tables serialises after the plain-array
+    /// fields (toml requires values before tables). Never read by this build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    elevated_approvals: Vec<toml::Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1935,6 +1943,47 @@ fn phase_b_tool_floor_refusal(entry: &travsr_plugin_host::PhaseBEntry) -> Option
 #[cfg(test)]
 mod tests {
     use super::resolve_install_tag;
+    use super::LangConfig;
+
+    #[test]
+    fn elevated_approvals_survive_a_save_load_round_trip() {
+        // #756 review: dropping the field used to rewrite lang.toml without a
+        // pre-upgrade user's [[elevated_approvals]] audit block, a one-way
+        // deletion. It must round-trip opaquely and must not trip toml's
+        // "values must be emitted before tables" ordering rule.
+        let src = r#"
+registered = ["java", "go"]
+trusted_corpora = ["github.com/acme/repo"]
+
+[[elevated_approvals]]
+language = "java"
+approved_by = "octocat"
+reason = "enable cross-file analysis"
+approved_date = "2026-01-01"
+
+[[unsandboxed_consent]]
+language = "scala"
+granted_by = "octocat"
+granted_date = "2026-01-02"
+"#;
+        let cfg: LangConfig = toml::from_str(src).expect("parse pre-upgrade config");
+        assert_eq!(
+            cfg.elevated_approvals.len(),
+            1,
+            "block must be retained on load"
+        );
+        let out = toml::to_string_pretty(&cfg).expect("serialise must not hit ValueAfterTable");
+        assert!(
+            out.contains("[[elevated_approvals]]"),
+            "block must survive a save: {out}"
+        );
+        assert!(
+            out.contains("octocat"),
+            "audit fields must survive a save: {out}"
+        );
+        let reparsed: LangConfig = toml::from_str(&out).expect("reparse round-tripped config");
+        assert_eq!(reparsed.elevated_approvals.len(), 1);
+    }
 
     // A `fetch_latest` that must never run — asserts the live path is skipped
     // when an override or a pin already decides the tag.

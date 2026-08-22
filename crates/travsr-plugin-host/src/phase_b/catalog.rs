@@ -551,7 +551,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["index", "--output", "{output}", "{root}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
-        install_hint: "travsr lang install java  (security approval required — run interactively)",
+        install_hint: "travsr lang install java",
         underlying_tool_hint: "https://github.com/sourcegraph/scip-java/releases — download scip-java-<version> and place in ~/.travsr/bin/scip-java (chmod +x)",
         provider_binary: Some("travsr-lang-java"),
         elevated_hosts: &[
@@ -592,8 +592,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &[],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
-        install_hint:
-            "travsr lang install kotlin  (security approval required — run interactively)",
+        install_hint: "travsr lang install kotlin",
         underlying_tool_hint: "travsr lang install kotlin  (auto-installs kotlin-language-server)",
         provider_binary: Some("travsr-lang-kotlin"),
         elevated_hosts: &[
@@ -633,7 +632,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &[],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
-        install_hint: "travsr lang install scala  (security approval required — run interactively)",
+        install_hint: "travsr lang install scala",
         underlying_tool_hint: "https://www.scala-sbt.org/download.html — install sbt (usually already present in Scala projects)",
         provider_binary: Some("travsr-lang-scala"),
         elevated_hosts: &[
@@ -718,8 +717,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["index", "{root}", "--output", "{output}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
-        install_hint:
-            "travsr lang install csharp  (security approval required — run interactively)",
+        install_hint: "travsr lang install csharp",
         underlying_tool_hint: "dotnet tool install --global scip-dotnet",
         provider_binary: Some("travsr-lang-csharp"),
         elevated_hosts: &["api.nuget.org", "www.nuget.org"],

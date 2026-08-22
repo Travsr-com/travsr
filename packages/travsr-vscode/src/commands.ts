@@ -1037,8 +1037,8 @@ function spawnManagedInstall(
 
 /**
  * travsr.showLanguages — Languages panel: indexed node counts from the graph +
- * available SCIP tools from `travsr lang list --json`, with one-click install,
- * elevated consent form, and disable.
+ * available SCIP tools from `travsr lang list --json`, with one-click install
+ * and disable.
  */
 export function registerShowLanguages(
   client: McpClient,
@@ -1118,6 +1118,16 @@ export function registerShowLanguages(
             void vscode.window.showWarningMessage(
               lastLine(out) ||
                 `${msg.language} is set up, but the build tool it needs${needTxt} was not found. Install it, then Reload to get full analysis.`
+            );
+          } else if (code !== 0) {
+            // Any other non-zero (or signal) exit is a real failure. Report it as
+            // an error, not a success toast — e.g. an older CLI that still has the
+            // elevated-approval gate bails with code 1, which must not be reported
+            // as "installed".
+            void vscode.window.showErrorMessage(
+              `Install of ${msg.language} failed. ${
+                lastLine(out) || `Run \`travsr lang install ${msg.language}\` in a terminal for details.`
+              }`
             );
           } else {
             void vscode.window.showInformationMessage(lastLine(out) || `${msg.language} tool installed.`);

@@ -282,7 +282,6 @@ travsr lang list                     List all known Phase B language indexers an
 travsr lang install <language>       Download and register a Phase B language indexer
 travsr lang detect                   Scan the repo, detect supported languages, auto-install
 travsr lang remove <language>        Unregister a Phase B language indexer
-travsr lang approve <language>       Pre-approve a language that needs network access
 travsr synonym add <term> <alias>    Add a query synonym
 travsr synonym list                  List all configured synonyms
 travsr synonym remove <term>         Remove a synonym term
