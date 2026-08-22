@@ -309,9 +309,23 @@ fn a_reindex_during_phase_b_keeps_the_flag_set() {
         let stop = std::sync::Arc::clone(&stop);
         let db = db.clone();
         std::thread::spawn(move || {
+            // Opened once and reused. Reopening per tick ran the migration
+            // runner each time, which takes heavier locks than the write itself
+            // and made init's bulk FTS insert fail with "database is locked" on
+            // Windows. Only one bump has to land inside init's window, so a tick
+            // that cannot get the lock is dropped rather than retried hard.
+            let Ok(mut store) = travsr_store::SqliteStore::open(&db) else {
+                return;
+            };
+            let mut next = read_dirty_seq(&mut store) + 1;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                bump_dirty_seq(&db);
-                std::thread::sleep(std::time::Duration::from_millis(25));
+                if store
+                    .set_meta("phase_b_dirty_seq", &next.to_string())
+                    .is_ok()
+                {
+                    next += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
             }
         })
     };
@@ -328,17 +342,13 @@ fn a_reindex_during_phase_b_keeps_the_flag_set() {
     );
 }
 
-/// Read the counter `reindex_files` bumps beside the flag.
-fn dirty_seq(db: &Path) -> u64 {
-    meta(db, "phase_b_dirty_seq")
+/// Read the counter through a store that is already open.
+fn read_dirty_seq(store: &mut travsr_store::SqliteStore) -> u64 {
+    store
+        .get_meta("phase_b_dirty_seq")
+        .ok()
+        .flatten()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
 }
 
-/// Stand in for the watcher having marked the graph dirty.
-fn bump_dirty_seq(db: &Path) {
-    let next = dirty_seq(db) + 1;
-    if let Ok(mut store) = travsr_store::SqliteStore::open(db) {
-        let _ = store.set_meta("phase_b_dirty_seq", &next.to_string());
-    }
-}
