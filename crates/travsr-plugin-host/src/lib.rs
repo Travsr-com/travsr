@@ -107,6 +107,10 @@ pub fn windows_pid_is_alive(pid: u32) -> bool {
 /// site re-opens this amendment". `unsafe` stays confined to
 /// `sandbox/windows/ffi.rs`.
 #[cfg(unix)]
+/// 0 is defined as not alive, and so is any value too large for `pid_t`.
+/// External callers get "is this a live process" and "is this a process id at
+/// all" folded into the same `false`, which is what every current consumer
+/// wants; a caller that needs to tell them apart has to check the value itself.
 pub fn unix_pid_is_alive(pid: u32) -> bool {
     // A PID that does not fit in i32 cannot name a real process on any Unix.
     let Ok(raw) = i32::try_from(pid) else {
@@ -116,9 +120,12 @@ pub fn unix_pid_is_alive(pid: u32) -> bool {
     // `kill(0, None)` always succeeds and 0 would read as alive. Nothing we write
     // ever stores it (`std::process::id()` cannot return 0), so a 0 in the info
     // file means the file is corrupt, truncated or externally written, and the
-    // one thing it must not do is name a live holder. Negative values are the
-    // same class: they address process groups, not processes.
-    if raw <= 0 {
+    // one thing it must not do is name a live holder.
+    //
+    // Only 0 needs excluding. `raw` comes from `i32::try_from(pid)` on a `u32`,
+    // which succeeds only for a non-negative value, so a negative `raw` cannot
+    // reach here and the guard does not pretend to handle one.
+    if raw == 0 {
         return false;
     }
     match nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None) {
