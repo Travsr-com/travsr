@@ -459,6 +459,16 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                     }
                 }
             }
+            if !report.produced_no_references.is_empty() {
+                let langs = report.produced_no_references.join(", ");
+                println!(
+                    "  {} semantic analyzer produced definitions but no references for: {langs}, so no call edges can come from it",
+                    pal.orange("⚠"),
+                );
+                println!(
+                    "    the analyzer reported success, so this is its output being incomplete rather than a crash"
+                );
+            }
             if !report.skipped_no_analyzer.is_empty() {
                 let langs = report.skipped_no_analyzer.join(", ");
                 println!(

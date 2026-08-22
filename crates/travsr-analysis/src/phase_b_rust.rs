@@ -4,6 +4,9 @@
 //! Sources of edges:
 //!   1. Cargo.toml parsing → `Depends` edges between crate nodes
 //!   2. Tree-sitter call-site query → `RefCall` edges between functions
+//!   3. Tree-sitter field-access query → `RefField` occurrences on struct
+//!      fields (#757), keyed to `field:Owner.name` via the recovered receiver
+//!      type (fail-closed without one, mirroring the method contract)
 //!
 //! Accuracy: name-based resolution without a type system. Correct for direct
 //! calls; approximate for trait-dispatched generics. Always better than zero
@@ -19,17 +22,23 @@ use tree_sitter::{Parser, Query, QueryCursor};
 
 // ── Tree-sitter query ─────────────────────────────────────────────────────────
 
-/// Captures three call-site patterns:
+/// Captures three call-site patterns plus field-access references:
 ///   `call.fn`     — bare identifier: `foo()`
 ///   `call.method` — field call: `self.process()` / `obj.method()`, with the
 ///                   receiver expression bound as `call.recv` (#529) so the
 ///                   extractor can attempt to recover its type instead of
 ///                   discarding it.
 ///   `call.scoped` — scoped path: `Type::new()` / `std::mem::swap()`
+///   `field.name`  — field read/write: `x.foo` (#757), with the receiver bound
+///                   as `field.recv`. This pattern also matches the
+///                   field-expression inside a method call (`x.foo()`); the
+///                   handler discards those (they are the `call.method` case)
+///                   and keeps only genuine field accesses.
 const CALL_QUERY: &str = "
 (call_expression function: (identifier) @call.fn)
 (call_expression function: (field_expression value: (_) @call.recv field: (field_identifier) @call.method))
 (call_expression function: (scoped_identifier name: (identifier) @call.scoped))
+(field_expression value: (_) @field.recv field: (field_identifier) @field.name)
 ";
 
 /// Common names that generate enormous noise (ubiquitous in every Rust crate) and
@@ -454,6 +463,52 @@ fn extract_file_call_edges(
                         caller_line: occ_line,
                         is_method_call: false,
                         recv_type: None,
+                    });
+                }
+                // #757: field-access reference `x.foo`. The `field_expression`
+                // pattern also fires on the receiver of a method call
+                // (`x.foo()`), so drop any whose parent is a `call_expression`
+                // using it as the callee — that is the `call.method` case above.
+                // A field read carries no disambiguating signal beyond its
+                // receiver's type, so we only emit when that type is recoverable
+                // (`recv_type`); otherwise the daemon would fail closed anyway
+                // (§1.5, mirroring the #604/#606 method contract). The daemon
+                // resolves the emitted `field:{name}` sig against the exact Phase
+                // A node `field:{recv_type}.{name}`.
+                "field.name" => {
+                    let Some(field_expr) = cap.node.parent() else {
+                        continue;
+                    };
+                    let is_method_callee = field_expr.parent().is_some_and(|p| {
+                        p.kind() == "call_expression"
+                            && p.child_by_field_name("function").map(|f| f.id())
+                                == Some(field_expr.id())
+                    });
+                    if is_method_callee {
+                        continue;
+                    }
+                    let recv_type = m
+                        .captures
+                        .iter()
+                        .find(|c| {
+                            cap_names.get(c.index as usize).map(String::as_str)
+                                == Some("field.recv")
+                        })
+                        .and_then(|recv_cap| {
+                            let enclosing_fn = enclosing_function_item(recv_cap.node)?;
+                            resolve_receiver_type(recv_cap.node, enclosing_fn, source.as_slice())
+                        });
+                    if recv_type.is_none() {
+                        continue;
+                    }
+                    unresolved.push(UnresolvedCall {
+                        src: caller_id,
+                        callee_sig: format!("field:{callee_name}"),
+                        alt_callee_sig: None,
+                        hint_crate: None,
+                        caller_line: occ_line,
+                        is_method_call: false,
+                        recv_type,
                     });
                 }
                 _ => {}
@@ -976,6 +1031,89 @@ mod tests {
             return resolve_receiver_type(recv_cap.node, enclosing_fn, source);
         }
         None
+    }
+
+    /// Drive the real `extract_file_call_edges` path over `source` and return
+    /// the field-access `UnresolvedCall`s it emits (`callee_sig` starts with
+    /// `field:`). Writes to a unique temp file so the on-disk read path is
+    /// exercised exactly as in production, not a hand-rolled shortcut.
+    fn field_refs(source: &str) -> Vec<UnresolvedCall> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("travsr_field_test_{}_{}.rs", std::process::id(), n));
+        std::fs::write(&path, source).unwrap();
+        let language = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
+        let query = Query::new(&language, CALL_QUERY).unwrap();
+        let (unresolved, _refs) =
+            extract_file_call_edges("c", &path, "main.rs", &language, &query).unwrap();
+        let _ = std::fs::remove_file(&path);
+        unresolved
+            .into_iter()
+            .filter(|u| u.callee_sig.starts_with("field:"))
+            .collect()
+    }
+
+    #[test]
+    fn field_read_on_self_emits_owner_qualifiable_ref() {
+        // `self.bar` read → daemon can resolve `field:Foo.bar` from recv_type.
+        let refs = field_refs("impl Foo { fn f(&self) { let _x = self.bar; } }");
+        assert_eq!(refs.len(), 1, "exactly one field ref: {refs:?}");
+        assert_eq!(refs[0].callee_sig, "field:bar");
+        assert_eq!(refs[0].recv_type.as_deref(), Some("Foo"));
+        assert!(!refs[0].is_method_call);
+    }
+
+    #[test]
+    fn method_call_receiver_field_expr_is_not_a_field_ref() {
+        // `self.bar()` is a method call, not a field read — no `field:bar`.
+        let refs = field_refs("impl Foo { fn f(&self) { self.bar(); } }");
+        assert!(
+            refs.is_empty(),
+            "method call must not emit a field ref: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn field_read_without_recoverable_receiver_is_dropped() {
+        // `thing` has no visible binding → recv_type None → fail closed.
+        let refs = field_refs("fn f() { let _x = thing.bar; }");
+        assert!(
+            refs.is_empty(),
+            "unresolved receiver must not emit: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn field_read_on_typed_parameter_resolves() {
+        let refs = field_refs("fn f(s: &SqliteStore) { let _x = s.conn; }");
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert_eq!(refs[0].callee_sig, "field:conn");
+        assert_eq!(refs[0].recv_type.as_deref(), Some("SqliteStore"));
+    }
+
+    #[test]
+    fn nested_field_read_resolves_inner_and_drops_unknowable_outer() {
+        // `self.store.conn`: inner `self.store` → field:store (recv self→Foo);
+        // outer `.conn` has a field_expression receiver of unknown type → dropped.
+        let refs = field_refs("impl Foo { fn f(&self) { let _x = self.store.conn; } }");
+        assert_eq!(
+            refs.len(),
+            1,
+            "only the inner field read resolves: {refs:?}"
+        );
+        assert_eq!(refs[0].callee_sig, "field:store");
+        assert_eq!(refs[0].recv_type.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn field_write_lhs_is_a_use_site() {
+        // A write `self.bar = 1` is a reference too (LHS field_expression).
+        let refs = field_refs("impl Foo { fn f(&mut self) { self.bar = 1; } }");
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert_eq!(refs[0].callee_sig, "field:bar");
+        assert_eq!(refs[0].recv_type.as_deref(), Some("Foo"));
     }
 
     #[test]

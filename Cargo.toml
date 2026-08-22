@@ -24,7 +24,7 @@ edition = "2021"
 license = "Apache-2.0"
 authors = ["Travsr Contributors"]
 repository = "https://github.com/Travsr-com/travsr"
-rust-version = "1.75"
+rust-version = "1.88"
 
 [workspace.dependencies]
 travsr-error           = { path = "crates/travsr-error" }
@@ -34,11 +34,17 @@ travsr-ipc             = { path = "crates/travsr-ipc" }
 travsr-plugin-protocol = { path = "crates/travsr-plugin-protocol" }
 travsr-plugin-sdk      = { path = "crates/travsr-plugin-sdk" }
 travsr-plugin-host     = { path = "crates/travsr-plugin-host" }
-# Pinned to the 0.21.x line (declared rust_version 1.75, matching this
-# workspace's MSRV exactly). tract-onnx 0.22+ requires rust_version 1.85+
-# and 0.23+ requires 1.91+ — bumping past 0.21 would force a workspace-wide
-# MSRV bump for one leaf crate (travsr-rerank), which RFC-021 does not ask for.
-tract-onnx = "0.21"
+# Held at >=0.22.2 for two security reasons, do not lower either bound.
+# (1) RUSTSEC-2026-0217 (integer overflow in tract-nnef's NNEF tensor parser,
+#     out-of-bounds read on model load) is patched only in >=0.21.16 <0.22.0,
+#     >=0.22.2 <0.23.0, and >=0.23.1. 0.22.0 and 0.22.1 are affected.
+# (2) The 0.21.x line pinned `time = ">=0.3.23, <0.3.42"` in tract-linalg's
+#     build script, which capped the whole workspace below the RUSTSEC-2026-0009
+#     fix (time 0.3.47). 0.22.x relaxes that to `time = "^0.3.23"`.
+# tract 0.22 declares rust_version 1.85. That is below this workspace's 1.88
+# MSRV, which is set by `time` itself (0.3.46+ all require 1.88), so tract is
+# not the binding constraint. 0.23+ would drop `time` entirely but needs 1.91.
+tract-onnx = "0.22.2"
 # tract's SimplePlan does not itself parallelize across the batch dimension
 # (measured: K=1 ~34ms, K=30 ~983ms — perfectly linear, zero batching
 # speedup); rayon splits the reranker's candidate batch across threads

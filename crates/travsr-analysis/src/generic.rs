@@ -39,13 +39,15 @@ pub struct LanguageConfig {
     /// patterns (e.g. Ruby `require` vs `require_relative`, #614) without any
     /// change to this parser's shared logic.
     pub capture_kinds: &'static [(&'static str, &'static str, &'static str)],
-    /// AST node kinds that enclose their methods as a type/namespace, each
-    /// paired with the signature prefix that container is itself captured
-    /// under. When a `fn`-prefixed definition capture is nested inside one of
-    /// these, it is emitted as `method:{ContainerName}.{leaf}` (kind `method`)
-    /// and its `DefinesBinding` edge is parented to the container node instead
-    /// of the file (N1 collision fix + N3 containment). Empty ⇒ the language
-    /// has no methods (e.g. C), so every `fn` capture stays a free function.
+    /// AST node kinds that enclose their members (methods and fields) as a
+    /// type/namespace, each paired with the signature prefix that container is
+    /// itself captured under. When a `fn`- or `field`-prefixed definition
+    /// capture is nested inside one of these, it is emitted as
+    /// `method:{ContainerName}.{leaf}` / `field:{ContainerName}.{leaf}` and its
+    /// `DefinesBinding` edge is parented to the container node instead of the
+    /// file (N1 collision fix + N3 containment). Empty ⇒ the container has no
+    /// methods; a language with fields but no methods (e.g. C `struct`) still
+    /// lists its type node here so field captures qualify (#757).
     pub method_containers: &'static [(&'static str, &'static str)],
     /// AST node kinds that represent a full definition *with its body* (N2).
     /// When a name capture is nested below its declaration (C
@@ -192,11 +194,19 @@ pub fn parse_with_config(
             // one hop to `name.parent()` gives the full span (G2).
             let end_line = decl_end_line(cap.node, config.decl_kinds).unwrap_or(line);
 
-            // N1/N3: a `fn`-prefixed definition nested inside a type container
-            // is a method. Qualify its signature by the enclosing type
-            // (`method:Type.name`, collision-free per Invariant #1) and parent
-            // its containment edge to the container node, not the file.
-            let enclosing = if sig_prefix == "fn" {
+            // N1/N3 + #757: a member definition nested inside a type container is
+            // qualified by the enclosing type (collision-free per Invariant #1)
+            // and its containment edge is parented to the container node, not the
+            // file. `member_qual` maps a member's signature prefix to its
+            // qualified `(sig_prefix, node_kind)`: a `fn` capture becomes
+            // `method:Type.name`, a `field` capture becomes `field:Type.name`.
+            // Every other prefix (var/const/type/class/import) stays file-level.
+            let member_qual: Option<(&'static str, &'static str)> = match sig_prefix {
+                "fn" => Some(("method", "method")),
+                "field" => Some(("field", "field")),
+                _ => None,
+            };
+            let enclosing = if member_qual.is_some() {
                 enclosing_container(
                     cap.node,
                     config.method_containers,
@@ -207,18 +217,18 @@ pub fn parse_with_config(
                 None
             };
 
-            let (sig, node_kind, parent_id) = match (&enclosing, sig_prefix) {
-                (Some((container_prefix, container_name)), _) => {
+            let (sig, node_kind, parent_id) = match (&enclosing, member_qual) {
+                (Some((container_prefix, container_name)), Some((qual_prefix, qual_kind))) => {
                     let container_sig = format!("{container_prefix}:{container_name}");
                     let container_id =
                         VName::new(corpus, "", vname_path, lang_str, &container_sig).id();
                     (
-                        format!("method:{container_name}.{text}"),
-                        "method",
+                        format!("{qual_prefix}:{container_name}.{text}"),
+                        qual_kind,
                         container_id,
                     )
                 }
-                (None, prefix) if is_import_prefix(prefix) => {
+                _ if is_import_prefix(sig_prefix) => {
                     // Use the full node text, strip leading keyword + trailing
                     // semicolons. N5: also strip surrounding quotes so Dart
                     // `import 'dart:core';` yields `import:dart:core` (the
@@ -233,9 +243,11 @@ pub fn parse_with_config(
                         .trim()
                         .trim_matches(|c| c == '\'' || c == '"')
                         .to_string();
-                    (format!("{prefix}:{cleaned}"), node_kind, file_id)
+                    (format!("{sig_prefix}:{cleaned}"), node_kind, file_id)
                 }
-                (None, _) => (format!("{sig_prefix}:{text}"), node_kind, file_id),
+                // A member not enclosed by any container (top-level fn / property)
+                // and every non-member prefix: file-level, unqualified.
+                _ => (format!("{sig_prefix}:{text}"), node_kind, file_id),
             };
 
             let vname = VName::new(corpus, "", vname_path, lang_str, &sig);
@@ -322,6 +334,24 @@ fn enclosing_container<'a>(
                 // used (every non-Swift/Kotlin grammar).
                 let prefix = container_kind_prefix(n, type_refinements, source).unwrap_or(prefix);
                 return Some((prefix, name));
+            }
+            // #757: a C/C++ anonymous aggregate named only via
+            // `typedef struct { .. } Name;` has no `name:` on the
+            // struct_specifier, so `container_name` is None and its fields would
+            // orphan as unqualified `field:name` (colliding across every such
+            // struct). The graph node that actually exists for it is the typedef
+            // (`type:Name`, from the `type_definition` capture), so borrow that
+            // name and prefix. Inert for grammars without `type_definition`.
+            if let Some(name) = n
+                .parent()
+                .filter(|p| p.kind() == "type_definition")
+                .and_then(|td| td.child_by_field_name("declarator"))
+                .filter(|d| d.kind() == "type_identifier")
+                .and_then(|d| d.utf8_text(source).ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(("type", name.to_string()));
             }
         }
         cur = n.parent();
@@ -561,6 +591,138 @@ mod tests {
         assert!(
             imports.contains(&"import:package:foo/bar.dart"),
             "got {imports:?}"
+        );
+    }
+
+    // #757: every declaration-based config language emits owner-qualified
+    // `field:Owner.name` nodes contained by their type. One case per language,
+    // asserting the field node exists, is kind `field`, and has a containment
+    // edge from the owning type node (not the file).
+    #[test]
+    fn field_nodes_emitted_and_contained_per_language() {
+        struct Case {
+            cfg: &'static LanguageConfig,
+            file: &'static str,
+            src: &'static str,
+            field_sig: &'static str,
+            owner_sig: &'static str,
+        }
+        let cases = [
+            Case {
+                cfg: &crate::c::CONFIG,
+                file: "p.c",
+                src: "struct Point { int x; int y; };\n",
+                field_sig: "field:Point.x",
+                owner_sig: "struct:Point",
+            },
+            Case {
+                cfg: &crate::cpp::CONFIG,
+                file: "p.cpp",
+                src: "class C { int count; void m(); };\n",
+                field_sig: "field:C.count",
+                owner_sig: "class:C",
+            },
+            Case {
+                cfg: &crate::csharp::CONFIG,
+                file: "p.cs",
+                src: "class C { int count; public int P { get; set; } }\n",
+                field_sig: "field:C.count",
+                owner_sig: "class:C",
+            },
+            Case {
+                cfg: &crate::csharp::CONFIG,
+                file: "prop.cs",
+                src: "class C { public int Total { get; set; } }\n",
+                field_sig: "field:C.Total",
+                owner_sig: "class:C",
+            },
+            Case {
+                cfg: &crate::kotlin::CONFIG,
+                file: "p.kt",
+                src: "class C {\n    val count: Int = 0\n    fun m() { val local = 1 }\n}\n",
+                field_sig: "field:C.count",
+                owner_sig: "class:C",
+            },
+            Case {
+                cfg: &crate::php::CONFIG,
+                file: "p.php",
+                src: "<?php\nclass C {\n    public $count;\n    private int $total;\n}\n",
+                field_sig: "field:C.count",
+                owner_sig: "class:C",
+            },
+            Case {
+                cfg: &crate::scala::CONFIG,
+                file: "p.scala",
+                src: "class C {\n  val count: Int = 0\n  def m(): Int = { val local = 1\n    local }\n}\n",
+                field_sig: "field:C.count",
+                owner_sig: "class:C",
+            },
+            Case {
+                cfg: &crate::dart::CONFIG,
+                file: "p.dart",
+                src: "class C {\n  int count = 0;\n  final String name = \"x\";\n}\n",
+                field_sig: "field:C.count",
+                owner_sig: "class:C",
+            },
+            Case {
+                cfg: &crate::objc::CONFIG,
+                file: "p.m",
+                src: "@interface C {\n  int _count;\n}\n@property (nonatomic) int total;\n@end\n",
+                field_sig: "field:C._count",
+                owner_sig: "class:C",
+            },
+        ];
+
+        for c in &cases {
+            let out = parse_str(c.cfg, c.file, c.src);
+            let field = out
+                .nodes
+                .iter()
+                .find(|n| n.vname.signature == c.field_sig)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{:?}: missing {}, have fields: {:?}",
+                        c.cfg.language,
+                        c.field_sig,
+                        out.nodes
+                            .iter()
+                            .filter(|n| n.kind == "field")
+                            .map(|n| &n.vname.signature)
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(field.kind, "field", "{:?}: wrong kind", c.cfg.language);
+            let owner = out
+                .nodes
+                .iter()
+                .find(|n| n.vname.signature == c.owner_sig)
+                .unwrap_or_else(|| panic!("{:?}: missing owner {}", c.cfg.language, c.owner_sig));
+            assert!(
+                out.edges.iter().any(|e| e.src == owner.id
+                    && e.dst == field.id
+                    && e.kind == EdgeKind::DefinesBinding),
+                "{:?}: expected {} → {} containment edge",
+                c.cfg.language,
+                c.owner_sig,
+                c.field_sig
+            );
+        }
+    }
+
+    // #757: a member `val`/`var`/local declared inside a method body must NOT be
+    // captured as a field (would pollute the type and risk collisions).
+    #[test]
+    fn local_variables_are_not_fields() {
+        let out = parse_str(
+            &crate::scala::CONFIG,
+            "loc.scala",
+            "class C {\n  def m(): Int = {\n    val temp = 5\n    temp\n  }\n}\n",
+        );
+        assert!(
+            !out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "field:C.temp"),
+            "local val must not become a field"
         );
     }
 

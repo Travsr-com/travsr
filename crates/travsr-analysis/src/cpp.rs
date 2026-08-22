@@ -19,6 +19,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (alias_declaration name: (type_identifier) @using.name)
 (function_declarator declarator: (identifier) @fn.name)
 (function_declarator declarator: (field_identifier) @fn.name)
+(field_declaration declarator: (field_identifier) @field.name)
 (preproc_def name: (identifier) @macro.name)
 (preproc_function_def name: (identifier) @macro.name)
 (preproc_include path: (_) @import)
@@ -31,11 +32,22 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("namespace.name", "namespace", "namespace"),
         ("using.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
+        // #757: data members → `field:Owner.name`. A method's declarator is a
+        // `function_declarator` (captured as `fn.name` above), so only true data
+        // members reach this capture.
+        ("field.name", "field", "field"),
         // N4e: `#define` object-like and function-like macros as first-class nodes.
         ("macro.name", "macro", "macro"),
         ("import", "import", "import"),
     ],
-    method_containers: &[("class_specifier", "class"), ("struct_specifier", "struct")],
+    // #757: `union_specifier` is a data-member container too; without it a
+    // union member orphans as an unqualified `field:name` that collides across
+    // every union (matching the C fix in `c.rs`).
+    method_containers: &[
+        ("class_specifier", "class"),
+        ("struct_specifier", "struct"),
+        ("union_specifier", "struct"),
+    ],
     decl_kinds: &["function_definition"],
     type_refinements: &[],
     get_grammar: || tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
@@ -189,6 +201,41 @@ mod tests {
         let kinds: Vec<&str> = out.nodes.iter().map(|n| n.kind.as_str()).collect();
         assert!(kinds.contains(&"class"));
         assert!(kinds.contains(&"namespace"));
+    }
+
+    #[test]
+    fn union_members_are_owner_qualified() {
+        // #757 re-review: `union_specifier` was captured as a node but was not a
+        // `method_container`, so its data members orphaned as unqualified
+        // `field:name`, colliding across every union. Adding it (matching
+        // `c.rs`) qualifies them to `field:U.name`. Class/struct members are
+        // unaffected.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("u.cpp");
+        std::fs::write(
+            &path,
+            "class C { int a; };\nstruct S { int c; };\nunion U { int d; float e; };\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "u.cpp").unwrap();
+        let field_sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "field")
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        for want in ["field:C.a", "field:S.c", "field:U.d", "field:U.e"] {
+            assert!(
+                field_sigs.contains(&want),
+                "missing {want}; got {field_sigs:?}"
+            );
+        }
+        assert!(
+            !field_sigs
+                .iter()
+                .any(|s| *s == "field:d" || *s == "field:e"),
+            "union members must not orphan unqualified; got {field_sigs:?}"
+        );
     }
 
     #[test]

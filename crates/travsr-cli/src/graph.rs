@@ -154,19 +154,40 @@ pub fn run(
             anyhow::bail!("ambiguous symbol query");
         }
 
+        // #757: `--path` only disambiguates *across* files. When the collision is
+        // same-file (a struct and its own impl, both at one path), the hint
+        // narrows nothing. The exact signature always resolves uniquely (Tier 1
+        // of the resolver), so point at it explicitly and use the first
+        // candidate's signature as a concrete example.
+        let example_sig = candidates.first().map(|n| n.signature.as_str());
+        let escape_hatch = match example_sig {
+            Some(sig) => format!(
+                "Re-run with a `--path` hint (for cross-file matches) or with one of the \
+                 exact signatures listed below (e.g. `{sig}`) to pick one:"
+            ),
+            None => "Re-run with a `--path` hint to pick one:".to_string(),
+        };
         if truncated {
             eprintln!(
                 "'{query_str}' is ambiguous, showing {limit} of at least {count} definitions. \
-                 Re-run with a `--path` hint to pick one:"
+                 {escape_hatch}"
             );
         } else {
-            eprintln!(
-                "'{query_str}' is ambiguous, {count} definitions. Re-run with a `--path` hint to pick one:"
-            );
+            eprintln!("'{query_str}' is ambiguous, {count} definitions. {escape_hatch}");
         }
         for n in candidates.iter().take(limit) {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
-            eprintln!("  {} ({}) \u{2014} {}{}", n.label, n.kind, n.path, loc);
+            // The clean label reads best, but for SCIP-synthesized nodes it is
+            // *not* the re-runnable token. Append the exact signature whenever it
+            // differs from the label so there is always a copy-pasteable query.
+            if n.signature == n.label {
+                eprintln!("  {} ({}) \u{2014} {}{}", n.label, n.kind, n.path, loc);
+            } else {
+                eprintln!(
+                    "  {} ({}) \u{2014} {}{}   [re-run: {}]",
+                    n.label, n.kind, n.path, loc, n.signature
+                );
+            }
         }
         if truncated {
             eprintln!("[truncated: additional filtering/narrowing is required]");

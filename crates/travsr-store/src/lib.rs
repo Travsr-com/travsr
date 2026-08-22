@@ -1605,6 +1605,22 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Clear every stored per-file content hash (the `files` table).
+    ///
+    /// #757 audit: `travsr init --force` relies on the incremental hash-delta
+    /// re-parsing every file, but the delta skips files whose content hash is
+    /// unchanged — and the `--force` graph purge does not touch this cache. An
+    /// index built by an older binary therefore reported "up to date" and was
+    /// never re-parsed by the current analyzer (so, e.g., newly-added `field`
+    /// nodes never appeared). Clearing the cache makes every file look new, so
+    /// `--force` genuinely re-parses the whole repo. Returns rows cleared.
+    pub fn clear_file_hashes(&mut self) -> Result<usize, StoreError> {
+        self.conn
+            .execute("DELETE FROM files", [])
+            .context("clearing file hashes")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Write a batch of parsed file graphs in a single SQLite transaction.
     ///
     /// For each `FileGraph` in `batch`:
@@ -3853,28 +3869,44 @@ LIMIT ?4",
             // rather than persist it. This gate is what lets the positional
             // rust-analyzer LSIF path (W3b) and any external-symbol reference
             // fail closed instead of leaving the 34% dangling this plan removes.
-            let callee_exists = tx
+            // Fetch the callee's kind (not just existence): #757 records a
+            // reference onto a `field` node under `ref/field` instead of
+            // `ref/call`, matching the native Rust field-ref path, so a field
+            // read never appears as a caller in `get_callers`/blast-radius.
+            let callee_kind: Option<String> = tx
                 .query_row(
-                    "SELECT 1 FROM nodes WHERE id = ?1",
+                    "SELECT kind FROM nodes WHERE id = ?1",
                     params![callee_id],
-                    |_| Ok(()),
+                    |row| row.get(0),
                 )
                 .optional()
-                .context("write_scip_attributed_batch: callee existence check")?
-                .is_some();
-            if !callee_exists {
+                .context("write_scip_attributed_batch: callee existence check")?;
+            let Some(callee_kind) = callee_kind else {
+                // E3 (W3a): callee resolves to no node — a genuine unresolved
+                // symbol (external/stdlib, or a positional miss). Fail closed:
+                // a dangling ref would pollute get_callers/blast-radius.
                 continue;
-            }
+            };
+            let is_field = callee_kind == "field";
 
-            // #650: only genuine calls create a call-graph `ref/call` edge, so
+            // #650/#757: only genuine calls create a call-graph `ref/call` edge, so
             // `get_callers` / blast-radius / PageRank stay a call graph and never
-            // gain a `src == dst` self-loop or a spurious non-call edge. Non-call
-            // references (type annotations, `self`/`Self`, path segments) still
-            // record their occurrence below so `find_references` enumerates every
-            // use site (issue #299). `is_call` defaults to true for call-scoped
-            // producers (native tree-sitter, bundled emitters), so their edges are
-            // unchanged.
-            if scip_ref.is_call {
+            // gain a `src == dst` self-loop or a spurious non-call edge. A field
+            // read is not a call: emit a `ref/field` edge (also excluded from the
+            // call graph) so it is symmetric with the native Rust path. Other
+            // non-call references (type annotations, `self`/`Self`, path segments)
+            // still record only their occurrence below so `find_references`
+            // enumerates every use site (issue #299). `is_call` defaults to true
+            // for call-scoped producers (native tree-sitter, bundled emitters).
+            if is_field {
+                tx.execute(
+                    "INSERT INTO edges(src, dst, kind, provenance, confidence) \
+                     VALUES(?1, ?2, 'ref/field', 'scip', NULL) \
+                     ON CONFLICT(src, dst, kind) DO UPDATE SET provenance = 'scip'",
+                    params![caller_id, callee_id],
+                )
+                .context("write_scip_attributed_batch: insert field edge")?;
+            } else if scip_ref.is_call {
                 tx.execute(
                     "INSERT INTO edges(src, dst, kind, provenance, confidence) \
                      VALUES(?1, ?2, 'ref/call', 'scip', NULL) \
@@ -3884,11 +3916,13 @@ LIMIT ?4",
                 .context("write_scip_attributed_batch: insert edge")?;
             }
 
-            // O4: record call-site line evidence. Written for every reference
-            // (call or not) so `find_references` covers non-call use sites too.
+            // O4: record the occurrence line for every reference (call, field, or
+            // other non-call) so `find_references` covers all use sites. Field
+            // occurrences go under `ref/field`; everything else under `ref/call`.
+            let site_kind = if is_field { "ref/field" } else { "ref/call" };
             tx.execute(
-                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, 'ref/call', ?3)",
-                params![caller_id, callee_id, occ_line],
+                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, ?3, ?4)",
+                params![caller_id, callee_id, site_kind, occ_line],
             )
             .context("write_scip_attributed_batch: insert edge_site")?;
         }
@@ -4047,9 +4081,15 @@ LIMIT ?4",
                 // `dst` on the same `path:line` (e.g. overlapping macro spans),
                 // which the `(src, dst, kind, line)` PK does not dedup. Collapse
                 // to unique occurrence locations before returning.
+                // #757: field-access use-sites are recorded with kind
+                // 'ref/field' (a field read is not a call), so a field node's
+                // references live under that kind. Include both so
+                // `find_references <field>` returns real occurrences while
+                // `get_callers` (which reads the ref/call *edge* set, not
+                // edge_sites) stays free of field reads.
                 "SELECT DISTINCT n.path AS path, es.line AS line \
                  FROM edge_sites es JOIN nodes n ON n.id = es.src \
-                 WHERE es.dst = ?1 AND es.kind = 'ref/call' \
+                 WHERE es.dst = ?1 AND es.kind IN ('ref/call', 'ref/field') \
                  ORDER BY n.path, es.line",
             )
             .context("preparing reference_sites query")?;
@@ -4229,6 +4269,35 @@ LIMIT ?4",
             .context("record_edge_sites: insert")?;
         }
         tx.commit().context("record_edge_sites: commit")
+    }
+
+    /// Record field-access occurrence lines under the `ref/field` kind (#757).
+    ///
+    /// A field read (`x.foo`) is a genuine use-site but not a call, so it is
+    /// stored distinctly from `ref/call`: `find_references` returns it (its
+    /// query spans both kinds) while `get_callers` / `get_blast_radius`, which
+    /// traverse the `ref/call` *edge* set, never surface it as a caller. Skips
+    /// unknown (`line == 0`) and self-loop rows for the same reasons
+    /// [`Self::record_edge_sites`] does.
+    pub fn record_field_sites(&mut self, sites: &[(NodeId, NodeId, u32)]) -> anyhow::Result<()> {
+        if sites.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .context("record_field_sites: begin")?;
+        for &(src, dst, line) in sites {
+            if line == 0 || src == dst {
+                continue;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, 'ref/field', ?3)",
+                params![node_id_to_i64(src), node_id_to_i64(dst), line as i64],
+            )
+            .context("record_field_sites: insert")?;
+        }
+        tx.commit().context("record_field_sites: commit")
     }
 
     /// G1: Register a mapping from a raw SCIP symbol string to a unified tree-sitter `NodeId`.
@@ -8041,6 +8110,71 @@ mod tests {
     }
 
     #[test]
+    fn reference_sites_includes_ref_field_occurrences() {
+        // #757: a field node's use-sites are recorded under kind 'ref/field'
+        // (a read is not a call). find_references must surface them, so
+        // reference_sites spans both 'ref/call' and 'ref/field'.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "user.rs", "rust", "method:User.run"),
+            "method",
+        );
+        let field = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "store.rs", "rust", "field:Store.conn"),
+            "field",
+        );
+        store.put_node(&caller).unwrap();
+        store.put_node(&field).unwrap();
+
+        store
+            .record_field_sites(&[(caller.id, field.id, 14)])
+            .unwrap();
+
+        // Stored under 'ref/field', not 'ref/call'.
+        let call_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM edge_sites WHERE kind = 'ref/call'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(call_rows, 0, "field ref must not be a ref/call row");
+
+        let sites = store.reference_sites(field.id).unwrap();
+        assert_eq!(
+            sites,
+            vec![travsr_core::RefSite {
+                path: "user.rs".into(),
+                line: 14
+            }]
+        );
+    }
+
+    #[test]
+    fn record_field_sites_skips_zero_line_and_self_loop() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "field:A.x"),
+            "field",
+        );
+        let m = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "b.rs", "rust", "method:B.f"),
+            "method",
+        );
+        store.put_node(&n).unwrap();
+        store.put_node(&m).unwrap();
+        store
+            .record_field_sites(&[(m.id, n.id, 0), (n.id, n.id, 5)])
+            .unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM edge_sites", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "zero-line and self-loop rows are skipped");
+    }
+
+    #[test]
     fn reference_sites_empty_when_no_occurrences() {
         let store = SqliteStore::open_in_memory().unwrap();
         let unknown = travsr_core::VName::new("c", "", "x.rs", "rust", "fn:nope").id();
@@ -8516,6 +8650,20 @@ mod tests {
         let got = store.get_file_hash("src/foo.ts").unwrap();
         assert_eq!(got, Some("abc123".to_string()));
         assert!(store.get_file_hash("nonexistent.ts").unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_file_hashes_empties_the_cache() {
+        // #757 audit: `--force` clears the per-file hash cache so every file
+        // re-parses. After clearing, no stored hash remains.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.put_file_hash("a.rs", "h1").unwrap();
+        store.put_file_hash("b.rs", "h2").unwrap();
+        assert_eq!(store.get_all_file_hashes().unwrap().len(), 2);
+        let cleared = store.clear_file_hashes().unwrap();
+        assert_eq!(cleared, 2);
+        assert!(store.get_all_file_hashes().unwrap().is_empty());
+        assert!(store.get_file_hash("a.rs").unwrap().is_none());
     }
 
     #[test]
@@ -10207,6 +10355,61 @@ mod tests {
             ],
             "must return cross-file ref/call + resolves-to pairs, excluding same-file"
         );
+    }
+
+    #[test]
+    fn scip_reference_onto_field_node_is_ref_field_not_ref_call() {
+        // #757: a SCIP reference whose callee is a `field` node (go/java field
+        // access, e.g. `z.animals`) must be recorded as `ref/field`, matching the
+        // native Rust path, so it surfaces in find_references but never in the
+        // ref/call caller set.
+        let corpus = "c";
+        let path = "src/zoo.go";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new(corpus, "", path, "go", "method:Zoo.Add"),
+            "method",
+        )
+        .with_line(1)
+        .with_end_line(10);
+        let field = Node::new(
+            VName::new(corpus, "", path, "go", "field:Zoo.animals"),
+            "field",
+        );
+        store
+            .write_scip_attributed_batch(corpus, &[caller.clone(), field.clone()], &[])
+            .unwrap();
+
+        let refs = vec![travsr_core::ScipRef {
+            caller_path: path.to_string(),
+            caller_line: 5,
+            callee_id: field.id,
+            // Even if a producer marks it a call, a field callee is never a call.
+            is_call: true,
+        }];
+        store
+            .write_scip_attributed_batch(corpus, &[], &refs)
+            .unwrap();
+
+        // Edge is ref/field, and there is NO ref/call edge onto the field.
+        let all_edges = store.all_edges().unwrap();
+        assert!(
+            all_edges
+                .iter()
+                .any(|(_, d, k, _)| *d == field.id && k == "ref/field"),
+            "expected a ref/field edge onto the field: {all_edges:?}"
+        );
+        assert!(
+            !all_edges
+                .iter()
+                .any(|(_, d, k, _)| *d == field.id && k == "ref/call"),
+            "field must never get a ref/call edge: {all_edges:?}"
+        );
+        // find_references still returns the occurrence.
+        let sites = store.reference_sites(field.id).unwrap();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].line, 5);
     }
 
     // P4 golden test: grouped span fetch produces identical (ref → enclosing_id) mapping

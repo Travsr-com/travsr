@@ -33,6 +33,8 @@ const QUERIES: &str = r"
 (function_declaration name: (identifier) @fn.name)
 (function_signature name: (identifier) @fn.name)
 (method_definition name: (property_identifier) @method.name)
+(public_field_definition name: (property_identifier) @field.name)
+(property_signature name: (property_identifier) @field.name)
 (program (lexical_declaration (variable_declarator) @topvar))
 (program (export_statement (lexical_declaration (variable_declarator) @topvar)))
 (program (variable_declaration (variable_declarator) @topvar))
@@ -211,6 +213,27 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     output.nodes.push(node);
                     output.edges.push(edge);
                 }
+                "field.name" => {
+                    // #757: class fields (`public_field_definition`) and
+                    // interface members (`property_signature`) become
+                    // owner-qualified `field:Owner.name` nodes contained by their
+                    // type. Members of an anonymous class expression or an inline
+                    // object type (`type T = { x: number }`) have no named owner
+                    // and are dropped rather than minting a file-level field.
+                    if let Some((prefix, owner)) = find_parent_type(capture.node, source.as_slice())
+                    {
+                        let container_id = if prefix == "interface" {
+                            emit::interface_node(corpus, vname_path, &owner).id
+                        } else {
+                            emit::class_node(corpus, vname_path, &owner).id
+                        };
+                        let node = emit::field_node(corpus, vname_path, &owner, text)
+                            .with_line(line)
+                            .with_end_line(line);
+                        output.edges.push(emit::defines_edge(container_id, node.id));
+                        output.nodes.push(node);
+                    }
+                }
                 "topvar" => {
                     // N4a: only top-level (program-child) declarators become
                     // nodes — locals inside function bodies no longer pollute
@@ -388,6 +411,31 @@ fn find_parent_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<
     }
 }
 
+/// #757: resolve the enclosing named type for a field/member capture, returning
+/// its signature prefix (`"class"` or `"interface"`) and name. Walks up to the
+/// first `class`/`interface` declaration; returns `None` for members of an
+/// anonymous class expression or an inline object type (`{ x: number }`), which
+/// have no named owner to qualify against.
+fn find_parent_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<(&'static str, String)> {
+    let mut current = node.parent()?;
+    loop {
+        let prefix = match current.kind() {
+            "class_declaration" | "class" | "abstract_class_declaration" => Some("class"),
+            "interface_declaration" => Some("interface"),
+            _ => None,
+        };
+        if let Some(prefix) = prefix {
+            let name = (0..current.child_count())
+                .filter_map(|i| current.child(i as u32))
+                .find(|child| child.kind() == "type_identifier")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(str::to_string)?;
+            return Some((prefix, name));
+        }
+        current = current.parent()?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +573,57 @@ mod tests {
                 .iter()
                 .any(|(_, s)| *s == "var:local" || *s == "var:inner"),
             "locals must be dropped; got {sigs:?}"
+        );
+    }
+
+    // #757: class fields (`public_field_definition`) and interface members
+    // (`property_signature`) become owner-qualified `field:Owner.name` nodes
+    // contained by their type; two owners with a same-named member do not
+    // collide.
+    #[test]
+    fn class_and_interface_fields_are_owner_qualified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.ts");
+        std::fs::write(
+            &path,
+            "class A {\n  count: number = 0;\n}\n\
+             class B {\n  count: number = 0;\n}\n\
+             interface I {\n  name: string;\n}\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "m.ts").unwrap();
+        let field = |sig: &str| out.nodes.iter().find(|n| n.vname.signature == sig);
+
+        let a = field("field:A.count").expect("field:A.count");
+        let b = field("field:B.count").expect("field:B.count");
+        assert_eq!(a.kind, "field");
+        assert_ne!(
+            a.id, b.id,
+            "same-named fields on distinct classes must not collide"
+        );
+        field("field:I.name").expect("interface member field:I.name");
+
+        // Containment: field:A.count parents to class:A, field:I.name to interface:I.
+        let class_a = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "class:A")
+            .unwrap()
+            .id;
+        assert!(
+            out.edges.iter().any(|e| e.src == class_a && e.dst == a.id),
+            "field:A.count must be contained by class:A"
+        );
+        let iface = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "interface:I")
+            .unwrap()
+            .id;
+        let iname = field("field:I.name").unwrap().id;
+        assert!(
+            out.edges.iter().any(|e| e.src == iface && e.dst == iname),
+            "field:I.name must be contained by interface:I"
         );
     }
 

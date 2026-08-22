@@ -256,6 +256,14 @@ pub fn run() -> anyhow::Result<()> {
                     // repo's sources (e.g. a sandbox-denied read, a missing SDK, or
                     // no buildable project). Point at the sidecar's own diagnostics,
                     // which the host now forwards on stderr.
+                    // #724: definitions arrived, occurrences did not, so no call
+                    // edge can come from this language. The analyzer reported
+                    // success, which is what makes it worth saying out loud.
+                    ["no_references", lang] => {
+                        eprintln!(
+                            "warning: '{lang}' analysis produced definitions but no references, so no call edges came from it. The analyzer reported success, so this is its output being incomplete rather than a crash. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see its own diagnostics"
+                        );
+                    }
                     ["zero_nodes", lang] => {
                         eprintln!(
                             "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help, it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
