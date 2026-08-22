@@ -2362,11 +2362,28 @@ mod tests {
         // running now reports the info file as stale, which is correct, and would
         // make this test assert the wrong branch.
         //
-        // On unix, pid 1 is always alive and is never this process, which is
-        // exactly "some other live holder". Elsewhere, liveness cannot be probed
-        // here, so the message degrades to naming no pid and the assertion below
-        // adapts rather than pretending otherwise.
-        let recorded_pid = if cfg!(unix) { "1" } else { "41822" };
+        // A genuinely live process, on every platform. This used to be pid 1 on
+        // unix and an arbitrary number elsewhere, with the assertion relaxed off
+        // unix because Windows could not probe liveness. Now that it can, that
+        // arbitrary number correctly reports as not running and the test was
+        // asserting the wrong branch there (#752 CI).
+        //
+        // Spawning one keeps both platforms on the same path and actually
+        // exercises the live-holder branch that the Windows probe unlocked.
+        let mut sleeper = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/c", "timeout", "/t", "30", "/nobreak"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn a live holder")
+        } else {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn a live holder")
+        };
+        let recorded_pid = sleeper.id().to_string();
         std::fs::write(
             repo.path().join(".travsr").join("embed.lock.info"),
             format!("{recorded_pid}\treindex"),
@@ -2376,16 +2393,17 @@ mod tests {
         let err = EmbedOpLock::try_acquire(repo.path(), "gc")
             .expect_err("must not acquire while another holder has the lock");
         let msg = err.to_string();
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+
         assert!(
             msg.contains("already running"),
             "error must report the conflict, got: {msg}"
         );
-        if cfg!(unix) {
-            assert!(
-                msg.contains(recorded_pid) && msg.contains("reindex"),
-                "a live holder must still be named with its pid and operation, got: {msg}"
-            );
-        }
+        assert!(
+            msg.contains(&recorded_pid) && msg.contains("reindex"),
+            "a live holder must be named with its pid and operation, got: {msg}"
+        );
 
         fs2::FileExt::unlock(&held).unwrap();
         drop(held);
