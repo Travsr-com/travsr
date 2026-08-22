@@ -207,9 +207,11 @@ struct ResolvedEntry {
 pub struct CatalogResolver {
     /// Pre-resolved entries keyed by language string.
     entries: Vec<ResolvedEntry>,
-    /// H5: languages that are RequiresElevated but have no PSE approval in
-    /// lang.toml. Surfaced in PhaseBOutcome so the CLI can print an actionable
-    /// "run `travsr lang approve <lang>`" message rather than silently skipping.
+    /// Vestigial since elevated network access became auto-granted for local use
+    /// (ADR-017 amendment): RequiresElevated languages now synthesize their
+    /// Elevated policy unconditionally, so nothing is ever pushed here. The field
+    /// and its getter are retained so `PhaseBOutcome::skipped_needs_approval` and
+    /// its downstream consumers compile and behave unchanged (always empty).
     needs_approval: Vec<String>,
     /// #573: languages whose only resolvable provider is an npm `.cmd`/`.bat`
     /// shim with no native binary behind it. Dropping them here alone left the
@@ -280,7 +282,8 @@ impl CatalogResolver {
         let lang_config = load_lang_config();
 
         let mut entries = Vec::new();
-        let mut needs_approval = Vec::new();
+        // Always empty since elevated access is auto-granted (see field doc).
+        let needs_approval = Vec::new();
         let mut unresolvable_shims = Vec::new();
         let mut missing_tool = Vec::new();
         let mut needs_unsandboxed_consent = Vec::new();
@@ -452,54 +455,35 @@ impl CatalogResolver {
                     SandboxRequirement::NativeIpc => SandboxPolicy::NativeIpc,
 
                     SandboxRequirement::RequiresElevated => {
-                        // Must have a recorded PSE approval in lang.toml.
-                        // If the user provided an explicit permitted_hosts override in
-                        // lang.toml, use that; otherwise fall back to the catalog
-                        // defaults from `entry.elevated_hosts`. Either way the
-                        // approved_by/approved_date fields must be non-empty.
-                        let Some(approval) =
-                            lang_config.as_ref().and_then(|cfg| cfg.get_approval(lang))
-                        else {
-                            tracing::info!(
-                                lang,
-                                "'{}' needs network access during indexing but has no security \
-                             approval on file — skipping (its semantic analysis stays disabled \
-                             until it is approved). Run: travsr lang approve {} \
-                             --approved-by <approver-github-handle> --reason \"...\" \
-                             --permitted-hosts <hosts>",
-                                lang,
-                                lang
-                            );
-                            needs_approval.push(lang.to_string());
-                            continue;
-                        };
-
-                        // Use the user-supplied hosts if non-empty; otherwise fall back
-                        // to the catalog-defined defaults for this language.
-                        let permitted_hosts = if !approval.permitted_hosts.is_empty() {
-                            approval.permitted_hosts.clone()
-                        } else {
-                            catalog_entry
-                                .elevated_hosts
-                                .iter()
-                                .map(|h| h.to_string())
-                                .collect()
-                        };
+                        // Elevated network access is auto-granted for local use
+                        // (ADR-017 amendment): no PSE approval record is required.
+                        // Synthesize the Elevated policy from the catalog's default
+                        // hosts with sentinel audit fields so SandboxPolicy::validate()
+                        // (which only checks the fields are non-empty) still passes and
+                        // the runtime isolation policy is unchanged. The four elevated
+                        // languages keep the same Elevated sandbox behaviour at spawn
+                        // time; only the human approval gate is removed.
+                        let permitted_hosts = catalog_entry
+                            .elevated_hosts
+                            .iter()
+                            .map(|h| h.to_string())
+                            .collect();
 
                         let policy = SandboxPolicy::Elevated {
                             permitted_hosts,
-                            reason: approval.reason.clone(),
-                            approved_by: approval.approved_by.clone(),
-                            approved_date: approval.approved_date.clone(),
+                            reason: "auto-approved".to_string(),
+                            approved_by: "auto".to_string(),
+                            approved_date: "auto-approved".to_string(),
                         };
 
-                        // Validate the Elevated policy fields per ADR-017 Rule 1.
-                        // This catches empty approved_by / approved_date.
+                        // Defensive: the synthesized fields are always non-empty for a
+                        // catalog language, so this cannot fail today. Keep the check so
+                        // a future catalog entry with empty elevated_hosts is caught
+                        // rather than spawning with an empty allowlist.
                         if let Err(e) = policy.validate() {
                             tracing::warn!(
                                 lang,
-                                "the security approval for '{}' is incomplete: {} \
-                             — skipping (its semantic analysis stays disabled)",
+                                "auto-approved elevated policy for '{}' is invalid: {}, skipping",
                                 lang,
                                 e
                             );
@@ -742,21 +726,10 @@ fn embedded_shim_target(
 
 #[derive(Debug, serde::Deserialize)]
 struct LangConfigFile {
-    #[serde(default)]
-    elevated_approvals: Vec<ElevatedApprovalRecord>,
     /// Per-language permission to run an isolation-incompatible analyzer with the
     /// user's own privileges on Windows (written by `travsr lang allow-unsandboxed`).
     #[serde(default)]
     unsandboxed_consent: Vec<UnsandboxedConsentRecord>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ElevatedApprovalRecord {
-    language: String,
-    approved_by: String,
-    reason: String,
-    permitted_hosts: Vec<String>,
-    approved_date: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -767,12 +740,6 @@ struct UnsandboxedConsentRecord {
 }
 
 impl LangConfigFile {
-    fn get_approval(&self, language: &str) -> Option<&ElevatedApprovalRecord> {
-        self.elevated_approvals
-            .iter()
-            .find(|a| a.language == language)
-    }
-
     fn has_unsandboxed_consent(&self, language: &str) -> bool {
         self.unsandboxed_consent
             .iter()

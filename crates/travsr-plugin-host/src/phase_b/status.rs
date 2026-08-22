@@ -156,12 +156,11 @@ pub fn capability(cap: &Capability) -> LangStatus {
         }
         return LangStatus::Active;
     }
-    // Network-reaching analyzers need a one-time approval before they can install.
-    if cap.entry.sandbox == super::catalog::SandboxRequirement::RequiresElevated && !cap.approved {
-        return LangStatus::NeedsApproval {
-            language: cap.entry.language.to_string(),
-        };
-    }
+    // Elevated (network-reaching) analyzers are auto-granted for local use
+    // (ADR-017 amendment): they are no longer gated on a one-time approval and
+    // fall through to the normal installed / needs-install status like any other
+    // language. `NeedsApproval` is retained as an enum variant for the MCP/JSON
+    // contract but is never emitted here.
     // Analyzer present and runnable → full cross-file semantic is available.
     if cap.analyzer_ready {
         return LangStatus::Active;
@@ -190,13 +189,10 @@ mod tests {
 
     #[test]
     fn analyzer_ready_reads_active_for_every_language() {
-        for lang in ["python", "rust", "typescript", "go"] {
-            // Elevated languages still need approval; test the non-elevated set here.
-            if lookup(lang).unwrap().sandbox
-                != crate::phase_b::catalog::SandboxRequirement::RequiresElevated
-            {
-                assert_eq!(cap(lang, true, false), LangStatus::Active, "{lang}");
-            }
+        for lang in ["python", "rust", "typescript", "go", "java"] {
+            // Every language, including elevated ones (java) now that elevated
+            // access is auto-granted, reads Active once its analyzer is ready.
+            assert_eq!(cap(lang, true, false), LangStatus::Active, "{lang}");
         }
     }
 
@@ -219,12 +215,16 @@ mod tests {
     }
 
     #[test]
-    fn elevated_language_without_approval_reads_needs_approval() {
-        // java requires elevated approval; with the tool absent and unapproved it
-        // must ask for approval, not claim "disabled".
+    fn elevated_language_is_auto_approved_and_reads_install() {
+        // java is an elevated language, but elevated access is auto-granted for
+        // local use (ADR-017 amendment): with the analyzer absent it reads the
+        // uniform install step, never needs_approval.
         let java = cap("java", false, false);
-        assert_eq!(java.tag(), "needs_approval");
+        assert_eq!(java.tag(), "partial");
         assert!(java.line().contains("travsr lang install java"));
+        assert!(cap("java", true, false).tag() != "needs_approval");
+        // Auto-grant does not depend on the `approved` flag either way.
+        assert_eq!(cap("java", true, true), LangStatus::Active);
     }
 
     #[test]
