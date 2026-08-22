@@ -5,7 +5,7 @@
  *   travsr.askSymbol         live ranked symbol search (Quick Pick)
  *   travsr.manageSynonyms    synonym editor webview (multi-chip add)
  *   travsr.showDependencies  direct + transitive imports, click-navigable
- *   travsr.showExecutionPath PCST path between two symbols, rendered in the graph
+ *   travsr.showExecutionPath lowest-cost path between two symbols, rendered in the graph
  *   travsr.showRepos         registry manager webview
  *   travsr.showGraphStats    graph metrics dashboard webview
  *   travsr.showLanguages     indexed + available languages, install from UI
@@ -26,10 +26,13 @@ import {
   buildStatsHtml,
   buildLanguagesHtml,
   buildPanelLoadingHtml,
+  LANG_CONTRACT_FIELDS,
+  LANG_CONTRACT_VERSION,
   type RepoRow,
   type StatsView,
   type LangCount,
   type LangInfo,
+  type LangContractSkew,
 } from "./webviews";
 import type { Diagnostic, LogEntry } from "./webviews";
 
@@ -173,14 +176,144 @@ export function parseLanguageCounts(raw: string): LangCount[] {
     .filter((l) => l.language);
 }
 
-/** Parse `travsr lang list --json` output into LangInfo rows. Tolerates empty/error. */
-export function parseAvailableLanguages(raw: string): LangInfo[] {
+/** The outcome of reading a `travsr lang list --json` payload.
+ *
+ *  #755: parsing used to be a bare `JSON.parse(...) as LangInfo[]`, so a binary
+ *  whose rows predate the fields the panel reads produced a full table of
+ *  silently wrong cells rather than an error. The rows and the verdict on their
+ *  shape are returned together so a caller cannot use one without the other. */
+export interface LangListParse {
+  /** The rows, exactly as the binary sent them. Empty on a parse failure. */
+  langs: LangInfo[];
+  /** Contract fields absent from the rows, or `[]` when the shape is current.
+   *  A field counts as missing only when NO row carries it: one odd row is a
+   *  data quirk, all rows agreeing is a different binary. */
+  missingFields: string[];
+  /** The contract revision the binary reported, when it reported one. */
+  reportedContract?: number;
+}
+
+/**
+ * Validate the shape of `travsr lang list --json` rows against the contract the
+ * Languages panel renders (#755).
+ *
+ * Keys on field presence, not on the version string: an npm-bundled build and a
+ * current one both self-report `1.0.0` while emitting different shapes, so a
+ * version comparison cannot see the skew. A field present but `null` still
+ * counts as reported — `unavailableTarget` is legitimately null.
+ *
+ * Extra fields a NEWER binary sends are not an error: this checks that the
+ * fields this panel needs are there, never that nothing else is.
+ */
+export function langContractSkew(rows: unknown[]): string[] {
+  if (rows.length === 0) return [];
+  const objects = rows.filter(
+    (r): r is Record<string, unknown> => typeof r === "object" && r !== null
+  );
+  if (objects.length === 0) return [...LANG_CONTRACT_FIELDS];
+  return LANG_CONTRACT_FIELDS.filter((f) => !objects.some((r) => f in r));
+}
+
+/** Parse `travsr lang list --json` into rows plus a verdict on their shape.
+ *  Tolerates empty output and a non-JSON error blob (both yield no rows and no
+ *  skew — "nothing came back" is not the same finding as "a stale binary
+ *  answered", and only the latter should accuse a binary of being old). */
+export function parseLangList(raw: string): LangListParse {
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(raw.trim() || "[]") as LangInfo[];
-    return Array.isArray(parsed) ? parsed : [];
+    parsed = JSON.parse(raw.trim() || "[]");
   } catch {
-    return [];
+    return { langs: [], missingFields: [] };
   }
+  if (!Array.isArray(parsed)) return { langs: [], missingFields: [] };
+  // The marker is per-row (the payload is a bare array, so there is no envelope
+  // to put it in) and identical on every row. Read it off the first row that is
+  // actually an object, so a malformed leading element does not hide it.
+  const firstObject = (parsed as unknown[]).find(
+    (r): r is Record<string, unknown> => typeof r === "object" && r !== null
+  );
+  const contract = firstObject?.["contract"];
+  return {
+    langs: parsed as LangInfo[],
+    missingFields: langContractSkew(parsed),
+    ...(typeof contract === "number" ? { reportedContract: contract } : {}),
+  };
+}
+
+/** Parse `travsr lang list --json` output into LangInfo rows. Tolerates empty/error.
+ *  Shape-blind by design — callers that render the rows must use
+ *  [`parseLangList`] so they see the skew verdict too. */
+export function parseAvailableLanguages(raw: string): LangInfo[] {
+  return parseLangList(raw).langs;
+}
+
+/**
+ * Wall-clock budget for `travsr lang list --json`.
+ *
+ * Deliberately far above the 4 s the other read-only `lang` calls use. This one
+ * resolves every catalog entry's analyzer, which is a PATH sweep per language —
+ * measured at ~17 s on Windows with a cold filesystem cache. Under the shared
+ * short timeout the command was killed mid-flight and its partial output parsed
+ * as "no languages available", so the panel reported an empty catalog on exactly
+ * the machines slow enough to need the information (#755). It also silently
+ * defeated the contract check below, whose one wrong answer is a false "current".
+ */
+const LANG_LIST_TIMEOUT_MS = 60_000;
+
+/**
+ * #755: ask a resolved binary whether its `lang list --json` speaks the contract
+ * this extension renders.
+ *
+ * Runs the same read-only command the Languages panel runs, with no cwd — the
+ * per-repo column is irrelevant to a shape check, and a repo-less probe works
+ * before any workspace is chosen. Returns `[]` for "current" and the missing
+ * field names otherwise.
+ *
+ * A binary that fails to spawn, times out, or prints an error blob returns `[]`:
+ * that is a different problem with its own recovery path (`assertExecutableBinary`,
+ * the download flow), and accusing it of being stale would misdirect the user.
+ */
+export async function probeLangListContract(
+  binary: string
+): Promise<{ missingFields: string[]; reportedContract?: number }> {
+  const { stdout, code } = await spawnLangCommandResult(
+    binary,
+    ["lang", "list", "--json"],
+    undefined,
+    LANG_LIST_TIMEOUT_MS
+  );
+  if (code !== 0) return { missingFields: [] };
+  // stdout only: a stray stderr line would fail the parse and be read as "no
+  // skew", i.e. as a clean bill of health for a binary that never got checked.
+  const parsed = parseLangList(stdout);
+  if (parsed.langs.length === 0) return { missingFields: [] };
+  return {
+    missingFields: parsed.missingFields,
+    ...(parsed.reportedContract !== undefined
+      ? { reportedContract: parsed.reportedContract }
+      : {}),
+  };
+}
+
+/** #755: the one wording for a contract-skewed binary, shared by the activation
+ *  gate and anything else that has to say it. Names the binary, what it failed to
+ *  report, and that the panel needs a newer one — never a bare "update travsr",
+ *  because both builds self-report the same version string and the user has no
+ *  way to tell them apart from that alone. */
+export function contractSkewMessage(
+  binary: string,
+  missingFields: string[],
+  reportedContract?: number
+): string {
+  const rev =
+    reportedContract === undefined
+      ? `reports no lang-list contract revision (this extension needs ${LANG_CONTRACT_VERSION})`
+      : `reports lang-list contract revision ${reportedContract}, but this extension needs ${LANG_CONTRACT_VERSION}`;
+  return (
+    `Travsr: the travsr binary at ${binary} is older than this extension expects — it ${rev}. ` +
+    `Missing: ${missingFields.join(", ")}. The Languages panel is held back until a current ` +
+    `binary is resolved; indexing and search are unaffected.`
+  );
 }
 
 /** Human-readable "time ago" for a timestamp in ms. */
@@ -610,6 +743,8 @@ type PanelMessage =
   | { command: "enableWithPermission"; language: string }
   | { command: "detectLangs" }
   | { command: "reloadAvailable" }
+  | { command: "downloadBinary" }
+  | { command: "openBinarySetting" }
   | { command: "pickRepo" }
   | { command: "initRepo" }
   | { command: "openFile"; path: string }
@@ -958,22 +1093,30 @@ export async function readDiagnostics(binary: string, cwd: string): Promise<Diag
  *  `code` is `null` on timeout or spawn error, so a caller that must confirm a
  *  command actually succeeded (a security-consent grant) can check `code === 0`
  *  rather than trust empty output. */
+/** `out` is stdout+stderr interleaved, which is what the human-facing callers
+ *  want (a CLI remedy line is as likely on stderr as on stdout). `stdout` is
+ *  stdout alone, for the one caller that must `JSON.parse` the result: #755
+ *  review — a single stderr line printed alongside the payload (a `tracing` line
+ *  when the user has `RUST_LOG` set) made `JSON.parse` fail, which the parser maps
+ *  to no rows and no skew. That is a false "current", the one wrong answer the
+ *  contract check must never give, and it needed no timeout to reach. */
 function spawnLangCommandResult(
   binary: string,
   args: string[],
   cwd?: string,
   timeoutMs = 4_000
-): Promise<{ out: string; code: number | null }> {
+): Promise<{ out: string; stdout: string; code: number | null }> {
   return new Promise((resolve) => {
     let out = "";
+    let stdout = "";
     let resolved = false;
-    const done = (v: { out: string; code: number | null }): void => { if (!resolved) { resolved = true; resolve(v); } };
+    const done = (v: { out: string; stdout: string; code: number | null }): void => { if (!resolved) { resolved = true; resolve(v); } };
     const proc = cp.spawn(binary, args, { env: { ...process.env, TERM: "dumb", NO_COLOR: "1" }, ...(cwd ? { cwd } : {}) });
-    proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
+    proc.stdout?.on("data", (d: Buffer) => { const s = d.toString(); out += s; stdout += s; });
     proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
-    const timer = setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done({ out, code: null }); }, timeoutMs);
-    proc.on("close", (code) => { clearTimeout(timer); done({ out, code }); });
-    proc.on("error", (e) => { clearTimeout(timer); done({ out: `error: ${e.message}`, code: null }); });
+    const timer = setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done({ out, stdout, code: null }); }, timeoutMs);
+    proc.on("close", (code) => { clearTimeout(timer); done({ out, stdout, code }); });
+    proc.on("error", (e) => { clearTimeout(timer); done({ out: `error: ${e.message}`, stdout: "", code: null }); });
   });
 }
 
@@ -1060,21 +1203,64 @@ export function registerShowLanguages(
 
   let cachedAvailable: LangInfo[] = [];
   let availableLoaded = false;
+  // #755: the shape verdict on the cached rows. Kept beside them so a refresh
+  // can never render rows from one binary under the verdict from another.
+  let cachedSkew: LangContractSkew | undefined;
+
+  // #755: the binaries already reported as skewed this session. The banner is in
+  // the panel every render, so the toast only has to fire the first time a given
+  // binary is seen — a Reload must not re-nag about a fact still on screen.
+  const skewReported = new Set<string>();
+
+  /** Load `lang list --json` and record both the rows and the shape verdict.
+   *  #755: a stale binary is reported once, here, instead of leaking into the
+   *  panel as cells the renderer had to guess at. */
+  const loadAvailable = async (): Promise<void> => {
+    const bin = getBinary();
+    // Run in the target repo so the CLI computes the per-repo "This repo" column
+    // (enabled / not enabled / …). Without a cwd it runs outside any repo and
+    // every non-builtin reads "n/a" (no_repo). `current()` never prompts.
+    // stdout only (#755 review): the payload has to survive a `tracing` line on
+    // stderr, which would otherwise blank the table AND report a false "current".
+    const parsed = parseLangList(
+      (
+        await spawnLangCommandResult(
+          bin,
+          ["lang", "list", "--json"],
+          activeRepo.current(),
+          LANG_LIST_TIMEOUT_MS
+        )
+      ).stdout
+    );
+    cachedAvailable = parsed.langs;
+    cachedSkew = parsed.missingFields.length
+      ? {
+          missingFields: parsed.missingFields,
+          ...(parsed.reportedContract !== undefined
+            ? { reportedContract: parsed.reportedContract }
+            : {}),
+          binary: bin,
+        }
+      : undefined;
+    availableLoaded = true;
+    // #755: this is the gate for a binary the user configured themselves —
+    // activation skips probing that case precisely because the payload is already
+    // being fetched here, so checking it costs nothing extra.
+    if (cachedSkew && !skewReported.has(bin)) {
+      skewReported.add(bin);
+      void vscode.window.showWarningMessage(
+        contractSkewMessage(bin, parsed.missingFields, parsed.reportedContract)
+      );
+    }
+  };
 
   const render = async (): Promise<string> => {
     const langsRaw = await client.callTool("repo_languages");
-    if (!availableLoaded) {
-      // Run in the target repo so the CLI computes the per-repo "This repo" column
-      // (enabled / not enabled / …). Without a cwd it runs outside any repo and
-      // every non-builtin reads "n/a" (no_repo). `current()` never prompts.
-      const raw = await spawnLangCommand(getBinary(), ["lang", "list", "--json"], activeRepo.current());
-      cachedAvailable = parseAvailableLanguages(raw);
-      availableLoaded = true;
-    }
+    if (!availableLoaded) await loadAvailable();
     // Show the target repo in the panel only when several are open — with one
     // repo there is no ambiguity to surface.
     const target = activeRepo.hasChoice() ? activeRepo.currentName() : undefined;
-    return buildLanguagesHtml(parseLanguageCounts(langsRaw), cachedAvailable, target);
+    return buildLanguagesHtml(parseLanguageCounts(langsRaw), cachedAvailable, target, cachedSkew);
   };
 
   // Buttons are unlocked immediately by openManagedPanel's 'unlockButtons' postMessage
@@ -1084,12 +1270,26 @@ export function registerShowLanguages(
     if (msg.command === "reloadAvailable") {
       availableLoaded = false;
       postStatus('Reloading available tools…');
-      void spawnLangCommand(getBinary(), ["lang", "list", "--json"], activeRepo.current()).then((raw) => {
-        cachedAvailable = parseAvailableLanguages(raw);
-        availableLoaded = true;
+      void loadAvailable().then(() => {
         postStatus(""); // clear immediately — never couple clear to render()/callTool
         void refresh();
       });
+      return;
+    }
+    // #755: the two remedies the skew banner offers. Both are the same actions the
+    // command palette already exposes — the banner just puts them where the user
+    // hit the problem, so the fix is not a docs trip.
+    if (msg.command === "downloadBinary") {
+      await vscode.commands.executeCommand("travsr.downloadBinary");
+      availableLoaded = false;
+      await refresh();
+      return;
+    }
+    if (msg.command === "openBinarySetting") {
+      await vscode.commands.executeCommand(
+        "workbench.action.openSettings",
+        "travsr.binaryPath"
+      );
       return;
     }
 

@@ -54,6 +54,11 @@ pub enum LangCommand {
         /// v0.3.0) instead of the latest one. Applies to analyzers fetched from
         /// GitHub releases. Analyzers with a built-in checksum stay pinned and
         /// reject a mismatching version.
+        ///
+        /// This is the analyzer's own release tag, which differs per language
+        /// (v0.12.3 for scip-java, 1.3.13 for kotlin-language-server). It does
+        /// not affect the travsr-lang support binary, which tracks its own
+        /// releases.
         #[arg(long)]
         version: Option<String>,
     },
@@ -338,7 +343,35 @@ impl RepoState {
     }
 }
 
-fn json_str(s: &str) -> String {
+/// Revision of the `lang list --json` row shape (#755).
+///
+/// Emitted on every row so a consumer can tell a current binary from an older
+/// one **without** comparing version strings. It cannot use the version string:
+/// the npm-distributed build and a locally built one both self-report `1.0.0`
+/// (npm's only differs by a `+<sha>` build suffix) while emitting different row
+/// shapes, so a version comparison sees no difference where one exists. The VS
+/// Code Languages panel silently rendered `status: undefined` as "partial" and
+/// `repoState: undefined` as the literal string "undefined" for exactly this
+/// reason.
+///
+/// Bump this whenever a field the panel reads is added, removed, or changes
+/// meaning. Adding a field a consumer may ignore does not require a bump; the
+/// consumer's own gate is field presence, and this marker only lets it phrase
+/// "your travsr is behind" precisely instead of guessing.
+///
+/// 1 — `language`, `package`, `sandbox`, `status`, `statusLine`, `repoState`,
+///     `installed`, `registered`, `builtin`, `needsApproval`, `scipInstallType`,
+///     `installHint`, `underlyingToolHint`, `prerequisites`, `elevatedHosts`,
+///     `availableOnThisPlatform`, `unavailableTarget`.
+pub(crate) const LANG_LIST_CONTRACT: u32 = 1;
+
+/// JSON-quote and fully escape `s`.
+///
+/// `pub(crate)` so `embed list --json` uses the same escaping rather than growing
+/// a second, weaker copy: its `machineDefault` is read back out of a config file
+/// the user edits by hand, which is the first value on that line that is not a
+/// compile-time catalog constant (#755 review).
+pub(crate) fn json_str(s: &str) -> String {
     // Full JSON string escaping, not just `\` and `"`: a control character
     // (newline, tab, …) in any field — an `underlying_tool_hint`, a status line —
     // would otherwise emit invalid JSON that the VS Code panel's `JSON.parse`
@@ -437,7 +470,7 @@ fn cmd_list(json: bool) -> Result<()> {
                 analyzer_ready(entry, registered),
             );
             entries.push(format!(
-                r#"{{"language":{},"package":{},"sandbox":{},"status":{},"statusLine":{},"repoState":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"prerequisites":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{}}}"#,
+                r#"{{"contract":{LANG_LIST_CONTRACT},"language":{},"package":{},"sandbox":{},"status":{},"statusLine":{},"repoState":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"prerequisites":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{}}}"#,
                 json_str(entry.language),
                 json_str(package),
                 json_str(sandbox),
@@ -579,6 +612,30 @@ fn cmd_install(
         );
     }
 
+    // #755 Part B item 2: `--version` used to be checked deep inside the analyzer
+    // install, AFTER the wrapper had already been downloaded at `latest`. So
+    // `lang install ruby --version v0.4.0` fetched the newest wrapper, then failed
+    // on the pinned analyzer — leaving the wrapper at a version the user did not
+    // ask for and no way to tell they were now mid-way through a partial install.
+    // Decide it here, before any network work, so either the whole install honours
+    // the pin or nothing happens.
+    if let (Some(requested), Some(pin)) = (override_version, analyzer_version_pin(entry)) {
+        if requested != pin {
+            anyhow::bail!(
+                "'{language}' cannot be installed at {requested}: its analysis tool \
+                 '{}' is pinned to {pin} for supply-chain integrity (its checksum is \
+                 vendored for that exact release), so no other version can be \
+                 verified.\n\
+                 \n\
+                 Install the pinned version instead:\n\
+                 \ttravsr lang install {language}\n\
+                 \n\
+                 Nothing was downloaded or changed.",
+                entry.command
+            );
+        }
+    }
+
     // On Windows, the analyzers that cannot run isolated (java/scala) take the
     // plain-child permission path (`travsr lang allow-unsandboxed <lang>`); the
     // consent gate for that is checked further below. Elevated network access for
@@ -616,9 +673,12 @@ fn cmd_install(
                 let target =
                     crate::install::current_target().context("determining install target")?;
 
-                // Fetch the latest release version; fall back to catalog default
-                // if GitHub is unreachable (e.g. offline / CI without network).
-                let version = fetch_version_with_fallback(entry.wrapper_version_fallback);
+                // #755 Part B item 2: resolved by a helper that takes no override by
+                // construction, so `override_version` cannot be forwarded here even
+                // by accident. See `wrapper_install_tag` for why that matters.
+                let version = wrapper_install_tag(entry.wrapper_version_fallback, bin, || {
+                    run_async(crate::install::fetch_latest_version())
+                })?;
 
                 println!("Installing {bin} {version}...");
 
@@ -921,6 +981,70 @@ fn run_pkg_command(
     Ok(CmdOutcome::Ran {
         success: status.success(),
     })
+}
+
+/// Resolve the `travsr-lang-*` wrapper's release tag.
+///
+/// Takes no `override_version` parameter **by construction**, because `--version`
+/// names a tag in the *analyzer's* release stream and the wrapper's is a
+/// different one. Wrappers ship from `Travsr-com/travsr-lang` on the
+/// `v0.1.0`/`v0.3.0` line the catalog records as `wrapper_version_fallback`;
+/// each analyzer has its own repo and its own tag vocabulary — `v0.12.3` for
+/// scip-java, `1.3.13` for kotlin-language-server, `scip-ruby-v0.4.7` for
+/// scip-ruby, `v0.4.0` for scip-clang. No single value is valid in both.
+///
+/// Forwarding the flag to both broke two invocations that work without it:
+/// requesting a pinned analyzer's own tag (`lang install kotlin --version
+/// 1.3.13`, which the up-front pin check deliberately allows), and the
+/// documented way to pin scip-java off Windows (`lang install java --version
+/// v0.12.3`, where nothing rejects it up front because that entry is not
+/// hash-pinned there). Both then asked travsr-lang for a tag it has never
+/// published and aborted on the 404.
+///
+/// Pinning a wrapper needs its own flag, or a resolver that knows which stream a
+/// tag belongs to. Until then the wrapper tracks its own latest release, which is
+/// what every install did before. The absent parameter is the enforcement: a
+/// comment saying "do not pass the override" is one careless edit from being
+/// false, and this cannot be.
+fn wrapper_install_tag(
+    wrapper_version_fallback: &str,
+    bin: &str,
+    fetch_latest: impl FnOnce() -> anyhow::Result<String>,
+) -> Result<String> {
+    resolve_install_tag(false, wrapper_version_fallback, None, bin, fetch_latest)
+}
+
+/// The one release tag this language's analysis tool can be installed at, when it
+/// is hash-pinned (#755 Part B item 2).
+///
+/// A vendored checksum only matches one exact asset, so a pinned entry has
+/// exactly one installable version and `--version` asking for another cannot be
+/// verified. `Some(tag)` means "this and nothing else"; `None` means the tag is
+/// free (live `releases/latest`, a package manager, or a manual install).
+///
+/// Computes the same `(pinned, version_fallback)` pair each install path feeds
+/// `resolve_install_tag`, per spec kind, so the up-front rejection in
+/// `cmd_install` and the deep one inside the download can never disagree about
+/// which languages are pinned and to what. `install_scip_github_binary`'s
+/// Windows compat pin for scip-java is included for the same reason: on Windows
+/// that entry also has exactly one installable tag.
+fn analyzer_version_pin(
+    entry: &travsr_plugin_host::phase_b::catalog::PhaseBEntry,
+) -> Option<&'static str> {
+    match entry.scip_install {
+        ScipInstall::GithubBinary(ref spec) => {
+            let windows_pin = spec.windows_pin.filter(|_| cfg!(windows));
+            (spec.sha256_fn.is_some() || windows_pin.is_some())
+                .then(|| windows_pin.unwrap_or(spec.version_fallback))
+        }
+        // `GzBinarySpec::sha256_fn` is not optional — a gz entry is always pinned.
+        ScipInstall::CommandThenGithubGz(_, ref spec) => Some(spec.version_fallback),
+        ScipInstall::ZipBinary(ref spec) => {
+            spec.sha256_fn.is_some().then_some(spec.version_fallback)
+        }
+        // A package manager or the user picks the version — nothing to pin.
+        ScipInstall::Command(_) | ScipInstall::Manual => None,
+    }
 }
 
 /// Attempt to install or hint for the underlying SCIP tool. Returns true if the
@@ -1754,15 +1878,12 @@ fn current_repo_corpus() -> Option<String> {
     })
 }
 
-fn fetch_version_with_fallback(fallback: &str) -> String {
-    match run_async(crate::install::fetch_latest_version()) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("warning: could not fetch latest version ({e:#}), using {fallback}");
-            fallback.to_string()
-        }
-    }
-}
+// #755 Part B item 2: `fetch_version_with_fallback` lived here as the wrapper's
+// own tag resolver, which is why `--version` never reached the wrapper — the flag
+// was threaded to the analyzer's `resolve_install_tag` and this function ignored
+// it. The wrapper now goes through `resolve_install_tag` too (with `pinned =
+// false`), so the override/latest/offline-fallback precedence is defined in one
+// place for wrappers, analyzers and the embed sidecar alike.
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -2124,5 +2245,274 @@ granted_date = "2026-01-02"
         assert_eq!(json_str("\r"), "\"\\r\"");
         // A bare low control char uses the \u escape.
         assert_eq!(json_str("\u{01}"), "\"\\u0001\"");
+    }
+}
+
+/// #755: the `lang list --json` contract marker (Part A) and `--version` pinning
+/// for `lang install` (Part B item 2).
+#[cfg(test)]
+mod issue_755_tests {
+    use super::{analyzer_version_pin, LANG_LIST_CONTRACT};
+    use travsr_plugin_host::phase_b::catalog::{lookup, ScipInstall, CATALOG};
+
+    // ── Part A: the contract marker ──────────────────────────────────────────
+
+    /// The marker is what lets a consumer tell a current binary from an older
+    /// one without comparing version strings — the npm build and a local build
+    /// both self-report `1.0.0`. Pinned so a field the VS Code panel reads
+    /// cannot be added or renamed without a deliberate bump on this line.
+    ///
+    /// Raising it means the panel's own `LANG_CONTRACT_VERSION`
+    /// (`packages/travsr-vscode/src/webviews.ts`) must move in the same commit.
+    #[test]
+    fn lang_list_contract_revision_is_pinned() {
+        assert_eq!(
+            LANG_LIST_CONTRACT, 1,
+            "bumping this requires bumping LANG_CONTRACT_VERSION in the VS Code \
+             extension in the same commit"
+        );
+    }
+
+    // ── Part B item 2: which languages have exactly one installable version ──
+
+    /// The reported repro. `scip-ruby` carries a vendored checksum, so ruby has
+    /// exactly one installable analyzer tag and `--version v0.4.0` can never be
+    /// verified. Knowing this BEFORE the wrapper download is the whole point:
+    /// the old flow fetched the wrapper at `latest`, then failed here.
+    #[test]
+    fn a_hash_pinned_analyzer_reports_its_single_installable_tag() {
+        let ruby = lookup("ruby").expect("ruby is in the catalog");
+        assert_eq!(
+            analyzer_version_pin(ruby),
+            Some("scip-ruby-v0.4.7"),
+            "ruby's analyzer is hash-pinned, so exactly one tag is installable"
+        );
+    }
+
+    /// rust installs its analyzer from a gz asset whose hash is not optional —
+    /// always pinned, so `--version` can only ever name that same tag.
+    #[test]
+    fn a_gz_analyzer_is_always_pinned() {
+        let rust = lookup("rust").expect("rust is in the catalog");
+        assert!(
+            matches!(rust.scip_install, ScipInstall::CommandThenGithubGz(..)),
+            "this test is about the gz path"
+        );
+        assert!(
+            analyzer_version_pin(rust).is_some(),
+            "a gz entry carries a non-optional vendored hash, so it is always pinned"
+        );
+    }
+
+    /// kotlin's zip analyzer vendors a hash too.
+    #[test]
+    fn a_hash_pinned_zip_analyzer_reports_its_tag() {
+        let kotlin = lookup("kotlin").expect("kotlin is in the catalog");
+        assert_eq!(analyzer_version_pin(kotlin), Some("1.3.13"));
+    }
+
+    /// The negative case, and the one that makes `--version` worth honouring for
+    /// the wrapper at all: swift's analyzer vendors no hash, so its tag floats
+    /// and an override is legitimate. Nothing here may be rejected.
+    #[test]
+    fn an_unpinned_github_analyzer_has_no_version_pin() {
+        let swift = lookup("swift").expect("swift is in the catalog");
+        assert_eq!(
+            analyzer_version_pin(swift),
+            None,
+            "no vendored hash and no windows pin means the tag floats, so \
+             `--version` must be honoured rather than refused"
+        );
+    }
+
+    /// A package-manager install resolves its own version, so there is nothing
+    /// to pin — `--version` is separately warned about as having no effect, not
+    /// rejected as unverifiable.
+    #[test]
+    fn a_package_manager_analyzer_has_no_version_pin() {
+        for lang in ["go", "typescript", "javascript", "csharp"] {
+            let entry = lookup(lang).expect("lang is in the catalog");
+            assert!(
+                matches!(entry.scip_install, ScipInstall::Command(_)),
+                "{lang} should install via a package-manager command"
+            );
+            assert_eq!(analyzer_version_pin(entry), None, "{lang}");
+        }
+    }
+
+    /// A manual install is the user's own choice of version.
+    #[test]
+    fn a_manual_analyzer_has_no_version_pin() {
+        for lang in ["scala", "php"] {
+            let entry = lookup(lang).expect("lang is in the catalog");
+            assert!(matches!(entry.scip_install, ScipInstall::Manual), "{lang}");
+            assert_eq!(analyzer_version_pin(entry), None, "{lang}");
+        }
+    }
+
+    /// java is pinned only where its compat pin applies. This is the arm that
+    /// makes the up-front check agree with `install_scip_github_binary`, which
+    /// treats the Windows pin as a pin for exactly the same reason.
+    #[test]
+    fn a_windows_compat_pin_counts_as_a_pin_on_windows_only() {
+        let java = lookup("java").expect("java is in the catalog");
+        if cfg!(windows) {
+            assert_eq!(
+                analyzer_version_pin(java),
+                Some("v0.12.3"),
+                "on Windows java has exactly one usable analyzer tag"
+            );
+        } else {
+            assert_eq!(
+                analyzer_version_pin(java),
+                None,
+                "off Windows java's analyzer tag floats to releases/latest"
+            );
+        }
+    }
+
+    /// Every catalog entry must answer this question without panicking — a new
+    /// language added with an install kind nobody mapped would otherwise reach
+    /// the up-front check and abort `lang install` for that language.
+    #[test]
+    fn every_catalog_entry_answers_the_pin_question() {
+        for entry in CATALOG {
+            let pin = analyzer_version_pin(entry);
+            if let Some(tag) = pin {
+                assert!(
+                    !tag.is_empty(),
+                    "{}: a pin must name a tag, not the empty string",
+                    entry.language
+                );
+            }
+        }
+    }
+
+    /// `--version` names a tag in the ANALYZER's release stream, and the wrapper's
+    /// is a different one. Wrappers ship from `Travsr-com/travsr-lang` on the
+    /// `v0.1.0`/`v0.3.0` line; analyzers each have their own repo and vocabulary
+    /// (`v0.12.3` scip-java, `1.3.13` kotlin-language-server, `scip-ruby-v0.4.7`
+    /// scip-ruby). Forwarding the flag to both asked travsr-lang for tags it has
+    /// never published.
+    ///
+    /// This is the shape of the two regressions that caused: a tag that is
+    /// perfectly valid for the analyzer must NOT become the wrapper's tag.
+    #[test]
+    fn an_analyzer_tag_never_becomes_the_wrapper_tag() {
+        use super::wrapper_install_tag;
+        // Every one of these is a real analyzer tag from the catalog, and none of
+        // them exists in the travsr-lang release stream. `wrapper_install_tag`
+        // accepts no override at all, so there is no argument position to leak one
+        // into — the assertion is that the tag it returns is its own stream's.
+        for analyzer_tag in ["1.3.13", "v0.12.3", "scip-ruby-v0.4.7", "v0.4.0"] {
+            let wrapper =
+                wrapper_install_tag("v0.1.0", "travsr-lang-kotlin", || Ok("v0.3.0".into()))
+                    .unwrap();
+            assert_ne!(
+                wrapper, analyzer_tag,
+                "the wrapper must resolve on its own stream, not inherit {analyzer_tag}"
+            );
+            assert_eq!(
+                wrapper, "v0.3.0",
+                "the wrapper tracks its own latest release"
+            );
+        }
+    }
+
+    /// Regression 1 from review: requesting a pinned analyzer's OWN tag is allowed
+    /// (`resolve_install_tag` documents it, and the up-front check only bails on a
+    /// mismatch), so it must reach the analyzer resolver and succeed there. This is
+    /// the case that worked on master, broke when the flag was forwarded to the
+    /// wrapper, and has to keep working.
+    #[test]
+    fn requesting_a_pinned_analyzers_own_tag_is_accepted() {
+        for (lang, tag) in [("kotlin", "1.3.13"), ("ruby", "scip-ruby-v0.4.7")] {
+            let entry = lookup(lang).expect("lang is in the catalog");
+            let pin = analyzer_version_pin(entry).expect("this language is pinned");
+            assert_eq!(pin, tag, "{lang}: catalog pin moved, update this test");
+            // The up-front gate in cmd_install bails only when requested != pin.
+            assert_eq!(
+                analyzer_version_pin(entry),
+                Some(tag),
+                "{lang}: requesting the pin itself must not be refused"
+            );
+        }
+    }
+
+    /// Regression 2 from review: java's analyzer is NOT hash-pinned off Windows, so
+    /// nothing rejects `--version v0.12.3` up front — and `v0.12.3` is the
+    /// documented way to pin scip-java. It must reach the analyzer and leave the
+    /// wrapper alone, or the documented invocation breaks on mac and linux.
+    #[test]
+    fn the_documented_scip_java_pin_does_not_touch_the_wrapper() {
+        use super::wrapper_install_tag;
+        let java = lookup("java").expect("java is in the catalog");
+        if !cfg!(windows) {
+            assert_eq!(
+                analyzer_version_pin(java),
+                None,
+                "off Windows nothing rejects a java --version up front"
+            );
+        }
+        // Whatever the up-front gate decides, the wrapper resolves independently.
+        let wrapper =
+            wrapper_install_tag(java.wrapper_version_fallback, "travsr-lang-java", || {
+                Ok("v0.3.0".into())
+            })
+            .unwrap();
+        assert_eq!(
+            wrapper, "v0.3.0",
+            "`--version v0.12.3` must not become the travsr-lang-java tag"
+        );
+    }
+
+    /// The wrapper tracks the live release, and falls back to the catalog floor
+    /// only when the fetch fails — unchanged behaviour, pinned here because the
+    /// resolver is shared with the analyzer path.
+    #[test]
+    fn the_wrapper_tag_tracks_latest_then_falls_back() {
+        use super::wrapper_install_tag;
+        let live =
+            wrapper_install_tag("v0.1.0", "travsr-lang-ruby", || Ok("v0.9.9".into())).unwrap();
+        assert_eq!(live, "v0.9.9", "no override means the live release wins");
+
+        let offline = wrapper_install_tag("v0.1.0", "travsr-lang-ruby", || {
+            Err(anyhow::anyhow!("no network"))
+        })
+        .unwrap();
+        assert_eq!(
+            offline, "v0.1.0",
+            "an unreachable GitHub must degrade to the catalog floor, not fail"
+        );
+    }
+
+    /// The up-front rejection and the deep one must agree: for every pinned
+    /// language, asking for a different tag is refused by `resolve_install_tag`
+    /// too, and asking for the pinned tag is allowed by both.
+    #[test]
+    fn the_up_front_pin_agrees_with_resolve_install_tag() {
+        use super::resolve_install_tag;
+        for entry in CATALOG {
+            let Some(pin) = analyzer_version_pin(entry) else {
+                continue;
+            };
+            // Same tag: both accept.
+            assert!(
+                resolve_install_tag(true, pin, Some(pin), entry.command, || Ok(pin.to_string()))
+                    .is_ok(),
+                "{}: the pinned tag itself must stay installable",
+                entry.language
+            );
+            // Different tag: both refuse.
+            let other = format!("{pin}-not-a-real-tag");
+            assert!(
+                resolve_install_tag(true, pin, Some(&other), entry.command, || Ok(
+                    pin.to_string()
+                ))
+                .is_err(),
+                "{}: a tag other than the pin must be refused",
+                entry.language
+            );
+        }
     }
 }

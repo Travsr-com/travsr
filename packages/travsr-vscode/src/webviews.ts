@@ -210,6 +210,14 @@ export function webviewShell(title: string, body: string, script: string): strin
   .banner.good { background: var(--green-deep); border-color: var(--green); color: var(--green); }
   .banner.bad  { background: var(--orange-deep); border-color: var(--orange); color: var(--orange); }
   .banner.idle { background: var(--bg-elev); border-color: var(--border); color: var(--fg-muted); }
+  /* #755: contract-skew notice. Block, not flex: it carries prose plus a row of
+     actions, so the parts must stack rather than share a baseline. */
+  .banner.warn { display: block; background: var(--orange-deep); border-color: var(--orange);
+    color: var(--fg); }
+  .banner.warn b { color: var(--orange); }
+  .banner.warn p { margin: 0; color: var(--fg-muted); }
+  .banner code { font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+    background: var(--bg-input); border-radius: 4px; padding: 0 4px; color: var(--fg); }
 
   /* One card per problem: what broke, what it costs, what to run. */
   .diags { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
@@ -1002,13 +1010,90 @@ export interface LangInfo {
    *  Empty when the analyzer has no such external dependency. */
   prerequisites: string;
   elevatedHosts: string[];
+  /** #755: the `lang list --json` contract revision the emitting binary speaks.
+   *  Absent on binaries built before the marker existed — which is itself the
+   *  signal that it predates the fields below. Never re-derive from the version
+   *  string: an npm-bundled and a current build can both self-report "1.0.0"
+   *  while emitting different shapes. */
+  contract?: number;
 }
 
-/** Languages panel: indexed section + available section with install actions. */
+/** #755: what `buildLanguagesHtml` reads out of every row and cannot re-derive.
+ *  A binary whose `lang list --json` omits any of these predates this panel's
+ *  contract, and rendering its rows produces silently wrong cells (a `status`
+ *  that falls back to "partial", a `repoState` that interpolates the literal
+ *  string "undefined"). Exported so the parser and the panel agree on one list.
+ *
+ *  Deliberately NOT every field on `LangInfo`. `needsApproval` and
+ *  `elevatedHosts` are still declared (and still emitted) so an older CLI's JSON
+ *  parses, but nothing renders them since elevated access became auto-granted for
+ *  local use — so a CLI that eventually drops them is not skewed, and demanding
+ *  them here would reject a binary that is in fact newer than this panel. */
+export const LANG_CONTRACT_FIELDS = [
+  "language",
+  "status",
+  "statusLine",
+  "repoState",
+  "prerequisites",
+  "builtin",
+  "availableOnThisPlatform",
+  "unavailableTarget",
+] as const satisfies readonly (keyof LangInfo)[];
+
+/** #755: the `lang list --json` contract revision this panel is written against.
+ *  Only used to phrase the skew message — the authoritative gate is field
+ *  presence (`LANG_CONTRACT_FIELDS`), so a NEWER binary is never rejected. */
+export const LANG_CONTRACT_VERSION = 1;
+
+/** #755: a `lang list --json` payload whose rows predate the panel's contract.
+ *  Carries the evidence so the message can name what is actually wrong instead
+ *  of telling the user to "update something". */
+export interface LangContractSkew {
+  /** Fields from `LANG_CONTRACT_FIELDS` absent from the payload's rows. */
+  missingFields: string[];
+  /** The contract revision the binary reported, when it reported one at all. */
+  reportedContract?: number;
+  /** The resolved binary that produced the payload, when known. */
+  binary?: string;
+}
+
+/** #755: render the skew banner — an actionable statement of which binary is
+ *  behind and how to point at a current one, in place of rows the panel knows
+ *  it cannot render truthfully. */
+function skewBanner(skew: LangContractSkew): string {
+  const fields = skew.missingFields.length
+    ? `It does not report ${skew.missingFields.map((f) => `<code>${esc(f)}</code>`).join(", ")}.`
+    : "";
+  const reported =
+    skew.reportedContract === undefined
+      ? `It reports no contract revision at all (this panel needs ${LANG_CONTRACT_VERSION}).`
+      : `It reports contract revision ${skew.reportedContract}; this panel needs ${LANG_CONTRACT_VERSION}.`;
+  const which = skew.binary
+    ? `<p style="margin:6px 0 0">Resolved binary: <code>${esc(skew.binary)}</code></p>`
+    : "";
+  return `<div class="banner warn" role="alert">
+  <b>The <code>travsr</code> this window resolved is older than this extension expects.</b>
+  <p style="margin:6px 0 0">${reported} ${fields}
+  Rather than show cells it would have to guess at, the available-tools list is held back.</p>
+  ${which}
+  <p style="margin:8px 0 0">
+    <button class="btn primary" onclick="downloadBinary(this)">Download a current binary</button>
+    <button class="btn" onclick="openBinarySetting()">Set travsr.binaryPath…</button>
+  </p>
+</div>`;
+}
+
+/** Languages panel: indexed section + available section with install actions.
+ *
+ *  `skew` (#755) is set when the resolved binary's `lang list --json` predates the
+ *  fields this panel reads. The available-tools rows are then withheld and replaced
+ *  by an actionable banner: rendering them would produce a table that silently
+ *  disagrees with `travsr lang list`, which is the whole failure this guards. */
 export function buildLanguagesHtml(
   indexed: LangCount[],
   available: LangInfo[],
-  targetRepo?: string
+  targetRepo?: string,
+  skew?: LangContractSkew
 ): string {
   // ── Indexed section ──────────────────────────────────────────────────────────
   const indexedRows = indexed.length
@@ -1027,8 +1112,19 @@ export function buildLanguagesHtml(
   // ── Available section ────────────────────────────────────────────────────────
   const detectedLangs = new Set(indexed.map((l) => l.language));
 
-  const availRows = available
+  // #755: skew short-circuits the rows entirely. Even with the per-cell guards
+  // below, a table of "unknown / unknown / unknown" rows is a worse answer than
+  // one sentence naming the wrong binary — the guards exist so a single odd row
+  // degrades gracefully, not so a whole skewed payload gets rendered.
+  const availRows = skew
+    ? ""
+    : available
     .map((l) => {
+      // #755: every row here is `JSON.parse` of another process's stdout, so at
+      // runtime any field can be absent no matter what `LangInfo` declares. Read
+      // presence through an untyped view so the guards below are real branches
+      // and not comparisons the compiler proves impossible and prunes.
+      const sent = l as unknown as Record<string, unknown>;
       const detected = detectedLangs.has(l.language);
       // Render the CLI's computed status — never re-derive it here, so the panel
       // can never disagree with `travsr lang list`.
@@ -1052,6 +1148,10 @@ export function buildLanguagesHtml(
 
       // Analysis column: one word per status, its plain (jargon-free) line as the
       // tooltip — except needs_consent, whose CLI line names an internal command.
+      // #755: a status the CLI did not send (an older binary, or a tag added by a
+      // newer one) must read as unknown. The old `?? ["stale","partial"]` fallback
+      // asserted "partial" — a specific, checkable claim about the language — on the
+      // strength of a missing field, which is how every row came out "partial".
       const badge = (
         {
           active: ["ok", "active"],
@@ -1060,8 +1160,13 @@ export function buildLanguagesHtml(
           needs_consent: ["dim", "needs permission"],
           unsupported: ["dim", "not available here"],
         } as Record<string, [string, string]>
-      )[l.status] ?? ["stale", "partial"];
-      const badgeTip = l.status === "needs_consent" ? permissionTip : l.statusLine;
+      )[l.status] ?? ["dim", "unknown"];
+      const badgeTip =
+        l.status === "needs_consent"
+          ? permissionTip
+          : typeof sent["statusLine"] === "string"
+            ? l.statusLine
+            : `travsr did not report a status for ${l.language}. Update travsr, or set travsr.binaryPath to a current binary.`;
       const analysisBadges = `<span class="badge ${badge[0]}" title="${esc(badgeTip)}">${badge[1]}</span>`;
 
       // Raw action HTML (used directly when detected or active; wrapped otherwise).
@@ -1069,12 +1174,12 @@ export function buildLanguagesHtml(
       if (unavailableHere) {
         // Honest dead-end: no install offered, structure still works. Tooltip is
         // the CLI's own plain line ("...not available on windows").
-        rawAction = `<span class="badge dim" title="${esc(l.statusLine)}">Not available on ${esc(osName)}</span>`;
+        rawAction = `<span class="badge dim" title="${esc(badgeTip)}">Not available on ${esc(osName)}</span>`;
       } else if (isActive && !l.builtin) {
         rawAction = `<button class="btn danger" onclick="removeLang(this,'${esc(l.language)}')">Disable</button>`;
       } else if (isActive) {
         // A built-in analyzer that is live (e.g. python): nothing to install or turn off.
-        rawAction = `<span class="badge ok" title="${esc(l.statusLine)}">on</span>`;
+        rawAction = `<span class="badge ok" title="${esc(badgeTip)}">on</span>`;
       } else if (l.status === "needs_consent") {
         // Installed, but needs the user's one-time permission to run on this OS.
         // One click records it and re-indexes — no docs trip, no command to type.
@@ -1100,32 +1205,44 @@ export function buildLanguagesHtml(
       // This repo: is full analysis actually turned on for the target repo (the
       // corpus trust gate), independent of whether the tool is installed. This is
       // the fact that keeps "active on this machine" from being read as "on here".
-      const repoText = {
-        always_on: "always on",
-        enabled: "enabled",
-        needs_analyzer: "no analyzer",
-        not_enabled: "not enabled",
-        no_repo: "n/a",
-      }[l.repoState];
+      // #755: these are object lookups on a CLI-supplied enum tag. An absent or
+      // unrecognised tag used to interpolate the literal string "undefined" into
+      // the cell, so every row read "undefined" against a stale binary. Fall back
+      // to a placeholder that says the value is unknown and names the remedy —
+      // never to a value that looks like a real answer.
+      const repoText =
+        {
+          always_on: "always on",
+          enabled: "enabled",
+          needs_analyzer: "no analyzer",
+          not_enabled: "not enabled",
+          no_repo: "n/a",
+        }[l.repoState] ?? "unknown";
       const repoCls =
         l.repoState === "enabled" || l.repoState === "always_on"
           ? "ok"
           : l.repoState === "not_enabled" || l.repoState === "needs_analyzer"
             ? "stale"
             : "dim";
-      const repoTip = {
-        always_on: "Built in — always on for every repo",
-        enabled: "Full analysis is on for this repo",
-        needs_analyzer: `Authorized for this repo, but its analyzer isn't installed yet — only structural analysis runs until it is. Install it: travsr lang install ${l.language}`,
-        not_enabled: `Full analysis is off for this repo. Enable it: travsr lang install ${l.language} (run in this repo)`,
-        no_repo: "Open a repo to see per-repo status",
-      }[l.repoState];
+      const repoTip =
+        {
+          always_on: "Built in — always on for every repo",
+          enabled: "Full analysis is on for this repo",
+          needs_analyzer: `Authorized for this repo, but its analyzer isn't installed yet — only structural analysis runs until it is. Install it: travsr lang install ${l.language}`,
+          not_enabled: `Full analysis is off for this repo. Enable it: travsr lang install ${l.language} (run in this repo)`,
+          no_repo: "Open a repo to see per-repo status",
+        }[l.repoState] ??
+        `travsr did not report per-repo state for ${l.language}. Update travsr, or set travsr.binaryPath to a current binary.`;
       const repoBadge = `<span class="badge ${repoCls}" title="${esc(repoTip)}">${repoText}</span>`;
 
+      // #755: an absent `prerequisites` is not the same fact as an analyzer with no
+      // external dependency, and "—" claims the latter. Say the value is unknown.
       const prereqText =
-        l.prerequisites && l.prerequisites !== "none"
-          ? `<span style="color:var(--fg-subtle)">${esc(l.prerequisites)}</span>`
-          : `<span style="color:var(--fg-subtle)">—</span>`;
+        sent["prerequisites"] === undefined || sent["prerequisites"] === null
+          ? `<span style="color:var(--fg-subtle)" title="travsr did not report prerequisites for ${esc(l.language)}.">unknown</span>`
+          : l.prerequisites && l.prerequisites !== "none"
+            ? `<span style="color:var(--fg-subtle)">${esc(l.prerequisites)}</span>`
+            : `<span style="color:var(--fg-subtle)">—</span>`;
 
       return `<tr>
 <td><span class="mono">${esc(l.language)}</span></td>
@@ -1142,9 +1259,17 @@ export function buildLanguagesHtml(
     ? `<p class="sub">Target repo: <b>${esc(targetRepo)}</b> — install &amp; detect run here. <a href="#" onclick="pickRepo();return false" style="color:var(--green)">change</a></p>`
     : `<p class="sub">Indexed languages in this repo and available semantic analysis tools.</p>`;
 
+  // #755: with a skewed payload the empty-table placeholder would read as "no
+  // tools available", which is a claim about the machine rather than about the
+  // binary. Say what actually happened.
+  const availEmpty = skew
+    ? '<tr><td colspan="5" class="empty">Held back — the resolved travsr is older than this panel expects (see above).</td></tr>'
+    : '<tr><td colspan="5" class="empty">No analysis tools available yet. Use Reload above to check again.</td></tr>';
+
   const body = `
 <h2>Languages</h2>
 ${sub}
+${skew ? skewBanner(skew) : ""}
 <div class="toolbar">
   <button class="btn" id="detectBtn" onclick="detectLangs(this)">Detect &amp; install</button>
   <button class="btn" id="refreshBtn" onclick="doRefresh(this)" title="Refresh indexed counts (fast)">Refresh</button>
@@ -1159,7 +1284,7 @@ ${sub}
 <section>
   <h3>Available tools</h3>
   <table><thead><tr><th>Language</th><th>Semantic</th><th>This repo</th><th>Prerequisites</th><th>Action</th></tr></thead>
-  <tbody>${availRows || '<tr><td colspan="5" class="empty">No analysis tools available yet. Use Reload above to check again.</td></tr>'}</tbody></table>
+  <tbody>${availRows || availEmpty}</tbody></table>
 </section>`;
 
   const script = `
@@ -1184,7 +1309,9 @@ function detectLangs(btn) {
 }
 function doRefresh(btn) { setLoading(btn, true, 'Refresh'); vscode.postMessage({command:'refresh'}); }
 function reloadAvail(btn) { setLoading(btn, true, 'Reload available tools'); vscode.postMessage({command:'reloadAvailable'}); }
-function initRepo(btn) { setLoading(btn, true, btn.innerText || 'Initialize this repo'); vscode.postMessage({command:'initRepo'}); }`;
+function initRepo(btn) { setLoading(btn, true, btn.innerText || 'Initialize this repo'); vscode.postMessage({command:'initRepo'}); }
+function downloadBinary(btn) { setLoading(btn, true, 'Download a current binary'); vscode.postMessage({command:'downloadBinary'}); }
+function openBinarySetting() { vscode.postMessage({command:'openBinarySetting'}); }`;
 
   return webviewShell("Travsr Languages", body, script);
 }
