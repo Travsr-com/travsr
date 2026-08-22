@@ -55,6 +55,12 @@ pub struct ConnectOpts {
     pub remove: bool,
     /// Do NOT git-ignore the generated files (opt in to committing them).
     pub commit: bool,
+    /// Also write the always-on rules file that tells an agent to prefer the
+    /// graph over grep. Off by default: that file is re-sent on every turn of
+    /// every conversation, so it is the one part of travsr with a recurring
+    /// token cost, and it is not needed for the tools to work. MCP already
+    /// hands the model every tool name and description.
+    pub rules: bool,
     /// Where the report goes. Never affects what is written.
     pub report: Report,
 }
@@ -66,6 +72,7 @@ impl ConnectOpts {
             dry_run: false,
             remove: false,
             commit: false,
+            rules: false,
             report: Report::Stdout,
         }
     }
@@ -117,43 +124,41 @@ const GUIDE_TITLE: &str = "Use Travsr first for all code questions";
 /// a `repo` argument and every schema is closed (`additionalProperties: false`).
 /// The multi-repo surface behind `travsr mcp --global` is a different tool list.
 /// When a tool is added or renamed in single-repo mode, update this table.
+/// The text written into every agent's always-on rules file.
+///
+/// Kept deliberately small. This is loaded on every turn of every conversation,
+/// so each line is paid for again and again, and it competes for attention with
+/// the user's own rules. The earlier version carried a question-to-tool routing
+/// table: eleven rows naming the tool to call for each kind of question. That
+/// was the bulk of it and it was redundant, because the MCP client already
+/// hands the model all twenty-six tool names with their descriptions before the
+/// conversation starts. Restating them here bought nothing and cost the tokens
+/// twice.
+///
+/// What stays is the part a tool schema cannot say: query the graph *before*
+/// grepping, and the handful of rules about how this server behaves. Detail
+/// that a reader wants once, rather than on every turn, lives in the FAQ and is
+/// one command away.
 fn guide_body() -> String {
-    "This repository is indexed by Travsr, a code graph served over MCP. For ANY \
-question about where code lives or how it connects (definitions, call sites, \
-imports, change impact, call paths, repo structure), query Travsr BEFORE \
-grep/find/ripgrep or reading whole files. Travsr answers from the graph, so it is \
-token-cheap and does not invent structure that is not there.
+    "This repository is indexed by Travsr, a code graph served over MCP. For any \
+question about where code lives or how it connects, query Travsr before grep, \
+find or reading whole files. It answers from the graph, so it is token-cheap and \
+does not invent structure that is not there.
 
-Pick the tool by the question:
-
-| question                          | tool                                        |
-| --------------------------------- | ------------------------------------------- |
-| where is X defined?               | search_symbol(name, exact)                  |
-| what does X actually look like?   | get_snippets(symbols, mode)                 |
-| who calls X?                      | get_callers(symbol)                         |
-| every use site of X?              | find_references(symbol, path)               |
-| what does this file import?       | get_dependencies(file, transitive)          |
-| what breaks if I change this?     | get_blast_radius(file, analysis)            |
-| how does A reach B?               | get_execution_path(source, sink)            |
-| what is in this repo?             | get_repo_map()                              |
-| open-ended \"how does X work?\"     | get_context(query, include_snippets)        |
-| text or regex search              | find_pattern(pattern, scope, fixed)         |
-| is the index fresh?               | get_index_status(), get_graph_health()      |
-
-Rules:
+The tool names and their descriptions arrive over MCP, so choose from those.
 
 1. This server is bound to this repository alone, so no tool takes a `repo` \
-   argument. Every schema is closed, pass only the arguments named above.
-2. Start open-ended questions with get_context, not with a file read. Set \
-   include_snippets=true and it returns the source inline, so there is no \
-   follow-up read at all.
-3. Prefer find_pattern over your own grep: it is the same regex search already \
-   scoped to the indexed file set, and `scope` narrows it further to a path \
-   prefix or to files-importing(<symbol>).
-4. Read a whole file only after Travsr has told you which file, and only when \
-   you need something the graph does not carry.
-5. Fall back to plain text search when Travsr returns nothing, or when it \
-   reports the index is unavailable or stale."
+   argument. Every schema is closed: pass only the arguments it names.
+2. Start open-ended questions with get_context and include_snippets=true. It \
+   returns the source inline, so there is no follow-up read.
+3. Prefer find_pattern over your own grep: the same regex search, already scoped \
+   to the indexed files, and `scope` narrows it further.
+4. Read a whole file only after Travsr has told you which file, and only for \
+   what the graph does not carry.
+5. Fall back to plain text search when Travsr returns nothing, or reports the \
+   index unavailable or stale.
+
+For anything about Travsr itself, run: travsr ask \"travsr: <question>\""
         .to_string()
 }
 
@@ -233,6 +238,17 @@ enum Content {
     JsonServer { top_key: &'static str, entry: Value },
     ManagedMd { body: String },
     Owned { text: String },
+}
+
+impl Content {
+    /// Whether this is guidance text rather than MCP wiring.
+    ///
+    /// The wiring is what makes the tools reachable; the guidance is prose an
+    /// agent re-reads every turn. They have different costs, so `connect` treats
+    /// them differently and this is the line between them.
+    fn is_guidance(&self) -> bool {
+        !matches!(self, Content::JsonServer { .. })
+    }
 }
 
 struct Planned {
@@ -1057,6 +1073,35 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         tracked(repo_root, &planned)
     };
 
+    // Guidance is opt-in, because it is the only part of travsr with a per-turn
+    // cost: an always-on rules file is re-read on every turn of every
+    // conversation, where the MCP wiring is read once at startup. Removal is not
+    // filtered, or `--remove` would strand a rules file written by an earlier
+    // run with `--rules`.
+    // Already written by an earlier run, so keep it current.
+    //
+    // Filtering guidance out unconditionally froze it: `upsert_block` never ran,
+    // so a `<!-- travsr:begin -->` block already in someone's CLAUDE.md kept the
+    // old 2270-character body forever. The token saving this is built around
+    // would have reached only people who had never run `connect`, which is
+    // nobody, while `the_always_on_guidance_stays_small` passed against a
+    // shipped file twice the budget.
+    //
+    // Presence of our block is the test, not presence of the file. CLAUDE.md
+    // usually exists for reasons that have nothing to do with travsr, and
+    // writing guidance into it because it happens to be there would put back the
+    // opt-out this change removed.
+    let already_written = |p: &Planned| match &p.content {
+        Content::ManagedMd { .. } => std::fs::read_to_string(&p.path)
+            .map(|t| t.contains(MD_BEGIN))
+            .unwrap_or(false),
+        // A file travsr owns outright: it exists only because we wrote it.
+        Content::Owned { .. } => p.path.exists(),
+        Content::JsonServer { .. } => false,
+    };
+    let wanted =
+        |p: &Planned| opts.remove || opts.rules || !p.content.is_guidance() || already_written(p);
+
     for tool in Tool::ALL {
         if let Some(only) = &opts.only {
             if tool.id() != only {
@@ -1067,7 +1112,26 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
             Detection::Auto => {
                 detected = true;
                 say!("{} ({verb}):", tool.id());
-                for planned in tool.plan(repo_root, &cmd) {
+                let full = tool.plan(repo_root, &cmd);
+                let full_len = full.len();
+                let kept: Vec<Planned> = full.into_iter().filter(&wanted).collect();
+                // Codex, Antigravity and Windsurf read their MCP config from a
+                // global file, so a rules file is the *only* thing travsr writes
+                // for them. Filtering it leaves nothing, and a tool heading with
+                // no lines under it reads as a failure rather than a choice.
+                // Say so whenever guidance was skipped, not only when nothing
+                // at all was written. For claude-code, cursor, copilot and zed
+                // the `JsonServer` entry survives, so `kept` is non-empty and a
+                // default run printed a normal-looking report with the guidance
+                // line simply absent: no signal that anything was withheld or
+                // that a flag exists (#746 review).
+                let skipped_guidance = kept.len() < full_len;
+                if kept.is_empty() {
+                    say!("  nothing to write; rules are opt-in, pass --rules");
+                } else if skipped_guidance && !opts.remove {
+                    say!("  (agent guidance not written; pass --rules to include it)");
+                }
+                for planned in kept {
                     let disp = rel(repo_root, &planned.path)
                         .unwrap_or_else(|| planned.path.display().to_string());
 
@@ -1827,9 +1891,12 @@ mod tests {
             .collect();
 
         let named = guide_table_tools(&guide_body());
+        // The guidance names only the few tools whose *use* needs explaining
+        // beyond their own description, so this is a floor against the parser
+        // silently matching nothing, not a target to grow.
         assert!(
-            named.len() >= 10,
-            "table parse recovered too few tools, it has probably broken: {named:?}"
+            named.len() >= 2,
+            "extraction recovered too few tools, it has probably broken: {named:?}"
         );
         for name in &named {
             assert!(
@@ -1883,32 +1950,222 @@ mod tests {
         );
     }
 
-    /// Tool names the routing table tells the agent to call: every identifier
-    /// immediately followed by `(` in the table's second column. Reading them
-    /// back out of the generated text is what makes the pin above real.
+    /// Tool names the guidance tells the agent to call.
+    ///
+    /// Read out of the generated text rather than kept as a list here, which is
+    /// what makes the pin above real: a rename on the server side fails the
+    /// test, where a hardcoded copy would happily agree with itself.
+    ///
+    /// Scans the whole body. It used to parse the second column of a routing
+    /// table, and when that table was removed for costing tokens on every turn
+    /// the parser silently recovered nothing, so the check passed by finding no
+    /// tools to check. Anchored to the naming convention instead.
     fn guide_table_tools(body: &str) -> Vec<String> {
         let mut names = Vec::new();
-        for line in body.lines().filter(|l| l.trim_start().starts_with('|')) {
-            let Some(cell) = line.split('|').nth(2) else {
-                continue;
-            };
-            let chars: Vec<char> = cell.chars().collect();
-            for (i, c) in chars.iter().enumerate() {
-                if *c != '(' {
-                    continue;
-                }
-                let start = chars[..i]
-                    .iter()
-                    .rposition(|c| !(c.is_alphanumeric() || *c == '_'))
-                    .map(|p| p + 1)
-                    .unwrap_or(0);
-                let name: String = chars[start..i].iter().collect();
-                if !name.is_empty() && !names.contains(&name) {
-                    names.push(name);
-                }
+        for word in body.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            let looks_like_a_tool = word.starts_with("get_")
+                || word.starts_with("find_")
+                || word.starts_with("search_")
+                || word.starts_with("repos_");
+            if looks_like_a_tool && !names.contains(&word.to_string()) {
+                names.push(word.to_string());
             }
         }
         names
+    }
+
+    /// The point of the whole change: a default `connect` must leave nothing
+    /// behind that an agent re-reads every turn.
+    ///
+    /// Exercised through `run()` rather than `plan()`. Every other test in this
+    /// file calls `plan()`, which still contains the rules entry, so all of them
+    /// kept passing when the filter was added and none of them would have caught
+    /// it being dropped.
+    #[test]
+    fn a_default_connect_writes_no_always_on_guidance() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let repo = d.path();
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(repo.join(".claude")).expect("claude dir");
+
+        let opts = ConnectOpts {
+            only: Some("claude-code".to_string()),
+            dry_run: false,
+            remove: false,
+            commit: false,
+            rules: false,
+            report: Report::Silent,
+        };
+        run(repo, &opts).expect("connect");
+
+        assert!(
+            repo.join(".mcp.json").is_file(),
+            "the MCP wiring is what makes the tools reachable and must still land"
+        );
+        assert!(
+            !repo.join("CLAUDE.md").exists(),
+            "a default connect wrote CLAUDE.md, which is re-read on every turn"
+        );
+    }
+
+    /// #746 review: an existing guidance block must be refreshed, not frozen.
+    ///
+    /// Filtering guidance out unconditionally meant `upsert_block` never ran, so
+    /// whoever ran `connect` before this change kept the old body forever and
+    /// the token saving reached nobody who had already connected.
+    #[test]
+    fn an_existing_guidance_block_is_refreshed_without_rules() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let repo = d.path();
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(repo.join(".claude")).expect("claude dir");
+
+        let opts = |rules: bool| ConnectOpts {
+            only: Some("claude-code".to_string()),
+            dry_run: false,
+            remove: false,
+            commit: false,
+            rules,
+            report: Report::Silent,
+        };
+
+        // An earlier run wrote guidance, with a body that is now out of date.
+        run(repo, &opts(true)).expect("connect --rules");
+        let path = repo.join("CLAUDE.md");
+        let stale = std::fs::read_to_string(&path)
+            .expect("CLAUDE.md")
+            .replace(GUIDE_TITLE, "Some older heading we no longer ship");
+        std::fs::write(&path, &stale).expect("write stale body");
+
+        // A default run must bring it back up to date.
+        run(repo, &opts(false)).expect("connect");
+        let after = std::fs::read_to_string(&path).expect("CLAUDE.md");
+        assert!(
+            after.contains(GUIDE_TITLE),
+            "an existing block must be refreshed by a default run: {after}"
+        );
+    }
+
+    /// The other half: a CLAUDE.md that exists for its own reasons must not
+    /// acquire guidance just by being there, or the opt-in is an opt-out.
+    #[test]
+    fn a_users_own_markdown_does_not_acquire_guidance() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let repo = d.path();
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(repo.join(".claude")).expect("claude dir");
+        std::fs::write(repo.join("CLAUDE.md"), "# My own notes\n").expect("write");
+
+        run(
+            repo,
+            &ConnectOpts {
+                only: Some("claude-code".to_string()),
+                dry_run: false,
+                remove: false,
+                commit: false,
+                rules: false,
+                report: Report::Silent,
+            },
+        )
+        .expect("connect");
+
+        let after = std::fs::read_to_string(repo.join("CLAUDE.md")).expect("CLAUDE.md");
+        assert!(
+            !after.contains(MD_BEGIN),
+            "a file we never wrote to must not gain guidance by default: {after}"
+        );
+    }
+
+    /// And the opt-in still works, or the flag is a lie.
+    #[test]
+    fn rules_writes_the_guidance_when_asked() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let repo = d.path();
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(repo.join(".claude")).expect("claude dir");
+
+        let opts = ConnectOpts {
+            only: Some("claude-code".to_string()),
+            dry_run: false,
+            remove: false,
+            commit: false,
+            rules: true,
+            report: Report::Silent,
+        };
+        run(repo, &opts).expect("connect");
+
+        let md = std::fs::read_to_string(repo.join("CLAUDE.md")).expect("CLAUDE.md");
+        assert!(
+            md.contains(GUIDE_TITLE),
+            "--rules did not write the guidance: {md}"
+        );
+    }
+
+    /// `--remove` must not be filtered, or a rules file written by an earlier
+    /// `--rules` run is stranded: the flag that created it is not the flag that
+    /// deletes it, and the user has no reason to think one is needed.
+    #[test]
+    fn remove_cleans_up_guidance_written_earlier() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let repo = d.path();
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(repo.join(".claude")).expect("claude dir");
+
+        let with_rules = |rules: bool, remove: bool| ConnectOpts {
+            only: Some("claude-code".to_string()),
+            dry_run: false,
+            remove,
+            commit: false,
+            rules,
+            report: Report::Silent,
+        };
+        run(repo, &with_rules(true, false)).expect("connect --rules");
+        assert!(repo.join("CLAUDE.md").is_file(), "setup did not write it");
+
+        run(repo, &with_rules(false, true)).expect("connect --remove");
+        let left = std::fs::read_to_string(repo.join("CLAUDE.md")).unwrap_or_default();
+        assert!(
+            !left.contains(GUIDE_TITLE),
+            "--remove left the guidance behind: {left}"
+        );
+    }
+
+    /// The guidance is loaded on every turn of every conversation, so its size
+    /// is a recurring cost paid by every user of every agent, not a one-off.
+    /// Nothing else in the codebase makes that cost visible, which is how it
+    /// reached 2270 characters: each addition looked small on its own.
+    ///
+    /// The budget is the point of this test. Adding a line means removing one,
+    /// or making a deliberate case for raising the limit.
+    #[test]
+    fn the_always_on_guidance_stays_small() {
+        let n = guide_body().chars().count();
+        assert!(
+            n <= 1200,
+            "agent guidance is {n} chars, over the 1200 budget. It is re-sent on \
+             every turn, so this is paid repeatedly. Detail that a reader wants \
+             once belongs in the FAQ, reachable with `travsr ask \"travsr: ...\"`"
+        );
+    }
+
+    /// The pointer has to be a command that works, or it is worse than nothing:
+    /// an agent that follows it gets an error and learns to distrust the rest.
+    #[test]
+    fn the_guidance_points_at_a_working_command() {
+        let body = guide_body();
+        let marker = "travsr ask \"travsr:";
+        assert!(
+            body.contains(marker),
+            "guidance lost its pointer to the FAQ"
+        );
+        assert!(
+            crate::faq::strip_namespace("travsr: how does MCP work").is_some(),
+            "the namespace the guidance tells agents to use is not recognised"
+        );
+        assert!(
+            crate::faq::match_namespaced("how does MCP work").is_some(),
+            "the example question the pointer implies matches nothing"
+        );
     }
 
     /// `plan()` wires `travsr mcp --stdio` with no `--global`, which is

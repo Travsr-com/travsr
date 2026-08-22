@@ -10,6 +10,7 @@ mod connect;
 mod daemon_client;
 mod embed;
 mod explain;
+mod faq;
 mod fsck;
 mod git_bounded;
 mod graph;
@@ -77,7 +78,7 @@ const RELEASE_VERSION: &str =
     version = RELEASE_VERSION,
     about = "The code graph that lives next to git."
 )]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Command,
 }
@@ -134,6 +135,16 @@ enum Command {
         /// Do not git-ignore generated files (opt in to committing them).
         #[arg(long)]
         commit: bool,
+        /// Also write the always-on rules file that tells the agent to prefer
+        /// the graph over grep.
+        ///
+        /// Off by default. That file is re-read on every turn of every
+        /// conversation, so it is the one part of travsr that costs tokens
+        /// repeatedly, and the tools work without it: MCP already gives the
+        /// model every tool name and description. Turn it on if you want agents
+        /// nudged toward the graph rather than left to choose.
+        #[arg(long)]
+        rules: bool,
     },
     /// Start the Travsr daemon (git hook + file watcher + MCP server).
     Daemon {
@@ -170,10 +181,18 @@ enum Command {
     /// retrieval). Also accepts a bare symbol name.
     Ask {
         /// Natural-language question, or a symbol name, to retrieve context for.
-        query: String,
+        /// Optional only so `--examples` and `--cmds` can be used on their own.
+        #[arg(required_unless_present_any = ["examples", "cmds"])]
+        query: Option<String>,
         /// Output format: table (default) or json.
         #[arg(long, value_enum, default_value = "table")]
         format: ask::OutputFormat,
+        /// List the kinds of question travsr can answer, with runnable examples.
+        #[arg(long)]
+        examples: bool,
+        /// List every command travsr supports, grouped by what it is for.
+        #[arg(long)]
+        cmds: bool,
     },
     /// Show why `travsr ask` ranked (or skipped) results for a query: which
     /// terms matched, which relevance thresholds passed or failed, and the final
@@ -761,6 +780,7 @@ async fn run(cli: Cli) -> Result<()> {
             print,
             remove,
             commit,
+            rules,
         } => {
             let cwd = std::env::current_dir()?;
             // Write command: `connect` creates files in the resolved root, so it
@@ -776,6 +796,7 @@ async fn run(cli: Cli) -> Result<()> {
                     dry_run: print,
                     remove,
                     commit,
+                    rules,
                     report: connect::Report::Stdout,
                 },
             )?;
@@ -1253,7 +1274,33 @@ async fn run(cli: Cli) -> Result<()> {
             json,
         } => repos::run(prune, remove.as_deref(), json)?,
         Command::Status => status::run()?,
-        Command::Ask { query, format } => ask::run(&query, format)?,
+        Command::Ask {
+            query,
+            format,
+            examples,
+            cmds,
+        } => {
+            if cmds {
+                // Read from clap, so it needs no repository and works before
+                // `init` just as `--examples` does.
+                ask::print_commands();
+            } else if examples {
+                // Best effort: an un-indexed repo, or none at all, falls back to
+                // placeholders rather than failing. `--examples` must work before
+                // `init`, which is exactly when someone is most likely to run it.
+                let db = std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| crate::repo::find_git_root(&cwd).ok())
+                    .map(|root| root.join(".travsr/graph.db"))
+                    .filter(|p| p.is_file());
+                ask::print_examples(db.as_deref());
+            } else {
+                // `required_unless_present` guarantees a query here; the
+                // `unwrap_or_default` keeps a future flag change from turning
+                // that invariant into a panic.
+                ask::run(&query.unwrap_or_default(), format)?;
+            }
+        }
         Command::Explain {
             query,
             symbol,
