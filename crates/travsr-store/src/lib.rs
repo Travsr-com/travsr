@@ -1605,6 +1605,22 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Clear every stored per-file content hash (the `files` table).
+    ///
+    /// #757 audit: `travsr init --force` relies on the incremental hash-delta
+    /// re-parsing every file, but the delta skips files whose content hash is
+    /// unchanged — and the `--force` graph purge does not touch this cache. An
+    /// index built by an older binary therefore reported "up to date" and was
+    /// never re-parsed by the current analyzer (so, e.g., newly-added `field`
+    /// nodes never appeared). Clearing the cache makes every file look new, so
+    /// `--force` genuinely re-parses the whole repo. Returns rows cleared.
+    pub fn clear_file_hashes(&mut self) -> Result<usize, StoreError> {
+        self.conn
+            .execute("DELETE FROM files", [])
+            .context("clearing file hashes")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Write a batch of parsed file graphs in a single SQLite transaction.
     ///
     /// For each `FileGraph` in `batch`:
@@ -8616,6 +8632,20 @@ mod tests {
         let got = store.get_file_hash("src/foo.ts").unwrap();
         assert_eq!(got, Some("abc123".to_string()));
         assert!(store.get_file_hash("nonexistent.ts").unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_file_hashes_empties_the_cache() {
+        // #757 audit: `--force` clears the per-file hash cache so every file
+        // re-parses. After clearing, no stored hash remains.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.put_file_hash("a.rs", "h1").unwrap();
+        store.put_file_hash("b.rs", "h2").unwrap();
+        assert_eq!(store.get_all_file_hashes().unwrap().len(), 2);
+        let cleared = store.clear_file_hashes().unwrap();
+        assert_eq!(cleared, 2);
+        assert!(store.get_all_file_hashes().unwrap().is_empty());
+        assert!(store.get_file_hash("a.rs").unwrap().is_none());
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (function_declaration name: (simple_identifier) @fn.name)
 (init_declaration "init" @init.name)
 (import_declaration)  @import
-(property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name))
+(class_body (property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name)))
 (function_declaration
   (modifiers (attribute (user_type (type_identifier) @_swa)))
   name: (simple_identifier) @test.entry
@@ -232,6 +232,33 @@ mod tests {
             .find(|n| n.vname.signature == "field:B.count")
             .expect("field:B.count");
         assert_ne!(a.id, b.id, "owner-qualified fields must be distinct nodes");
+    }
+
+    #[test]
+    fn local_and_toplevel_bindings_are_not_fields() {
+        // #757 audit: Swift uses `property_declaration` for top-level and
+        // function-local `let`/`var` too, so an unanchored capture emitted
+        // spurious unqualified `field:dog` nodes. Anchoring to `class_body`
+        // keeps only stored properties.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.swift");
+        std::fs::write(
+            &path,
+            "let dog = Dog()\nfunc run() {\n  let local = 1\n}\nclass Cat {\n  let name: String = \"\"\n}\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "main.swift").unwrap();
+        let field_sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "field")
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert_eq!(
+            field_sigs,
+            vec!["field:Cat.name"],
+            "only the stored property is a field; got {field_sigs:?}"
+        );
     }
 
     // L2: an `init` declaration must emit a bare `method:Cat.init` node, not the

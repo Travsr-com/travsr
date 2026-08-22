@@ -335,6 +335,24 @@ fn enclosing_container<'a>(
                 let prefix = container_kind_prefix(n, type_refinements, source).unwrap_or(prefix);
                 return Some((prefix, name));
             }
+            // #757: a C/C++ anonymous aggregate named only via
+            // `typedef struct { .. } Name;` has no `name:` on the
+            // struct_specifier, so `container_name` is None and its fields would
+            // orphan as unqualified `field:name` (colliding across every such
+            // struct). The graph node that actually exists for it is the typedef
+            // (`type:Name`, from the `type_definition` capture), so borrow that
+            // name and prefix. Inert for grammars without `type_definition`.
+            if let Some(name) = n
+                .parent()
+                .filter(|p| p.kind() == "type_definition")
+                .and_then(|td| td.child_by_field_name("declarator"))
+                .filter(|d| d.kind() == "type_identifier")
+                .and_then(|d| d.utf8_text(source).ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(("type", name.to_string()));
+            }
         }
         cur = n.parent();
     }

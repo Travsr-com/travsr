@@ -1278,6 +1278,21 @@ pub fn init_repo_with_progress(
             .reconcile(&empty_walked, &purge_policy, repo_root, &corpus)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("--force full-graph purge")?;
+        // #757 audit: `reconcile` only prunes nodes for files absent from disk,
+        // so on-disk files keep their nodes AND their `files` content-hash rows.
+        // The hash-delta below would then skip every unchanged file, leaving the
+        // whole point of `--force` (re-parse with the current analyzer, even
+        // when file bytes are unchanged) unmet — it reported "up to date" over an
+        // index an older binary built. Clearing the hash cache makes every file
+        // look new, so `--force` genuinely re-parses the repo.
+        let cleared = store
+            .clear_file_hashes()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("--force clearing file hash cache")?;
+        tracing::info!(
+            cleared,
+            "--force: cleared file hash cache for full re-parse"
+        );
     }
 
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
