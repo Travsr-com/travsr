@@ -367,13 +367,17 @@ fn decode_phase_b_warnings(
                 }
             }
             "needs_approval" => {
+                // Vestigial class: elevated access is auto-granted for local use
+                // (ADR-017 Amendment A5), so this build never writes it. It can
+                // still be read from meta written by a pre-upgrade index; the
+                // actionable fix is to reindex, not the deleted `lang approve`.
                 out.insert(
                     rest.to_string(),
                     (
                         "unavailable",
                         format!(
-                            "'{rest}' requires elevated sandbox approval, \
-                             run `travsr lang approve {rest}`"
+                            "'{rest}' was skipped by a previous index, \
+                             run `travsr lang install {rest}` to enable and reindex it"
                         ),
                     ),
                 );
