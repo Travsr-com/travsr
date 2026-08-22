@@ -49,26 +49,66 @@ fn reindex_hard_ceiling_secs() -> Option<u64> {
         .filter(|&x: &u64| x > 0)
 }
 
-/// Count embeddings written for `model_id` in the sidecar's embed.db.
+/// Progress reader for the no-progress watchdog: counts embeddings written
+/// for one model in the sidecar's embed.db.
 ///
-/// Used by the no-progress watchdog to detect a stalled sidecar. Opens
-/// read-only + no-mutex so it never blocks the writer (embed.db is WAL,
-/// synchronous=OFF). Returns None on any error (missing db, locked) so the
-/// caller treats an unreadable count as "no observation this tick" rather than
-/// a stall.
-fn count_model_embeddings(embed_db_path: &Path, model_id: &str) -> Option<u64> {
-    let conn = rusqlite::Connection::open_with_flags(
-        embed_db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
-    conn.query_row(
-        "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
-        [model_id],
-        |r| r.get::<_, i64>(0),
-    )
-    .ok()
-    .map(|n| n as u64)
+/// Opens read-only + no-mutex so it never blocks the writer (embed.db is WAL,
+/// synchronous=OFF). `read()` returns None on any error (missing db, locked,
+/// schema not created yet) so the caller treats an unreadable count as "no
+/// observation this tick" rather than a stall.
+///
+/// #735: holds ONE connection for the whole reindex run instead of opening a
+/// fresh one per 500 ms poll. A killed reindex leaves a large `embed.db-wal`
+/// behind (its final `wal_checkpoint(TRUNCATE)` never ran), and a read-only
+/// connection cannot truncate it, so the per-poll open paid SQLite WAL
+/// recovery (a full WAL scan plus a heap-built wal-index) twice a second,
+/// silently burning a core and churning tens of MB of allocations per open
+/// for as long as the state persisted. One held connection pays recovery at
+/// most once per run and keeps the shared wal-index alive between polls. The
+/// connection is opened lazily (embed.db may not exist until the sidecar's
+/// first commit) and dropped + re-opened lazily after a query error, so a
+/// mid-run schema change or file swap degrades to today's behaviour, never a
+/// wedge.
+struct ProgressCounter {
+    embed_db_path: PathBuf,
+    model_id: String,
+    conn: Option<rusqlite::Connection>,
+}
+
+impl ProgressCounter {
+    fn new(embed_db_path: &Path, model_id: &str) -> Self {
+        Self {
+            embed_db_path: embed_db_path.to_path_buf(),
+            model_id: model_id.to_string(),
+            conn: None,
+        }
+    }
+
+    fn read(&mut self) -> Option<u64> {
+        if self.conn.is_none() {
+            self.conn = rusqlite::Connection::open_with_flags(
+                &self.embed_db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .ok();
+        }
+        let conn = self.conn.as_ref()?;
+        match conn.query_row(
+            "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+            [self.model_id.as_str()],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(n) => Some(n as u64),
+            Err(_) => {
+                // A poisoned/stale connection (dropped table, replaced file)
+                // will not heal by re-querying; drop it and re-open lazily on
+                // the next poll.
+                self.conn = None;
+                None
+            }
+        }
+    }
 }
 
 /// FT-H1: process-level single-flight guard.
@@ -121,6 +161,68 @@ impl Drop for ReindexInFlightGuard {
 #[derive(Debug)]
 pub struct EmbedOpLock {
     file: std::fs::File,
+    /// Path of the adjacent `embed.lock.info` metadata file, removed on clean
+    /// release (#735) so leftover metadata is an honest crash signal.
+    info_path: PathBuf,
+}
+
+/// True when `e` is the platform's "somebody else holds the lock" error
+/// (EWOULDBLOCK / ERROR_LOCK_VIOLATION), the only `try_lock_exclusive`
+/// failure that means contention and is worth retrying (#735).
+fn is_contention_error(e: &std::io::Error) -> bool {
+    e.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
+/// Parsed view of `embed.lock.info`, tolerant of every malformed shape #735
+/// lists (missing file, empty, non-numeric pid, no separator, garbage): all of
+/// them degrade to "unknown holder", never a panic or an error.
+struct LockInfo {
+    /// `(pid_text, op)` when the file had the `<pid>\t<op>` shape.
+    recorded: Option<(String, String)>,
+    /// Liveness of the recorded pid: `None` when there is no parseable pid.
+    alive: Option<bool>,
+}
+
+impl LockInfo {
+    fn read(info_path: &Path) -> Self {
+        let raw = std::fs::read_to_string(info_path).unwrap_or_default();
+        let recorded = raw
+            .trim()
+            .split_once('\t')
+            .map(|(p, o)| (p.trim().to_string(), o.trim().to_string()))
+            .filter(|(p, o)| !p.is_empty() && !o.is_empty());
+        let alive = recorded
+            .as_ref()
+            .and_then(|(p, _)| p.parse::<u32>().ok())
+            .map(pid_alive);
+        LockInfo { recorded, alive }
+    }
+
+    /// User-facing message for a genuinely contended lock. Names the recorded
+    /// holder when there is one, and is explicit when that recording is
+    /// provably stale (recorded pid no longer running) so the reader is not
+    /// sent hunting for a process that exited days ago (#735).
+    fn contended_message(&self) -> String {
+        match (&self.recorded, self.alive) {
+            (Some((pid, op)), Some(false)) => format!(
+                "Another process holds the embed lock for this repo, but the \
+                 recorded holder ({op}, pid {pid}) is no longer running; \
+                 that record is stale, left by an interrupted operation. The \
+                 lock itself is held by a live process (the OS releases it when \
+                 its holder dies).\n\
+                 Wait for it to finish, or stop it with: travsr daemon stop"
+            ),
+            (Some((pid, op)), _) => format!(
+                "Another embed operation is already running for this repo \
+                 ({op}, pid {pid}).\n\
+                 Wait for it to finish, or stop it with: travsr daemon stop"
+            ),
+            (None, _) => "Another embed operation is already running for this repo \
+                 (an embed operation, pid unknown).\n\
+                 Wait for it to finish, or stop it with: travsr daemon stop"
+                .to_string(),
+        }
+    }
 }
 
 impl EmbedOpLock {
@@ -144,6 +246,16 @@ impl EmbedOpLock {
     /// also fails, not just its own lock attempt — so a losing caller could
     /// never read the holder's pid/op back out of the locked file to report
     /// it. Reading an adjacent, always-unlocked file sidesteps that.
+    ///
+    /// #735: the info file is advisory metadata only, never an ownership
+    /// check. The OS lock is the single source of truth: it cannot outlive a
+    /// dead holder, so a free lock is taken regardless of what the info file
+    /// claims (a dead recorded pid is crash residue and is logged + replaced,
+    /// never a reason to refuse), and a held lock is respected regardless of
+    /// the recorded pid's liveness (the recorded pid may be stale while a
+    /// *different* live process legitimately holds the lock; deciding
+    /// ownership by pid here would also race pid reuse). Liveness of the
+    /// recorded pid is probed only to make the diagnostics honest.
     pub fn try_acquire(repo_root: &Path, op: &str) -> anyhow::Result<Option<Self>> {
         use anyhow::Context as _;
         use fs2::FileExt as _;
@@ -169,22 +281,43 @@ impl EmbedOpLock {
                 )));
             }
         };
-        if file.try_lock_exclusive().is_err() {
-            let held = std::fs::read_to_string(&info_path).unwrap_or_default();
-            let (pid, held_op) = held
-                .trim()
-                .split_once('\t')
-                .map(|(p, o)| (p.to_string(), o.to_string()))
-                .unwrap_or_else(|| ("unknown".to_string(), "an embed operation".to_string()));
-            return Err(anyhow::Error::new(Contended(format!(
-                "Another embed operation is already running for this repo \
-                 ({held_op}, pid {pid}).\n\
-                 Wait for it to finish, or stop it with: travsr daemon stop"
-            ))));
+        if let Err(lock_err) = file.try_lock_exclusive() {
+            // #735: only genuine contention may be reported as "another
+            // operation is running" (and retried by callers). Any other lock
+            // failure (ENOLCK on a network mount, EBADF, …) previously fell
+            // into the same branch and was rendered with whatever pid the
+            // info file happened to contain; on a repo with crash residue
+            // that read as "another embed operation is already running
+            // (reindex, pid <dead>)" forever, with a 10 s retry burned on an
+            // error waiting cannot fix.
+            if !is_contention_error(&lock_err) {
+                return Err(anyhow::Error::new(lock_err).context(format!(
+                    "taking the exclusive embed lock at {} failed with a non-contention error; \
+                     refusing to run an embed operation without it",
+                    lock_path.display()
+                )));
+            }
+            let info = LockInfo::read(&info_path);
+            return Err(anyhow::Error::new(Contended(info.contended_message())));
+        }
+        // Lock acquired. Anything left in the info file is residue from a
+        // holder that never released cleanly (the OS lock itself is free, so
+        // no live operation owns it); say so once before replacing it, since
+        // this is exactly the state issue #735 reported as inscrutable.
+        let residue = LockInfo::read(&info_path);
+        if let Some((pid_str, prev_op)) = residue.recorded {
+            tracing::info!(
+                prev_pid = %pid_str,
+                prev_op = %prev_op,
+                prev_pid_alive = ?residue.alive,
+                "embed lock: recovered stale lock metadata from an interrupted \
+                 operation (the lock itself was free; the OS releases it when \
+                 its holder dies)"
+            );
         }
         std::fs::write(&info_path, format!("{}\t{op}", std::process::id()))
             .context("writing embed.lock.info")?;
-        Ok(Some(EmbedOpLock { file }))
+        Ok(Some(EmbedOpLock { file, info_path }))
     }
 
     /// Like [`Self::try_acquire`], but absorbs a *brief* overlap before
@@ -246,6 +379,13 @@ impl std::error::Error for Contended {}
 
 impl Drop for EmbedOpLock {
     fn drop(&mut self) {
+        // Remove the metadata BEFORE releasing the lock: while we still hold
+        // it, no other process can legitimately be writing its own info, so
+        // this can never delete a new holder's record (#735). After this
+        // change, an `embed.lock.info` on disk with no live lock is always
+        // residue from a crashed/killed holder, and try_acquire logs it as
+        // such when it recovers.
+        let _ = std::fs::remove_file(&self.info_path);
         let _ = fs2::FileExt::unlock(&self.file);
     }
 }
@@ -1141,7 +1281,11 @@ fn run_parallel_reindex(
     // fixed wall-clock limit. An optional env-set hard ceiling still applies.
     let start = std::time::Instant::now();
     let hard_ceiling = reindex_hard_ceiling_secs();
-    let mut last_count = count_model_embeddings(embed_db_path, model_id).unwrap_or(0);
+    // #735: one persistent read-only connection for the whole poll loop; see
+    // ProgressCounter for why a fresh open per poll is pathological against a
+    // crashed run's un-truncated WAL.
+    let mut progress = ProgressCounter::new(embed_db_path, model_id);
+    let mut last_count = progress.read().unwrap_or(0);
     let mut last_progress = std::time::Instant::now();
     // Stdout is Stdio::null() (quiet) or inherited — never a pipe. Stderr is
     // already draining on the StderrRing background thread (line above). No
@@ -1171,7 +1315,7 @@ fn run_parallel_reindex(
 
                 // Observe progress. An unreadable count (None) is treated as "no
                 // observation" — it neither resets nor trips the watchdog.
-                if let Some(cur) = count_model_embeddings(embed_db_path, model_id) {
+                if let Some(cur) = progress.read() {
                     if cur > last_count {
                         last_count = cur;
                         last_progress = now;
@@ -2364,6 +2508,320 @@ mod tests {
             reacquired,
             "lock must be re-acquirable once its holder is killed"
         );
+    }
+
+    // ── #735: stale-lock recovery, malformed metadata, retry stability ───────
+
+    /// Spawn a short-lived child and reap it, yielding a PID that is (with
+    /// overwhelming probability, within this test's lifetime) not running.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("reap child");
+        pid
+    }
+
+    /// Issue #735 Test 1: no lock file at all → the operation proceeds.
+    #[test]
+    fn acquiring_with_no_lock_file_succeeds_and_records_the_holder() {
+        let repo = tempfile::tempdir().unwrap();
+        let travsr_dir = repo.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+
+        let lock = EmbedOpLock::try_acquire(repo.path(), "reindex")
+            .unwrap()
+            .expect("free repo must acquire");
+        let info = std::fs::read_to_string(travsr_dir.join("embed.lock.info")).unwrap();
+        assert_eq!(
+            info,
+            format!("{}\treindex", std::process::id()),
+            "info must record this process and operation"
+        );
+        drop(lock);
+    }
+
+    /// Issue #735 Tests 3 + 6: an `embed.lock` + `embed.lock.info` left behind
+    /// by a killed holder (dead PID, no live OS lock) must not block the next
+    /// operation; the lock is recovered and the stale metadata replaced.
+    #[test]
+    fn stale_lock_from_a_dead_pid_is_recovered_and_metadata_replaced() {
+        let repo = tempfile::tempdir().unwrap();
+        let travsr_dir = repo.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        // The residue exactly as the issue reports it: both files present,
+        // info naming a PID that no longer exists, no live flock holder.
+        std::fs::write(travsr_dir.join("embed.lock"), b"").unwrap();
+        std::fs::write(
+            travsr_dir.join("embed.lock.info"),
+            format!("{}\treindex", dead_pid()),
+        )
+        .unwrap();
+
+        let lock = EmbedOpLock::try_acquire(repo.path(), "reindex")
+            .expect("stale metadata must not be an error")
+            .expect("stale metadata must not block acquisition");
+        let info = std::fs::read_to_string(travsr_dir.join("embed.lock.info")).unwrap();
+        assert_eq!(
+            info,
+            format!("{}\treindex", std::process::id()),
+            "stale metadata must be replaced by the new holder's record"
+        );
+        drop(lock);
+    }
+
+    /// Issue #735 Test 7: a normal release leaves no residue; the info file
+    /// is removed with the lock, so leftover metadata is an honest crash
+    /// signal.
+    #[test]
+    fn clean_release_removes_the_lock_metadata() {
+        let repo = tempfile::tempdir().unwrap();
+        let travsr_dir = repo.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+
+        let lock = EmbedOpLock::try_acquire(repo.path(), "gc")
+            .unwrap()
+            .unwrap();
+        assert!(travsr_dir.join("embed.lock.info").exists());
+        drop(lock);
+        assert!(
+            !travsr_dir.join("embed.lock.info").exists(),
+            "info must be removed on clean release"
+        );
+        // And the repo is immediately re-acquirable.
+        assert!(EmbedOpLock::try_acquire(repo.path(), "gc")
+            .unwrap()
+            .is_some());
+    }
+
+    /// Issue #735 Test 2 + PID-safety: a lock held by a live process stays
+    /// held; liveness of the RECORDED pid never overrides the OS lock, so a
+    /// stale record cannot be used to steal a lock a live process owns.
+    #[test]
+    fn a_held_lock_is_never_stolen_even_when_its_recorded_pid_is_dead() {
+        let repo = tempfile::tempdir().unwrap();
+        let travsr_dir = repo.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(travsr_dir.join("embed.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        // Metadata names a DEAD pid while a live handle holds the lock; the
+        // exact race the issue's PID-reuse section warns about.
+        let stale = dead_pid();
+        std::fs::write(
+            travsr_dir.join("embed.lock.info"),
+            format!("{stale}\treindex"),
+        )
+        .unwrap();
+
+        let err = EmbedOpLock::try_acquire(repo.path(), "reindex")
+            .expect_err("a held lock must stay held regardless of recorded-pid liveness");
+        assert!(
+            err.downcast_ref::<Contended>().is_some(),
+            "a held lock is contention (retryable), got: {err:#}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&stale.to_string()) && msg.contains("no longer running"),
+            "the message must name the stale record and say its holder is dead, got: {msg}"
+        );
+
+        fs2::FileExt::unlock(&held).unwrap();
+    }
+
+    /// A held lock whose recorded holder is alive keeps the original wording.
+    #[test]
+    fn a_held_lock_with_a_live_recorded_holder_names_it() {
+        let repo = tempfile::tempdir().unwrap();
+        let travsr_dir = repo.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(travsr_dir.join("embed.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        std::fs::write(
+            travsr_dir.join("embed.lock.info"),
+            format!("{}\tgc", std::process::id()),
+        )
+        .unwrap();
+
+        let msg = EmbedOpLock::try_acquire(repo.path(), "reindex")
+            .expect_err("held lock must block")
+            .to_string();
+        assert!(
+            msg.contains("already running") && msg.contains("gc"),
+            "live holder must be reported as running, got: {msg}"
+        );
+        fs2::FileExt::unlock(&held).unwrap();
+    }
+
+    /// Issue #735 Test 4: every malformed shape of `embed.lock.info` degrades
+    /// to "unknown holder"; no panic, no misparse, and (because the error is
+    /// still plain contention) no unbounded retry beyond the fixed budget.
+    #[test]
+    fn malformed_lock_metadata_never_panics_and_stays_contention() {
+        let repo = tempfile::tempdir().unwrap();
+        let travsr_dir = repo.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(travsr_dir.join("embed.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+
+        let info_path = travsr_dir.join("embed.lock.info");
+        let cases: &[&[u8]] = &[
+            b"",                      // empty file
+            b"   \n",                 // whitespace only
+            b"12345",                 // partial: pid, no separator/op
+            b"not-a-pid\treindex",    // non-numeric pid
+            b"\treindex",             // missing pid
+            b"99999999999999999\tgc", // pid overflows u32
+            b"\xff\xfe garbage \x00", // binary garbage
+        ];
+        for case in cases {
+            std::fs::write(&info_path, case).unwrap();
+            let err = EmbedOpLock::try_acquire(repo.path(), "reindex")
+                .expect_err("held lock must block whatever the metadata says");
+            assert!(
+                err.downcast_ref::<Contended>().is_some(),
+                "malformed metadata must still classify as contention, case {case:?}: {err:#}"
+            );
+        }
+        // Missing file entirely.
+        std::fs::remove_file(&info_path).unwrap();
+        let err = EmbedOpLock::try_acquire(repo.path(), "reindex")
+            .expect_err("held lock must block with no metadata at all");
+        assert!(err.to_string().contains("unknown"), "got: {err}");
+
+        fs2::FileExt::unlock(&held).unwrap();
+    }
+
+    /// Issue #735 Test 5: repeated conflicts are cheap and stateless; each
+    /// attempt fails the same way, leaves the metadata untouched, and finishes
+    /// promptly (no accumulation of state, handles, or wait time per attempt).
+    #[test]
+    fn repeated_lock_conflicts_do_not_accumulate_state() {
+        let repo = tempfile::tempdir().unwrap();
+        let travsr_dir = repo.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(travsr_dir.join("embed.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let info = format!("{}\treindex", std::process::id());
+        std::fs::write(travsr_dir.join("embed.lock.info"), &info).unwrap();
+
+        let started = std::time::Instant::now();
+        for _ in 0..200 {
+            let err =
+                EmbedOpLock::try_acquire(repo.path(), "reindex").expect_err("must stay contended");
+            assert!(err.downcast_ref::<Contended>().is_some());
+        }
+        assert_eq!(
+            std::fs::read_to_string(travsr_dir.join("embed.lock.info")).unwrap(),
+            info,
+            "failed attempts must never touch the holder's metadata"
+        );
+        // Generous bound: catches an accidental per-attempt sleep or spawn
+        // explosion, not scheduler noise. (200 × liveness probe included.)
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "200 failed attempts took {:?}",
+            started.elapsed()
+        );
+        fs2::FileExt::unlock(&held).unwrap();
+    }
+
+    /// #735: only the platform's contended error may classify as contention;
+    /// everything else must surface as a hard error, not as "another
+    /// operation is running (pid <whatever the stale info file says>)".
+    #[test]
+    fn only_the_platform_contended_error_reads_as_contention() {
+        assert!(is_contention_error(&fs2::lock_contended_error()));
+        assert!(!is_contention_error(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no locks available"
+        )));
+        assert!(!is_contention_error(&std::io::Error::from_raw_os_error(
+            // ENOLCK (unix) / ERROR_INVALID_HANDLE-adjacent (windows): any
+            // raw code other than the contended one must not classify.
+            {
+                #[cfg(unix)]
+                {
+                    77
+                }
+                #[cfg(not(unix))]
+                {
+                    6
+                }
+            }
+        )));
+    }
+
+    // ── #735: watchdog progress counter ─────────────────────────────────────
+
+    #[test]
+    fn progress_counter_is_lazy_reusable_and_recovers_from_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("embed.db");
+        let mut counter = ProgressCounter::new(&db, "m1");
+
+        // Missing db: no observation, repeatedly, without wedging.
+        assert_eq!(counter.read(), None);
+        assert_eq!(counter.read(), None);
+
+        // Create the db + schema + rows: the counter picks it up lazily.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE node_embeddings (
+                 node_id INTEGER NOT NULL, model_id TEXT NOT NULL,
+                 embedding BLOB NOT NULL, text_hash TEXT,
+                 PRIMARY KEY (node_id, model_id)) WITHOUT ROWID;
+             INSERT INTO node_embeddings VALUES (1,'m1',x'00',NULL);
+             INSERT INTO node_embeddings VALUES (2,'m1',x'00',NULL);
+             INSERT INTO node_embeddings VALUES (3,'other',x'00',NULL);",
+        )
+        .unwrap();
+        assert_eq!(counter.read(), Some(2), "counts only the requested model");
+
+        // New rows are visible through the SAME held connection.
+        conn.execute_batch("INSERT INTO node_embeddings VALUES (4,'m1',x'00',NULL);")
+            .unwrap();
+        assert_eq!(counter.read(), Some(3));
+
+        // A query error (schema gone) degrades to None and later recovers.
+        conn.execute_batch("DROP TABLE node_embeddings").unwrap();
+        assert_eq!(counter.read(), None);
+        conn.execute_batch(
+            "CREATE TABLE node_embeddings (
+                 node_id INTEGER NOT NULL, model_id TEXT NOT NULL,
+                 embedding BLOB NOT NULL, text_hash TEXT,
+                 PRIMARY KEY (node_id, model_id)) WITHOUT ROWID;
+             INSERT INTO node_embeddings VALUES (1,'m1',x'00',NULL);",
+        )
+        .unwrap();
+        assert_eq!(counter.read(), Some(1), "must recover after a re-open");
     }
 
     // ── L2: embed gc ────────────────────────────────────────────────────────
