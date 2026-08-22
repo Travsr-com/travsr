@@ -1113,13 +1113,23 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                 detected = true;
                 say!("{} ({verb}):", tool.id());
                 let full = tool.plan(repo_root, &cmd);
+                let full_len = full.len();
                 let kept: Vec<Planned> = full.into_iter().filter(&wanted).collect();
                 // Codex, Antigravity and Windsurf read their MCP config from a
                 // global file, so a rules file is the *only* thing travsr writes
                 // for them. Filtering it leaves nothing, and a tool heading with
                 // no lines under it reads as a failure rather than a choice.
+                // Say so whenever guidance was skipped, not only when nothing
+                // at all was written. For claude-code, cursor, copilot and zed
+                // the `JsonServer` entry survives, so `kept` is non-empty and a
+                // default run printed a normal-looking report with the guidance
+                // line simply absent: no signal that anything was withheld or
+                // that a flag exists (#746 review).
+                let skipped_guidance = kept.len() < full_len;
                 if kept.is_empty() {
                     say!("  nothing to write; rules are opt-in, pass --rules");
+                } else if skipped_guidance && !opts.remove {
+                    say!("  (agent guidance not written; pass --rules to include it)");
                 }
                 for planned in kept {
                     let disp = rel(repo_root, &planned.path)

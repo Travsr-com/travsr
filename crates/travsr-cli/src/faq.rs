@@ -243,7 +243,16 @@ pub(crate) fn match_question(query: &str) -> Option<&'static Entry> {
         let judged: Vec<&String> = asked.iter().filter(|w| !subject(w)).collect();
         if !judged.is_empty() {
             let covered = judged.iter().filter(|w| want.contains(**w)).count();
-            if covered * 5 < judged.len() * 3 {
+            // Every word the reader typed has to be accounted for, not 60% of
+            // them. The ratio held for long queries and let short ones through:
+            // "how do I start using redis on a repo" covered 3 of 4 judged words
+            // and cleared it, so a question about redis got travsr's onboarding
+            // answer. Moving this matcher above the repo guard widened where
+            // that lands, which is what makes it worth tightening (#746 review).
+            //
+            // An unaccounted word is a subject the catalogue does not cover, and
+            // one is enough: the reader is asking about something else.
+            if covered != judged.len() {
                 continue;
             }
         }

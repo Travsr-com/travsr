@@ -156,6 +156,11 @@ fn answer_faq(e: &crate::faq::Entry, format: OutputFormat) -> anyhow::Result<()>
         println!(
             "{}",
             serde_json::json!({
+                // `matched` is mandatory on the ordinary payload, so consumers
+                // branch on it. Omitting it made ab-eval read a FAQ answer as a
+                // zero-recall retrieval result: a silent miss that looks like a
+                // search regression rather than a routing one (#746 review).
+                "matched": false,
                 "kind": "faq",
                 "question": e.question,
                 "lead": e.lead,
@@ -240,6 +245,7 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             println!(
                 "{}",
                 serde_json::json!({
+                    "matched": false,
                     "kind": "redirect",
                     "answer": redirect.answer,
                     "command": redirect.command,
@@ -824,6 +830,40 @@ pub(crate) struct MetaRedirect {
     pub command: &'static str,
 }
 
+/// Whether the query *is* this question, rather than merely containing it.
+///
+/// `contains` let `tech stack` catch "how is the tech stack detected", and
+/// anchoring alone was not enough: "what is the tech stack detector doing"
+/// genuinely starts with the trigger while asking about a symbol (#746 review).
+/// The trigger has to account for the whole query, give or take the filler people
+/// add to a question typed at a tool.
+fn asks_exactly(query: &str, phrase: &str) -> bool {
+    let Some(rest) = query.strip_prefix(phrase) else {
+        return false;
+    };
+    const FILLER: &[&str] = &[
+        "here",
+        "now",
+        "please",
+        "in",
+        "of",
+        "for",
+        "this",
+        "repo",
+        "repository",
+        "project",
+        "codebase",
+        "currently",
+        "right",
+        "at",
+        "the",
+        "moment",
+    ];
+    rest.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .all(|w| FILLER.contains(&w))
+}
+
 /// Phrases meaning the question is about the repository as a whole, paired with
 /// what actually answers them.
 ///
@@ -851,7 +891,7 @@ const META_QUESTIONS: &[(&[&str], MetaRedirect)] = &[
             "what languages does the repo",
             "what language is this repo",
             "what language is this project",
-            "tech stack",
+            "what is the tech stack",
             "what is this codebase written in",
         ],
         MetaRedirect {
@@ -868,7 +908,8 @@ const META_QUESTIONS: &[(&[&str], MetaRedirect)] = &[
             "is the index ready",
             "is the index fresh",
             "is the index up to date",
-            "is my index",
+            "is my index ready",
+            "is my index fresh",
             "is the graph fresh",
         ],
         MetaRedirect {
@@ -885,7 +926,7 @@ pub(crate) fn meta_question_redirect(query: &str) -> Option<&'static MetaRedirec
     let q = query.to_lowercase();
     META_QUESTIONS
         .iter()
-        .find(|(phrases, _)| phrases.iter().any(|p| q.contains(p)))
+        .find(|(phrases, _)| phrases.iter().any(|p| asks_exactly(&q, p)))
         .map(|(_, r)| r)
 }
 
@@ -1066,9 +1107,19 @@ mod meta_question_tests {
         for (phrases, redirect) in META_QUESTIONS {
             assert!(!phrases.is_empty());
             for p in *phrases {
+                // Containing a space was the bar that let `is the index` through,
+                // and last round the data was corrected without the check being.
+                // `tech stack` passes a space test and is exactly the shape that
+                // hijacks (#746 review).
+                let words = p.split_whitespace().count();
+                let opens_a_question = matches!(
+                    p.split_whitespace().next(),
+                    Some("how" | "what" | "which" | "where" | "is" | "do" | "does" | "can")
+                );
                 assert!(
-                    p.contains(' '),
-                    "`{p}` is a single word; routing on it would hijack code queries"
+                    words >= 3 && opens_a_question,
+                    "`{p}` is too short or does not open a question; even anchored \
+                     at the start of a query it would hijack a code search"
                 );
                 assert_eq!(p.to_lowercase(), *p, "`{p}` must be lowercase to match");
             }
@@ -1433,7 +1484,13 @@ pub(crate) fn suggest_next(db_path: &std::path::Path, query: &str) -> Vec<Sugges
     for (keys, template, why) in INTENT_ROUTES {
         if keys.iter().any(|k| lower.contains(k)) {
             out.push(Suggestion {
-                command: template.replace("{sym}", &sym_slot).replace("{q}", query),
+                // Quotes stripped: the template wraps `{q}` in double quotes, so a
+                // query containing one produced `travsr explain "why is "charge" not
+                // showing" <symbol>`, which the shell splits into three words
+                // (#746 review).
+                command: template
+                    .replace("{sym}", &sym_slot)
+                    .replace("{q}", &query.replace('"', "")),
                 why: (*why).to_string(),
                 ident: sym_slot.clone(),
             });
@@ -1507,15 +1564,60 @@ mod suggestion_tests {
     use super::{distinctive_term, INTENT_ROUTES};
 
     /// Every route must produce a runnable command, not a template with an
+    /// Split a rendered command the way a shell would, so a quoted argument
+    /// stays one word.
+    fn shell_words(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let (mut cur, mut quoted) = (String::new(), false);
+        for ch in line.chars() {
+            match ch {
+                '"' => quoted = !quoted,
+                c if c.is_whitespace() && !quoted => {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                }
+                c => cur.push(c),
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
     /// unsubstituted slot left in it.
     #[test]
     fn routes_have_no_unsubstituted_slots_after_rendering() {
         for (_, template, _) in INTENT_ROUTES {
-            let rendered = template.replace("{sym}", "Foo").replace("{q}", "a query");
+            // A query carrying a quote, deliberately: the old fixture used
+            // `"a query"` with none, so it rendered the exact template that
+            // produced a broken command and passed over it (#746 review).
+            let rendered = template
+                .replace("{sym}", "Foo")
+                .replace("{q}", &"why is \"charge\" missing".replace('"', ""));
             assert!(
                 !rendered.contains('{') && !rendered.contains('}'),
                 "template `{template}` left a slot unfilled: {rendered}"
             );
+            assert!(
+                !rendered.contains("\"\""),
+                "an empty quoted argument means the query was eaten: {rendered}"
+            );
+            // And it has to parse. That was the ask last round and it landed
+            // only on the FAQ list.
+            {
+                use clap::CommandFactory as _;
+                let argv: Vec<String> = shell_words(&rendered);
+                if let Err(e) = crate::Cli::command().try_get_matches_from(&argv) {
+                    use clap::error::ErrorKind::{DisplayHelp, DisplayVersion};
+                    assert!(
+                        matches!(e.kind(), DisplayHelp | DisplayVersion),
+                        "`{rendered}` does not parse: {}",
+                        e.render().to_string().lines().next().unwrap_or_default()
+                    );
+                }
+            }
         }
     }
 
