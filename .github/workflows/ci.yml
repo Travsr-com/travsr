@@ -186,12 +186,22 @@ jobs:
       # lockfile was already patched. Reuses the root deny.toml. Advisories
       # only: the fuzz package itself is unpublished and carries no license
       # field, which the licenses check would reject.
+      #
+      # RUSTUP_TOOLCHAIN neutralizes fuzz/rust-toolchain.toml, which pins
+      # nightly for cargo-fuzz's sanitizer flags. cargo-deny only reads the
+      # manifest and lockfile, so it does not need nightly, and without this
+      # the step made the container install a whole nightly toolchain and then
+      # failed its crates-index fetch looking for `stable`, degrading to
+      # "unable to check for yanked crates" while still exiting 0. rustup
+      # auto-installs whatever this names, matching the root step above.
       - name: Check advisories (fuzz workspace)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           manifest-path: fuzz/Cargo.toml
           command: check advisories
           arguments: --all-features --config deny.toml
+        env:
+          RUSTUP_TOOLCHAIN: stable
 
   plugin-hashes:
     name: plugin-hashes.lock
