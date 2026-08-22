@@ -12,9 +12,17 @@
 # `gate-osv` for any non-beta promotion, it would have blocked the
 # v1.0.0-rc.1 to v1.0.0 promotion outright.
 #
-# Keep this list in sync with the ignore[] block in deny.toml. Both files
-# encode the same decisions for two different scanners; if one is updated and
-# the other is not, cargo-deny and OSV will disagree on identical input.
+# This list and the ignore[] block in deny.toml cover the same two advisories,
+# and adding or removing an ID in one without the other will make cargo-deny
+# and OSV disagree on identical input. They are NOT identical, though, and the
+# difference is deliberate: deny.toml ignores RUSTSEC-2026-0173 with no expiry
+# (condition-based, "revisit when tabled_derive migrates"), while this file
+# expires it on 2026-11-30. From that date the two scanners diverge on purpose,
+# cargo-deny staying green while OSV goes red, because OSV is the one wired
+# into the release gate and is therefore the right place to force a decision.
+# Do not "fix" that divergence by deleting the expiry; see the note on that
+# entry below.
+#
 # Only advisories with NO upstream fix belong here. Anything fixable gets
 # fixed instead, which is why RUSTSEC-2026-0009 (time) is absent: it was
 # resolved by moving to time 0.3.55 rather than suppressed.
