@@ -121,6 +121,15 @@ impl Drop for ReindexInFlightGuard {
 #[derive(Debug)]
 pub struct EmbedOpLock {
     file: std::fs::File,
+    /// Path to `embed.lock.info`, cleared on drop.
+    ///
+    /// The file used to outlive the lock, so a long-lived daemon left its own
+    /// pid recorded after every operation it finished. A different process could
+    /// then win the lock, and in the window before it wrote its own info the
+    /// daemon would read the stale file, match `std::process::id()`, and report
+    /// "this process is already running ... nothing needs to be stopped" about a
+    /// lock somebody else held (#745 review).
+    info_path: std::path::PathBuf,
 }
 
 impl EmbedOpLock {
@@ -176,7 +185,7 @@ impl EmbedOpLock {
         }
         std::fs::write(&info_path, format!("{}\t{op}", std::process::id()))
             .context("writing embed.lock.info")?;
-        Ok(Some(EmbedOpLock { file }))
+        Ok(Some(EmbedOpLock { file, info_path }))
     }
 
     /// Like [`Self::try_acquire`], but absorbs a *brief* overlap before
@@ -213,7 +222,12 @@ impl EmbedOpLock {
                     if e.downcast_ref::<Contended>().is_some()
                         && std::time::Instant::now() < deadline =>
                 {
-                    tracing::debug!("embed lock busy, retrying: {e}");
+                    // Deliberately not `{e}`. That payload is the settled
+                    // message, which says the operation did not start and
+                    // nothing needs stopping; emitting it on every poll
+                    // contradicted itself ~50 times while the caller was still
+                    // waiting and might yet win (#745 review).
+                    tracing::debug!("embed lock busy, still waiting");
                     std::thread::sleep(POLL_INTERVAL);
                 }
                 Err(e) => return Err(e),
@@ -274,12 +288,13 @@ fn contention_message(info_path: &Path) -> String {
     // to be made here (#745 review).
     let unwritable = pid.is_some_and(|p| p == 0 || i32::try_from(p).is_err());
     if unwritable {
-        return "The embed lock is held, but .travsr/embed.lock.info does not name a \
-                usable pid, so the holder cannot be identified.\n\
-                The lock releases when the real holder exits. If this keeps \
-                recurring, find it with: lsof .travsr/embed.lock  (or: fuser \
-                .travsr/embed.lock)"
-            .to_string();
+        return format!(
+            "The embed lock is held, but .travsr/embed.lock.info does not name a \
+             usable pid, so the holder cannot be identified.\n\
+             The lock releases when the real holder exits. If this keeps \
+             recurring, find it with: {}",
+            find_holder_hint()
+        );
     }
 
     match pid.map(pid_liveness) {
@@ -299,8 +314,8 @@ fn contention_message(info_path: &Path) -> String {
              {pid_str}, which is not running, so that file does not identify the \
              process actually holding it.\n\
              The lock releases when the real holder exits. If this keeps \
-             recurring, find it with: lsof .travsr/embed.lock  (or: fuser \
-             .travsr/embed.lock)"
+             recurring, find it with: {}",
+            find_holder_hint()
         ),
         Some(Liveness::Alive) => format!(
             "Another embed operation is already running for this repo \
@@ -317,10 +332,40 @@ fn contention_message(info_path: &Path) -> String {
              The lock file records pid {pid_str}; travsr cannot verify on this \
              platform whether that process is still running."
         ),
-        // No pid to report: the info file is missing or unparseable.
-        None => "Another embed operation is already running for this repo.\n\
-                 Wait for it to finish, or stop it with: travsr daemon stop"
-            .to_string(),
+        // No pid to report: the info file is missing, empty or unparseable.
+        //
+        // Same epistemic state as the `unwritable` branch above, so it gets the
+        // same treatment. It used to end with "stop it with: travsr daemon stop",
+        // which meant a `0` in the file got no stop-advice while `not-a-number`
+        // got it, for identical corruption. Worse, the holder may not be the
+        // daemon at all, and being told to stop it and seeing nothing change is
+        // #735's complaint restated (#745 review).
+        None => format!(
+            "The embed lock is held, but .travsr/embed.lock.info does not \
+             identify the process holding it.\n\
+             The lock releases when the real holder exits. If this keeps \
+             recurring, find it with: {}",
+            find_holder_hint()
+        ),
+    }
+}
+
+/// How to find whatever is holding the lock, in commands that exist here.
+///
+/// `lsof` and `fuser` are unix tools, and both arms that suggest them are
+/// reachable on Windows, so a Windows user was handed two commands that fail
+/// with "not recognized as an internal or external command" (#745 review). This
+/// is the one remediation the function prescribes, so it has to be one the
+/// reader can actually run.
+fn find_holder_hint() -> &'static str {
+    #[cfg(windows)]
+    {
+        "handle.exe .travsr\\embed.lock  (Sysinternals), or Resource Monitor, \
+         CPU tab, Associated Handles"
+    }
+    #[cfg(not(windows))]
+    {
+        "lsof .travsr/embed.lock  (or: fuser .travsr/embed.lock)"
     }
 }
 
@@ -389,6 +434,11 @@ impl std::error::Error for Contended {}
 
 impl Drop for EmbedOpLock {
     fn drop(&mut self) {
+        // Cleared before the unlock, so the file never describes a holder that
+        // has already released. Truncated rather than removed: the next holder
+        // rewrites it, and a missing file and an empty one are handled the same
+        // way by `contention_message`.
+        let _ = std::fs::write(&self.info_path, b"");
         let _ = fs2::FileExt::unlock(&self.file);
     }
 }
@@ -2858,6 +2908,39 @@ mod stale_lock_tests {
         );
     }
 
+    /// #745 review: releasing the lock must not leave this process recorded as
+    /// its holder.
+    ///
+    /// The info file used to outlive the lock, so a long-lived daemon stayed
+    /// named after every operation it finished. Another process could then win
+    /// the lock, and in the window before it wrote its own info the daemon would
+    /// read the stale file, match its own pid, and report "nothing needs to be
+    /// stopped" about a lock somebody else was holding.
+    #[test]
+    fn releasing_the_lock_clears_the_recorded_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let info = tmp.path().join(".travsr").join("embed.lock.info");
+
+        let lock = super::EmbedOpLock::try_acquire(tmp.path(), "reindex")
+            .expect("acquire")
+            .expect("an indexed repo yields a lock");
+        assert!(
+            std::fs::read_to_string(&info)
+                .unwrap()
+                .contains(&std::process::id().to_string()),
+            "the holder records itself while it holds the lock"
+        );
+
+        drop(lock);
+        assert!(
+            !std::fs::read_to_string(&info)
+                .unwrap()
+                .contains(&std::process::id().to_string()),
+            "a released lock must not still name this process as its holder"
+        );
+    }
+
     /// A missing or malformed info file must degrade to a message that claims
     /// nothing about a pid, rather than printing "pid unknown" as if it were one.
     #[test]
@@ -2870,8 +2953,14 @@ mod stale_lock_tests {
                 "must not name a pid it could not read ({contents:?}): {msg}"
             );
             assert!(
-                msg.contains("already running"),
+                msg.contains("The embed lock is held"),
                 "the conflict itself is still real and must be reported ({contents:?}): {msg}"
+            );
+            // Same epistemic state as a corrupt pid, so it gets the same
+            // treatment: no advice to stop a holder it never identified.
+            assert!(
+                !msg.contains("travsr daemon stop"),
+                "must not advise stopping an unidentified holder ({contents:?}): {msg}"
             );
         }
     }
