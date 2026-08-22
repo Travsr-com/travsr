@@ -2718,6 +2718,15 @@ fn write_phase_b_results(
     for lang in &pb_outcome.produced_no_nodes {
         warnings.push(format!("zero_nodes:{lang}"));
     }
+    // #724: a sidecar that returned definitions and not one occurrence. No call
+    // edge can be derived from it, so the run is a success with nothing
+    // traversable. Persisted for the same reason `zero_nodes` is: without this
+    // the bucket only reached the inline `--semantic` summary, and the default
+    // `init` path defers Phase B to the daemon, so the java user this exists for
+    // saw nothing anywhere (#752 review).
+    for lang in &pb_outcome.produced_no_references {
+        warnings.push(format!("no_references:{lang}"));
+    }
     for (lang, expected, got) in &pb_outcome.version_mismatch {
         warnings.push(format!("version_mismatch:{lang}:{expected}:{got}"));
     }

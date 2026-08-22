@@ -351,6 +351,23 @@ fn decode_phase_b_warnings(
                     ),
                 );
             }
+            // #724: the analyzer succeeded and returned definitions, but not one
+            // reference occurrence, so no call edge can be derived from it. An
+            // agent asking whether the index is healthy was told it is, which is
+            // the silence this class exists to break (#752 review).
+            "no_references" => {
+                out.insert(
+                    rest.to_string(),
+                    (
+                        "failed",
+                        format!(
+                            "semantic analyzer for '{rest}' produced definitions but no \
+                             references, so no call edges came from it, re-run \
+                             `travsr init --semantic --force` to retry"
+                        ),
+                    ),
+                );
+            }
             "version_mismatch" => {
                 let v: Vec<&str> = rest.splitn(3, ':').collect();
                 if let [lang, expected, got] = v[..] {
@@ -2347,6 +2364,7 @@ mod tests {
             "skipped_no_analyzer",
             "skipped_no_compdb",
             "untrusted_corpus",
+            "no_references",
         ] {
             // `version_mismatch` carries `lang:expected:got`, the rest `lang`.
             let warning = if class == "version_mismatch" {
