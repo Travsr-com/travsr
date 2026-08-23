@@ -80,7 +80,8 @@ pub fn windows_pid_is_alive(pid: u32) -> bool {
 /// than a subprocess.
 ///
 /// **`EPERM` means alive.** This is the correctness point, not an
-/// optimisation (#636 round-3 review). `kill -0` as a shell command collapses
+/// optimisation (#636 round-3 review; filed independently as #759). `kill -0`
+/// as a shell command collapses
 /// `EPERM` and `ESRCH` into the same non-zero exit status, so the previous
 /// subprocess implementation reported any live process the calling user
 /// cannot signal as *dead*:
@@ -159,6 +160,9 @@ mod unix_pid_tests {
     /// it is the canonical `EPERM`-means-alive case. Skips itself when the
     /// suite happens to run as root, where the call returns `Ok` instead and
     /// the assertion would pass without exercising the `EPERM` arm at all.
+    ///
+    /// #759: this is the regression test for that issue. Naming it here so the
+    /// issue is findable by number; the report and this test are the same bug.
     #[test]
     fn pid_one_reads_as_alive_even_when_not_signallable() {
         assert!(
