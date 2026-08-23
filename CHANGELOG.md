@@ -4,6 +4,30 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v1.0.0 - 2026-08-23
+
+> First stable 1.0. Install with `npm i -g @travsr.com/travsr` or
+> `curl -fsSL https://travsr.com/install.sh | sh`.
+>
+> This is a promotion, not a rebuild. It republishes the exact signed
+> artifacts built for `v1.0.0-beta.2` under the `latest` dist-tag, so the bits
+> that ship as stable are byte-for-byte the ones that were beta-tested. There
+> is therefore no separate list of changes here: everything in this release is
+> the `v1.0.0-beta.2` entry below, which in turn carries all of
+> `v1.0.0-rc.1` and `v1.0.0-beta.1`.
+>
+> Promoted from `v1.0.0-beta.2` rather than from `v1.0.0-rc.1`. The rc.1
+> artifacts predate the Windows npm extraction fix, and rc.1's own Windows
+> smoke-install job failed at "Verify binary runs" for exactly that reason, so
+> its Windows tarball was never verified end to end. beta.2 is the first build
+> in the 1.0 train whose smoke install passed on all four target platforms.
+
+### Changed
+
+- **The VS Code extension's `DOWNLOAD_VERSION` moves to 1.0.0.** It is the version the extension offers to fetch when no `travsr` binary resolves, and it had been left at `0.11.0` for the whole 1.0 prerelease train, deliberately: pre-releases are exempt from the release workflow's lockstep check because pointing the extension at a stable tag that does not exist yet would turn its one recovery path into a 404. With `v1.0.0` published that exemption ends, and leaving it would make the extension's "reinstall" advice silently downgrade a 1.0 user to 0.11.0, which is #486. The bump lands before the tag so the two are never out of step in the direction that breaks.
+
+---
+
 ## v1.0.0-beta.2 - 2026-08-23
 
 > Second 1.0 beta, cut from `master` after `v1.0.0-rc.1`. Install with
