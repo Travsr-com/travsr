@@ -303,6 +303,14 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
 ///
 /// Same helper as `travsr-daemon`'s `hook_backend_id` (#526), which fixed the
 /// identical resolution order in the daemon's own hook injection.
+///
+/// `parent().parent()` assumes `db_path` is `<repo>/.travsr/graph.db`, which
+/// holds for the default path. An explicit `travsr mcp --stdio --db <path>`
+/// outside a repo yields no `embed.toml` there and falls through to the
+/// machine default, which is the pre-existing behaviour and not a regression.
+/// `resolve_backend_paths` on the spawn side makes the same assumption from
+/// the same input, so hook and spawn still agree in that case, which is the
+/// invariant that matters (#770 review).
 fn hook_backend_id(db_path: &Path) -> Option<String> {
     use travsr_plugin_host::{active_backend_id, repo_backend_id};
 
@@ -316,9 +324,15 @@ fn hook_backend_id(db_path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
-    // HOME is a process-global env var and Rust tests run in parallel;
-    // serialize every test that mutates it through this lock.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // HOME is process-global and Rust tests run in parallel, so every test
+    // that mutates it must serialize on ONE lock. Reuses the existing
+    // `seed::DOCS_ENV_LOCK` rather than declaring a second: these tests and
+    // the docs-lane tests share the `travsr_mcp` lib test binary, so two
+    // disjoint mutexes would serialize each group against itself while still
+    // racing the other. That is not hypothetical here; DOCS_ENV_LOCK's own doc
+    // records it happening once already, and #770's review demonstrated this
+    // pair interleaving (#770 review).
+    use crate::seed::DOCS_ENV_LOCK as ENV_LOCK;
 
     /// #547: hook injection must prefer a repo's own `.travsr/embed.toml`
     /// override over the machine-wide `~/.travsr/embed.toml` default, the
