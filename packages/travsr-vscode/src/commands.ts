@@ -26,6 +26,10 @@ import {
   buildStatsHtml,
   buildLanguagesHtml,
   buildPanelLoadingHtml,
+  LOG_MAX_LINES,
+  LOG_MAX_FILES_LISTED,
+  LOG_AUTO_SECONDS,
+  buildLogRowsHtml,
   LANG_CONTRACT_FIELDS,
   LANG_CONTRACT_VERSION,
   type RepoRow,
@@ -34,7 +38,7 @@ import {
   type LangInfo,
   type LangContractSkew,
 } from "./webviews";
-import type { Diagnostic, LogEntry } from "./webviews";
+import type { Diagnostic, LogEntry, LogFileInfo } from "./webviews";
 
 // ── Pure helpers (unit-testable) ────────────────────────────────────────────
 
@@ -330,57 +334,323 @@ export function timeAgo(ms: number): string {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
+/** Bytes read per backward step when scanning a log file from its end. */
+const LOG_CHUNK_BYTES = 64 * 1024;
+
+/** Hard ceiling on how far back a single file is scanned.
+ *
+ *  The backward scan normally stops as soon as it has enough newlines, so this
+ *  only binds on a pathological file: one enormous line, or a file with no
+ *  newlines at all, where "scan until enough lines" would otherwise read all
+ *  50 MB of a rotated log into a webview.
+ *
+ *  It bounds the READ. What the read produces needs bounding separately, which
+ *  is what `LOG_OVERSIZED_PREVIEW_CHARS` is for: when the ceiling lands inside a
+ *  line, the window holds no complete entry, and handing the fragment on as one
+ *  cost about 32 MB of HTML from a single row.
+ *
+ *  This is the one place the panel's reader diverges from `append_file_tail` by
+ *  design. The Rust has no ceiling, so `line_start_from_end` falls through to 0
+ *  and `travsr daemon logs` reads such a file from byte zero. A terminal can
+ *  afford that and a webview cannot. */
+export const LOG_MAX_BYTES_PER_FILE = 8 * 1024 * 1024;
+
+/** How much of an oversized line is shown when the ceiling leaves no complete
+ *  line in reach. One bounded row, rather than the two wrong answers: nothing
+ *  at all, which renders "No daemon log yet" over a file with readable lines
+ *  earlier in it, or the whole window as a single entry. */
+export const LOG_OVERSIZED_PREVIEW_CHARS = 2000;
+
+/** The one row a file gets when the byte ceiling leaves no complete line in it.
+ *
+ *  Deliberately NOT valid daemon JSON. This is the panel accounting for itself,
+ *  not something the daemon wrote, and `parseLogLine` renders an unparseable
+ *  line as its own message with no severity pill, which is exactly how it should
+ *  read. */
+function oversizedLineNotice(scanned: string): string {
+  const mb = LOG_MAX_BYTES_PER_FILE / (1024 * 1024);
+  return (
+    `[travsr] a single log line is longer than this panel's ${mb} MB per-file scan, ` +
+    `so no complete entry was within reach. Run \`travsr daemon logs\` to read the ` +
+    `file without that limit. First ${LOG_OVERSIZED_PREVIEW_CHARS} characters: ` +
+    scanned.slice(0, LOG_OVERSIZED_PREVIEW_CHARS)
+  );
+}
+
+/** Every rotated log file in `dir`, oldest first.
+ *
+ *  `tracing-appender` suffixes with an ISO date, which sorts lexicographically
+ *  in chronological order, so no date parsing is required. Mirrors
+ *  `log_files` in `crates/travsr-daemon/src/logfile.rs`, including its
+ *  files-only guard: a directory called `daemon.log.something` is not a log. */
+function daemonLogFiles(dir: string): string[] {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.startsWith("daemon.log"))
+      .map((e) => e.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/** The last `maxLines` complete lines of one log file, oldest first.
+ *
+ *  Scans backwards in chunks and stops as soon as enough newlines are in hand,
+ *  so cost is proportional to the tail read rather than to file size: a 400 MB
+ *  log tails as fast as a 4 KB one. Ports `line_start_from_end` /
+ *  `append_file_tail` from `logfile.rs`.
+ *
+ *  A scan that starts mid-file drops everything before the first newline,
+ *  because a seek lands in the middle of a line and half an entry is not an
+ *  entry. */
+function readFileTailLines(file: string, maxLines: number): string[] {
+  let fd: number;
+  let size: number;
+  try {
+    size = fs.statSync(file).size;
+    if (size === 0) return [];
+    fd = fs.openSync(file, "r");
+  } catch {
+    return [];
+  }
+  try {
+    let start = size;
+    // Bytes, not strings. Decoding each chunk on its own would split any UTF-8
+    // sequence that straddles a chunk boundary into two replacement characters,
+    // destroying the character: a path like `travsr-café` in a log line would
+    // render as `caf??` in the panel while `travsr daemon logs` printed it
+    // correctly, which is exactly the divergence this reader exists to avoid.
+    // `append_file_tail` accumulates bytes and decodes once for the same
+    // reason, and its lossy decode is there for a torn write, not for a split
+    // we inflicted on ourselves.
+    //
+    // Counting newlines per chunk rather than rescanning the accumulated text
+    // keeps this linear. Rescanning made the scan quadratic in chunk count on
+    // the one path the byte ceiling exists to bound (a file with no newlines),
+    // which cost about a second of synchronous extension-host work at the 8 MB
+    // limit.
+    const parts: Buffer[] = [];
+    let newlines = 0;
+    // Which exit the loop took matters: "I found enough lines" and "the ceiling
+    // stopped me" leave the window in different states, and treating them as the
+    // same exit is what broke the partial-line drop below.
+    let ceilingHit = false;
+    for (;;) {
+      const next = Math.max(0, start - LOG_CHUNK_BYTES);
+      const len = start - next;
+      if (len <= 0) break;
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, next);
+      parts.push(buf);
+      for (let i = 0; i < len; i++) {
+        if (buf[i] === 0x0a) newlines++;
+      }
+      start = next;
+      if (start === 0) break;
+      if (size - start >= LOG_MAX_BYTES_PER_FILE) {
+        ceilingHit = true;
+        break;
+      }
+      // Strictly greater: the extra newline is the one terminating the line
+      // *before* the first one we want, which is what proves it is whole.
+      if (newlines > maxLines) break;
+    }
+    parts.reverse();
+    const scanned = Buffer.concat(parts).toString("utf8");
+
+    // A scan that starts mid-file drops everything before the first newline,
+    // because a seek lands in the middle of a line and half an entry is not an
+    // entry. `indexOf` returning -1 does NOT mean "cut at zero": it means the
+    // window holds no boundary at all, which happens only when the ceiling
+    // landed inside one line. `slice(indexOf + 1)` read that as cut-at-zero and
+    // kept the fragment, handing an 8 MB partial line back as an entry.
+    let body = scanned;
+    if (start > 0) {
+      const nl = body.indexOf("\n");
+      body = nl === -1 ? "" : body.slice(nl + 1);
+    }
+
+    const lines = body.split("\n").filter((l) => l.trim() !== "");
+    if (lines.length === 0 && ceilingHit) {
+      // The ceiling stopped the scan inside a line longer than the whole budget,
+      // so there is no complete entry in the window: either no boundary at all,
+      // or only the newline closing that one line. Reporting nothing renders
+      // "No daemon log yet" over a file whose earlier lines are perfectly
+      // readable, which is the symptom this reader exists to remove arriving by
+      // another route. One bounded, marked row instead.
+      return [oversizedLineNotice(scanned)];
+    }
+    return lines.slice(-maxLines);
+  } catch {
+    return [];
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
 /**
- * Read the tail of the daemon log.
+ * Read the tail of the daemon log, across rotated files.
  *
- * `daemon.log.<UTC-DATE>` is JSON lines, one object per line. Only the last
- * `maxBytes` are read, by seeking rather than by loading the file and slicing:
- * the log is capped at 50 MB across rotations and the newest file is never
- * pruned even when it alone exceeds that, so reading it whole to show 200 lines
- * is a bounded-looking call that is not bounded.
+ * `daemon.log.<UTC-DATE>` is JSON lines, one object per line, rotated daily
+ * with seven files kept. "The last 500 lines" is therefore rarely 500 lines of
+ * one file: shortly after 00:00 UTC today's file holds a handful and the rest
+ * of the answer sits in yesterday's. Reading only the newest file returned
+ * short without saying so, so a healthy daemon read as one that had logged
+ * almost nothing.
  *
- * The first line of the window is dropped when the window did not start at byte
- * zero, because a seek lands mid-line.
+ * So older files are walked, newest first, each supplying only what the newer
+ * ones could not, stopping as soon as the request is satisfied. This mirrors
+ * `LogTail::backfill` in `crates/travsr-daemon/src/logfile.rs`, which is what
+ * `travsr daemon logs --lines N` already does correctly; the panel had its own
+ * reader and never got the fix.
+ *
+ * Lines are returned oldest first, each tagged with the date of the file it
+ * came from so the panel can show where one day ends and the next begins.
+ *
+ * One deliberate divergence from `backfill`: there, `lines == 0` means "the
+ * whole retained history", which is a reasonable thing to pipe to a terminal
+ * and not a reasonable thing to build a DOM out of. Here 0 reads nothing, and
+ * the panel's widest option resolves to `LOG_MAX_LINES` instead. Unreachable
+ * from the UI either way, since the smallest option is 100 and `setLogLines`
+ * clamps to at least 1.
+ *
+ * No longer the panel's reader. The File control reads one file at a time via
+ * `readDaemonLogFile`, because a stream spanning rotations gave no way to ask
+ * for a particular day. This stays as the tested port of `backfill`, which is
+ * what `travsr daemon logs` still does, and its tests hold the two readers to
+ * the same answer on the same fixture.
  */
 export function readDaemonLogTail(repoRoot: string, maxLines = 500): LogEntry[] {
   const dir = path.join(repoRoot, ".travsr");
-  let newest: string;
-  try {
-    const files = fs
-      .readdirSync(dir)
-      .filter((f) => f.startsWith("daemon.log"))
-      .sort(); // ISO date suffix sorts chronologically
-    if (files.length === 0) return [];
-    newest = path.join(dir, files[files.length - 1]);
-  } catch {
-    return [];
-  }
+  const files = daemonLogFiles(dir);
+  if (files.length === 0) return [];
 
-  // Generous enough that maxLines is the binding limit, not the byte window.
-  const MAX_BYTES = 512 * 1024;
-  let text: string;
-  try {
-    const size = fs.statSync(newest).size;
-    const start = Math.max(0, size - MAX_BYTES);
-    const len = size - start;
-    const fd = fs.openSync(newest, "r");
-    try {
-      const buf = Buffer.alloc(len);
-      fs.readSync(fd, buf, 0, len, start);
-      text = buf.toString("utf8");
-    } finally {
-      fs.closeSync(fd);
-    }
-    if (start > 0) text = text.slice(text.indexOf("\n") + 1);
-  } catch {
-    return [];
-  }
+  const want = Math.min(Math.max(maxLines, 0), LOG_MAX_LINES);
+  if (want === 0) return [];
 
-  return text
-    .split("\n")
-    .filter((l) => l.trim() !== "")
-    .slice(-maxLines)
-    .map(parseLogLine);
+  // Newest first, each older file supplying only the shortfall. Older files are
+  // never opened once the newest satisfies the request.
+  const chunks: LogEntry[][] = [];
+  let needed = want;
+  for (let i = files.length - 1; i >= 0 && needed > 0; i--) {
+    const name = files[i];
+    const lines = readFileTailLines(path.join(dir, name), needed);
+    needed -= lines.length;
+    // Concatenating arrays rather than text is deliberate: a rotated file whose
+    // last write was torn has no trailing newline, and gluing its text onto the
+    // next file's would fuse two entries into one line.
+    chunks.push(lines.map((l) => ({ ...parseLogLine(l), day: logFileDay(name) })));
+  }
+  chunks.reverse();
+  return chunks.flat();
+}
+
+/** The date a rotated log file covers, from its `daemon.log.<DATE>` name.
+ *  Falls back to the whole name so a file with an unexpected suffix still
+ *  groups deterministically instead of collapsing into its neighbours. */
+function logFileDay(fileName: string): string {
+  const suffix = fileName.slice("daemon.log".length).replace(/^\./, "");
+  return suffix || fileName;
+}
+
+/** `today` or `yesterday` for a log file's date, `undefined` for anything else.
+ *
+ *  Both dates are UTC, because `rolling::daily` names files by the UTC date.
+ *  That is worth saying out loud: at UTC+5:30 the file called `2026-08-22`
+ *  holds 05:30 on the 22nd through 05:29 on the 23rd local, so "today" here
+ *  means the current UTC day and not the reader's. The File control says
+ *  "UTC days" beside itself for exactly this reason.
+ *
+ *  Only those two labels. Files are named for days the daemon ran rather than
+ *  for consecutive days, so seven files can span months and a counted label
+ *  ("3 days ago") on the third entry would usually be wrong. Everything older
+ *  shows its date and nothing else.
+ *
+ *  `todayUtc` is a parameter rather than a call to the clock so this is testable
+ *  without freezing time. */
+export function logFileRelativeDay(day: string, todayUtc: string): string | undefined {
+  const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+  if (!ISO_DAY.test(day) || !ISO_DAY.test(todayUtc)) return undefined;
+  if (day === todayUtc) return "today";
+  // Date arithmetic rather than string maths, so month and year ends work.
+  const prev = new Date(`${todayUtc}T00:00:00Z`);
+  prev.setUTCDate(prev.getUTCDate() - 1);
+  return prev.toISOString().slice(0, 10) === day ? "yesterday" : undefined;
+}
+
+/** The rotated log files the panel's File control should offer, newest first.
+ *
+ *  Sizes come from `statSync`, which is metadata and costs nothing. Line counts
+ *  deliberately do not: there is no way to know how many lines a file holds
+ *  without reading all of it, so labelling every file with a count would open
+ *  every file on every redraw. That is the opposite of what the tail reader is
+ *  built to do, and `refreshOpenPanels` fires on `dbWatcher.onDidChange`, so it
+ *  would run again on every reindex while the panel is open.
+ *
+ *  `onDisk` is the number of files actually present, so a capped list can say
+ *  it is capped. It can exceed the returned length: `MAX_LOG_FILES` is enforced
+ *  by the daemon's `prune`, not by the directory. */
+export function daemonLogFileList(
+  repoRoot: string,
+  todayUtc: string = new Date().toISOString().slice(0, 10)
+): { files: LogFileInfo[]; onDisk: number } {
+  const dir = path.join(repoRoot, ".travsr");
+  const names = daemonLogFiles(dir);
+  // `daemonLogFiles` is oldest first; the newest file is the default selection
+  // and belongs at the top of the list.
+  const files = names
+    .slice()
+    .reverse()
+    .slice(0, LOG_MAX_FILES_LISTED)
+    .map((name) => {
+      let size = 0;
+      try {
+        size = fs.statSync(path.join(dir, name)).size;
+      } catch {
+        // Raced with the daemon's prune between the listing and the stat. Zero
+        // reads as "nothing in here", which is true enough of a file being
+        // deleted, and is better than dropping the entry and renumbering the
+        // list under the user's cursor.
+      }
+      const day = logFileDay(name);
+      const rel = logFileRelativeDay(day, todayUtc);
+      return rel === undefined ? { name, day, size } : { name, day, size, rel };
+    });
+  return { files, onDisk: names.length };
+}
+
+/** The last `maxLines` lines of one rotated log file, oldest first.
+ *
+ *  The panel's reader. Sits on the same backward chunked scan
+ *  `readDaemonLogTail` uses, so cost is proportional to the tail taken rather
+ *  than to file size, and the same per-file byte ceiling applies. Reading one
+ *  file is strictly less work than spanning: the other files are never opened.
+ *
+ *  `fileName` is a bare name and is checked against the directory listing, not
+ *  sanitised. It arrives from the webview, and an allowlist of names the
+ *  directory actually reports cannot be walked out of, while a `..` test on a
+ *  joined path has to be right about what the platform accepts in a name. An
+ *  unknown name reads as empty. */
+export function readDaemonLogFile(
+  repoRoot: string,
+  fileName: string,
+  maxLines = 500
+): LogEntry[] {
+  const dir = path.join(repoRoot, ".travsr");
+  if (!daemonLogFiles(dir).includes(fileName)) return [];
+  const want = Math.min(Math.max(maxLines, 0), LOG_MAX_LINES);
+  if (want === 0) return [];
+  const day = logFileDay(fileName);
+  return readFileTailLines(path.join(dir, fileName), want).map((l) => ({
+    ...parseLogLine(l),
+    day,
+  }));
 }
 
 /**
@@ -751,7 +1021,10 @@ type PanelMessage =
   | { command: "pickRepo" }
   | { command: "initRepo" }
   | { command: "openFile"; path: string }
-  | { command: "refreshLog" }
+
+  | { command: "setLogLines"; lines: number }
+  | { command: "setLogFile"; file: string }
+  | { command: "setLogAuto"; seconds: number }
   | { command: "refresh" };
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
@@ -892,12 +1165,75 @@ export function registerShowRepos(client: McpClient): vscode.Disposable {
  * travsr.showGraphStats — read-only metrics dashboard webview.
  */
 export function registerShowGraphStats(client: McpClient): vscode.Disposable {
-  // Kept so a follow tick can redraw the log without re-running the two
-  // expensive halves of a render. Undefined until the first full pass, so a
-  // log-only refresh before then falls back to doing the work.
+  // Kept so a log-only refresh can redraw without re-running the two expensive
+  // halves of a render, which is what changing Lines or File does. Undefined
+  // until the first full pass, so a log-only refresh before then falls back to
+  // doing the work.
   let lastStats: StatsView | undefined;
   let lastDiags: Diagnostic[] = [];
   let logOnly = false;
+  // How many lines the reader is asked for. The panel's Lines control raises
+  // this when the user picks a window wider than what is already loaded, which
+  // is the only way to show more: the dropdown's other job is a local hide over
+  // rows that are already in the DOM.
+  let logLines = 500;
+  // Which rotated file is showing. `undefined` means "whatever the newest is",
+  // which is the default and the only state that survives a rotation: an
+  // explicit pick is a pick of that day and stays put when the day rolls, while
+  // the default follows the daemon onto the new file.
+  let logFile: string | undefined;
+  // Auto-refresh interval in seconds, 0 for off.
+  //
+  // The timer lives here rather than in the webview, and that is the whole
+  // difference from the Follow toggle this replaces. `refresh()` assigns
+  // `panel.webview.html` wholesale, so a `setInterval` inside the document dies
+  // with the first tick it triggers: Follow fired once, cleared its own
+  // checkbox, and never polled again.
+  let logAuto = 0;
+  let autoTimer: ReturnType<typeof setInterval> | undefined;
+
+  const stopAuto = (): void => {
+    if (autoTimer !== undefined) {
+      clearInterval(autoTimer);
+      autoTimer = undefined;
+    }
+  };
+
+  /** One auto-refresh tick: new log rows into the live document, nothing else.
+   *
+   *  Deliberately not `refresh()`. A full render on a timer would discard the
+   *  search box, the severity chip, the toggles, the scroll position and every
+   *  expanded row on every tick, which is #767, and inflicting it every few
+   *  seconds is worse than not polling at all. Replacing the rows leaves all of
+   *  that standing.
+   *
+   *  What that trades away: the metric cards and the health banner do not move
+   *  on a tick, so a daemon that dies while you watch is reported by its own log
+   *  lines arriving (or stopping) rather than by the banner. The Refresh button
+   *  moves everything. Stated in the control's tooltip so it is not a surprise.
+   */
+  const autoTick = (): void => {
+    const entry = managedPanels.get("travsrStats");
+    if (entry === undefined) {
+      // The panel was closed. Nothing else clears this, and posting into a
+      // disposed webview is pointless, so the timer retires itself. Costs at
+      // most one dead tick after a close.
+      stopAuto();
+      return;
+    }
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (root === undefined) return;
+    const listed = daemonLogFileList(root);
+    const selected =
+      logFile !== undefined && listed.files.some((f) => f.name === logFile)
+        ? logFile
+        : (listed.files[0]?.name ?? "");
+    if (selected === "") return;
+    void entry.panel.webview.postMessage({
+      command: "setLogRows",
+      rows: buildLogRowsHtml(readDaemonLogFile(root, selected, logLines)),
+    });
+  };
 
   const render = async (): Promise<string> => {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -905,14 +1241,30 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
     const stats = reuse ? (lastStats as StatsView) : buildStatsView(await client.callTool("get_graph_stats"));
     // Read straight from the log file rather than asking the daemon: it works
     // after a crash, which is when the panel is worth opening. This is the
-    // cheap half, and the only half a follow tick needs.
-    const log = root ? readDaemonLogTail(root) : [];
+    // cheap half, and the only half a log-only refresh needs.
+    // Re-listed every render rather than cached: rotation and the daemon's
+    // prune both change the directory under an open panel.
+    const logFiles = root ? daemonLogFileList(root) : { files: [], onDisk: 0 };
+    // A pinned file that is gone (rotated past the cap, or pruned while the
+    // panel sat open) falls back to the newest, rather than rendering an empty
+    // log against a filename nothing can satisfy.
+    const selected =
+      logFile !== undefined && logFiles.files.some((f) => f.name === logFile)
+        ? logFile
+        : (logFiles.files[0]?.name ?? "");
+    const log = root && selected !== "" ? readDaemonLogFile(root, selected, logLines) : [];
     const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
     // readDiagnostics spawns `travsr status`.
     const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
     lastStats = stats;
     lastDiags = diags;
-    return buildStatsHtml(stats, log, diags);
+    // A panel that was closed and reopened renders the stored interval as
+    // selected, so the timer has to come back with it: otherwise the control
+    // claims to be polling while nothing is.
+    if (logAuto > 0 && autoTimer === undefined) {
+      autoTimer = setInterval(autoTick, logAuto * 1000);
+    }
+    return buildStatsHtml(stats, log, diags, logLines, { ...logFiles, selected }, logAuto);
   };
 
   const handle = async (msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
@@ -941,13 +1293,48 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
       }
       return;
     }
-    if (msg.command === "refreshLog") {
+    if (msg.command === "setLogLines") {
+      // Widening the window: re-read with the bigger cap. Log-only, because the
+      // graph stats and the `travsr status` spawn have not changed and are the
+      // expensive half of a render.
+      logLines = Math.min(Math.max(Math.trunc(msg.lines) || 0, 1), LOG_MAX_LINES);
       logOnly = true;
       try {
         await refresh();
       } finally {
         logOnly = false;
       }
+      return;
+    }
+    if (msg.command === "setLogFile") {
+      // Always a re-read: the rows for another file were never sent to the
+      // webview, so there is no local path to take. Log-only, for the same
+      // reason widening Lines is: the graph stats and the `travsr status` spawn
+      // have not changed and are the expensive half.
+      //
+      // Stored unchecked on purpose. `render` drops a name the directory does
+      // not list and falls back to the newest, and `readDaemonLogFile` checks
+      // again before it opens anything, so a crafted message cannot turn into a
+      // path.
+      logFile = msg.file;
+      logOnly = true;
+      try {
+        await refresh();
+      } finally {
+        logOnly = false;
+      }
+      return;
+    }
+    if (msg.command === "setLogAuto") {
+      // Validated against the options the control actually offers rather than
+      // trusted: this number comes from the webview and goes into setInterval,
+      // where a 0.001 would busy-loop the extension host.
+      logAuto = LOG_AUTO_SECONDS.includes(msg.seconds) ? msg.seconds : 0;
+      stopAuto();
+      if (logAuto > 0) autoTimer = setInterval(autoTick, logAuto * 1000);
+      // No refresh: the select in the live document already shows the choice,
+      // and redrawing to confirm it would throw away the panel state the tick
+      // path exists to protect. `autoSeconds` renders it on the next full pass.
       return;
     }
     await refresh();
