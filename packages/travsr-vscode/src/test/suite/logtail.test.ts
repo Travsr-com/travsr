@@ -7,6 +7,8 @@ import {
   readDaemonLogFile,
   daemonLogFileList,
   logFileRelativeDay,
+  LOG_MAX_BYTES_PER_FILE,
+  LOG_OVERSIZED_PREVIEW_CHARS,
 } from "../../commands";
 import {
   buildStatsHtml,
@@ -751,5 +753,87 @@ suite("#log-rotation: the rows a tick sends are the rows a render builds", () =>
     const rows = buildLogRowsHtml(log);
     assert.ok(rows.indexOf("newer") < rows.indexOf("older"), "newest first");
     assert.strictEqual(log[0].message, "older", "reverse() must not hit the caller");
+  });
+});
+
+suite("#log-rotation: the per-file byte ceiling and the partial-line drop", () => {
+  /** Comfortably past the ceiling, so the scan is guaranteed to stop inside it. */
+  const OVERSIZE = LOG_MAX_BYTES_PER_FILE + 1024 * 1024;
+
+  /** Write raw bytes, bypassing writeLog's JSON shaping. */
+  function writeRaw(root: string, name: string, body: string): void {
+    fs.writeFileSync(path.join(root, ".travsr", name), body);
+  }
+
+  test("an oversized line does not make a file with readable lines read as empty", () => {
+    // The reported case. Two good entries at offset 0, then one line bigger than
+    // the whole scan budget. The only newline inside the window is the one
+    // closing that line, so dropping the partial first line left nothing, and
+    // the panel rendered "No daemon log yet" over a file with real entries in
+    // it: the exact symptom this reader exists to remove, by another door.
+    const root = tempRepo();
+    writeRaw(root, "daemon.log.2026-08-22", '{"a":1}\n{"a":2}\n' + "Z".repeat(OVERSIZE) + "\n");
+
+    const got = readDaemonLogFile(root, "daemon.log.2026-08-22", 500);
+    assert.strictEqual(got.length, 1, "one accounted row, never an empty log");
+    assert.ok(
+      got[0].message.startsWith("[travsr]"),
+      `expected a panel notice, got: ${got[0].message.slice(0, 120)}`
+    );
+    assert.ok(got[0].message.includes("MB per-file scan"), "the limit must be named");
+    assert.ok(
+      got[0].message.includes("travsr daemon logs"),
+      "and the way to read the file without it"
+    );
+  });
+
+  test("a window with no boundary at all is bounded, not an 8 MB entry", () => {
+    // Nothing but one unterminated line. The window held no newline, `indexOf`
+    // returned -1, and `slice(-1 + 1)` kept the whole fragment: one 8 MB
+    // "entry", which buildLogRowsHtml embeds four times over (data-json,
+    // data-raw, the message text and the JSON view) for ~32 MB of HTML from a
+    // single row, against the 8.69 MB that LOG_MAX_LINES budgets for 5000.
+    const root = tempRepo();
+    writeRaw(root, "daemon.log.2026-08-22", "x".repeat(OVERSIZE));
+
+    const got = readDaemonLogFile(root, "daemon.log.2026-08-22", 500);
+    assert.strictEqual(got.length, 1);
+    assert.ok(
+      got[0].raw.length < LOG_OVERSIZED_PREVIEW_CHARS * 2,
+      `row is ${got[0].raw.length} chars, ceiling is ${LOG_MAX_BYTES_PER_FILE}`
+    );
+    // The cost that actually mattered, asserted where it lands.
+    const html = buildLogRowsHtml(got);
+    assert.ok(html.length < 100_000, `one row produced ${html.length} chars of HTML`);
+  });
+
+  test("a file under the ceiling is untouched by any of this", () => {
+    // The ceiling must not fire on ordinary files, and the partial-line drop
+    // must keep working when the window does hold a boundary.
+    const root = tempRepo();
+    writeLog(root, "daemon.log.2026-08-22", ["a", "b", "c"]);
+    assert.deepStrictEqual(
+      messages(readDaemonLogFile(root, "daemon.log.2026-08-22", 500)),
+      ["a", "b", "c"]
+    );
+  });
+
+  test("an oversized line does not hide complete lines that follow it", () => {
+    // The other side of the same file: when the oversized line is at the START
+    // and good lines come after it, those are inside the window and must be
+    // returned normally, with the fragment dropped and no notice.
+    const root = tempRepo();
+    writeRaw(root, "daemon.log.2026-08-22", "Z".repeat(OVERSIZE) + '\n{"a":1}\n{"a":2}\n');
+
+    const got = readDaemonLogFile(root, "daemon.log.2026-08-22", 500);
+    assert.strictEqual(got.length, 2, "both trailing entries must survive");
+    assert.ok(
+      !got.some((e) => e.message.startsWith("[travsr]")),
+      "no notice when complete lines were in reach"
+    );
+    assert.ok(
+      got.every((e) => e.raw.length < 100),
+      "and no fragment glued onto one of them"
+    );
   });
 });

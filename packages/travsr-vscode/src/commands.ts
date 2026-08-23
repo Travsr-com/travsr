@@ -340,10 +340,42 @@ const LOG_CHUNK_BYTES = 64 * 1024;
 /** Hard ceiling on how far back a single file is scanned.
  *
  *  The backward scan normally stops as soon as it has enough newlines, so this
- *  only binds on a pathological file — one enormous line, or a file with no
- *  newlines at all — where "scan until enough lines" would otherwise read all
- *  50 MB of a rotated log into a webview. */
-const LOG_MAX_BYTES_PER_FILE = 8 * 1024 * 1024;
+ *  only binds on a pathological file: one enormous line, or a file with no
+ *  newlines at all, where "scan until enough lines" would otherwise read all
+ *  50 MB of a rotated log into a webview.
+ *
+ *  It bounds the READ. What the read produces needs bounding separately, which
+ *  is what `LOG_OVERSIZED_PREVIEW_CHARS` is for: when the ceiling lands inside a
+ *  line, the window holds no complete entry, and handing the fragment on as one
+ *  cost about 32 MB of HTML from a single row.
+ *
+ *  This is the one place the panel's reader diverges from `append_file_tail` by
+ *  design. The Rust has no ceiling, so `line_start_from_end` falls through to 0
+ *  and `travsr daemon logs` reads such a file from byte zero. A terminal can
+ *  afford that and a webview cannot. */
+export const LOG_MAX_BYTES_PER_FILE = 8 * 1024 * 1024;
+
+/** How much of an oversized line is shown when the ceiling leaves no complete
+ *  line in reach. One bounded row, rather than the two wrong answers: nothing
+ *  at all, which renders "No daemon log yet" over a file with readable lines
+ *  earlier in it, or the whole window as a single entry. */
+export const LOG_OVERSIZED_PREVIEW_CHARS = 2000;
+
+/** The one row a file gets when the byte ceiling leaves no complete line in it.
+ *
+ *  Deliberately NOT valid daemon JSON. This is the panel accounting for itself,
+ *  not something the daemon wrote, and `parseLogLine` renders an unparseable
+ *  line as its own message with no severity pill, which is exactly how it should
+ *  read. */
+function oversizedLineNotice(scanned: string): string {
+  const mb = LOG_MAX_BYTES_PER_FILE / (1024 * 1024);
+  return (
+    `[travsr] a single log line is longer than this panel's ${mb} MB per-file scan, ` +
+    `so no complete entry was within reach. Run \`travsr daemon logs\` to read the ` +
+    `file without that limit. First ${LOG_OVERSIZED_PREVIEW_CHARS} characters: ` +
+    scanned.slice(0, LOG_OVERSIZED_PREVIEW_CHARS)
+  );
+}
 
 /** Every rotated log file in `dir`, oldest first.
  *
@@ -401,6 +433,10 @@ function readFileTailLines(file: string, maxLines: number): string[] {
     // limit.
     const parts: Buffer[] = [];
     let newlines = 0;
+    // Which exit the loop took matters: "I found enough lines" and "the ceiling
+    // stopped me" leave the window in different states, and treating them as the
+    // same exit is what broke the partial-line drop below.
+    let ceilingHit = false;
     for (;;) {
       const next = Math.max(0, start - LOG_CHUNK_BYTES);
       const len = start - next;
@@ -413,18 +449,40 @@ function readFileTailLines(file: string, maxLines: number): string[] {
       }
       start = next;
       if (start === 0) break;
-      if (size - start >= LOG_MAX_BYTES_PER_FILE) break;
+      if (size - start >= LOG_MAX_BYTES_PER_FILE) {
+        ceilingHit = true;
+        break;
+      }
       // Strictly greater: the extra newline is the one terminating the line
       // *before* the first one we want, which is what proves it is whole.
       if (newlines > maxLines) break;
     }
     parts.reverse();
-    let text = Buffer.concat(parts).toString("utf8");
-    if (start > 0) text = text.slice(text.indexOf("\n") + 1);
-    return text
-      .split("\n")
-      .filter((l) => l.trim() !== "")
-      .slice(-maxLines);
+    const scanned = Buffer.concat(parts).toString("utf8");
+
+    // A scan that starts mid-file drops everything before the first newline,
+    // because a seek lands in the middle of a line and half an entry is not an
+    // entry. `indexOf` returning -1 does NOT mean "cut at zero": it means the
+    // window holds no boundary at all, which happens only when the ceiling
+    // landed inside one line. `slice(indexOf + 1)` read that as cut-at-zero and
+    // kept the fragment, handing an 8 MB partial line back as an entry.
+    let body = scanned;
+    if (start > 0) {
+      const nl = body.indexOf("\n");
+      body = nl === -1 ? "" : body.slice(nl + 1);
+    }
+
+    const lines = body.split("\n").filter((l) => l.trim() !== "");
+    if (lines.length === 0 && ceilingHit) {
+      // The ceiling stopped the scan inside a line longer than the whole budget,
+      // so there is no complete entry in the window: either no boundary at all,
+      // or only the newline closing that one line. Reporting nothing renders
+      // "No daemon log yet" over a file whose earlier lines are perfectly
+      // readable, which is the symptom this reader exists to remove arriving by
+      // another route. One bounded, marked row instead.
+      return [oversizedLineNotice(scanned)];
+    }
+    return lines.slice(-maxLines);
   } catch {
     return [];
   } finally {
