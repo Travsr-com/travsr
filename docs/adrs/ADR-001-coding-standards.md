@@ -17,7 +17,9 @@ The following standards are mandatory for every Rust crate in the workspace.
 ### Language and toolchain
 
 - **Edition:** `2021` in every `Cargo.toml`.
-- **MSRV:** `1.75`, declared via `clippy.toml` (already set) and `rust-toolchain.toml`.
+- **MSRV:** `1.88`, declared via `rust-version` in the workspace `Cargo.toml`, which is
+  the single source of truth. `rust-toolchain.toml` pins a channel (`stable`), not a
+  version, and `clippy.toml`'s `msrv` deliberately lags at `1.75`; see below.
 - **Unsafe:** Every library crate must begin with `#![forbid(unsafe_code)]`. Removing it requires an RFC and Tech Lead sign-off, as stated in `CLAUDE.md`.
 
 ### Error handling
@@ -45,7 +47,11 @@ The following standards are mandatory for every Rust crate in the workspace.
 ### Formatting and lints
 
 - Formatting is enforced by the existing `rustfmt.toml` (edition 2021, `max_width = 100`, `imports_granularity = "Crate"`, `group_imports = "StdExternalCrate"`). Do not override locally.
-- Linting is enforced by the existing `clippy.toml` (MSRV 1.75). CI runs `cargo clippy --workspace --all-targets -- -D warnings`.
+- Linting is enforced by the existing `clippy.toml`. CI runs `cargo clippy --workspace --all-targets -- -D warnings`.
+  Its `msrv` is still `1.75`, below the real `1.88`. That is the safe direction: clippy
+  withholds lints newer than the value, so it never suggests an API the MSRV forbids.
+  Raising it turns on new lints that `-D warnings` would fail the build on, so it is a
+  code change rather than a version edit and is tracked separately.
 
 ### Documentation
 
