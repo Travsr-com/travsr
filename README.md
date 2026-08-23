@@ -31,7 +31,7 @@ travsr init       # indexes every tracked file → .travsr/graph.db
 ```
 
 The shell installer supports `--version <tag>` to install a specific release
-instead of latest stable (e.g. `sh -s -- --version v1.0.0-beta.2`), `--system`
+instead of latest stable (e.g. `sh -s -- --version v1.0.0`), `--system`
 (installs to `/usr/local/bin`, e.g.
 `curl -fsSL https://travsr.com/install.sh | sh -s -- --system`, since a piped
 script can only take flags via `sh -s --`), and `TRAVSR_INSTALL_DIR` to
@@ -80,11 +80,11 @@ rather than rebuilding, so what you tested on `beta` is exactly what ships to
 channel; see [SECURITY.md](SECURITY.md) for verification steps.
 
 The channels move independently, so `beta` can be newer than `rc` in content
-while sorting below it under semver. That is the case right now:
-`v1.0.0-beta.2` is a fresh build cut after `v1.0.0-rc.1`, not a promotion of
-it, so `@rc` and `@latest` will not pick it up until the next candidate is
-promoted from it. `travsr --version` reports the tag base plus the commit it
-was built from, which is what tells two builds apart.
+while sorting below it under semver. `v1.0.0-beta.2` was a fresh build cut
+after `v1.0.0-rc.1` rather than a promotion of it, and `v1.0.0` was promoted
+from that beta rather than from rc.1, so the stable bits are the ones the beta
+channel tested. `travsr --version` reports the tag base plus the commit it was
+built from, which is what tells two builds apart.
 
 ---
 
@@ -431,7 +431,7 @@ The extension connects to your local Travsr daemon over MCP and adds:
 - **Stats panel**: index and daemon health, plus a searchable daemon log with severity filters, a per-day file picker, and optional auto-refresh
 - **Repository picker**: choose which of several open repos an action targets, shown in the status bar
 
-The extension uses your installed `travsr` binary, resolved from `travsr.binaryPath`, then `~/.travsr/bin`, then PATH, and offers to download a verified release build if none of those resolve. Set `travsr.binaryPath` in VS Code settings to pin it. The Languages panel needs the language-status fields a v1.0.0-beta.2 or later binary reports; an older one is detected and named rather than rendered as a table of gaps.
+The extension uses your installed `travsr` binary, resolved from `travsr.binaryPath`, then `~/.travsr/bin`, then PATH, and offers to download a verified release build if none of those resolve. Set `travsr.binaryPath` in VS Code settings to pin it. The Languages panel needs the language-status fields a v1.0.0 or later binary reports; an older one is detected and named rather than rendered as a table of gaps.
 
 ---
 
