@@ -382,27 +382,41 @@ function readFileTailLines(file: string, maxLines: number): string[] {
   }
   try {
     let start = size;
-    let text = "";
-    // Grow the window backwards until it holds enough lines, reaches the start
-    // of the file, or hits the per-file ceiling.
+    // Bytes, not strings. Decoding each chunk on its own would split any UTF-8
+    // sequence that straddles a chunk boundary into two replacement characters,
+    // destroying the character: a path like `travsr-café` in a log line would
+    // render as `caf??` in the panel while `travsr daemon logs` printed it
+    // correctly, which is exactly the divergence this reader exists to avoid.
+    // `append_file_tail` accumulates bytes and decodes once for the same
+    // reason, and its lossy decode is there for a torn write, not for a split
+    // we inflicted on ourselves.
+    //
+    // Counting newlines per chunk rather than rescanning the accumulated text
+    // keeps this linear. Rescanning made the scan quadratic in chunk count on
+    // the one path the byte ceiling exists to bound (a file with no newlines),
+    // which cost about a second of synchronous extension-host work at the 8 MB
+    // limit.
+    const parts: Buffer[] = [];
+    let newlines = 0;
     for (;;) {
       const next = Math.max(0, start - LOG_CHUNK_BYTES);
       const len = start - next;
       if (len <= 0) break;
       const buf = Buffer.alloc(len);
       fs.readSync(fd, buf, 0, len, next);
-      text = buf.toString("utf8") + text;
+      parts.push(buf);
+      for (let i = 0; i < len; i++) {
+        if (buf[i] === 0x0a) newlines++;
+      }
       start = next;
       if (start === 0) break;
       if (size - start >= LOG_MAX_BYTES_PER_FILE) break;
-      // +1: the newline that terminates the line *before* the first one we
-      // want, which is what tells us the first wanted line is whole.
-      let newlines = 0;
-      for (let i = 0; i < text.length; i++) {
-        if (text.charCodeAt(i) === 10) newlines++;
-      }
+      // Strictly greater: the extra newline is the one terminating the line
+      // *before* the first one we want, which is what proves it is whole.
       if (newlines > maxLines) break;
     }
+    parts.reverse();
+    let text = Buffer.concat(parts).toString("utf8");
     if (start > 0) text = text.slice(text.indexOf("\n") + 1);
     return text
       .split("\n")
@@ -438,6 +452,13 @@ function readFileTailLines(file: string, maxLines: number): string[] {
  *
  * Lines are returned oldest first, each tagged with the date of the file it
  * came from so the panel can show where one day ends and the next begins.
+ *
+ * One deliberate divergence from `backfill`: there, `lines == 0` means "the
+ * whole retained history", which is a reasonable thing to pipe to a terminal
+ * and not a reasonable thing to build a DOM out of. Here 0 reads nothing, and
+ * the panel's widest option resolves to `LOG_MAX_LINES` instead. Unreachable
+ * from the UI either way, since the smallest option is 100 and `setLogLines`
+ * clamps to at least 1.
  */
 export function readDaemonLogTail(repoRoot: string, maxLines = 500): LogEntry[] {
   const dir = path.join(repoRoot, ".travsr");

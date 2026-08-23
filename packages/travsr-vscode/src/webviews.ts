@@ -672,7 +672,15 @@ export function buildStatsHtml(
   diags: Diagnostic[] = [],
   /** How many lines the reader was asked for, so the Lines control can show the
    *  window actually loaded and know when a bigger pick needs a re-read rather
-   *  than a local filter. */
+   *  than a local filter.
+   *
+   *  This only ever moves up. Narrowing is a local hide that never tells the
+   *  extension, so picking 100 over a loaded 500 leaves the control marking 500
+   *  and the next full redraw shows 500 again. That is a symptom of something
+   *  wider rather than anything specific to Lines: `refresh()` assigns
+   *  `panel.webview.html` wholesale, so a redraw also discards the search box,
+   *  the severity chip and the UTC/JSON toggles. Fixing it means persisting
+   *  panel state across a redraw, which is its own change. */
   loadedLines: number = 500
 ): string {
   const card = (k: string, v: string): string =>
@@ -1032,7 +1040,19 @@ function filterLog() {
  *  The daemon prunes its log directory at 50 MB, which is a fine amount to
  *  stream to a terminal and far too much to turn into DOM nodes. The Lines
  *  control's "All" resolves to this and names it, so the ceiling is stated
- *  rather than discovered when the webview stops responding. */
+ *  rather than discovered when the webview stops responding.
+ *
+ *  What the ceiling actually bounds is the HTML, not the read. Measured on a
+ *  three-file fixture of realistic daemon lines:
+ *
+ *      n=500   read  5ms   html  9ms   0.89 MB
+ *      n=2000  read 14ms   html 29ms   3.49 MB
+ *      n=5000  read 29ms   html 51ms   8.69 MB
+ *
+ *  So the reader is never the expensive half; 5000 costs ~8.7 MB of HTML, and
+ *  `refresh()` assigns `panel.webview.html` wholesale, so every redraw
+ *  reserializes and reparses all of it. Raising this number is a decision about
+ *  that figure, not about read time. */
 export const LOG_MAX_LINES = 5000;
 
 /** A per-language node count from the graph. */

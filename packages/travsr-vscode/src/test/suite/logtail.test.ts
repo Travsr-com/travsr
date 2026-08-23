@@ -173,6 +173,80 @@ suite("#log-rotation: readDaemonLogTail spans rotated files", () => {
     }
   });
 
+  test("a multi-byte character straddling a chunk boundary survives intact", () => {
+    // The scan reads backwards in 64 KB chunks. Decoding each chunk separately
+    // splits any UTF-8 sequence that crosses a boundary into two replacement
+    // characters and the character is gone, while `travsr daemon logs` prints
+    // it correctly. Bytes are accumulated and decoded once to prevent that.
+    //
+    // Built to straddle deliberately rather than hoping: the accented byte pair
+    // is placed so it spans the `size - 65536` boundary exactly.
+    const root = tempRepo();
+    const file = path.join(root, ".travsr", "daemon.log.2026-08-12");
+    const CHUNK = 64 * 1024;
+
+    /** A valid daemon JSON line of exactly `n` bytes, including its newline. */
+    const lineOfBytes = (n: number, ts: string): string => {
+      const base = Buffer.byteLength(
+        JSON.stringify({
+          timestamp: ts,
+          level: "INFO",
+          target: "daemon",
+          fields: { message: "" },
+        }) + "\n",
+        "utf8"
+      );
+      return (
+        JSON.stringify({
+          timestamp: ts,
+          level: "INFO",
+          target: "daemon",
+          fields: { message: "p".repeat(Math.max(n - base, 0)) },
+        }) + "\n"
+      );
+    };
+
+    const marker = "travsr-café/src/lib.rs";
+    const markerLine =
+      JSON.stringify({
+        timestamp: "2026-08-12T00:00:01Z",
+        level: "INFO",
+        target: "daemon",
+        fields: { message: marker },
+      }) + "\n";
+    // Byte offset of the first of the two bytes of `é` within the line.
+    const eAt = Buffer.byteLength(markerLine.slice(0, markerLine.indexOf("é")), "utf8");
+
+    // The first chunk read is [size - CHUNK, size), so the boundary is
+    // `size - CHUNK`. For it to fall between the two bytes of `é` we need
+    //     size - CHUNK == eStart + 1
+    // and since the marker sits at the front, eStart is just eAt. Solve for the
+    // total size and pad the tail to exactly that.
+    const head = "";
+    const eStart = Buffer.byteLength(head, "utf8") + eAt;
+    const wantSize = eStart + 1 + CHUNK;
+    const written = Buffer.byteLength(head + markerLine, "utf8");
+    const tail = lineOfBytes(wantSize - written, "2026-08-12T00:00:02Z");
+    fs.writeFileSync(file, head + markerLine + tail, "utf8");
+
+    const size = fs.statSync(file).size;
+    const boundary = size - CHUNK;
+    const bytes = fs.readFileSync(file);
+    assert.strictEqual(
+      boundary,
+      eStart + 1,
+      `fixture must straddle: e at ${eStart}..${eStart + 1}, boundary ${boundary}`
+    );
+    assert.strictEqual(bytes[eStart], 0xc3, "first byte of the two-byte sequence");
+    assert.strictEqual(bytes[eStart + 1], 0xa9, "second byte, on the far side of the boundary");
+
+    const got = readDaemonLogTail(root, 45);
+    const hit = got.find((e) => e.message.includes("travsr-caf"));
+    assert.ok(hit, "the line spanning the boundary must be returned");
+    assert.strictEqual(hit.message, marker, "the accented character must survive intact");
+    assert.ok(!hit.message.includes("�"), "no replacement characters");
+  });
+
   test("missing, empty, and non-file cases return nothing rather than throwing", () => {
     assert.deepStrictEqual(readDaemonLogTail(path.join(os.tmpdir(), "no-such-repo-xyz")), []);
 
