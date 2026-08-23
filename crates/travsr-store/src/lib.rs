@@ -743,6 +743,72 @@ fn backfill_counts(node_count: i64, map_count: i64) -> (i64, i64) {
     )
 }
 
+/// #509: what makes a file at a path *that* file, rather than merely a file
+/// with that name. Compared for equality only; the members have no meaning
+/// beyond "these two stats came from the same file or they did not". One shape
+/// for both platforms so the rest of the code needs no `cfg`: unix fills two
+/// members and leaves the third zero, windows fills all three.
+type FileIdentity = (u64, u64, u64);
+
+/// Identity of the file currently at `path`, or `None` when it cannot be
+/// stat-ed (absent, or unreadable), which callers treat the same as gone.
+///
+/// The repository has no portable file-identity helper to reuse: the only
+/// prior stat-based identity work is `travsr-ipc`'s `owner_uid`, which is
+/// `#[cfg(unix)]` with no Windows counterpart. So this is gated per platform.
+///
+/// unix: `(st_dev, st_ino)` is the kernel's own identity for a file and is
+/// exact here. A file that is unlinked while a descriptor is still open on it
+/// keeps its inode allocated until the last descriptor closes, so as long as
+/// [`SqliteStore::embed_meta_conn`] holds the old embed.db open, its inode
+/// number cannot be handed to the replacement. Different file, different
+/// identity, always.
+///
+/// windows: `std::os::windows::fs::MetadataExt::file_index`, the direct
+/// analogue named in #509, is still unstable behind `windows_by_handle`
+/// (rust-lang/rust#63010) and cannot be called on stable Rust. This uses the
+/// stable triple `(creation_time, last_write_time, file_size)` instead. That
+/// is a strong heuristic rather than an identity: NTFS tunneling can carry a
+/// deleted file's creation time onto a same-named replacement created within
+/// ~15 s, so in that window the other two members carry the comparison. It
+/// errs toward *extra* reopens (any write moves `last_write_time`), never
+/// toward keeping a dead handle, which is the safe direction: a spurious
+/// reopen costs one cache miss, a missed one serves stale answers forever.
+/// Note too that SQLite opens database files on Windows without
+/// `FILE_SHARE_DELETE`, so unlinking embed.db out from under a live connection
+/// fails there outright; this branch covers the rename-over case and the case
+/// where the connection was already dropped and reopened.
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    let md = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some((md.dev(), md.ino(), 0))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        Some((md.creation_time(), md.last_write_time(), md.file_size()))
+    }
+}
+
+/// #509: fold a file identity and a `PRAGMA data_version` reading into the one
+/// opaque `u64` that [`SqliteStore::embed_data_version`] hands back.
+///
+/// Hashing rather than, say, packing the two into halves of the `u64`, because
+/// neither input has a bounded range to pack into. The consumer is the daemon's
+/// query cache, which only ever compares this for equality (`CacheKey` derives
+/// `PartialEq`/`Hash` and nothing orders it), so an unordered token is all the
+/// contract needs. Determinism is only required within a single process: the
+/// cache is in memory and does not outlive the daemon.
+fn embed_version_token(identity: FileIdentity, version: u64) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    identity.hash(&mut h);
+    version.hash(&mut h);
+    h.finish()
+}
+
 /// SQLite-backed store. The MVP target — zero setup, single file on disk.
 pub struct SqliteStore {
     conn: Connection,
@@ -778,7 +844,13 @@ pub struct SqliteStore {
     /// SAME connection — a fresh connection per call would never observe a
     /// change. `RefCell` keeps the lazy open behind `&self`; the store is not
     /// `Sync` anyway (callers wrap it in a `Mutex`).
-    embed_meta_conn: std::cell::RefCell<Option<Connection>>,
+    ///
+    /// #509: the [`FileIdentity`] the connection was opened against is stored
+    /// alongside it, in the same slot so the two can never drift apart. A
+    /// connection outlives the file it was opened on when embed.db is unlinked,
+    /// so the identity is the only way to notice that the path has come to name
+    /// a different file.
+    embed_meta_conn: std::cell::RefCell<Option<(Connection, FileIdentity)>>,
     /// #376 Phase 2: optional doc-space semantic hook, injected beside
     /// `embed_knn_hook` by the same injector. Same shape as `EmbedKnnHook`
     /// (reused, not a distinct type — both are `Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError>`)
@@ -1318,16 +1390,48 @@ impl SqliteStore {
     /// The pragma is read on a persistent, lazily-opened read-only connection:
     /// `data_version` only moves relative to prior reads on the SAME
     /// connection. If embed.db disappears after the connection was opened, the
-    /// connection is dropped and `Ok(None)` is returned, so a later re-created
-    /// embed.db is picked up with a fresh connection.
+    /// connection is dropped and `Ok(None)` is returned.
+    ///
+    /// # What the returned number is (#509)
+    ///
+    /// It is a freshness token, not the raw pragma. Callers must compare it for
+    /// equality only: it carries no ordering, and a larger value does not mean
+    /// newer. The token mixes the pragma with the [`file_identity`] of the file
+    /// the connection is open on, because the pragma alone cannot see a
+    /// delete-and-recreate at the same path, in two separate ways:
+    ///
+    /// 1. The old code kept the cached connection whenever `path.exists()` was
+    ///    true. Deleting embed.db and letting the sidecar rebuild it (a natural
+    ///    user recovery from a bad embedding state) leaves the path present at
+    ///    every poll, so the connection stayed pinned to the unlinked inode and
+    ///    its `data_version` was frozen for the daemon's lifetime. Identity, not
+    ///    existence, is what decides whether to reopen.
+    /// 2. Reopening alone is still not enough. `data_version` counts writes
+    ///    observed by one connection, so a fresh connection to the rebuilt file
+    ///    begins its own count from a low value rather than continuing the old
+    ///    one, and the two readings routinely collide: the regression test's
+    ///    swap reads 2 on both sides. Mixing the identity in makes the token
+    ///    move across the swap even when both pragmas read the same.
+    ///
+    /// So the token changes when embed.db's contents change *or* when the path
+    /// comes to name a different file, which is exactly the condition under
+    /// which a cached `ask` answer stops being valid.
     pub fn embed_data_version(&self) -> Result<Option<u64>, StoreError> {
         let Some(path) = self.embed_db_path.as_deref() else {
             return Ok(None); // in-memory store — no embed sidecar
         };
         let mut slot = self.embed_meta_conn.borrow_mut();
-        if !path.exists() {
+        let Some(identity) = file_identity(path) else {
             *slot = None;
             return Ok(None);
+        };
+        // #509: the path resolving to a different file than the one the cached
+        // connection was opened on means that connection is reading a corpse.
+        if slot
+            .as_ref()
+            .is_some_and(|(_, opened_on)| *opened_on != identity)
+        {
+            *slot = None;
         }
         if slot.is_none() {
             let conn = Connection::open_with_flags(
@@ -1337,14 +1441,16 @@ impl SqliteStore {
             )
             .with_context(|| format!("opening embed.db read-only at {}", path.display()))
             .map_err(|e| StoreError::Database(e.to_string()))?;
-            *slot = Some(conn);
+            *slot = Some((conn, identity));
         }
-        slot.as_ref()
+        let version = slot
+            .as_ref()
             .expect("embed_meta_conn initialized above")
+            .0
             .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
             .context("querying embed.db data_version")
-            .map(|v| Some(v as u64))
-            .map_err(|e| StoreError::Database(e.to_string()))
+            .map_err(|e| StoreError::Database(e.to_string()))? as u64;
+        Ok(Some(embed_version_token(identity, version)))
     }
 
     /// Return the live journal mode reported by SQLite. Useful in tests.
@@ -7872,6 +7978,80 @@ mod tests {
             Some(v2),
             "stable when unchanged"
         );
+    }
+
+    /// #509: embed.db deleted and recreated at the same path between two polls
+    /// is a *different file*, and the cached read-only connection is left
+    /// reading the unlinked inode with a permanently frozen `data_version`.
+    /// `path.exists()` is true on both sides of the swap, so existence cannot
+    /// see it. The reported version must move, or every `ask` answer cached
+    /// before the swap keeps hitting until the daemon restarts.
+    #[test]
+    fn embed_data_version_detects_delete_and_recreate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(&tmp.path().join("graph.db")).unwrap();
+        let embed_db = tmp.path().join("embed.db");
+
+        // The sidecar creates embed.db; reading it pins the store's persistent
+        // read-only connection to that file.
+        write_embed_db(&embed_db, 1);
+        let before = store
+            .embed_data_version()
+            .unwrap()
+            .expect("embed.db exists");
+
+        // The user deletes .travsr/embed.db to force a rebuild and the sidecar
+        // recreates it, both between two polls. WAL sidecars are deleted too,
+        // which is what a real `rm .travsr/embed.db*` does.
+        for sidecar in ["", "-wal", "-shm"] {
+            let p = tmp.path().join(format!("embed.db{sidecar}"));
+            if p.exists() {
+                std::fs::remove_file(&p).unwrap();
+            }
+        }
+        write_embed_db(&embed_db, 2);
+        assert!(
+            embed_db.exists(),
+            "the path is present on both sides of the swap, which is why \
+             exists() cannot detect it"
+        );
+
+        let after = store
+            .embed_data_version()
+            .unwrap()
+            .expect("recreated embed.db");
+        assert_ne!(
+            before, after,
+            "delete-and-recreate must move the embed version, otherwise warm \
+             ask entries keep hitting against a rebuilt embed.db"
+        );
+
+        // And the reopened connection is live, not another corpse: a further
+        // out-of-band write to the new file is still observed.
+        let writer = Connection::open(&embed_db).unwrap();
+        writer
+            .execute("INSERT INTO node_embeddings VALUES (99)", [])
+            .unwrap();
+        assert_ne!(
+            after,
+            store.embed_data_version().unwrap().unwrap(),
+            "the reopened connection must track writes to the new file"
+        );
+    }
+
+    /// Create (or recreate) an embed.db at `path` holding a single row, the way
+    /// the embed sidecar would. Used by the #509 regression test.
+    fn write_embed_db(path: &Path, row: i64) {
+        let writer = Connection::open(path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE node_embeddings (node_id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        writer
+            .execute("INSERT INTO node_embeddings VALUES (?1)", [row])
+            .unwrap();
     }
 
     #[test]
