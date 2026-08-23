@@ -39,7 +39,7 @@ pub use embed_catalog::{
 pub use embed_sidecar::{EmbedCapabilities, EmbedError, EmbedSidecar};
 pub use embed_supervisor::{EmbedQueryHook, EmbedSupervisor};
 pub use governance::{Capacity, EmbedGovernance, EmbedOverrides, Priority};
-pub use indexer::{PhaseBInputs, PhaseBOutcome, PluginIndexer};
+pub use indexer::{PhaseBInputs, PhaseBLiveness, PhaseBOutcome, PluginIndexer};
 pub use phase_b::{
     lookup as lookup_phase_b, OutputFormat, PhaseBEntry, SandboxRequirement,
     CATALOG as PHASE_B_CATALOG,

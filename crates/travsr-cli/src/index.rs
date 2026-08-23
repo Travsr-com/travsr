@@ -55,6 +55,7 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
         // P6 (#329): forward the already-collected file list so Phase B runners
         // skip their own directory walks.
         indexable_paths: &files,
+        liveness: None,
     };
     // E3 W3b note: `_phase_b_positional` (rust-analyzer LSIF positional refs) is
     // resolved only in the daemon path, which has a persistent store to resolve

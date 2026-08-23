@@ -140,6 +140,119 @@ pub struct PhaseBInputs<'a> {
     /// Partitioned by language extension inside `invoke_phase_b_all` and
     /// forwarded via `InvokeRequest.files` (P6 — #329).
     pub indexable_paths: &'a [PathBuf],
+    /// Live view of the per-language fan-out, for callers that render progress
+    /// (#755 item 3). `None` when nobody is watching (background daemon runs,
+    /// tests). The fan-out marks each language as it starts and finishes;
+    /// `invoke_phase_b_all` blocks its caller for up to the full per-language
+    /// invoke window, so without this handle a JVM analyzer's multi-minute cold
+    /// start is indistinguishable from a hang.
+    pub liveness: Option<&'a PhaseBLiveness>,
+}
+
+/// Which languages Phase B is running right now, and for how long.
+///
+/// Written by `invoke_phase_b_all`'s fan-out threads, read by a caller-side
+/// heartbeat (the `travsr init` progress line) while the invocation blocks.
+/// A language appears when its work item starts and disappears when its thread
+/// finishes — including the crash/timeout paths, which return through the same
+/// tail. Snapshotting is cheap (a mutex over a small map), and the map is empty
+/// again by the time `invoke_phase_b_all` returns.
+#[derive(Default)]
+pub struct PhaseBLiveness {
+    inner: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, bool)>>,
+}
+
+/// One language currently inside the Phase B fan-out.
+#[derive(Debug, Clone)]
+pub struct RunningLang {
+    pub lang: String,
+    pub elapsed: std::time::Duration,
+    /// Whether this language runs as a sandboxed sidecar subprocess, and so is
+    /// bounded by the transport's handshake plus invoke watchdogs.
+    ///
+    /// The builtin languages (rust, typescript, javascript, python, dart) are
+    /// called in-process by `phase_b_native_*` and have **no** per-language
+    /// timeout at all, so a surface that quotes a ceiling must not quote one for
+    /// them. Recorded here rather than re-derived by the consumer because the
+    /// dispatch decision is made in this file and nowhere else.
+    pub sidecar: bool,
+}
+
+/// Marks a language as running for as long as this value lives.
+///
+/// A drop guard rather than a matching `finish` call, because the fan-out's work
+/// items can leave by unwinding: a panicking analyzer thread jumps straight past
+/// the end of its closure, `join()` returns `Err`, and the collector demotes it
+/// to `crashed` — but an explicit `finish` at the tail never runs, so the
+/// language stays in the map and the heartbeat renders a dead analyzer with a
+/// climbing elapsed. That is the exact opposite of what a surface for telling
+/// "slow" apart from "hung" should say.
+///
+/// `finish` is idempotent and tolerates an unknown language, so this cannot
+/// double-remove or resurrect anything.
+pub struct LivenessMark<'a> {
+    liveness: Option<&'a PhaseBLiveness>,
+    lang: String,
+}
+
+impl<'a> LivenessMark<'a> {
+    /// Mark `lang` running. `liveness` is `None` when nobody is watching, which
+    /// makes this a no-op and keeps the call site free of conditionals.
+    pub fn new(liveness: Option<&'a PhaseBLiveness>, lang: &str, sidecar: bool) -> Self {
+        if let Some(lv) = liveness {
+            lv.start(lang, sidecar);
+        }
+        Self {
+            liveness,
+            lang: lang.to_string(),
+        }
+    }
+}
+
+impl Drop for LivenessMark<'_> {
+    fn drop(&mut self) {
+        if let Some(lv) = self.liveness {
+            lv.finish(&self.lang);
+        }
+    }
+}
+
+impl PhaseBLiveness {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn start(&self, lang: &str, sidecar: bool) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(lang.to_string(), (std::time::Instant::now(), sidecar));
+    }
+
+    fn finish(&self, lang: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(lang);
+    }
+
+    /// The languages still running, each with its elapsed wall time, sorted by
+    /// name so the rendered line is stable between polls.
+    pub fn running(&self) -> Vec<RunningLang> {
+        let mut out: Vec<RunningLang> = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(lang, (started, sidecar))| RunningLang {
+                lang: lang.clone(),
+                elapsed: started.elapsed(),
+                sidecar: *sidecar,
+            })
+            .collect();
+        out.sort_by(|a, b| a.lang.cmp(&b.lang));
+        out
+    }
 }
 
 /// Drop-in replacement for travsr_indexer::Indexer.
@@ -603,13 +716,27 @@ impl PluginIndexer {
         // `thread::scope` guarantees all threads finish before the scope exits —
         // no `'static` bounds required, no Arc/clone of `repo_root`.
         let corpus: &str = &self.corpus;
+        // #755 item 3: `Option<&PhaseBLiveness>` is `Copy`, so each spawned
+        // closure gets its own copy without borrowing `inputs` into the scope.
+        let liveness = inputs.liveness;
         let mut lang_results: Vec<LangResult> = std::thread::scope(|s| {
             let handles: Vec<_> = work_items
                 .into_iter()
                 .map(|item| {
                     s.spawn(move || {
                         let lang = item.lang;
-                        match item.work {
+                        // #755 item 3: bracket the whole work item, including an
+                        // unwind. A drop guard rather than a matching `finish`
+                        // at the tail, because a panicking analyzer never
+                        // reaches the tail; see `LivenessMark`.
+                        //
+                        // Only the sidecar arm is watchdogged; the native arms
+                        // call `phase_b_native_*` in-process with no ceiling, and
+                        // a surface that quotes one for them states a limit that
+                        // does not exist.
+                        let is_sidecar = matches!(item.work, LangWork::Sidecar(_));
+                        let _mark = LivenessMark::new(liveness, &lang, is_sidecar);
+                        let result = match item.work {
                             LangWork::Dart => {
                                 match travsr_indexer::phase_b_native_dart(corpus, repo_root) {
                                     Ok((nodes, edges, refs)) => {
@@ -1043,7 +1170,10 @@ impl PluginIndexer {
                                     }
                                 }
                             }
-                        }
+                        };
+                        // No explicit `finish` here: `_mark` runs it on the way
+                        // out of this closure, on both the return and the unwind.
+                        result
                     })
                 })
                 .collect();
@@ -1328,6 +1458,7 @@ mod tests {
             // Single dummy language that no file extension maps to — gates out everything.
             present_languages: ["__no_such_lang__".to_string()].into_iter().collect(),
             indexable_paths: &[],
+            liveness: None,
         };
         let (nodes, edges, refs, unresolved, positional, outcome) =
             indexer.invoke_phase_b_all(&inputs);
@@ -1438,6 +1569,7 @@ mod tests {
             repo_root: std::path::Path::new("/nonexistent"),
             present_languages: HashSet::new(), // no gating
             indexable_paths: &[],
+            liveness: None,
         };
         let (_, _, _, _, _, outcome1) = indexer.invoke_phase_b_all(&inputs);
         let (_, _, _, _, _, outcome2) = indexer.invoke_phase_b_all(&inputs);
@@ -1448,6 +1580,137 @@ mod tests {
         assert_eq!(
             outcome1.skipped_unregistered, outcome2.skipped_unregistered,
             "skipped_unregistered must be deterministic across runs"
+        );
+    }
+}
+
+/// #755 item 3: the liveness view the `travsr init` heartbeat polls while
+/// `invoke_phase_b_all` blocks its caller.
+#[cfg(test)]
+mod issue_755_liveness_tests {
+    use super::*;
+
+    /// A language is visible from `start` until `finish`, with a monotonically
+    /// growing elapsed — the exact contract the heartbeat renders from.
+    #[test]
+    fn running_reflects_start_and_finish() {
+        let lv = PhaseBLiveness::new();
+        assert!(lv.running().is_empty(), "nothing has started yet");
+        lv.start("kotlin", true);
+        lv.start("scala", true);
+        let snap = lv.running();
+        assert_eq!(
+            snap.iter().map(|r| r.lang.as_str()).collect::<Vec<_>>(),
+            vec!["kotlin", "scala"],
+            "name-sorted so the rendered line is stable between polls"
+        );
+        lv.finish("kotlin");
+        let snap = lv.running();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].lang, "scala");
+        lv.finish("scala");
+        assert!(
+            lv.running().is_empty(),
+            "a finished fan-out leaves nothing behind"
+        );
+    }
+
+    /// Elapsed must not reset between polls — a heartbeat that re-zeroes would
+    /// hide exactly the long cold start it exists to show.
+    #[test]
+    fn elapsed_grows_between_polls() {
+        let lv = PhaseBLiveness::new();
+        lv.start("kotlin", true);
+        let first = lv.running()[0].elapsed;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = lv.running()[0].elapsed;
+        assert!(
+            second >= first,
+            "elapsed must be monotonic: {first:?} -> {second:?}"
+        );
+        assert!(
+            second >= std::time::Duration::from_millis(15),
+            "elapsed tracks wall time; got {second:?}"
+        );
+    }
+
+    /// Finishing a language that never started (or twice) is harmless — the
+    /// fan-out's crash arms all return through the same finish call, and a
+    /// paranoid double-finish must not panic the init. The drop guard relies on
+    /// this: it can fire after an explicit finish on some paths.
+    #[test]
+    fn finish_is_idempotent_and_tolerates_unknown() {
+        let lv = PhaseBLiveness::new();
+        lv.finish("nolang");
+        lv.start("go", false);
+        lv.finish("go");
+        lv.finish("go");
+        assert!(lv.running().is_empty());
+    }
+
+    /// Whether a language is bounded by a timeout is recorded at dispatch, not
+    /// re-derived by whoever renders it. Sidecar languages are watchdogged by
+    /// the transport; the builtins run in-process with no ceiling, and a surface
+    /// that quotes one for them tells the user a limit that does not exist.
+    #[test]
+    fn liveness_records_whether_a_language_is_bounded() {
+        let lv = PhaseBLiveness::new();
+        lv.start("kotlin", true);
+        lv.start("typescript", false);
+        let snap = lv.running();
+        assert_eq!(
+            snap.iter()
+                .map(|r| (r.lang.as_str(), r.sidecar))
+                .collect::<Vec<_>>(),
+            vec![("kotlin", true), ("typescript", false)]
+        );
+    }
+
+    /// A panicking work item unwinds straight past the end of the closure, so an
+    /// explicit `finish` at the tail never runs and the language stays in the map
+    /// for good. The heartbeat would then show a dead analyzer with a climbing
+    /// elapsed, which is precisely the wrong answer from a surface built to tell
+    /// "slow" apart from "hung". The drop guard is what covers the unwind.
+    #[test]
+    fn a_panicking_work_item_does_not_leak_into_the_heartbeat() {
+        let lv = PhaseBLiveness::new();
+        let joined_err = std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                // The same guard the fan-out uses, not a copy of it: neutering
+                // the production one has to fail this test, or it pins nothing.
+                let _mark = LivenessMark::new(Some(&lv), "kotlin", true);
+                assert!(!lv.running().is_empty(), "running while the item is alive");
+                panic!("analyzer thread blew up");
+            });
+            h.join().is_err()
+        });
+        assert!(joined_err, "the item must actually have panicked");
+        assert!(
+            lv.running().is_empty(),
+            "a panicked language must not keep ticking in the heartbeat"
+        );
+    }
+
+    /// End-to-end through the fan-out: a liveness handle attached to a real
+    /// `invoke_phase_b_all` run is empty again when the call returns, whatever
+    /// the languages did — the heartbeat must never report a language as still
+    /// running after init moved on.
+    #[test]
+    fn liveness_is_drained_when_invoke_returns() {
+        let indexer = PluginIndexer::new("liveness-test-corpus");
+        let lv = PhaseBLiveness::new();
+        let inputs = PhaseBInputs {
+            repo_root: std::path::Path::new("/nonexistent"),
+            // Gate out every language: the fan-out spawns nothing, and the
+            // invariant "empty on return" must hold on that path too.
+            present_languages: ["__no_such_lang__".to_string()].into_iter().collect(),
+            indexable_paths: &[],
+            liveness: Some(&lv),
+        };
+        let _ = indexer.invoke_phase_b_all(&inputs);
+        assert!(
+            lv.running().is_empty(),
+            "invoke_phase_b_all returned with languages still marked running"
         );
     }
 }

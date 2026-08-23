@@ -310,6 +310,7 @@ fn run_phase_b_with_provider(
         repo_root: repo.path(),
         present_languages: ["go".to_string()].into_iter().collect(),
         indexable_paths: &[],
+        liveness: None,
     };
     let (.., outcome) = indexer.invoke_phase_b_all(&inputs);
 

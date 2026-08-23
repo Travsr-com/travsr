@@ -112,7 +112,108 @@ test('dump contains item/references edges for method overrides (Overrides)', () 
   );
 });
 
+// ── issue #755 item 1: travsr_vname must agree with tree-sitter ──────────────
+//
+// The Rust ingester builds ref/call edges to the NodeId hashed from these
+// vnames, and tree-sitter owns the nodes. Any signature computed differently
+// from tree-sitter's classification is an edge to a node that was never
+// written — an orphan a fresh `travsr init --semantic` fails fsck on.
+
+test('a top-level arrow const gets fn:, matching tree-sitter (issue #755)', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  const sigs = travsrSignatures(result.stdout, 'arrow-helpers.ts');
+  assert.ok(sigs.includes('fn:shout'), `expected fn:shout in ${JSON.stringify(sigs)}`);
+  assert.ok(
+    !sigs.includes('var:shout'),
+    'var:shout is the orphan-producing vname tree-sitter never indexes'
+  );
+});
+
+test('a top-level function-expression const gets fn: (issue #755)', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  const sigs = travsrSignatures(result.stdout, 'arrow-helpers.ts');
+  assert.ok(sigs.includes('fn:legacyShout'), `expected fn:legacyShout in ${JSON.stringify(sigs)}`);
+  assert.ok(!sigs.includes('var:legacyShout'));
+});
+
+test('a top-level plain const keeps var: (issue #755)', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  const sigs = travsrSignatures(result.stdout, 'arrow-helpers.ts');
+  assert.ok(sigs.includes('var:MAX_VOLUME'), `expected var:MAX_VOLUME in ${JSON.stringify(sigs)}`);
+  assert.ok(
+    !sigs.includes('fn:MAX_VOLUME'),
+    'a non-function const must stay a variable, or a real var: reference orphans instead'
+  );
+});
+
+test('a top-level generator expression stays var: (issue #755)', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  // `function*` is a FunctionExpression in the TS AST but a distinct
+  // `generator_function` kind in the tree-sitter grammar, so tree-sitter writes
+  // `var:`. Calling it `fn:` here would name a node that was never written.
+  const sigs = travsrSignatures(result.stdout, 'arrow-helpers.ts');
+  assert.ok(sigs.includes('var:genShout'), `expected var:genShout in ${JSON.stringify(sigs)}`);
+  assert.ok(
+    !sigs.includes('fn:genShout'),
+    'a generator is not an arrow or a plain function expression to tree-sitter'
+  );
+});
+
+test('an ambient declare const gets no travsr_vname at all (issue #755)', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  // `declare const` is wrapped in `ambient_declaration`, so no `@topvar`
+  // pattern matches and tree-sitter writes no node. Any vname for it orphans
+  // every reference, exactly like a local.
+  const sigs = travsrSignatures(result.stdout, 'arrow-helpers.ts');
+  for (const sig of sigs) {
+    assert.ok(
+      !sig.endsWith(':AMBIENT_LIMIT'),
+      `an ambient declaration must carry no vname; got ${sig}`
+    );
+  }
+});
+
+test('a local variable gets no travsr_vname at all (issue #755)', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  // Tree-sitter drops non-top-level declarators entirely (typescript.rs N4a),
+  // so any vname for a local guarantees an orphan for every reference to it.
+  // The resultSet must be emitted without a vname — opaque, not misnamed.
+  const sigs = travsrSignatures(result.stdout, 'arrow-helpers.ts');
+  for (const sig of sigs) {
+    assert.ok(
+      !sig.endsWith(':localEcho'),
+      `local declarator must carry no vname; got ${sig}`
+    );
+  }
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/** All travsr_vname signatures in the dump whose path ends with `fileSuffix`. */
+function travsrSignatures(stdout: string, fileSuffix: string): string[] {
+  return parseVertices(stdout)
+    .map((v) => v['travsr_vname'] as { path?: string; signature?: string } | undefined)
+    .filter(
+      (vn): vn is { path: string; signature: string } =>
+        vn !== undefined &&
+        typeof vn.path === 'string' &&
+        typeof vn.signature === 'string' &&
+        vn.path.endsWith(fileSuffix)
+    )
+    .map((vn) => vn.signature);
+}
 
 function parseAll(stdout: string): Record<string, unknown>[] {
   return stdout
