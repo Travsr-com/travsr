@@ -23,7 +23,8 @@
 //!
 //! ```text
 //! daemon.session.start     daemon.ready          daemon.socket.bound
-//! daemon.session.stop      head.drift.detected   tree.reconcile.pruned
+//! daemon.session.stop      daemon.log_pruned
+//! head.drift.detected      tree.reconcile.pruned
 //! head.reconcile.complete  phase_b.start         phase_b.indexed
 //! phase_b.complete         kcore.updated         embed.text.updated
 //! embed.text.fts_backfill  store.fts_words.backfill
@@ -55,6 +56,10 @@
 //! under someone's typing, which is how the rule above — worth adding where
 //! something happened that a reader would count or chart, not to the running
 //! commentary in between — reads when applied to an external producer.
+//!
+//! `daemon.log_pruned` reports a rotation sweep that actually dropped files, so
+//! a log directory that shrank says why it shrank. Silent when nothing went,
+//! which is every tick except the first one after a day roll.
 //!
 //! The keys keep the codebase's own vocabulary (`phase_b`, `lsif`, `kcore`)
 //! because they are identifiers, matched exactly by whatever reads them, and a
@@ -244,6 +249,39 @@ pub fn prune(dir: &Path, budget: u64, max_files: usize) -> usize {
         }
     }
     removed
+}
+
+/// Prune when the log has rotated since the last check.
+///
+/// `prune` at daemon start is not enough on its own. `rolling::daily` opens a
+/// new file a day and deletes nothing, so for as long as the daemon stays up
+/// neither `MAX_LOG_FILES` nor `LOG_BUDGET_BYTES` is applied: a month of uptime
+/// is a month of files, and the startup sweep the caps depend on never gets a
+/// turn. Rotation is the moment there is something to sweep, so the daemon's
+/// tick looks for it here.
+///
+/// `last` carries the newest file seen on the previous call and is updated in
+/// place. Seeding it from `current_log_file` after the startup prune makes the
+/// first tick a no-op instead of a redundant second sweep. A directory with no
+/// log file yet is left alone rather than counted as a rotation.
+///
+/// Cheap enough to run inline on the tick: the common case is one `read_dir`
+/// that finds the same newest name and returns, and a real rotation adds at
+/// most `MAX_LOG_FILES` `metadata` calls on top.
+///
+/// Returns the number of files removed.
+pub fn prune_if_rotated(
+    dir: &Path,
+    last: &mut Option<PathBuf>,
+    budget: u64,
+    max_files: usize,
+) -> usize {
+    let current = current_log_file(dir);
+    if current.is_none() || current == *last {
+        return 0;
+    }
+    *last = current;
+    prune(dir, budget, max_files)
 }
 
 /// A rotation-aware reader over the daemon log.
@@ -632,5 +670,47 @@ mod tests {
         write(d.path(), "daemon.log.2026-08-12", &"x".repeat(10_000));
         assert_eq!(prune(d.path(), 10, 1), 0);
         assert_eq!(log_files(d.path()).len(), 1);
+    }
+
+    #[test]
+    fn prune_runs_again_when_the_day_rolls_under_a_running_daemon() {
+        // The gap: prune ran at start and nowhere else, so a daemon left up for
+        // a month held a month of files and neither cap had been applied since
+        // boot. Rotation is what makes them enforceable again.
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "daemon.log.2026-08-10", "a
+");
+        write(d.path(), "daemon.log.2026-08-11", "b
+");
+        let mut last = current_log_file(d.path());
+
+        // Nothing rotated: no sweep, nothing removed, even though a cap of 1
+        // would otherwise take a file.
+        assert_eq!(prune_if_rotated(d.path(), &mut last, LOG_BUDGET_BYTES, 1), 0);
+        assert_eq!(log_files(d.path()).len(), 2);
+
+        // The day rolls. The cap applies now, so the oldest goes.
+        write(d.path(), "daemon.log.2026-08-12", "c
+");
+        assert_eq!(prune_if_rotated(d.path(), &mut last, LOG_BUDGET_BYTES, 2), 1);
+        let left: Vec<String> = log_files(d.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["daemon.log.2026-08-11", "daemon.log.2026-08-12"]);
+
+        // Same newest file on the next tick: no second sweep.
+        assert_eq!(prune_if_rotated(d.path(), &mut last, LOG_BUDGET_BYTES, 2), 0);
+        assert_eq!(log_files(d.path()).len(), 2);
+    }
+
+    #[test]
+    fn prune_if_rotated_leaves_a_directory_with_no_log_alone() {
+        // No log file yet means the daemon has not written one, not that a
+        // rotation happened. Counting it as one would sweep on every tick.
+        let d = tempfile::tempdir().unwrap();
+        let mut last = None;
+        assert_eq!(prune_if_rotated(d.path(), &mut last, LOG_BUDGET_BYTES, 7), 0);
+        assert!(last.is_none());
     }
 }
