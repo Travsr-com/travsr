@@ -229,6 +229,14 @@ function extractObjectValues(text, absPath, objectName) {
     // carries its own "(", which left the rendered message visibly unbalanced
     // on the very case this check exists to explain.
     const where = atLine ? `line ${atLine}, which reads \`${atText}\`` : "the end of the file";
+    // The reason the scan stopped differs per shape, so it travels with the
+    // shape rather than being appended to every one of them. The end of a file
+    // has no indentation, so the indentation clause cannot describe it
+    // (#769 review).
+    const whyStopped = atLine
+      ? `${where}, which is back at the declaration's own indentation and so ` +
+        `cannot be part of the literal`
+      : `${where}, with no closing brace anywhere below the declaration`;
     const site = `${objectName} in ${rel(absPath)} (declared on line ${startIdx + 1})`;
     throw new Error(
       reason === "unopened"
@@ -239,8 +247,7 @@ function extractObjectValues(text, absPath, objectName) {
               `${where}, which does not end a const declaration. Expected a line ` +
               `of the form "};". Fix ${rel(absPath)}; the other target maps are not at fault.`
           : `the closing brace of ${site} is missing: the object literal is still ` +
-              `open at ${where}, which is back at the declaration's own indentation ` +
-              `and so cannot be part of the literal. Restore the "};" that closes ` +
+              `open at ${whyStopped}. Restore the "};" that closes ` +
               `${objectName}. Fix ${rel(absPath)}; the other target maps are not at fault.`
     );
   }
@@ -469,6 +476,31 @@ function selfTest() {
       /still open at line 6, which reads `export function resolveInstallPath[\s\S]*Fix packages\/travsr-vscode\/src\/installer\.ts; the other target maps are not at fault/,
       () => extractObjectValues(MAP_HEAD + TAIL, INSTALLER_TS, "TARGET_MAP")
     );
+  });
+
+  // The one shape the other cases cannot reach: every case above ends inside a
+  // file, so all of them exercise the `atLine` branch. A map at the end of a
+  // file, or a truncated file, stops with no line to name, and the justification
+  // has to change with it. Pinned because that branch was wrong and invisible
+  // until #769's review read it (#769).
+  check("a map running off the end of the file does not claim an indentation", () => {
+    const src = `const TARGETS = {\n  'linux-x64': 'x86_64-unknown-linux-gnu',\n`;
+    throwsMatching(
+      /still open at the end of the file, with no closing brace anywhere below the declaration/,
+      () => extractObjectValues(src, INSTALL_JS, "TARGETS")
+    );
+    // and must NOT carry the clause that only fits a real line
+    let msg = "";
+    try {
+      extractObjectValues(src, INSTALL_JS, "TARGETS");
+    } catch (e) {
+      msg = e.message;
+    }
+    if (msg.includes("back at the declaration's own indentation")) {
+      throw new Error(
+        `the end of a file has no indentation, so the message must not cite one: ${msg}`
+      );
+    }
   });
 
   // The ensure-binary.js shape: flat map, single quotes, no type annotation.

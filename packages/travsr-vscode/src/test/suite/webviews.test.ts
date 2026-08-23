@@ -516,6 +516,29 @@ suite("activity feed colouring", () => {
     assert.ok(html.includes('<span class="run">&times;3</span>'), "and it says three");
   });
 
+  test("the light palette follows the editor theme, not the desktop", () => {
+    // Reported from a machine with a light Windows and a dark VS Code theme: the
+    // panel rendered linen inside a dark editor and switching themes did
+    // nothing. The palette was behind `@media (prefers-color-scheme: light)`,
+    // which in an Electron window resolves from the OS appearance rather than
+    // from the editor theme, so the panel was reporting the desktop.
+    //
+    // Asserted on the rule rather than the string, because the comment that
+    // explains this ships inside the stylesheet and names it.
+    const html = buildStatsHtml(STATS, []);
+    assert.ok(
+      !/@media\s*\(\s*prefers-color-scheme/.test(html),
+      "the palette must not be keyed on the OS appearance"
+    );
+    assert.ok(html.includes("body.vscode-light"), "keyed on the editor theme kind");
+    assert.ok(
+      html.includes("body.vscode-high-contrast-light"),
+      "high-contrast light is a light kind of its own and vscode-light misses it"
+    );
+    // prefers-reduced-motion is genuinely an OS preference and stays one.
+    assert.ok(/@media\s*\(\s*prefers-reduced-motion/.test(html));
+  });
+
   test("family hues are defined for both themes", () => {
     const html = buildStatsHtml(STATS, [evt("phase_b.start", "INFO", "")]);
     for (const token of ["--green", "--orange", "--gold"]) {

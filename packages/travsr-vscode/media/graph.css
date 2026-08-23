@@ -57,14 +57,25 @@
 }
 
 /* ── Light mode ─────────────────────────────────────────────────────────── */
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: var(--linen-100); --bg-elev: var(--linen-50);
-    --bg-input: var(--linen-200); --border: var(--linen-300); --border-mid: var(--linen-400);
-    --fg: var(--ch-700); --fg-muted: var(--ch-500); --fg-subtle: var(--ch-400);
-    --node: var(--green-500); --hot: var(--orange-500);
-    --danger: var(--red-500);
-  }
+/* Keyed on the theme kind VS Code stamps on the webview body, not on
+   prefers-color-scheme: that resolves from the OS appearance in an Electron
+   window rather than from the editor theme, so a light desktop running a dark
+   VS Code theme drew this webview light regardless. It stayed on :root here
+   after webviews.ts and commands.ts moved, because this file is loaded from
+   media/ via a <link>, which a source-tree grep for the old query does not
+   reach.
+
+   These tokens are safe on body rather than :root: every scrollable pane is a
+   descendant of body (below, body is overflow: hidden and everything that
+   scrolls is inside it), and there is no html selector or palette-consuming
+   pseudo-element outside body in this file, so nothing resolves the palette
+   from a context these classes do not cover. */
+body.vscode-light, body.vscode-high-contrast-light {
+  --bg: var(--linen-100); --bg-elev: var(--linen-50);
+  --bg-input: var(--linen-200); --border: var(--linen-300); --border-mid: var(--linen-400);
+  --fg: var(--ch-700); --fg-muted: var(--ch-500); --fg-subtle: var(--ch-400);
+  --node: var(--green-500); --hot: var(--orange-500);
+  --danger: var(--red-500);
 }
 
 /* ── Reduced motion ─────────────────────────────────────────────────────── */

@@ -168,7 +168,7 @@ Language support: **TypeScript / TSX**. Python, Go, Rust arriving in Phase 2.
 ```bash
 git clone https://github.com/Travsr-com/travsr
 cd travsr
-cargo build --release   # requires Rust 1.75+
+cargo build --release   # requires Rust 1.88+
 ```
 
 ---
