@@ -27,6 +27,7 @@ import {
   buildLanguagesHtml,
   buildPanelLoadingHtml,
   LOG_MAX_LINES,
+  LOG_MAX_FILES_LISTED,
   LANG_CONTRACT_FIELDS,
   LANG_CONTRACT_VERSION,
   type RepoRow,
@@ -35,7 +36,7 @@ import {
   type LangInfo,
   type LangContractSkew,
 } from "./webviews";
-import type { Diagnostic, LogEntry } from "./webviews";
+import type { Diagnostic, LogEntry, LogFileInfo } from "./webviews";
 
 // ── Pure helpers (unit-testable) ────────────────────────────────────────────
 
@@ -459,6 +460,12 @@ function readFileTailLines(file: string, maxLines: number): string[] {
  * the panel's widest option resolves to `LOG_MAX_LINES` instead. Unreachable
  * from the UI either way, since the smallest option is 100 and `setLogLines`
  * clamps to at least 1.
+ *
+ * No longer the panel's reader. The File control reads one file at a time via
+ * `readDaemonLogFile`, because a stream spanning rotations gave no way to ask
+ * for a particular day. This stays as the tested port of `backfill`, which is
+ * what `travsr daemon logs` still does, and its tests hold the two readers to
+ * the same answer on the same fixture.
  */
 export function readDaemonLogTail(repoRoot: string, maxLines = 500): LogEntry[] {
   const dir = path.join(repoRoot, ".travsr");
@@ -491,6 +498,100 @@ export function readDaemonLogTail(repoRoot: string, maxLines = 500): LogEntry[] 
 function logFileDay(fileName: string): string {
   const suffix = fileName.slice("daemon.log".length).replace(/^\./, "");
   return suffix || fileName;
+}
+
+/** `today` or `yesterday` for a log file's date, `undefined` for anything else.
+ *
+ *  Both dates are UTC, because `rolling::daily` names files by the UTC date.
+ *  That is worth saying out loud: at UTC+5:30 the file called `2026-08-22`
+ *  holds 05:30 on the 22nd through 05:29 on the 23rd local, so "today" here
+ *  means the current UTC day and not the reader's. The File control says
+ *  "UTC days" beside itself for exactly this reason.
+ *
+ *  Only those two labels. Files are named for days the daemon ran rather than
+ *  for consecutive days, so seven files can span months and a counted label
+ *  ("3 days ago") on the third entry would usually be wrong. Everything older
+ *  shows its date and nothing else.
+ *
+ *  `todayUtc` is a parameter rather than a call to the clock so this is testable
+ *  without freezing time. */
+export function logFileRelativeDay(day: string, todayUtc: string): string | undefined {
+  const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+  if (!ISO_DAY.test(day) || !ISO_DAY.test(todayUtc)) return undefined;
+  if (day === todayUtc) return "today";
+  // Date arithmetic rather than string maths, so month and year ends work.
+  const prev = new Date(`${todayUtc}T00:00:00Z`);
+  prev.setUTCDate(prev.getUTCDate() - 1);
+  return prev.toISOString().slice(0, 10) === day ? "yesterday" : undefined;
+}
+
+/** The rotated log files the panel's File control should offer, newest first.
+ *
+ *  Sizes come from `statSync`, which is metadata and costs nothing. Line counts
+ *  deliberately do not: there is no way to know how many lines a file holds
+ *  without reading all of it, so labelling every file with a count would open
+ *  every file on every redraw. That is the opposite of what the tail reader is
+ *  built to do, and `refreshOpenPanels` fires on `dbWatcher.onDidChange`, so it
+ *  would run again on every reindex while the panel is open.
+ *
+ *  `onDisk` is the number of files actually present, so a capped list can say
+ *  it is capped. It can exceed the returned length: `MAX_LOG_FILES` is enforced
+ *  by the daemon's `prune`, not by the directory. */
+export function daemonLogFileList(
+  repoRoot: string,
+  todayUtc: string = new Date().toISOString().slice(0, 10)
+): { files: LogFileInfo[]; onDisk: number } {
+  const dir = path.join(repoRoot, ".travsr");
+  const names = daemonLogFiles(dir);
+  // `daemonLogFiles` is oldest first; the newest file is the default selection
+  // and belongs at the top of the list.
+  const files = names
+    .slice()
+    .reverse()
+    .slice(0, LOG_MAX_FILES_LISTED)
+    .map((name) => {
+      let size = 0;
+      try {
+        size = fs.statSync(path.join(dir, name)).size;
+      } catch {
+        // Raced with the daemon's prune between the listing and the stat. Zero
+        // reads as "nothing in here", which is true enough of a file being
+        // deleted, and is better than dropping the entry and renumbering the
+        // list under the user's cursor.
+      }
+      const day = logFileDay(name);
+      const rel = logFileRelativeDay(day, todayUtc);
+      return rel === undefined ? { name, day, size } : { name, day, size, rel };
+    });
+  return { files, onDisk: names.length };
+}
+
+/** The last `maxLines` lines of one rotated log file, oldest first.
+ *
+ *  The panel's reader. Sits on the same backward chunked scan
+ *  `readDaemonLogTail` uses, so cost is proportional to the tail taken rather
+ *  than to file size, and the same per-file byte ceiling applies. Reading one
+ *  file is strictly less work than spanning: the other files are never opened.
+ *
+ *  `fileName` is a bare name and is checked against the directory listing, not
+ *  sanitised. It arrives from the webview, and an allowlist of names the
+ *  directory actually reports cannot be walked out of, while a `..` test on a
+ *  joined path has to be right about what the platform accepts in a name. An
+ *  unknown name reads as empty. */
+export function readDaemonLogFile(
+  repoRoot: string,
+  fileName: string,
+  maxLines = 500
+): LogEntry[] {
+  const dir = path.join(repoRoot, ".travsr");
+  if (!daemonLogFiles(dir).includes(fileName)) return [];
+  const want = Math.min(Math.max(maxLines, 0), LOG_MAX_LINES);
+  if (want === 0) return [];
+  const day = logFileDay(fileName);
+  return readFileTailLines(path.join(dir, fileName), want).map((l) => ({
+    ...parseLogLine(l),
+    day,
+  }));
 }
 
 /**
@@ -863,6 +964,7 @@ type PanelMessage =
   | { command: "openFile"; path: string }
   | { command: "refreshLog" }
   | { command: "setLogLines"; lines: number }
+  | { command: "setLogFile"; file: string }
   | { command: "refresh" };
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
@@ -1014,6 +1116,11 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
   // is the only way to show more: the dropdown's other job is a local hide over
   // rows that are already in the DOM.
   let logLines = 500;
+  // Which rotated file is showing. `undefined` means "whatever the newest is",
+  // which is the default and the only state that survives a rotation: an
+  // explicit pick is a pick of that day and stays put when the day rolls, while
+  // the default follows the daemon onto the new file.
+  let logFile: string | undefined;
 
   const render = async (): Promise<string> => {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -1022,13 +1129,23 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
     // Read straight from the log file rather than asking the daemon: it works
     // after a crash, which is when the panel is worth opening. This is the
     // cheap half, and the only half a follow tick needs.
-    const log = root ? readDaemonLogTail(root, logLines) : [];
+    // Re-listed every render rather than cached: rotation and the daemon's
+    // prune both change the directory under an open panel.
+    const logFiles = root ? daemonLogFileList(root) : { files: [], onDisk: 0 };
+    // A pinned file that is gone (rotated past the cap, or pruned while the
+    // panel sat open) falls back to the newest, rather than rendering an empty
+    // log against a filename nothing can satisfy.
+    const selected =
+      logFile !== undefined && logFiles.files.some((f) => f.name === logFile)
+        ? logFile
+        : (logFiles.files[0]?.name ?? "");
+    const log = root && selected !== "" ? readDaemonLogFile(root, selected, logLines) : [];
     const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
     // readDiagnostics spawns `travsr status`.
     const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
     lastStats = stats;
     lastDiags = diags;
-    return buildStatsHtml(stats, log, diags, logLines);
+    return buildStatsHtml(stats, log, diags, logLines, { ...logFiles, selected });
   };
 
   const handle = async (msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
@@ -1062,6 +1179,25 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
       // graph stats and the `travsr status` spawn have not changed and are the
       // expensive half of a render.
       logLines = Math.min(Math.max(Math.trunc(msg.lines) || 0, 1), LOG_MAX_LINES);
+      logOnly = true;
+      try {
+        await refresh();
+      } finally {
+        logOnly = false;
+      }
+      return;
+    }
+    if (msg.command === "setLogFile") {
+      // Always a re-read: the rows for another file were never sent to the
+      // webview, so there is no local path to take. Log-only, for the same
+      // reason widening Lines is: the graph stats and the `travsr status` spawn
+      // have not changed and are the expensive half.
+      //
+      // Stored unchecked on purpose. `render` drops a name the directory does
+      // not list and falls back to the newest, and `readDaemonLogFile` checks
+      // again before it opens anything, so a crafted message cannot turn into a
+      // path.
+      logFile = msg.file;
       logOnly = true;
       try {
         await refresh();

@@ -2,9 +2,19 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { readDaemonLogTail } from "../../commands";
-import { buildStatsHtml, LOG_MAX_LINES } from "../../webviews";
-import type { LogEntry, StatsView } from "../../webviews";
+import {
+  readDaemonLogTail,
+  readDaemonLogFile,
+  daemonLogFileList,
+  logFileRelativeDay,
+} from "../../commands";
+import {
+  buildStatsHtml,
+  formatLogSize,
+  LOG_MAX_LINES,
+  LOG_MAX_FILES_LISTED,
+} from "../../webviews";
+import type { LogEntry, LogFileInfo, StatsView } from "../../webviews";
 
 /**
  * The daemon log rotates daily (`daemon.log.<YYYY-MM-DD>`, seven files kept),
@@ -17,6 +27,12 @@ import type { LogEntry, StatsView } from "../../webviews";
  * (`crates/travsr-daemon/src/logfile.rs`), which is the reader
  * `travsr daemon logs` already uses correctly, so the two surfaces cannot drift
  * apart again.
+ *
+ * The panel then went further and stopped spanning at all: a File control picks
+ * one rotated file, defaulting to the newest, because a continuous stream gave
+ * no way to ask for a particular day. `readDaemonLogTail` stays under test as
+ * the port of `backfill`, which is still what the CLI does; the suites below it
+ * cover the reader the panel actually calls.
  */
 
 /** A temp repo root containing a `.travsr` dir; removed on process exit. */
@@ -391,5 +407,254 @@ suite("#log-rotation: the Lines control can widen the window", () => {
     assert.ok(html.includes('data-loaded="500"'), "the webview needs the loaded window");
     assert.ok(html.includes("onLogLinesChange()"), "the change handler must be wired");
     assert.ok(html.includes("setLogLines"), "widening must post back to the extension");
+  });
+});
+
+suite("#log-rotation: the File control reads one rotated file", () => {
+  test("the named file is read, not the newest and not a span", () => {
+    const root = tempRepo();
+    writeLog(root, "daemon.log.2026-08-21", ["a1", "a2", "a3"]);
+    writeLog(root, "daemon.log.2026-08-22", ["b1", "b2"]);
+    writeLog(root, "daemon.log.2026-08-23", ["c1"]);
+
+    assert.deepStrictEqual(messages(readDaemonLogFile(root, "daemon.log.2026-08-22", 500)), [
+      "b1",
+      "b2",
+    ]);
+    assert.deepStrictEqual(messages(readDaemonLogFile(root, "daemon.log.2026-08-23", 500)), ["c1"]);
+    // Same fixture through the spanning reader: the two answers differ now, on
+    // purpose, and both are still asserted so neither drifts unnoticed.
+    assert.deepStrictEqual(messages(readDaemonLogTail(root, 500)), [
+      "a1",
+      "a2",
+      "a3",
+      "b1",
+      "b2",
+      "c1",
+    ]);
+  });
+
+  test("a window smaller than the file takes the tail of it", () => {
+    const root = tempRepo();
+    writeLog(root, "daemon.log.2026-08-22", ["b1", "b2", "b3", "b4"]);
+    assert.deepStrictEqual(messages(readDaemonLogFile(root, "daemon.log.2026-08-22", 2)), [
+      "b3",
+      "b4",
+    ]);
+  });
+
+  test("over-requesting does not pad from a neighbouring file", () => {
+    const root = tempRepo();
+    writeLog(root, "daemon.log.2026-08-21", ["a1", "a2", "a3"]);
+    writeLog(root, "daemon.log.2026-08-22", ["b1"]);
+    // 500 asked for, 1 in that file. The older file must not fill the gap:
+    // not filling it is the entire point of picking a file.
+    assert.deepStrictEqual(messages(readDaemonLogFile(root, "daemon.log.2026-08-22", 500)), ["b1"]);
+  });
+
+  test("a name the directory does not list reads as empty, not as a path", () => {
+    const root = tempRepo();
+    writeLog(root, "daemon.log.2026-08-22", ["b1"]);
+    fs.writeFileSync(path.join(root, "secret.txt"), "not a log\n");
+    // The name arrives from the webview, so anything the listing does not
+    // report must read empty whatever shape it arrives in.
+    for (const name of [
+      "../secret.txt",
+      "..\\secret.txt",
+      "daemon.log.2026-08-22/../../secret.txt",
+      "/etc/passwd",
+      "daemon.log.2026-08-99",
+      "",
+    ]) {
+      assert.deepStrictEqual(readDaemonLogFile(root, name, 500), [], name + " must read empty");
+    }
+  });
+
+  test("every entry carries the day of the file it came from", () => {
+    const root = tempRepo();
+    writeLog(root, "daemon.log.2026-08-21", ["a1", "a2"]);
+    const got = readDaemonLogFile(root, "daemon.log.2026-08-21", 500);
+    assert.deepStrictEqual(
+      got.map((e) => e.day),
+      ["2026-08-21", "2026-08-21"]
+    );
+  });
+
+  test("a zero window reads nothing", () => {
+    const root = tempRepo();
+    writeLog(root, "daemon.log.2026-08-22", ["b1"]);
+    assert.deepStrictEqual(readDaemonLogFile(root, "daemon.log.2026-08-22", 0), []);
+  });
+
+  test("a repo with no .travsr reads as empty", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "travsr-nolog-"));
+    assert.deepStrictEqual(readDaemonLogFile(root, "daemon.log.2026-08-22", 500), []);
+  });
+});
+
+suite("#log-rotation: the File control lists what is on disk", () => {
+  test("newest first, so the default sits at the top", () => {
+    const root = tempRepo();
+    writeLog(root, "daemon.log.2026-08-21", ["a"]);
+    writeLog(root, "daemon.log.2026-08-22", ["b"]);
+    writeLog(root, "daemon.log.2026-08-23", ["c"]);
+    const { files, onDisk } = daemonLogFileList(root, "2026-08-23");
+    assert.deepStrictEqual(
+      files.map((f) => f.day),
+      ["2026-08-23", "2026-08-22", "2026-08-21"]
+    );
+    assert.strictEqual(onDisk, 3);
+  });
+
+  test("the list is capped and reports how many are really there", () => {
+    const root = tempRepo();
+    // More than the daemon's own cap on purpose: MAX_LOG_FILES is enforced by
+    // prune, so a restored .travsr can hold more, and the dropdown must not
+    // grow to fit whatever it finds.
+    for (let d = 1; d <= 12; d++) {
+      writeLog(root, "daemon.log.2026-08-" + String(d).padStart(2, "0"), ["x"]);
+    }
+    const { files, onDisk } = daemonLogFileList(root, "2026-08-12");
+    assert.strictEqual(files.length, LOG_MAX_FILES_LISTED);
+    assert.strictEqual(onDisk, 12);
+    assert.strictEqual(files[0].day, "2026-08-12", "the newest must survive the cap");
+  });
+
+  test("today and yesterday are labelled, older files are not", () => {
+    const root = tempRepo();
+    writeLog(root, "daemon.log.2026-08-21", ["a"]);
+    writeLog(root, "daemon.log.2026-08-22", ["b"]);
+    writeLog(root, "daemon.log.2026-08-23", ["c"]);
+    const { files } = daemonLogFileList(root, "2026-08-23");
+    assert.deepStrictEqual(
+      files.map((f) => f.rel),
+      ["today", "yesterday", undefined]
+    );
+  });
+
+  test("sizes are reported and line counts are never asked for", () => {
+    const root = tempRepo();
+    writeLog(root, "daemon.log.2026-08-22", ["b1", "b2"]);
+    const { files } = daemonLogFileList(root, "2026-08-22");
+    assert.ok(files[0].size > 0, "size is free from statSync");
+    assert.ok(
+      !("lines" in files[0]),
+      "a line count would cost a full read of every file on every redraw"
+    );
+  });
+
+  test("a directory named like a log is not a log", () => {
+    const root = tempRepo();
+    writeLog(root, "daemon.log.2026-08-22", ["b"]);
+    fs.mkdirSync(path.join(root, ".travsr", "daemon.log.2026-08-23"));
+    const { files, onDisk } = daemonLogFileList(root, "2026-08-23");
+    assert.deepStrictEqual(
+      files.map((f) => f.day),
+      ["2026-08-22"]
+    );
+    assert.strictEqual(onDisk, 1);
+  });
+});
+
+suite("#log-rotation: relative day labels", () => {
+  test("today, yesterday, and nothing else", () => {
+    assert.strictEqual(logFileRelativeDay("2026-08-23", "2026-08-23"), "today");
+    assert.strictEqual(logFileRelativeDay("2026-08-22", "2026-08-23"), "yesterday");
+    assert.strictEqual(logFileRelativeDay("2026-08-21", "2026-08-23"), undefined);
+    // Seven files can span months, so a counted label would be wrong more
+    // often than it would help.
+    assert.strictEqual(logFileRelativeDay("2026-06-30", "2026-08-23"), undefined);
+  });
+
+  test("month and year ends are real dates, not string arithmetic", () => {
+    assert.strictEqual(logFileRelativeDay("2026-07-31", "2026-08-01"), "yesterday");
+    assert.strictEqual(logFileRelativeDay("2025-12-31", "2026-01-01"), "yesterday");
+    assert.strictEqual(logFileRelativeDay("2024-02-29", "2024-03-01"), "yesterday");
+  });
+
+  test("a file whose suffix is not a date gets no label", () => {
+    // logFileDay falls back to the whole name, which must not be relabelled.
+    assert.strictEqual(logFileRelativeDay("daemon.log", "2026-08-23"), undefined);
+    assert.strictEqual(logFileRelativeDay("2026-8-3", "2026-08-23"), undefined);
+  });
+});
+
+suite("#log-rotation: the File control renders", () => {
+  const FILES: LogFileInfo[] = [
+    { name: "daemon.log.2026-08-23", day: "2026-08-23", size: 142, rel: "today" },
+    { name: "daemon.log.2026-08-22", day: "2026-08-22", size: 61896, rel: "yesterday" },
+    { name: "daemon.log.2026-08-21", day: "2026-08-21", size: 61896 },
+  ];
+  const withFiles = (onDisk: number, selected: string): string =>
+    buildStatsHtml(STATS, [entry("a", "2026-08-23")], [], 500, { files: FILES, onDisk, selected });
+
+  test("every file is offered, valued by name, with the showing one selected", () => {
+    const html = withFiles(3, "daemon.log.2026-08-22");
+    assert.ok(html.includes('id="logFile"'));
+    assert.ok(html.includes("onLogFileChange()"), "the change handler must be wired");
+    assert.ok(html.includes("setLogFile"), "picking a file must post back to the extension");
+    for (const f of FILES) {
+      assert.ok(html.includes('value="' + f.name + '"'), f.name + " must be offered");
+    }
+    assert.ok(
+      html.includes('value="daemon.log.2026-08-22" selected'),
+      "the file being shown must be the selected option"
+    );
+  });
+
+  test("the label carries the day, the relative word and the size", () => {
+    const html = withFiles(3, "daemon.log.2026-08-23");
+    assert.ok(html.includes("2026-08-23 · today · 142 B"));
+    assert.ok(html.includes("2026-08-22 · yesterday · 60 KB"));
+    // No relative word on the oldest, and no empty separator left behind.
+    assert.ok(html.includes("2026-08-21 · 60 KB"));
+    assert.ok(!html.includes("2026-08-21 ·  ·"));
+  });
+
+  test("the day boundary is named as UTC", () => {
+    // rolling::daily rotates on the UTC date while rows show local times, so at
+    // UTC+5:30 the file called 2026-08-22 holds part of the 23rd. Saying so is
+    // the difference between a quirk and a bug report.
+    assert.ok(withFiles(3, "daemon.log.2026-08-23").includes("UTC days"));
+  });
+
+  test("a capped list says how many files are really on disk", () => {
+    assert.ok(
+      withFiles(12, "daemon.log.2026-08-23").includes("3 of 12 files"),
+      "a silent truncation reads as the whole history"
+    );
+  });
+
+  test("an uncapped list says nothing about counts", () => {
+    assert.ok(!/of 3 files/.test(withFiles(3, "daemon.log.2026-08-23")));
+  });
+
+  test("no file list renders no File control at all", () => {
+    // Callers that pass four arguments still get a working panel; an empty
+    // dropdown would be worse than none.
+    const html = buildStatsHtml(STATS, [entry("a", "2026-08-22")], [], 500);
+    assert.ok(!html.includes('id="logFile"'));
+    assert.ok(html.includes('id="logLines"'), "the rest of the toolbar must survive");
+  });
+
+  test("a hostile file name is escaped", () => {
+    const html = buildStatsHtml(STATS, [], [], 500, {
+      files: [{ name: 'daemon.log."><script>x</script>', day: '"><script>x</script>', size: 1 }],
+      onDisk: 1,
+      selected: "none",
+    });
+    assert.ok(!html.includes("<script>x</script>"), "a file name is not markup");
+  });
+});
+
+suite("#log-rotation: file sizes read as sizes", () => {
+  test("bytes, whole KB, one decimal MB", () => {
+    assert.strictEqual(formatLogSize(0), "0 B");
+    assert.strictEqual(formatLogSize(142), "142 B");
+    assert.strictEqual(formatLogSize(1023), "1023 B");
+    assert.strictEqual(formatLogSize(1024), "1 KB");
+    assert.strictEqual(formatLogSize(61896), "60 KB");
+    assert.strictEqual(formatLogSize(1024 * 1024), "1.0 MB");
+    assert.strictEqual(formatLogSize(52 * 1024 * 1024), "52.0 MB");
   });
 });

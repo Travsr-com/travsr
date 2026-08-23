@@ -261,6 +261,11 @@ export function webviewShell(title: string, body: string, script: string): strin
     border-radius: 4px; padding: 2px 4px; font-size: 11px; font-family: inherit; }
   .tog { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
   .tog input { margin: 0; }
+  /* Quiet asides beside the File control: the day boundary is UTC, and the list
+     may be shorter than what is on disk. Both are things a reader needs once
+     and should not have to read twice. */
+  .hint { color: var(--fg-subtle); }
+  .hint[title] { cursor: help; border-bottom: 1px dotted var(--border); }
 
   /* JSON mode makes each row expandable rather than replacing the list with a
      wall of objects. The column line is already the summary, so collapsed costs
@@ -592,6 +597,31 @@ export interface LogEntry {
   day?: string;
 }
 
+/** One rotated log file, as the panel's File control needs it.
+ *
+ *  Carries no line count on purpose. A count cannot be known without reading
+ *  the whole file, so labelling every file with one would open all seven on
+ *  every redraw and undo the property the tail reader is built on, that older
+ *  files are never opened when the newest already answers the request. Size
+ *  comes free from `statSync` and answers the same question the count was
+ *  wanted for: whether there is anything in this file. */
+export interface LogFileInfo {
+  /** Name on disk, `daemon.log.<DATE>`. The option's value, and what comes back
+   *  on `setLogFile`. */
+  name: string;
+  /** The date in the name, or the whole name when the suffix is not one. */
+  day: string;
+  /** Size in bytes. */
+  size: number;
+  /** `today` or `yesterday` where that is true of `day`, absent otherwise.
+   *
+   *  Supplied by the caller rather than computed here, so this builder does not
+   *  depend on the clock. Only those two, because files are named for days the
+   *  daemon ran and not for consecutive days: seven files can span months, so
+   *  "3 days ago" on the third entry would be wrong more often than useful. */
+  rel?: string;
+}
+
 /**
  * Human labels for the stable event keys the daemon emits.
  *
@@ -605,6 +635,7 @@ const EVENT_LABELS: Record<string, string> = {
   "daemon.ready": "Daemon ready",
   "daemon.socket.bound": "Control socket bound",
   "daemon.session.stop": "Daemon stopped",
+  "daemon.log_pruned": "Old log files removed",
   "head.drift.detected": "HEAD moved, reconciling",
   "head.reconcile.complete": "Reindexed after HEAD moved",
   "tree.reconcile.pruned": "Pruned deleted files",
@@ -639,6 +670,7 @@ const EVENT_FAMILY: Record<string, string> = {
   "daemon.ready": "daemon",
   "daemon.socket.bound": "daemon",
   "daemon.session.stop": "daemon",
+  "daemon.log_pruned": "daemon",
   "head.drift.detected": "git",
   "head.reconcile.complete": "git",
   "tree.reconcile.pruned": "git",
@@ -681,7 +713,14 @@ export function buildStatsHtml(
    *  `panel.webview.html` wholesale, so a redraw also discards the search box,
    *  the severity chip and the UTC/JSON toggles. Fixing it means persisting
    *  panel state across a redraw, which is its own change. */
-  loadedLines: number = 500
+  loadedLines: number = 500,
+  /** The File control's contents: which rotated files to offer, which one is
+   *  showing, and how many are on disk so a truncated list can say so.
+   *
+   *  Absent renders no File control at all, so a caller that predates rotation
+   *  awareness (and every test that does not care) still gets a working panel
+   *  rather than an empty dropdown. */
+  logFiles?: { files: LogFileInfo[]; onDisk: number; selected: string }
 ): string {
   const card = (k: string, v: string): string =>
     `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
@@ -762,6 +801,12 @@ export function buildStatsHtml(
           // only where the day actually changes, so a single-day log has none.
           // `log-day`, deliberately not `log-line`: filterLog() counts and
           // filters `.log-line`, and a divider is neither a line nor a match.
+          //
+          // Unreachable from the panel now that the File control reads one file
+          // at a time, since a single file cannot change day. Kept because this
+          // is a pure builder over whatever entries it is handed, and
+          // `readDaemonLogTail` still produces multi-day input for the tests
+          // that hold it to parity with the CLI's `LogTail::backfill`.
           const prev = i > 0 ? rows[i - 1].day : undefined;
           const needsDivider = i > 0 && e.day !== undefined && e.day !== prev;
           return needsDivider
@@ -801,6 +846,38 @@ export function buildStatsHtml(
         .join("\n") +
       `</div>`
     : "";
+
+  // The File control. One file at a time is the whole point: the panel used to
+  // read across rotations, which made "the last 500 lines" a stream with no way
+  // to ask for a particular day.
+  //
+  // The list is capped and says when it is capped. `MAX_LOG_FILES` is the
+  // daemon's cap, not a guarantee about what is on disk: it is applied by
+  // `prune`, and a `.travsr` restored from a backup, or written by a daemon
+  // that predates the rotation sweep, can hold more. The dropdown should not
+  // grow to match.
+  const fileControl =
+    logFiles !== undefined && logFiles.files.length > 0
+      ? `<label class="sel">File
+    <select id="logFile" onchange="onLogFileChange()">
+      ${logFiles.files
+        .map((f) => {
+          const label = [f.day, f.rel, formatLogSize(f.size)]
+            .filter((p): p is string => p !== undefined && p !== "")
+            .join(" · ");
+          const on = f.name === logFiles.selected ? " selected" : "";
+          return `<option value="${esc(f.name)}"${on}>${esc(label)}</option>`;
+        })
+        .join("\n      ")}
+    </select>
+  </label>
+  <span class="hint" title="The daemon rotates on the UTC date, so one file covers one UTC day. Turn on UTC below to read the times on the same clock.">UTC days</span>${
+    logFiles.onDisk > logFiles.files.length
+      ? `
+  <span class="hint">${logFiles.files.length} of ${logFiles.onDisk} files</span>`
+      : ""
+  }`
+      : "";
 
   const body = `
 <h2>Graph stats</h2>
@@ -842,6 +919,7 @@ ${activityRows}
   <span class="count" id="logCount">${log.length} lines</span>
 </div>
 <div class="log-bar modes">
+  ${fileControl}
   <label class="sel">Lines
     <select id="logLines" data-loaded="${loadedLines}" onchange="onLogLinesChange()">
       <option value="100">100</option>
@@ -956,6 +1034,14 @@ function onLogLinesChange() {
   filterLog();
 }
 
+// The File control has no local fast path of its own. Narrowing Lines hides
+// rows that are already in the DOM; another file's rows were never sent at all,
+// so every change here is a re-read.
+function onLogFileChange() {
+  var sel = document.getElementById('logFile');
+  if (sel) vscode.postMessage({ command: 'setLogFile', file: sel.value });
+}
+
 function filterLog() {
   var box = document.getElementById('logBox');
   if (!box) return;
@@ -1054,6 +1140,27 @@ function filterLog() {
  *  reserializes and reparses all of it. Raising this number is a decision about
  *  that figure, not about read time. */
 export const LOG_MAX_LINES = 5000;
+
+/** How many rotated files the File control will list, newest kept.
+ *
+ *  `MAX_LOG_FILES` on the daemon side is 7, but that is a cap the daemon
+ *  applies rather than a promise about the directory: it runs in `prune`, at
+ *  start and on rotation, so a `.travsr` copied from a backup or written by an
+ *  older daemon can hold more than seven. The control lists this many and says
+ *  so when there are more, instead of growing a dropdown to fit whatever is
+ *  there. */
+export const LOG_MAX_FILES_LISTED = 7;
+
+/** A log file's size for the File control.
+ *
+ *  Whole KB is the useful resolution: the question a size answers here is
+ *  whether the file has anything in it, which is why it stands in for a line
+ *  count that would cost a full read of every file to produce. */
+export function formatLogSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 /** A per-language node count from the graph. */
 export interface LangCount {
