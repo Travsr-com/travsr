@@ -161,8 +161,13 @@ pub struct PhaseBReport {
 
 /// Progress events emitted during [`init_repo_with_progress`] so a caller (the
 /// CLI) can render a live indicator. Counts are best-effort. The callback runs
-/// on the indexing thread, so keep it cheap and non-blocking.
-#[derive(Debug, Clone, Copy)]
+/// on the indexing thread (or, during the Phase B fan-out, on the heartbeat
+/// thread that temporarily owns it), so keep it cheap and non-blocking.
+///
+/// `Clone`, not `Copy`: `SemanticRunning` carries the language names, which are
+/// the actionable half of a heartbeat (the user needs to see that it is
+/// *kotlin* still warming up, not just that "something" is).
+#[derive(Debug, Clone)]
 pub enum InitProgress {
     /// Walking the work tree to discover indexable files. `scanned` is the
     /// number of directory entries seen so far (the total is not yet known).
@@ -177,6 +182,20 @@ pub enum InitProgress {
     /// Post-index semantic passes (LSIF + Phase B); no granular count.
     /// Only emitted when `--semantic` is passed or there is no HEAD commit.
     Finalizing,
+    /// #755 item 3: heartbeat while the Phase B fan-out blocks. Emitted every
+    /// second or so with the analyzers still running and their elapsed wall
+    /// time. This exists because a JVM analyzer (kotlin-language-server, sbt)
+    /// can legitimately spend minutes on cold start; without a ticking signal
+    /// naming the language, that silence is indistinguishable from a hang and
+    /// users kill the init.
+    SemanticRunning {
+        /// `(language, elapsed_seconds)` per still-running analyzer, name-sorted.
+        langs: Vec<(String, u64)>,
+        /// The per-language invoke window in seconds — the budget the slowest
+        /// analyzer is still inside, so the renderer can say how long the run
+        /// is *allowed* to take rather than leave the ceiling unstated.
+        budget_secs: u64,
+    },
     /// Phase B deferred to the daemon background scheduler. Emitted on the
     /// normal (non-`--semantic`) path once Phase A completes successfully.
     PhaseBDeferred,
@@ -1070,7 +1089,11 @@ pub fn init_repo_with_progress(
     jobs: Option<usize>,
     semantic: bool,
     force: bool,
-    on_progress: &mut dyn FnMut(InitProgress),
+    // `+ Send` (#755 item 3): during the Phase B fan-out the callback is driven
+    // from a scoped heartbeat thread (the indexing thread is blocked inside
+    // `invoke_phase_b_all` and cannot emit anything itself). Every caller
+    // passes a closure over plain terminal state, so the bound costs nothing.
+    on_progress: &mut (dyn FnMut(InitProgress) + Send),
 ) -> anyhow::Result<InitStats> {
     // M3: canonicalize so ~/.travsr/registry.json never gets two entries for the
     // same repo (e.g. `/home/user/proj` vs `/home/user/proj/`).
@@ -1697,15 +1720,60 @@ pub fn init_repo_with_progress(
             // this repo's write_phase_b_results call.
             travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
             let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
+            // #755 item 3: live per-language view of the fan-out, polled by the
+            // heartbeat thread below so the progress line keeps ticking while
+            // this thread blocks inside `invoke_phase_b_all`.
+            let liveness = travsr_plugin_host::PhaseBLiveness::new();
             let inputs = travsr_plugin_host::PhaseBInputs {
                 repo_root,
                 present_languages: present_languages.clone(),
                 // P6 (#329): reuse the already-walked file list so Phase B runners
                 // skip their own directory walks.
                 indexable_paths: &indexable_paths,
+                liveness: Some(&liveness),
             };
-            let (pb_nodes, pb_edges, mut pb_refs, pb_unresolved, pb_positional, pb_outcome) =
-                phase_b_indexer.invoke_phase_b_all(&inputs);
+            // #755 item 3: the fan-out blocks this thread for up to the full
+            // per-language invoke window (a JVM analyzer's cold start can
+            // legitimately take minutes), and `Finalizing` above was the last
+            // event — so the progress line would freeze for exactly the runs
+            // where the user most needs to see life. Lend the callback to a
+            // scoped heartbeat thread for the duration: it polls the liveness
+            // snapshot and emits `SemanticRunning` until the fan-out returns.
+            // The scope guarantees the borrow ends before this thread touches
+            // `on_progress` again.
+            let (pb_nodes, pb_edges, mut pb_refs, pb_unresolved, pb_positional, pb_outcome) = {
+                let done = std::sync::atomic::AtomicBool::new(false);
+                let budget_secs = travsr_plugin_host::transport::phase_b_invoke_timeout_secs();
+                // Reborrow: the closure moves this short-lived `&mut`, not the
+                // parameter itself, so `on_progress` is whole again after the
+                // scope (the deferred-path emit below still needs it).
+                let hb_progress: &mut (dyn FnMut(InitProgress) + Send) = &mut *on_progress;
+                std::thread::scope(|s| {
+                    let hb_done = &done;
+                    let hb_liveness = &liveness;
+                    let hb = s.spawn(move || {
+                        while !hb_done.load(std::sync::atomic::Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            let running = hb_liveness.running();
+                            if !running.is_empty() {
+                                hb_progress(InitProgress::SemanticRunning {
+                                    langs: running
+                                        .into_iter()
+                                        .map(|(lang, d)| (lang, d.as_secs()))
+                                        .collect(),
+                                    budget_secs,
+                                });
+                            }
+                        }
+                    });
+                    let out = phase_b_indexer.invoke_phase_b_all(&inputs);
+                    done.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // A parked heartbeat wakes within one tick; joining keeps the
+                    // callback borrow strictly inside this scope.
+                    let _ = hb.join();
+                    out
+                })
+            };
             // E3 W3b: resolve rust-analyzer LSIF positional refs against the full
             // store (cross-file + incremental-safe) into attributable ScipRefs.
             // Fail closed — a callee that resolves to no node is dropped here, so
@@ -3596,6 +3664,8 @@ fn run_background_phase_b_inner(
         repo_root,
         present_languages,
         indexable_paths: &indexable_paths,
+        // Background refresh: no terminal is attached, nobody renders progress.
+        liveness: None,
     };
     let (pb_nodes, pb_edges, mut pb_refs, pb_unresolved, pb_positional, pb_outcome) =
         indexer.invoke_phase_b_all(&inputs);

@@ -268,18 +268,33 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
 /**
  * Compute the Travsr VName for a declaration node.
  *
- * Signature format is identical to travsr-indexer/src/emit.rs so that the Rust
- * LSIF ingester can deterministically compute the same BLAKE3 NodeId and
- * match LSIF resultSets to Tree-sitter-indexed nodes without a store lookup.
+ * Signature format is identical to travsr-analysis/src/typescript.rs (the
+ * tree-sitter parser) so that the Rust LSIF ingester can deterministically
+ * compute the same BLAKE3 NodeId and match LSIF resultSets to
+ * Tree-sitter-indexed nodes without a store lookup.
  *
  *   class:ClassName          → ClassDeclaration
- *   fn:funcName              → FunctionDeclaration
+ *   fn:funcName              → FunctionDeclaration, or a TOP-LEVEL variable
+ *                              whose initializer is an arrow function or
+ *                              function expression (tree-sitter classifies
+ *                              those as functions, not variables — N4a)
  *   method:ClassName.name    → MethodDeclaration (requires parent class walk)
- *   var:varName              → VariableDeclaration
- *   interface:InterfaceName  → InterfaceDeclaration (not indexed by Tree-sitter; included for future use)
+ *   var:varName              → TOP-LEVEL VariableDeclaration
+ *   interface:InterfaceName  → InterfaceDeclaration
  *
- * Returns undefined for unrecognised node kinds — the caller omits travsr_vname
- * in that case, so the resultSet is still valid LSIF, just opaque to the Rust side.
+ * Returns undefined for unrecognised node kinds AND for non-top-level variable
+ * declarations — the caller omits travsr_vname in that case, so the resultSet
+ * is still valid LSIF, just opaque to the Rust side.
+ *
+ * The variable rules exist because the ingester builds edges to these ids and
+ * tree-sitter owns the nodes (issue #755 item 1): any signature this function
+ * computes differently from tree-sitter is an edge to a node that does not
+ * exist — an orphan `fsck` flags on a fresh index. Tree-sitter's variable rules
+ * are exactly two (typescript.rs, the `topvar` arm): only program-child
+ * declarators become nodes at all (locals are dropped), and a declarator whose
+ * value is an arrow function or function expression is a `fn:`, not a `var:`.
+ * `const shout = (s) => …` referenced from two files used to produce two
+ * orphan edges to a `var:shout` node that was never written.
  */
 function computeTravsrVName(
   node: ts.Node,
@@ -299,7 +314,23 @@ function computeTravsrVName(
     const className = findParentClassName(node) ?? '<anonymous>';
     signature = `method:${className}.${node.name.text}`;
   } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
-    signature = `var:${node.name.getText(sf)}`;
+    // Tree-sitter only indexes program-child declarators (`(program
+    // (lexical_declaration (variable_declarator)))`). A local has no node, so
+    // a vname here would guarantee an orphan edge for every reference to it.
+    // In the TS AST a top-level declarator is VariableDeclaration →
+    // VariableDeclarationList → VariableStatement whose parent is the
+    // SourceFile; `for (const x of …)` heads and catch bindings have other
+    // parents and correctly fall out here too.
+    const stmt = node.parent !== undefined ? node.parent.parent : undefined;
+    const topLevel =
+      stmt !== undefined && ts.isVariableStatement(stmt) && ts.isSourceFile(stmt.parent);
+    if (!topLevel) {
+      return undefined;
+    }
+    const init = node.initializer;
+    const isFn =
+      init !== undefined && (ts.isArrowFunction(init) || ts.isFunctionExpression(init));
+    signature = `${isFn ? 'fn' : 'var'}:${node.name.getText(sf)}`;
   } else {
     return undefined;
   }

@@ -258,6 +258,13 @@ impl ProgressReporter {
                     pal.dim(&elapsed)
                 )
             }
+            InitProgress::SemanticRunning { langs, budget_secs } => {
+                format!(
+                    "  {spinner} semantic  {}   {}",
+                    semantic_langs_cell(&langs),
+                    pal.dim(&semantic_tail(&langs, budget_secs, &elapsed))
+                )
+            }
             InitProgress::PhaseBDeferred => {
                 // Transient line — do not assert *when* semantic edges build (that
                 // depends on whether a daemon is running, which init decides after
@@ -291,6 +298,13 @@ impl ProgressReporter {
                 )
             }
             InitProgress::Finalizing => format!("finalizing (semantic pass)  {elapsed}"),
+            InitProgress::SemanticRunning { langs, budget_secs } => {
+                format!(
+                    "semantic: {}  {}",
+                    semantic_langs_cell(&langs),
+                    semantic_tail(&langs, budget_secs, &elapsed)
+                )
+            }
             InitProgress::PhaseBDeferred => {
                 format!("structural index ready  {elapsed}")
             }
@@ -311,11 +325,58 @@ impl ProgressReporter {
             InitProgress::Finalizing => {
                 format!(r#"{{"phase":"finalizing","elapsed_s":{secs}}}"#)
             }
+            InitProgress::SemanticRunning { langs, budget_secs } => {
+                let items: Vec<String> = langs
+                    .iter()
+                    .map(|(lang, s)| {
+                        format!(
+                            r#"{{"lang":{},"elapsed_s":{s}}}"#,
+                            crate::lang::json_str(lang)
+                        )
+                    })
+                    .collect();
+                format!(
+                    r#"{{"phase":"semantic","running":[{}],"budget_s":{budget_secs},"elapsed_s":{secs}}}"#,
+                    items.join(",")
+                )
+            }
             InitProgress::PhaseBDeferred => {
                 format!(r#"{{"phase":"phase_b_deferred","elapsed_s":{secs}}}"#)
             }
         }
     }
+}
+
+/// The per-language cell of the semantic heartbeat: `kotlin 34s · scala 12s`.
+/// Language names come from the fan-out, so the user sees WHICH analyzer is
+/// slow, not just that something is (#755 item 3).
+fn semantic_langs_cell(langs: &[(String, u64)]) -> String {
+    langs
+        .iter()
+        .map(|(lang, s)| format!("{lang} {}", fmt_dur(Duration::from_secs(*s))))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The dim tail of the heartbeat line: the budget the run is inside, a JVM
+/// warm-up note when it applies, and total elapsed. Naming the budget is the
+/// documented-budget half of #755 item 3: "kotlin 90s" alone still reads as a
+/// hang unless the line also says how long the run is allowed to take.
+fn semantic_tail(langs: &[(String, u64)], budget_secs: u64, elapsed: &str) -> String {
+    let jvm = langs.iter().any(|(lang, _)| {
+        travsr_plugin_host::phase_b::catalog::lookup(lang)
+            .and_then(|e| e.runtime_driver)
+            .is_some_and(|d| d == "java")
+    });
+    let hint = if jvm {
+        ", JVM startup is slow on first run"
+    } else {
+        ""
+    };
+    format!(
+        "(up to {} per language{hint})   {elapsed}",
+        fmt_dur(Duration::from_secs(budget_secs))
+    )
 }
 
 /// Print the final, on-brand summary for the human modes (TTY/plain) to stdout.
@@ -864,5 +925,104 @@ mod tests {
             Some((4, 4))
         );
         assert_eq!(parse_bash_version("not a version banner"), None);
+    }
+}
+
+/// #755 item 3: the semantic heartbeat line — the signal that stops a
+/// multi-minute JVM cold start from reading as a hang.
+#[cfg(test)]
+mod issue_755_heartbeat_tests {
+    use super::*;
+
+    fn kotlin_scala() -> Vec<(String, u64)> {
+        vec![("kotlin".to_string(), 94), ("scala".to_string(), 12)]
+    }
+
+    /// The reported failure mode is "which analyzer is slow" being invisible.
+    /// The cell must name every running language with its own elapsed time.
+    #[test]
+    fn the_cell_names_each_running_language_with_its_elapsed() {
+        let cell = semantic_langs_cell(&kotlin_scala());
+        assert_eq!(cell, "kotlin 1m34s · scala 12s");
+    }
+
+    /// The documented-budget half of the item: the tail states the per-language
+    /// ceiling, so "kotlin 94s" reads as "inside its window", not as wedged.
+    #[test]
+    fn the_tail_states_the_budget() {
+        let tail = semantic_tail(&kotlin_scala(), 300, "2m 0s");
+        assert!(
+            tail.contains("up to 5m00s per language"),
+            "the ceiling must be stated; got: {tail}"
+        );
+        assert!(
+            tail.ends_with("2m 0s"),
+            "total elapsed stays visible; got: {tail}"
+        );
+    }
+
+    /// kotlin and scala run on a JVM, whose cold start is the whole reason this
+    /// heartbeat exists — say so, keyed off the catalog's runtime_driver rather
+    /// than a hardcoded language list, so a future JVM language inherits it.
+    #[test]
+    fn jvm_languages_get_the_warm_up_note() {
+        let tail = semantic_tail(&kotlin_scala(), 300, "2m 0s");
+        assert!(
+            tail.contains("JVM startup is slow on first run"),
+            "got: {tail}"
+        );
+        // java is JVM too.
+        let tail = semantic_tail(&[("java".to_string(), 30)], 300, "1m 0s");
+        assert!(tail.contains("JVM"), "got: {tail}");
+    }
+
+    /// A non-JVM analyzer must not carry a JVM excuse — a wrong explanation is
+    /// worse than none.
+    #[test]
+    fn non_jvm_languages_do_not_get_the_jvm_note() {
+        let tail = semantic_tail(&[("go".to_string(), 8)], 300, "30s");
+        assert!(!tail.contains("JVM"), "got: {tail}");
+        // An unknown language (not in the catalog) must not panic or claim JVM.
+        let tail = semantic_tail(&[("nolang".to_string(), 8)], 300, "30s");
+        assert!(!tail.contains("JVM"), "got: {tail}");
+    }
+
+    /// The `--json` heartbeat must stay parseable — it is the machine surface
+    /// CI reads, and language names pass through the shared JSON escaper.
+    #[test]
+    fn the_json_heartbeat_parses_and_carries_the_fields() {
+        let rep = ProgressReporter::new(false, true);
+        let line = rep.describe_json(InitProgress::SemanticRunning {
+            langs: kotlin_scala(),
+            budget_secs: 300,
+        });
+        let parsed: serde_json::Value =
+            serde_json::from_str(&line).expect("heartbeat JSON must parse");
+        assert_eq!(parsed["phase"], "semantic");
+        assert_eq!(parsed["budget_s"], 300);
+        assert_eq!(parsed["running"][0]["lang"], "kotlin");
+        assert_eq!(parsed["running"][0]["elapsed_s"], 94);
+        assert_eq!(parsed["running"][1]["lang"], "scala");
+    }
+
+    /// TTY and plain renderings both carry the language names — the heartbeat
+    /// exists for the human watching either surface.
+    #[test]
+    fn tty_and_plain_lines_both_name_the_languages() {
+        let rep = ProgressReporter::new(false, false);
+        let ev = InitProgress::SemanticRunning {
+            langs: kotlin_scala(),
+            budget_secs: 300,
+        };
+        let plain = rep.describe_plain(ev.clone());
+        assert!(
+            plain.contains("kotlin") && plain.contains("scala"),
+            "got: {plain}"
+        );
+        let tty = rep.compose("*", ev);
+        assert!(
+            tty.contains("kotlin") && tty.contains("scala"),
+            "got: {tty}"
+        );
     }
 }
