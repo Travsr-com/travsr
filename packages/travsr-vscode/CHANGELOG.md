@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **The binary the extension offers to download moves to v1.0.0.** `DOWNLOAD_VERSION` is the release the extension fetches when no `travsr` binary resolves from `travsr.binaryPath`, `~/.travsr/bin` or PATH. It had been held at `0.11.0` for the whole 1.0 prerelease train on purpose, because the release workflow exempts pre-releases from the lockstep check and pointing the one recovery path at a stable tag that does not exist yet would have made it a guaranteed 404. With `v1.0.0` published that exemption ends, and leaving it would make a fresh install pull 0.11.0 over a 1.0 daemon (#486).
+
 ## [0.11.0] - 2026-08-23
 
 Requires travsr v1.0.0-beta.2 or later for the language-status fields the

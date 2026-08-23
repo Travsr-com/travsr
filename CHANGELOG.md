@@ -21,10 +21,13 @@ All notable changes to Travsr are documented here.
 > smoke-install job failed at "Verify binary runs" for exactly that reason, so
 > its Windows tarball was never verified end to end. beta.2 is the first build
 > in the 1.0 train whose smoke install passed on all four target platforms.
-
-### Changed
-
-- **The VS Code extension's `DOWNLOAD_VERSION` moves to 1.0.0.** It is the version the extension offers to fetch when no `travsr` binary resolves, and it had been left at `0.11.0` for the whole 1.0 prerelease train, deliberately: pre-releases are exempt from the release workflow's lockstep check because pointing the extension at a stable tag that does not exist yet would turn its one recovery path into a 404. With `v1.0.0` published that exemption ends, and leaving it would make the extension's "reinstall" advice silently downgrade a 1.0 user to 0.11.0, which is #486. The bump lands before the tag so the two are never out of step in the direction that breaks.
+>
+> Because promotion tags the source commit, `v1.0.0` points at beta.2's
+> commit. The release-side repository changes made for this release (the
+> extension's `DOWNLOAD_VERSION`, the installer and `SECURITY.md` version
+> examples, and this entry) therefore land on `master` after that commit and
+> are not in the tagged tree; they ship with the releases that follow. The
+> published `v1.0.0` artifacts are unaffected by them.
 
 ---
 
