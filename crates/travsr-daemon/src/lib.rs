@@ -189,11 +189,15 @@ pub enum InitProgress {
     /// naming the language, that silence is indistinguishable from a hang and
     /// users kill the init.
     SemanticRunning {
-        /// `(language, elapsed_seconds)` per still-running analyzer, name-sorted.
-        langs: Vec<(String, u64)>,
-        /// The per-language invoke window in seconds — the budget the slowest
-        /// analyzer is still inside, so the renderer can say how long the run
-        /// is *allowed* to take rather than leave the ceiling unstated.
+        /// `(language, elapsed_seconds, is_sidecar)` per still-running analyzer,
+        /// name-sorted. `is_sidecar` is false for the builtin languages, which
+        /// run in-process with no per-language timeout, so a renderer must not
+        /// quote a ceiling for them.
+        langs: Vec<(String, u64, bool)>,
+        /// The watchdogged window a *sidecar* language has, in seconds, so the
+        /// renderer can say how long such a run is allowed to take rather than
+        /// leave the ceiling unstated. Meaningless for the builtin languages;
+        /// gate on the per-language flag before quoting it.
         budget_secs: u64,
     },
     /// Phase B deferred to the daemon background scheduler. Emitted on the
@@ -1743,7 +1747,7 @@ pub fn init_repo_with_progress(
             // `on_progress` again.
             let (pb_nodes, pb_edges, mut pb_refs, pb_unresolved, pb_positional, pb_outcome) = {
                 let done = std::sync::atomic::AtomicBool::new(false);
-                let budget_secs = travsr_plugin_host::transport::phase_b_invoke_timeout_secs();
+                let budget_secs = travsr_plugin_host::transport::phase_b_sidecar_budget_secs();
                 // Reborrow: the closure moves this short-lived `&mut`, not the
                 // parameter itself, so `on_progress` is whole again after the
                 // scope (the deferred-path emit below still needs it).
@@ -1759,7 +1763,7 @@ pub fn init_repo_with_progress(
                                 hb_progress(InitProgress::SemanticRunning {
                                     langs: running
                                         .into_iter()
-                                        .map(|(lang, d)| (lang, d.as_secs()))
+                                        .map(|r| (r.lang, r.elapsed.as_secs(), r.sidecar))
                                         .collect(),
                                     budget_secs,
                                 });

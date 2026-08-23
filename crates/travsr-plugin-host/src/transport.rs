@@ -76,11 +76,22 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 60;
 /// large-repo SCIP passes (KLS/sbt).
 const INVOKE_TIMEOUT_SECS: u64 = 300;
 
-/// The per-language Phase B invoke window, for surfaces that render it (#755
-/// item 3: the `travsr init` heartbeat names the budget so a multi-minute JVM
-/// cold start reads as "still inside its window", not as a hang).
-pub fn phase_b_invoke_timeout_secs() -> u64 {
-    INVOKE_TIMEOUT_SECS
+/// The whole watchdogged window a **sidecar** language has, for surfaces that
+/// render it (#755 item 3: the `travsr init` heartbeat names the budget so a
+/// multi-minute JVM cold start reads as "still inside its window", not as a
+/// hang).
+///
+/// Handshake plus invoke, because those are watchdogged separately and the
+/// handshake precedes the invoke: a cold JVM has to clear both, and the elapsed
+/// the heartbeat displays starts before the spawn. Quoting the invoke window
+/// alone would understate the ceiling by a minute.
+///
+/// Applies to sidecar languages only. The builtin ones (rust, typescript,
+/// javascript, python, dart) run in-process via `phase_b_native_*` with no
+/// per-language timeout, so a caller must not quote this for them; see
+/// `RunningLang::sidecar`.
+pub fn phase_b_sidecar_budget_secs() -> u64 {
+    HANDSHAKE_TIMEOUT_SECS + INVOKE_TIMEOUT_SECS
 }
 
 /// Subprocess transport. Spawns under ADR-017 SandboxPolicy::Standard.

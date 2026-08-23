@@ -322,14 +322,33 @@ function computeTravsrVName(
     // SourceFile; `for (const x of …)` heads and catch bindings have other
     // parents and correctly fall out here too.
     const stmt = node.parent !== undefined ? node.parent.parent : undefined;
-    const topLevel =
-      stmt !== undefined && ts.isVariableStatement(stmt) && ts.isSourceFile(stmt.parent);
-    if (!topLevel) {
+    if (stmt === undefined || !ts.isVariableStatement(stmt) || !ts.isSourceFile(stmt.parent)) {
+      return undefined;
+    }
+    // `declare const x` parses as `(program (ambient_declaration
+    // (lexical_declaration (variable_declarator))))` in the tree-sitter
+    // grammar, so the declarator is a grandchild of `ambient_declaration` and
+    // none of the four `@topvar` patterns match: no node is written. A
+    // `declare` modifier does not change the TS parent chain, so the test above
+    // passes and this one is what keeps the emitter from naming a node that
+    // does not exist. `declare module` / `namespace` bodies are already out,
+    // since their statements' parent is a block rather than the SourceFile.
+    if (stmt.modifiers?.some((m) => m.kind === ts.SyntaxKind.DeclareKeyword)) {
       return undefined;
     }
     const init = node.initializer;
+    // Generators are excluded deliberately. `typescript.rs` classifies on the
+    // tree-sitter node kind, `matches!(v.kind(), "arrow_function" |
+    // "function_expression")`, and `function*` parses as a distinct
+    // `generator_function` kind, so tree-sitter writes `var:`. In the TS AST a
+    // generator IS a FunctionExpression (with an `asteriskToken`), so treating
+    // every function expression as `fn:` would name `fn:` for a node written as
+    // `var:` and orphan every reference to it. Arrow functions cannot be
+    // generators, so only the function-expression arm needs the guard.
     const isFn =
-      init !== undefined && (ts.isArrowFunction(init) || ts.isFunctionExpression(init));
+      init !== undefined &&
+      (ts.isArrowFunction(init) ||
+        (ts.isFunctionExpression(init) && init.asteriskToken === undefined));
     signature = `${isFn ? 'fn' : 'var'}:${node.name.getText(sf)}`;
   } else {
     return undefined;
