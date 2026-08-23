@@ -81,10 +81,9 @@ pub fn windows_pid_is_alive(pid: u32) -> bool {
 ///
 /// **`EPERM` means alive.** This is the correctness point, not an
 /// optimisation (#636 round-3 review; filed independently as #759). `kill -0`
-/// as a shell command collapses
-/// `EPERM` and `ESRCH` into the same non-zero exit status, so the previous
-/// subprocess implementation reported any live process the calling user
-/// cannot signal as *dead*:
+/// as a shell command collapses `EPERM` and `ESRCH` into the same non-zero
+/// exit status, so the previous subprocess implementation reported any live
+/// process the calling user cannot signal as *dead*:
 ///
 /// ```text
 /// $ ps -p 1 -o pid,user,comm
@@ -165,6 +164,15 @@ mod unix_pid_tests {
     /// issue is findable by number; the report and this test are the same bug.
     #[test]
     fn pid_one_reads_as_alive_even_when_not_signallable() {
+        // The skip the comment above promises, which until now was only
+        // promised: root may signal PID 1, so `kill` returns Ok, the assert
+        // passes, and the EPERM arm is never reached. Container and
+        // self-hosted runners are routinely root, so without this the
+        // coverage this test advertises is absent exactly where it is
+        // least visible (#768 review).
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
         assert!(
             super::unix_pid_is_alive(1),
             "PID 1 is alive; EPERM must not be read as dead"
