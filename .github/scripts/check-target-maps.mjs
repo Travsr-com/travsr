@@ -225,7 +225,10 @@ function extractObjectValues(text, absPath, objectName) {
   }
   const { endIdx, reason, atLine, atText } = findClosingBraceLine(lines, startIdx);
   if (endIdx === -1) {
-    const where = atLine ? `line ${atLine} (${atText})` : "the end of the file";
+    // Quoted, not parenthesised: atText is a raw source line and routinely
+    // carries its own "(", which left the rendered message visibly unbalanced
+    // on the very case this check exists to explain.
+    const where = atLine ? `line ${atLine}, which reads \`${atText}\`` : "the end of the file";
     const site = `${objectName} in ${rel(absPath)} (declared on line ${startIdx + 1})`;
     throw new Error(
       reason === "unopened"
@@ -463,7 +466,7 @@ function selfTest() {
 
   check("the missing brace message names where the scan stopped and what to fix", () => {
     throwsMatching(
-      /still open at line 6 \(export function resolveInstallPath[\s\S]*Fix packages\/travsr-vscode\/src\/installer\.ts; the other target maps are not at fault/,
+      /still open at line 6, which reads `export function resolveInstallPath[\s\S]*Fix packages\/travsr-vscode\/src\/installer\.ts; the other target maps are not at fault/,
       () => extractObjectValues(MAP_HEAD + TAIL, INSTALLER_TS, "TARGET_MAP")
     );
   });
@@ -524,14 +527,14 @@ function selfTest() {
   });
 
   check("a declaration that is not an object literal is reported as such", () => {
-    throwsMatching(/does not open an object literal before line 2 \(const X = 1;\)/, () =>
+    throwsMatching(/does not open an object literal before line 2, which reads `const X = 1;`/, () =>
       extractObjectValues(`const TARGETS = buildTargets();\nconst X = 1;\n`, INSTALL_JS, "TARGETS")
     );
   });
 
   // Balanced, but the brace that balances it does not end the declaration.
   check("a closer that does not terminate the declaration is reported as malformed", () => {
-    throwsMatching(/is malformed: its braces balance at line 3 \(\}\)/, () =>
+    throwsMatching(/is malformed: its braces balance at line 3, which reads `\}`/, () =>
       extractObjectValues(`const TARGETS = {\n  'a': 'x86_64-apple-darwin',\n}\n`, INSTALL_JS, "TARGETS")
     );
   });
