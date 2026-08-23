@@ -50,16 +50,30 @@ export function webviewShell(title: string, body: string, script: string): strin
     --error: #ef4444;
     --blue: #7dd3fc;
   }
-  @media (prefers-color-scheme: light) {
-    :root {
-      --bg: #f6f1ed; --bg-elev: #fbfaf9; --bg-input: #eee5de;
-      --border: #e2d4ca;
-      --fg: #1a1a1a; --fg-muted: #705f54; --fg-subtle: #8f7a6c;
-      --green: #429429; --green-deep: #dbf6db; --gold: #d89a02;
-      --orange: #b35500; --orange-deep: #fff7ed;
-      --error: #b91c1c;
-      --blue: #0369a1;
-    }
+  /* Light palette, keyed on the class VS Code stamps on a webview's body.
+
+     Deliberately NOT a prefers-color-scheme media query, which is what this was.
+     Inside an Electron window that resolves from the OS appearance rather than
+     from the editor theme, so a light Windows running a dark VS Code theme drew
+     a linen panel in the middle of a dark editor, and no amount of switching
+     themes could shift it: the panel was reporting the desktop, not the editor
+     it is docked in.
+
+     The body class is the authoritative signal and VS Code updates it live, so a
+     theme change repaints without a reload. High-contrast light is named
+     separately because it is a light theme kind of its own that vscode-light does
+     not cover. The reduced-motion query below stays a media query, since that one
+     genuinely is an OS preference.
+
+     No backticks in this comment: the stylesheet is inside a template literal. */
+  body.vscode-light, body.vscode-high-contrast-light {
+    --bg: #f6f1ed; --bg-elev: #fbfaf9; --bg-input: #eee5de;
+    --border: #e2d4ca;
+    --fg: #1a1a1a; --fg-muted: #705f54; --fg-subtle: #8f7a6c;
+    --green: #429429; --green-deep: #dbf6db; --gold: #d89a02;
+    --orange: #b35500; --orange-deep: #fff7ed;
+    --error: #b91c1c;
+    --blue: #0369a1;
   }
   @media (prefers-reduced-motion: reduce) {
     * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
