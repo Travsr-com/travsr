@@ -827,9 +827,11 @@ export function buildDepListHtml(
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
 <style>
   :root { --bg:#141414; --bg-elev:#1a1a1a; --border:#4d4d4d; --fg:#f6f1ed; --fg-muted:#c8b7ab; --green:#86df86; }
-  @media (prefers-color-scheme: light) {
-    :root { --bg:#f6f1ed; --bg-elev:#fbfaf9; --border:#e2d4ca; --fg:#1a1a1a; --fg-muted:#705f54; --green:#429429; }
-  }
+  /* Keyed on the theme kind VS Code stamps on the body, not on
+     prefers-color-scheme: that resolves from the OS appearance in an Electron
+     window, so a light desktop with a dark editor theme drew this light. See the
+     longer note in webviewShell. */
+  body.vscode-light, body.vscode-high-contrast-light { --bg:#f6f1ed; --bg-elev:#fbfaf9; --border:#e2d4ca; --fg:#1a1a1a; --fg-muted:#705f54; --green:#429429; }
   body { font-family: var(--vscode-font-family); padding: 16px; color: var(--fg); background: var(--bg); }
   h3 { margin: 0 0 12px; font-size: 14px; }
   ul.deps { list-style: none; margin: 0; padding: 0; }
