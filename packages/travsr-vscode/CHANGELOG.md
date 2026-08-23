@@ -5,14 +5,12 @@
 ### Added
 
 - **Pick which rotated log file the stats panel shows (#765).** The daemon log rotates daily and the panel had no way to ask for a particular day: it read the last N lines across rotations, so a day boundary was a divider inside one continuous stream. A File control now lists the rotated files newest first and reads one of them, defaulting to the newest. Labels carry the date, `today`/`yesterday` where that is what the date means, and the file size. Sizes rather than line counts on purpose: a line count cannot be known without reading the whole file, and the panel redraws on every reindex, so labelling every file with one would read all seven each time. The list is capped at seven and says `7 of 12 files` when there is more on disk, because that cap is one the daemon's `prune` applies and not a guarantee about the directory. The days are UTC and the control says so, since `rolling::daily` rotates on the UTC date while the rows render local times.
+- **Auto-refresh the log on an interval you choose (#765).** An `Auto` control offers off, 5s, 15s, 30s and 60s, replacing the `Follow` checkbox that never worked (below). A tick replaces the log lines and nothing else, so the filter box, the severity chip, the UTC and JSON toggles, all four selects and the scroll position survive it, and the view stays pinned to the tail if that is where you already were. The metric cards and the health banner are deliberately not on the timer, because moving those means rebuilding the panel and discarding everything above; the Refresh button still moves them. Off by default.
 
 ### Fixed
 
+- **`Follow` in the stats panel's log polled exactly once and then stopped (#765).** It set a three second interval inside the webview and posted a refresh on each tick, but a refresh assigns `panel.webview.html` wholesale, so the document holding the timer was replaced by the very tick that triggered it. The re-rendered checkbox carried no `checked` attribute either, so it cleared itself about three seconds after being ticked and never polled again, having read as enabled in the meantime. Replaced by the `Auto` control above, whose timer lives in the extension where a redraw cannot reach it.
 - **The daemon enforced neither log-retention cap while it was running (#765).** `prune` ran at daemon start and nowhere else, on the reasoning that daily rotation left no window in which files could accumulate. The window was the daemon's own uptime: `rolling::daily` opens a file a day and deletes nothing, so a daemon left up for a month held a month of files with neither `MAX_LOG_FILES` (7) nor `LOG_BUDGET_BYTES` (50 MB) applied since boot. Both caps now re-apply when the day rolls, checked on the existing five-minute tick, and a sweep that actually drops files logs `daemon.log_pruned` so a log directory that shrank says why.
-
-### Removed
-
-- **Follow mode in the stats panel's log (#765).** It set a three second interval in the webview and posted a refresh on each tick, but a refresh reassigns `panel.webview.html` wholesale and so replaced the document that both the interval and the checkbox lived in. It ticked once, stopped, and went on rendering as enabled, which is worse than not offering it. Removed rather than repaired: making panel state survive a redraw is #767. The manual Refresh button is unaffected.
 
 ## [0.10.0] - 2026-08-16
 

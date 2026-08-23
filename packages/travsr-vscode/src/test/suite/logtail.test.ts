@@ -13,6 +13,8 @@ import {
   formatLogSize,
   LOG_MAX_LINES,
   LOG_MAX_FILES_LISTED,
+  LOG_AUTO_SECONDS,
+  buildLogRowsHtml,
 } from "../../webviews";
 import type { LogEntry, LogFileInfo, StatsView } from "../../webviews";
 
@@ -659,30 +661,95 @@ suite("#log-rotation: file sizes read as sizes", () => {
   });
 });
 
-suite("#log-rotation: the panel has no Follow toggle", () => {
+suite("#log-rotation: auto-refresh on a chosen interval", () => {
+  /** Just the Auto `<select>`, because the toolbar has four of them and Since
+   *  offers `value="0"`, `value="5"` and `value="60"` of its own. Asserting on
+   *  the whole page passes for the wrong reason. */
+  const autoBlock = (html: string): string => {
+    const at = html.indexOf('id="logAuto"');
+    assert.ok(at >= 0, "the Auto control must be there");
+    return html.slice(at, html.indexOf("</select>", at));
+  };
+
+  test("the intervals are offered, Off is the default", () => {
+    const html = buildStatsHtml(STATS, [entry("a", "2026-08-22")], [], 500);
+    const auto = autoBlock(html);
+    assert.ok(html.includes("onLogAutoChange()"), "the change handler must be wired");
+    assert.ok(html.includes("setLogAuto"), "the choice must reach the extension");
+    for (const s of LOG_AUTO_SECONDS) {
+      assert.ok(auto.includes(`value="${s}"`), `${s} must be offered`);
+      assert.ok(auto.includes(s === 0 ? ">Off<" : `>${s}s<`), `${s} must be labelled`);
+    }
+    // Off by default: a panel that starts polling because it was opened is a
+    // surprise, and the reader has not asked for anything yet.
+    assert.ok(/value="0" selected/.test(auto), "Off is the default");
+  });
+
+  test("a running interval survives a full redraw", () => {
+    // The point of threading autoSeconds through: a redraw replaces the
+    // document, so without this the control would come back reading Off while
+    // the extension-side timer kept ticking, which is the Follow bug inverted.
+    const auto = autoBlock(buildStatsHtml(STATS, [entry("a", "2026-08-22")], [], 500, undefined, 15));
+    assert.ok(/value="15" selected/.test(auto));
+    assert.ok(!/value="0" selected/.test(auto), "Off must not also be selected");
+    assert.strictEqual(auto.match(/selected/g)?.length, 1, "exactly one option selected");
+  });
+
+  test("a tick replaces only the rows, and reapplies the filters to them", () => {
+    const html = buildStatsHtml(STATS, [entry("a", "2026-08-22")], [], 500);
+    assert.ok(html.includes("setLogRows"), "the tick message must be handled");
+    // The handler has to re-run filterLog, or the new rows arrive ignoring the
+    // search box and the severity chip that the old rows were obeying.
+    const handler = html.slice(html.indexOf("setLogRows"));
+    assert.ok(handler.includes("filterLog()"), "filters must be reapplied");
+    assert.ok(handler.includes("logEmpty"), "the empty-state node must be rebuilt");
+    assert.ok(handler.includes("scrollTop"), "scroll position must be handled");
+  });
+
   test("Follow is gone, and so is the message only it sent", () => {
-    // Follow meant to poll the log the way `travsr daemon logs --follow` does:
-    // a 3 second interval in the webview, posting a log-only refresh on each
-    // tick and a full one every tenth. It fired once. `refresh` assigns
-    // panel.webview.html wholesale, which replaces the document the interval
-    // lived in, so the timer died with the tick that triggered it, and the
-    // re-rendered checkbox carried no `checked` attribute. The box cleared
-    // itself about three seconds after you ticked it and never polled again.
+    // Follow meant to poll the log the way `travsr daemon logs --follow` does,
+    // but it set its interval in the webview. A refresh assigns
+    // panel.webview.html wholesale, so the document the timer lived in was
+    // replaced by the very tick that triggered it, and the re-rendered checkbox
+    // carried no `checked` attribute. It fired once, cleared itself about three
+    // seconds after being ticked, and never polled again.
     //
-    // Not moved to the extension host, where a timer would survive: a working
-    // 3 second poll would discard the search box, severity chip, toggles,
-    // scroll position and expanded rows on every tick, because that is what
-    // assigning the html does. Worth building after #767 makes panel state
-    // survive a redraw, not before.
+    // The Auto control above is the replacement, with the timer on the extension
+    // side where a redraw cannot reach it.
     const html = buildStatsHtml(STATS, [entry("a", "2026-08-22")], [], 500);
     assert.ok(!html.includes("logFollow"), "no Follow checkbox");
     assert.ok(!html.includes("toggleFollow"), "no Follow handler");
     assert.ok(!html.includes("refreshLog"), "its only message goes with it");
-    // What is left to bring the panel up to date by hand.
     assert.ok(html.includes('id="refreshBtn"'), "manual Refresh must survive");
     // UTC and JSON are local filters over rows already in the DOM, so they
     // never depended on a redraw and are unaffected.
     assert.ok(html.includes('id="logUtc"'));
     assert.ok(html.includes('id="logJson"'));
+  });
+});
+
+suite("#log-rotation: the rows a tick sends are the rows a render builds", () => {
+  test("buildLogRowsHtml output is what the full page embeds", () => {
+    // Two paths render the same log now: a full render and an auto tick. If they
+    // ever diverge, a polled panel drifts away from a refreshed one, so the page
+    // is asserted to contain exactly what the tick would send.
+    const log = [entry("first", "2026-08-22"), entry("second", "2026-08-22")];
+    const rows = buildLogRowsHtml(log);
+    assert.ok(rows.includes("first") && rows.includes("second"));
+    assert.ok(buildStatsHtml(STATS, log, [], 500).includes(rows));
+  });
+
+  test("an empty log says how to start the daemon, on both paths", () => {
+    const rows = buildLogRowsHtml([]);
+    assert.ok(rows.includes("No daemon log yet"));
+    assert.ok(rows.includes("travsr daemon start"));
+    assert.ok(buildStatsHtml(STATS, [], [], 500).includes(rows));
+  });
+
+  test("rows run newest first, and the caller's array is not reordered", () => {
+    const log = [entry("older", "2026-08-22"), entry("newer", "2026-08-22")];
+    const rows = buildLogRowsHtml(log);
+    assert.ok(rows.indexOf("newer") < rows.indexOf("older"), "newest first");
+    assert.strictEqual(log[0].message, "older", "reverse() must not hit the caller");
   });
 });

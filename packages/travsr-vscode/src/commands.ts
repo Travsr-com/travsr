@@ -28,6 +28,8 @@ import {
   buildPanelLoadingHtml,
   LOG_MAX_LINES,
   LOG_MAX_FILES_LISTED,
+  LOG_AUTO_SECONDS,
+  buildLogRowsHtml,
   LANG_CONTRACT_FIELDS,
   LANG_CONTRACT_VERSION,
   type RepoRow,
@@ -964,6 +966,7 @@ type PanelMessage =
 
   | { command: "setLogLines"; lines: number }
   | { command: "setLogFile"; file: string }
+  | { command: "setLogAuto"; seconds: number }
   | { command: "refresh" };
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
@@ -1121,6 +1124,58 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
   // explicit pick is a pick of that day and stays put when the day rolls, while
   // the default follows the daemon onto the new file.
   let logFile: string | undefined;
+  // Auto-refresh interval in seconds, 0 for off.
+  //
+  // The timer lives here rather than in the webview, and that is the whole
+  // difference from the Follow toggle this replaces. `refresh()` assigns
+  // `panel.webview.html` wholesale, so a `setInterval` inside the document dies
+  // with the first tick it triggers: Follow fired once, cleared its own
+  // checkbox, and never polled again.
+  let logAuto = 0;
+  let autoTimer: ReturnType<typeof setInterval> | undefined;
+
+  const stopAuto = (): void => {
+    if (autoTimer !== undefined) {
+      clearInterval(autoTimer);
+      autoTimer = undefined;
+    }
+  };
+
+  /** One auto-refresh tick: new log rows into the live document, nothing else.
+   *
+   *  Deliberately not `refresh()`. A full render on a timer would discard the
+   *  search box, the severity chip, the toggles, the scroll position and every
+   *  expanded row on every tick, which is #767, and inflicting it every few
+   *  seconds is worse than not polling at all. Replacing the rows leaves all of
+   *  that standing.
+   *
+   *  What that trades away: the metric cards and the health banner do not move
+   *  on a tick, so a daemon that dies while you watch is reported by its own log
+   *  lines arriving (or stopping) rather than by the banner. The Refresh button
+   *  moves everything. Stated in the control's tooltip so it is not a surprise.
+   */
+  const autoTick = (): void => {
+    const entry = managedPanels.get("travsrStats");
+    if (entry === undefined) {
+      // The panel was closed. Nothing else clears this, and posting into a
+      // disposed webview is pointless, so the timer retires itself. Costs at
+      // most one dead tick after a close.
+      stopAuto();
+      return;
+    }
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (root === undefined) return;
+    const listed = daemonLogFileList(root);
+    const selected =
+      logFile !== undefined && listed.files.some((f) => f.name === logFile)
+        ? logFile
+        : (listed.files[0]?.name ?? "");
+    if (selected === "") return;
+    void entry.panel.webview.postMessage({
+      command: "setLogRows",
+      rows: buildLogRowsHtml(readDaemonLogFile(root, selected, logLines)),
+    });
+  };
 
   const render = async (): Promise<string> => {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -1145,7 +1200,13 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
     const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
     lastStats = stats;
     lastDiags = diags;
-    return buildStatsHtml(stats, log, diags, logLines, { ...logFiles, selected });
+    // A panel that was closed and reopened renders the stored interval as
+    // selected, so the timer has to come back with it: otherwise the control
+    // claims to be polling while nothing is.
+    if (logAuto > 0 && autoTimer === undefined) {
+      autoTimer = setInterval(autoTick, logAuto * 1000);
+    }
+    return buildStatsHtml(stats, log, diags, logLines, { ...logFiles, selected }, logAuto);
   };
 
   const handle = async (msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
@@ -1204,6 +1265,18 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
       } finally {
         logOnly = false;
       }
+      return;
+    }
+    if (msg.command === "setLogAuto") {
+      // Validated against the options the control actually offers rather than
+      // trusted: this number comes from the webview and goes into setInterval,
+      // where a 0.001 would busy-loop the extension host.
+      logAuto = LOG_AUTO_SECONDS.includes(msg.seconds) ? msg.seconds : 0;
+      stopAuto();
+      if (logAuto > 0) autoTimer = setInterval(autoTick, logAuto * 1000);
+      // No refresh: the select in the live document already shows the choice,
+      // and redrawing to confirm it would throw away the panel state the tick
+      // path exists to protect. `autoSeconds` renders it on the next full pass.
       return;
     }
     await refresh();

@@ -697,6 +697,68 @@ export interface StatsView {
   lastIndexed: string;
 }
 
+/** Severity ranks, the same semantics `travsr daemon logs --level` uses: warn
+ *  means warn and above, not warn alone. */
+const LOG_RANK: Record<string, number> = { TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4 };
+const rankOf = (lvl: string): number => LOG_RANK[lvl] ?? 2;
+
+/** The intervals the log's Auto control offers, in seconds. 0 is off.
+ *
+ *  Exported so the extension can reject a value the control never offered
+ *  instead of trusting a number from the webview into `setInterval`. */
+export const LOG_AUTO_SECONDS: readonly number[] = [0, 5, 15, 30, 60];
+
+/** The `.log-line` rows for a log tail, newest first.
+ *
+ *  Its own function because auto-refresh sends only these rows into a live
+ *  webview rather than rebuilding the document. `refresh()` assigns
+ *  `panel.webview.html` wholesale, so redrawing every few seconds would throw
+ *  away the search box, the severity chip, the toggles, the scroll position and
+ *  every expanded row on each tick. Replacing the rows in place leaves all of
+ *  that standing, which is the difference between a poll you can read and a
+ *  poll that fights you. */
+export function buildLogRowsHtml(log: LogEntry[]): string {
+  // Every line the reader returned is rendered. It used to cap at 200 while the
+  // header and the chips counted the full array, so on a log over 200 lines the
+  // panel claimed 342 with 200 rows in the DOM, and the 500 option could never
+  // show more than 200. The reader's own cap is the only cap now.
+  if (log.length === 0) {
+    return `<div class="empty">No daemon log yet. Run <span class="mono">travsr daemon start</span>.</div>`;
+  }
+  // Copy first: reverse() is in place, and this array belongs to the caller.
+  return [...log]
+    .reverse()
+    .flatMap((e, i, rows) => {
+      const row =
+        `<div class="log-line lvl-${esc(e.level)}" data-rank="${rankOf(e.level)}"` +
+        ` data-iso="${esc(e.iso)}" data-json="${esc(e.raw)}" data-tg="${esc(e.target)}">` +
+        `<span class="caret" aria-hidden="true"></span>` +
+        `<span class="mono muted t" data-local="${esc(e.time)}">${esc(e.time)}</span>` +
+        `<span class="pill p-${esc(e.level)}">${esc(e.level || "\u2014")}</span>` +
+        `<span class="mono muted tg">${esc(e.target)}</span>` +
+        `<span class="msg" data-raw="${esc(e.message)}">${esc(e.message)}</span>` +
+        `<span class="mono muted detail" data-raw="${esc(e.detail)}">${renderDetail(e.detail)}</span>` +
+        `<span class="jsonline mono">${highlightJson(e.raw)}</span></div>`;
+      // Rows run newest first, so a day divider belongs ABOVE the first row of
+      // each older file: it labels the block that follows it. Emitted only where
+      // the day actually changes, so a single-day log has none. `log-day`,
+      // deliberately not `log-line`: filterLog() counts and filters
+      // `.log-line`, and a divider is neither a line nor a match.
+      //
+      // Unreachable from the panel now that the File control reads one file at a
+      // time, since a single file cannot change day. Kept because this is a pure
+      // builder over whatever entries it is handed, and `readDaemonLogTail`
+      // still produces multi-day input for the tests that hold it to parity with
+      // the CLI's `LogTail::backfill`.
+      const prev = i > 0 ? rows[i - 1].day : undefined;
+      const needsDivider = i > 0 && e.day !== undefined && e.day !== prev;
+      return needsDivider
+        ? [`<div class="log-day" data-day="${esc(e.day ?? "")}">${esc(e.day ?? "")}</div>`, row]
+        : [row];
+    })
+    .join("\n");
+}
+
 /** Graph stats dashboard: metric cards, recent activity, and the log tail. */
 export function buildStatsHtml(
   stats: StatsView,
@@ -720,7 +782,12 @@ export function buildStatsHtml(
    *  Absent renders no File control at all, so a caller that predates rotation
    *  awareness (and every test that does not care) still gets a working panel
    *  rather than an empty dropdown. */
-  logFiles?: { files: LogFileInfo[]; onDisk: number; selected: string }
+  logFiles?: { files: LogFileInfo[]; onDisk: number; selected: string },
+  /** The auto-refresh interval in seconds, 0 for off, so the Auto control comes
+   *  back set the way the user left it after a full redraw. The timer itself
+   *  lives in the extension, not in this document, because a redraw replaces
+   *  this document. */
+  autoSeconds: number = 0
 ): string {
   const card = (k: string, v: string): string =>
     `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
@@ -763,8 +830,6 @@ export function buildStatsHtml(
 
   // Severity threshold, the same semantics `travsr daemon logs --level` uses:
   // warn means warn and above, not warn alone.
-  const RANK: Record<string, number> = { TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4 };
-  const rankOf = (lvl: string): number => RANK[lvl] ?? 2;
   const counts = { all: log.length, info: 0, warn: 0, error: 0 };
   for (const e of log) {
     const r = rankOf(e.level);
@@ -777,44 +842,11 @@ export function buildStatsHtml(
     `<button class="chip-btn" data-level="${id}" onclick="setLevel('${id}',this)">` +
     `${esc(label)} <span class="chip-n">${n}</span></button>`;
 
-  // Every line the reader returned is rendered. It used to cap at 200 while the
-  // header and the chips counted the full array, so on a log over 200 lines the
-  // panel claimed 342 with 200 rows in the DOM, and the 500 option could never
-  // show more than 200. The reader's own cap is the only cap now.
-  const logRows = log.length
-    ? // Copy first: reverse() is in place, and this array belongs to the caller.
-      [...log]
-        .reverse()
-        .flatMap((e, i, rows) => {
-          const row =
-            `<div class="log-line lvl-${esc(e.level)}" data-rank="${rankOf(e.level)}"` +
-            ` data-iso="${esc(e.iso)}" data-json="${esc(e.raw)}" data-tg="${esc(e.target)}">` +
-            `<span class="caret" aria-hidden="true"></span>` +
-            `<span class="mono muted t" data-local="${esc(e.time)}">${esc(e.time)}</span>` +
-            `<span class="pill p-${esc(e.level)}">${esc(e.level || "\u2014")}</span>` +
-            `<span class="mono muted tg">${esc(e.target)}</span>` +
-            `<span class="msg" data-raw="${esc(e.message)}">${esc(e.message)}</span>` +
-            `<span class="mono muted detail" data-raw="${esc(e.detail)}">${renderDetail(e.detail)}</span>` +
-            `<span class="jsonline mono">${highlightJson(e.raw)}</span></div>`;
-          // Rows run newest first, so a day divider belongs ABOVE the first row
-          // of each older file: it labels the block that follows it. Emitted
-          // only where the day actually changes, so a single-day log has none.
-          // `log-day`, deliberately not `log-line`: filterLog() counts and
-          // filters `.log-line`, and a divider is neither a line nor a match.
-          //
-          // Unreachable from the panel now that the File control reads one file
-          // at a time, since a single file cannot change day. Kept because this
-          // is a pure builder over whatever entries it is handed, and
-          // `readDaemonLogTail` still produces multi-day input for the tests
-          // that hold it to parity with the CLI's `LogTail::backfill`.
-          const prev = i > 0 ? rows[i - 1].day : undefined;
-          const needsDivider = i > 0 && e.day !== undefined && e.day !== prev;
-          return needsDivider
-            ? [`<div class="log-day" data-day="${esc(e.day ?? "")}">${esc(e.day ?? "")}</div>`, row]
-            : [row];
-        })
-        .join("\n")
-    : `<div class="empty">No daemon log yet. Run <span class="mono">travsr daemon start</span>.</div>`;
+  const logRows = buildLogRowsHtml(log);
+  const autoOptions = LOG_AUTO_SECONDS.map(
+    (s) =>
+      `<option value="${s}"${s === autoSeconds ? " selected" : ""}>${s === 0 ? "Off" : `${s}s`}</option>`
+  ).join("\n      ");
 
   // Health reads before anything else, because "is something wrong" is the
   // question the panel is opened with. All clear is its own state, not an empty
@@ -937,6 +969,12 @@ ${activityRows}
       <option value="1440">24h</option>
     </select>
   </label>
+  <label class="sel">Auto
+    <select id="logAuto" onchange="onLogAutoChange()"
+            title="Re-read the log on a timer. Only the lines are replaced, so the filter, the severity chip and the scroll position are kept; the metric cards and the health banner move on Refresh.">
+      ${autoOptions}
+    </select>
+  </label>
   <label class="tog"><input type="checkbox" id="logUtc" onchange="filterLog()"> UTC</label>
   <label class="tog"><input type="checkbox" id="logJson" onchange="filterLog()"> JSON</label>
 </div>
@@ -1013,6 +1051,36 @@ function onLogLinesChange() {
   }
   filterLog();
 }
+
+// Auto-refresh. The interval is set in the EXTENSION, not here, and that is the
+// whole reason this works where the old Follow toggle did not: a refresh assigns
+// panel.webview.html wholesale, so a setInterval in this document dies with the
+// first tick it triggers. This only reports the choice.
+function onLogAutoChange() {
+  var sel = document.getElementById('logAuto');
+  if (sel) vscode.postMessage({ command: 'setLogAuto', seconds: Number(sel.value) });
+}
+
+// An auto tick replaces the rows and nothing else. The search box, the severity
+// chip (minRank is a variable in this document, and this document survives), the
+// UTC/JSON toggles and all four selects keep their state; filterLog() reapplies
+// them to the new rows.
+//
+// Scroll: pinned to the bottom if that is where the reader already was, since
+// watching the tail arrive is the point of a poll, and otherwise left where they
+// put it so a tick cannot yank the line they were reading off the screen.
+window.addEventListener('message', function (ev) {
+  var d = ev.data;
+  if (!d || d.command !== 'setLogRows') return;
+  var box = document.getElementById('logBox');
+  if (!box) return;
+  var atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 4;
+  var was = box.scrollTop;
+  box.innerHTML =
+    '<div class="empty" id="logEmpty" style="display:none">No lines match this filter.</div>' + d.rows;
+  filterLog();
+  box.scrollTop = atBottom ? box.scrollHeight : was;
+});
 
 // The File control has no local fast path of its own. Narrowing Lines hides
 // rows that are already in the DOM; another file's rows were never sent at all,
