@@ -53,11 +53,16 @@ removing the filter would loop forever. Deleting the model's rows up front makes
 every node pending again with no other change to the loop.
 
 **Crash-safety.** The old vectors are gone before any new one is written, so at
-every moment the rows present are all from the current engine (never a torn or
-mixed file). A killed run simply leaves fewer rows; a later ordinary `--reindex`
-fills the rest with the same engine. Forgetting the recorded engine up front
-means a mid-run crash leaves provenance honest (single engine), and a completed
-run records the current engine with no mixed-engine warning.
+every moment the rows present in `embed.db` are all from the current engine
+(never a torn or mixed file). The stale HNSW index files are removed in the same
+up-front step, because search reads the index directly and `rebuild_index` only
+rewrites it after the full re-embed; leaving them would let a killed run keep
+serving old-engine vectors for rows that no longer exist. A killed run therefore
+degrades to "no index" (visible, recoverable by a plain `--reindex`) and fewer
+rows, all current-engine, rather than a stale index that looks healthy.
+Forgetting the recorded engine up front means a mid-run crash leaves provenance
+honest (single engine), and a completed run records the current engine with no
+mixed-engine warning.
 
 ### 2. Sidecar: honest, end-of-run notice (F8)
 
@@ -94,3 +99,20 @@ Until step 1 lands, honesty test (b) is red **by design** on a networked run
   (every daemon spawn passes `reembed = false`).
 - A future sidecar-behavior dependency repeats this pattern: add the behavior,
   release the sidecar, floor to it in the same commit that first relies on it.
+- **Upgrade wall (accepted trade-off).** `EMBED_MIN_VERSION` is a single host
+  constant consumed by `resolve_backend`, the chokepoint every embed spawn funnels
+  through (foreground `--rebuild`, the daemon's background phase-1/phase-2/all
+  passes, and `run_parallel_reindex_blocking`). Raising it to v1.6.0 therefore
+  refuses **all** embedding for any user still on a sidecar at or below v1.5.0 -
+  including ordinary background reindexing - until they run `travsr embed init
+  --reinstall`, even though `--reembed` is strictly opt-in. This differs from the
+  v1.2.0 floor, which guarded the #376 content-hash CDC path the host relied on
+  unconditionally, so a blunt floor was the only correct answer there. Here a
+  narrower gate (refuse only on the `--rebuild` path, leave `PhaseFilter`-only
+  spawns on the v1.2.0 floor) would protect the same case without the wall. We
+  keep the single blunt floor deliberately, for RFC-025 consistency: one
+  honesty-tested constant, one refusal message, no per-operation floor threaded
+  through the trust-boundary chokepoint. The cost is that the reinstall prompt
+  reaches the whole installed base on first upgrade rather than only users of the
+  new flag. If that cost proves too high in practice, splitting the floor by
+  operation is the escape hatch and does not change the contract above.

@@ -125,7 +125,11 @@ pub enum EmbedCommand {
         /// Use this after switching the embedding model, when older embeddings
         /// may be inconsistent with newer ones. Slower than a normal reindex,
         /// which only fills in what is missing.
-        #[arg(long)]
+        ///
+        /// Cannot be combined with `--phase1`: the sidecar clears the whole
+        /// model before re-embedding, so a phase-restricted rebuild would delete
+        /// the phase 2 tier and never refill it.
+        #[arg(long, conflicts_with = "phase1")]
         rebuild: bool,
         /// Only embed symbol nodes with shell_number >= N (Phase 1 high-centrality pass).
         /// Omit to embed all pending nodes.
@@ -641,9 +645,12 @@ fn prompt_cpu_budget() -> Result<Option<travsr_plugin_host::Capacity>> {
     let parsed = parse_cpu_choice(&choice, &custom);
     match choice.as_str() {
         "" | "1" | "2" | "3" | "4" => {}
-        "5" if parsed.is_none() => println!("  (not a valid percent, using Full)"),
+        // parsed is None on these two arms, which means "no explicit choice,
+        // fall through to config/env/default" (F1) rather than Full, so the
+        // message must not claim Full or it repeats the very bug F1 fixed.
+        "5" if parsed.is_none() => println!("  (not a valid percent, using the configured budget)"),
         "5" => {}
-        _ => println!("  (unrecognised, using Full)"),
+        _ => println!("  (unrecognised, using the configured budget)"),
     }
     Ok(parsed)
 }
@@ -2808,6 +2815,27 @@ mod embed_ux_tests {
         assert_eq!(parse_cpu_choice("1", ""), Some(Capacity::Percent(100)));
     }
 
+    /// `--rebuild` and `--phase1` must be mutually exclusive: the sidecar clears
+    /// the whole model before re-embedding, so a phase-restricted rebuild would
+    /// delete the phase 2 tier and never refill it. clap must reject the combo.
+    #[test]
+    fn rebuild_and_phase1_conflict() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(subcommand)]
+            cmd: EmbedCommand,
+        }
+        // Each alone parses.
+        assert!(Wrap::try_parse_from(["x", "reindex", "--rebuild"]).is_ok());
+        assert!(Wrap::try_parse_from(["x", "reindex", "--phase1", "5"]).is_ok());
+        // Together they are rejected.
+        let err = Wrap::try_parse_from(["x", "reindex", "--rebuild", "--phase1", "5"])
+            .err()
+            .expect("--rebuild --phase1 must conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
     #[test]
     fn preset_choices_map_to_their_budgets() {
         assert_eq!(parse_cpu_choice("2", ""), Some(Capacity::Percent(50)));
@@ -2818,7 +2846,7 @@ mod embed_ux_tests {
     #[test]
     fn custom_choice_parses_its_percent() {
         assert_eq!(parse_cpu_choice("5", "73"), Some(Capacity::Percent(73)));
-        // An unparseable custom percent yields no override (falls through to Full).
+        // An unparseable custom percent yields no override (falls through to config).
         assert_eq!(parse_cpu_choice("5", "abc"), None);
     }
 
