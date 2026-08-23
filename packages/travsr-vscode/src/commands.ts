@@ -441,9 +441,8 @@ function readFileTailLines(file: string, maxLines: number): string[] {
  * with seven files kept. "The last 500 lines" is therefore rarely 500 lines of
  * one file: shortly after 00:00 UTC today's file holds a handful and the rest
  * of the answer sits in yesterday's. Reading only the newest file returned
- * short without saying so, which reads as "the daemon logged almost nothing" —
- * and with the panel's Follow mode polling every three seconds, a user watching
- * across midnight saw the log empty itself while the daemon was healthy.
+ * short without saying so, so a healthy daemon read as one that had logged
+ * almost nothing.
  *
  * So older files are walked, newest first, each supplying only what the newer
  * ones could not, stopping as soon as the request is satisfied. This mirrors
@@ -962,7 +961,7 @@ type PanelMessage =
   | { command: "pickRepo" }
   | { command: "initRepo" }
   | { command: "openFile"; path: string }
-  | { command: "refreshLog" }
+
   | { command: "setLogLines"; lines: number }
   | { command: "setLogFile"; file: string }
   | { command: "refresh" };
@@ -1105,9 +1104,10 @@ export function registerShowRepos(client: McpClient): vscode.Disposable {
  * travsr.showGraphStats — read-only metrics dashboard webview.
  */
 export function registerShowGraphStats(client: McpClient): vscode.Disposable {
-  // Kept so a follow tick can redraw the log without re-running the two
-  // expensive halves of a render. Undefined until the first full pass, so a
-  // log-only refresh before then falls back to doing the work.
+  // Kept so a log-only refresh can redraw without re-running the two expensive
+  // halves of a render, which is what changing Lines or File does. Undefined
+  // until the first full pass, so a log-only refresh before then falls back to
+  // doing the work.
   let lastStats: StatsView | undefined;
   let lastDiags: Diagnostic[] = [];
   let logOnly = false;
@@ -1128,7 +1128,7 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
     const stats = reuse ? (lastStats as StatsView) : buildStatsView(await client.callTool("get_graph_stats"));
     // Read straight from the log file rather than asking the daemon: it works
     // after a crash, which is when the panel is worth opening. This is the
-    // cheap half, and the only half a follow tick needs.
+    // cheap half, and the only half a log-only refresh needs.
     // Re-listed every render rather than cached: rotation and the daemon's
     // prune both change the directory under an open panel.
     const logFiles = root ? daemonLogFileList(root) : { files: [], onDisk: 0 };
@@ -1198,15 +1198,6 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
       // again before it opens anything, so a crafted message cannot turn into a
       // path.
       logFile = msg.file;
-      logOnly = true;
-      try {
-        await refresh();
-      } finally {
-        logOnly = false;
-      }
-      return;
-    }
-    if (msg.command === "refreshLog") {
       logOnly = true;
       try {
         await refresh();

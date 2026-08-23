@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Pick which rotated log file the stats panel shows (#765).** The daemon log rotates daily and the panel had no way to ask for a particular day: it read the last N lines across rotations, so a day boundary was a divider inside one continuous stream. A File control now lists the rotated files newest first and reads one of them, defaulting to the newest. Labels carry the date, `today`/`yesterday` where that is what the date means, and the file size. Sizes rather than line counts on purpose: a line count cannot be known without reading the whole file, and the panel redraws on every reindex, so labelling every file with one would read all seven each time. The list is capped at seven and says `7 of 12 files` when there is more on disk, because that cap is one the daemon's `prune` applies and not a guarantee about the directory. The days are UTC and the control says so, since `rolling::daily` rotates on the UTC date while the rows render local times.
+
+### Fixed
+
+- **The daemon enforced neither log-retention cap while it was running (#765).** `prune` ran at daemon start and nowhere else, on the reasoning that daily rotation left no window in which files could accumulate. The window was the daemon's own uptime: `rolling::daily` opens a file a day and deletes nothing, so a daemon left up for a month held a month of files with neither `MAX_LOG_FILES` (7) nor `LOG_BUDGET_BYTES` (50 MB) applied since boot. Both caps now re-apply when the day rolls, checked on the existing five-minute tick, and a sweep that actually drops files logs `daemon.log_pruned` so a log directory that shrank says why.
+
+### Removed
+
+- **Follow mode in the stats panel's log (#765).** It set a three second interval in the webview and posted a refresh on each tick, but a refresh reassigns `panel.webview.html` wholesale and so replaced the document that both the interval and the checkbox lived in. It ticked once, stopped, and went on rendering as enabled, which is worse than not offering it. Removed rather than repaired: making panel state survive a redraw is #767. The manual Refresh button is unaffected.
+
 ## [0.10.0] - 2026-08-16
 
 ### Added

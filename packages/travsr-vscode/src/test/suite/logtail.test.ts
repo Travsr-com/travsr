@@ -658,3 +658,31 @@ suite("#log-rotation: file sizes read as sizes", () => {
     assert.strictEqual(formatLogSize(52 * 1024 * 1024), "52.0 MB");
   });
 });
+
+suite("#log-rotation: the panel has no Follow toggle", () => {
+  test("Follow is gone, and so is the message only it sent", () => {
+    // Follow meant to poll the log the way `travsr daemon logs --follow` does:
+    // a 3 second interval in the webview, posting a log-only refresh on each
+    // tick and a full one every tenth. It fired once. `refresh` assigns
+    // panel.webview.html wholesale, which replaces the document the interval
+    // lived in, so the timer died with the tick that triggered it, and the
+    // re-rendered checkbox carried no `checked` attribute. The box cleared
+    // itself about three seconds after you ticked it and never polled again.
+    //
+    // Not moved to the extension host, where a timer would survive: a working
+    // 3 second poll would discard the search box, severity chip, toggles,
+    // scroll position and expanded rows on every tick, because that is what
+    // assigning the html does. Worth building after #767 makes panel state
+    // survive a redraw, not before.
+    const html = buildStatsHtml(STATS, [entry("a", "2026-08-22")], [], 500);
+    assert.ok(!html.includes("logFollow"), "no Follow checkbox");
+    assert.ok(!html.includes("toggleFollow"), "no Follow handler");
+    assert.ok(!html.includes("refreshLog"), "its only message goes with it");
+    // What is left to bring the panel up to date by hand.
+    assert.ok(html.includes('id="refreshBtn"'), "manual Refresh must survive");
+    // UTC and JSON are local filters over rows already in the DOM, so they
+    // never depended on a redraw and are unaffected.
+    assert.ok(html.includes('id="logUtc"'));
+    assert.ok(html.includes('id="logJson"'));
+  });
+});

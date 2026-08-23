@@ -939,7 +939,6 @@ ${activityRows}
   </label>
   <label class="tog"><input type="checkbox" id="logUtc" onchange="filterLog()"> UTC</label>
   <label class="tog"><input type="checkbox" id="logJson" onchange="filterLog()"> JSON</label>
-  <label class="tog"><input type="checkbox" id="logFollow" onchange="toggleFollow(this)"> Follow</label>
 </div>
 <div class="log" id="logBox" onclick="onLogClick(event)">
 <div class="empty" id="logEmpty" style="display:none">No lines match this filter.</div>
@@ -979,25 +978,6 @@ function mark(el, q) {
   el.appendChild(document.createTextNode(raw.slice(i)));
 }
 
-var followTimer = null;
-var followTick = 0;
-function toggleFollow(cb) {
-  if (followTimer) { clearInterval(followTimer); followTimer = null; }
-  followTick = 0;
-  // Re-reads the file on a timer, which is what --follow does. 3s is slower
-  // than a tail and fast enough for a panel you glance at.
-  //
-  // Most ticks ask for the log alone. A full refresh costs a get_graph_stats
-  // round trip and a travsr status process, and paying that every three
-  // seconds to redraw a log is not what --follow does. Every tenth tick is
-  // full, so the health banner cannot claim the daemon is up for more than
-  // thirty seconds after it stops, which is the one thing that must not go
-  // stale while you are watching the log.
-  if (cb.checked) followTimer = setInterval(function () {
-    followTick += 1;
-    vscode.postMessage({ command: followTick % 10 === 0 ? 'refresh' : 'refreshLog' });
-  }, 3000);
-}
 
 function onLogClick(ev) {
   // A ref wins over the row toggle: clicking the filename should open the file,
