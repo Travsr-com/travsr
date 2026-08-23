@@ -678,21 +678,24 @@ mod tests {
         // a month held a month of files and neither cap had been applied since
         // boot. Rotation is what makes them enforceable again.
         let d = tempfile::tempdir().unwrap();
-        write(d.path(), "daemon.log.2026-08-10", "a
-");
-        write(d.path(), "daemon.log.2026-08-11", "b
-");
+        write(d.path(), "daemon.log.2026-08-10", "a\n");
+        write(d.path(), "daemon.log.2026-08-11", "b\n");
         let mut last = current_log_file(d.path());
 
         // Nothing rotated: no sweep, nothing removed, even though a cap of 1
         // would otherwise take a file.
-        assert_eq!(prune_if_rotated(d.path(), &mut last, LOG_BUDGET_BYTES, 1), 0);
+        assert_eq!(
+            prune_if_rotated(d.path(), &mut last, LOG_BUDGET_BYTES, 1),
+            0
+        );
         assert_eq!(log_files(d.path()).len(), 2);
 
         // The day rolls. The cap applies now, so the oldest goes.
-        write(d.path(), "daemon.log.2026-08-12", "c
-");
-        assert_eq!(prune_if_rotated(d.path(), &mut last, LOG_BUDGET_BYTES, 2), 1);
+        write(d.path(), "daemon.log.2026-08-12", "c\n");
+        assert_eq!(
+            prune_if_rotated(d.path(), &mut last, LOG_BUDGET_BYTES, 2),
+            1
+        );
         let left: Vec<String> = log_files(d.path())
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -700,7 +703,10 @@ mod tests {
         assert_eq!(left, vec!["daemon.log.2026-08-11", "daemon.log.2026-08-12"]);
 
         // Same newest file on the next tick: no second sweep.
-        assert_eq!(prune_if_rotated(d.path(), &mut last, LOG_BUDGET_BYTES, 2), 0);
+        assert_eq!(
+            prune_if_rotated(d.path(), &mut last, LOG_BUDGET_BYTES, 2),
+            0
+        );
         assert_eq!(log_files(d.path()).len(), 2);
     }
 
@@ -710,7 +716,10 @@ mod tests {
         // rotation happened. Counting it as one would sweep on every tick.
         let d = tempfile::tempdir().unwrap();
         let mut last = None;
-        assert_eq!(prune_if_rotated(d.path(), &mut last, LOG_BUDGET_BYTES, 7), 0);
+        assert_eq!(
+            prune_if_rotated(d.path(), &mut last, LOG_BUDGET_BYTES, 7),
+            0
+        );
         assert!(last.is_none());
     }
 }
