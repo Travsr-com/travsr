@@ -147,6 +147,13 @@ jobs:
       # To bump MSRV: update rust-version in Cargo.toml, update the toolchain
       # version below AND the RUSTUP_TOOLCHAIN value in the check step (both,
       # they are not linked), and add a changelog entry.
+      #
+      # The job `name:` above carries the version, and release.yml's preflight
+      # matches required checks by exact name, so renaming this job without
+      # editing that list makes every release tag fail preflight on a check
+      # that no longer exists. The 1.75 to 1.88 bump did exactly that.
+      # clippy.toml's `msrv` is a third copy; raising it unlocks newer lints,
+      # so it is a code change, not a rename, and belongs in its own commit.
       - name: Install Rust toolchain (1.88.0)
         uses: dtolnay/rust-toolchain@1.88.0
 

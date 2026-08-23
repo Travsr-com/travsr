@@ -132,7 +132,7 @@ jobs:
             "test (macos-latest)"
             "test (windows-latest)"
             "lsif-ts (build + test)"
-            "MSRV (rust 1.75)"
+            "MSRV (rust 1.88)"
             "cargo-deny"
             "plugin-hashes.lock"
             "release/installer target maps"
