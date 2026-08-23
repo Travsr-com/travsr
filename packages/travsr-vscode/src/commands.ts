@@ -26,6 +26,7 @@ import {
   buildStatsHtml,
   buildLanguagesHtml,
   buildPanelLoadingHtml,
+  LOG_MAX_LINES,
   LANG_CONTRACT_FIELDS,
   LANG_CONTRACT_VERSION,
   type RepoRow,
@@ -330,57 +331,145 @@ export function timeAgo(ms: number): string {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
+/** Bytes read per backward step when scanning a log file from its end. */
+const LOG_CHUNK_BYTES = 64 * 1024;
+
+/** Hard ceiling on how far back a single file is scanned.
+ *
+ *  The backward scan normally stops as soon as it has enough newlines, so this
+ *  only binds on a pathological file — one enormous line, or a file with no
+ *  newlines at all — where "scan until enough lines" would otherwise read all
+ *  50 MB of a rotated log into a webview. */
+const LOG_MAX_BYTES_PER_FILE = 8 * 1024 * 1024;
+
+/** Every rotated log file in `dir`, oldest first.
+ *
+ *  `tracing-appender` suffixes with an ISO date, which sorts lexicographically
+ *  in chronological order, so no date parsing is required. Mirrors
+ *  `log_files` in `crates/travsr-daemon/src/logfile.rs`, including its
+ *  files-only guard: a directory called `daemon.log.something` is not a log. */
+function daemonLogFiles(dir: string): string[] {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.startsWith("daemon.log"))
+      .map((e) => e.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/** The last `maxLines` complete lines of one log file, oldest first.
+ *
+ *  Scans backwards in chunks and stops as soon as enough newlines are in hand,
+ *  so cost is proportional to the tail read rather than to file size: a 400 MB
+ *  log tails as fast as a 4 KB one. Ports `line_start_from_end` /
+ *  `append_file_tail` from `logfile.rs`.
+ *
+ *  A scan that starts mid-file drops everything before the first newline,
+ *  because a seek lands in the middle of a line and half an entry is not an
+ *  entry. */
+function readFileTailLines(file: string, maxLines: number): string[] {
+  let fd: number;
+  let size: number;
+  try {
+    size = fs.statSync(file).size;
+    if (size === 0) return [];
+    fd = fs.openSync(file, "r");
+  } catch {
+    return [];
+  }
+  try {
+    let start = size;
+    let text = "";
+    // Grow the window backwards until it holds enough lines, reaches the start
+    // of the file, or hits the per-file ceiling.
+    for (;;) {
+      const next = Math.max(0, start - LOG_CHUNK_BYTES);
+      const len = start - next;
+      if (len <= 0) break;
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, next);
+      text = buf.toString("utf8") + text;
+      start = next;
+      if (start === 0) break;
+      if (size - start >= LOG_MAX_BYTES_PER_FILE) break;
+      // +1: the newline that terminates the line *before* the first one we
+      // want, which is what tells us the first wanted line is whole.
+      let newlines = 0;
+      for (let i = 0; i < text.length; i++) {
+        if (text.charCodeAt(i) === 10) newlines++;
+      }
+      if (newlines > maxLines) break;
+    }
+    if (start > 0) text = text.slice(text.indexOf("\n") + 1);
+    return text
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .slice(-maxLines);
+  } catch {
+    return [];
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
 /**
- * Read the tail of the daemon log.
+ * Read the tail of the daemon log, across rotated files.
  *
- * `daemon.log.<UTC-DATE>` is JSON lines, one object per line. Only the last
- * `maxBytes` are read, by seeking rather than by loading the file and slicing:
- * the log is capped at 50 MB across rotations and the newest file is never
- * pruned even when it alone exceeds that, so reading it whole to show 200 lines
- * is a bounded-looking call that is not bounded.
+ * `daemon.log.<UTC-DATE>` is JSON lines, one object per line, rotated daily
+ * with seven files kept. "The last 500 lines" is therefore rarely 500 lines of
+ * one file: shortly after 00:00 UTC today's file holds a handful and the rest
+ * of the answer sits in yesterday's. Reading only the newest file returned
+ * short without saying so, which reads as "the daemon logged almost nothing" —
+ * and with the panel's Follow mode polling every three seconds, a user watching
+ * across midnight saw the log empty itself while the daemon was healthy.
  *
- * The first line of the window is dropped when the window did not start at byte
- * zero, because a seek lands mid-line.
+ * So older files are walked, newest first, each supplying only what the newer
+ * ones could not, stopping as soon as the request is satisfied. This mirrors
+ * `LogTail::backfill` in `crates/travsr-daemon/src/logfile.rs`, which is what
+ * `travsr daemon logs --lines N` already does correctly; the panel had its own
+ * reader and never got the fix.
+ *
+ * Lines are returned oldest first, each tagged with the date of the file it
+ * came from so the panel can show where one day ends and the next begins.
  */
 export function readDaemonLogTail(repoRoot: string, maxLines = 500): LogEntry[] {
   const dir = path.join(repoRoot, ".travsr");
-  let newest: string;
-  try {
-    const files = fs
-      .readdirSync(dir)
-      .filter((f) => f.startsWith("daemon.log"))
-      .sort(); // ISO date suffix sorts chronologically
-    if (files.length === 0) return [];
-    newest = path.join(dir, files[files.length - 1]);
-  } catch {
-    return [];
-  }
+  const files = daemonLogFiles(dir);
+  if (files.length === 0) return [];
 
-  // Generous enough that maxLines is the binding limit, not the byte window.
-  const MAX_BYTES = 512 * 1024;
-  let text: string;
-  try {
-    const size = fs.statSync(newest).size;
-    const start = Math.max(0, size - MAX_BYTES);
-    const len = size - start;
-    const fd = fs.openSync(newest, "r");
-    try {
-      const buf = Buffer.alloc(len);
-      fs.readSync(fd, buf, 0, len, start);
-      text = buf.toString("utf8");
-    } finally {
-      fs.closeSync(fd);
-    }
-    if (start > 0) text = text.slice(text.indexOf("\n") + 1);
-  } catch {
-    return [];
-  }
+  const want = Math.min(Math.max(maxLines, 0), LOG_MAX_LINES);
+  if (want === 0) return [];
 
-  return text
-    .split("\n")
-    .filter((l) => l.trim() !== "")
-    .slice(-maxLines)
-    .map(parseLogLine);
+  // Newest first, each older file supplying only the shortfall. Older files are
+  // never opened once the newest satisfies the request.
+  const chunks: LogEntry[][] = [];
+  let needed = want;
+  for (let i = files.length - 1; i >= 0 && needed > 0; i--) {
+    const name = files[i];
+    const lines = readFileTailLines(path.join(dir, name), needed);
+    needed -= lines.length;
+    // Concatenating arrays rather than text is deliberate: a rotated file whose
+    // last write was torn has no trailing newline, and gluing its text onto the
+    // next file's would fuse two entries into one line.
+    chunks.push(lines.map((l) => ({ ...parseLogLine(l), day: logFileDay(name) })));
+  }
+  chunks.reverse();
+  return chunks.flat();
+}
+
+/** The date a rotated log file covers, from its `daemon.log.<DATE>` name.
+ *  Falls back to the whole name so a file with an unexpected suffix still
+ *  groups deterministically instead of collapsing into its neighbours. */
+function logFileDay(fileName: string): string {
+  const suffix = fileName.slice("daemon.log".length).replace(/^\./, "");
+  return suffix || fileName;
 }
 
 /**
@@ -752,6 +841,7 @@ type PanelMessage =
   | { command: "initRepo" }
   | { command: "openFile"; path: string }
   | { command: "refreshLog" }
+  | { command: "setLogLines"; lines: number }
   | { command: "refresh" };
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
@@ -898,6 +988,11 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
   let lastStats: StatsView | undefined;
   let lastDiags: Diagnostic[] = [];
   let logOnly = false;
+  // How many lines the reader is asked for. The panel's Lines control raises
+  // this when the user picks a window wider than what is already loaded, which
+  // is the only way to show more: the dropdown's other job is a local hide over
+  // rows that are already in the DOM.
+  let logLines = 500;
 
   const render = async (): Promise<string> => {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -906,13 +1001,13 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
     // Read straight from the log file rather than asking the daemon: it works
     // after a crash, which is when the panel is worth opening. This is the
     // cheap half, and the only half a follow tick needs.
-    const log = root ? readDaemonLogTail(root) : [];
+    const log = root ? readDaemonLogTail(root, logLines) : [];
     const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
     // readDiagnostics spawns `travsr status`.
     const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
     lastStats = stats;
     lastDiags = diags;
-    return buildStatsHtml(stats, log, diags);
+    return buildStatsHtml(stats, log, diags, logLines);
   };
 
   const handle = async (msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
@@ -938,6 +1033,19 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
       } catch {
         // The file the log complained about may be the file that is gone.
         void vscode.window.showWarningMessage(`Travsr: cannot open ${msg.path}`);
+      }
+      return;
+    }
+    if (msg.command === "setLogLines") {
+      // Widening the window: re-read with the bigger cap. Log-only, because the
+      // graph stats and the `travsr status` spawn have not changed and are the
+      // expensive half of a render.
+      logLines = Math.min(Math.max(Math.trunc(msg.lines) || 0, 1), LOG_MAX_LINES);
+      logOnly = true;
+      try {
+        await refresh();
+      } finally {
+        logOnly = false;
       }
       return;
     }

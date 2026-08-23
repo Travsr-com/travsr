@@ -162,6 +162,16 @@ export function webviewShell(title: string, body: string, script: string): strin
   .lvl-ERROR .msg { color: var(--error); }
   .log-line:hover { background: var(--bg-input); border-radius: 3px; }
 
+  /* Rotation boundary: the log spans daily files, and without a marker a jump
+     back to yesterday looks like a gap in one continuous stream. A rule with
+     the date on it, quiet enough not to compete with the entries either side. */
+  .log-day { display: flex; align-items: center; gap: 8px; margin: 8px 0 4px;
+    color: var(--fg-subtle); font-size: 10px; letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-family: var(--vscode-editor-font-family, ui-monospace, monospace); }
+  .log-day::before, .log-day::after { content: ""; flex: 1 1 auto;
+    border-top: 1px solid var(--border); }
+
   .pill { flex: 0 0 auto; min-width: 42px; text-align: center; font-size: 9.5px;
     font-weight: 700; letter-spacing: 0.06em; padding: 1px 5px; border-radius: 3px;
     border: 1px solid transparent; text-transform: uppercase; }
@@ -576,6 +586,10 @@ export interface LogEntry {
   iso: string;
   /** The stored line verbatim, for the JSON view. */
   raw: string;
+  /** Date of the rotated file this line came from (`daemon.log.<DATE>`), so the
+   *  panel can show where one day's file ends and the next begins. Absent when
+   *  the entry did not come from a file on disk (older callers, tests). */
+  day?: string;
 }
 
 /**
@@ -655,7 +669,11 @@ export interface StatsView {
 export function buildStatsHtml(
   stats: StatsView,
   log: LogEntry[] = [],
-  diags: Diagnostic[] = []
+  diags: Diagnostic[] = [],
+  /** How many lines the reader was asked for, so the Lines control can show the
+   *  window actually loaded and know when a bigger pick needs a re-read rather
+   *  than a local filter. */
+  loadedLines: number = 500
 ): string {
   const card = (k: string, v: string): string =>
     `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
@@ -720,8 +738,8 @@ export function buildStatsHtml(
     ? // Copy first: reverse() is in place, and this array belongs to the caller.
       [...log]
         .reverse()
-        .map(
-          (e) =>
+        .flatMap((e, i, rows) => {
+          const row =
             `<div class="log-line lvl-${esc(e.level)}" data-rank="${rankOf(e.level)}"` +
             ` data-iso="${esc(e.iso)}" data-json="${esc(e.raw)}" data-tg="${esc(e.target)}">` +
             `<span class="caret" aria-hidden="true"></span>` +
@@ -730,8 +748,18 @@ export function buildStatsHtml(
             `<span class="mono muted tg">${esc(e.target)}</span>` +
             `<span class="msg" data-raw="${esc(e.message)}">${esc(e.message)}</span>` +
             `<span class="mono muted detail" data-raw="${esc(e.detail)}">${renderDetail(e.detail)}</span>` +
-            `<span class="jsonline mono">${highlightJson(e.raw)}</span></div>`
-        )
+            `<span class="jsonline mono">${highlightJson(e.raw)}</span></div>`;
+          // Rows run newest first, so a day divider belongs ABOVE the first row
+          // of each older file: it labels the block that follows it. Emitted
+          // only where the day actually changes, so a single-day log has none.
+          // `log-day`, deliberately not `log-line`: filterLog() counts and
+          // filters `.log-line`, and a divider is neither a line nor a match.
+          const prev = i > 0 ? rows[i - 1].day : undefined;
+          const needsDivider = i > 0 && e.day !== undefined && e.day !== prev;
+          return needsDivider
+            ? [`<div class="log-day" data-day="${esc(e.day ?? "")}">${esc(e.day ?? "")}</div>`, row]
+            : [row];
+        })
         .join("\n")
     : `<div class="empty">No daemon log yet. Run <span class="mono">travsr daemon start</span>.</div>`;
 
@@ -807,10 +835,12 @@ ${activityRows}
 </div>
 <div class="log-bar modes">
   <label class="sel">Lines
-    <select id="logLines" onchange="filterLog()">
+    <select id="logLines" data-loaded="${loadedLines}" onchange="onLogLinesChange()">
       <option value="100">100</option>
-      <option value="200" selected>200</option>
-      <option value="500">500</option>
+      <option value="200"${loadedLines <= 200 ? " selected" : ""}>200</option>
+      <option value="500"${loadedLines > 200 && loadedLines <= 500 ? " selected" : ""}>500</option>
+      <option value="2000"${loadedLines > 500 && loadedLines <= 2000 ? " selected" : ""}>2000</option>
+      <option value="${LOG_MAX_LINES}"${loadedLines > 2000 ? " selected" : ""}>All (max ${LOG_MAX_LINES})</option>
     </select>
   </label>
   <label class="sel">Since
@@ -902,6 +932,22 @@ function toggleRow(ev) {
   if (row) row.classList.toggle('open');
 }
 
+// The Lines control does two different jobs. Narrowing is a local hide, which
+// is instant. Widening past what the reader actually loaded cannot be done in
+// the DOM at all, because those rows were never sent, so it asks the extension
+// to re-read the log with a bigger window. Without this the dropdown silently
+// topped out at whatever the reader had fetched.
+function onLogLinesChange() {
+  var sel = document.getElementById('logLines');
+  var want = Number(sel.value);
+  var loaded = Number(sel.getAttribute('data-loaded') || '0');
+  if (want > loaded) {
+    vscode.postMessage({ command: 'setLogLines', lines: want });
+    return;
+  }
+  filterLog();
+}
+
 function filterLog() {
   var box = document.getElementById('logBox');
   if (!box) return;
@@ -941,6 +987,27 @@ function filterLog() {
       mark(line.querySelector('.detail'), q);
     }
   }
+  // A day divider labels the block beneath it, so it must go when every line in
+  // that block is filtered out — otherwise a severity chip leaves a date
+  // heading standing over nothing. Walk the children in order and show each
+  // divider only if a visible line follows it before the next one.
+  var kids = box.children;
+  var pendingDay = null;
+  for (var k = 0; k < kids.length; k++) {
+    var el = kids[k];
+    if (el.classList.contains('log-day')) {
+      el.style.display = 'none';
+      pendingDay = el;
+    } else if (
+      pendingDay &&
+      el.classList.contains('log-line') &&
+      el.style.display !== 'none'
+    ) {
+      pendingDay.style.display = '';
+      pendingDay = null;
+    }
+  }
+
   var total = lines.length;
   var label = document.getElementById('logCount');
   // Say when a filter is hiding something. A short list with no explanation
@@ -959,6 +1026,14 @@ function filterLog() {
 `;
   return webviewShell("Travsr Stats", body, script);
 }
+
+/** The largest log window the panel will read, whatever the caller asks for.
+ *
+ *  The daemon prunes its log directory at 50 MB, which is a fine amount to
+ *  stream to a terminal and far too much to turn into DOM nodes. The Lines
+ *  control's "All" resolves to this and names it, so the ceiling is stated
+ *  rather than discovered when the webview stops responding. */
+export const LOG_MAX_LINES = 5000;
 
 /** A per-language node count from the graph. */
 export interface LangCount {
