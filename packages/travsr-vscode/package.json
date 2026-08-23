@@ -2,7 +2,7 @@
   "name": "travsr-vscode",
   "displayName": "Travsr",
   "description": "Graph-native code intelligence for VS Code. Live call graph, blast radius, and callers, powered by the local Travsr daemon over MCP.",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "publisher": "travsr",
   "license": "Apache-2.0",
   "icon": "icon.png",
@@ -345,7 +345,7 @@
           "default": 2000,
           "minimum": 500,
           "maximum": 8000,
-          "description": "Token budget for \"Copy Graph Context for Chat\" pulls. At 2000 tokens, a typical context is 8–15 graph nodes."
+          "description": "Token budget for \"Copy Graph Context for Chat\" pulls. At 2000 tokens, a typical context is 8 to 15 graph nodes."
         },
         "travsr.suggestSynonyms": {
           "type": "boolean",
@@ -356,7 +356,7 @@
           "type": "number",
           "default": 20,
           "minimum": 1,
-          "description": "Dependent-file count at which the blast-radius code lens escalates to a high-risk warning. When a file has this many or more dependents, the lens reads \"⚠️ high blast: N files — review before editing\" so you see risk before touching a high-impact file."
+          "description": "Dependent-file count at which the blast-radius code lens escalates to a high-risk warning. When a file has this many or more dependents, the lens reads \"⚠️ high blast: N files; review before editing\" so you see risk before touching a high-impact file."
         }
       }
     }

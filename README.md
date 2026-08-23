@@ -24,14 +24,14 @@ npm install -g @travsr.com/travsr               # npm
 # 2. Initialize your repo (requires git)
 cd your-project
 git init          # skip if already a git repo
-travsr init       # indexes TypeScript files → .travsr/graph.db
+travsr init       # indexes every tracked file → .travsr/graph.db
                   # auto-registers in ~/.travsr/registry.json
 
 # 3. Connect to Claude Desktop (set once, works for all repos)
 ```
 
 The shell installer supports `--version <tag>` to install a specific release
-instead of latest stable (e.g. `sh -s -- --version v0.11.0`), `--system`
+instead of latest stable (e.g. `sh -s -- --version v1.0.0-beta.2`), `--system`
 (installs to `/usr/local/bin`, e.g.
 `curl -fsSL https://travsr.com/install.sh | sh -s -- --system`, since a piped
 script can only take flags via `sh -s --`), and `TRAVSR_INSTALL_DIR` to
@@ -78,6 +78,13 @@ binaries: promotion re-publishes the same signed artifact under a new tag
 rather than rebuilding, so what you tested on `beta` is exactly what ships to
 `latest`. Every tarball is cosign-signed and SLSA-attested regardless of
 channel; see [SECURITY.md](SECURITY.md) for verification steps.
+
+The channels move independently, so `beta` can be newer than `rc` in content
+while sorting below it under semver. That is the case right now:
+`v1.0.0-beta.2` is a fresh build cut after `v1.0.0-rc.1`, not a promotion of
+it, so `@rc` and `@latest` will not pick it up until the next candidate is
+promoted from it. `travsr --version` reports the tag base plus the commit it
+was built from, which is what tells two builds apart.
 
 ---
 
@@ -268,27 +275,37 @@ travsr connect                       Detect installed AI coding tools and wire e
 travsr connect --print               Show what connect would write, without touching the filesystem
 travsr connect --remove              Undo a previous connect run
 travsr daemon start/stop/status      Start, stop, or check the background daemon
+travsr daemon logs                   Print daemon log entries (--follow, --level, --since, --json)
+travsr daemon lsp                    Show the last diagnostics overlay the editor extension reported
 travsr repos                         List all globally registered repos
 travsr status                        Show node/edge counts, schema version, last-indexed SHA
 travsr fsck                          Report ghost nodes and orphan edges (add --fix to repair)
 travsr config get/set <key>          Inspect or set a layered config key (global, or --repo for this repo)
-travsr ask <query>                   PPR + knapsack symbol lookup from the terminal
+travsr ask <query>                   Graph-grounded answer for a question, or a bare symbol name
+travsr ask --examples                What you can ask, with runnable examples from your own index
+travsr ask --cmds                    Every command travsr supports, grouped by what it is for
+travsr references <symbol>           Every use site of a symbol as path:line (add --format json)
+travsr pattern <regex>               Graph-scoped text search for what the graph does not model
+travsr index                         Index without installing hooks or registering the repo
 travsr graph <query>                 Show dependency graph for a symbol or file
 travsr graph --all                   Show graph for the entire indexed repository
 travsr mcp --stdio                   Start the MCP stdio server (single-repo, cwd-based)
 travsr mcp --stdio --global          Start the MCP stdio server (all registered repos)
 travsr mcp --stdio --db <path>       Start the MCP stdio server (explicit db path)
-travsr lang list                     List all known Phase B language indexers and their status
-travsr lang install <language>       Download and register a Phase B language indexer
-travsr lang detect                   Scan the repo, detect supported languages, auto-install
-travsr lang remove <language>        Unregister a Phase B language indexer
+travsr lang list                     Per-language analysis status, prerequisites, and this repo's state
+travsr lang status                   Alias of `lang list`
+travsr lang install <language>       Set up full cross-file analysis for a language, and enable this repo
+travsr lang detect                   Scan the repo and install what it finds (--yes to skip prompts)
+travsr lang remove <language>        Unregister a language analyzer
+travsr lang allow-unsandboxed <lang> Windows only: permit a language whose build tooling cannot run
+                                     inside isolation (Java, Scala) to run with your own privileges
 travsr synonym add <term> <alias>    Add a query synonym
 travsr synonym list                  List all configured synonyms
 travsr synonym remove <term>         Remove a synonym term
 travsr embed list                    List available embedding models
 travsr embed init                    Initialize the embedding index for this repo
 travsr embed status                  Show embedding index status
-travsr embed reindex                 Rebuild the embedding index
+travsr embed reindex                 Fill in missing embeddings (--rebuild to re-embed everything)
 travsr embed switch <model>          Switch to a different embedding model
 travsr embed reconfigure             Change the reindex worker budget/priority and apply it immediately
 travsr embed gc                      Reclaim disk space held by inactive embedding models (dry-run; add --apply)
@@ -300,8 +317,11 @@ travsr rerank status                 Show whether the reranker model is installe
 **AI tool auto-wiring.** `travsr init` (unless run with `--no-connect`) and
 `travsr connect` detect installed AI coding tools, Claude Code, Cursor, VS Code
 Copilot, Gemini CLI, Antigravity, Codex, Windsurf, and Zed, and for each one
-register the `travsr mcp --stdio` server plus an always-on rules file telling
-the agent to query Travsr before grep or a raw file read. Generated files are
+register the `travsr mcp --stdio` server. Pass `--rules` to also write an
+always-on rules file telling the agent to query Travsr before grep or a raw
+file read; it is opt-in because an agent re-reads it on every turn of every
+conversation, while MCP already hands the model every tool name, description
+and schema before the conversation starts. Generated files are
 local and git-ignored by default (a committed MCP server definition is a
 clone-and-run-arbitrary-command vector), written only into files a strict-JSON
 check confirms Travsr already owns or that don't exist yet, so an existing
@@ -403,11 +423,15 @@ Install the **Travsr** extension from the VS Code Marketplace (`travsr.travsr-vs
 The extension connects to your local Travsr daemon over MCP and adds:
 
 - **Status bar**: daemon connection state and indexed node count
-- **Code lens**: inline "N callers" annotations on function definitions
+- **Code lens**: inline "N callers" annotations on function definitions, escalating to a warning before you edit a high-blast file
 - **Hover**: dependency list on import statements
-- **Graph panel**: interactive dependency graph rendered with Cytoscape.js; supports kind filtering and two-hop import traversal; open via the Travsr sidebar or the command palette (`Travsr: Show Graph`)
+- **Graph panel**: interactive dependency graph rendered with Cytoscape.js; kind filtering, two-hop traversal, node search, and an overlay of the diagnostics your language extensions report; open via the Travsr sidebar or the command palette (`Travsr: Show Graph`)
+- **Context Explorer**: graph-ranked context for a natural-language query, grouped by how each result matched
+- **Languages panel**: which languages have full cross-file analysis here and in this repository, what each one still needs, and a one-click install
+- **Stats panel**: index and daemon health, plus a searchable daemon log with severity filters, a per-day file picker, and optional auto-refresh
+- **Repository picker**: choose which of several open repos an action targets, shown in the status bar
 
-The extension uses your installed `travsr` binary. Set `travsr.binaryPath` in VS Code settings to override the binary location.
+The extension uses your installed `travsr` binary, resolved from `travsr.binaryPath`, then `~/.travsr/bin`, then PATH, and offers to download a verified release build if none of those resolve. Set `travsr.binaryPath` in VS Code settings to pin it. The Languages panel needs the language-status fields a v1.0.0-beta.2 or later binary reports; an older one is detected and named rather than rendered as a table of gaps.
 
 ---
 
@@ -472,6 +496,7 @@ design docs) alongside code by default, so a query can surface the
 | `depends` | File imports another module |
 | `defines/binding` | File or class defines a symbol (function, method, variable) |
 | `ref/call` | Call-site reference |
+| `ref/field` | Field read (`x.foo`), a use site that is not a call, so it stays out of the call graph `get_callers` and `get_blast_radius` traverse |
 | `exports` | Symbol exported from a module |
 
 ### Security

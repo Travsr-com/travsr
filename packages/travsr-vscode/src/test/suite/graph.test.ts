@@ -30,6 +30,16 @@ function readGraphJs(): string {
     .replace(/\r\n/g, "\n");
 }
 
+/** `media/graph.css`, LF-normalized for the same reason `readGraphJs` is. */
+function readGraphCss(): string {
+  return fs
+    .readFileSync(
+      path.join(__dirname, "..", "..", "..", "media", "graph.css"),
+      "utf8"
+    )
+    .replace(/\r\n/g, "\n");
+}
+
 // Combines HTML template + graph.js so tests can check both DOM and JS content.
 function getFullHtml(): string {
   const graphJs = readGraphJs();
@@ -1073,5 +1083,59 @@ suite("GraphPanel: diagnostics overlay renderer (#688)", () => {
       html.includes("Counts are per file, not per symbol."),
       "must state the file-scoped attribution caveat"
     );
+  });
+});
+
+suite("#log-rotation: graph.css follows the editor theme, not the desktop", () => {
+  test("the palette must not be keyed on the OS appearance", () => {
+    // Reported after the same fix landed in webviews.ts and commands.ts:
+    // graph.css is loaded from media/ via a <link>, not inlined from src/, so a
+    // source-tree grep for the old media query came back clean while this file
+    // still had it. It carries the largest palette in the extension and takes
+    // nothing from VS Code, unlike the loading placeholder built alongside it.
+    const css = readGraphCss();
+    assert.ok(
+      !/@media\s*\(\s*prefers-color-scheme/.test(css),
+      "the palette must not be keyed on the OS appearance"
+    );
+    assert.ok(css.includes("body.vscode-light"), "keyed on the editor theme kind");
+    assert.ok(
+      css.includes("body.vscode-high-contrast-light"),
+      "high-contrast light is a light kind of its own and vscode-light misses it"
+    );
+    // Reduced motion is genuinely an OS preference and stays a media query.
+    assert.ok(/@media\s*\(\s*prefers-reduced-motion/.test(css));
+  });
+
+  test("the light block still overrides every token its dark counterpart sets", () => {
+    // Guards against the move itself silently dropping a token: if the light
+    // rule ever redefines fewer custom properties than :root does, one of them
+    // keeps its dark value under a light theme without anything failing loudly.
+    const css = readGraphCss();
+    const rootBlock = /:root\s*\{([\s\S]*?)\n\}/.exec(css)?.[1] ?? "";
+    const lightBlock =
+      /body\.vscode-light,\s*body\.vscode-high-contrast-light\s*\{([\s\S]*?)\n\}/.exec(css)?.[1] ?? "";
+    assert.ok(rootBlock.length > 0 && lightBlock.length > 0, "both blocks must be found");
+    const tokensIn = (block: string): string[] =>
+      Array.from(block.matchAll(/(--[\w-]+)\s*:/g)).map((m) => m[1]);
+    const rootTokens = new Set(tokensIn(rootBlock));
+    const lightTokens = tokensIn(lightBlock);
+    assert.ok(lightTokens.length > 0);
+    for (const t of lightTokens) {
+      assert.ok(rootTokens.has(t), `${t} is set in light but not in :root`);
+    }
+  });
+
+  test("the scrollbar thumb still resolves the light tokens", () => {
+    // Moving the light block off :root onto body only stays correct because
+    // this file has no html selector and no palette-consuming pseudo-element
+    // outside body. This is the one such consumer in the file, so it is the
+    // one worth pinning: it must read var(--bg), which now only resolves
+    // against body, and body must still be the thing everything scrollable
+    // sits inside.
+    const css = readGraphCss();
+    assert.ok(css.includes("::-webkit-scrollbar-thumb { background: var(--ch-600)"));
+    assert.ok(css.includes("border: 2px solid var(--bg)"), "the thumb border reads the palette");
+    assert.ok(/body\s*\{[^}]*overflow:\s*hidden/.test(css), "body must still contain the scroll area");
   });
 });
