@@ -57,18 +57,32 @@ const fn resolve_version(
 /// the eventual stable `1.0.0` reports, so a tester's version string could not be
 /// attributed to a build.
 ///
-/// It deliberately does **not** carry the prerelease suffix. `release.yml`'s
-/// `promote` job reuses the source channel's signed artifacts byte for byte and
-/// never rebuilds, so `beta.1 -> rc.1 -> stable` all ship the same binary. Baking
-/// in `1.0.0-beta.1` would make every promoted stable release report itself as a
-/// beta forever, which is a worse lie than the ambiguity it replaced.
+/// A **stable** release reports the bare version and nothing else:
 ///
-/// Instead the release job injects `<tag base>+<short commit>`. The tag base is
-/// promotion-stable (`v1.0.0-beta.1` and `v1.0.0` share the base `1.0.0`), and
-/// the commit identifies the build itself: `beta.1` and `beta.2` differ because
-/// they are different commits, while a promoted stable matches the beta it came
-/// from because it genuinely is the same bits. Unset on local builds, which fall
-/// back to the crate version.
+/// ```text
+/// v1.0.0        ->  travsr 1.0.0
+/// v1.0.0-beta.2 ->  travsr 1.0.0+98619a8
+/// ```
+///
+/// That number is what a user quotes in a bug report and reads in release notes,
+/// so a stable release gives them the version, not the version plus a commit.
+///
+/// A prerelease keeps `+<short commit>`, which is the ambiguity above: without
+/// it a beta and the eventual stable are indistinguishable. Dropping it only on
+/// stable makes it a signal rather than noise, since a `+` now means "not a
+/// stable release".
+///
+/// The prerelease *suffix* is still stripped from the version part, so a beta
+/// reports `1.0.0+<sha>` rather than `1.0.0-beta.2+<sha>`: the base is what
+/// `verify-version` pins to the crate version, and the commit identifies the
+/// build more precisely than the channel does.
+///
+/// Unset on local builds, which fall back to the crate version. So a local build
+/// and a stable release both report a bare `1.0.0`; `+<sha>` distinguishes a
+/// prerelease, not a provenance. `travsr status` carries the build id separately
+/// when that distinction matters.
+///
+/// See `.github/scripts/build-id.sh`, which owns this and is self-tested.
 const RELEASE_VERSION: &str =
     resolve_version(option_env!("TRAVSR_BUILD_ID"), env!("CARGO_PKG_VERSION"));
 
@@ -2864,10 +2878,15 @@ mod daemon_log_tests {
     /// caught a regression in the production const.
     #[test]
     fn resolve_version_prefers_the_injected_build_id() {
+        // A prerelease build injects base+sha.
         assert_eq!(
             resolve_version(Some("1.0.0+56c9329"), "1.0.0"),
             "1.0.0+56c9329"
         );
+        // A stable build injects the bare version, so injected and crate
+        // version agree and `--version` shows no commit (build-id.sh).
+        assert_eq!(resolve_version(Some("1.0.0"), "1.0.0"), "1.0.0");
+        // A local build injects nothing.
         assert_eq!(resolve_version(None, "1.0.0"), "1.0.0");
     }
 

@@ -543,6 +543,29 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # A promoted artifact is the source channel's binary byte for byte, so its
+      # baked TRAVSR_BUILD_ID is the source channel's. build-id.sh gives a
+      # stable tag the bare version and a prerelease `<base>+<sha>`, so
+      # promoting a prerelease onto a stable tag would publish a stable release
+      # whose binary reports `1.0.0+<sha>`. Refuse instead of shipping a version
+      # string that contradicts its own tag. Promoting prerelease to prerelease
+      # (beta -> rc) is unaffected: both sides carry the suffix.
+      #
+      # Cut a stable release by pushing its tag, which rebuilds and bakes the
+      # bare version. That is how every release to date was cut.
+      - name: A stable tag must be built, not promoted
+        run: |
+          set -euo pipefail
+          TO="${{ github.event.inputs.promote_to }}"
+          case "${TO#v}" in
+            *-*) echo "OK: $TO is a prerelease target, promotion keeps the build suffix" ;;
+            *)   echo "REFUSING: $TO is a stable tag." >&2
+                 echo "Promotion reuses the source binary, whose baked version carries a" >&2
+                 echo "+<sha> build suffix. A stable release must report a bare version, so" >&2
+                 echo "it has to be built from its own pushed tag rather than promoted." >&2
+                 exit 1 ;;
+          esac
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
