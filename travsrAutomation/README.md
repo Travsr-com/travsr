@@ -59,7 +59,7 @@ skips into failures, which is what you want in CI.
 
 | Phase | Verifies |
 | --- | --- |
-| `artifacts` | checksums, target coverage, build-id identity (`--tag` only) |
+| `artifacts` | checksums, target coverage, `--version` works |
 | `first-run` | `lang status`, `init`, the no-daemon pending message, and that `init --semantic` genuinely completes Phase B with no daemon |
 | `languages` | `references` resolves to the right file for typescript, javascript (`.mjs`), python, rust, and with `--with-cpp` also c and c++ |
 | `graph` | a cross-file caller edge, which is the one answer Phase A alone cannot give; `fsck`; `--format json` is parseable |
@@ -69,10 +69,8 @@ skips into failures, which is what you want in CI.
 
 MCP is not an optional extra here: it is the only external interface travsr has
 (principle 4, no REST and no GraphQL), so it is the surface an agent actually
-uses. Adding this phase immediately found that `serverInfo.version` still
-reported a bare crate version after #728 gave the CLI and the daemon an injected
-build id, meaning the one interface agents talk to was the one that could not say
-which build it was.
+uses. `serverInfo.version` must agree with what `travsr --version` reports, or
+the one interface agents talk to disagrees with the CLI about which build it is.
 
 Run a subset with `--phase honesty --phase languages`, or `--filter references`.
 
@@ -108,7 +106,7 @@ travsrAutomation/
 │   ├── checks.py   the checks, each tagged with the issues it guards
 │   ├── fixtures.py the multi-language fixture repo and its expected answers
 │   ├── report.py   outcomes, console output, JSON, JUnit
-│   └── travsr.py   CLI wrapper, release download, checksums, build-id extraction
+│   └── travsr.py   CLI wrapper, release download, checksums
 └── README.md
 ```
 
@@ -129,8 +127,10 @@ assumed the hint was present, so on any machine where trust had already been
 granted every c/c++ check silently skipped, degrading on exactly the machines
 that had run it most. Both are pinned.
 
-It also asserts that #724, #726, #727, #728 and #741 each still have a check
+It also asserts that #724, #726, #727 and #741 each still have a check
 guarding them, so deleting one fails rather than quietly reducing coverage.
+(#728, the build-id injection, was later removed by product decision rather
+than regressed, so it is no longer in that guarded set.)
 
 ## Adding a check
 

@@ -277,18 +277,3 @@ def extract(tarball: Path, dest: Path) -> Optional[Path]:
     return None
 
 
-#: A release binary must carry `<version>+<shortsha>` (#728). A bare version
-#: means the build-id injection was lost for that target.
-BUILD_ID_RE = re.compile(rb"\d+\.\d+\.\d+\+[0-9a-f]{7}")
-
-
-def build_id_in_binary(binary: Path) -> Optional[str]:
-    """Scan a binary for its embedded build id, without executing it.
-
-    Reading bytes rather than running `--version` is what lets one host check
-    every target, including the cross-built Linux one that is the most likely to
-    have silently lost the injection.
-    """
-    data = binary.read_bytes()
-    found = sorted({m.group(0).decode() for m in BUILD_ID_RE.finditer(data)})
-    return found[0] if found else None
