@@ -7986,6 +7986,64 @@ mod tests {
     /// `path.exists()` is true on both sides of the swap, so existence cannot
     /// see it. The reported version must move, or every `ask` answer cached
     /// before the swap keeps hitting until the daemon restarts.
+    /// #509: `file_identity` must change when a path is replaced by a different
+    /// file, on every platform.
+    ///
+    /// Runs on Windows too, unlike the store-level test below, because it never
+    /// holds the file open: it swaps the file first and reads identity after, so
+    /// nothing is blocking the unlink. That makes this the coverage for the
+    /// Windows `(creation_time, last_write_time, file_size)` arm, which is
+    /// otherwise reachable by no test on this platform.
+    ///
+    /// Deliberately asserts inequality of two identities rather than any
+    /// particular member. On unix the inode carries it; on Windows creation time
+    /// can be tunneled onto a same-named replacement within ~15s (NTFS
+    /// tunneling), and the other two members carry it instead. Asserting the
+    /// tuple differs is the property both platforms actually promise.
+    #[test]
+    fn file_identity_changes_when_the_file_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("swapme.db");
+
+        std::fs::write(&p, b"first").unwrap();
+        let first = super::file_identity(&p).expect("identity of an existing file");
+
+        std::fs::remove_file(&p).unwrap();
+        std::fs::write(&p, b"second file, different length").unwrap();
+        let second = super::file_identity(&p).expect("identity of the replacement");
+
+        assert_ne!(
+            first, second,
+            "a replaced file must not keep the identity of the one it replaced,              or a cached connection to the old file reads as current"
+        );
+
+        // Same file, read twice: identity is stable, so it does not spuriously
+        // invalidate the cache on every poll.
+        assert_eq!(
+            second,
+            super::file_identity(&p).unwrap(),
+            "identity must be stable for an unchanged file"
+        );
+
+        // A missing path has no identity, which is what makes the caller fall
+        // back to "no embed.db" rather than to a stale reading.
+        std::fs::remove_file(&p).unwrap();
+        assert!(super::file_identity(&p).is_none());
+    }
+
+    ///
+    /// Unix only, and not for convenience: the failure mode cannot occur on
+    /// Windows. SQLite opens db files there without `FILE_SHARE_DELETE`, so
+    /// unlinking embed.db under the live read-only connection is refused
+    /// outright (`os error 32`, the file is in use) rather than succeeding and
+    /// leaving the connection on an unlinked inode. A `#[cfg(windows)]` variant
+    /// would have to fake the swap in a way the platform cannot actually
+    /// produce, which would assert against a scenario no user can reach. The
+    /// Windows arm of `file_identity` is defensive, for the rename-over and
+    /// already-reopened paths, and is covered by
+    /// `file_identity_changes_when_the_file_is_replaced` above, which runs on
+    /// every platform because it never holds the file open.
+    #[cfg(unix)]
     #[test]
     fn embed_data_version_detects_delete_and_recreate() {
         let tmp = tempfile::tempdir().unwrap();
