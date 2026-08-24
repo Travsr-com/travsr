@@ -6,6 +6,10 @@
 
 use anyhow::Context as _;
 use travsr_mcp::query::{self, StatusPayload};
+// #760: the Phase B warning classes are the daemon's, not this file's. Naming
+// them through the enum it writes them from is what lets the guard below prove
+// this surface handles every one.
+use travsr_plugin_host::phase_b::PhaseBWarningClass as Warn;
 
 use crate::daemon_client;
 use crate::repo::find_git_root;
@@ -61,14 +65,14 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                 // on (not trusted / not registered) are their own separate notice,
                 // not a downgrade of the ones that did run.
                 let crashed = crashed_langs(payload);
-                let not_run: Vec<String> = warned_langs(payload, "skipped_no_analyzer")
+                let not_run: Vec<String> = warned_langs(payload, Warn::SkippedNoAnalyzer.tag())
                     .into_iter()
-                    .chain(warned_langs(payload, "needs_consent"))
+                    .chain(warned_langs(payload, Warn::NeedsConsent.tag()))
                     // needs_approval is vestigial (elevated access is auto-granted
                     // now, ADR-017 A5), but a pre-upgrade index can still have it in
                     // stored meta; keep honouring it so status stays honest rather
                     // than reporting a flat "complete" for a language that never ran.
-                    .chain(warned_langs(payload, "needs_approval"))
+                    .chain(warned_langs(payload, Warn::NeedsApproval.tag()))
                     .collect();
                 if crashed.is_empty() && not_run.is_empty() {
                     "complete".to_string()
@@ -94,7 +98,7 @@ fn phase_b_state(payload: &StatusPayload) -> String {
 /// `semantic:` field from `complete` to `partial (crashed: …)` so it agrees with
 /// the crash warning and the per-language outcome.
 fn crashed_langs(payload: &StatusPayload) -> Vec<String> {
-    warned_langs(payload, "crashed")
+    warned_langs(payload, Warn::Crashed.tag())
 }
 
 /// Languages named by a `<kind>:<lang>` entry in the `phase_b_warnings` meta, for
@@ -126,6 +130,151 @@ fn head_at(cwd: &std::path::Path) -> Option<String> {
     // bytes that are not valid UTF-8 is legal, and converting it to a string
     // first would mangle it into U+FFFD and lose a repo that exists.
     crate::git_bounded::git_stdout_bounded(Some(cwd), ["rev-parse", "--short", "HEAD"])
+}
+
+/// The user-facing lines for the `phase_b_warnings` meta, in print order.
+///
+/// Split out of `run` (#760) so the guard below can assert that every class the
+/// daemon writes is rendered here. Printing straight to stderr from inside `run`
+/// left this consumer untestable, which is half of why classes could go missing
+/// from it unnoticed.
+fn phase_b_warning_lines(warnings: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if warnings.is_empty() {
+        return out;
+    }
+    // Trust is per-repo, not per-language: a single `install` enables
+    // every language at once, so collapse the "not enabled here" notices
+    // into one line rather than repeating it per language (matches init).
+    let untrusted: Vec<&str> = warnings
+        .split(',')
+        .filter_map(|w| w.strip_prefix(&format!("{}:", Warn::UntrustedCorpus.tag())))
+        .collect();
+    if !untrusted.is_empty() {
+        out.push(format!(
+            "warning: semantic analysis is not enabled for this repository yet ({}); run `travsr lang install <lang>` here to enable",
+            untrusted.join(", ")
+        ));
+    }
+    for warn in warnings.split(',') {
+        let parts: Vec<&str> = warn.splitn(2, ':').collect();
+        match parts.as_slice() {
+            // #712: point at the force path. A plain `travsr init
+            // --semantic` re-runs on top of the existing graph, which a
+            // no-op Phase A can make look like it did nothing; `--force`
+            // purges and rebuilds so the retry is unambiguous.
+            ["crashed", lang] => out.push(format!(
+                "warning: semantic analyzer for '{lang}' crashed, fix the tool (e.g. `travsr lang install {lang}`), then re-run `travsr init --semantic --force` to rebuild"
+            )),
+            ["version_mismatch", rest] => {
+                let v: Vec<&str> = rest.splitn(3, ':').collect();
+                if let [lang, expected, got] = v.as_slice() {
+                    out.push(format!(
+                        "warning: the '{lang}' analyzer is out of date (protocol v{got}, expected v{expected}); run `travsr lang install {lang}`"
+                    ));
+                }
+            }
+            // Windows only: an analyzer that cannot run inside Travsr's
+            // isolation and has no permission on record. The one-time
+            // permission is the only thing standing between it and full
+            // analysis here.
+            ["needs_consent", lang] => out.push(format!(
+                "warning: full '{lang}' analysis needs your permission to run; run `travsr lang allow-unsandboxed {lang}`"
+            )),
+            // Vestigial: elevated access is auto-granted for local use (ADR-017
+            // Amendment A5), so this build never writes it, but a pre-upgrade
+            // index still holds it in stored meta. `phase_b_state` already
+            // downgrades to "not run" for it; without this arm the user was told
+            // the language did not run and never told what to do about it. Found
+            // by the #760 guard, which is the hole this class of bug lives in.
+            ["needs_approval", lang] => out.push(format!(
+                "warning: '{lang}' was skipped by a previous index. Run `travsr lang install {lang}`, then `travsr init --semantic --force` to index it"
+            )),
+            // #712: analyzer ran but produced no nodes over the repo's
+            // source files of this language — a silent zero-node result,
+            // not a crash. Point at the tool and a rebuild.
+            // UX-3: the analyzer is installed and active (the zero-node
+            // warning only fires for a language that ran), so telling the
+            // user to reinstall misdirects — reinstalling changes nothing.
+            // The real causes are the sidecar failing to parse/resolve this
+            // repo's sources (e.g. a sandbox-denied read, a missing SDK, or
+            // no buildable project). Point at the sidecar's own diagnostics,
+            // which the host now forwards on stderr.
+            // #724: definitions arrived, occurrences did not, so no call
+            // edge can come from this language. The analyzer reported
+            // success, which is what makes it worth saying out loud.
+            ["no_references", lang] => {
+                out.push(format!(
+                    "warning: '{lang}' analysis produced definitions but no references, so no call edges came from it. The analyzer reported success, so this is its output being incomplete rather than a crash. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see its own diagnostics"
+                ));
+            }
+            ["zero_nodes", lang] => {
+                out.push(format!(
+                    "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help, it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
+                ));
+                // Name the concrete thing to check rather than leaving
+                // "a missing SDK or an unbuildable project" as the only
+                // clue — the catalog already knows what this language's
+                // analyzer needs from the project.
+                if let Some(entry) = travsr_plugin_host::phase_b::catalog::lookup(lang) {
+                    let prereq = entry.effective_prerequisites();
+                    if !prereq.is_empty() && prereq != "none" {
+                        out.push(format!("  needs: {prereq}"));
+                    }
+                }
+                // #724 Finding 4: the most common cause of a zero-node
+                // Java run on macOS is scip-java's javac shim crashing
+                // under the stock bash 3.2. Surface the actionable fix.
+                if *lang == "java" {
+                    if let Some(hint) = crate::progress::macos_java_bash_hint() {
+                        out.push(format!("  {hint}"));
+                    }
+                }
+            }
+            // #449: languages present in the repo whose Phase B sidecar
+            // never ran, previously a silent skip that left the user
+            // with "0 references" and no explanation.
+            // A language whose analyzer has no build for this OS can never
+            // reach full analysis here, so pointing at `travsr lang install`
+            // (which just dead-ends) is misleading — state the honest
+            // "not available on this platform" instead.
+            ["skipped_unregistered", lang] if crate::lang::full_analysis_unavailable_here(lang) => {
+                out.push(format!(
+                    "note: full '{lang}' analysis is not available on this platform, structural analysis still works"
+                ))
+            }
+            ["skipped_unregistered", lang] => out.push(format!(
+                "warning: '{lang}' sources found but full analysis is not set up. Run `travsr lang install {lang}`"
+            )),
+            ["skipped_no_analyzer", lang] if crate::lang::full_analysis_unavailable_here(lang) => {
+                out.push(format!(
+                    "note: full '{lang}' analysis is not available on this platform, structural analysis still works"
+                ))
+            }
+            // #414 (ADR-017 Rule 3): registered globally but this repo was
+            // never enabled. Collapsed into one combined line above the
+            // loop (trust is per-repo, so one install fixes all of them).
+            ["untrusted_corpus", _] => {}
+            ["skipped_no_analyzer", lang] => out.push(format!(
+                "warning: '{lang}' is registered but its analyzer binary is missing. Run `travsr lang install {lang}`"
+            )),
+            // L5a: scip-clang (c/cpp) needs a compile_commands.json at the
+            // repo root — without one it hangs, so it is skipped up front.
+            ["skipped_no_compdb", lang] => out.push(format!(
+                "warning: full '{lang}' analysis needs a compile database (compile_commands.json) at the repo root. Generate one (e.g. `bear -- make`, or CMake's CMAKE_EXPORT_COMPILE_COMMANDS)"
+            )),
+            // E6: SCIP definitions that did not unify onto their Phase A
+            // tree-sitter node — their references attribute to an orphaned
+            // duplicate node instead. `rate` is missed/attempted. Repo-wide,
+            // not a per-language state, so it is deliberately not a
+            // `PhaseBWarningClass` variant.
+            ["scip_unification_misses", rate] => out.push(format!(
+                "warning: {rate} semantic definitions did not match their parsed symbol, some references may resolve to a duplicate. Re-run `travsr init --semantic` if it persists."
+            )),
+            _ => {}
+        }
+    }
+    out
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -207,131 +356,8 @@ pub fn run() -> anyhow::Result<()> {
     // H3: surface Phase B warnings so the user knows about crashed/mismatched
     // analyzers without having to re-read the init output.
     if let Some(warnings) = &payload.phase_b_warnings {
-        if !warnings.is_empty() {
-            // Trust is per-repo, not per-language: a single `install` enables
-            // every language at once, so collapse the "not enabled here" notices
-            // into one line rather than repeating it per language (matches init).
-            let untrusted: Vec<&str> = warnings
-                .split(',')
-                .filter_map(|w| w.strip_prefix("untrusted_corpus:"))
-                .collect();
-            if !untrusted.is_empty() {
-                eprintln!(
-                    "warning: semantic analysis is not enabled for this repository yet ({}); run `travsr lang install <lang>` here to enable",
-                    untrusted.join(", ")
-                );
-            }
-            for warn in warnings.split(',') {
-                let parts: Vec<&str> = warn.splitn(2, ':').collect();
-                match parts.as_slice() {
-                    // #712: point at the force path. A plain `travsr init
-                    // --semantic` re-runs on top of the existing graph, which a
-                    // no-op Phase A can make look like it did nothing; `--force`
-                    // purges and rebuilds so the retry is unambiguous.
-                    ["crashed", lang] => eprintln!(
-                        "warning: semantic analyzer for '{lang}' crashed, fix the tool (e.g. `travsr lang install {lang}`), then re-run `travsr init --semantic --force` to rebuild"
-                    ),
-                    ["version_mismatch", rest] => {
-                        let v: Vec<&str> = rest.splitn(3, ':').collect();
-                        if let [lang, expected, got] = v.as_slice() {
-                            eprintln!(
-                                "warning: the '{lang}' analyzer is out of date (protocol v{got}, expected v{expected}); run `travsr lang install {lang}`"
-                            );
-                        }
-                    }
-                    // Windows only: an analyzer that cannot run inside Travsr's
-                    // isolation and has no permission on record. The one-time
-                    // permission is the only thing standing between it and full
-                    // analysis here.
-                    ["needs_consent", lang] => eprintln!(
-                        "warning: full '{lang}' analysis needs your permission to run; run `travsr lang allow-unsandboxed {lang}`"
-                    ),
-                    // #712: analyzer ran but produced no nodes over the repo's
-                    // source files of this language — a silent zero-node result,
-                    // not a crash. Point at the tool and a rebuild.
-                    // UX-3: the analyzer is installed and active (the zero-node
-                    // warning only fires for a language that ran), so telling the
-                    // user to reinstall misdirects — reinstalling changes nothing.
-                    // The real causes are the sidecar failing to parse/resolve this
-                    // repo's sources (e.g. a sandbox-denied read, a missing SDK, or
-                    // no buildable project). Point at the sidecar's own diagnostics,
-                    // which the host now forwards on stderr.
-                    // #724: definitions arrived, occurrences did not, so no call
-                    // edge can come from this language. The analyzer reported
-                    // success, which is what makes it worth saying out loud.
-                    ["no_references", lang] => {
-                        eprintln!(
-                            "warning: '{lang}' analysis produced definitions but no references, so no call edges came from it. The analyzer reported success, so this is its output being incomplete rather than a crash. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see its own diagnostics"
-                        );
-                    }
-                    ["zero_nodes", lang] => {
-                        eprintln!(
-                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help, it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
-                        );
-                        // Name the concrete thing to check rather than leaving
-                        // "a missing SDK or an unbuildable project" as the only
-                        // clue — the catalog already knows what this language's
-                        // analyzer needs from the project.
-                        if let Some(entry) = travsr_plugin_host::phase_b::catalog::lookup(lang) {
-                            let prereq = entry.effective_prerequisites();
-                            if !prereq.is_empty() && prereq != "none" {
-                                eprintln!("  needs: {prereq}");
-                            }
-                        }
-                        // #724 Finding 4: the most common cause of a zero-node
-                        // Java run on macOS is scip-java's javac shim crashing
-                        // under the stock bash 3.2. Surface the actionable fix.
-                        if *lang == "java" {
-                            if let Some(hint) = crate::progress::macos_java_bash_hint() {
-                                eprintln!("  {hint}");
-                            }
-                        }
-                    }
-                    // #449: languages present in the repo whose Phase B sidecar
-                    // never ran, previously a silent skip that left the user
-                    // with "0 references" and no explanation.
-                    // A language whose analyzer has no build for this OS can never
-                    // reach full analysis here, so pointing at `travsr lang install`
-                    // (which just dead-ends) is misleading — state the honest
-                    // "not available on this platform" instead.
-                    ["skipped_unregistered", lang]
-                        if crate::lang::full_analysis_unavailable_here(lang) =>
-                    {
-                        eprintln!(
-                            "note: full '{lang}' analysis is not available on this platform, structural analysis still works"
-                        )
-                    }
-                    ["skipped_unregistered", lang] => eprintln!(
-                        "warning: '{lang}' sources found but full analysis is not set up. Run `travsr lang install {lang}`"
-                    ),
-                    ["skipped_no_analyzer", lang]
-                        if crate::lang::full_analysis_unavailable_here(lang) =>
-                    {
-                        eprintln!(
-                            "note: full '{lang}' analysis is not available on this platform, structural analysis still works"
-                        )
-                    }
-                    // #414 (ADR-017 Rule 3): registered globally but this repo was
-                    // never enabled. Collapsed into one combined line above the
-                    // loop (trust is per-repo, so one install fixes all of them).
-                    ["untrusted_corpus", _] => {}
-                    ["skipped_no_analyzer", lang] => eprintln!(
-                        "warning: '{lang}' is registered but its analyzer binary is missing. Run `travsr lang install {lang}`"
-                    ),
-                    // L5a: scip-clang (c/cpp) needs a compile_commands.json at the
-                    // repo root — without one it hangs, so it is skipped up front.
-                    ["skipped_no_compdb", lang] => eprintln!(
-                        "warning: full '{lang}' analysis needs a compile database (compile_commands.json) at the repo root. Generate one (e.g. `bear -- make`, or CMake's CMAKE_EXPORT_COMPILE_COMMANDS)"
-                    ),
-                    // E6: SCIP definitions that did not unify onto their Phase A
-                    // tree-sitter node — their references attribute to an orphaned
-                    // duplicate node instead. `rate` is missed/attempted.
-                    ["scip_unification_misses", rate] => eprintln!(
-                        "warning: {rate} semantic definitions did not match their parsed symbol, some references may resolve to a duplicate. Re-run `travsr init --semantic` if it persists."
-                    ),
-                    _ => {}
-                }
-            }
+        for line in phase_b_warning_lines(warnings) {
+            eprintln!("{line}");
         }
     }
 
@@ -529,6 +555,50 @@ mod tests {
         let mut p = payload("abc", "abc", false);
         p.phase_b_warnings = Some("zero_nodes:go".into());
         assert_eq!(phase_b_state(&p), "complete");
+    }
+
+    /// #760: every warning class the daemon can write must produce a line here.
+    ///
+    /// The classes are produced in one place and read in three, and until now
+    /// every reader kept its own hardcoded copy of the names. A class this
+    /// surface does not handle is dropped in silence: `travsr status` prints
+    /// nothing about it and the user is left with a language that did not run
+    /// and no reason why. The guard that was supposed to catch that restated
+    /// the names in a third hand-written list, so a class missing from the
+    /// producer's readers AND from the list was invisible.
+    ///
+    /// This iterates `PhaseBWarningClass::ALL`, the enum the daemon formats
+    /// `phase_b_warnings` from, so adding a class there and forgetting this
+    /// file fails the build. Same treatment `is_native_phase_b` got in #752:
+    /// assert against the real decision, not against a copy of it.
+    ///
+    /// Turning it on immediately found one: `needs_approval` was downgrading
+    /// the `semantic:` field to "not run" while printing no explanation at all.
+    #[test]
+    fn every_phase_b_warning_class_the_daemon_writes_is_rendered() {
+        for class in Warn::ALL {
+            let tag = class.tag();
+            let lines = phase_b_warning_lines(&class.sample_entry("go"));
+            assert!(
+                !lines.is_empty(),
+                "class {tag:?} is written by the daemon but `travsr status` says nothing \
+                 about it, so the language is degraded with no visible reason"
+            );
+            for line in &lines {
+                assert!(!line.is_empty(), "class {tag:?} produced an empty line");
+            }
+        }
+    }
+
+    /// #760: `untrusted_corpus` is the one class with no arm of its own, because
+    /// trust is per-repo and the notices collapse into a single line before the
+    /// loop. Pin that, so the guard above cannot be satisfied by an accidental
+    /// arm that repeats it per language.
+    #[test]
+    fn untrusted_corpus_collapses_into_one_line_for_every_language() {
+        let lines = phase_b_warning_lines("untrusted_corpus:go,untrusted_corpus:php");
+        assert_eq!(lines.len(), 1, "one line for the whole repo: {lines:?}");
+        assert!(lines[0].contains("go, php"), "both named: {lines:?}");
     }
 
     #[test]

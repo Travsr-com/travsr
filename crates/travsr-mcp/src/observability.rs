@@ -304,13 +304,14 @@ fn error_payload(reason: &str) -> serde_json::Value {
 /// classes (e.g. `scip_unification_misses`, which is not per-language) are
 /// ignored, they're not a language state.
 ///
-/// The set of per-language classes handled here must stay equal to the set
-/// `travsr status` matches on, which is what the shared invariant above
-/// actually requires: a class present there and absent here does not merely
-/// lose its wording, it silently falls through to the availability ladder and
-/// can be reported as a terminal `done` (#636 round-5 review, which is how
-/// `untrusted_corpus` was missed). `phase_b_warning_classes_match_the_cli`
-/// pins the set, not just one string.
+/// Every class the daemon writes must be handled here: one that is not does
+/// not merely lose its wording, it silently falls through to the availability
+/// ladder and can be reported as a terminal `done` (#636 round-5 review, which
+/// is how `untrusted_corpus` was missed). #760 made that enforceable rather
+/// than aspirational: the classes are the variants of
+/// `travsr_plugin_host::phase_b::PhaseBWarningClass`, the daemon formats from
+/// it, and `phase_b_warning_classes_match_the_cli` iterates it, so a class
+/// added there and forgotten here fails the build.
 ///
 /// `corpus` is the store's `corpus` meta, needed only by the
 /// `untrusted_corpus` arm, whose remediation names the corpus to trust.
@@ -2378,49 +2379,46 @@ mod tests {
         assert!(!detail.contains('\u{2014}'), "em-dash: {detail}");
     }
 
-    /// #636 round-5 review: pinning one string's wording was not enough. The
-    /// invariant that actually matters is that the *set* of per-language
-    /// warning classes handled here equals the set `travsr status` matches
-    /// on. A class present there and missing here does not just lose its
-    /// wording: it falls through to the availability ladder and can surface
-    /// as a terminal `done`, which is exactly how `untrusted_corpus` was
-    /// missed. Every class listed here is one the daemon writes.
+    /// #760: every warning class the daemon can write must be decoded here.
+    ///
+    /// #636 round-5 established the invariant: a class the daemon writes and
+    /// this function does not handle falls through to the availability ladder
+    /// and can surface as a terminal `done`, telling the user the language
+    /// succeeded when it did not. That is how `untrusted_corpus` was missed.
+    ///
+    /// The guard that followed could not enforce it. It restated the class
+    /// names in a third hand-written list, so a class missing from BOTH that
+    /// list and this function was invisible: there was nothing to disagree
+    /// with. `zero_nodes` and `needs_consent` sat in that hole until they were
+    /// found by reading the producer against the consumers.
+    ///
+    /// So the list is gone. This iterates `PhaseBWarningClass::ALL`, the enum
+    /// the daemon formats `phase_b_warnings` from, and asserts every variant
+    /// decodes. Adding a class to the producer and forgetting this consumer now
+    /// fails here. Same treatment `is_native_phase_b` got in #752: assert
+    /// against the real decision, not against a copy of it.
     #[test]
     fn phase_b_warning_classes_match_the_cli() {
-        // The per-language classes `travsr status` handles (status.rs).
-        // `scip_unification_misses` is deliberately absent: it is a repo-wide
-        // rate, not a per-language state, and neither surface treats it as one.
-        for class in [
-            "crashed",
-            "version_mismatch",
-            "needs_approval",
-            "skipped_unregistered",
-            "skipped_no_analyzer",
-            "skipped_no_compdb",
-            "untrusted_corpus",
-            "no_references",
-            "zero_nodes",
-            "needs_consent",
-        ] {
-            // `version_mismatch` carries `lang:expected:got`, the rest `lang`.
-            let warning = if class == "version_mismatch" {
-                format!("{class}:go:2:1")
-            } else {
-                format!("{class}:go")
-            };
-            let decoded = decode_phase_b_warnings(&warning, "github.com/acme/repo");
+        use travsr_plugin_host::phase_b::PhaseBWarningClass;
+        // `scip_unification_misses` is deliberately not in `ALL`: it is a
+        // repo-wide rate, not a per-language state, and neither surface treats
+        // it as one.
+        for class in PhaseBWarningClass::ALL {
+            let tag = class.tag();
+            let decoded =
+                decode_phase_b_warnings(&class.sample_entry("go"), "github.com/acme/repo");
             let (state, detail) = decoded.get("go").unwrap_or_else(|| {
-                panic!("class {class:?} is handled by travsr status but falls through here")
+                panic!(
+                    "class {tag:?} is written by the daemon but falls through here, so a \
+                     language it describes can still be reported as a terminal `done`"
+                )
             });
             assert!(
                 matches!(*state, "failed" | "unavailable"),
-                "class {class:?} must map to a terminal state, got {state:?}"
+                "class {tag:?} must map to a terminal state, got {state:?}"
             );
-            assert!(!detail.is_empty(), "class {class:?} must explain itself");
-            assert!(
-                !detail.contains('\u{2014}'),
-                "em-dash in {class:?}: {detail}"
-            );
+            assert!(!detail.is_empty(), "class {tag:?} must explain itself");
+            assert!(!detail.contains('\u{2014}'), "em-dash in {tag:?}: {detail}");
         }
     }
 
