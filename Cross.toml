@@ -1,7 +1,0 @@
-# `cross` builds inside a container that does not inherit the host environment,
-# so the release workflow's TRAVSR_BUILD_ID would be invisible to the compiler
-# and `option_env!` would fall back to the crate version. That would make the one
-# cross-built target (aarch64-unknown-linux-musl) report a different
-# `travsr --version` from every other target in the same release.
-[build.env]
-passthrough = ["TRAVSR_BUILD_ID"]

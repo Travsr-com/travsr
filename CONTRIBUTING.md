@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.75 or later (`rustup install stable`)
+- Rust 1.88 or later (`rustup install stable`)
 - Git
 
 ## Build & Test

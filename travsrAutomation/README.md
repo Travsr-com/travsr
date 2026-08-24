@@ -41,14 +41,9 @@ manual and not dependent on someone remembering to look.
 `--binary` and `--tag` run the same functional checks. The difference is what can
 be verified:
 
-- `--tag` additionally checks artifact checksums, that every expected target was
-  published, and that the build id is **identical across all five targets**. That
-  last one matters because the cross-built Linux target compiles in a container
-  which does not inherit the host environment, so it is the one that can silently
-  lose the build-id injection and ship a version string different from its
-  siblings.
-- `--binary` skips those, since there are no artifacts, and does not require a
-  build id (a local build legitimately has none).
+- `--tag` additionally checks artifact checksums and that every expected target
+  was published.
+- `--binary` skips those, since there are no artifacts to check.
 
 Checks that cannot run report **SKIP**, and every skip is listed in the summary.
 A check that did not run must never read as a check that passed; that is the
@@ -59,7 +54,7 @@ skips into failures, which is what you want in CI.
 
 | Phase | Verifies |
 | --- | --- |
-| `artifacts` | checksums, target coverage, build-id identity (`--tag` only) |
+| `artifacts` | checksums, target coverage, `--version` works |
 | `first-run` | `lang status`, `init`, the no-daemon pending message, and that `init --semantic` genuinely completes Phase B with no daemon |
 | `languages` | `references` resolves to the right file for typescript, javascript (`.mjs`), python, rust, and with `--with-cpp` also c and c++ |
 | `graph` | a cross-file caller edge, which is the one answer Phase A alone cannot give; `fsck`; `--format json` is parseable |
@@ -69,10 +64,8 @@ skips into failures, which is what you want in CI.
 
 MCP is not an optional extra here: it is the only external interface travsr has
 (principle 4, no REST and no GraphQL), so it is the surface an agent actually
-uses. Adding this phase immediately found that `serverInfo.version` still
-reported a bare crate version after #728 gave the CLI and the daemon an injected
-build id, meaning the one interface agents talk to was the one that could not say
-which build it was.
+uses. `serverInfo.version` must agree with what `travsr --version` reports, or
+the one interface agents talk to disagrees with the CLI about which build it is.
 
 Run a subset with `--phase honesty --phase languages`, or `--filter references`.
 
@@ -108,7 +101,7 @@ travsrAutomation/
 │   ├── checks.py   the checks, each tagged with the issues it guards
 │   ├── fixtures.py the multi-language fixture repo and its expected answers
 │   ├── report.py   outcomes, console output, JSON, JUnit
-│   └── travsr.py   CLI wrapper, release download, checksums, build-id extraction
+│   └── travsr.py   CLI wrapper, release download, checksums
 └── README.md
 ```
 
@@ -129,8 +122,10 @@ assumed the hint was present, so on any machine where trust had already been
 granted every c/c++ check silently skipped, degrading on exactly the machines
 that had run it most. Both are pinned.
 
-It also asserts that #724, #726, #727, #728 and #741 each still have a check
+It also asserts that #724, #726, #727 and #741 each still have a check
 guarding them, so deleting one fails rather than quietly reducing coverage.
+(#728, the build-id injection, was later removed by product decision rather
+than regressed, so it is no longer in that guarded set.)
 
 ## Adding a check
 

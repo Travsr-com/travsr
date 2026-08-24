@@ -9075,6 +9075,12 @@ impl Daemon {
             logfile::LOG_BUDGET_BYTES,
             logfile::MAX_LOG_FILES,
         );
+        // The startup sweep alone left both caps unenforced for the daemon's
+        // whole uptime: `rolling::daily` adds a file a day and removes none, so
+        // a month-long session held a month of files. The gc tick re-checks on
+        // rotation; this watermark is what makes the first tick a no-op rather
+        // than a second sweep of what was just swept.
+        let mut last_log_file = logfile::current_log_file(&travsr_dir);
 
         let file_appender = tracing_appender::rolling::daily(&travsr_dir, logfile::LOG_PREFIX);
         // Must be held for the daemon's lifetime — dropping flushes and closes
@@ -9625,6 +9631,19 @@ impl Daemon {
                             "daemon heartbeat, uptime {}s",
                             start_time.elapsed().as_secs()
                         );
+                        let dropped = logfile::prune_if_rotated(
+                            &travsr_dir,
+                            &mut last_log_file,
+                            logfile::LOG_BUDGET_BYTES,
+                            logfile::MAX_LOG_FILES,
+                        );
+                        if dropped > 0 {
+                            tracing::info!(
+                                event = "daemon.log_pruned",
+                                files = dropped,
+                                "dropped rotated log files after a day roll"
+                            );
+                        }
                         // #621: HEAD may have moved while the daemon was down
                         // (reset/checkout/rebase/pull) — the watcher never saw
                         // those edits, so the graph would stay pinned to a
@@ -9761,6 +9780,19 @@ impl Daemon {
                             "daemon heartbeat, uptime {}s",
                             start_time.elapsed().as_secs()
                         );
+                        let dropped = logfile::prune_if_rotated(
+                            &travsr_dir,
+                            &mut last_log_file,
+                            logfile::LOG_BUDGET_BYTES,
+                            logfile::MAX_LOG_FILES,
+                        );
+                        if dropped > 0 {
+                            tracing::info!(
+                                event = "daemon.log_pruned",
+                                files = dropped,
+                                "dropped rotated log files after a day roll"
+                            );
+                        }
                         // #621: see the unix gc_tick arm — startup + periodic
                         // reconciliation of last_commit against live HEAD.
                         if !head_reconcile_running.swap(true, std::sync::atomic::Ordering::AcqRel) {

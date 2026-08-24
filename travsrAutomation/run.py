@@ -10,10 +10,10 @@ Two modes, because the same checks are worth running at two different times:
     cargo build --release -p travsr-cli
     python3 travsrAutomation/run.py --binary target/release/travsr
 
-Every check corresponds to something that actually broke. #724, #726, #727 and
-#728 were found by a manual pass on v1.0.0-beta.1, three of them already shipped
-in a tagged artifact that testers were being asked to use. #741 was found by a
-manual pass on v1.0.0-rc.1. The suite exists so the third pass is not manual.
+Every check corresponds to something that actually broke. #724, #726 and #727
+were found by a manual pass on v1.0.0-beta.1, already shipped in a tagged
+artifact that testers were being asked to use. #741 was found by a manual pass
+on v1.0.0-rc.1. The suite exists so the third pass is not manual.
 
 Exit codes: 0 all good, 1 at least one failure (or a skip under --strict-skip),
 2 bad usage or the suite could not start.

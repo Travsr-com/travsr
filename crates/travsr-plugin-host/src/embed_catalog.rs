@@ -794,16 +794,18 @@ pub struct EmbedBackend {
 }
 
 /// RFC-025: the behavioral floor the host requires of the `travsr-embed`
-/// sidecar. v1.2.0 is the first release whose content-hash CDC invalidation
-/// (travsr-embed #376) replaced the blanket tombstone-delete path; a sidecar
-/// below it runs a code path the current host no longer expects and fails deep
-/// with a cryptic SQLite error (issue #701). Every embed catalog entry uses the
-/// same `travsr-embed` binary, so the floor is a single host constant rather
-/// than per-model catalog data. Bump this in the same commit that first relies
-/// on a newer sidecar behavior (RFC-025 decision 3), and keep every
-/// `version_fallback` in `embed_catalog.toml` at or above it (honesty test).
+/// sidecar. v1.6.0 is the first release with the `--reembed` full-rebuild mode
+/// that `travsr embed reindex --rebuild` depends on; a sidecar below it does not
+/// understand the flag and would exit on the unknown argument instead of
+/// rebuilding. (The prior floor, v1.2.0, guarded travsr-embed #376's content-
+/// hash CDC path that replaced the blanket tombstone-delete; issue #701.) Every
+/// embed catalog entry uses the same `travsr-embed` binary, so the floor is a
+/// single host constant rather than per-model catalog data. Bump this in the
+/// same commit that first relies on a newer sidecar behavior (RFC-025
+/// decision 3), and keep every `version_fallback` in `embed_catalog.toml` at or
+/// above it (honesty test).
 pub const EMBED_MIN_VERSION: crate::sidecar_version::Semver =
-    crate::sidecar_version::Semver::new(1, 2, 0);
+    crate::sidecar_version::Semver::new(1, 6, 0);
 
 impl crate::sidecar_version::SidecarSpec for EmbedBackend {
     fn install_name(&self) -> &str {
@@ -928,7 +930,33 @@ pub fn write_model_descriptor(model_dir: &Path, b: &EmbedBackend) -> anyhow::Res
         #[serde(skip_serializing_if = "str::is_empty")]
         family: &'a str,
     }
-    let content = toml::to_string(&Descriptor {
+    let path = model_dir.join("model.toml");
+
+    // The fields `travsr embed init` owns and rewrites on every run. Any other
+    // key already present in the file (for example a hand-set `macos_engine`,
+    // which is the sidecar's to own) is carried forward untouched, so re-running
+    // init no longer silently reverts a user's choice (F6). Merging onto the
+    // existing file also future-proofs against the next sidecar-owned key.
+    const INIT_OWNED_KEYS: &[&str] = &[
+        "dim",
+        "pooling",
+        "query_prefix",
+        "n_inputs",
+        "truncate_dim",
+        "family",
+    ];
+
+    let mut table: toml::Table = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default();
+    // Drop init-owned keys first so a value init no longer emits (e.g. `family`
+    // when the catalog entry has no arch) does not linger from a prior write.
+    for k in INIT_OWNED_KEYS {
+        table.remove(*k);
+    }
+
+    let owned = toml::Value::try_from(Descriptor {
         dim: b.dim,
         pooling: &b.pooling,
         query_prefix: &b.query_prefix,
@@ -937,7 +965,11 @@ pub fn write_model_descriptor(model_dir: &Path, b: &EmbedBackend) -> anyhow::Res
         family: &b.arch,
     })
     .context("serialize model descriptor")?;
-    let path = model_dir.join("model.toml");
+    if let toml::Value::Table(owned) = owned {
+        table.extend(owned);
+    }
+
+    let content = toml::to_string(&table).context("serialize model descriptor")?;
 
     // Atomic write: the sidecar reads `model.toml` at startup and hard-errors on a
     // malformed descriptor, so a concurrent spawn (or the `ensure_model_descriptor`
@@ -1334,6 +1366,7 @@ fn derive_phase1_threshold(db_path: &Path, fraction: f64) -> Option<u32> {
 ///
 /// RFC-021: one sidecar process loads the model once; N reader threads inside
 /// the sidecar feed a single inference loop. No temp-db management, no merge.
+#[allow(clippy::too_many_arguments)]
 fn run_parallel_reindex(
     bin_path: &Path,
     db_path: &Path,
@@ -1341,6 +1374,11 @@ fn run_parallel_reindex(
     model_id: &str,
     phase: PhaseFilter,
     quiet: bool,
+    // When true, the sidecar clears every stored vector for this model first and
+    // re-embeds all of them (`travsr embed reindex --rebuild`), instead of only
+    // filling in what is missing. CLI-only; the daemon's automatic spawns always
+    // pass false.
+    reembed: bool,
     overrides: &EmbedOverrides,
 ) -> anyhow::Result<()> {
     let model_ram_mb = lookup(model_id).map(|b| b.ram_mb as u64).unwrap_or(0);
@@ -1396,6 +1434,10 @@ fn run_parallel_reindex(
 
     if cancel_supported {
         cmd.arg("--cancel-sentinel").arg(&sentinel_path);
+    }
+
+    if reembed {
+        cmd.arg("--reembed");
     }
 
     if let Some((flag, val)) = phase.sidecar_flag() {
@@ -1576,6 +1618,7 @@ pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
                 &model_id,
                 PhaseFilter::Phase1 { threshold },
                 false,
+                false,
                 &EmbedOverrides::default(),
             ) {
                 tracing::warn!("embed Phase 1 failed: {e:#}");
@@ -1625,6 +1668,7 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
                 &model_id,
                 phase,
                 false,
+                false,
                 &EmbedOverrides::default(),
             ) {
                 tracing::warn!("embed Phase 2 failed: {e:#}");
@@ -1658,6 +1702,7 @@ pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
                 &embed_db_path,
                 &model_id,
                 PhaseFilter::All,
+                false,
                 false,
                 &EmbedOverrides::default(),
             ) {
@@ -1704,6 +1749,9 @@ pub fn ensure_reindex_backend_ready(db_path: &Path) -> anyhow::Result<()> {
 pub fn run_parallel_reindex_blocking(
     db_path: &Path,
     phase1_threshold: Option<u32>,
+    // `travsr embed reindex --rebuild`: clear + re-embed every node for the
+    // active model instead of only filling in what is missing.
+    reembed: bool,
     overrides: &EmbedOverrides,
 ) -> anyhow::Result<()> {
     let (bin_path, embed_db_path, model_id) = resolve_backend_for_reindex(db_path)?;
@@ -1720,6 +1768,7 @@ pub fn run_parallel_reindex_blocking(
         &model_id,
         phase,
         false,
+        reembed,
         overrides,
     )
 }
@@ -1735,6 +1784,7 @@ pub fn run_parallel_reindex_blocking_quiet(db_path: &Path) -> anyhow::Result<()>
         &model_id,
         PhaseFilter::All,
         true,
+        false,
         &EmbedOverrides::default(),
     )
 }
@@ -2257,6 +2307,33 @@ mod tests {
             entries,
             vec!["model.toml".to_string()],
             "only model.toml must remain (no temp litter), found: {entries:?}"
+        );
+    }
+
+    /// F6: re-running `embed init` must not revert a hand-set `macos_engine`.
+    /// The writer owns dim/pooling/etc. but preserves keys it does not own.
+    #[test]
+    fn write_descriptor_preserves_hand_set_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = lookup("bge-small-en-v1.5").expect("bge in catalog");
+        let toml_path = dir.path().join("model.toml");
+        // A prior descriptor with a hand-set sidecar-owned key plus a stale
+        // init-owned value that must be refreshed.
+        std::fs::write(&toml_path, b"dim = 1\nmacos_engine = \"tract\"\n").unwrap();
+
+        write_model_descriptor(dir.path(), b).expect("write descriptor");
+
+        let parsed: toml::Table = toml::from_str(&std::fs::read_to_string(&toml_path).unwrap())
+            .expect("descriptor must parse");
+        assert_eq!(
+            parsed.get("macos_engine").and_then(|v| v.as_str()),
+            Some("tract"),
+            "hand-set macos_engine must survive re-init"
+        );
+        assert_eq!(
+            parsed.get("dim").and_then(|v| v.as_integer()),
+            Some(b.dim as i64),
+            "init-owned dim must be rewritten to the catalog value"
         );
     }
 
