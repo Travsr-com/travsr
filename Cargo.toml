@@ -139,7 +139,7 @@ tracing-appender = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "5"
 toml        = "0.8"
-yaml-rust2  = "0.9"
+yaml-rust2  = "0.12"
 quick-xml   = "0.41"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
