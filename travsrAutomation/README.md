@@ -41,14 +41,9 @@ manual and not dependent on someone remembering to look.
 `--binary` and `--tag` run the same functional checks. The difference is what can
 be verified:
 
-- `--tag` additionally checks artifact checksums, that every expected target was
-  published, and that the build id is **identical across all five targets**. That
-  last one matters because the cross-built Linux target compiles in a container
-  which does not inherit the host environment, so it is the one that can silently
-  lose the build-id injection and ship a version string different from its
-  siblings.
-- `--binary` skips those, since there are no artifacts, and does not require a
-  build id (a local build legitimately has none).
+- `--tag` additionally checks artifact checksums and that every expected target
+  was published.
+- `--binary` skips those, since there are no artifacts to check.
 
 Checks that cannot run report **SKIP**, and every skip is listed in the summary.
 A check that did not run must never read as a check that passed; that is the

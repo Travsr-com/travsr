@@ -65,6 +65,13 @@ pub(crate) const PROTOCOL_VERSION: &str = "2024-11-05";
 pub(crate) const SERVER_NAME: &str = "travsr";
 
 /// The version reported in `initialize`'s `serverInfo`, over both stdio and SSE.
+///
+/// Reads this crate's own `Cargo.toml`, independently of `travsr-cli`'s. Nothing
+/// at the Cargo level keeps the two in lockstep (`verify-version` in release.yml
+/// only pins `travsr-cli` and npm's `package.json` to the tag); they agree today
+/// only because both files say `1.0.0`. The only thing that would catch a release
+/// that bumps one and forgets the other is `check_mcp_server_version_matches_cli`
+/// in `travsrAutomation`, which runs on every PR via `run.py --binary` in `ci.yml`.
 pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Start the MCP stdio server backed by the graph database at `db_path`.
