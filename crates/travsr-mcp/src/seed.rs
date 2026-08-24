@@ -2227,6 +2227,25 @@ pub(crate) fn build_seed_set(
             .collect();
         let resolved = !boundary_matched.is_empty();
 
+        // #778: the anchor candidate POOL — nodes that carry the (possibly
+        // corrected) token as an actual NAME segment, not a mere substring.
+        // `search_nodes_by_name` is a SUBSTRING match, so for a short token it
+        // also returns path/substring noise ("ui" inside "building" ->
+        // `method:Gym.building_*`). The per-node `contains_token` gate in the
+        // emit loop already rejects that noise, but leaving it in the pool let
+        // the #463 kind-reorder promote logic-bearing noise ahead of the true
+        // match and then consume the `MAX_ANCHORS_PER_TOKEN` budget via
+        // take-then-filter, starving the exact `class:UI` anchor (issue #778).
+        // Filtering the pool up front is a no-op when the top candidates already
+        // segment-match (identical #463 input/output); it only removes noise that
+        // could never have emitted. Uses the signature-only predicate to match
+        // the emit-loop gate exactly (a path-only match is not an anchor — #478).
+        let anchor_pool: Vec<CoreNode> = exact_nodes
+            .iter()
+            .filter(|n| travsr_core::ident::contains_token(&resolve_token, &n.vname.signature))
+            .cloned()
+            .collect();
+
         // #709: the corrected anchor deliberately bypasses the *budget* gates
         // below (the IDF emit cut and the per-path cap) because a unique strict
         // correction is deliberate lexical evidence that must seed and must
@@ -2243,9 +2262,9 @@ pub(crate) fn build_seed_set(
         // import FTS happened to rank first.
         let corrected_pick: Option<&CoreNode> = if corrected {
             let ordered: Vec<&CoreNode> = if anchor_kind_priority {
-                order_anchor_candidates(&exact_nodes, anchor_reorder_window)
+                order_anchor_candidates(&anchor_pool, anchor_reorder_window)
             } else {
-                exact_nodes.iter().take(MAX_ANCHORS_PER_TOKEN).collect()
+                anchor_pool.iter().take(MAX_ANCHORS_PER_TOKEN).collect()
             };
             ordered.into_iter().find(|node| {
                 !is_anchor_noise(node)
@@ -2320,9 +2339,9 @@ pub(crate) fn build_seed_set(
         // bounded emit (on by default; `TRAVSR_ANCHOR_KIND_PRIORITY=0` restores the
         // original FTS-rank order). See [`order_anchor_candidates`].
         let ordered: Vec<&CoreNode> = if anchor_kind_priority {
-            order_anchor_candidates(&exact_nodes, anchor_reorder_window)
+            order_anchor_candidates(&anchor_pool, anchor_reorder_window)
         } else {
-            exact_nodes.iter().take(MAX_ANCHORS_PER_TOKEN).collect()
+            anchor_pool.iter().take(MAX_ANCHORS_PER_TOKEN).collect()
         };
         for node in ordered.into_iter().take(MAX_ANCHORS_PER_TOKEN) {
             // RFC-022 D3: stricter anchor-pool gate than the general `is_noise_seed`
@@ -5575,6 +5594,61 @@ mod tests {
             seed_ids.contains(&real.id),
             "the signature match is the correction target and must seed; \
              seeds present: {seed_ids:?}"
+        );
+    }
+
+    /// #778 regression: a short symbol (`UI`) whose exact definition is crowded
+    /// out of the anchor set by SUBSTRING noise. `search_nodes_by_name` is a
+    /// substring match, so "ui" also matches methods named `*build**ui**ng*`;
+    /// the #463 kind-reorder then promotes those logic-bearing methods (rank 0)
+    /// ahead of `class:UI` (rank 1), and the emit loop's take-then-filter spent
+    /// all `MAX_ANCHORS_PER_TOKEN` slots on them before the `contains_token`
+    /// gate could reject them, so `class:UI` never seeded and `ask "UI"`
+    /// abstained on an exact rank-0 match. The fix pre-filters the anchor pool
+    /// to signature-segment matches, so the noise never enters the window.
+    #[test]
+    fn build_seed_set_short_exact_symbol_not_starved_by_substring_noise() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        // The real target: a 2-char class name, absent from the word vocab.
+        let ui = Node::new(
+            VName::new("corpus", "", "core/lib/ui/ui.rb", "ruby", "class:UI"),
+            "class",
+        );
+        store.put_node(&ui).unwrap();
+        // Three substring-noise methods: "ui" is a substring of "building"/
+        // "buildup"/"builtui", never a name segment. As `method` (logic rank 0)
+        // they reorder ahead of the class and, pre-fix, filled the 3 anchor
+        // slots via take-then-filter.
+        for sig in [
+            "method:Gym.building_for_ios",
+            "method:Gym.buildup_guid",
+            "method:Gym.rebuild_circuit",
+        ] {
+            store
+                .put_node(&Node::new(
+                    VName::new("corpus", "", "gym/lib/gym/module.rb", "ruby", sig),
+                    "method",
+                ))
+                .unwrap();
+        }
+
+        let seed_set = build_seed_set(
+            &store,
+            "UI",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        let seed_ids: std::collections::HashSet<NodeId> =
+            seed_set.seeds.iter().map(|s| s.node).collect();
+        assert!(
+            seed_ids.contains(&ui.id),
+            "the exact `class:UI` match must seed and not be starved by \
+             substring-noise methods; seeds present: {seed_ids:?}"
         );
     }
 

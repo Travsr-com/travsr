@@ -282,8 +282,26 @@ fn symbol_frequency_counts_sqlite_on_sqlitestore_fixture() {
 #[test]
 fn symbol_frequency_none_for_short_token() {
     let store = open();
-    // < 3 bytes is never indexed (ident::segments post-processing drops it).
+    // < 3 bytes never enters the word vocab (ident::segments drops it), and with
+    // no node bearing "ab" as a name the #778 boundary-count fallback is 0, so the
+    // token is still unmeasurable -> None (stays generic / abstains).
     assert_eq!(store.symbol_frequency("ab").unwrap(), None);
+}
+
+#[test]
+fn symbol_frequency_short_token_grounds_on_exact_symbol() {
+    // #778: a 2-char symbol (`UI`) is absent from the word vocab (min segment
+    // len 3), but it is a real, unique symbol in this repo. The boundary-count
+    // fallback must measure it as rare (Some(1)) rather than returning None and
+    // letting the seed path fabricate `freq = n_total` and abstain on the exact
+    // rank-0 match.
+    let mut store = open();
+    store
+        .put_node(&node("app/ui.rb", "class:UI", "class"))
+        .unwrap();
+    assert_eq!(store.symbol_frequency("UI").unwrap(), Some(1));
+    // A different short token with no matching symbol stays unmeasurable.
+    assert_eq!(store.symbol_frequency("QZ").unwrap(), None);
 }
 
 #[test]

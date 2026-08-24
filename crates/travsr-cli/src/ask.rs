@@ -1470,7 +1470,14 @@ pub(crate) fn suggest_next(db_path: &std::path::Path, query: &str) -> Vec<Sugges
     // `ask` itself uses, so a suggestion can never name something unindexed.
     let nearest = nearest_symbol(db_path, query);
 
-    if let Some(sym) = nearest.as_deref() {
+    // #778: only suggest the nearest symbol when it differs from what the user
+    // already typed. When the query IS an exact symbol name (`ask "UI"`), the
+    // nearest match is that same string, so echoing `ask "UI"` -> `ask "UI"` is a
+    // dead-end loop. Skip it; intent routing below still offers a real next step.
+    if let Some(sym) = nearest
+        .as_deref()
+        .filter(|sym| !sym.eq_ignore_ascii_case(query.trim()))
+    {
         out.push(Suggestion {
             command: format!("travsr ask \"{sym}\""),
             why: "closest symbol in this repo to what you typed".to_string(),

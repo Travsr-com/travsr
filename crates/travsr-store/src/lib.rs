@@ -6267,7 +6267,19 @@ impl SqliteStore {
                 .filter(|s| s.len() >= 3)
                 .collect();
             if segs.is_empty() {
-                return Ok(None);
+                // #778: a token whose identifier segments are all < 3 chars (e.g.
+                // the Ruby class `UI`) never enters `nodes_words_vocab` (min segment
+                // len 3), so the word-vocab path below cannot measure it. Returning
+                // `None` here let the caller fabricate `freq = n_total`, scoring a
+                // unique 2-char symbol as maximally generic (the idf floor) — the
+                // exact inverse of the truth, so `ask "UI"` abstained on an exact
+                // rank-0 match. Fall back to the exact/word-boundary name document
+                // frequency: how many nodes actually bear this token as their symbol
+                // name. A real, small count (`UI` -> 3) makes the token rare and lets
+                // it ground; a genuine zero (a nonsense short token) stays `None` so
+                // it is still treated as generic and abstains.
+                let count = self.boundary_name_count(token)?;
+                return Ok((count > 0).then_some(count));
             }
             let mut min_doc: Option<i64> = None;
             for seg in &segs {
@@ -6288,6 +6300,24 @@ impl SqliteStore {
             Ok(min_doc.map(|d| d.max(0) as usize))
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// #778: count nodes whose signature/path matches `token` at an exact/word
+    /// boundary — the same [`Self::NAME_MATCH_BOUNDARY`] semantics (and
+    /// `doc-chunk` exclusion) used by [`Self::search_nodes_by_name_exact`], so
+    /// the count reflects nodes the anchor path would actually treat as exact
+    /// matches. Used only as the [`Self::symbol_frequency`] fallback for tokens
+    /// too short (< 3-char segments) to appear in `nodes_words_vocab`.
+    fn boundary_name_count(&self, token: &str) -> AnyResult<usize> {
+        let sql = format!(
+            "SELECT count(*) FROM nodes WHERE {} AND kind != 'doc-chunk'",
+            Self::NAME_MATCH_BOUNDARY
+        );
+        let n: i64 = self
+            .conn
+            .query_row(&sql, params![token], |r| r.get(0))
+            .context("counting boundary name matches for symbol_frequency")?;
+        Ok(n.max(0) as usize)
     }
 
     /// Returns the total number of nodes in the graph.
