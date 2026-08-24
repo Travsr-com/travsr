@@ -2900,24 +2900,41 @@ fn write_phase_b_results(
         scip_unify_attempted = unify.attempted;
         scip_unify_missed = unify.attempted.saturating_sub(unify.unified);
         alias_map = unify.alias_map;
-        let pb_refs = pb_refs_mut;
+        // #780: synthetic DSL meta-scope def nodes (RSpec blocks) with no twin.
+        // Dropped outright — node, inbound refs, and edges — so they stop
+        // surviving as orphan duplicates that steal spec-file reference edges.
+        let dropped = unify.dropped;
+
+        // Refs whose callee is a dropped synthetic node would write an edge onto
+        // a node that no longer exists (a dangling/ghost edge). Drop them: the
+        // "target" was never a real definition, so the reference correctly
+        // resolves to nothing rather than to a bogus duplicate.
+        let pb_refs: Vec<travsr_core::ScipRef> = pb_refs_mut
+            .into_iter()
+            .filter(|r| !dropped.contains(&r.callee_id))
+            .collect();
 
         // Drop unified SCIP definition nodes: the tree-sitter node already
         // represents them (symbol_aliases preserves scip_symbol → TS node
         // resolution), and writing them would re-create the duplicate node
-        // + FTS rows that unification exists to eliminate.
+        // + FTS rows that unification exists to eliminate. Also drop the
+        // synthetic DSL nodes (#780), which have no TS twin to alias onto.
         let pb_nodes: Vec<travsr_core::Node> = pb_nodes
             .into_iter()
-            .filter(|n| !alias_map.contains_key(&n.id))
+            .filter(|n| !alias_map.contains_key(&n.id) && !dropped.contains(&n.id))
             .collect();
 
         // Rewrite SCIP structural edges through the alias map so they land
         // on the unified TS nodes instead of the dropped duplicates; an
         // edge that collapses to a self-loop after rewriting carried no
-        // information beyond the node itself — drop it.
+        // information beyond the node itself — drop it. An edge touching a
+        // dropped synthetic node (#780) has no valid endpoint — drop it too.
         let pb_edges: Vec<travsr_core::Edge> = pb_edges
             .into_iter()
             .filter_map(|mut e| {
+                if dropped.contains(&e.src) || dropped.contains(&e.dst) {
+                    return None;
+                }
                 if let Some(&ts_id) = alias_map.get(&e.src) {
                     e.src = ts_id;
                 }

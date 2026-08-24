@@ -4515,6 +4515,33 @@ LIMIT ?4",
         Ok(id.map(i64_to_node_id))
     }
 
+    /// The set of paths in `corpus` that carry at least one Phase A definition —
+    /// a node whose signature is not a `scip:` descriptor and whose kind is not
+    /// the synthetic `file` node. #780: SCIP tools (scip-ruby) index gitignored
+    /// vendored code that the tree-sitter parser deliberately skips, so those
+    /// files hold only SCIP `definition` nodes (plus a `file` stub) and their
+    /// defs can never reconcile. G1 uses this to tell a file the structural
+    /// parser actually indexed from one only the SCIP tool saw, so the latter's
+    /// unreconcilable defs are neither counted as misses nor kept as orphans.
+    pub fn phase_a_indexed_paths(
+        &self,
+        corpus: &str,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT DISTINCT path FROM nodes \
+                 WHERE corpus = ?1 AND kind != 'file' AND signature NOT LIKE 'scip:%'",
+            )
+            .context("phase_a_indexed_paths: prepare")?;
+        let paths = stmt
+            .query_map([corpus], |row| row.get::<_, String>(0))
+            .context("phase_a_indexed_paths: query")?
+            .collect::<Result<std::collections::HashSet<String>, _>>()
+            .context("phase_a_indexed_paths: collect")?;
+        Ok(paths)
+    }
+
     /// The single tree-sitter node anywhere in `corpus` matching one of
     /// `signatures`, or `None` when there is not exactly one.
     ///
@@ -8147,6 +8174,41 @@ mod tests {
             .find_ts_node_for_unification("c", "src/n.go", &candidates, 15, 5)
             .unwrap();
         assert_eq!(found, Some(inner.id), "narrowest containing span wins");
+    }
+
+    #[test]
+    fn phase_a_indexed_paths_excludes_scip_only_and_file_stub() {
+        // #780: a file the tree-sitter parser indexed has a real def node; a file
+        // only the SCIP tool saw (gitignored vendored code) has just SCIP defs
+        // (plus a `file` stub). Only the former counts as Phase-A-indexed.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // App file: a real tree-sitter method node.
+        store
+            .put_node(&Node::new(
+                VName::new("c", "main", "lib/app.rb", "ruby", "method:App.run"),
+                "method",
+            ))
+            .unwrap();
+        // Vendored file: only a SCIP definition node and a `file` stub.
+        store
+            .put_node(&Node::new(
+                VName::new("c", "main", "vendor/gem.rb", "ruby", "scip:vendor/gem.rb:x"),
+                "definition",
+            ))
+            .unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("c", "main", "vendor/gem.rb", "ruby", "file"),
+                "file",
+            ))
+            .unwrap();
+
+        let paths = store.phase_a_indexed_paths("c").unwrap();
+        assert!(paths.contains("lib/app.rb"), "app file is indexed");
+        assert!(
+            !paths.contains("vendor/gem.rb"),
+            "scip-only vendored file must not count as indexed"
+        );
     }
 
     #[test]

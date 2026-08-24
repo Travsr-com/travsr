@@ -33,7 +33,15 @@ pub struct ScipName<'a> {
 /// descriptors, parameter descriptors, and macro/meta descriptors — callers
 /// can feed every Phase B node through without pre-filtering by language.
 pub fn scip_name_kind(symbol: &str) -> Option<ScipName<'_>> {
-    let descriptor_chain = symbol.split_whitespace().last()?;
+    // SCIP symbol = `<scheme> <manager> <package> <version> <descriptor-chain>`.
+    // The four metadata fields are single-space separated and space-free for
+    // every indexer we ingest, but the descriptor chain that follows MAY contain
+    // spaces when a segment is backtick-escaped — scip-ruby wraps Sorbet's RSpec
+    // DSL scopes that way (`` `<describe 'Foo'>`#`<it 'does x'>`(). ``).
+    // `split_whitespace().last()` tears those apart into garbage that still gets
+    // counted as a def miss; take everything after the 4th space instead so the
+    // whole chain (spaces and all) is parsed as one unit.
+    let descriptor_chain = symbol.splitn(5, ' ').nth(4)?;
 
     // Namespace descriptor `Name/`: Obj-C emits protocols this way
     // (`Speakable/`), and a protocol is a unifiable type (Phase A `protocol:`).
@@ -51,14 +59,18 @@ pub fn scip_name_kind(symbol: &str) -> Option<ScipName<'_>> {
         });
     }
 
-    let leaf = descriptor_chain
-        .rsplit('/')
-        .next()
-        .unwrap_or(descriptor_chain);
+    // Strip the package-path prefix at the last `/` that is not inside a
+    // backtick-escaped segment — a test-description scope can contain `/`
+    // (scip-ruby: `` `<it 'uses /var/tmp'>`(). ``), which is part of the name,
+    // not a path separator.
+    let leaf = match rfind_outside_backticks(descriptor_chain, '/') {
+        Some(i) => &descriptor_chain[i + 1..],
+        None => descriptor_chain,
+    };
 
     if leaf.ends_with(").") {
         // Method/function: `Name().`, `Type#Name().`, `Name(+1).`
-        let open = leaf.rfind('(')?;
+        let open = rfind_outside_backticks(leaf, '(')?;
         let (container, name) = split_container(&leaf[..open]);
         if name.is_empty() {
             return None;
@@ -104,17 +116,54 @@ pub fn scip_name_kind(symbol: &str) -> Option<ScipName<'_>> {
 /// match Phase A signatures.  Backticks containing `/` or `(` (package
 /// descriptors) are not tokenized here — those never parse as name/kind.
 fn split_container(s: &str) -> (Option<&str>, &str) {
-    match s.rsplit_once('#') {
-        Some((pre, name)) => {
-            let container =
-                unwrap_meta_container(strip_backticks(pre.rsplit('#').next().unwrap_or(pre)));
+    // Split on the last `#` that is not inside a backtick-escaped segment. A
+    // scip-ruby RSpec scope embeds `#` in its description (`` `<describe
+    // '#matches_identifiers?'>` ``); those are part of the name, not the
+    // `Container#name` separator, so a naive `rsplit('#')` would tear the scope
+    // apart into garbage that then escapes DSL detection and mis-parses real
+    // names.
+    match rfind_outside_backticks(s, '#') {
+        Some(i) => {
+            let name = &s[i + 1..];
+            let pre = &s[..i];
+            // Innermost container = the segment after `pre`'s own last
+            // outside-backtick `#` (nested types keep only the innermost).
+            let container_raw = match rfind_outside_backticks(pre, '#') {
+                Some(j) => &pre[j + 1..],
+                None => pre,
+            };
+            let container = unwrap_meta_container(strip_backticks(container_raw));
             (
                 (!container.is_empty()).then_some(container),
-                strip_backticks(name),
+                // Unwrap the leaf too: a `<Class:X>`/`<Module:X>` leaf is the
+                // *singleton class* of a real type (`Tunes#`<Class:Members>`#`),
+                // which has no separate Phase A node; reducing it to `X` lets the
+                // reference unify onto the real `class:X`. A synthetic DSL leaf
+                // (`<describe …>`) is left unchanged and still recognized.
+                unwrap_meta_container(strip_backticks(name)),
             )
         }
-        None => (None, strip_backticks(s)),
+        None => (None, unwrap_meta_container(strip_backticks(s))),
     }
+}
+
+/// Byte index of the last `ch` in `s` that is not inside a backtick-escaped
+/// segment. SCIP wraps any identifier containing a structural character
+/// (`#`, `/`, `(`, space, `.`) in backticks, so such a character inside a
+/// backtick pair belongs to the name and must not be read as a descriptor
+/// separator. Backtick regions are delimited by single backticks (the common
+/// scip-go / scip-ruby form); the scan simply toggles in/out on each one.
+fn rfind_outside_backticks(s: &str, ch: char) -> Option<usize> {
+    let mut in_tick = false;
+    let mut found = None;
+    for (i, c) in s.char_indices() {
+        if c == '`' {
+            in_tick = !in_tick;
+        } else if c == ch && !in_tick {
+            found = Some(i);
+        }
+    }
+    found
 }
 
 /// Unwrap scip-ruby's Sorbet meta-class container notation to the bare name.
@@ -141,6 +190,33 @@ fn unwrap_meta_container(s: &str) -> &str {
         }
     }
     s
+}
+
+/// `true` when a parsed SCIP name is a Sorbet synthetic DSL meta-scope rather
+/// than a real definition — scip-ruby (built on Sorbet) models every RSpec block
+/// (`describe`, `context`, `it`, `before`, …) as a singleton scope and emits a
+/// descriptor for it (`` `<describe 'Foo'>`#`<it 'does x'>`(). ``). Tree-sitter
+/// correctly sees these as method calls with a block, not definitions, so no
+/// Phase A twin exists or can exist. Counting them as def misses is what inflated
+/// issue #780's rate to ~52%; the daemon excludes them from the miss counters and
+/// drops them so they stop stealing spec-file reference edges.
+///
+/// True when the leaf `name` or its `container` is a DSL meta-scope: a bracketed
+/// `<…>` segment that [`unwrap_meta_container`] does NOT resolve to a real
+/// `<Class:Name>`/`<Module:Name>`.
+pub fn is_synthetic_dsl_scope(parsed: &ScipName<'_>) -> bool {
+    is_dsl_meta_scope(parsed.name) || parsed.container.is_some_and(is_dsl_meta_scope)
+}
+
+/// A single descriptor segment is a Sorbet DSL meta-scope: bracketed `<…>`, its
+/// first inner character alphabetic (so a Ruby operator method whose name merely
+/// starts with `<` — `<`, `<<`, `<=>` — is NOT misread as a scope), and not a
+/// real singleton class/module that [`unwrap_meta_container`] would unwrap.
+fn is_dsl_meta_scope(s: &str) -> bool {
+    let Some(inner) = s.strip_prefix('<').and_then(|i| i.strip_suffix('>')) else {
+        return false;
+    };
+    inner.chars().next().is_some_and(|c| c.is_alphabetic()) && unwrap_meta_container(s) == s
 }
 
 /// Strip ONE pair of surrounding backticks from a SCIP escaped identifier.
@@ -510,6 +586,124 @@ mod tests {
         assert_eq!(p.kind, "function");
         assert!(candidate_signatures(&p)
             .contains(&"method:EnsureBundleExecAction.is_supported?".to_string()));
+    }
+
+    #[test]
+    fn dsl_descriptor_with_spaces_tokenizes_and_is_synthetic() {
+        // #780 RC-1b: an RSpec `it` block's descriptor is backtick-escaped and
+        // contains spaces. `split_whitespace().last()` used to tear it into
+        // garbage that still counted as a def miss; the 4-space-prefix split now
+        // keeps the whole chain, and the result is recognized as synthetic.
+        let p = scip_name_kind(
+            "scip-ruby gem fastlane 0.0.0 `<describe 'Fastlane'>`#`<it 'sets the platform to iOS'>`().",
+        )
+        .unwrap();
+        assert_eq!(p.name, "<it 'sets the platform to iOS'>");
+        assert_eq!(p.container, Some("<describe 'Fastlane'>"));
+        assert_eq!(p.kind, "function");
+        assert!(is_synthetic_dsl_scope(&p), "DSL block must be synthetic");
+    }
+
+    #[test]
+    fn dsl_scope_with_hash_in_description_is_synthetic() {
+        // #780 RC-1b: an RSpec `describe '#method'` scope embeds a `#` inside its
+        // backtick-quoted description. A `#`-naive split tore it into garbage that
+        // escaped DSL detection and stayed counted; the backtick-aware split keeps
+        // the scope intact so it is recognized and excluded.
+        let p = scip_name_kind(
+            "scip-ruby gem fastlane 0.0.0 `<describe 'BetaGroup'>`#`<describe '#matches_identifiers?'>`#",
+        )
+        .unwrap();
+        assert_eq!(p.kind, "class");
+        assert_eq!(p.name, "<describe '#matches_identifiers?'>");
+        assert!(
+            is_synthetic_dsl_scope(&p),
+            "scope with '#' must be synthetic"
+        );
+    }
+
+    #[test]
+    fn dsl_scope_with_slash_in_description_parses_and_is_synthetic() {
+        // #780 RC-1b: a test description can contain `/` (`uses /var/tmp`), which
+        // is not a package-path separator. Backtick-aware leaf extraction keeps
+        // the whole chain so the scope parses and is recognized as synthetic.
+        let p = scip_name_kind(
+            "scip-ruby gem fastlane 0.0.0 `<describe 'Client'>`#`<it 'uses /var/tmp if home not available'>`().",
+        )
+        .unwrap();
+        assert_eq!(p.name, "<it 'uses /var/tmp if home not available'>");
+        assert!(is_synthetic_dsl_scope(&p));
+    }
+
+    #[test]
+    fn dsl_type_block_trailing_hash_is_synthetic() {
+        // #780 category C: a `describe` block with a trailing `#` parses as a
+        // class-kind name that is itself a DSL scope.
+        let p = scip_name_kind(
+            "scip-ruby gem fastlane 0.0.0 `<describe 'Match'>`#`<describe 'Setup'>`#",
+        )
+        .unwrap();
+        assert_eq!(p.kind, "class");
+        assert!(
+            is_synthetic_dsl_scope(&p),
+            "DSL type block must be synthetic"
+        );
+    }
+
+    #[test]
+    fn real_ruby_method_is_not_synthetic() {
+        // A genuine `Class#method().` must NOT be classified synthetic — it is a
+        // real def that Phase A should reconcile and the miss rate should count.
+        let p = scip_name_kind(
+            "scip-ruby gem fastlane 0.0.0 Supply#GeneratedUniversalApk#package_name().",
+        )
+        .unwrap();
+        assert_eq!(p.container, Some("GeneratedUniversalApk"));
+        assert_eq!(p.name, "package_name");
+        assert!(!is_synthetic_dsl_scope(&p));
+    }
+
+    #[test]
+    fn operator_method_starting_with_angle_is_not_synthetic() {
+        // Regression guard: `def <=>` / `def <<` name with `<`, and `<=>` even
+        // ends with `>`. Neither is a DSL scope (first inner char is not
+        // alphabetic), so they must reconcile as real operator methods.
+        for sym in [
+            "scip-ruby gem fastlane 0.0.0 Foo#`<=>`().",
+            "scip-ruby gem fastlane 0.0.0 Foo#`<<`().",
+        ] {
+            let p = scip_name_kind(sym).unwrap();
+            assert!(
+                !is_synthetic_dsl_scope(&p),
+                "operator misread as DSL: {sym}"
+            );
+        }
+    }
+
+    #[test]
+    fn singleton_class_leaf_unwraps_to_real_type() {
+        // #780: a `<Class:X>` leaf (kind class) is the singleton class of `X`; it
+        // has no Phase A twin of its own, so it must reduce to `X` and unify onto
+        // the real `class:X` instead of orphaning.
+        let p = scip_name_kind("scip-ruby gem fastlane 0.0.0 Spaceship#Tunes#`<Class:Members>`#")
+            .unwrap();
+        assert_eq!(p.kind, "class");
+        assert_eq!(p.name, "Members");
+        assert_eq!(p.container, Some("Tunes"));
+        assert!(!is_synthetic_dsl_scope(&p));
+        assert!(candidate_signatures(&p).contains(&"class:Members".to_string()));
+    }
+
+    #[test]
+    fn class_module_singleton_scope_is_not_synthetic() {
+        // `<Class:Name>` unwraps to a real container, so a class method inside it
+        // is a real def, not a synthetic scope.
+        let p = scip_name_kind(
+            "scip-ruby gem fastlane 0.0.0 Fastlane#Actions#`<Class:EnsureBundleExecAction>`#`is_supported?`().",
+        )
+        .unwrap();
+        assert_eq!(p.container, Some("EnsureBundleExecAction"));
+        assert!(!is_synthetic_dsl_scope(&p));
     }
 
     #[test]

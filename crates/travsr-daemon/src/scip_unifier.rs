@@ -11,7 +11,7 @@
 //! Phase A parser's signature convention.  Non-SCIP node signatures (builtin
 //! native Phase B plugins) yield no descriptor parse and fall through.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use travsr_core::{NodeId, ScipRef};
 use travsr_store::SqliteStore;
@@ -33,6 +33,14 @@ pub struct UnifyOutcome {
     pub attempted: usize,
     /// Callable/type candidates that matched an existing Phase A node.
     pub unified: usize,
+    /// SCIP def nodes with no reconcilable Phase A counterpart that must not be
+    /// counted as misses (#780): Sorbet synthetic DSL meta-scopes (RSpec
+    /// `describe`/`context`/`it` blocks), and defs in files the tree-sitter parser
+    /// never indexed (gitignored vendored code scip-ruby indexes anyway). Neither
+    /// is a reconciliation failure — no twin exists or can. Excluded from
+    /// `attempted`/`unified`, and dropped by the caller (node plus its inbound
+    /// refs/edges) so they stop surviving as orphan duplicates that steal edges.
+    pub dropped: HashSet<NodeId>,
 }
 
 /// G1 unification pass for all SCIP-indexed languages.
@@ -51,6 +59,10 @@ pub fn unify_all(
 ) -> UnifyOutcome {
     // Maps SCIP NodeId → unified TS NodeId for ref-patching.
     let mut alias_map: HashMap<NodeId, NodeId> = HashMap::new();
+    // #780: SCIP def nodes that are synthetic DSL meta-scopes — no twin exists
+    // and none can, so they are neither an attempt nor a miss. Collected here so
+    // the caller drops them (and their inbound refs/edges) outright.
+    let mut dropped: HashSet<NodeId> = HashSet::new();
     // (scip_symbol, ts_id) pairs, registered in one batch transaction below.
     let mut aliases: Vec<(String, NodeId)> = Vec::new();
     // E6: unification attempts/matches for the miss-rate signal. Scoped to
@@ -84,6 +96,13 @@ pub fn unify_all(
     // re-deriving it would mean re-parsing the SCIP descriptor.
     let mut unmatched: Vec<(NodeId, &str, Vec<String>, &str)> = Vec::new();
 
+    // #780: paths the tree-sitter parser actually indexed. A SCIP def in a file
+    // absent from this set is one only the SCIP tool saw — gitignored vendored
+    // code (scip-ruby indexes `vendor/bundle`, tree-sitter skips it) — and can
+    // never reconcile, so it is excluded from the miss counters and dropped
+    // rather than counted as a failure or kept as an edge-stealing orphan.
+    let indexed_paths = store.phase_a_indexed_paths(corpus).unwrap_or_default();
+
     for node in nodes {
         let scip_sym = travsr_indexer::scip_unifier::scip_symbol_from_sig(&node.vname.signature);
         // Primary: SCIP descriptor grammar (go/java/ruby/c#/c/c++/… + rust/ts/py
@@ -92,19 +111,38 @@ pub fn unify_all(
         // parse as SCIP. The fallback is gated to those languages so native
         // Phase A/rust nodes — whose signatures look identical — are never
         // re-unified against themselves.
-        let parsed = match travsr_indexer::scip_unifier::scip_name_kind(scip_sym) {
-            Some(p) => p,
+        let (parsed, is_scip) = match travsr_indexer::scip_unifier::scip_name_kind(scip_sym) {
+            Some(p) => (p, true),
             None if matches!(node.vname.language.as_str(), "kotlin" | "swift" | "dart") => {
                 match travsr_indexer::scip_unifier::native_name_kind(
                     &node.vname.signature,
                     &node.kind,
                 ) {
-                    Some(p) => p,
+                    Some(p) => (p, false),
                     None => continue,
                 }
             }
             None => continue,
         };
+        // #780: a SCIP def in a file the tree-sitter parser never indexed
+        // (gitignored vendored code that scip-ruby indexes anyway) has no twin
+        // and none can exist — it is not a reconciliation failure. Drop it and
+        // exclude it from the counters. Native sidecar nodes (kotlin/swift/dart)
+        // are never path-excluded: their twins live in the same indexed sources.
+        if is_scip && !indexed_paths.contains(&node.vname.path) {
+            dropped.insert(node.id);
+            continue;
+        }
+        // #780: Sorbet models RSpec `describe`/`context`/`it` blocks as singleton
+        // scopes and emits SCIP defs for them, but tree-sitter (correctly) sees a
+        // method call with a block, so no Phase A twin exists or can. These are
+        // not definitions: exclude them from the miss counters entirely and drop
+        // the node so it stops orphaning as a duplicate that steals spec-file
+        // reference edges (~70% of issue #780's headline rate).
+        if travsr_indexer::scip_unifier::is_synthetic_dsl_scope(&parsed) {
+            dropped.insert(node.id);
+            continue;
+        }
         // No definition line means line-proximity matching is meaningless —
         // unwrapping to 0 would let any same-named node on lines 1..=5 of the
         // file match wrongly. Skip instead.
@@ -232,5 +270,112 @@ pub fn unify_all(
         unified,
         attempted,
         alias_map,
+        dropped,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use travsr_core::{Node, VName};
+
+    fn scip_node(path: &str, symbol: &str, line: u32) -> Node {
+        // scip-reader packs def signatures as `scip:{rel_path}:{symbol}`.
+        let sig = format!("scip:{path}:{symbol}");
+        Node::new(VName::new("c", "main", path, "ruby", &sig), "definition").with_line(line)
+    }
+
+    #[test]
+    fn dsl_scopes_excluded_and_dropped_real_method_counted() {
+        // #780: a real `Class#method().` def unifies onto its Phase A twin and
+        // counts toward the miss rate; a Sorbet RSpec DSL block def is neither
+        // counted nor written — it is dropped so it cannot steal ref edges.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // Phase A twin for the real accessor (as emitted by the Ruby attr_* /
+        // method captures), same path + line as the SCIP def.
+        let ts = Node::new(
+            VName::new(
+                "c",
+                "main",
+                "supply/lib/supply/generated_universal_apk.rb",
+                "ruby",
+                "method:GeneratedUniversalApk.package_name",
+            ),
+            "method",
+        )
+        .with_line(4)
+        .with_end_line(4);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&ts), &[], "scip")
+            .unwrap();
+
+        let real = scip_node(
+            "supply/lib/supply/generated_universal_apk.rb",
+            "scip-ruby gem fastlane 0.0.0 Supply#GeneratedUniversalApk#package_name().",
+            4,
+        );
+        let dsl_method = scip_node(
+            "fastlane/spec/actions_specs/carthage_spec.rb",
+            "scip-ruby gem fastlane 0.0.0 `<describe 'Fastlane'>`#`<it 'sets the platform to iOS'>`().",
+            7,
+        );
+        let dsl_type = scip_node(
+            "match/spec/setup_spec.rb",
+            "scip-ruby gem fastlane 0.0.0 `<describe 'Match'>`#`<describe 'Setup'>`#",
+            1,
+        );
+
+        let nodes = vec![real.clone(), dsl_method.clone(), dsl_type.clone()];
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", &nodes, &mut refs);
+
+        assert_eq!(out.attempted, 1, "only the real Class#method is an attempt");
+        assert_eq!(out.unified, 1, "the real method unifies onto its twin");
+        assert_eq!(out.alias_map.get(&real.id), Some(&ts.id));
+        assert!(out.dropped.contains(&dsl_method.id), "DSL block dropped");
+        assert!(out.dropped.contains(&dsl_type.id), "DSL type block dropped");
+        assert!(
+            !out.dropped.contains(&real.id),
+            "the real method must not be dropped"
+        );
+    }
+
+    #[test]
+    fn scip_def_in_unindexed_file_is_dropped_not_counted() {
+        // #780: scip-ruby indexes gitignored vendored code the tree-sitter parser
+        // skips, so those files hold only SCIP defs and no Phase A node. Such a
+        // def can never reconcile — it must be dropped and excluded from the miss
+        // rate, not counted as a failure.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // An indexed app file with a real Phase A twin (so its path is "indexed").
+        let ts = Node::new(
+            VName::new("c", "main", "lib/app.rb", "ruby", "method:App.run"),
+            "method",
+        )
+        .with_line(2)
+        .with_end_line(2);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&ts), &[], "scip")
+            .unwrap();
+
+        let app = scip_node("lib/app.rb", "scip-ruby gem g 0.0.0 App#run().", 2);
+        // A vendored def whose file has NO Phase A node at all.
+        let vendored = scip_node(
+            "vendor/bundle/ruby/3.4.0/gems/rake/lib/rake/task.rb",
+            "scip-ruby gem g 0.0.0 Rake#Task#invoke().",
+            10,
+        );
+
+        let nodes = vec![app.clone(), vendored.clone()];
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", &nodes, &mut refs);
+
+        assert_eq!(out.attempted, 1, "only the indexed-file def is an attempt");
+        assert_eq!(out.unified, 1);
+        assert!(
+            out.dropped.contains(&vendored.id),
+            "def in an unindexed (vendored) file must be dropped"
+        );
+        assert!(!out.dropped.contains(&app.id));
     }
 }
