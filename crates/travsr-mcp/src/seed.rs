@@ -3360,7 +3360,7 @@ mod tests {
     fn order_anchor_candidates_prefers_logic_bearing_over_field_only() {
         // FTS returns the field-only struct FIRST (closer literal name match) and the
         // logic-bearing impl/method after — exactly the `Daemon` case from #463.
-        let nodes = vec![
+        let nodes = [
             anchor_node("struct", "struct:Daemon", 1, 3),
             anchor_node("impl", "impl:Daemon", 5, 60),
             anchor_node("method", "fn:Daemon.run", 20, 55),
@@ -3374,7 +3374,7 @@ mod tests {
 
     #[test]
     fn order_anchor_candidates_breaks_kind_ties_by_larger_span() {
-        let nodes = vec![
+        let nodes = [
             anchor_node("function", "fn:small", 10, 15), // span 5
             anchor_node("function", "fn:big", 10, 90),   // span 80
         ];
@@ -3386,7 +3386,7 @@ mod tests {
     #[test]
     fn order_anchor_candidates_is_stable_within_equal_keys() {
         // Two leaves with identical (rank, span): FTS order must be preserved.
-        let nodes = vec![
+        let nodes = [
             anchor_node("field", "field:a", 1, 1),
             anchor_node("field", "field:b", 1, 1),
         ];
@@ -3399,7 +3399,7 @@ mod tests {
     fn order_anchor_candidates_respects_window_bound() {
         // A logic-bearing node BELOW the window must not be pulled up — name-match
         // quality (FTS rank) still gates the pool; only the head is reordered.
-        let nodes = vec![
+        let nodes = [
             anchor_node("struct", "struct:Foo", 1, 2),
             anchor_node("field", "field:Foo", 3, 4),
             anchor_node("field", "field:Bar", 5, 6),
