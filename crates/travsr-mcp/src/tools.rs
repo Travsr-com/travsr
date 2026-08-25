@@ -3836,6 +3836,93 @@ fn get_execution_path_with_filter(
 /// explained (#620): single-repo callers pass `true` so an agent never gets a
 /// silent blank; the multi-repo aggregator passes `false` because a repo
 /// without the symbols is normal, not an error.
+/// How one `get_execution_path` endpoint name resolved, after access filtering.
+///
+/// #779: the distinction that was missing. The old code took the first hit from
+/// `search_nodes_by_name`, so "several definitions" and "exactly one" were the
+/// same case, and an ambiguous name silently became a guess.
+enum EndpointResolution {
+    Unique(CoreNode),
+    /// More than one definition the caller may see. Never resolved by picking
+    /// one: the caller is handed the list, exactly as `graph` does.
+    Ambiguous(Vec<CoreNode>),
+    None,
+}
+
+impl EndpointResolution {
+    /// The node when unique, else `None`. `Ambiguous` deliberately collapses to
+    /// `None` here so a caller that skipped the ambiguity branch (the
+    /// non-diagnose path, which returns an empty string for every failure) can
+    /// never accidentally proceed on a guessed endpoint.
+    fn into_unique(self) -> Option<CoreNode> {
+        match self {
+            EndpointResolution::Unique(n) => Some(n),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve one endpoint through the shared tiered resolver, then apply the
+/// access filter.
+///
+/// SEC P0: the filter runs BEFORE the count, and that order is load-bearing.
+/// Ambiguity is a property of what *this caller* may see, so a name with four
+/// definitions of which the caller may see one resolves uniquely for them and
+/// they are never told the other three exist. Counting first and filtering
+/// after would leak their existence through the candidate list, which is the
+/// same oracle `get_execution_path_denied_matches_not_found` exists to prevent.
+fn resolve_endpoint(
+    store: &SqliteStore,
+    name: &str,
+    filter: &dyn EdgeFilter,
+) -> EndpointResolution {
+    let visible = |n: &CoreNode| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()));
+    let mut candidates = match resolve_reference_targets(store, name, None) {
+        RefTarget::Unique(n) => vec![n],
+        RefTarget::Ambiguous(list) => list,
+        RefTarget::None => Vec::new(),
+    };
+    candidates.retain(visible);
+    match candidates.len() {
+        0 => EndpointResolution::None,
+        1 => EndpointResolution::Unique(candidates.remove(0)),
+        _ => EndpointResolution::Ambiguous(candidates),
+    }
+}
+
+/// The candidate list for an ambiguous `get_execution_path` endpoint.
+///
+/// Mirrors `graph`'s wording so the two tools teach the same escape hatch: an
+/// exact signature always resolves uniquely (Tier 1 of the resolver), so the
+/// listed signatures are directly re-runnable.
+fn ambiguous_endpoint_message(which: &str, name: &str, candidates: &[CoreNode]) -> String {
+    let limit = crate::AMBIGUOUS_DISPLAY_LIMIT;
+    let count = candidates.len();
+    let truncated = count > limit;
+    let head = if truncated {
+        format!("{which} '{name}' is ambiguous, showing {limit} of at least {count} definitions.")
+    } else {
+        format!("{which} '{name}' is ambiguous, {count} definitions.")
+    };
+    let mut out = format!(
+        "{head} Re-run with one of the exact signatures below, which each resolve \
+         uniquely, instead of the bare name:"
+    );
+    for n in candidates.iter().take(limit) {
+        // " at " rather than the em-dash `graph` uses for the same list. This
+        // is a diagnostic message, not the `<sig> (<kind>) \u{2014} <path>` wire
+        // header packages/travsr-vscode parses, so it has no separator to
+        // preserve and falls under the no-em-dash rule the CI gate enforces.
+        let loc = if n.vname.path.is_empty() {
+            String::new()
+        } else {
+            format!(" at {}", n.vname.path)
+        };
+        out.push_str(&format!("\n  {} ({}){}", n.vname.signature, n.kind, loc));
+    }
+    out
+}
+
 fn get_execution_path_body(
     store: &SqliteStore,
     source: &str,
@@ -3844,25 +3931,17 @@ fn get_execution_path_body(
     diagnose: bool,
 ) -> String {
     // SEC P0: resolve source and sink; treat "not found" == "access denied" identically.
-    let src_node = match store.search_nodes_by_name(source) {
-        Ok(n) => n
-            .into_iter()
-            .find(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()))),
-        Err(e) => {
-            tracing::warn!("get_execution_path source search error: {e}");
-            return String::new();
-        }
-    };
-
-    let sink_node = match store.search_nodes_by_name(sink) {
-        Ok(n) => n
-            .into_iter()
-            .find(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()))),
-        Err(e) => {
-            tracing::warn!("get_execution_path sink search error: {e}");
-            return String::new();
-        }
-    };
+    //
+    // #779: goes through `resolve_reference_targets`, the same tiered resolver
+    // `graph` and `search_symbol` use, rather than taking the first hit from
+    // `search_nodes_by_name`. Picking `[0]` from an ambiguous name silently
+    // chose one of several same-named definitions and then reported "no path
+    // found", which is a *wrong* answer rather than a missing one: the caller is
+    // told two symbols are disconnected when the tool simply looked at the wrong
+    // pair. On fastlane/fastlane, `Runner.run` has four definitions and only
+    // match's calls `fetch_certificate`.
+    let src_res = resolve_endpoint(store, source, filter);
+    let sink_res = resolve_endpoint(store, sink, filter);
 
     // #755 Part B item 6: say WHICH endpoint failed. The old message hedged with
     // "source X and/or sink Y" even when only one side was bad, so the caller had
@@ -3874,6 +3953,22 @@ fn get_execution_path_body(
     // existence oracle needs — "sink 'X' did not resolve" is emitted identically
     // for a nonexistent X and for an X the caller may not see, which is exactly
     // the indistinguishability `get_execution_path_denied_matches_not_found` pins.
+    // #779: an ambiguous endpoint is answered with the candidate list, never by
+    // guessing. Checked before the resolution failure below, because "I found
+    // several and will not choose" is a different, more actionable answer than
+    // "I found none". Only the endpoint that is actually ambiguous is reported;
+    // if both are, the source is named first so the caller has one thing to fix.
+    if diagnose {
+        if let EndpointResolution::Ambiguous(candidates) = &src_res {
+            return ambiguous_endpoint_message("source", source, candidates);
+        }
+        if let EndpointResolution::Ambiguous(candidates) = &sink_res {
+            return ambiguous_endpoint_message("sink", sink, candidates);
+        }
+    }
+
+    let (src_node, sink_node) = (src_res.into_unique(), sink_res.into_unique());
+
     let (src, snk) = match (src_node, sink_node) {
         (Some(a), Some(b)) => (a, b),
         (src_opt, sink_opt) => {
@@ -12191,6 +12286,148 @@ mod snippet_tests {
             result.contains("fn:alpha") && result.contains("fn:beta"),
             "the resolved signatures confirm resolution succeeded; got: {result}"
         );
+    }
+
+    /// #779: an ambiguous endpoint must be answered with the candidate list,
+    /// not silently resolved to one of them and then reported as disconnected.
+    ///
+    /// The reported shape on fastlane/fastlane: `Runner.run` has four
+    /// definitions, only match's calls `fetch_certificate`, and the tool picked
+    /// a different one and said "no path found". That is a wrong answer rather
+    /// than a missing one, which is why it outranks the no-path message.
+    #[test]
+    fn get_execution_path_ambiguous_endpoint_lists_candidates() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for dir in ["gym", "scan", "sigh", "match"] {
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "t",
+                        "",
+                        &format!("{dir}/runner.rb"),
+                        "ruby",
+                        "method:Runner.run",
+                    ),
+                    "method",
+                ))
+                .unwrap();
+        }
+        store
+            .put_node(&Node::new(
+                VName::new(
+                    "t",
+                    "",
+                    "match/runner.rb",
+                    "ruby",
+                    "method:Runner.fetch_certificate",
+                ),
+                "method",
+            ))
+            .unwrap();
+
+        let result = get_execution_path(&store, "Runner.run", "fetch_certificate");
+        assert!(
+            result.contains("ambiguous"),
+            "an ambiguous source must be reported as ambiguous; got: {result}"
+        );
+        assert!(
+            !result.contains("no path found"),
+            "reporting disconnection for a name that was never resolved is the \
+             bug itself; got: {result}"
+        );
+        assert!(
+            result.contains("source"),
+            "the message must say WHICH endpoint is ambiguous; got: {result}"
+        );
+        assert!(
+            result.contains("method:Runner.run"),
+            "the candidate signatures are the escape hatch, so they must be \
+             listed; got: {result}"
+        );
+    }
+
+    /// #779: the same guard on the sink side, and it must name the sink rather
+    /// than blaming the source.
+    #[test]
+    fn get_execution_path_ambiguous_sink_names_the_sink() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "a/x.rb", "ruby", "method:Only.start"),
+                "method",
+            ))
+            .unwrap();
+        for dir in ["a", "b"] {
+            store
+                .put_node(&Node::new(
+                    VName::new("t", "", &format!("{dir}/y.rb"), "ruby", "method:Dup.finish"),
+                    "method",
+                ))
+                .unwrap();
+        }
+        let result = get_execution_path(&store, "Only.start", "Dup.finish");
+        assert!(
+            result.contains("ambiguous") && result.contains("sink"),
+            "an ambiguous sink must be named as the sink; got: {result}"
+        );
+    }
+
+    /// #779 + SEC P0: ambiguity is a property of what THIS caller may see.
+    ///
+    /// Four definitions exist, the caller may see one, so it resolves uniquely
+    /// for them and they are never told the other three exist. This pins the
+    /// filter-before-count order in `resolve_endpoint`: counting first and
+    /// filtering after would leak the hidden definitions through the candidate
+    /// list, which is the existence oracle
+    /// `get_execution_path_denied_matches_not_found` exists to prevent.
+    #[test]
+    fn get_execution_path_ambiguity_never_leaks_denied_definitions() {
+        use travsr_core::{Node, VName};
+        use travsr_retrieval::RbacFilter;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // One visible definition, three the caller may not see.
+        store
+            .put_node(&Node::new(
+                VName::new("public", "", "ok/runner.rb", "ruby", "method:Runner.run"),
+                "method",
+            ))
+            .unwrap();
+        for dir in ["s1", "s2", "s3"] {
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "secret",
+                        "",
+                        &format!("{dir}/runner.rb"),
+                        "ruby",
+                        "method:Runner.run",
+                    ),
+                    "method",
+                ))
+                .unwrap();
+        }
+        store
+            .put_node(&Node::new(
+                VName::new("public", "", "ok/runner.rb", "ruby", "method:Runner.sink"),
+                "method",
+            ))
+            .unwrap();
+
+        let filter = RbacFilter::new(["public"]);
+        let result = get_execution_path_authed(&store, "Runner.run", "Runner.sink", &filter);
+        assert!(
+            !result.contains("ambiguous"),
+            "one visible definition is not ambiguous for this caller; got: {result}"
+        );
+        for hidden in ["s1", "s2", "s3", "secret"] {
+            assert!(
+                !result.contains(hidden),
+                "a definition the caller may not see must never appear, not even \
+                 in a candidate list ({hidden}); got: {result}"
+            );
+        }
     }
 
     /// An endpoint that does not resolve must get the could-not-resolve
