@@ -190,8 +190,8 @@ fn span_size(node: &CoreNode) -> u32 {
 /// borrows into the head of `exact_nodes` (never more than `window`).
 ///
 /// `O(window log window)`.
-fn order_anchor_candidates(exact_nodes: &[CoreNode], window: usize) -> Vec<&CoreNode> {
-    let mut head: Vec<&CoreNode> = exact_nodes.iter().take(window).collect();
+fn order_anchor_candidates<'a>(exact_nodes: &[&'a CoreNode], window: usize) -> Vec<&'a CoreNode> {
+    let mut head: Vec<&CoreNode> = exact_nodes.iter().take(window).copied().collect();
     head.sort_by(|a, b| {
         kind_logic_rank(&a.kind)
             .cmp(&kind_logic_rank(&b.kind))
@@ -2236,14 +2236,19 @@ pub(crate) fn build_seed_set(
         // the #463 kind-reorder promote logic-bearing noise ahead of the true
         // match and then consume the `MAX_ANCHORS_PER_TOKEN` budget via
         // take-then-filter, starving the exact `class:UI` anchor (issue #778).
-        // Filtering the pool up front is a no-op when the top candidates already
-        // segment-match (identical #463 input/output); it only removes noise that
-        // could never have emitted. Uses the signature-only predicate to match
-        // the emit-loop gate exactly (a path-only match is not an anchor — #478).
-        let anchor_pool: Vec<CoreNode> = exact_nodes
+        //
+        // This is a RECALL INCREASE, not a no-op: pre-filtering changes what the
+        // `anchor_reorder_window` head covers, so for a starved token the emitted
+        // anchors can go from 0 to `MAX_ANCHORS_PER_TOKEN` — which shifts RRF
+        // ordering, the per-path budget and the g1 input. It only ever admits
+        // nodes the emit loop's own `contains_token` gate would have kept anyway;
+        // it never admits a node that could not have emitted. Uses the
+        // signature-only predicate to match that gate exactly (a path-only match
+        // is not an anchor — #478). Borrows from `exact_nodes` (no clone): the
+        // pool lives only within this loop iteration.
+        let anchor_pool: Vec<&CoreNode> = exact_nodes
             .iter()
             .filter(|n| travsr_core::ident::contains_token(&resolve_token, &n.vname.signature))
-            .cloned()
             .collect();
 
         // #709: the corrected anchor deliberately bypasses the *budget* gates
@@ -2264,7 +2269,11 @@ pub(crate) fn build_seed_set(
             let ordered: Vec<&CoreNode> = if anchor_kind_priority {
                 order_anchor_candidates(&anchor_pool, anchor_reorder_window)
             } else {
-                anchor_pool.iter().take(MAX_ANCHORS_PER_TOKEN).collect()
+                anchor_pool
+                    .iter()
+                    .copied()
+                    .take(MAX_ANCHORS_PER_TOKEN)
+                    .collect()
             };
             ordered.into_iter().find(|node| {
                 !is_anchor_noise(node)
@@ -2341,7 +2350,11 @@ pub(crate) fn build_seed_set(
         let ordered: Vec<&CoreNode> = if anchor_kind_priority {
             order_anchor_candidates(&anchor_pool, anchor_reorder_window)
         } else {
-            anchor_pool.iter().take(MAX_ANCHORS_PER_TOKEN).collect()
+            anchor_pool
+                .iter()
+                .copied()
+                .take(MAX_ANCHORS_PER_TOKEN)
+                .collect()
         };
         for node in ordered.into_iter().take(MAX_ANCHORS_PER_TOKEN) {
             // RFC-022 D3: stricter anchor-pool gate than the general `is_noise_seed`
@@ -3352,7 +3365,7 @@ mod tests {
             anchor_node("impl", "impl:Daemon", 5, 60),
             anchor_node("method", "fn:Daemon.run", 20, 55),
         ];
-        let ordered = order_anchor_candidates(&nodes, 6);
+        let ordered = order_anchor_candidates(&nodes.iter().collect::<Vec<_>>(), 6);
         // Body-bearing definitions now lead (largest-span first); the struct sinks last.
         assert_eq!(ordered[0].kind, "impl");
         assert_eq!(ordered[1].kind, "method");
@@ -3365,7 +3378,7 @@ mod tests {
             anchor_node("function", "fn:small", 10, 15), // span 5
             anchor_node("function", "fn:big", 10, 90),   // span 80
         ];
-        let ordered = order_anchor_candidates(&nodes, 6);
+        let ordered = order_anchor_candidates(&nodes.iter().collect::<Vec<_>>(), 6);
         assert_eq!(ordered[0].vname.signature, "fn:big");
         assert_eq!(ordered[1].vname.signature, "fn:small");
     }
@@ -3377,7 +3390,7 @@ mod tests {
             anchor_node("field", "field:a", 1, 1),
             anchor_node("field", "field:b", 1, 1),
         ];
-        let ordered = order_anchor_candidates(&nodes, 6);
+        let ordered = order_anchor_candidates(&nodes.iter().collect::<Vec<_>>(), 6);
         assert_eq!(ordered[0].vname.signature, "field:a");
         assert_eq!(ordered[1].vname.signature, "field:b");
     }
@@ -3392,7 +3405,7 @@ mod tests {
             anchor_node("field", "field:Bar", 5, 6),
             anchor_node("method", "fn:Foo.run", 7, 40), // past the window-3 head
         ];
-        let ordered = order_anchor_candidates(&nodes, 3);
+        let ordered = order_anchor_candidates(&nodes.iter().collect::<Vec<_>>(), 3);
         assert_eq!(ordered.len(), 3, "window bounds the reordered set");
         assert!(
             ordered.iter().all(|n| n.kind != "method"),
