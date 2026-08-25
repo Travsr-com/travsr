@@ -12305,7 +12305,7 @@ mod snippet_tests {
                     VName::new(
                         "t",
                         "",
-                        &format!("{dir}/runner.rb"),
+                        format!("{dir}/runner.rb"),
                         "ruby",
                         "method:Runner.run",
                     ),
@@ -12362,7 +12362,7 @@ mod snippet_tests {
         for dir in ["a", "b"] {
             store
                 .put_node(&Node::new(
-                    VName::new("t", "", &format!("{dir}/y.rb"), "ruby", "method:Dup.finish"),
+                    VName::new("t", "", format!("{dir}/y.rb"), "ruby", "method:Dup.finish"),
                     "method",
                 ))
                 .unwrap();
@@ -12400,7 +12400,7 @@ mod snippet_tests {
                     VName::new(
                         "secret",
                         "",
-                        &format!("{dir}/runner.rb"),
+                        format!("{dir}/runner.rb"),
                         "ruby",
                         "method:Runner.run",
                     ),
