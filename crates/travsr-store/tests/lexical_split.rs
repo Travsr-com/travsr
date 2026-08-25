@@ -340,6 +340,35 @@ fn symbol_frequency_short_token_counts_qualified_members_as_generic() {
 }
 
 #[test]
+fn symbol_frequency_short_token_saturates_at_cap() {
+    // #778 PR #791 review follow-up: when a short leaf name is common enough to
+    // hit LEAF_NAME_COUNT_CAP (4096), the LIMIT truncates the scan. The truncated
+    // count must NOT be reported verbatim: 4096 still reads as "specific" through
+    // idf_weight (which does not saturate near it), which would let a name borne
+    // by tens of thousands of nodes clear the anchor-emit cut. The count is
+    // instead saturated to the corpus size so IDF floors to generic.
+    let mut store = open();
+    // 4096 nodes named exactly `xy` at their leaf -> the leaf-count scan hits the
+    // LIMIT. One extra non-matching node makes the corpus 4097, so a saturated
+    // result is distinguishable from the truncated 4096.
+    for i in 0..4096 {
+        store
+            .put_node(&node(
+                &format!("app/w_{i}.rb"),
+                &format!("method:W{i}.xy"),
+                "method",
+            ))
+            .unwrap();
+    }
+    store
+        .put_node(&node("app/other.rb", "class:Other", "class"))
+        .unwrap();
+    // Saturated to the corpus size (4097), not the truncated cap (4096): proves
+    // the LIMIT value is not reported as-is.
+    assert_eq!(store.symbol_frequency("xy").unwrap(), Some(4097));
+}
+
+#[test]
 fn symbol_frequency_none_for_absent_token() {
     let mut store = open();
     store

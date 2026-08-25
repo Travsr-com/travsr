@@ -2695,8 +2695,9 @@ FROM nodes";
     /// short exact symbol; anything past a few hundred is already "generic" for
     /// any realistic corpus via IDF), so counting past this adds nothing and the
     /// `LIMIT` caps the worst-case scan for a pathologically common short name.
-    /// Sits far above the frequency at which IDF saturates to generic, so a
-    /// capped count never inflates a common token's IDF.
+    /// Hitting the cap means "at least this many"; the caller saturates the
+    /// count to the corpus size so IDF floors to generic (a truncated 4096 would
+    /// still read as specific — `idf_weight` does not saturate near it).
     const LEAF_NAME_COUNT_CAP: usize = 4096;
 
     /// Exact/word-boundary/prefix match: drops the loose `ELSE 40` substring
@@ -6342,9 +6343,10 @@ impl SqliteStore {
     /// Bounded by [`Self::LEAF_NAME_COUNT_CAP`]: only the rare/generic
     /// distinction (via the resulting IDF band) is used downstream, so the true
     /// count above the cap is irrelevant, and the `LIMIT` early-stops the scan
-    /// for a pathologically common short name. The cap sits far above the
-    /// frequency at which IDF saturates to "generic" for any realistic corpus,
-    /// so a capped count never inflates a common token's IDF. Returns 0 when no
+    /// for a pathologically common short name. At the cap the count is
+    /// saturated to the corpus size (see the return below) rather than reported
+    /// as the truncated `LIMIT` value, so a name common enough to hit the cap
+    /// floors IDF to "generic" instead of reading as specific. Returns 0 when no
     /// node bears the exact name — the caller keeps `None` on that genuine zero.
     ///
     /// `_` and `%` in `token` are escaped so a token like `a_b` is matched
@@ -6383,7 +6385,19 @@ impl SqliteStore {
                 |r| r.get(0),
             )
             .context("counting exact leaf-name matches for symbol_frequency")?;
-        Ok(n.clamp(0, Self::LEAF_NAME_COUNT_CAP as i64) as usize)
+        // At the cap the true count is unknown but is >= the cap: the `LIMIT`
+        // truncated it. A truncated count reads as *specific* through
+        // `idf_weight`, which does not saturate anywhere near the cap, so a
+        // short leaf name borne by tens of thousands of nodes would clear the
+        // anchor-emit cut — the exact inversion this fallback exists to prevent.
+        // Saturate to the corpus size N so IDF floors to "generic" instead;
+        // below the cap the count is exact. Only the capped branch touches the
+        // store again.
+        Ok(if n >= Self::LEAF_NAME_COUNT_CAP as i64 {
+            self.total_node_count()?
+        } else {
+            n.max(0) as usize
+        })
     }
 
     /// Returns the total number of nodes in the graph.
