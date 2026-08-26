@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
@@ -32,8 +32,32 @@ pub enum WatchEvent {
 /// A handle to the running watcher threads. Drop to signal shutdown.
 pub struct WatcherHandle {
     stop: Arc<AtomicBool>,
+    /// #801: raw events accepted from the OS, counted BEFORE any userspace
+    /// filtering.
+    ///
+    /// Observable because the userspace filter makes the interesting failure
+    /// invisible from the outside: `should_skip_all` discards `target/` events
+    /// either way, so "no reindex happened" is equally true whether the tree is
+    /// unwatched or whether every one of its 251,662 files is being watched,
+    /// queued and stat'd first. That indistinguishability is precisely why the
+    /// existing filter tests passed while the daemon grew 13 MB/s.
+    raw_events: Arc<AtomicU64>,
+    /// Raw events dropped because the bounded queue was full (#801).
+    raw_dropped: Arc<AtomicU64>,
     _event_thread: std::thread::JoinHandle<()>,
     _flush_thread: std::thread::JoinHandle<()>,
+}
+
+impl WatcherHandle {
+    /// Raw OS events accepted so far, before userspace filtering.
+    pub fn raw_events(&self) -> u64 {
+        self.raw_events.load(Ordering::Relaxed)
+    }
+
+    /// Raw OS events shed because the bounded queue was full.
+    pub fn raw_dropped(&self) -> u64 {
+        self.raw_dropped.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for WatcherHandle {
@@ -58,6 +82,17 @@ const DEBOUNCE_MS: u64 = 500;
 /// hook reconciles via `git diff-tree` on the next commit; `travsr init`
 /// always fully recovers the graph.
 const MAX_PENDING: usize = 100_000;
+
+/// #801: capacity of the raw OS-event queue between the notify callback and the
+/// event loop.
+///
+/// Sized well above any burst a human edit or a `git checkout` produces, and far
+/// below the point where holding that many `notify::Event` values costs real
+/// memory, so it only engages on a genuine flood. Deliberately smaller than
+/// `MAX_PENDING`: this queue holds unfiltered events, most of which the very
+/// next step discards, whereas the debounce table holds paths already known to
+/// be relevant and worth keeping.
+const RAW_EVENT_CAP: usize = 8_192;
 
 /// Mirrored by `travsr-mcp`'s own `SKIP_DIRS` so `find_pattern` searches the
 /// same file universe the graph is built from (#448). The dependency rules run
@@ -104,8 +139,16 @@ pub fn spawn(
     let pending: Arc<Mutex<HashMap<PathBuf, (PendingKind, Instant)>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    // Synchronous channel from the notify callback to our processing loop.
-    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<notify::Event>();
+    // #801: bounded. This channel sits UPSTREAM of the debounce table's
+    // `MAX_PENDING` cap, so that cap never applied to it: a flood grew this
+    // queue without limit, at ~13 MB/s on a repo with a populated `target/`,
+    // until the machine thrashed. Shedding is the right policy for a
+    // reindex trigger, exactly as it already is for the debounce table: the
+    // next event for a path supersedes the one dropped, and the periodic
+    // reconcile catches anything missed entirely.
+    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<notify::Event>(RAW_EVENT_CAP);
+    let raw_events = Arc::new(AtomicU64::new(0));
+    let raw_dropped = Arc::new(AtomicU64::new(0));
 
     // ── Flush thread ─────────────────────────────────────────────────────────
     // Every DEBOUNCE_MS, emit entries whose deadline has passed. Runs on an OS
@@ -155,6 +198,8 @@ pub fn spawn(
 
     // ── Event-processing thread ───────────────────────────────────────────────
     // Owns the `RecommendedWatcher` so it lives on a stable OS thread.
+    let raw_events_cb = Arc::clone(&raw_events);
+    let raw_dropped_cb = Arc::clone(&raw_dropped);
     let stop_event = Arc::clone(&stop);
     let event_thread = std::thread::Builder::new()
         .name("travsr-watcher-event".into())
@@ -166,7 +211,20 @@ pub fn spawn(
             let mut watcher = match RecommendedWatcher::new(
                 move |res: notify::Result<notify::Event>| {
                     if let Ok(ev) = res {
-                        let _ = raw_tx.send(ev);
+                        raw_events_cb.fetch_add(1, Ordering::Relaxed);
+                        // try_send, never send: this runs on the notify thread,
+                        // and blocking it stalls the OS event source itself.
+                        if let Err(std::sync::mpsc::TrySendError::Full(_)) = raw_tx.try_send(ev) {
+                            let n = raw_dropped_cb.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n == 1 || n % 10_000 == 0 {
+                                tracing::warn!(
+                                    dropped = n,
+                                    cap = RAW_EVENT_CAP,
+                                    "watcher event queue full; shedding events. \
+                                     The periodic reconcile still catches missed paths."
+                                );
+                            }
+                        }
                     }
                 },
                 notify::Config::default(),
@@ -185,7 +243,43 @@ pub fn spawn(
                 return;
             }
 
-            // Signal ready — watch is established, caller can proceed.
+            // #801: drop the watches this module has always claimed to drop.
+            // Two doc comments promised it and no code did it, so a recursive
+            // watch covered every SKIP_DIRS tree: on a built Rust repo that is
+            // 15,664 directories and 251,662 files under `target/` alone,
+            // producing events that were queued and stat'd before being
+            // discarded by `should_skip_all`.
+            //
+            // This is not only a cost fix. `spawn`'s contract, which
+            // `lib.rs` relies on before binding the control socket, is that
+            // `.travsr/` is unwatched by the time it returns; otherwise the
+            // kqueue backend opens `daemon.sock` and gets ENOTSUP, killing the
+            // whole watch. That guarantee has never actually held.
+            //
+            // Failures are logged and not fatal: a skip dir that does not exist
+            // in this repo is the common case, and losing the optimisation is
+            // never worth refusing to watch the repo at all.
+            for skip in SKIP_DIRS {
+                let p = repo_root.join(skip);
+                if p.is_dir() {
+                    // WatchNotFound is the EXPECTED result on FSEvents (macOS
+                    // default backend): it streams one recursive watch from the
+                    // root and has no per-directory watch to remove, so there is
+                    // nothing to unwatch and this call cannot help there. Verified
+                    // against notify 8.2.0 rather than assumed. Backends with
+                    // per-directory watches (inotify, the platform the 13 MB/s
+                    // failure was measured on) drop the subtree here. On FSEvents
+                    // the cost is instead bounded by the reordered filter and the
+                    // bounded queue below, which is why those are not optional
+                    // extras to this fix.
+                    if let Err(e) = watcher.unwatch(&p) {
+                        tracing::debug!("unwatch {} not applied (non-fatal): {e}", p.display());
+                    }
+                }
+            }
+
+            // Signal ready — watch is established and skip dirs are unwatched,
+            // so the caller can proceed.
             let _ = ready_tx.send(Ok(()));
 
             // Block on raw events until the stop flag is set.
@@ -208,6 +302,16 @@ pub fn spawn(
                             gitignore = build_ignore_matcher(&repo_root);
                         }
                         for path in &event.paths {
+                            // #801: the cheap prefix test runs FIRST. It used to
+                            // run after the `metadata` call below, so every event
+                            // from a skipped tree paid a stat syscall before being
+                            // rejected on a string compare. Ordering only: a
+                            // skipped path is discarded either way, so nothing
+                            // downstream sees a different set of paths.
+                            if should_skip_all(path, &repo_root, &gitignore) {
+                                continue;
+                            }
+
                             // Drop events predating daemon start (FSEvents replay guard).
                             if let Ok(meta) = std::fs::metadata(path) {
                                 if let Ok(modified) = meta.modified() {
@@ -219,10 +323,6 @@ pub fn spawn(
                                         continue;
                                     }
                                 }
-                            }
-
-                            if should_skip_all(path, &repo_root, &gitignore) {
-                                continue;
                             }
 
                             // Name(From) is the "old path" half of a rename — treat
@@ -298,6 +398,8 @@ pub fn spawn(
 
     Ok(WatcherHandle {
         stop,
+        raw_events,
+        raw_dropped,
         _event_thread: event_thread,
         _flush_thread: flush_thread,
     })
@@ -382,6 +484,118 @@ fn should_skip_upsert(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #801: a SKIP_DIRS tree must not be WATCHED, not merely filtered.
+    ///
+    /// The distinction is the entire bug. `should_skip_all` works and always
+    /// did, so every `target/` event was correctly discarded, but only AFTER
+    /// being delivered, queued and stat'd. On a built repo (15,664 dirs,
+    /// 251,662 files) that grew the daemon 13 MB/s until the machine thrashed.
+    ///
+    /// Asserting "no reindex happened" would therefore pass on the broken code
+    /// too: the filter guarantees that either way. This asserts on `raw_events`,
+    /// counted in the notify callback before any filtering, which is the only
+    /// place the difference is observable from outside.
+    ///
+    /// Linux only, and not for convenience. `unwatch` needs per-directory
+    /// watches, which inotify has and FSEvents does not: FSEvents streams one
+    /// recursive watch from the root, and `unwatch` on a subdirectory returns
+    /// `WatchNotFound` (verified against notify 8.2.0, not assumed). So this
+    /// property is unachievable on the macOS default backend, and asserting it
+    /// there would pin a behaviour no code can deliver. macOS is covered by
+    /// `raw_event_queue_is_bounded_under_flood` below, which holds everywhere.
+    /// Linux is also the platform the reported failure was measured on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn skip_dirs_are_not_watched_only_filtered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<WatchEvent>(1024);
+        let handle = spawn(root, tx, Instant::now()).expect("watcher spawns");
+
+        // Control arm first: a watched path must move the counter, otherwise the
+        // assertion below is vacuous. Without this the whole test passes if the
+        // counter simply never increments, which is the shape of guard that let
+        // this ship in the first place.
+        for i in 0..40 {
+            std::fs::write(root.join(format!("src/f{i}.ts")), "export const x = 1;").unwrap();
+        }
+        wait_until(|| handle.raw_events() > 0, Duration::from_secs(5));
+        let after_watched = handle.raw_events();
+        assert!(
+            after_watched > 0,
+            "a write inside the repo must produce raw events, or this test proves nothing"
+        );
+
+        for i in 0..400 {
+            std::fs::write(root.join(format!("target/debug/deps/x{i}.rlib")), "junk").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        let from_skip = handle.raw_events() - after_watched;
+        assert!(
+            from_skip < 40,
+            "400 writes under target/ produced {from_skip} raw events: the tree is \
+             still watched, so every file is queued and stat'd before the skip \
+             filter discards it (#801). Expected the tree to be unwatched."
+        );
+    }
+
+    /// #801: a full raw queue sheds rather than blocking the producer.
+    ///
+    /// Scope, stated because the obvious test here does not work. I first wrote
+    /// this as "flood the watcher and assert it keeps accepting", and
+    /// mutation-checked it by reverting to the unbounded channel: it still
+    /// passed. An unbounded channel also keeps accepting, so that assertion
+    /// discriminated nothing. Forcing a real overflow through the watcher is not
+    /// reliable either, because the consumer drains roughly as fast as a test
+    /// loop can create files, so the queue empties as fast as it fills and drop
+    /// counts are timing dependent.
+    ///
+    /// So this pins the property that actually matters and can be asserted
+    /// deterministically: when the queue is full, the producer sheds and keeps
+    /// going. `send` would block here, and the producer is the notify callback,
+    /// so blocking it stalls the OS event source itself: the watcher would stop
+    /// noticing edits rather than merely fall behind.
+    ///
+    /// What this does NOT cover is the wiring, that the watcher's own channel is
+    /// the bounded kind. `RAW_EVENT_CAP`'s use at the `sync_channel` call is the
+    /// only place that is decided, and it is one line under review.
+    #[test]
+    fn a_full_raw_queue_sheds_instead_of_blocking() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<u32>(2);
+        assert!(tx.try_send(1).is_ok());
+        assert!(tx.try_send(2).is_ok());
+        match tx.try_send(3) {
+            Err(std::sync::mpsc::TrySendError::Full(v)) => assert_eq!(v, 3),
+            other => panic!("a full bounded queue must report Full, got {other:?}"),
+        }
+        // And the producer is still usable afterwards: shedding is not fatal.
+        let _ = _rx.recv().unwrap();
+        assert!(
+            tx.try_send(4).is_ok(),
+            "after a slot frees the producer must resume, or a single burst would \
+             permanently deafen the watcher"
+        );
+    }
+
+    /// Poll `cond` until true or `budget` elapses. Watchers are inherently
+    /// asynchronous, so a fixed sleep either flakes or wastes wall clock.
+    ///
+    /// Only the Linux watch test needs this, and `-D warnings` rejects it as
+    /// dead code elsewhere, so it carries the same gate as its caller.
+    #[cfg(target_os = "linux")]
+    fn wait_until(cond: impl Fn() -> bool, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
 
     #[test]
     fn ignore_matcher_honors_travsrignore_and_skip_dirs() {
