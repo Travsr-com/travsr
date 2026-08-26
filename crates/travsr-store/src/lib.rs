@@ -8006,11 +8006,26 @@ mod tests {
         let p = tmp.path().join("swapme.db");
 
         std::fs::write(&p, b"first").unwrap();
+
+        // The open handle is load-bearing, not incidental setup. It mirrors the
+        // cached read-only `Connection` production holds across exactly this
+        // swap, and it is what makes the assertion below true on every platform:
+        // POSIX cannot free an unlinked inode while a descriptor still refers to
+        // it, so its number cannot be reallocated to the replacement.
+        //
+        // Without it this failed on Linux CI and passed on macOS: ext4 handed the
+        // recreated file the inode just released, so `(dev, ino)` was unchanged
+        // and the replacement looked like the original. That is a real property
+        // of the filesystem. The reason it cannot bite production is the pin, so
+        // the test has to hold one too, or it is asserting against a situation
+        // the code never meets.
+        let pin = std::fs::File::open(&p).expect("pin the inode as the cached connection does");
         let first = super::file_identity(&p).expect("identity of an existing file");
 
         std::fs::remove_file(&p).unwrap();
         std::fs::write(&p, b"second file, different length").unwrap();
         let second = super::file_identity(&p).expect("identity of the replacement");
+        drop(pin);
 
         assert_ne!(
             first, second,
