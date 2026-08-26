@@ -259,24 +259,7 @@ pub fn spawn(
             // Failures are logged and not fatal: a skip dir that does not exist
             // in this repo is the common case, and losing the optimisation is
             // never worth refusing to watch the repo at all.
-            for skip in SKIP_DIRS {
-                let p = repo_root.join(skip);
-                if p.is_dir() {
-                    // WatchNotFound is the EXPECTED result on FSEvents (macOS
-                    // default backend): it streams one recursive watch from the
-                    // root and has no per-directory watch to remove, so there is
-                    // nothing to unwatch and this call cannot help there. Verified
-                    // against notify 8.2.0 rather than assumed. Backends with
-                    // per-directory watches (inotify, the platform the 13 MB/s
-                    // failure was measured on) drop the subtree here. On FSEvents
-                    // the cost is instead bounded by the reordered filter and the
-                    // bounded queue below, which is why those are not optional
-                    // extras to this fix.
-                    if let Err(e) = watcher.unwatch(&p) {
-                        tracing::debug!("unwatch {} not applied (non-fatal): {e}", p.display());
-                    }
-                }
-            }
+            unwatch_skipped_subtrees(&mut watcher, &repo_root, &gitignore);
 
             // Signal ready — watch is established and skip dirs are unwatched,
             // so the caller can proceed.
@@ -452,6 +435,30 @@ pub(crate) fn is_ignore_file(path: &Path) -> bool {
 /// Filter applied to ALL events (Upsert and Remove).
 /// Skips SKIP_DIRS components and gitignored/travsrignored paths.
 pub(crate) fn should_skip_all(path: &Path, repo_root: &Path, gitignore: &Gitignore) -> bool {
+    skip_check(path, repo_root, gitignore, false)
+}
+
+/// [`should_skip_all`] for a path known to be a directory.
+///
+/// #801: the two cannot share one `is_dir` value, and the difference is not
+/// cosmetic. A `build/` rule is directory-only, so matching the directory
+/// `build` itself requires `is_dir = true`; asking with `false` says "not
+/// ignored" and a caller walking the tree then descends into the very subtree it
+/// meant to prune. That is exactly what `skipped_subtree_roots` did before this
+/// split: it returned `build/obj` instead of `build`, having already walked all
+/// of `build`.
+///
+/// Event filtering keeps `is_dir = false`, because a watcher event names a path
+/// that is usually a file and often already deleted, so `is_dir` cannot be
+/// probed reliably there. Files under an ignored directory are still caught by
+/// the `_or_any_parents` half.
+pub(crate) fn should_skip_dir(path: &Path, repo_root: &Path, gitignore: &Gitignore) -> bool {
+    skip_check(path, repo_root, gitignore, true)
+}
+
+/// Shared body of [`should_skip_all`] and [`should_skip_dir`], so the SKIP_DIRS
+/// half can never drift between them.
+fn skip_check(path: &Path, repo_root: &Path, gitignore: &Gitignore, is_dir: bool) -> bool {
     let rel = path.strip_prefix(repo_root).unwrap_or(path);
     if rel
         .components()
@@ -463,8 +470,78 @@ pub(crate) fn should_skip_all(path: &Path, repo_root: &Path, gitignore: &Gitigno
     // `vendor/` or `**/generated/` excludes the files *under* it (#403). Plain
     // `matched` only tests the exact path and never applies the parent-dir rule.
     gitignore
-        .matched_path_or_any_parents(rel, false)
+        .matched_path_or_any_parents(rel, is_dir)
         .is_ignore()
+}
+
+/// #801: drop the OS watches for every subtree `should_skip_all` would discard.
+///
+/// Derived from the filter rather than restating it. An earlier version of this
+/// walked `SKIP_DIRS` alone, which left the *other* half of the filter
+/// unaddressed: `should_skip_all` also honours `.gitignore` / `.travsrignore`,
+/// so a repo whose ignored `build/`, `vendor/` or `.venv/` holds tens of
+/// thousands of files stayed fully watched and paid exactly the cost this fix
+/// exists to remove. Asking the filter means the watched set and the discarded
+/// set cannot disagree, including for a `.travsrignore` re-include (`!vendored/`),
+/// which keeps its watch because the filter says to keep it.
+///
+/// Prunes rather than walking the whole repo: a directory that is skipped is
+/// never descended into. The traversal therefore costs work proportional to the
+/// tree that stays watched, which is the tree the daemon has to enumerate
+/// anyway, not to the `target/` being excluded.
+///
+/// `unwatch` failures are logged and never fatal. `WatchNotFound` is the
+/// expected result on FSEvents (the macOS default backend), which streams one
+/// recursive watch from the root and has no per-directory watch to remove;
+/// verified against notify 8.2.0 rather than assumed. Backends with
+/// per-directory watches (inotify, the platform the 13 MB/s failure was
+/// measured on) genuinely drop the subtree here. On FSEvents the cost is bounded
+/// instead by the reordered filter and the bounded queue, which is why those are
+/// not optional extras to this fix.
+fn unwatch_skipped_subtrees(
+    watcher: &mut RecommendedWatcher,
+    repo_root: &Path,
+    gitignore: &Gitignore,
+) {
+    for path in skipped_subtree_roots(repo_root, gitignore) {
+        if let Err(e) = watcher.unwatch(&path) {
+            tracing::debug!("unwatch {} not applied (non-fatal): {e}", path.display());
+        }
+    }
+}
+
+/// The shallowest directories `should_skip_all` discards, for [`unwatch_skipped_subtrees`].
+///
+/// Split from the unwatching so the decision is testable without a live watcher,
+/// and therefore on every platform rather than only the ones where `unwatch`
+/// does something. The end-to-end watch behaviour is covered separately.
+///
+/// Prunes: a skipped directory is returned and never descended into, so the walk
+/// costs work proportional to the tree that stays watched, which the daemon has
+/// to enumerate anyway, not to the `target/` being excluded.
+fn skipped_subtree_roots(repo_root: &Path, gitignore: &Gitignore) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut stack = vec![repo_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // Unreadable directory: leave its watch in place. Failing to prune is
+            // a lost optimisation; refusing to watch would be a lost edit.
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            if should_skip_dir(&path, repo_root, gitignore) {
+                roots.push(path);
+            } else {
+                stack.push(path);
+            }
+        }
+    }
+    roots
 }
 
 /// Additional filter applied only to Upsert events.
@@ -540,6 +617,132 @@ mod tests {
             "400 writes under target/ produced {from_skip} raw events: the tree is \
              still watched, so every file is queued and stat'd before the skip \
              filter discards it (#801). Expected the tree to be unwatched."
+        );
+    }
+
+    /// #801: the unwatch set is derived from the filter, on every platform.
+    ///
+    /// Runs everywhere because it asserts the DECISION, not the `unwatch` call:
+    /// `unwatch` is a no-op on FSEvents, so an end-to-end test can only run on
+    /// Linux, and that would leave this logic unverified on the machine most of
+    /// this repo is developed on.
+    ///
+    /// The case that motivated splitting it out: the first version of the fix
+    /// walked `SKIP_DIRS` alone and missed the other half of `should_skip_all`,
+    /// so an ignored `build/` with tens of thousands of files stayed watched.
+    #[test]
+    fn skipped_subtree_roots_follow_the_filter_not_a_second_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), "build/\nvendored/\n").unwrap();
+        std::fs::write(root.join(".travsrignore"), "!vendored/\n").unwrap();
+        for d in [
+            "target/debug",   // SKIP_DIRS
+            "node_modules/a", // SKIP_DIRS
+            "build/obj",      // gitignored: the case the first fix missed
+            "vendored/pkg",   // gitignored then RE-INCLUDED: must be kept
+            "src/inner",      // ordinary
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+
+        let gi = build_ignore_matcher(root);
+        let roots = skipped_subtree_roots(root, &gi);
+        let rel: std::collections::HashSet<String> = roots
+            .iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        for want in ["target", "node_modules", "build"] {
+            assert!(rel.contains(want), "{want} must be unwatched; got {rel:?}");
+        }
+        for keep in ["vendored", "src"] {
+            assert!(
+                !rel.contains(keep),
+                "{keep} is kept by the filter, so unwatching it would silently stop \
+                 indexing a tree the user asked to index; got {rel:?}"
+            );
+        }
+        // Pruned, not walked: nothing BELOW a skipped root is returned, which is
+        // what keeps this proportional to the kept tree.
+        assert!(
+            !rel.iter().any(|p| p.contains('/')),
+            "only the shallowest skipped directory should be returned, not its \
+             children; got {rel:?}"
+        );
+    }
+
+    /// #801 follow-up: a gitignored tree must be unwatched too, not just
+    /// SKIP_DIRS.
+    ///
+    /// The first version of this fix walked `SKIP_DIRS` alone, which left half
+    /// of `should_skip_all` unaddressed: it also honours `.gitignore` and
+    /// `.travsrignore`. A repo whose ignored `build/` holds tens of thousands of
+    /// files stayed fully watched and paid the whole cost the fix exists to
+    /// remove, and no test would have noticed, since the userspace filter
+    /// discards those events either way.
+    ///
+    /// Also pins the re-include: `!vendored/` in `.travsrignore` means the
+    /// filter keeps that tree, so the watch must be kept too. Deriving the
+    /// unwatch set from the filter is what makes that true for free rather than
+    /// by remembering to special-case it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gitignored_trees_are_unwatched_and_reincludes_are_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), "build/\nvendored/\n").unwrap();
+        // Re-include: the filter keeps this, so the watch must survive.
+        std::fs::write(root.join(".travsrignore"), "!vendored/\n").unwrap();
+        std::fs::create_dir_all(root.join("build/obj")).unwrap();
+        std::fs::create_dir_all(root.join("vendored")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<WatchEvent>(1024);
+        let handle = spawn(root, tx, Instant::now()).expect("watcher spawns");
+
+        // Control: a kept tree moves the counter.
+        for i in 0..40 {
+            std::fs::write(root.join(format!("src/f{i}.ts")), "x").unwrap();
+        }
+        wait_until(|| handle.raw_events() > 0, Duration::from_secs(5));
+        let base = handle.raw_events();
+        assert!(
+            base > 0,
+            "a watched dir must produce events, or this proves nothing"
+        );
+
+        // The gitignored tree must be invisible to the OS watch.
+        for i in 0..400 {
+            std::fs::write(root.join(format!("build/obj/o{i}.o")), "junk").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        let from_ignored = handle.raw_events() - base;
+        assert!(
+            from_ignored < 40,
+            "400 writes under a gitignored build/ produced {from_ignored} raw \
+             events: the tree is still watched (#801)"
+        );
+
+        // The re-included tree must still be watched.
+        let before_reinclude = handle.raw_events();
+        for i in 0..20 {
+            std::fs::write(root.join(format!("vendored/v{i}.ts")), "x").unwrap();
+        }
+        wait_until(
+            || handle.raw_events() > before_reinclude,
+            Duration::from_secs(5),
+        );
+        assert!(
+            handle.raw_events() > before_reinclude,
+            "`!vendored/` is re-included by .travsrignore, so the filter keeps it \
+             and the watch must be kept: unwatching it would silently stop \
+             indexing a tree the user asked to index"
         );
     }
 
