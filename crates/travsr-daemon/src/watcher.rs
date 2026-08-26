@@ -601,7 +601,7 @@ mod tests {
             std::fs::write(root.join(format!("src/f{i}.ts")), "export const x = 1;").unwrap();
         }
         wait_until(|| handle.raw_events() > 0, Duration::from_secs(5));
-        let after_watched = handle.raw_events();
+        let after_watched = settled(|| handle.raw_events(), Duration::from_secs(10));
         assert!(
             after_watched > 0,
             "a write inside the repo must produce raw events, or this test proves nothing"
@@ -610,8 +610,7 @@ mod tests {
         for i in 0..400 {
             std::fs::write(root.join(format!("target/debug/deps/x{i}.rlib")), "junk").unwrap();
         }
-        std::thread::sleep(Duration::from_millis(600));
-        let from_skip = handle.raw_events() - after_watched;
+        let from_skip = settled(|| handle.raw_events(), Duration::from_secs(10)) - after_watched;
         assert!(
             from_skip < 40,
             "400 writes under target/ produced {from_skip} raw events: the tree is \
@@ -711,7 +710,7 @@ mod tests {
             std::fs::write(root.join(format!("src/f{i}.ts")), "x").unwrap();
         }
         wait_until(|| handle.raw_events() > 0, Duration::from_secs(5));
-        let base = handle.raw_events();
+        let base = settled(|| handle.raw_events(), Duration::from_secs(10));
         assert!(
             base > 0,
             "a watched dir must produce events, or this proves nothing"
@@ -721,8 +720,7 @@ mod tests {
         for i in 0..400 {
             std::fs::write(root.join(format!("build/obj/o{i}.o")), "junk").unwrap();
         }
-        std::thread::sleep(Duration::from_millis(600));
-        let from_ignored = handle.raw_events() - base;
+        let from_ignored = settled(|| handle.raw_events(), Duration::from_secs(10)) - base;
         assert!(
             from_ignored < 40,
             "400 writes under a gitignored build/ produced {from_ignored} raw \
@@ -730,7 +728,7 @@ mod tests {
         );
 
         // The re-included tree must still be watched.
-        let before_reinclude = handle.raw_events();
+        let before_reinclude = settled(|| handle.raw_events(), Duration::from_secs(10));
         for i in 0..20 {
             std::fs::write(root.join(format!("vendored/v{i}.ts")), "x").unwrap();
         }
@@ -787,8 +785,8 @@ mod tests {
     /// Poll `cond` until true or `budget` elapses. Watchers are inherently
     /// asynchronous, so a fixed sleep either flakes or wastes wall clock.
     ///
-    /// Only the Linux watch test needs this, and `-D warnings` rejects it as
-    /// dead code elsewhere, so it carries the same gate as its caller.
+    /// Only the Linux watch tests need this, and `-D warnings` rejects it as
+    /// dead code elsewhere, so it carries the same gate as its callers.
     #[cfg(target_os = "linux")]
     fn wait_until(cond: impl Fn() -> bool, budget: Duration) {
         let deadline = Instant::now() + budget;
@@ -798,6 +796,33 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    /// Wait until `counter` stops moving, then return its settled value.
+    ///
+    /// Waiting for "some event arrived" is not enough before taking a baseline,
+    /// and getting that wrong is what made this suite fail in CI: the first
+    /// event of a 40-file burst satisfies `> 0` while the other 39 are still in
+    /// flight, so the stragglers land after the baseline is taken and are
+    /// attributed to whatever is measured next. That reported 59 events from a
+    /// directory the OS was not watching at all.
+    #[cfg(target_os = "linux")]
+    fn settled(counter: impl Fn() -> u64, budget: Duration) -> u64 {
+        let deadline = Instant::now() + budget;
+        let mut last = counter();
+        let mut stable = 0;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            let now = counter();
+            // Three consecutive quiet samples: one is not enough, because inotify
+            // delivers in bursts with gaps between them.
+            stable = if now == last { stable + 1 } else { 0 };
+            last = now;
+            if stable >= 3 {
+                break;
+            }
+        }
+        last
     }
 
     #[test]
