@@ -3647,6 +3647,14 @@ fn run_with_phase_b_finish_guard(
 ///
 /// Fail-open: a live edge is a freshness gain, never a correctness dependency,
 /// so every error here is logged at debug and dropped.
+/// Upper bound on files re-resolved by one interface edit (RFC-027 Risk R4).
+///
+/// A save must stay a save. Editing a hot utility can dirty hundreds of files,
+/// and re-parsing all of them on every keystroke would cost more than the
+/// freshness is worth. Beyond the cap those files keep their commit-gated
+/// behavior, which is a recall cost the next Phase B run repairs.
+const LIVE_CLOSURE_FILE_CAP: usize = 32;
+
 fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, abs_path: &Path) {
     let vname_path = abs_path
         .strip_prefix(repo_root)
@@ -3675,7 +3683,7 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
     if unresolved.is_empty() {
         return;
     }
-    let outcome = live_resolve::resolve_unambiguous_lexical(store, &unresolved);
+    let outcome = live_resolve::resolve_unambiguous_lexical(store, corpus, vname_path, &unresolved);
     if outcome.emitted > 0 {
         tracing::debug!(
             event = "live.file",
@@ -4066,6 +4074,8 @@ pub fn reindex_files(
     let mut any_changed = false;
     // Accumulate Tier-0 dirty callers across all files in this batch.
     let mut callers_all = travsr_core::DirtySet::default();
+    // Paths this batch rewrote, for the end-of-batch orphan sweep below.
+    let mut written_paths: Vec<String> = Vec::new();
 
     // L5b: unlike `index_paths_parallel`'s full-repo `paths`, this commit-hook
     // batch only contains changed files — a `.m`/`.mm` sibling may not be in it
@@ -4171,6 +4181,7 @@ pub fn reindex_files(
                     callers_all.extend(report.callers);
                 }
                 any_changed = true;
+                written_paths.push(vname_path.clone());
                 // Collect FFI markers for the repo-level pass (RFC-005).
                 all_ffi_markers.extend(out.ffi_markers);
                 // Collect Cargo workspace dep markers for the A2 repo-level pass.
@@ -4295,6 +4306,29 @@ pub fn reindex_files(
     //
     // The LSIF pass now runs only from `init_repo` (full initial index).
     // Per-commit LSIF delta is tracked as DEBT(travsr-25).
+
+    // Bring the incremental path up to the init path's "no orphan edges"
+    // invariant. `flush_staging_to_production` drops staged edges with a
+    // missing endpoint once every node in the batch has landed; nothing did the
+    // equivalent here, so speculative import candidates (`./user` becomes
+    // `user.ts`/`user.tsx`/`user.js`, only one of which exists) survived every
+    // incremental write. A full index and an incremental index of the same tree
+    // therefore disagreed by two edges per TypeScript import, and `fsck`
+    // reported orphans on a healthy repo.
+    //
+    // After the loop, not inside it: an edge from an already-processed file to
+    // one later in this same batch is legitimately dangling until that file's
+    // nodes land. This is the same position the staging flush occupies.
+    if any_changed {
+        match store.sweep_orphan_edges_for_paths(&corpus, &written_paths) {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(
+                swept = n,
+                "reindex: dropped speculative edges with no destination node"
+            ),
+            Err(e) => tracing::warn!("reindex: orphan edge sweep failed: {e}"),
+        }
+    }
 
     Ok(callers_all)
 }
@@ -7438,6 +7472,282 @@ mod tests {
         );
     }
 
+    /// Invariant #4, orphan dimension: an incremental edit must leave the graph
+    /// as free of dangling edges as a full index would.
+    ///
+    /// TypeScript import resolution is speculative by construction — `./user`
+    /// emits a `resolves-to` candidate for `user.ts`, `user.tsx` and `user.js`
+    /// because it cannot know which exists without touching the store. The init
+    /// path drops the losers when staging is flushed, which its own comment
+    /// calls making "no orphan edges" a store invariant. The incremental path
+    /// had no equivalent, so every ordinary edit to a file with a relative
+    /// import left two dead edges behind and `fsck` reported orphans on a
+    /// perfectly healthy repo.
+    #[test]
+    fn an_incremental_edit_leaves_no_orphan_edges() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        let user = tmp.path().join("src/user.ts");
+        let order = tmp.path().join("src/order.ts");
+        std::fs::write(&user, "export class User {\n  save(): void {}\n}\n").unwrap();
+        std::fs::write(
+            &order,
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.save();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
+            "precondition: a full index leaves no orphans"
+        );
+
+        // Edit both files, the way a rename lands incrementally.
+        std::fs::write(&user, "export class User {\n  persist(): void {}\n}\n").unwrap();
+        std::fs::write(
+            &order,
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.persist();\n}\n",
+        )
+        .unwrap();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(&[user.clone(), order.clone()], tmp.path(), &mut store).unwrap();
+        }
+
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
+            "an incremental edit must not leave dangling edges the full path drops"
+        );
+    }
+
+    /// The sweep runs after the whole batch, so an edge into a file that is
+    /// created later in the same batch survives. Sweeping per file would delete
+    /// it, since its destination node does not exist yet at that point.
+    #[test]
+    fn the_orphan_sweep_spares_a_forward_reference_within_one_batch() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        // Only the importer exists at index time.
+        let order = tmp.path().join("src/order.ts");
+        std::fs::write(&order, "export function placeOrder(): void {}\n").unwrap();
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        // Now add both the import and its target in one batch, importer first.
+        let user = tmp.path().join("src/user.ts");
+        std::fs::write(
+            &order,
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {}\n",
+        )
+        .unwrap();
+        std::fs::write(&user, "export class User {\n  save(): void {}\n}\n").unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(&[order.clone(), user.clone()], tmp.path(), &mut store).unwrap();
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(store.count_orphans().unwrap(), 0, "no orphans either way");
+        let resolves: u64 = store.count_edges_with_provenance("tree-sitter").unwrap();
+        assert!(
+            resolves > 0,
+            "the real import edge must survive a same-batch forward reference"
+        );
+    }
+
+    /// RFC-027 Phase 1 gate: a rename must leave no ghost live edge.
+    ///
+    /// The hazard the live lane introduces is an edge to a symbol that no
+    /// longer exists. `reindex_replace` deletes the inbound edges of a symbol
+    /// whose NodeId vanished, so a `live` edge is cleaned up exactly as a
+    /// `tree-sitter` or `scip` one is — this test is what keeps that true, and
+    /// it is the difference between honest staleness and a fabricated target.
+    #[test]
+    fn a_rename_leaves_no_ghost_live_edge() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        let user = tmp.path().join("src/user.ts");
+        let order = tmp.path().join("src/order.ts");
+        std::fs::write(&user, "export class User {\n  save(): void {}\n}\n").unwrap();
+        std::fs::write(
+            &order,
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.save();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.get_meta("corpus").unwrap().unwrap_or_default()
+        };
+
+        // Emit the live overlay for order.ts, then confirm it exists.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &order);
+        }
+        let live_before = count_live_edges(&db_path);
+        assert!(
+            live_before > 0,
+            "precondition: the live lane must have emitted an edge to rename away from"
+        );
+
+        // Rename User.save -> User.persist. The old NodeId vanishes, so every
+        // inbound edge to it — live included — must go with it.
+        std::fs::write(&user, "export class User {\n  persist(): void {}\n}\n").unwrap();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&user), tmp.path(), &mut store).unwrap();
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let orphans = store.count_orphans().unwrap();
+        assert_eq!(
+            orphans, 0,
+            "a rename must leave no edge pointing at a node that no longer exists"
+        );
+    }
+
+    /// A deleted file takes its inbound live edges with it, the same way
+    /// `delete_file` takes both directions for every other provenance.
+    #[test]
+    fn a_delete_leaves_no_ghost_live_edge() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        let user = tmp.path().join("src/user.ts");
+        let order = tmp.path().join("src/order.ts");
+        std::fs::write(&user, "export class User {\n  save(): void {}\n}\n").unwrap();
+        std::fs::write(
+            &order,
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.save();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.get_meta("corpus").unwrap().unwrap_or_default()
+        };
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &order);
+        }
+        assert!(
+            count_live_edges(&db_path) > 0,
+            "precondition: a live edge exists"
+        );
+
+        std::fs::remove_file(&user).unwrap();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&user), tmp.path(), &mut store).unwrap();
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let orphans = store.count_orphans().unwrap();
+        assert_eq!(
+            orphans, 0,
+            "a deleted file must take its inbound live edges with it"
+        );
+    }
+
+    /// RFC-027 section 9.2: an abstention is recorded, not dropped.
+    ///
+    /// `save` here is ambiguous (two classes define it), which is exactly the
+    /// method-on-receiver case the lexical lane must refuse. Refusing quietly
+    /// and refusing honestly look identical in the edge table; they differ in
+    /// whether anything can later say *why* the answer is thin.
+    #[test]
+    fn an_abstention_is_recorded_as_pending() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        std::fs::write(
+            tmp.path().join("src/a.ts"),
+            "export class A {\n  ping(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/b.ts"),
+            "export class B {\n  ping(): void {}\n}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("src/caller.ts");
+        std::fs::write(
+            &caller,
+            "export function go(x: any): void {\n  x.ping();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.get_meta("corpus").unwrap().unwrap_or_default()
+        };
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let pending = store
+            .pending_refs_in_file(&corpus, "src/caller.ts")
+            .unwrap();
+        assert!(
+            pending.iter().any(|(name, _)| name == "ping"),
+            "an untyped receiver must leave a pending row, got {pending:?}"
+        );
+    }
+
+    /// Count `provenance='live'` rows. Shared by the Phase 1 ghost-edge tests.
+    fn count_live_edges(db_path: &std::path::Path) -> u64 {
+        travsr_store::SqliteStore::open(db_path)
+            .unwrap()
+            .count_edges_with_provenance("live")
+            .unwrap()
+    }
+
     /// §9 CI invariant: incremental delete + reindex must produce the same
     /// node and edge counts as a full rebuild on the mutated tree.
     ///
@@ -10055,12 +10365,27 @@ fn handle_watch_event(
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             match reindex_files(std::slice::from_ref(&path), repo_root, &mut s) {
                 Ok(callers) => {
-                    // RFC-027 section 7.3a: refresh this file's live overlay.
+                    // RFC-027 sections 6 and 7.3a: refresh this file's live
+                    // overlay, and on an interface edit the overlay of the files
+                    // that reference it.
+                    //
                     // Only here, on the save path — the commit path arms a Phase
                     // B refresh that re-derives the same edges, so doing it
                     // there would be waste inside `git commit`'s latency.
+                    //
+                    // `callers` is non-empty exactly when a symbol other files
+                    // reference vanished, which is the interface-edit signal
+                    // (section 6.2). Their edges into this file were deleted by
+                    // `reindex_replace`, so re-resolving them is what stops a
+                    // rename from silently dropping every inbound live edge.
                     let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
                     live_resolve_file(&mut s, &corpus, repo_root, &path);
+                    for dependent in callers.iter().take(LIVE_CLOSURE_FILE_CAP) {
+                        let abs = repo_root.join(dependent);
+                        if abs != path && abs.is_file() {
+                            live_resolve_file(&mut s, &corpus, repo_root, &abs);
+                        }
+                    }
                     enqueue_dirty_callers(callers, repo_root, index_tx)
                 }
                 Err(e) => tracing::warn!(path=%path.display(), err=%e, "watcher reindex failed"),

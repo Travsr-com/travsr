@@ -575,6 +575,19 @@ impl Migration for V22TestRole {
     }
 }
 
+/// RFC-027 section 9.2: `ref_resolution_state`, so an unresolved reference can
+/// be reported as pending instead of silently vanishing or being guessed at.
+struct V23RefResolutionState;
+impl Migration for V23RefResolutionState {
+    fn version(&self) -> u32 {
+        23
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // CREATE TABLE / INDEX IF NOT EXISTS — idempotent on re-run.
+        store.exec_ddl(include_str!("migrations/v23_ref_resolution_state.sql"))
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -600,6 +613,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V20PurgeOrphanEdgeSites);
     r.register(V21LexicalSplit);
     r.register(V22TestRole);
+    r.register(V23RefResolutionState);
     r
 }
 
@@ -2474,6 +2488,66 @@ impl SqliteStore {
             .map(|n| n as u64)
             .context("counting orphan edges")
             .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Scoped orphan sweep for the incremental path: drop edges *owned by*
+    /// `paths` whose destination is absent from `nodes`.
+    ///
+    /// The init path already guarantees this. `flush_staging_to_production`
+    /// promotes every node in the batch and then drops any staged edge with a
+    /// missing endpoint, which it calls making "no orphan edges" a store
+    /// invariant at the staging boundary. `reindex_replace` had no equivalent,
+    /// so the two paths disagreed and Invariant #4 (incremental == full) failed
+    /// in the orphan dimension.
+    ///
+    /// The edges this matters for are speculative by construction. TypeScript
+    /// import resolution emits a `resolves-to` candidate per plausible
+    /// extension (`./user` becomes `user.ts`, `user.tsx`, `user.js`) because it
+    /// cannot know which one exists without touching the store. On a full index
+    /// the losers are dropped at the staging boundary; incrementally they
+    /// survived, so every ordinary TypeScript edit left two dead edges behind
+    /// and `fsck` reported orphans on a healthy repo.
+    ///
+    /// **Call this after the whole batch is written, never per file.** That is
+    /// the same position the staging flush occupies: an edge from an
+    /// already-processed file to one later in the same batch is legitimately
+    /// dangling until that file's nodes land, and sweeping mid-batch would
+    /// delete it.
+    ///
+    /// Scoped to `paths` rather than the whole table because the unscoped
+    /// [`sweep_orphans`] is a full edge scan, which is a fine cost for `fsck`
+    /// and not one to pay on every save.
+    pub fn sweep_orphan_edges_for_paths(
+        &mut self,
+        corpus: &str,
+        paths: &[String],
+    ) -> Result<u64, StoreError> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        (|| -> AnyResult<u64> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("sweep_orphan_edges_for_paths: begin")?;
+            let mut swept = 0u64;
+            for path in paths {
+                // `src IN (…)` hits the edges primary key prefix, so this is a
+                // bounded probe per path rather than a scan of the edge table.
+                swept += tx
+                    .execute(
+                        "DELETE FROM edges \
+                         WHERE src IN (SELECT id FROM nodes WHERE corpus = ?1 AND path = ?2) \
+                           AND dst NOT IN (SELECT id FROM nodes)",
+                        params![corpus, path],
+                    )
+                    .context("sweeping orphan edges for path")? as u64;
+            }
+            tx.commit()
+                .context("sweep_orphan_edges_for_paths: commit")?;
+            Ok(swept)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Orphan-edge sweep: deletes every edge whose src or dst is absent from
@@ -4653,6 +4727,120 @@ LIMIT ?4",
             .collect::<Result<Vec<i64>, _>>()
             .context("definition_node_ids_in_file")?;
         Ok(ids.into_iter().map(i64_to_node_id).collect())
+    }
+
+    /// Count edges carrying `provenance`.
+    ///
+    /// RFC-027 leans on this twice: the Invariant #4 convergence check asserts
+    /// zero `live` rows in a committed graph, and the precision meter needs the
+    /// overlay's size. Cheap enough to call per assertion at fixture scale.
+    pub fn count_edges_with_provenance(&self, provenance: &str) -> Result<u64, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM edges WHERE provenance = ?1",
+                params![provenance],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .context("counting edges by provenance")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 9.2: replace a file's reference-resolution rows.
+    ///
+    /// Called once per live pass over a file, with every reference that pass
+    /// saw and what became of it. Whole-file replacement rather than
+    /// incremental patching, for the same reason the live engine re-emits
+    /// whole-file: `reindex_replace` has just rewritten the file's nodes, so
+    /// any row keyed on a node that no longer exists is stale by construction.
+    ///
+    /// `rows` are `(src, ref_line, ref_col, name, state)` where `state` is
+    /// `"pending"` or `"resolved"`. Owned by `src`'s file, mirroring how
+    /// `edge_sites` scopes ownership, so the delete below can be keyed on the
+    /// same `(corpus, path)` predicate.
+    pub fn replace_ref_resolution_states(
+        &mut self,
+        corpus: &str,
+        path: &str,
+        rows: &[(NodeId, u32, u32, String, &'static str)],
+    ) -> Result<(), StoreError> {
+        (|| -> AnyResult<()> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("replace_ref_resolution_states: begin")?;
+            tx.execute(
+                "DELETE FROM ref_resolution_state \
+                 WHERE src IN (SELECT id FROM nodes WHERE corpus = ?1 AND path = ?2)",
+                params![corpus, path],
+            )
+            .context("clearing this file's ref_resolution_state rows")?;
+            for (src, line, col, name, state) in rows {
+                tx.execute(
+                    "INSERT INTO ref_resolution_state(src, ref_line, ref_col, name, state) \
+                     VALUES(?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT(src, ref_line, ref_col, name) DO UPDATE SET state = excluded.state",
+                    params![node_id_to_i64(*src), *line as i64, *col as i64, name, state],
+                )
+                .context("inserting ref_resolution_state row")?;
+            }
+            tx.commit()
+                .context("replace_ref_resolution_states: commit")?;
+            Ok(())
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 10: the pending references in `path`, for the
+    /// `live_overlay` freshness note.
+    ///
+    /// Returns `(name, ref_line)` per unresolved reference, so a consumer can
+    /// say *which* call sites are un-targeted rather than only how many.
+    pub fn pending_refs_in_file(
+        &self,
+        corpus: &str,
+        path: &str,
+    ) -> Result<Vec<(String, u32)>, StoreError> {
+        (|| -> AnyResult<Vec<(String, u32)>> {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "SELECT r.name, r.ref_line FROM ref_resolution_state r \
+                     JOIN nodes n ON n.id = r.src \
+                     WHERE r.state = 'pending' AND n.corpus = ?1 AND n.path = ?2 \
+                     ORDER BY r.ref_line ASC",
+                )
+                .context("pending_refs_in_file: prepare")?;
+            let rows = stmt
+                .query_map(params![corpus, path], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+                })
+                .context("pending_refs_in_file: query")?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.context("decoding pending ref row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 8.3: clear pending rows that Phase B has since resolved.
+    ///
+    /// Run at ratification. A reference whose enclosing node now has an
+    /// outgoing edge is no longer pending, whatever resolved it, so this is
+    /// keyed on edge existence rather than on which lane won.
+    ///
+    /// Returns the number of rows cleared.
+    pub fn clear_resolved_pending_refs(&mut self) -> Result<usize, StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM ref_resolution_state \
+                 WHERE state = 'pending' \
+                   AND EXISTS (SELECT 1 FROM edges e WHERE e.src = ref_resolution_state.src)",
+                [],
+            )
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// RFC-027 section 7.5: map a `(path, line)` position to the graph node

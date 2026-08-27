@@ -113,6 +113,87 @@ fn resolve_one(store: &SqliteStore, corpus: &str, file: &str, r: &LiveResolution
     edge_if_sound(store, src, dst)
 }
 
+/// RFC-027 section 6: what an edit actually invalidates.
+///
+/// The distinction is not cosmetic. *Outgoing* edges (edited file to others) are
+/// recomputable from the edited file alone. *Incoming* edges (others to the
+/// edited file) are not, because their sources live elsewhere — and they stay
+/// correct only while the referenced surface is unchanged. That asymmetry is
+/// the whole reason a body edit can be resolved locally and an interface edit
+/// cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditKind {
+    /// No symbol's referenced surface changed. Re-resolve this file's outgoing
+    /// references and touch nothing else. This is the common case, and the one
+    /// that has to stay cheap or the live lane is not worth having.
+    Body,
+    /// A symbol other files reference was renamed, removed, or replaced. Their
+    /// edges into this file may now be wrong, so the reverse closure is
+    /// re-resolved (section 6.3).
+    Interface,
+}
+
+/// Classify an edit from the report `reindex_replace` already returns.
+///
+/// Deliberately does not compute a second diff. `ReplaceReport` is derived
+/// inside the same transaction that rewrote the file, from the authoritative
+/// old-versus-new NodeId sets, so any diff computed here would be a less
+/// reliable copy of it. `removed_count` counts symbols whose id vanished, and
+/// `callers` names the files that had edges into them.
+///
+/// Conservative by construction: a rename is a remove plus an add, so it lands
+/// in `Interface` without needing to be told apart from a delete. Section 16.2
+/// notes that mis-classifying toward `Interface` costs recall and never
+/// correctness, and this is where that choice is made.
+pub fn classify_edit(report: &travsr_core::ReplaceReport) -> EditKind {
+    if report.removed_count > 0 || !report.callers.is_empty() {
+        EditKind::Interface
+    } else {
+        EditKind::Body
+    }
+}
+
+/// Section 6.3: the files whose edges into `changed` may now be wrong.
+///
+/// Reverse lookup over `iter_edges_to`, which the covering index
+/// `idx_edges_dst_kind_cov` serves without touching the nodes table for the
+/// edge scan itself.
+///
+/// **Depth one, not transitive** (Risk R4). A rename invalidates the edges that
+/// point *at* the renamed symbol; it does not invalidate the callers of those
+/// callers, whose own referenced surface did not change. Walking transitively
+/// would pull in most of a repo from one edit to a hot file, for no additional
+/// correctness. The existing Tier-0 propagation makes the same choice for the
+/// same reason.
+///
+/// `MAX_CLOSURE_FILES` bounds the result even at depth one: a symbol with
+/// thousands of callers is a hot utility, and re-resolving every one of them on
+/// each keystroke would cost more than the freshness is worth. Truncation costs
+/// recall, which the commit-gated path then repairs.
+pub fn reverse_closure(
+    store: &SqliteStore,
+    changed: &[NodeId],
+) -> std::collections::HashSet<String> {
+    let mut files = std::collections::HashSet::new();
+    for &id in changed {
+        let Ok(incoming) = store.iter_edges_to(id) else {
+            continue;
+        };
+        for edge in incoming {
+            if files.len() >= MAX_CLOSURE_FILES {
+                return files;
+            }
+            if let Ok(Some(node)) = store.get_node(edge.src) {
+                files.insert(node.vname.path);
+            }
+        }
+    }
+    files
+}
+
+/// Upper bound on files pulled into one reverse closure (Risk R4).
+const MAX_CLOSURE_FILES: usize = 64;
+
 /// Section 7.3a: emit for calls whose callee signature is unambiguous repo-wide.
 ///
 /// This lane needs no language server and is the zero-regression floor: with no
@@ -136,24 +217,57 @@ fn resolve_one(store: &SqliteStore, corpus: &str, file: &str, r: &LiveResolution
 /// rule, never to widen the net.
 pub fn resolve_unambiguous_lexical(
     store: &mut SqliteStore,
+    corpus: &str,
+    path: &str,
     unresolved: &[UnresolvedCall],
 ) -> LiveOutcome {
     let mut outcome = LiveOutcome::default();
+    // Section 9.2: every reference this pass saw, and what became of it. An
+    // abstention is recorded, not dropped — "there is a call here and its
+    // target is not yet known" is true and useful, and saying it is what makes
+    // fail-closed honest rather than merely quiet.
+    let mut states: Vec<(NodeId, u32, u32, String, &'static str)> =
+        Vec::with_capacity(unresolved.len());
+
     for call in unresolved {
-        let Some(edge) = lexical_one(store, call) else {
-            outcome.abstain();
-            continue;
+        let name = travsr_core::ident::leaf_of(&call.callee_sig).to_string();
+        let resolved = match lexical_one(store, call) {
+            Some(edge) => match store.put_edge_live(&edge) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::debug!(error = %e, "live lexical edge write failed");
+                    false
+                }
+            },
+            None => false,
         };
-        if let Err(e) = store.put_edge_live(&edge) {
-            tracing::debug!(error = %e, "live lexical edge write failed");
-            outcome.abstain();
-        } else {
+        if resolved {
             outcome.emit();
+        } else {
+            outcome.abstain();
         }
+        // `ref_col` is 0: the native extractor records the call's line but not
+        // its column. The PK tolerates it, and a second call to the same name
+        // on one line is the only collision it can cause, which merges two
+        // identical pending facts rather than losing one.
+        states.push((
+            call.src,
+            call.caller_line,
+            0,
+            name,
+            if resolved { "resolved" } else { "pending" },
+        ));
     }
-    if outcome.emitted > 0 {
+
+    if let Err(e) = store.replace_ref_resolution_states(corpus, path, &states) {
+        // Losing the pending record costs the freshness note its detail, never
+        // the graph its correctness.
+        tracing::debug!(error = %e, "recording ref_resolution_state failed");
+    }
+    if outcome.emitted > 0 || outcome.pending > 0 {
         tracing::debug!(
             event = "live.lexical",
+            path = %path,
             emitted = outcome.emitted,
             pending = outcome.pending,
             "unambiguous-lexical live resolution complete"
@@ -453,7 +567,12 @@ mod tests {
             ("src/user.ts", "method:User.save", "method", 15, 20),
         ]);
         let src = node_id("src/order.ts", "fn:placeOrder");
-        let out = resolve_unambiguous_lexical(&mut store, &[call(src, "method:User.save", 18)]);
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[call(src, "method:User.save", 18)],
+        );
 
         assert_eq!(
             out,
@@ -488,7 +607,12 @@ mod tests {
             ("src/draft.ts", "method:save", "method", 5, 9),
         ]);
         let src = node_id("src/order.ts", "fn:placeOrder");
-        let out = resolve_unambiguous_lexical(&mut store, &[call(src, "method:save", 18)]);
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[call(src, "method:save", 18)],
+        );
 
         assert_eq!(
             out,
@@ -518,7 +642,7 @@ mod tests {
         let mut c = call(src, "class:Field", 18);
         c.alt_callee_sig = Some("fn:Field".to_string());
 
-        let out = resolve_unambiguous_lexical(&mut store, &[c]);
+        let out = resolve_unambiguous_lexical(&mut store, CORPUS, "src/order.ts", &[c]);
         assert_eq!(
             out,
             LiveOutcome {
