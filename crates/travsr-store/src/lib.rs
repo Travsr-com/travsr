@@ -4930,6 +4930,22 @@ LIMIT ?4",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// RFC-027 section 10: how many references are currently unresolved.
+    ///
+    /// The count half of [`pending_refs_in_file`], for the envelope note where
+    /// only the magnitude is wanted.
+    pub fn pending_ref_count(&self) -> Result<u64, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM ref_resolution_state WHERE state = 'pending'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .context("counting pending references")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// RFC-027 section 8.3: clear pending rows that Phase B has since resolved.
     ///
     /// Run at ratification. A reference whose enclosing node now has an
