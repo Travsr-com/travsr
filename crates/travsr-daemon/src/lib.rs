@@ -3631,13 +3631,29 @@ fn run_with_phase_b_finish_guard(
 /// Only languages with a native Phase B call-site extractor participate; every
 /// other language keeps today's commit-gated behavior exactly, which is the
 /// RFC's zero-regression floor.
-fn live_resolve_file(
-    store: &mut SqliteStore,
-    corpus: &str,
-    repo_root: &Path,
-    abs_path: &Path,
-    vname_path: &str,
-) {
+///
+/// **Called from the save path only, never from the commit path.** It lives
+/// beside `reindex_files` rather than inside it because `reindex_files` is
+/// shared by the watcher and the commit hook, and on commit this work is pure
+/// waste: the hook arms a Phase B refresh immediately afterwards, which
+/// re-derives the same edges and ratifies them. Doing it there would buy
+/// nothing and would put a second tree-sitter parse per changed file directly
+/// in `git commit`'s latency, which the parse timeout in the Phase A parsers
+/// exists to protect.
+///
+/// It re-resolves the **whole** file, not only references that look new,
+/// because `reindex_replace` has just deleted every outbound edge the file
+/// owned. `put_edge_live` upserts, so re-emitting is idempotent.
+///
+/// Fail-open: a live edge is a freshness gain, never a correctness dependency,
+/// so every error here is logged at debug and dropped.
+fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, abs_path: &Path) {
+    let vname_path = abs_path
+        .strip_prefix(repo_root)
+        .unwrap_or(abs_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let vname_path = vname_path.as_str();
     let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     // `Language::TypeScript` covers .ts/.tsx/.js/.jsx — there is no separate
     // JavaScript variant, and the native extractor handles both.
@@ -4155,21 +4171,6 @@ pub fn reindex_files(
                     callers_all.extend(report.callers);
                 }
                 any_changed = true;
-                // RFC-027 section 7.3a: re-resolve this file's call sites into
-                // `provenance='live'` edges for the ones whose callee signature
-                // is unambiguous repo-wide. This is the between-commits overlay
-                // and needs no language server.
-                //
-                // It runs on EVERY save of the file, not only when something
-                // looks new, because `reindex_replace` above just deleted every
-                // outbound edge this file owned. Re-emitting is idempotent
-                // (`put_edge_live` upserts), so whole-file re-resolution is
-                // both the correct and the cheap option.
-                //
-                // Fail-open: a live edge is a freshness gain, never a
-                // correctness dependency, so any error here is logged and
-                // dropped rather than failing the save.
-                live_resolve_file(store, &corpus, repo_root, abs_path, &vname_path);
                 // Collect FFI markers for the repo-level pass (RFC-005).
                 all_ffi_markers.extend(out.ffi_markers);
                 // Collect Cargo workspace dep markers for the A2 repo-level pass.
@@ -10053,7 +10054,15 @@ fn handle_watch_event(
         WatchEvent::Upsert(path) => {
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             match reindex_files(std::slice::from_ref(&path), repo_root, &mut s) {
-                Ok(callers) => enqueue_dirty_callers(callers, repo_root, index_tx),
+                Ok(callers) => {
+                    // RFC-027 section 7.3a: refresh this file's live overlay.
+                    // Only here, on the save path — the commit path arms a Phase
+                    // B refresh that re-derives the same edges, so doing it
+                    // there would be waste inside `git commit`'s latency.
+                    let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
+                    live_resolve_file(&mut s, &corpus, repo_root, &path);
+                    enqueue_dirty_callers(callers, repo_root, index_tx)
+                }
                 Err(e) => tracing::warn!(path=%path.display(), err=%e, "watcher reindex failed"),
             }
         }
