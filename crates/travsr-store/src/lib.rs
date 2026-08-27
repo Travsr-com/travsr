@@ -2490,6 +2490,105 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Stable content fingerprint of every node, for equality assertions.
+    ///
+    /// Ordered by id so two graphs built by different routes compare directly.
+    pub fn node_fingerprint(&self) -> Result<Vec<String>, StoreError> {
+        (|| -> AnyResult<Vec<String>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT corpus || '|' || path || '|' || signature || '|' || kind \
+                     FROM nodes ORDER BY id",
+                )
+                .context("node_fingerprint: prepare")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .context("node_fingerprint: query")?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.context("node_fingerprint: decode")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Stable content fingerprint of every edge **including its provenance**.
+    ///
+    /// Provenance is in the fingerprint on purpose. The RFC-027 convergence
+    /// property is not "the same number of edges" but "the same graph", and an
+    /// un-ratified `live` row sitting where a `scip` row belongs has the same
+    /// count and the wrong meaning. Counting alone would let exactly the
+    /// failure this property exists to rule out slip through.
+    pub fn edge_fingerprint(&self) -> Result<Vec<String>, StoreError> {
+        (|| -> AnyResult<Vec<String>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT src || '|' || dst || '|' || kind || '|' || provenance \
+                     FROM edges ORDER BY src, dst, kind",
+                )
+                .context("edge_fingerprint: prepare")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .context("edge_fingerprint: query")?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.context("edge_fingerprint: decode")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 8.3: retire the live overlay for the languages that just
+    /// completed a Phase B run.
+    ///
+    /// Most live edges never reach this. When Phase B re-derives an edge the
+    /// live lane had already found, the ratification write upserts the same
+    /// `(src, dst, kind)` row and relabels its provenance, so the edge is
+    /// ratified *in place*. What is still marked `live` afterwards is exactly
+    /// the set Phase B did **not** re-derive, which is why deleting it cannot
+    /// lose a real edge. That is also why the ratification writes must run
+    /// first, and must not be prevented from overwriting a `live` row.
+    ///
+    /// **Scoped, not blanket.** The Phase B completion marker advances whenever
+    /// *any* language produced results, even when another language's sidecar
+    /// crashed (#712). A blanket delete would therefore discard the overlay for
+    /// a language whose truth was never re-derived, taking away precision the
+    /// developer had a moment earlier and not giving it back until that sidecar
+    /// is fixed and a later commit runs. Live edges for a crashed language
+    /// survive, still labeled `live`, which is honest.
+    ///
+    /// Keyed on the **src node's** language rather than `edges.language`, which
+    /// is a derived label reconciled after the fact and defaulted at insert
+    /// time, so it cannot be trusted as the scoping key.
+    ///
+    /// Invariant #4 is unaffected: a clean run has nothing crashed, so every
+    /// language that has nodes is in `languages` and the sweep is total.
+    pub fn sweep_live_edges_for_languages(
+        &mut self,
+        languages: &[String],
+    ) -> Result<u64, StoreError> {
+        if languages.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(languages.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM edges WHERE provenance = 'live' \
+             AND src IN (SELECT id FROM nodes WHERE language IN ({placeholders}))"
+        );
+        self.conn
+            .execute(&sql, params_from_iter(languages.iter()))
+            .map(|n| n as u64)
+            .context("sweeping live edges for ratified languages")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Scoped orphan sweep for the incremental path: drop edges *owned by*
     /// `paths` whose destination is absent from `nodes`.
     ///
@@ -3727,22 +3826,28 @@ LIMIT ?4",
     ///
     /// Live edges are an ephemeral overlay over the commit-gated semantic graph:
     /// Tree-sitter detected the reference, the live engine resolved it precisely
-    /// (unambiguous-lexical or LSP-disambiguated), and commit-time SCIP will
-    /// ratify and replace it. They sit on the middle rung of the ADR-002
-    /// precedence ladder:
+    /// (unambiguous-lexical or LSP-disambiguated), and the next Phase B run
+    /// ratifies it.
     ///
-    /// ```text
-    /// lsif / scip   (compiler-grade, durable)   beats
-    /// live          (this lane, ephemeral)      beats
-    /// tree-sitter   (heuristic)
-    /// ```
+    /// **The overlay is purely additive: this never relabels an edge that
+    /// already exists.** That is what makes retiring it safe. The sweep in
+    /// [`sweep_live_edges_for_languages`] deletes rows, so anything it can
+    /// reach must be something the live lane itself created — otherwise
+    /// retiring the overlay would destroy pre-existing truth rather than
+    /// returning the graph to what it was.
     ///
-    /// The `WHERE` on the upsert enforces the ladder from below: an existing
-    /// `lsif`, `scip`, or `bridge:*` row is left untouched, so a live edge can
-    /// never demote ratified truth. Re-emitting over an existing `live` row is
-    /// allowed and idempotent, which matters because `reindex_replace` deletes
-    /// every outbound edge of a file on each save, so the live engine re-emits
-    /// for the whole file rather than only for references it thinks are new.
+    /// The hazard is concrete, not theoretical. An interface edit re-resolves
+    /// the files that reference the edited one (section 6.3), and those files
+    /// were *not* re-parsed, so their `tree-sitter` edges are still in place. An
+    /// upsert that relabelled them `live` would hand them to the sweep, and any
+    /// one Phase B did not happen to re-derive would be deleted outright. The
+    /// convergence property test is what surfaced this.
+    ///
+    /// So the `ON CONFLICT` only refreshes a row that is *already* `live`, which
+    /// keeps re-emission idempotent — `reindex_replace` deletes every outbound
+    /// edge of a file on each save, so the engine re-emits whole-file rather
+    /// than only for references it believes are new. Every other provenance is
+    /// left exactly as it was.
     ///
     /// This never mints identity (RFC-027 section 8.2): both endpoints must
     /// already exist as nodes, so the fencing rule and VName uniqueness hold.
@@ -3751,8 +3856,8 @@ LIMIT ?4",
             .execute(
                 "INSERT INTO edges(src, dst, kind, provenance, confidence) VALUES(?1, ?2, ?3, 'live', ?4) \
                  ON CONFLICT(src, dst, kind) DO UPDATE SET \
-                   provenance = 'live', confidence = excluded.confidence \
-                 WHERE edges.provenance IN ('tree-sitter', 'live')",
+                   confidence = excluded.confidence \
+                 WHERE edges.provenance = 'live'",
                 params![
                     node_id_to_i64(edge.src),
                     node_id_to_i64(edge.dst),
@@ -9719,11 +9824,15 @@ mod tests {
         assert_eq!(prov(&by_kind, EdgeKind::RefCall), "lsif");
     }
 
-    /// RFC-027 Phase 0: the `live` provenance rung sits between `tree-sitter`
-    /// and `lsif`/`scip`. A live edge upgrades a heuristic row and is idempotent
-    /// over itself, but must never demote compiler-grade truth.
+    /// RFC-027: the live overlay is purely additive.
+    ///
+    /// It creates edges that were absent and refreshes its own, but never
+    /// relabels a row another lane wrote. That is the property that makes the
+    /// ratification sweep safe: everything the sweep can delete is something
+    /// the live lane created, so retiring the overlay returns the graph to what
+    /// it was instead of destroying pre-existing truth.
     #[test]
-    fn live_edge_beats_tree_sitter_and_loses_to_compiler_provenance() {
+    fn the_live_overlay_is_additive_and_never_relabels_another_lane() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let a = node_with_path("a.ts", "fn:a");
         let b = node_with_path("b.ts", "fn:b");
@@ -9738,24 +9847,14 @@ mod tests {
                 .expect("reader must carry provenance")
         };
 
-        // tree-sitter -> live: upgrade.
-        store.put_edge(&e).unwrap();
-        assert_eq!(prov(&store), "tree-sitter");
+        // Absent -> live: the overlay's actual job.
         store.put_edge_live(&e).unwrap();
-        assert_eq!(prov(&store), "live", "live must upgrade a tree-sitter row");
+        assert_eq!(prov(&store), "live", "a missing edge is created as live");
 
         // live -> live: idempotent. reindex_replace wipes a file's outbound
         // edges on every save, so the engine re-emits whole-file (plan R5).
         store.put_edge_live(&e).unwrap();
         assert_eq!(prov(&store), "live");
-
-        // live -> tree-sitter: must NOT demote.
-        store.put_edge(&e).unwrap();
-        assert_eq!(
-            prov(&store),
-            "live",
-            "a tree-sitter write must not demote a live row"
-        );
 
         // live -> lsif: ratification wins.
         store.put_edge_lsif(&e).unwrap();
@@ -9767,6 +9866,25 @@ mod tests {
             prov(&store),
             "lsif",
             "a live write must never demote lsif/scip"
+        );
+
+        // tree-sitter -> live: must NOT relabel. This is the one the sweep
+        // depends on. An interface edit re-resolves files that were never
+        // re-parsed and still hold their tree-sitter edges; relabelling those
+        // would hand pre-existing truth to the sweep to delete.
+        let e2 = Edge::new(a.id, b.id, EdgeKind::DefinesBinding);
+        store.put_edge(&e2).unwrap();
+        store.put_edge_live(&e2).unwrap();
+        let ts = store
+            .iter_edges_from(a.id)
+            .unwrap()
+            .into_iter()
+            .find(|x| x.kind == EdgeKind::DefinesBinding)
+            .and_then(|x| x.provenance)
+            .unwrap();
+        assert_eq!(
+            ts, "tree-sitter",
+            "a live write must leave an existing tree-sitter row untouched"
         );
     }
 

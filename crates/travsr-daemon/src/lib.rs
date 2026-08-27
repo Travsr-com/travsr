@@ -3695,6 +3695,65 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
     }
 }
 
+/// RFC-027 section 8.3: retire the live overlay and clear resolved pendings.
+///
+/// Extracted so the convergence property test can drive ratification directly
+/// instead of racing the background scheduler.
+///
+/// Fail-open on both steps: a sweep that errors leaves `live` rows labeled as
+/// what they are, which is stale but honest, and never wrong.
+fn ratify_live_overlay(store: &mut SqliteStore, ratified: &[String]) {
+    match store.sweep_live_edges_for_languages(ratified) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!(
+            event = "live.swept",
+            swept = n,
+            languages = ?ratified,
+            "retired live edges Phase B did not re-derive"
+        ),
+        Err(e) => tracing::warn!("live overlay sweep failed: {e:#}"),
+    }
+    // A reference whose enclosing node now has an outgoing edge is no longer
+    // pending, whoever resolved it.
+    if let Err(e) = store.clear_resolved_pending_refs() {
+        tracing::debug!("clearing resolved pending refs failed: {e:#}");
+    }
+}
+
+/// The `nodes.language` values whose live overlay this Phase B run may retire.
+///
+/// `report.ran` names the languages whose analyzers completed. Two adjustments
+/// map that onto how nodes are actually labeled:
+///
+/// - JavaScript has no `nodes.language` of its own. `Language::from_extension`
+///   maps `.js`/`.jsx` to `TypeScript`, so a run that analysed JavaScript
+///   ratifies rows labeled `typescript`.
+/// - The LSIF pass is TypeScript's and is not represented in `report.ran`, so
+///   `typescript` is added whenever it produced edges.
+///
+/// A language absent from this set keeps its live edges. That is the #712
+/// partial-success case: the marker advances because *something* progressed,
+/// but a crashed sidecar's truth was never re-derived, and discarding its
+/// overlay would take away precision without replacing it.
+fn ratified_languages(report: &PhaseBReport, lsif_ran: bool) -> Vec<String> {
+    let mut langs: Vec<String> = Vec::with_capacity(report.ran.len() + 1);
+    for lang in &report.ran {
+        // JavaScript nodes are labeled `typescript`; see above.
+        let mapped = if lang == "javascript" {
+            "typescript"
+        } else {
+            lang.as_str()
+        };
+        if !langs.iter().any(|l| l == mapped) {
+            langs.push(mapped.to_string());
+        }
+    }
+    if lsif_ran && !langs.iter().any(|l| l == "typescript") {
+        langs.push("typescript".to_string());
+    }
+    langs
+}
+
 fn run_background_phase_b_inner(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
@@ -3841,6 +3900,26 @@ fn run_background_phase_b_inner(
     // --force`, not on an endless background loop.
     let made_progress =
         report.crashed.is_empty() || !report.ran.is_empty() || !lsif_edges.is_empty();
+
+    // RFC-027 section 8.3: ratify the live overlay.
+    //
+    // Position matters twice over. This runs *after* every SCIP/LSIF/native
+    // write above, so any live edge Phase B re-derived has already been
+    // relabelled in place by those writes and what remains marked `live` is
+    // exactly what Phase B did not re-derive. And it runs *before* the marker
+    // advance below, while the same store lock is still held, so no in-process
+    // reader can observe the graph between ratification and the marker.
+    //
+    // Not one WAL transaction, and it does not need to be. The Phase B write
+    // path is already several self-committing statements under a process-local
+    // mutex, so there is no single transaction to append this to. Because the
+    // order is insert-then-delete, the only state an out-of-process reader can
+    // catch mid-flight is a superset of the ratified graph, never a gap. The
+    // hazard the RFC worried about was the gap; the ordering dissolves it.
+    if made_progress {
+        ratify_live_overlay(&mut s, &ratified_languages(&report, !lsif_edges.is_empty()));
+    }
+
     if made_progress {
         let _ = s.set_meta("phase_b_commit", &target_sha);
         // #583: the semantic layer now matches the working tree again.
@@ -7472,6 +7551,315 @@ mod tests {
         );
     }
 
+    /// RFC-027 Phase 2 gate, Invariant #4: ratifying the live overlay returns
+    /// the graph to exactly what it was before the overlay existed.
+    ///
+    /// ```text
+    /// graph(G) --overlay--> G' --ratify--> G
+    /// ```
+    ///
+    /// This is the load-bearing half of the convergence argument. The overlay
+    /// is allowed to be non-deterministic — it depends on which language server
+    /// a developer happens to be running — and this is the fence that makes
+    /// that safe: whatever it contained, retiring it cannot leave a trace.
+    ///
+    /// It holds because the overlay is purely **additive**. `put_edge_live`
+    /// creates edges that were absent and refreshes its own, but never relabels
+    /// a row another lane wrote, so every row the sweep can delete is one the
+    /// live lane created. An earlier version relabelled `tree-sitter` rows,
+    /// and this test is what caught it: the sweep then deleted pre-existing
+    /// truth instead of returning the graph to it.
+    ///
+    /// Fingerprints compare provenance as well as endpoints, so a `live` row
+    /// left sitting where a ratified one belongs fails here rather than
+    /// passing on a matching count.
+    #[test]
+    fn ratifying_the_overlay_restores_the_pre_overlay_graph() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        let order = tmp.path().join("src/order.ts");
+
+        // Phase A only, exactly what a save does: content changes, the file's
+        // outgoing edges are rebuilt from the parse, and the new call site has
+        // no semantic edge. This is the mid-edit degradation RFC-027 covers.
+        {
+            let mut text = std::fs::read_to_string(&order).unwrap();
+            text.push_str("\nexport function expressOrder(u: User): void {\n  u.save();\n}\n");
+            std::fs::write(&order, text).unwrap();
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&order), tmp.path(), &mut store).unwrap();
+        }
+        let degraded = graph_fingerprint(&db_path);
+
+        // Overlay.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &order);
+        }
+        let live_rows = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .count_edges_with_provenance("live")
+            .unwrap();
+        assert!(
+            live_rows > 0,
+            "precondition: the overlay must be non-empty or this asserts nothing"
+        );
+        assert_ne!(
+            graph_fingerprint(&db_path),
+            degraded,
+            "precondition: the overlay must actually have changed the graph"
+        );
+
+        // Ratify with nothing re-derived: the strictest case for the sweep.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            ratify_live_overlay(&mut store, &["typescript".to_string()]);
+        }
+
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_edges_with_provenance("live")
+                .unwrap(),
+            0,
+            "no live edge may survive the run that ratifies it"
+        );
+        assert_eq!(
+            graph_fingerprint(&db_path),
+            degraded,
+            "retiring the overlay must restore the graph exactly, not merely its size"
+        );
+    }
+
+    /// The destructive case the additive rule exists to prevent.
+    ///
+    /// An interface edit re-resolves the files that *reference* the edited one
+    /// (section 6.3). Those files were never re-parsed, so their existing
+    /// `tree-sitter` edges are still in place. If the overlay relabelled them
+    /// `live`, the ratification sweep would delete pre-existing truth rather
+    /// than returning the graph to it, and a caller edge would simply vanish.
+    ///
+    /// So: run the overlay over a file that was *not* re-indexed, then ratify,
+    /// and require the graph to be unchanged throughout.
+    #[test]
+    fn the_overlay_cannot_destroy_an_edge_it_did_not_create() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        let order = tmp.path().join("src/order.ts");
+
+        // order.ts keeps every edge the full index gave it. This is a closure
+        // re-resolution, not a save.
+        let before = graph_fingerprint(&db_path);
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &order);
+        }
+        assert_eq!(
+            graph_fingerprint(&db_path),
+            before,
+            "resolving a file whose edges already exist must change nothing"
+        );
+
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            ratify_live_overlay(&mut store, &["typescript".to_string()]);
+        }
+        assert_eq!(
+            graph_fingerprint(&db_path),
+            before,
+            "ratification must not delete an edge the overlay did not create"
+        );
+    }
+
+    /// The other half: an overlay edge Phase B *does* re-derive is ratified in
+    /// place and survives the sweep, now carrying the ratified provenance.
+    ///
+    /// This is why the sweep can be a blunt delete. By the time it runs, every
+    /// edge Phase B re-derived has already been relabelled by the ratification
+    /// write, so what is still marked `live` is exactly what Phase B did not
+    /// re-derive.
+    #[test]
+    fn an_overlay_edge_phase_b_rederives_is_ratified_in_place() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        edit_and_reindex_order(&tmp, &db_path, &corpus);
+        let overlay: Vec<travsr_core::Edge> = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_edges(&store)
+        };
+        assert!(!overlay.is_empty(), "precondition: an overlay edge exists");
+
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            // Stand in for Phase B re-deriving these edges natively. This is the
+            // same call the daemon makes after a Phase B run.
+            store
+                .write_phase_b_batch(&[], &overlay, "tree-sitter")
+                .unwrap();
+            ratify_live_overlay(&mut store, &["typescript".to_string()]);
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.count_edges_with_provenance("live").unwrap(),
+            0,
+            "the row is no longer live once Phase B has re-derived it"
+        );
+        for e in &overlay {
+            let survived = store
+                .iter_edges_from(e.src)
+                .unwrap()
+                .into_iter()
+                .any(|x| x.dst == e.dst && x.kind == e.kind);
+            assert!(
+                survived,
+                "an edge Phase B re-derived must survive ratification, not be swept"
+            );
+        }
+    }
+
+    /// The sweep is scoped to languages that completed, so a crashed sidecar's
+    /// overlay survives rather than being discarded with nothing to replace it
+    /// (#712 partial success advances the marker regardless).
+    #[test]
+    fn ratification_spares_a_language_that_did_not_complete() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        edit_and_reindex_order(&tmp, &db_path, &corpus);
+        let before = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .count_edges_with_provenance("live")
+            .unwrap();
+        assert!(before > 0, "precondition: an overlay exists");
+
+        // Rust "completed"; TypeScript did not. The TypeScript overlay stays.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            ratify_live_overlay(&mut store, &["rust".to_string()]);
+        }
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_edges_with_provenance("live")
+                .unwrap(),
+            before,
+            "a language whose truth was never re-derived must keep its overlay"
+        );
+    }
+
+    /// `ratified_languages` maps analyzer names onto how nodes are labeled.
+    #[test]
+    fn ratified_languages_maps_javascript_and_the_lsif_pass_onto_typescript() {
+        let js_only = PhaseBReport {
+            ran: vec!["javascript".to_string()],
+            ..PhaseBReport::default()
+        };
+        assert_eq!(
+            ratified_languages(&js_only, false),
+            vec!["typescript".to_string()],
+            "JavaScript nodes are labeled typescript, so that is what ratifies"
+        );
+
+        // The LSIF pass is TypeScript's and never appears in `ran`.
+        let nothing_ran = PhaseBReport::default();
+        assert_eq!(
+            ratified_languages(&nothing_ran, true),
+            vec!["typescript".to_string()]
+        );
+
+        // Nothing ran and no LSIF edges: sweep nothing at all.
+        assert!(ratified_languages(&nothing_ran, false).is_empty());
+
+        // No duplicate when both signals point at typescript.
+        let both = PhaseBReport {
+            ran: vec!["typescript".to_string(), "javascript".to_string()],
+            ..PhaseBReport::default()
+        };
+        assert_eq!(
+            ratified_languages(&both, true),
+            vec!["typescript".to_string()]
+        );
+    }
+
+    /// Append a second caller to `order.ts` and re-index it, the way a save
+    /// lands: content changes, so `reindex_files` does not skip it on the hash,
+    /// Phase A rewrites the file's outgoing edges, and the new call site has no
+    /// semantic edge until something resolves it.
+    ///
+    /// Returns the overlay outcome so a caller can assert on it.
+    fn edit_and_reindex_order(
+        tmp: &tempfile::TempDir,
+        db_path: &std::path::Path,
+        corpus: &str,
+    ) -> std::path::PathBuf {
+        let order = tmp.path().join("src/order.ts");
+        let mut text = std::fs::read_to_string(&order).unwrap();
+        text.push_str("\nexport function expressOrder(u: User): void {\n  u.save();\n}\n");
+        std::fs::write(&order, text).unwrap();
+        let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
+        reindex_files(std::slice::from_ref(&order), tmp.path(), &mut store).unwrap();
+        live_resolve_file(&mut store, corpus, tmp.path(), &order);
+        order
+    }
+
+    /// A two-file TypeScript repo where `order.ts` calls into `user.ts`,
+    /// indexed. Shared by the RFC-027 Phase 1 and Phase 2 tests.
+    fn repo_with_a_call() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/user.ts"),
+            "export class User {\n  save(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/order.ts"),
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.save();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .get_meta("corpus")
+            .unwrap()
+            .unwrap_or_default();
+        (tmp, db_path, corpus)
+    }
+
+    /// Every `provenance='live'` edge currently in the store.
+    ///
+    /// `all_edges` returns `(src, dst, kind, provenance)` tuples, so rebuild the
+    /// core `Edge` from them for the ratification write.
+    fn live_edges(store: &travsr_store::SqliteStore) -> Vec<travsr_core::Edge> {
+        store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, _, _, prov)| prov == "live")
+            .filter_map(|(src, dst, kind, _)| {
+                travsr_core::EdgeKind::from_str(&kind).map(|k| travsr_core::Edge::new(src, dst, k))
+            })
+            .collect()
+    }
+
+    /// A content fingerprint of the whole graph: every node, and every edge with
+    /// its provenance, in a stable order. Comparing counts alone would miss a
+    /// live edge sitting where a ratified one belongs, which is the exact
+    /// failure the convergence property exists to rule out.
+    fn graph_fingerprint(db_path: &std::path::Path) -> (Vec<String>, Vec<String>) {
+        let store = travsr_store::SqliteStore::open(db_path).unwrap();
+        (
+            store.node_fingerprint().unwrap(),
+            store.edge_fingerprint().unwrap(),
+        )
+    }
+
     /// Invariant #4, orphan dimension: an incremental edit must leave the graph
     /// as free of dangling edges as a full index would.
     ///
@@ -7581,57 +7969,35 @@ mod tests {
     /// The hazard the live lane introduces is an edge to a symbol that no
     /// longer exists. `reindex_replace` deletes the inbound edges of a symbol
     /// whose NodeId vanished, so a `live` edge is cleaned up exactly as a
-    /// `tree-sitter` or `scip` one is — this test is what keeps that true, and
+    /// `tree-sitter` or `scip` one is. This test is what keeps that true, and
     /// it is the difference between honest staleness and a fabricated target.
     #[test]
     fn a_rename_leaves_no_ghost_live_edge() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        git_init(tmp.path());
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-
+        let (tmp, db_path, corpus) = repo_with_a_call();
         let user = tmp.path().join("src/user.ts");
-        let order = tmp.path().join("src/order.ts");
-        std::fs::write(&user, "export class User {\n  save(): void {}\n}\n").unwrap();
-        std::fs::write(
-            &order,
-            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.save();\n}\n",
-        )
-        .unwrap();
-
-        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
-        init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
-
-        let db_path = tmp.path().join(".travsr/graph.db");
-        let corpus = {
-            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            store.get_meta("corpus").unwrap().unwrap_or_default()
-        };
-
-        // Emit the live overlay for order.ts, then confirm it exists.
-        {
-            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &order);
-        }
-        let live_before = count_live_edges(&db_path);
+        // A real save adds a call site the overlay then resolves, which is the
+        // only way a live edge exists to be renamed away from.
+        edit_and_reindex_order(&tmp, &db_path, &corpus);
         assert!(
-            live_before > 0,
-            "precondition: the live lane must have emitted an edge to rename away from"
+            count_live_edges(&db_path) > 0,
+            "precondition: a live edge must exist to rename away from"
         );
 
         // Rename User.save -> User.persist. The old NodeId vanishes, so every
-        // inbound edge to it — live included — must go with it.
+        // inbound edge to it, live included, must go with it.
         std::fs::write(&user, "export class User {\n  persist(): void {}\n}\n").unwrap();
         {
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
             reindex_files(std::slice::from_ref(&user), tmp.path(), &mut store).unwrap();
         }
 
-        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
-        let orphans = store.count_orphans().unwrap();
         assert_eq!(
-            orphans, 0,
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
             "a rename must leave no edge pointing at a node that no longer exists"
         );
     }
@@ -7641,32 +8007,9 @@ mod tests {
     #[test]
     fn a_delete_leaves_no_ghost_live_edge() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        git_init(tmp.path());
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-
+        let (tmp, db_path, corpus) = repo_with_a_call();
         let user = tmp.path().join("src/user.ts");
-        let order = tmp.path().join("src/order.ts");
-        std::fs::write(&user, "export class User {\n  save(): void {}\n}\n").unwrap();
-        std::fs::write(
-            &order,
-            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.save();\n}\n",
-        )
-        .unwrap();
-
-        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
-        init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
-
-        let db_path = tmp.path().join(".travsr/graph.db");
-        let corpus = {
-            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            store.get_meta("corpus").unwrap().unwrap_or_default()
-        };
-        {
-            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &order);
-        }
+        edit_and_reindex_order(&tmp, &db_path, &corpus);
         assert!(
             count_live_edges(&db_path) > 0,
             "precondition: a live edge exists"
@@ -7678,10 +8021,12 @@ mod tests {
             reindex_files(std::slice::from_ref(&user), tmp.path(), &mut store).unwrap();
         }
 
-        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
-        let orphans = store.count_orphans().unwrap();
         assert_eq!(
-            orphans, 0,
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
             "a deleted file must take its inbound live edges with it"
         );
     }

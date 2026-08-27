@@ -249,13 +249,23 @@ At commit, ratification rides the **whole-project** Phase B run. (The RFC origin
 
 **Most live edges never reach the sweep.** A live edge that Phase B re-derives is ratified *in place*: the ratification write upserts the same `(src, dst, kind)` row and relabels its provenance (`lsif`/`scip`, or `tree-sitter` when the edge came from native leaf-name resolution, which is itself only ever written on a Phase B path). By the time the sweep runs, the rows still marked `live` are exactly those Phase B did **not** re-derive, so deleting them cannot lose a real edge. This is why the ratification writes must not be prevented from overwriting a `live` row.
 
+**The overlay must be purely additive** (confirmed in implementation; this is what makes the sweep safe). Emitting a live edge creates a row that was absent, or refreshes one the live lane already owns. It must **never** relabel a row another lane wrote. Otherwise the sweep — which deletes rows — could reach an edge the overlay did not create, and retiring the overlay would destroy pre-existing truth instead of returning the graph to it.
+
+The hazard is concrete rather than theoretical: an interface edit re-resolves the files that *reference* the edited one (§6.3), and those files were not re-parsed, so their `tree-sitter` edges are still in place. An upsert that relabelled them would hand them to the sweep, and any one Phase B did not happen to re-derive would vanish. The convergence property below is what surfaced this.
+
+Stated as an invariant: **every row the sweep can delete is a row the live lane created**, so ratification is a return to the pre-overlay graph rather than a mutation of it.
+
 **The sweep is language-scoped, not blanket.** `made_progress` advances the `phase_b_commit` marker whenever *any* language produced results, even when another language's sidecar crashed (#712). A blanket `DELETE FROM edges WHERE provenance='live'` would therefore discard live edges for a language whose SCIP truth was never re-derived in that run. The sweep is restricted to the languages that completed, keyed on the src node's language. Live edges for a crashed language survive, still labeled `live`, which is honest. Invariant #4 is unaffected: a clean run has nothing crashed, so the scoped sweep is total, and that is the case the convergence property below asserts.
 
 **Property (must hold, property-tested):**
 ```
-graph(full_reindex @ commit_C) == graph(incremental + live_overlay, ratified @ commit_C)
+graph(G) --overlay--> G' --ratify--> graph(G)
 ```
-Because every live edge is deleted and replaced by SCIP at commit, the *committed* graph contains zero live edges and is identical to a from-scratch reindex. Invariant #4 is discharged: the live overlay never survives a commit unratified.
+Ratifying the overlay returns the graph to exactly what it was before the overlay existed, provenance included. This is the form the property actually takes in code, and it is stronger than a count comparison: a `live` row sitting where a ratified one belongs has the same count and the wrong meaning.
+
+It composes with in-place ratification to give the original statement. An overlay edge Phase B re-derives is relabelled and survives; one it does not re-derive is swept; either way the committed graph carries zero live edges and is what the deterministic pipeline produces. Invariant #4 is discharged: the live overlay never survives the run that ratifies it.
+
+Note the property is asserted against the *pre-overlay* graph rather than against a from-scratch reindex. Those differ for an unrelated, pre-existing reason — Phase B is whole-project and commit-gated (`DEBT(travsr-25)`), so an incremental Phase A pass legitimately lacks semantic edges a full index would have. Asserting equality with a full reindex would be asserting something RFC-027 does not claim and does not fix.
 
 ### 8.4 Determinism fence
 Live resolution depends on the installed server version and is therefore non-deterministic across environments. This is **fenced**: non-determinism exists only in the ephemeral overlay, between commits. The durable (committed) graph is SCIP-pinned and deterministic. The overlay was never part of the deterministic ground-truth contract, so the fence is sound. Live edges MUST be visibly distinguishable at query time (§10) so no consumer mistakes the overlay for ratified truth.
