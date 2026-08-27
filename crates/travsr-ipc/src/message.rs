@@ -108,6 +108,48 @@ pub enum ControlMessage {
         /// so are unknown rather than clean.
         undiagnosed: usize,
     },
+    /// RFC-027: an editor reports where a reference in a dirty file actually
+    /// resolves to, so the daemon can close the between-commits semantic gap.
+    ///
+    /// This looks like the editor plane above but is deliberately a different
+    /// thing, and the difference is the whole safety argument. #688 keeps
+    /// editor data *out* of the graph because diagnostics are the editor's
+    /// claim about the code. Here the editor never makes a claim about the
+    /// graph: it reports a **position**, and the daemon resolves that position
+    /// against its own SCIP-owned identity. The editor cannot name a node,
+    /// cannot mint a VName, and cannot say which symbols are related. It
+    /// answers exactly one question a language server is authoritative for
+    /// ("what does the cursor at this position point at?") and the graph owns
+    /// everything downstream of that answer.
+    ///
+    /// The resulting edges are written with `provenance='live'` and swept when
+    /// commit-time SCIP ratifies the region (RFC-027 sections 8.3 and 8.4), so
+    /// the durable graph stays SCIP-pinned and deterministic. Non-determinism
+    /// is confined to the ephemeral overlay, which is why persisting these does
+    /// not reopen what #688 closed.
+    ///
+    /// Unlike [`ControlMessage::ReportLspDiagnostics`] there is no `ttl_secs`:
+    /// a live edge's lifetime is bounded by ratification, not by a lease, so a
+    /// TTL here would be a second expiry mechanism with no consumer.
+    ///
+    /// Daemons older than this variant answer with a parse error, which the
+    /// extension ignores. Losing the report costs freshness, never truth.
+    ReportLiveResolution {
+        /// Absolute workspace root this report describes. Checked against the
+        /// daemon's own repo for the same reason as `ReportLspDiagnostics`
+        /// (#698 review, P1): discovery enumerates a namespace, not a repo.
+        repo_root: String,
+        /// Stable for the lifetime of one editor window.
+        session: String,
+        /// The dirty file these references live in. Repo-relative, forward
+        /// slashes, matching the graph's own path keys.
+        file: String,
+        /// One entry per reference the editor was able to resolve. References
+        /// it could not resolve are simply absent: the live lane is fail-closed
+        /// (RFC-027 section 8.1), so an omission becomes a `pending` marker
+        /// rather than a guessed edge.
+        resolutions: Vec<LiveResolution>,
+    },
     /// #688: read the editor plane (`travsr daemon lsp`).
     ///
     /// Answers from memory across all live sessions, dropping expired ones as
@@ -115,6 +157,34 @@ pub enum ControlMessage {
     /// describes what editors are seeing now, and after a restart the daemon
     /// has not heard from any of them.
     LspStatus,
+}
+
+/// One resolved reference: where the call site is, and where the editor's
+/// language provider says it points.
+///
+/// Both ends are positions, never identities. The daemon maps them to nodes
+/// itself (RFC-027 section 7.5: current Tree-sitter spans for dirty files, SCIP
+/// ranges for clean ones), which is what keeps VName minting SCIP's exclusive
+/// job.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LiveResolution {
+    /// 1-based line of the reference in the dirty file.
+    pub ref_line: u32,
+    /// 0-based UTF-16 column, as the editor counts them.
+    pub ref_col: u32,
+    /// The referenced name, used to narrow candidates before position mapping
+    /// and to record an honest `pending` row when mapping fails.
+    pub name: String,
+    /// Repo-relative path the definition lives in, forward slashes. A target
+    /// outside the workspace is dropped by the extension rather than sent, so
+    /// the live lane stays intra-corpus (RFC-027 section 8.2).
+    pub target_path: String,
+    /// 1-based line of the definition the editor resolved to.
+    pub target_line: u32,
+    /// Editor buffer version this answer was computed against. The daemon drops
+    /// a resolution whose buffer has moved on rather than trusting a stale
+    /// position (RFC-027 section 11).
+    pub buffer_version: i64,
 }
 
 /// One file's current diagnostic state, as an editor sees it.
@@ -224,6 +294,52 @@ mod tests {
                 assert_eq!((files[0].errors, files[0].warnings), (2, 1));
             }
             other => panic!("expected ReportLspDiagnostics, got {other:?}"),
+        }
+    }
+
+    // RFC-027: same contract as the diagnostics line above. The extension
+    // hand-builds this in TypeScript (packages/travsr-vscode/src/daemonIpc.ts),
+    // so the wire tag and field names here are the contract. If this test is
+    // edited, that file has to change with it.
+    #[test]
+    fn report_live_resolution_wire_shape_matches_the_extension() {
+        let line = r#"{"op":"report-live-resolution","repo_root":"/home/alice/proj",
+            "session":"vscode-1-abc","file":"src/order.ts",
+            "resolutions":[{"ref_line":42,"ref_col":8,"name":"save",
+              "target_path":"src/user.ts","target_line":17,"buffer_version":9}]}"#;
+        match serde_json::from_str::<ControlMessage>(line).expect("extension line must parse") {
+            ControlMessage::ReportLiveResolution {
+                repo_root,
+                session,
+                file,
+                resolutions,
+            } => {
+                assert_eq!(repo_root, "/home/alice/proj");
+                assert_eq!(session, "vscode-1-abc");
+                assert_eq!(file, "src/order.ts");
+                assert_eq!(resolutions.len(), 1);
+                let r = &resolutions[0];
+                assert_eq!((r.ref_line, r.ref_col), (42, 8));
+                assert_eq!(r.name, "save");
+                assert_eq!(r.target_path, "src/user.ts");
+                assert_eq!(r.target_line, 17);
+                assert_eq!(r.buffer_version, 9);
+            }
+            other => panic!("expected ReportLiveResolution, got {other:?}"),
+        }
+    }
+
+    // An empty resolution list is meaningful: the editor looked and resolved
+    // nothing, which the daemon records as pending rather than as "no report".
+    #[test]
+    fn an_empty_live_resolution_report_parses() {
+        let line = r#"{"op":"report-live-resolution","repo_root":"/r","session":"s",
+            "file":"src/a.ts","resolutions":[]}"#;
+        match serde_json::from_str::<ControlMessage>(line).expect("empty report must parse") {
+            ControlMessage::ReportLiveResolution { resolutions, .. } => {
+                assert!(resolutions.is_empty())
+            }
+            other => panic!("expected ReportLiveResolution, got {other:?}"),
         }
     }
 

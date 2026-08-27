@@ -3649,6 +3649,48 @@ LIMIT ?4",
         Ok(())
     }
 
+    /// Persist an edge resolved by the RFC-027 live lane (`provenance='live'`).
+    ///
+    /// Live edges are an ephemeral overlay over the commit-gated semantic graph:
+    /// Tree-sitter detected the reference, the live engine resolved it precisely
+    /// (unambiguous-lexical or LSP-disambiguated), and commit-time SCIP will
+    /// ratify and replace it. They sit on the middle rung of the ADR-002
+    /// precedence ladder:
+    ///
+    /// ```text
+    /// lsif / scip   (compiler-grade, durable)   beats
+    /// live          (this lane, ephemeral)      beats
+    /// tree-sitter   (heuristic)
+    /// ```
+    ///
+    /// The `WHERE` on the upsert enforces the ladder from below: an existing
+    /// `lsif`, `scip`, or `bridge:*` row is left untouched, so a live edge can
+    /// never demote ratified truth. Re-emitting over an existing `live` row is
+    /// allowed and idempotent, which matters because `reindex_replace` deletes
+    /// every outbound edge of a file on each save, so the live engine re-emits
+    /// for the whole file rather than only for references it thinks are new.
+    ///
+    /// This never mints identity (RFC-027 section 8.2): both endpoints must
+    /// already exist as nodes, so the fencing rule and VName uniqueness hold.
+    pub fn put_edge_live(&mut self, edge: &Edge) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO edges(src, dst, kind, provenance, confidence) VALUES(?1, ?2, ?3, 'live', ?4) \
+                 ON CONFLICT(src, dst, kind) DO UPDATE SET \
+                   provenance = 'live', confidence = excluded.confidence \
+                 WHERE edges.provenance IN ('tree-sitter', 'live')",
+                params![
+                    node_id_to_i64(edge.src),
+                    node_id_to_i64(edge.dst),
+                    edge.kind.as_str(),
+                    edge.confidence.map(|c| c as i64),
+                ],
+            )
+            .context("inserting live edge")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// PR #715: batch-check which of `ids` already exist in `nodes`, one query per
     /// chunk rather than a `SELECT 1` per id, for the Phase B half-edge guard.
     ///
@@ -3790,6 +3832,15 @@ LIMIT ?4",
                 // ('lsif'/'scip') already on the row is never demoted by a later
                 // write (ADR-002), so a heuristic 'tree-sitter' write cannot
                 // overwrite it.
+                //
+                // RFC-027: the ELSE arm demoting a 'live' row to 'tree-sitter'
+                // is deliberate, not a leak. Both callers that pass a
+                // 'tree-sitter' provenance (`init_repo_with_progress` and
+                // `run_background_phase_b_inner`) are Phase B runs, so reaching
+                // here means Phase B just re-derived this edge and it is no
+                // longer a live guess. Demotion IS ratification for a
+                // co-located edge, and it is what leaves the section 8.3 sweep
+                // holding only the live edges Phase B did not re-derive.
                 tx.execute(
                     "INSERT INTO edges(src, dst, kind, provenance, confidence) \
                      VALUES(?1, ?2, ?3, ?4, ?5) \
@@ -4602,6 +4653,52 @@ LIMIT ?4",
             .collect::<Result<Vec<i64>, _>>()
             .context("definition_node_ids_in_file")?;
         Ok(ids.into_iter().map(i64_to_node_id).collect())
+    }
+
+    /// RFC-027 section 7.5: map a `(path, line)` position to the graph node
+    /// that owns it, returning the **narrowest** enclosing definition.
+    ///
+    /// This is the `location_to_node` primitive the live lane needs at both
+    /// ends: the call site's enclosing function becomes the edge's `src`, and
+    /// the definition the editor pointed at becomes its `dst`.
+    ///
+    /// The RFC describes this as range-source-aware (current Tree-sitter spans
+    /// for dirty files, SCIP ranges for clean ones). In this store one lookup
+    /// covers both, because a node's `line`/`end_line` always come from the most
+    /// recent parse of its file and Phase A re-parses a file on save before the
+    /// live engine runs. A position that lands in no definition span returns
+    /// `None`, which the caller must treat as an abstention rather than
+    /// guessing: fail-closed is the whole precision argument (section 8.1).
+    ///
+    /// Ordering matches [`find_narrowest_enclosing`]: widest-last, so the first
+    /// containing span is the tightest one.
+    pub fn enclosing_definition_at(
+        &self,
+        corpus: &str,
+        path: &str,
+        line: u32,
+    ) -> Result<Option<NodeId>, StoreError> {
+        (|| -> AnyResult<Option<NodeId>> {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "SELECT id FROM nodes \
+                     WHERE corpus = ?1 AND path = ?2 \
+                       AND line IS NOT NULL AND end_line IS NOT NULL \
+                       AND line <= ?3 AND end_line >= ?3 \
+                       AND kind IN ('function','method','fn','class','interface','struct', \
+                                    'trait','enum','type','typedef','union','object', \
+                                    'protocol','mixin','extension','namespace','init') \
+                     ORDER BY (end_line - line) ASC, id ASC LIMIT 1",
+                )
+                .context("enclosing_definition_at: prepare")?;
+            let id: Option<i64> = stmt
+                .query_row(params![corpus, path, line as i64], |row| row.get(0))
+                .optional()
+                .context("enclosing_definition_at: query")?;
+            Ok(id.map(i64_to_node_id))
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// G1: Look up the unified `NodeId` for a raw SCIP symbol string.
@@ -9432,6 +9529,100 @@ mod tests {
 
         let by_kind = store.iter_edges_from_kind(a.id, EdgeKind::RefCall).unwrap();
         assert_eq!(prov(&by_kind, EdgeKind::RefCall), "lsif");
+    }
+
+    /// RFC-027 Phase 0: the `live` provenance rung sits between `tree-sitter`
+    /// and `lsif`/`scip`. A live edge upgrades a heuristic row and is idempotent
+    /// over itself, but must never demote compiler-grade truth.
+    #[test]
+    fn live_edge_beats_tree_sitter_and_loses_to_compiler_provenance() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = node_with_path("a.ts", "fn:a");
+        let b = node_with_path("b.ts", "fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let e = Edge::new(a.id, b.id, EdgeKind::RefCall);
+
+        let prov = |st: &SqliteStore| -> String {
+            st.iter_edges_from(a.id).unwrap()[0]
+                .provenance
+                .clone()
+                .expect("reader must carry provenance")
+        };
+
+        // tree-sitter -> live: upgrade.
+        store.put_edge(&e).unwrap();
+        assert_eq!(prov(&store), "tree-sitter");
+        store.put_edge_live(&e).unwrap();
+        assert_eq!(prov(&store), "live", "live must upgrade a tree-sitter row");
+
+        // live -> live: idempotent. reindex_replace wipes a file's outbound
+        // edges on every save, so the engine re-emits whole-file (plan R5).
+        store.put_edge_live(&e).unwrap();
+        assert_eq!(prov(&store), "live");
+
+        // live -> tree-sitter: must NOT demote.
+        store.put_edge(&e).unwrap();
+        assert_eq!(
+            prov(&store),
+            "live",
+            "a tree-sitter write must not demote a live row"
+        );
+
+        // live -> lsif: ratification wins.
+        store.put_edge_lsif(&e).unwrap();
+        assert_eq!(prov(&store), "lsif", "lsif must overwrite live");
+
+        // lsif -> live: must NOT demote ratified truth.
+        store.put_edge_live(&e).unwrap();
+        assert_eq!(
+            prov(&store),
+            "lsif",
+            "a live write must never demote lsif/scip"
+        );
+    }
+
+    /// RFC-027: a Phase B write over a `live` row ratifies it.
+    ///
+    /// Both callers that pass a 'tree-sitter' provenance are Phase B runs
+    /// (`init_repo_with_progress`, `run_background_phase_b_inner`), so such a
+    /// write reaching an existing `live` row means Phase B just re-derived that
+    /// edge by native leaf-name resolution. Relabelling it is correct: it is no
+    /// longer a live guess. This is what leaves the section 8.3 sweep holding
+    /// only the live edges Phase B did *not* re-derive, so deleting those
+    /// cannot lose a real edge.
+    #[test]
+    fn write_phase_b_batch_ratifies_a_live_edge() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = node_with_path("a.ts", "fn:a");
+        let b = node_with_path("b.ts", "fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let e = Edge::new(a.id, b.id, EdgeKind::RefCall);
+        store.put_edge_live(&e).unwrap();
+
+        store
+            .write_phase_b_batch(&[], std::slice::from_ref(&e), "tree-sitter")
+            .unwrap();
+        assert_eq!(
+            store.iter_edges_from(a.id).unwrap()[0]
+                .provenance
+                .as_deref(),
+            Some("tree-sitter"),
+            "Phase B re-derived this edge natively, so it is ratified, not live"
+        );
+
+        // And a SCIP-provenance batch ratifies it as compiler truth.
+        store
+            .write_phase_b_batch(&[], std::slice::from_ref(&e), "scip")
+            .unwrap();
+        assert_eq!(
+            store.iter_edges_from(a.id).unwrap()[0]
+                .provenance
+                .as_deref(),
+            Some("scip"),
+            "scip must overwrite live"
+        );
     }
 
     /// Provenance is metadata about how an edge was derived, not part of its

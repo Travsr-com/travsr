@@ -238,12 +238,18 @@ Live edges are **intra-corpus only**. They:
 This preserves RFC-005's `src.corpus == dst.corpus` invariant and Principal Architect Invariant #1 (VName uniqueness): the live lane cannot synthesize a colliding identity because it never synthesizes identity at all.
 
 ### 8.3 Convergence (Principal Architect Invariant #4)
-At commit, the ratification pass runs incremental SCIP over `changed_set ∪ reverse_closure`, then, **in a single WAL transaction**:
+At commit, ratification rides the **whole-project** Phase B run. (The RFC originally specified incremental SCIP over `changed_set ∪ reverse_closure`; that machinery does not exist — `invoke_phase_b_all` runs over full-project inputs and file-level delta is unbuilt, `DEBT(travsr-25)`. Region-scoped ratification is a future optimization gated on that debt.) The pass then:
 1. inserts the SCIP-derived edges (which dominate any co-located `live` edge by ADR-002 precedence — the existing `ON CONFLICT(src,dst,kind) DO UPDATE` upsert in `travsr-store/src/lib.rs` already lets `lsif`/`scip` win),
 2. deletes the leftover `provenance = "live"` edges in that region that SCIP did not overwrite,
 3. clears `pending` reference markers SCIP resolved; GCs ghost nodes/edges from deletions.
 
-**Ordering rationale (delete-old / insert-new hazard).** A naive "delete all `live` edges, then insert SCIP" sequence opens a transient-gap window: a concurrent query landing between the two steps would see *neither* the live edge (already deleted) nor the SCIP edge (not yet inserted), momentarily reporting a missing edge on ratified code. Insert-then-delete inside one transaction closes that window — every reader sees either the pre-commit overlay or the fully-ratified graph, never a torn intermediate. This directly answers review-ask #1: the hazard is real but is dissolved by ordering + transaction atomicity, not by a change to the convergence property.
+**Ordering rationale (delete-old / insert-new hazard).** A naive "delete all `live` edges, then insert SCIP" sequence opens a transient-gap window: a concurrent query landing between the two steps would see *neither* the live edge (already deleted) nor the SCIP edge (not yet inserted), momentarily reporting a missing edge on ratified code. Insert-then-delete closes that window: the only observable intermediate is a **superset** of the ratified graph, never a gap.
+
+**Atomicity, corrected (confirmed in implementation).** These steps do **not** run in one WAL transaction, and cannot without restructuring the Phase B write path. That path is already a sequence of independently-committing statements — `put_edge_lsif` per LSIF edge, `write_phase_b_batch`, `write_scip_attributed_batch`, a second `write_phase_b_batch` for natively-resolved edges, `record_edge_sites`, `reconcile_edge_languages` — all under one *process-local* store mutex, which is not a transaction. The realizable guarantee is **ordering + store-lock exclusion + marker-gated visibility**: the sweep runs while that mutex is still held, after the last ratification write and before the `phase_b_commit` marker advances. In-process readers share the mutex and never observe an intermediate; a separate-process reader can, and sees only the harmless superset above. This answers review-ask #1: the hazard is real, and is dissolved by ordering, not by transaction atomicity.
+
+**Most live edges never reach the sweep.** A live edge that Phase B re-derives is ratified *in place*: the ratification write upserts the same `(src, dst, kind)` row and relabels its provenance (`lsif`/`scip`, or `tree-sitter` when the edge came from native leaf-name resolution, which is itself only ever written on a Phase B path). By the time the sweep runs, the rows still marked `live` are exactly those Phase B did **not** re-derive, so deleting them cannot lose a real edge. This is why the ratification writes must not be prevented from overwriting a `live` row.
+
+**The sweep is language-scoped, not blanket.** `made_progress` advances the `phase_b_commit` marker whenever *any* language produced results, even when another language's sidecar crashed (#712). A blanket `DELETE FROM edges WHERE provenance='live'` would therefore discard live edges for a language whose SCIP truth was never re-derived in that run. The sweep is restricted to the languages that completed, keyed on the src node's language. Live edges for a crashed language survive, still labeled `live`, which is honest. Invariant #4 is unaffected: a clean run has nothing crashed, so the scoped sweep is total, and that is the case the convergence property below asserts.
 
 **Property (must hold, property-tested):**
 ```
@@ -253,6 +259,14 @@ Because every live edge is deleted and replaced by SCIP at commit, the *committe
 
 ### 8.4 Determinism fence
 Live resolution depends on the installed server version and is therefore non-deterministic across environments. This is **fenced**: non-determinism exists only in the ephemeral overlay, between commits. The durable (committed) graph is SCIP-pinned and deterministic. The overlay was never part of the deterministic ground-truth contract, so the fence is sound. Live edges MUST be visibly distinguishable at query time (§10) so no consumer mistakes the overlay for ratified truth.
+
+**Reconciliation with the #688 editor plane.** The daemon already has an editor plane (`ControlMessage::ReportLspDiagnostics`) whose written contract is that editor-derived data is volatile and *"never enters the graph … can never be an edge or a node."* Persisting `live` edges appears to cross that line. It does not, and the distinction is what makes this sound:
+
+- **#688 carries the editor's claim about the code.** A diagnostic is the editor's own judgement, it has no counterpart in the repository, and nothing later replaces it with a derived truth. Admitting it to the graph would make the graph unreproducible with no path back.
+- **RFC-027 carries a position, not a claim.** The editor answers only "what does the cursor at this position point at" — the one question a language server is authoritative for. It never names a node, never mints a VName, and never asserts a relationship. The daemon maps both endpoints to nodes itself against SCIP-owned identity (§7.5, §8.2), so the graph owns everything downstream of that answer.
+- **The result is bounded by ratification, not by trust.** Every live edge is either relabelled by a Phase B write or swept (§8.3), so the non-determinism has a guaranteed end. A diagnostic has no such terminating event, which is exactly why it stays in its own plane.
+
+The two rules are therefore the same rule: *nothing whose non-determinism has no terminating event may enter the graph.* #688 has none, so it stays out; a live edge's terminating event is the next Phase B run.
 
 ---
 
@@ -271,7 +285,11 @@ Add one value to the edge provenance enum:
 
 Note: this table reflects the **de-facto** enum in the shipped store (`tree-sitter` / `lsif` / `scip`, plus `bridge:<mech>` from ADR-009), which already diverged from ADR-002's originally written value list (`tree-sitter` / `lsif` / `merged`, where `merged` was reserved-for-future and `scip` was added later). `live` extends that de-facto set; it does not reinstate `merged`.
 
-`live` edges are the only provenance the commit ratifier is permitted to bulk-delete-and-replace. A schema migration adds the enum value; no column changes.
+`live` edges are the only provenance the commit ratifier is permitted to bulk-delete-and-replace.
+
+**No schema migration is required** (confirmed in implementation). `edges.provenance` is an unconstrained `TEXT NOT NULL DEFAULT 'tree-sitter'` column with no `CHECK` (`travsr-store/src/migrations/v2_edge_provenance.sql`), so `'live'` is a code change at the precedence-bearing insert sites, not a migration. Only the `ref_resolution_state` table (§9.2) needs one.
+
+**Precedence in code.** `put_edge_live` upserts with `WHERE edges.provenance IN ('tree-sitter','live')`, so a live edge upgrades a heuristic row, is idempotent over itself, and can never overwrite `lsif`/`scip`/`bridge:*`. Re-emission has to be idempotent because `reindex_replace` deletes every outbound edge of a file on each save, so the engine re-emits for the whole file rather than only for references it believes are new.
 
 ### 9.2 Reference resolution state
 References detected by Tree-sitter but not yet edge-resolved carry a `ref_resolution_state` (named to avoid collision with the daemon's existing `record_dart_resolution_state` bookkeeping in `travsr-daemon/src/lib.rs`, which tracks Dart Phase B availability and is an unrelated concept):
@@ -286,7 +304,7 @@ References detected by Tree-sitter but not yet edge-resolved carry a `ref_resolu
 
 The live overlay must be *legible* to consumers, never silently blended into ratified truth:
 
-- `get_callers`, `find_references`, `get_blast_radius`, `get_graph_json` gain an optional per-edge `provenance` field already present internally; `live` edges are labeled and MAY be filtered via an existing `provenance` filter.
+- `get_callers`, `find_references`, `get_blast_radius`, `get_graph_json` gain an optional per-edge `provenance` field, and `live` edges are labeled. Two corrections from implementation: per-edge provenance was **not** "already present" at the MCP surface (`DEBT(travsr-75)` — core `Edge` carried no provenance field, so every BFS-traversed edge reported `tree-sitter` regardless of its stored row), and there is **no** existing `provenance` filter (only `kind_filter`). Threading provenance through `Edge` and the store readers is a prerequisite, landed separately; the filter argument is a small additive schema edit.
 - Responses that include a dirty region append a freshness note in the `<travsr-data>` envelope: `live_overlay: { dirty_files: N, pending_refs: M }`, so an agent knows the answer includes un-ratified edges and where the gaps are.
 - **No new MCP tool.** This is a data-quality/provenance annotation on existing tools, not a new contract. MCP-as-only-interface (Invariant #6) is unaffected.
 - Default behavior is additive: consumers that ignore provenance see a *fresher* graph; consumers that require ground truth filter to `provenance != live`.

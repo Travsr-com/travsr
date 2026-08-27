@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod hook;
+pub mod live_resolve;
 pub mod logfile;
 mod phase_b_sched;
 mod query_cache;
@@ -3620,6 +3621,56 @@ fn run_with_phase_b_finish_guard(
 /// tick), and [`AllCrashed`](phase_b_sched::RunOutcome::AllCrashed) when every
 /// sidecar crashed, which increments the retry-cap counter in
 /// `PhaseBScheduler`.
+/// RFC-027 section 7.3a: emit the unambiguous-lexical live overlay for one file.
+///
+/// Re-runs the native Phase B call-site extractor over just this file to get its
+/// [`UnresolvedCall`]s, then hands them to the precision-first live resolver.
+/// Reusing the extractor (rather than a second call-site parser) is what keeps
+/// the live lane detecting exactly the references Phase B will later ratify.
+///
+/// Only languages with a native Phase B call-site extractor participate; every
+/// other language keeps today's commit-gated behavior exactly, which is the
+/// RFC's zero-regression floor.
+fn live_resolve_file(
+    store: &mut SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+    vname_path: &str,
+) {
+    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    // `Language::TypeScript` covers .ts/.tsx/.js/.jsx — there is no separate
+    // JavaScript variant, and the native extractor handles both.
+    if travsr_core::Language::from_extension(ext) != Some(travsr_core::Language::TypeScript) {
+        return;
+    }
+    let files = [(abs_path.to_path_buf(), vname_path.to_string())];
+    let unresolved = match travsr_analysis::phase_b_typescript::extract_native_phase_b(
+        corpus,
+        repo_root,
+        Some(&files),
+    ) {
+        Ok((_, _, unresolved)) => unresolved,
+        Err(e) => {
+            tracing::debug!(path = %vname_path, error = %e, "live: call-site extraction failed");
+            return;
+        }
+    };
+    if unresolved.is_empty() {
+        return;
+    }
+    let outcome = live_resolve::resolve_unambiguous_lexical(store, &unresolved);
+    if outcome.emitted > 0 {
+        tracing::debug!(
+            event = "live.file",
+            path = %vname_path,
+            emitted = outcome.emitted,
+            pending = outcome.pending,
+            "live overlay refreshed for saved file"
+        );
+    }
+}
+
 fn run_background_phase_b_inner(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
@@ -4104,6 +4155,21 @@ pub fn reindex_files(
                     callers_all.extend(report.callers);
                 }
                 any_changed = true;
+                // RFC-027 section 7.3a: re-resolve this file's call sites into
+                // `provenance='live'` edges for the ones whose callee signature
+                // is unambiguous repo-wide. This is the between-commits overlay
+                // and needs no language server.
+                //
+                // It runs on EVERY save of the file, not only when something
+                // looks new, because `reindex_replace` above just deleted every
+                // outbound edge this file owned. Re-emitting is idempotent
+                // (`put_edge_live` upserts), so whole-file re-resolution is
+                // both the correct and the cheap option.
+                //
+                // Fail-open: a live edge is a freshness gain, never a
+                // correctness dependency, so any error here is logged and
+                // dropped rather than failing the save.
+                live_resolve_file(store, &corpus, repo_root, abs_path, &vname_path);
                 // Collect FFI markers for the repo-level pass (RFC-005).
                 all_ffi_markers.extend(out.ffi_markers);
                 // Collect Cargo workspace dep markers for the A2 repo-level pass.
@@ -10211,6 +10277,48 @@ fn handle_control_message(
             drop(s);
             enqueue_dirty_callers(dirty, repo_root, index_tx);
             (ControlResponse::ok(None), false)
+        }
+        Ok(ControlMessage::ReportLiveResolution {
+            repo_root: reported_root,
+            session,
+            file,
+            resolutions,
+        }) => {
+            // Same identity guard as ReportLspDiagnostics (#698 review, P1):
+            // discovery enumerates a namespace, not a repo, so a report has to
+            // say who it is for. Here the stakes are higher than for the editor
+            // plane, because these positions become graph edges: accepting
+            // another repo's report would write edges between nodes chosen by
+            // paths that mean something else in this graph.
+            let reported = travsr_ipc::normalize_repo_root(std::path::Path::new(&reported_root));
+            if reported != travsr_ipc::normalize_repo_root(repo_root) {
+                return (
+                    ControlResponse::err("report is for a different repo".to_string()),
+                    false,
+                );
+            }
+
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
+            let outcome =
+                live_resolve::apply_live_resolutions(&mut s, &corpus, &file, &resolutions);
+            drop(s);
+
+            tracing::debug!(
+                event = "live.report",
+                session = %session,
+                file = %file,
+                emitted = outcome.emitted,
+                pending = outcome.pending,
+                "live resolution report applied"
+            );
+            (
+                ControlResponse::ok(Some(format!(
+                    "{} live, {} pending",
+                    outcome.emitted, outcome.pending
+                ))),
+                false,
+            )
         }
         Ok(ControlMessage::ReportLspDiagnostics {
             repo_root: reported_root,
