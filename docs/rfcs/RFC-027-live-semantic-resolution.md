@@ -37,7 +37,7 @@ CLAUDE.md's dogfooding mandate says "the friction you feel is the bug report." T
 ### 2.2 Why this is not solved by the existing stack
 
 - **Phase A (Tree-sitter)** runs live on save and updates structural nodes/edges, but cannot resolve semantic edges: it knows `user.save()` is a call, not *which* `save`. Name resolution requires scope + type analysis Tree-sitter does not perform.
-- **Phase B (SCIP)** is correct but commit-gated by deliberate decision (see `project_phase_b_commit_gated_decision` — commit-gating is a cost concession, not a belief that staleness is acceptable). Running full SCIP on every keystroke is not viable.
+- **Phase B (SCIP)** is correct but commit-gated by deliberate decision (recorded in code at `travsr-daemon/src/lib.rs` — "Phase B stays commit-gated" / "still commit-gated on purpose"; commit-gating is a cost concession, not a belief that staleness is acceptable). Running full SCIP on every keystroke is not viable.
 
 The gap is narrow but real: **cross-file, type-resolved edges for uncommitted edits.** This RFC closes that gap for the surface where it hurts (the IDE) while preserving every existing correctness property.
 
@@ -61,7 +61,7 @@ Be precise about what this buys: the durable graph converges at commit **regardl
 
 - **ADR-009** established SCIP for new languages and LSIF for incumbents, keyed on *stable, package-qualified symbol identity*. That identity is the foundation this RFC builds on and must never be weakened.
 - **ADR-009 Rule 4** forbids feeding *synthetic* (non-corpus-verified) symbols into the bridge registry, because they can collide with a real symbol from a different corpus and violate RFC-005's `src.corpus == dst.corpus` invariant. LSP-derived resolutions are exactly such synthetic symbols; this RFC's fencing rule (§8.2) is a direct consequence.
-- **ADR-002 Rule 5** requires every edge to carry a provenance tag. This RFC adds a new value (§9.1).
+- **ADR-002 Rule 1** requires every edge to carry a provenance tag (`provenance TEXT NOT NULL DEFAULT 'tree-sitter'`). This RFC adds a new value (§9.1).
 - **Principal Architect Invariant #4** (incremental correctness): a full reindex and an incremental reindex of the same codebase must produce identical graphs. This is the load-bearing correctness property and §8.3 discharges it.
 - **Principal Architect Invariant #3** (LLM prohibition on structural reasoning): note LSP resolution is *deterministic compiler-grade analysis*, not an LLM. It does not violate Invariant #3. It is an algorithm, used as an oracle.
 
@@ -134,7 +134,7 @@ For each new or unresolved reference `R` at position `P` in a dirty file:
       else          → ABSTAIN (mark pending).  // L pointed outside the graph
 
 3c. AMBIGUOUS + NO LSP
-    → ABSTAIN. Mark R as resolution_state = pending.
+    → ABSTAIN. Mark R as ref_resolution_state = pending.
 
 4. ABSTENTION IS HONEST
    A pending reference is surfaced as "call site present, target not yet
@@ -216,8 +216,9 @@ sequenceDiagram
     Note over Dev,CI: RATIFICATION PATH — on commit (Invariant #4)
     Dev->>CI: git commit (hook fires)
     CI->>CI: incremental SCIP over changed ∪ closure
-    CI->>G: delete all provenance="live" edges in region
-    CI->>G: insert SCIP edges; clear resolved pendings; GC ghosts
+    CI->>G: insert SCIP edges (SCIP wins by ADR-002 precedence)
+    CI->>G: delete leftover provenance="live"; clear resolved pendings; GC ghosts
+    Note over G: steps run in one WAL transaction (§8.3 — no torn intermediate)
     Note over G: committed graph == full reindex (§8.3) — deterministic, live-free
 ```
 
@@ -237,10 +238,12 @@ Live edges are **intra-corpus only**. They:
 This preserves RFC-005's `src.corpus == dst.corpus` invariant and Principal Architect Invariant #1 (VName uniqueness): the live lane cannot synthesize a colliding identity because it never synthesizes identity at all.
 
 ### 8.3 Convergence (Principal Architect Invariant #4)
-At commit, the ratification pass runs incremental SCIP over `changed_set ∪ reverse_closure`, then:
-1. deletes all `provenance = "live"` edges in that region,
-2. inserts the SCIP-derived edges,
+At commit, the ratification pass runs incremental SCIP over `changed_set ∪ reverse_closure`, then, **in a single WAL transaction**:
+1. inserts the SCIP-derived edges (which dominate any co-located `live` edge by ADR-002 precedence — the existing `ON CONFLICT(src,dst,kind) DO UPDATE` upsert in `travsr-store/src/lib.rs` already lets `lsif`/`scip` win),
+2. deletes the leftover `provenance = "live"` edges in that region that SCIP did not overwrite,
 3. clears `pending` reference markers SCIP resolved; GCs ghost nodes/edges from deletions.
+
+**Ordering rationale (delete-old / insert-new hazard).** A naive "delete all `live` edges, then insert SCIP" sequence opens a transient-gap window: a concurrent query landing between the two steps would see *neither* the live edge (already deleted) nor the SCIP edge (not yet inserted), momentarily reporting a missing edge on ratified code. Insert-then-delete inside one transaction closes that window — every reader sees either the pre-commit overlay or the fully-ratified graph, never a torn intermediate. This directly answers review-ask #1: the hazard is real but is dissolved by ordering + transaction atomicity, not by a change to the convergence property.
 
 **Property (must hold, property-tested):**
 ```
@@ -255,7 +258,7 @@ Live resolution depends on the installed server version and is therefore non-det
 
 ## 9. Data Model & Schema
 
-### 9.1 Provenance (ADR-002 Rule 5)
+### 9.1 Provenance (ADR-002 Rule 1)
 Add one value to the edge provenance enum:
 
 | Source | `edges.provenance` |
@@ -266,10 +269,12 @@ Add one value to the edge provenance enum:
 | Cross-language bridge | `bridge:<mech>` |
 | **Live resolution (new)** | `live` |
 
+Note: this table reflects the **de-facto** enum in the shipped store (`tree-sitter` / `lsif` / `scip`, plus `bridge:<mech>` from ADR-009), which already diverged from ADR-002's originally written value list (`tree-sitter` / `lsif` / `merged`, where `merged` was reserved-for-future and `scip` was added later). `live` extends that de-facto set; it does not reinstate `merged`.
+
 `live` edges are the only provenance the commit ratifier is permitted to bulk-delete-and-replace. A schema migration adds the enum value; no column changes.
 
 ### 9.2 Reference resolution state
-References detected by Tree-sitter but not yet edge-resolved carry a `resolution_state`:
+References detected by Tree-sitter but not yet edge-resolved carry a `ref_resolution_state` (named to avoid collision with the daemon's existing `record_dart_resolution_state` bookkeeping in `travsr-daemon/src/lib.rs`, which tracks Dart Phase B availability and is an unrelated concept):
 - `resolved` — an edge exists (any provenance).
 - `pending` — detected, not resolved, awaiting live resolution or commit ratification. Surfaced honestly; never rendered as an edge.
 
@@ -356,7 +361,7 @@ Language choice for the spike is **TypeScript**: mature `tsserver` resolution + 
 1. **Headless daemon path.** Should Travsr ever spawn its own pinned language servers for non-IDE consumers, or is commit-gated the permanent answer there? Deferred to Phase 4 with Security.
 2. **Interface-edit detection granularity.** Can the classifier reliably distinguish rename from delete+add without the commit SCIP pass? Rename mis-classification only affects the *live* overlay (healed at commit), so a conservative "treat ambiguous as interface edit" is safe but costs recall. Measure in Phase 1.
 3. **Multi-dirty-file settle ordering.** When several files are dirty and cross-reference each other, is single-pass resolution sufficient or is a fixpoint needed? Bound the iterations; measure convergence in Phase 1.
-4. **Confidence exposure.** Do we surface `live` as a boolean provenance only, or a graded confidence? Solution Architect leans boolean (provenance) for MCP simplicity; revisit if consumers ask.
+4. **Confidence exposure.** Do we surface `live` as a boolean provenance only, or a graded confidence? Solution Architect leans boolean (provenance) for MCP simplicity; revisit if consumers ask. Note the plumbing for graded already exists independently of provenance: the `edges` table already carries a `confidence` column (written today by the LSIF/SCIP upserts in `travsr-store/src/lib.rs`), so a future graded signal can ride that field **without** touching the provenance enum. Recommended resolution: keep `provenance` boolean, reserve `confidence` as the graded channel if a consumer ever needs it.
 
 ---
 
