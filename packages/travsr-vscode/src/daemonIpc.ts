@@ -186,6 +186,46 @@ export async function reportLspDiagnostics(
   });
 }
 
+/** One reference an editor's language provider resolved (RFC-027). */
+export interface LiveResolutionItem {
+  /** 1-based line of the reference in the dirty file. */
+  ref_line: number;
+  /** 0-based UTF-16 column, as VS Code counts them. */
+  ref_col: number;
+  /** The referenced name, for the daemon's pending bookkeeping. */
+  name: string;
+  /** Repo-relative path of the definition, forward slashes. */
+  target_path: string;
+  /** 1-based line of the definition. */
+  target_line: number;
+  /** Document version this answer was computed against. */
+  buffer_version: number;
+}
+
+/**
+ * Publish where references in a dirty file actually resolve (RFC-027).
+ *
+ * Unlike `reportLspDiagnostics` this carries no lease: a live edge's lifetime
+ * is bounded by commit-time ratification in the daemon, not by a TTL here.
+ *
+ * Same fire-and-forget contract as everything else in this file. Losing a
+ * report costs freshness, never truth: the daemon abstains rather than
+ * guessing, and the commit-gated path resolves the same references anyway.
+ */
+export async function reportLiveResolution(
+  repoRoot: string,
+  file: string,
+  resolutions: LiveResolutionItem[]
+): Promise<boolean> {
+  return send(repoRoot, {
+    op: "report-live-resolution",
+    repo_root: repoRoot,
+    session: SESSION_ID,
+    file,
+    resolutions,
+  });
+}
+
 /**
  * Drop this window's view now, rather than leaving it to expire.
  *

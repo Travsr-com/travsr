@@ -15,6 +15,7 @@ import {
   BLAST_RADIUS_SELECTOR,
 } from "./codelens";
 import { CallersHoverProvider, HOVER_SELECTOR } from "./hover";
+import { publishLiveResolutions } from "./liveResolution";
 import { TravsrTreeDataProvider } from "./tree";
 import { TravsrRepoFileTreeProvider } from "./repoFileTree";
 import { showWelcome, showWelcomeIfFirstRun } from "./welcome";
@@ -531,6 +532,25 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       });
       await Promise.all(checks);
+    })
+  );
+
+  // RFC-027: live semantic resolution. On save, ask the language provider the
+  // developer is already running where this file's call sites resolve, and
+  // report the positions to the daemon so it can close the between-commits
+  // semantic gap. No server is spawned (section 7.6).
+  //
+  // Fire-and-forget and fully optional: the daemon resolves unambiguous callees
+  // on its own without any of this, and abstains rather than guessing on
+  // anything it cannot map. Losing these reports costs freshness, never truth,
+  // so nothing here is awaited or surfaced.
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      // No folder open means no repo to attribute the file to.
+      if (!workspaceRoot) return;
+      void publishLiveResolutions(workspaceRoot, doc).catch(() => {
+        // Never surfaced: see the note above.
+      });
     })
   );
 
