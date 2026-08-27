@@ -6907,7 +6907,7 @@ fn get_graph_json_raw(
                 // First pass: dedup via edge_seen, enqueue new visits.
                 // Collect (dst_id, kind_s) only for edges that produce JSON output.
                 let mut new_edges: Vec<(NodeId, &str)> = Vec::new();
-                for (kind, next_id, child_expand, _incoming) in &nexts {
+                for (kind, next_id, child_expand, _incoming, _provenance) in &nexts {
                     let kind_s = edge_kind_str(kind);
                     if edge_seen.insert((current_id, *next_id, kind_s)) {
                         new_edges.push((*next_id, kind_s));
@@ -6946,7 +6946,7 @@ fn get_graph_json_raw(
             ) {
                 // First pass: dedup via edge_seen, enqueue new visits.
                 let mut new_edges: Vec<(NodeId, &str)> = Vec::new();
-                for (kind, next_id, child_expand, _incoming) in &nexts {
+                for (kind, next_id, child_expand, _incoming, _provenance) in &nexts {
                     let kind_s = edge_kind_str(kind);
                     if edge_seen.insert((*next_id, current_id, kind_s)) {
                         new_edges.push((*next_id, kind_s));

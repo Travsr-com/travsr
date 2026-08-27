@@ -7250,20 +7250,24 @@ impl Store for SqliteStore {
         (|| -> AnyResult<Vec<Edge>> {
             let mut stmt = self
                 .conn
-                .prepare_cached("SELECT dst, kind, confidence FROM edges WHERE src = ?1")
+                .prepare_cached(
+                    "SELECT dst, kind, confidence, provenance FROM edges WHERE src = ?1",
+                )
                 .context("preparing iter_edges_from query")?;
             let rows = stmt
                 .query_map(params![node_id_to_i64(src)], |row| {
                     let dst_i64: i64 = row.get(0)?;
                     let kind_str: String = row.get(1)?;
                     let confidence: Option<i64> = row.get(2)?;
-                    Ok((dst_i64, kind_str, confidence))
+                    let provenance: String = row.get(3)?;
+                    Ok((dst_i64, kind_str, confidence, provenance))
                 })
                 .context("executing iter_edges_from query")?;
 
             let mut out = Vec::new();
             for row in rows {
-                let (dst_i64, kind_str, confidence) = row.context("decoding edge row")?;
+                let (dst_i64, kind_str, confidence, provenance) =
+                    row.context("decoding edge row")?;
                 let kind = EdgeKind::from_str(&kind_str)
                     .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
                 out.push(Edge {
@@ -7271,6 +7275,7 @@ impl Store for SqliteStore {
                     dst: i64_to_node_id(dst_i64),
                     kind,
                     confidence: confidence.map(|c| c as u8),
+                    provenance: Some(provenance),
                 });
             }
             tracing::debug!(edges_returned = out.len());
@@ -7288,18 +7293,18 @@ impl Store for SqliteStore {
         (|| -> AnyResult<Vec<Edge>> {
             let mut stmt = self
                 .conn
-                .prepare("SELECT dst FROM edges WHERE src = ?1 AND kind = ?2")
+                .prepare("SELECT dst, provenance FROM edges WHERE src = ?1 AND kind = ?2")
                 .context("preparing iter_edges_from_kind query")?;
             let rows = stmt
                 .query_map(params![node_id_to_i64(src), kind.as_str()], |row| {
-                    row.get::<_, i64>(0)
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })
                 .context("executing iter_edges_from_kind query")?;
 
             let mut out = Vec::new();
             for row in rows {
-                let dst_i64 = row.context("decoding iter_edges_from_kind row")?;
-                out.push(Edge::new(src, i64_to_node_id(dst_i64), kind));
+                let (dst_i64, provenance) = row.context("decoding iter_edges_from_kind row")?;
+                out.push(Edge::new(src, i64_to_node_id(dst_i64), kind).with_provenance(provenance));
             }
             tracing::debug!(edges_returned = out.len());
             Ok(out)
@@ -7316,7 +7321,7 @@ impl Store for SqliteStore {
         (|| -> AnyResult<Vec<Edge>> {
             let placeholders = srcs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT src, dst, kind, confidence FROM edges WHERE src IN ({placeholders})"
+                "SELECT src, dst, kind, confidence, provenance FROM edges WHERE src IN ({placeholders})"
             );
             // prepare() not prepare_cached(): the SQL string varies per chunk length
             // (different number of '?' placeholders), so prepare_cached would create a
@@ -7334,12 +7339,14 @@ impl Store for SqliteStore {
                     let dst_i64: i64 = row.get(1)?;
                     let kind_str: String = row.get(2)?;
                     let confidence: Option<i64> = row.get(3)?;
-                    Ok((src_i64, dst_i64, kind_str, confidence))
+                    let provenance: String = row.get(4)?;
+                    Ok((src_i64, dst_i64, kind_str, confidence, provenance))
                 })
                 .context("executing iter_edges_from_batch")?;
             let mut out = Vec::new();
             for row in rows {
-                let (src_i64, dst_i64, kind_str, confidence) = row.context("decoding edge row")?;
+                let (src_i64, dst_i64, kind_str, confidence, provenance) =
+                    row.context("decoding edge row")?;
                 let kind = EdgeKind::from_str(&kind_str)
                     .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
                 out.push(Edge {
@@ -7347,6 +7354,7 @@ impl Store for SqliteStore {
                     dst: i64_to_node_id(dst_i64),
                     kind,
                     confidence: confidence.map(|c| c as u8),
+                    provenance: Some(provenance),
                 });
             }
             tracing::debug!(edges_returned = out.len());
@@ -7360,22 +7368,23 @@ impl Store for SqliteStore {
         (|| -> AnyResult<Vec<Edge>> {
             let mut stmt = self
                 .conn
-                .prepare("SELECT src, kind FROM edges WHERE dst = ?1")
+                .prepare("SELECT src, kind, provenance FROM edges WHERE dst = ?1")
                 .context("preparing iter_edges_to query")?;
             let rows = stmt
                 .query_map(params![node_id_to_i64(dst)], |row| {
                     let src_i64: i64 = row.get(0)?;
                     let kind_str: String = row.get(1)?;
-                    Ok((src_i64, kind_str))
+                    let provenance: String = row.get(2)?;
+                    Ok((src_i64, kind_str, provenance))
                 })
                 .context("executing iter_edges_to query")?;
 
             let mut out = Vec::new();
             for row in rows {
-                let (src_i64, kind_str) = row.context("decoding edge row")?;
+                let (src_i64, kind_str, provenance) = row.context("decoding edge row")?;
                 let kind = EdgeKind::from_str(&kind_str)
                     .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
-                out.push(Edge::new(i64_to_node_id(src_i64), dst, kind));
+                out.push(Edge::new(i64_to_node_id(src_i64), dst, kind).with_provenance(provenance));
             }
             tracing::debug!(edges_returned = out.len());
             Ok(out)
@@ -9382,6 +9391,71 @@ mod tests {
         );
     }
 
+    /// DEBT-75: every `iter_edges_*` reader must carry the row's true
+    /// `edges.provenance`, so a consumer that traverses the graph (the MCP
+    /// surface, `travsr graph --format json`) reports how an edge was actually
+    /// derived instead of assuming `tree-sitter`. Before this, an `lsif` edge
+    /// read back through BFS was indistinguishable from a heuristic one.
+    #[test]
+    fn edge_readers_carry_true_provenance() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = node_with_path("a.ts", "fn:a");
+        let b = node_with_path("b.ts", "fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+
+        // One tree-sitter edge and one lsif edge out of the same source.
+        let ts_edge = Edge::new(a.id, b.id, EdgeKind::DefinesBinding);
+        let lsif_edge = Edge::new(a.id, b.id, EdgeKind::RefCall);
+        store.put_edge(&ts_edge).unwrap();
+        store.put_edge_lsif(&lsif_edge).unwrap();
+
+        let prov = |edges: &[Edge], kind: EdgeKind| -> String {
+            edges
+                .iter()
+                .find(|e| e.kind == kind)
+                .and_then(|e| e.provenance.clone())
+                .unwrap_or_else(|| panic!("no {kind:?} edge returned"))
+        };
+
+        let from = store.iter_edges_from(a.id).unwrap();
+        assert_eq!(prov(&from, EdgeKind::RefCall), "lsif");
+        assert_eq!(prov(&from, EdgeKind::DefinesBinding), "tree-sitter");
+
+        let to = store.iter_edges_to(b.id).unwrap();
+        assert_eq!(prov(&to, EdgeKind::RefCall), "lsif");
+        assert_eq!(prov(&to, EdgeKind::DefinesBinding), "tree-sitter");
+
+        let batch = store.iter_edges_from_batch(&[a.id]).unwrap();
+        assert_eq!(prov(&batch, EdgeKind::RefCall), "lsif");
+        assert_eq!(prov(&batch, EdgeKind::DefinesBinding), "tree-sitter");
+
+        let by_kind = store.iter_edges_from_kind(a.id, EdgeKind::RefCall).unwrap();
+        assert_eq!(prov(&by_kind, EdgeKind::RefCall), "lsif");
+    }
+
+    /// Provenance is metadata about how an edge was derived, not part of its
+    /// identity: the store's primary key is `(src, dst, kind)`. A read-back edge
+    /// must therefore still compare equal to the constructed one it came from.
+    #[test]
+    fn provenance_is_not_part_of_edge_identity() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = node_with_path("a.ts", "fn:a");
+        let b = node_with_path("b.ts", "fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let built = Edge::new(a.id, b.id, EdgeKind::RefCall);
+        store.put_edge_lsif(&built).unwrap();
+
+        let read_back = store.iter_edges_from(a.id).unwrap();
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].provenance.as_deref(), Some("lsif"));
+        assert_eq!(
+            read_back[0], built,
+            "an edge differing only in provenance is the same edge"
+        );
+    }
+
     // V4 (no package column) → V5 migration must add package with empty default,
     // add language column to edges, and existing nodes must read back correctly.
     #[test]
@@ -10120,6 +10194,7 @@ mod tests {
             dst: node_b.id,
             kind: travsr_core::EdgeKind::RefCall,
             confidence: None,
+            provenance: None,
         };
 
         let batch = vec![
@@ -10185,6 +10260,7 @@ mod tests {
             dst: node.id,
             kind: travsr_core::EdgeKind::RefCall,
             confidence: None,
+            provenance: None,
         };
 
         let batch = vec![
