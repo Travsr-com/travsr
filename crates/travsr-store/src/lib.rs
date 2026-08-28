@@ -5042,6 +5042,63 @@ LIMIT ?4",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// RFC-027 section 12: [`live_precision_sample`], split by language.
+    ///
+    /// The shipping gate is **per-language** ("if it cannot hold that bar for a
+    /// language, the lane is disabled for that language"), so the meter has to
+    /// attribute each claim to one. Attribution is by the **source** node's
+    /// language — the file that was edited, which is the file the live lane ran
+    /// on — the same key the ratification sweep scopes its delete on, so the
+    /// meter and the sweep never disagree about which language a row belongs to.
+    ///
+    /// Bucketing is in Rust rather than a SQL `GROUP BY` so the two per-claim
+    /// `EXISTS` sub-selects stay identical to [`live_precision_sample`]; the
+    /// only change is carrying `n.language` alongside them.
+    pub fn live_precision_sample_by_language(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, LivePrecision>, StoreError> {
+        (|| -> AnyResult<std::collections::BTreeMap<String, LivePrecision>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT n.language, \
+                       EXISTS (SELECT 1 FROM edge_sites s \
+                               WHERE s.src = r.src AND s.line = r.ref_line) AS has_site, \
+                       EXISTS (SELECT 1 FROM edge_sites s \
+                               WHERE s.src = r.src AND s.line = r.ref_line \
+                                 AND s.dst = r.resolved_dst) AS matches \
+                     FROM ref_resolution_state r \
+                     JOIN nodes n ON n.id = r.src \
+                     WHERE r.state = 'resolved' AND r.resolved_dst IS NOT NULL",
+                )
+                .context("live_precision_sample_by_language: prepare")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? == 1,
+                        row.get::<_, i64>(2)? == 1,
+                    ))
+                })
+                .context("live_precision_sample_by_language: query")?;
+
+            let mut out: std::collections::BTreeMap<String, LivePrecision> =
+                std::collections::BTreeMap::new();
+            for row in rows {
+                let (lang, has_site, matches) =
+                    row.context("live_precision_sample_by_language: decode")?;
+                let bucket = out.entry(lang).or_default();
+                match (has_site, matches) {
+                    (false, _) => bucket.unverifiable += 1,
+                    (true, true) => bucket.agree += 1,
+                    (true, false) => bucket.disagree += 1,
+                }
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// RFC-027 section 10: the pending references in `path`, for the
     /// `live_overlay` freshness note.
     ///

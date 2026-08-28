@@ -760,4 +760,143 @@ mod tests {
             "re-emitting must not accumulate duplicate edges"
         );
     }
+
+    // ── Phase 4: Rust call-site encoding (RFC-027 §14) ──────────────────────
+    //
+    // `candidate_signatures` was written against TypeScript's encoding; Rust's
+    // differs in three ways (see the fn doc). These tests pin each, so a change
+    // to the extractor or the signature builder cannot silently regress Rust
+    // recall or, worse, start double-qualifying an already-qualified sig.
+
+    fn rust_store_with(nodes: &[(&str, &str, &str, u32, u32)]) -> SqliteStore {
+        let mut store = SqliteStore::open_in_memory().expect("in-memory store");
+        for (path, sig, kind, line, end_line) in nodes {
+            let vname = VName::new(CORPUS, "", *path, "rust", *sig);
+            let mut node = Node::new(vname, *kind);
+            node.line = Some(*line);
+            node.end_line = Some(*end_line);
+            store.put_node(&node).expect("put_node");
+        }
+        store
+    }
+
+    fn rust_node_id(path: &str, sig: &str) -> NodeId {
+        VName::new(CORPUS, "", path, "rust", sig).id()
+    }
+
+    /// `Type::method()` (an associated call like `Zoo::new()`) is emitted by the
+    /// Rust extractor ALREADY QUALIFIED — `callee_sig = "method:Zoo.new"`, with
+    /// no receiver type and `is_method_call = false` (phase_b_rust.rs, the
+    /// `call.scoped` uppercase-qualifier arm). It must reach `unique_definition`
+    /// verbatim: rebuilding `method:{recv}.{leaf}` would double-qualify it. A
+    /// `None` recv_type and `!is_method_call` route it to the free-function
+    /// branch, which uses the sig as-is. The plan flagged this as "correct by
+    /// accident"; this pins it as correct on purpose.
+    #[test]
+    fn rust_associated_call_signature_is_used_verbatim_not_rebuilt() {
+        let src = rust_node_id("src/main.rs", "fn:main");
+        let c = call(src, "method:Zoo.new", 3);
+        assert_eq!(candidate_signatures(&c), vec!["method:Zoo.new".to_string()]);
+    }
+
+    /// `recv.method()` (e.g. `zoo.add()`) is emitted as `callee_sig = "fn:add"`
+    /// with `is_method_call = true` and the receiver type recovered into
+    /// `recv_type`. The lane must rebuild `method:{recv}.{leaf}` to match the
+    /// definition node `method:Zoo.add`; `fn:add` alone names no method.
+    #[test]
+    fn rust_method_call_with_receiver_type_rebuilds_the_qualified_sig() {
+        let src = rust_node_id("src/zoo.rs", "method:Zoo.announce");
+        let mut c = call(src, "fn:add", 5);
+        c.is_method_call = true;
+        c.recv_type = Some("Zoo".to_string());
+        assert_eq!(candidate_signatures(&c), vec!["method:Zoo.add".to_string()]);
+    }
+
+    /// A method call with no recovered receiver type is the ambiguity §7.3a
+    /// cannot settle, so it yields no candidate and abstains — the LSP lane
+    /// (§7.3b) is what exists for it. Guessing by leaf name here is the
+    /// recall-biased Phase B policy, wrong for an un-ratified edge.
+    #[test]
+    fn rust_method_call_without_receiver_type_yields_no_candidate() {
+        let src = rust_node_id("src/zoo.rs", "method:Zoo.announce");
+        let mut c = call(src, "fn:add", 5);
+        c.is_method_call = true;
+        c.recv_type = None;
+        assert!(candidate_signatures(&c).is_empty());
+    }
+
+    /// A bare free-function call `helper()` names its definition directly.
+    #[test]
+    fn rust_bare_function_call_names_its_definition_directly() {
+        let src = rust_node_id("src/main.rs", "fn:main");
+        let c = call(src, "fn:helper", 2);
+        assert_eq!(candidate_signatures(&c), vec!["fn:helper".to_string()]);
+    }
+
+    /// End to end on a Rust-labeled store: `Zoo::new()` resolves to the
+    /// associated-function definition with a `live` edge and no double-qualify.
+    #[test]
+    fn rust_associated_call_resolves_to_a_live_edge() {
+        let mut store = rust_store_with(&[
+            ("src/main.rs", "fn:main", "function", 1, 6),
+            ("src/zoo.rs", "method:Zoo.new", "method", 4, 9),
+        ]);
+        let src = rust_node_id("src/main.rs", "fn:main");
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/main.rs",
+            &[call(src, "method:Zoo.new", 3)],
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            }
+        );
+        assert_eq!(
+            provenance_of(&store, src, rust_node_id("src/zoo.rs", "method:Zoo.new")).as_deref(),
+            Some("live"),
+        );
+    }
+
+    /// Rust field access `x.count` is emitted with `callee_sig = "field:count"`
+    /// AND a recovered `recv_type` — the extractor only emits field refs when
+    /// the receiver type is recoverable (phase_b_rust.rs guards
+    /// `recv_type.is_none()`). So `candidate_signatures` DOES build
+    /// `field:Zoo.count`, and the field definition node is present. It still
+    /// abstains, because `is_definition` does not admit the `"field"` kind and
+    /// `unique_definition` filters the node out. The abstention is by
+    /// definition-kind, NOT (as an earlier note assumed) a missing receiver
+    /// type. Recorded, not closed: a field read is not a call and must not mint
+    /// a `RefCall` edge. Both facts are asserted here so neither can drift.
+    #[test]
+    fn rust_field_access_abstains_on_definition_kind_not_missing_receiver() {
+        let mut c = call(
+            rust_node_id("src/zoo.rs", "method:Zoo.tally"),
+            "field:count",
+            5,
+        );
+        c.recv_type = Some("Zoo".to_string());
+        assert_eq!(
+            candidate_signatures(&c),
+            vec!["field:Zoo.count".to_string()],
+            "the owner-qualified field sig is built; recv_type is present",
+        );
+
+        let mut store = rust_store_with(&[
+            ("src/zoo.rs", "method:Zoo.tally", "method", 4, 9),
+            ("src/zoo.rs", "field:Zoo.count", "field", 2, 2),
+        ]);
+        let out = resolve_unambiguous_lexical(&mut store, CORPUS, "src/zoo.rs", &[c]);
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+            "the field node exists and its sig matches; abstention is the is_definition filter",
+        );
+    }
 }

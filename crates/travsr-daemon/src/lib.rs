@@ -3663,18 +3663,49 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
         .replace('\\', "/");
     let vname_path = vname_path.as_str();
     let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    // `Language::TypeScript` covers .ts/.tsx/.js/.jsx — there is no separate
-    // JavaScript variant, and the native extractor handles both.
-    if travsr_core::Language::from_extension(ext) != Some(travsr_core::Language::TypeScript) {
+    // Only the native call-site extractor is per-language; everything downstream
+    // (`resolve_unambiguous_lexical`, `candidate_signatures`, the emit path) is
+    // language-agnostic. `Language::TypeScript` covers .ts/.tsx/.js/.jsx — there
+    // is no separate JavaScript variant, and the native extractor handles both;
+    // Rust is `.rs`.
+    let lang = match travsr_core::Language::from_extension(ext) {
+        Some(lang @ (travsr_core::Language::TypeScript | travsr_core::Language::Rust)) => lang,
+        _ => return,
+    };
+    // RFC-027 section 12: a language the cumulative meter has measured below the
+    // shipping bar is disabled — the fail-closed floor (§7.3c) is better than an
+    // un-ratified wrong edge. Extraction is skipped entirely so a disabled
+    // language costs nothing on save.
+    if !live_lane_enabled_for(store, lang.as_str()) {
+        tracing::debug!(
+            path = %vname_path,
+            language = lang.as_str(),
+            "live: lane disabled for language by the precision gate"
+        );
         return;
     }
     let files = [(abs_path.to_path_buf(), vname_path.to_string())];
-    let unresolved = match travsr_analysis::phase_b_typescript::extract_native_phase_b(
-        corpus,
-        repo_root,
-        Some(&files),
-    ) {
-        Ok((_, _, unresolved)) => unresolved,
+    // The two extractors return different arities: TypeScript is
+    // `(nodes, edges, unresolved)`, Rust is `(nodes, edges, unresolved, refs)`
+    // (the same-file `refs` the live lane does not consume).
+    let extraction = match lang {
+        travsr_core::Language::TypeScript => {
+            travsr_analysis::phase_b_typescript::extract_native_phase_b(
+                corpus,
+                repo_root,
+                Some(&files),
+            )
+            .map(|(_, _, unresolved)| unresolved)
+        }
+        travsr_core::Language::Rust => {
+            travsr_analysis::phase_b_rust::extract_native_phase_b(corpus, repo_root, Some(&files))
+                .map(|(_, _, unresolved, _)| unresolved)
+        }
+        // Unreachable: the gate above admits only the two arms handled here.
+        _ => return,
+    };
+    let unresolved = match extraction {
+        Ok(unresolved) => unresolved,
         Err(e) => {
             tracing::debug!(path = %vname_path, error = %e, "live: call-site extraction failed");
             return;
@@ -3712,52 +3743,88 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
 /// is built to avoid, and it should be visible the moment it happens rather than
 /// averaged into a ratio.
 fn measure_live_precision(store: &mut SqliteStore) {
-    let sample = match store.live_precision_sample() {
+    let by_lang = match store.live_precision_sample_by_language() {
         Ok(s) => s,
         Err(e) => {
             tracing::debug!("live precision sample failed: {e:#}");
             return;
         }
     };
-    if sample.claims() == 0 {
+    if by_lang.is_empty() {
         return;
     }
 
+    // Accumulate each language's counters under its own key, and roll the same
+    // deltas into the corpus-wide `live_precision` key `travsr status` reads.
+    // The per-language keys are what the shipping gate (`live_lane_enabled_for`)
+    // consults; the aggregate stays a faithful sum so the status line is
+    // unchanged.
+    let (mut run_agree, mut run_disagree, mut run_unverifiable) = (0u64, 0u64, 0u64);
+    for (lang, sample) in &by_lang {
+        if sample.claims() == 0 {
+            continue;
+        }
+        let prior = read_precision_totals_for(store, Some(lang));
+        let _ = store.set_meta(
+            &live_precision_meta_key(Some(lang)),
+            &format!(
+                "{},{},{}",
+                prior.0 + sample.agree,
+                prior.1 + sample.disagree,
+                prior.2 + sample.unverifiable
+            ),
+        );
+
+        if sample.disagree > 0 {
+            tracing::warn!(
+                event = "live.precision.disagreement",
+                language = %lang,
+                disagreed = sample.disagree,
+                agreed = sample.agree,
+                "the live lane resolved a reference differently from Phase B"
+            );
+        }
+        tracing::info!(
+            event = "live.precision",
+            language = %lang,
+            agree = sample.agree,
+            disagree = sample.disagree,
+            unverifiable = sample.unverifiable,
+            precision = ?sample.precision(),
+            coverage = sample.coverage(),
+            "live overlay scored against Phase B"
+        );
+
+        run_agree += sample.agree;
+        run_disagree += sample.disagree;
+        run_unverifiable += sample.unverifiable;
+    }
+
     let prior = read_precision_totals(store);
-    let agree = prior.0 + sample.agree;
-    let disagree = prior.1 + sample.disagree;
-    let unverifiable = prior.2 + sample.unverifiable;
     let _ = store.set_meta(
         LIVE_PRECISION_META,
-        &format!("{agree},{disagree},{unverifiable}"),
-    );
-
-    if sample.disagree > 0 {
-        tracing::warn!(
-            event = "live.precision.disagreement",
-            disagreed = sample.disagree,
-            agreed = sample.agree,
-            "the live lane resolved a reference differently from Phase B"
-        );
-    }
-    tracing::info!(
-        event = "live.precision",
-        agree = sample.agree,
-        disagree = sample.disagree,
-        unverifiable = sample.unverifiable,
-        precision = ?sample.precision(),
-        coverage = sample.coverage(),
-        "live overlay scored against Phase B"
+        &format!(
+            "{},{},{}",
+            prior.0 + run_agree,
+            prior.1 + run_disagree,
+            prior.2 + run_unverifiable
+        ),
     );
 }
 
-/// Cumulative `(agree, disagree, unverifiable)` recorded so far.
+/// Cumulative corpus-wide `(agree, disagree, unverifiable)` recorded so far.
+fn read_precision_totals(store: &SqliteStore) -> (u64, u64, u64) {
+    read_precision_totals_for(store, None)
+}
+
+/// Cumulative `(agree, disagree, unverifiable)` for one language, or the
+/// corpus-wide aggregate when `language` is `None`.
 ///
 /// A malformed or absent value reads as zeroes: the meter is diagnostic, and a
-/// corrupt counter must never fail a commit.
-fn read_precision_totals(store: &SqliteStore) -> (u64, u64, u64) {
+/// corrupt counter must never fail a commit or wrongly disable a language.
+fn read_precision_totals_for(store: &SqliteStore, language: Option<&str>) -> (u64, u64, u64) {
     let raw = store
-        .get_meta(LIVE_PRECISION_META)
+        .get_meta(&live_precision_meta_key(language))
         .ok()
         .flatten()
         .unwrap_or_default();
@@ -3771,8 +3838,54 @@ fn read_precision_totals(store: &SqliteStore) -> (u64, u64, u64) {
     }
 }
 
+/// The `meta` key holding cumulative live-lane precision counters. The
+/// corpus-wide aggregate is `live_precision`; each language namespaces under it
+/// as `live_precision.<language>` (matching `nodes.language`).
+fn live_precision_meta_key(language: Option<&str>) -> String {
+    match language {
+        Some(lang) => format!("{LIVE_PRECISION_META}.{lang}"),
+        None => LIVE_PRECISION_META.to_string(),
+    }
+}
+
 /// Cumulative live-lane precision counters, as `agree,disagree,unverifiable`.
 const LIVE_PRECISION_META: &str = "live_precision";
+
+/// RFC-027 section 12: the per-language shipping bar. Below this the lane is
+/// disabled for a language ("a measured decision, not a guess").
+const LIVE_PRECISION_GATE: f64 = 0.99;
+
+/// Minimum verified live claims before the gate may DISABLE a language.
+///
+/// Below this the sample is too small to act on, so the lane stays enabled and
+/// keeps gathering evidence — a language (a brand-new one especially) has to be
+/// allowed to run to be measured at all. Precision-first, but not so trigger-shy
+/// that one early disagreement silences a language for good.
+const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
+
+/// RFC-027 section 12: is the live lane enabled for `language`?
+///
+/// Precision-driven and biased toward on: enabled unless the cumulative
+/// per-language meter carries a statistically meaningful adverse reading — at
+/// least [`LIVE_PRECISION_MIN_SAMPLE`] verified claims *and* precision below
+/// [`LIVE_PRECISION_GATE`]. A language with too little evidence, or none, stays
+/// enabled so it can earn a reading. This is what makes "disable the lane for a
+/// language" a measured decision rather than a config guess, and it is
+/// self-healing: a later run whose Phase B agreement lifts the cumulative
+/// precision back over the bar re-enables the language on its own.
+fn live_lane_enabled_for(store: &SqliteStore, language: &str) -> bool {
+    let (agree, disagree, unverifiable) = read_precision_totals_for(store, Some(language));
+    let sample = travsr_store::LivePrecision {
+        agree,
+        disagree,
+        unverifiable,
+    };
+    let verified = agree + disagree;
+    match sample.precision() {
+        Some(p) if verified >= LIVE_PRECISION_MIN_SAMPLE && p < LIVE_PRECISION_GATE => false,
+        _ => true,
+    }
+}
 
 /// RFC-027 section 8.3: retire the live overlay and clear resolved pendings.
 ///
@@ -7767,6 +7880,179 @@ mod tests {
         assert!(
             precision >= 0.99,
             "measured precision {precision} is below the 0.99 shipping gate: {sample:?}"
+        );
+    }
+
+    /// RFC-027 Phase 4 gate: the same shipping bar, measured for **Rust**, split
+    /// out by language. This is the differential the phase turns on — the live
+    /// lane's Rust claims scored against what the commit-time Phase B (native
+    /// tree-sitter resolution, and rust-analyzer LSIF when present) derived at
+    /// the same call sites.
+    ///
+    /// The fixture is cross-file on purpose: a same-file call is resolved by
+    /// Phase A and never becomes an `UnresolvedCall`, so the live lane would have
+    /// nothing to claim. It exercises the three Rust shapes the lane resolves:
+    /// `Zoo::assemble()` (associated call — the already-qualified `method:Zoo.*`
+    /// sig used verbatim), `z.describe()` (method call whose receiver type the
+    /// extractor recovers, rebuilt to `method:Zoo.describe`), and `helper()` (a
+    /// bare free function). The names are deliberately NOT in the extractor's
+    /// `NOISE_NAMES` set (`new`, `from`, `clone`, …), which would drop them
+    /// before the lane ever saw them. All are unambiguous repo-wide, so §7.3a
+    /// resolves them with no language server, which keeps the test hermetic.
+    #[test]
+    fn measured_rust_live_precision_clears_the_per_language_gate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        std::fs::write(
+            tmp.path().join("src/zoo.rs"),
+            "pub struct Zoo;\n\nimpl Zoo {\n    pub fn assemble() -> Zoo {\n        Zoo\n    }\n    pub fn describe(&self) -> i32 {\n        7\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/util.rs"),
+            "pub fn helper() -> i32 {\n    42\n}\n",
+        )
+        .unwrap();
+        let main = tmp.path().join("src/main.rs");
+        std::fs::write(
+            &main,
+            "mod zoo;\nmod util;\nuse zoo::Zoo;\nuse util::helper;\n\nfn run(z: &Zoo) {\n    let _a = Zoo::assemble();\n    let _d = z.describe();\n    let _n = helper();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .get_meta("corpus")
+            .unwrap()
+            .unwrap_or_default();
+
+        // A save, then the overlay: the mid-edit state. The appended function
+        // adds a third cross-file call the live lane must resolve.
+        {
+            let mut text = std::fs::read_to_string(&main).unwrap();
+            text.push_str("\nfn run_again(z: &Zoo) {\n    let _a = Zoo::assemble();\n    let _d = z.describe();\n}\n");
+            std::fs::write(&main, text).unwrap();
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&main), tmp.path(), &mut store).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &main);
+        }
+
+        // Commit and let Phase B run for real, so the meter has ratified
+        // call-site evidence to score against (see the TS gate test for why the
+        // meter must run here and not on save).
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "edit",
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let sha = read_head_commit_sha(tmp.path()).expect("HEAD after commit");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", &sha).unwrap();
+        }
+        let store_mutex = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        run_background_phase_b_inner(tmp.path(), &store_mutex);
+        drop(store_mutex);
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let by_lang = store.live_precision_sample_by_language().unwrap();
+        let rust = by_lang
+            .get("rust")
+            .copied()
+            .unwrap_or_else(|| panic!("no rust bucket in the meter; got {by_lang:?}"));
+
+        assert!(
+            rust.claims() > 0,
+            "precondition: the Rust lane must have claimed something to score: {rust:?}"
+        );
+        assert!(
+            rust.coverage() > 0.0,
+            "precondition: Phase B must have left Rust call-site evidence, or this \
+             gate asserts nothing. Got {rust:?}"
+        );
+        assert_eq!(
+            rust.disagree, 0,
+            "a live Rust edge that disagrees with Phase B is a false positive, and \
+             the target is zero: {rust:?}"
+        );
+        let precision = rust
+            .precision()
+            .expect("a verified Rust sample must yield a precision");
+        assert!(
+            precision >= LIVE_PRECISION_GATE,
+            "measured Rust precision {precision} is below the {LIVE_PRECISION_GATE} \
+             per-language shipping gate: {rust:?}"
+        );
+
+        // The gate is per-language: the enable switch reads Rust's own reading,
+        // which this run has just written above the bar.
+        assert!(
+            live_lane_enabled_for(&store, "rust"),
+            "a Rust reading at or above the bar must keep the lane enabled"
+        );
+    }
+
+    /// The enable switch is measured, not vacuous: it disables a language ONLY on
+    /// a meaningful adverse sample, and re-enables when the cumulative reading
+    /// recovers. Driven directly through the per-language meta keys so it does not
+    /// depend on a live Phase B run.
+    #[test]
+    fn the_precision_gate_disables_a_language_only_on_a_meaningful_adverse_sample() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // No reading at all: enabled, so a new language can earn one.
+        assert!(live_lane_enabled_for(&store, "rust"));
+
+        // Below the bar but too few verified claims to act on: still enabled.
+        store.set_meta("live_precision.rust", "4,1,0").unwrap();
+        assert!(
+            live_lane_enabled_for(&store, "rust"),
+            "5 verified claims is below the min sample; must not disable yet"
+        );
+
+        // Enough claims AND below the bar: disabled. (18 agree, 5 disagree =>
+        // 23 verified, precision ~0.78.)
+        store.set_meta("live_precision.rust", "18,5,3").unwrap();
+        assert!(
+            !live_lane_enabled_for(&store, "rust"),
+            "a meaningful sample below 0.99 must disable the language"
+        );
+
+        // A disagreement-free follow-up lifts the cumulative reading back over
+        // the bar: self-healing, re-enabled. (198 agree, 2 disagree => 0.99.)
+        store.set_meta("live_precision.rust", "198,2,0").unwrap();
+        assert!(
+            live_lane_enabled_for(&store, "rust"),
+            "recovered precision at the bar must re-enable the language"
+        );
+
+        // The switch is per-language: a disabled Rust must not disable TypeScript.
+        store.set_meta("live_precision.rust", "18,5,3").unwrap();
+        assert!(!live_lane_enabled_for(&store, "rust"));
+        assert!(
+            live_lane_enabled_for(&store, "typescript"),
+            "the gate must be scoped per language, not corpus-wide"
         );
     }
 
