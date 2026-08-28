@@ -350,7 +350,7 @@ The "is the live lane worse than nothing?" question is answered empirically, not
   **The meter must run at ratification**, after the Phase B writes and before the sweep. Not a stylistic choice: `reindex_replace` deletes the edited file's `edge_sites` on save, so between the save and the next Phase B run there is no call-site evidence at all, and measuring earlier yields no number rather than a pessimistic one.
 
   The reading is cumulative and surfaced by `travsr status`, since a gate needs a value a human can read rather than a log line that scrolled away.
-- **Gate:** the live lane ships enabled only if measured precision ≥ 0.99 on the fixture corpus (target: zero false positives). If it cannot hold that bar for a language, the lane is disabled for that language — a measured decision, not a guess.
+- **Gate:** the live lane ships enabled only if measured precision ≥ 0.99 on the fixture corpus (target: zero false positives). If it cannot hold that bar for a language, the lane is disabled for that language — a measured decision, not a guess. **(Phase 4: implemented per-language.** The meter splits by the source node's language — `live_precision_sample_by_language`, cumulative under `meta` key `live_precision.<language>` — and the save path consults `live_lane_enabled_for(language)`, which disables a language only on a meaningful adverse sample (≥ 20 verified claims *and* precision < 0.99) and re-enables it on its own when the cumulative reading recovers. A language with too little evidence stays enabled so it can earn a reading.)
 - **Recall telemetry:** the same diff reports the recall the live lane buys over the pure fail-closed lexical lane, quantifying whether the LSP dependency earns its operational cost.
 - Fixture corpus reuses the RFC-003 §6 fixtures plus the existing LSIF path as a differential oracle (available for TS/Rust/Python).
 
@@ -360,14 +360,14 @@ The "is the live lane worse than nothing?" question is answered empirically, not
 
 | Concern | Assessment |
 |---|---|
-| Persistent language server = long-lived process running build logic (ADR-006/017) | **IDE-piggyback path spawns nothing** — it reuses the server the developer already trusts and runs. The headless spawn path (out of v1 scope) inherits the ADR-006/017 review. |
+| Persistent language server = long-lived process running build logic (ADR-006/017) | **IDE-piggyback path spawns nothing** — it reuses the server the developer already runs and trusts; the serverless §7.3a lane needs none. A daemon-spawned headless server is **REJECTED for v1** (§16.1): it would run the indexed repo's build logic continuously, outside ADR-006 Rule 1's per-repo opt-in and ADR-017's bounded-batch sandbox. Any revisit is `NEEDS_THREAT_MODEL`. |
 | Live edges poisoning cross-corpus resolution | Blocked by the fencing rule (§8.2): `live` edges never enter the `BridgeRegistry`. |
 | Non-deterministic durable graph | Impossible: live edges never survive a commit (§8.3). |
 | Prompt-injection via edge content | Unchanged from existing pipeline; `<travsr-data>` sanitization applies identically. |
 
 **Sign-offs required before Accepted:**
 - Principal Architect — schema change (§9), new provenance value, convergence proof (§8.3).
-- Principal Security Engineer — headless spawn path (when scoped), IDE-piggyback trust assumption.
+- Principal Security Engineer — **signed off (Phase 4).** IDE-piggyback trust assumption accepted: the daemon spawns nothing and only consumes positions from a server the developer already runs. Daemon-spawned headless language servers **REJECTED for v1** (§16.1); any future path is gated on a fresh threat model that extends ADR-006 Rule 1 and defines a persistent-server sandbox profile.
 - Solution Architect — MCP provenance surface (§10).
 
 ---
@@ -398,7 +398,7 @@ Language choice for the spike is **TypeScript**: mature `tsserver` resolution + 
 
 ## 16. Open Questions
 
-1. **Headless daemon path.** Should Travsr ever spawn its own pinned language servers for non-IDE consumers, or is commit-gated the permanent answer there? Deferred to Phase 4 with Security.
+1. **Headless daemon path — RESOLVED (Phase 4, Principal Security Engineer).** *Should Travsr ever spawn its own pinned language servers for non-IDE consumers?* **No — commit-gated Phase B plus the IDE-piggyback live lane is the permanent answer for v1; the daemon spawns no language server of its own.** Two facts decide it. **(a) There is no functional need:** §7.3a (unambiguous-lexical) runs with no server at all, and §7.3b consumes a position from the server the developer already runs and already trusts inside their editor — the daemon spawns nothing on either lane. **(b) Spawning would strictly widen the trust surface ADR-006/017 exist to bound.** A persistent language server (rust-analyzer, tsserver) executes the indexed repo's `build.rs`, proc-macros, and build scripts — the same arbitrary code as `rust-analyzer --lsif`, but **continuously and long-lived** rather than in a bounded batch killed at 60s. A daemon that spawned one unprompted would run that code on any repo it indexes, including a repo the developer is only *reviewing, not running*, without the per-repo opt-in ADR-006 Rule 1 requires and outside the bounded-batch profile ADR-017 `SandboxPolicy::Standard` defines — a long-lived server legitimately spawns the compiler and never terminates, tripping the very kill conditions that sandbox imposes. **Verdict: REJECTED for v1.** If ever revisited it is `NEEDS_THREAT_MODEL`: a new RFC must (i) extend ADR-006 Rule 1's per-repo opt-in to cover persistent servers, (ii) define a persistent-server sandbox profile distinct from the bounded-batch one, and (iii) be gated on a demonstrated consumer need the two shipped lanes cannot serve. Absent all three, commit-gated stays the answer.
 2. **Interface-edit detection granularity.** Can the classifier reliably distinguish rename from delete+add without the commit SCIP pass? Rename mis-classification only affects the *live* overlay (healed at commit), so a conservative "treat ambiguous as interface edit" is safe but costs recall. Measure in Phase 1.
 3. **Multi-dirty-file settle ordering.** When several files are dirty and cross-reference each other, is single-pass resolution sufficient or is a fixpoint needed? Bound the iterations; measure convergence in Phase 1.
 4. **Confidence exposure.** Do we surface `live` as a boolean provenance only, or a graded confidence? Solution Architect leans boolean (provenance) for MCP simplicity; revisit if consumers ask. Note the plumbing for graded already exists independently of provenance: the `edges` table already carries a `confidence` column (written today by the LSIF/SCIP upserts in `travsr-store/src/lib.rs`), so a future graded signal can ride that field **without** touching the provenance enum. Recommended resolution: keep `provenance` boolean, reserve `confidence` as the graded channel if a consumer ever needs it.
