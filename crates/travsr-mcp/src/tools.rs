@@ -11921,7 +11921,14 @@ mod snippet_tests {
             .replace_ref_resolution_states(
                 &a.vname.corpus,
                 "a.ts",
-                &[(a.id, 3, 0, "save".to_string(), "pending")],
+                &[travsr_store::RefResolution {
+                    src: a.id,
+                    ref_line: 3,
+                    ref_col: 0,
+                    name: "save".to_string(),
+                    state: "pending",
+                    resolved_dst: None,
+                }],
             )
             .unwrap();
 

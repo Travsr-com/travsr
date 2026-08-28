@@ -339,7 +339,17 @@ In the IDE-piggyback path (§7.6), the editor owns `didChange`; Travsr reads thr
 
 The "is the live lane worse than nothing?" question is answered empirically, not by assertion. Ground truth is on tap every commit:
 
-- **Continuous precision meter:** at each commit, diff `live` edges in the ratified region against the SCIP truth. Precision = agreement rate. **SCIP wins all ties** (it is the ratified ground truth); disagreements are logged with the LSP-resolved vs SCIP-resolved target.
+- **Continuous precision meter:** at each commit, diff what the live lane claimed against what Phase B derived. Disagreements are logged individually at `warn` — one wrong edge is the failure this design exists to avoid, and it should be visible the moment it happens rather than averaged into a ratio. **SCIP wins all ties**; in implementation that falls out of ordering rather than needing a rule, because the meter runs after Phase B has already written its answer over any co-located live row.
+
+  **Precision is measured, not agreement** (corrected in implementation). The two are not the same here, because the two lanes have deliberately opposite policies: the live lane is precision-first and abstains on ambiguity, while the Phase B resolver is explicitly recall-biased ("overconnection is safe … all matches are emitted; PPR damping absorbs the noise"). The live lane therefore emits a legitimate *subset*, and scoring agreement would penalise it for exactly the abstentions §8.1 requires.
+
+  **Verification is at call-site line granularity**, joining each recorded claim to the `edge_sites` row Phase B wrote for the same `(src, line)`. Anything coarser is not safe to gate on: a function that calls several things would let a mis-targeted claim match some *other* call's correct answer and score as agreement. An optimistic meter is worse than none, because it clears a bar the lane has not met.
+
+  **Three buckets, not two.** A claim Phase B left no evidence for is `unverifiable`, not wrong: Phase B has recall gaps of its own, and the code can change between the edit and the commit. Precision is reported over the verified subset with **coverage beside it**, because precision alone would let "1.0 over two of four hundred claims" read as a passing grade. A sample with nothing verifiable reports *no* precision rather than a perfect one, so an empty measurement cannot clear the gate.
+
+  **The meter must run at ratification**, after the Phase B writes and before the sweep. Not a stylistic choice: `reindex_replace` deletes the edited file's `edge_sites` on save, so between the save and the next Phase B run there is no call-site evidence at all, and measuring earlier yields no number rather than a pessimistic one.
+
+  The reading is cumulative and surfaced by `travsr status`, since a gate needs a value a human can read rather than a log line that scrolled away.
 - **Gate:** the live lane ships enabled only if measured precision ≥ 0.99 on the fixture corpus (target: zero false positives). If it cannot hold that bar for a language, the lane is disabled for that language — a measured decision, not a guess.
 - **Recall telemetry:** the same diff reports the recall the live lane buys over the pure fail-closed lexical lane, quantifying whether the LSP dependency earns its operational cost.
 - Fixture corpus reuses the RFC-003 §6 fixtures plus the existing LSIF path as a differential oracle (available for TS/Rust/Python).

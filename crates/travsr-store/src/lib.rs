@@ -588,6 +588,22 @@ impl Migration for V23RefResolutionState {
     }
 }
 
+/// RFC-027 section 12: `ref_resolution_state.resolved_dst`, so the precision
+/// meter can compare what the live lane claimed against what Phase B derived.
+struct V24RefResolutionTarget;
+impl Migration for V24RefResolutionTarget {
+    fn version(&self) -> u32 {
+        24
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // ALTER TABLE … ADD COLUMN has no IF NOT EXISTS in SQLite — guard.
+        if !store.column_exists("ref_resolution_state", "resolved_dst")? {
+            store.exec_ddl(include_str!("migrations/v24_ref_resolution_target.sql"))?;
+        }
+        Ok(())
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -614,7 +630,73 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V21LexicalSplit);
     r.register(V22TestRole);
     r.register(V23RefResolutionState);
+    r.register(V24RefResolutionTarget);
     r
+}
+
+/// RFC-027 section 9.2: one reference the live lane examined, and what became
+/// of it.
+///
+/// `resolved_dst` is `None` for a `pending` row — an abstention resolved to
+/// nothing, which is the whole point of it.
+#[derive(Debug, Clone)]
+pub struct RefResolution {
+    pub src: NodeId,
+    pub ref_line: u32,
+    pub ref_col: u32,
+    pub name: String,
+    /// `"resolved"` or `"pending"`.
+    pub state: &'static str,
+    pub resolved_dst: Option<NodeId>,
+}
+
+/// RFC-027 section 12: how the live lane scored against Phase B.
+///
+/// Deliberately three buckets, not two. `unverifiable` is the honest home for a
+/// live claim Phase B left no call-site evidence for — Phase B has its own
+/// recall gaps, and the code can change between the edit and the commit, so
+/// "Phase B did not produce this" is not the same statement as "the live lane
+/// was wrong". Folding those into `disagree` would make the meter pessimistic
+/// and unactionable, and a meter nobody believes does not gate anything.
+///
+/// Precision is therefore reported over the verified subset only, with coverage
+/// beside it. Precision without coverage would let 1.0 over two of five hundred
+/// claims read as a passing grade.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LivePrecision {
+    /// Live claims Phase B resolved to the same target at the same call site.
+    pub agree: u64,
+    /// Live claims Phase B resolved to a *different* target at that site. These
+    /// are true false positives, and the number the shipping gate exists for.
+    pub disagree: u64,
+    /// Live claims with no ratified call-site evidence either way.
+    pub unverifiable: u64,
+}
+
+impl LivePrecision {
+    /// Agreement over the verified subset, or `None` when nothing was verifiable.
+    ///
+    /// `None` rather than `1.0`: a lane that resolved nothing verifiable has not
+    /// earned a perfect score, and returning one would let an empty sample clear
+    /// the shipping gate.
+    pub fn precision(&self) -> Option<f64> {
+        let verified = self.agree + self.disagree;
+        (verified > 0).then(|| self.agree as f64 / verified as f64)
+    }
+
+    /// Fraction of live claims that could be checked at all.
+    pub fn coverage(&self) -> f64 {
+        let total = self.agree + self.disagree + self.unverifiable;
+        if total == 0 {
+            return 0.0;
+        }
+        (self.agree + self.disagree) as f64 / total as f64
+    }
+
+    /// Total live claims this sample covers.
+    pub fn claims(&self) -> u64 {
+        self.agree + self.disagree + self.unverifiable
+    }
 }
 
 /// The storage interface every Travsr backend must satisfy.
@@ -4867,7 +4949,7 @@ LIMIT ?4",
         &mut self,
         corpus: &str,
         path: &str,
-        rows: &[(NodeId, u32, u32, String, &'static str)],
+        rows: &[RefResolution],
     ) -> Result<(), StoreError> {
         (|| -> AnyResult<()> {
             let tx = self
@@ -4880,18 +4962,82 @@ LIMIT ?4",
                 params![corpus, path],
             )
             .context("clearing this file's ref_resolution_state rows")?;
-            for (src, line, col, name, state) in rows {
+            for r in rows {
                 tx.execute(
-                    "INSERT INTO ref_resolution_state(src, ref_line, ref_col, name, state) \
-                     VALUES(?1, ?2, ?3, ?4, ?5) \
-                     ON CONFLICT(src, ref_line, ref_col, name) DO UPDATE SET state = excluded.state",
-                    params![node_id_to_i64(*src), *line as i64, *col as i64, name, state],
+                    "INSERT INTO ref_resolution_state(src, ref_line, ref_col, name, state, resolved_dst) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT(src, ref_line, ref_col, name) DO UPDATE SET \
+                       state = excluded.state, resolved_dst = excluded.resolved_dst",
+                    params![
+                        node_id_to_i64(r.src),
+                        r.ref_line as i64,
+                        r.ref_col as i64,
+                        r.name,
+                        r.state,
+                        r.resolved_dst.map(node_id_to_i64),
+                    ],
                 )
                 .context("inserting ref_resolution_state row")?;
             }
             tx.commit()
                 .context("replace_ref_resolution_states: commit")?;
             Ok(())
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 12: score the live lane's claims against Phase B's truth.
+    ///
+    /// Run at ratification, **after** the Phase B writes and **before** the
+    /// sweep. After, because it compares against what Phase B derived; before,
+    /// because the sweep is about to discard the evidence.
+    ///
+    /// Verification is at **call-site line** granularity, joining each live
+    /// claim in `ref_resolution_state` to the `edge_sites` rows Phase B recorded
+    /// for the same `(src, line)`. Anything coarser is not safe to gate on: a
+    /// function that calls several things would let a mis-targeted claim match
+    /// some *other* call's correct answer and score as agreement. An optimistic
+    /// meter is worse than none, because it clears a bar the lane has not met.
+    ///
+    /// A claim whose site Phase B recorded nothing for is `unverifiable`, not
+    /// wrong — Phase B has recall gaps of its own, and the code can change
+    /// between the edit and the commit.
+    ///
+    /// `SCIP wins all ties` (section 12) falls out of the ordering rather than
+    /// needing a rule here: by the time this runs, Phase B has already written
+    /// its answer over any co-located live row.
+    pub fn live_precision_sample(&self) -> Result<LivePrecision, StoreError> {
+        (|| -> AnyResult<LivePrecision> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    // Per claim: does Phase B have any site at this line, and does
+                    // one of them name the same target?
+                    "SELECT \
+                       EXISTS (SELECT 1 FROM edge_sites s \
+                               WHERE s.src = r.src AND s.line = r.ref_line) AS has_site, \
+                       EXISTS (SELECT 1 FROM edge_sites s \
+                               WHERE s.src = r.src AND s.line = r.ref_line \
+                                 AND s.dst = r.resolved_dst) AS matches \
+                     FROM ref_resolution_state r \
+                     WHERE r.state = 'resolved' AND r.resolved_dst IS NOT NULL",
+                )
+                .context("live_precision_sample: prepare")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)? == 1, row.get::<_, i64>(1)? == 1))
+                })
+                .context("live_precision_sample: query")?;
+
+            let mut out = LivePrecision::default();
+            for row in rows {
+                match row.context("live_precision_sample: decode")? {
+                    (false, _) => out.unverifiable += 1,
+                    (true, true) => out.agree += 1,
+                    (true, false) => out.disagree += 1,
+                }
+            }
+            Ok(out)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
     }

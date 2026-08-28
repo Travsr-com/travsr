@@ -3695,6 +3695,85 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
     }
 }
 
+/// RFC-027 section 12: the continuous precision meter.
+///
+/// "Is the live lane worse than nothing?" is answered empirically, not by
+/// assertion, and ground truth is on tap every commit. Each run compares what
+/// the lane claimed against what Phase B derived at the same call sites, and
+/// records the result so the per-language shipping gate has a number to read.
+///
+/// Persisted to `meta` as well as logged. A log line scrolls away; the gate
+/// needs a value `travsr status` can show and a human can act on.
+///
+/// The reading is cumulative across runs rather than last-run-only: a single
+/// commit can carry two claims, and a gate computed from a sample that small
+/// would swing between 0.0 and 1.0 on noise. Disagreements are logged
+/// individually at warn, because one wrong edge is the failure this whole design
+/// is built to avoid, and it should be visible the moment it happens rather than
+/// averaged into a ratio.
+fn measure_live_precision(store: &mut SqliteStore) {
+    let sample = match store.live_precision_sample() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("live precision sample failed: {e:#}");
+            return;
+        }
+    };
+    if sample.claims() == 0 {
+        return;
+    }
+
+    let prior = read_precision_totals(store);
+    let agree = prior.0 + sample.agree;
+    let disagree = prior.1 + sample.disagree;
+    let unverifiable = prior.2 + sample.unverifiable;
+    let _ = store.set_meta(
+        LIVE_PRECISION_META,
+        &format!("{agree},{disagree},{unverifiable}"),
+    );
+
+    if sample.disagree > 0 {
+        tracing::warn!(
+            event = "live.precision.disagreement",
+            disagreed = sample.disagree,
+            agreed = sample.agree,
+            "the live lane resolved a reference differently from Phase B"
+        );
+    }
+    tracing::info!(
+        event = "live.precision",
+        agree = sample.agree,
+        disagree = sample.disagree,
+        unverifiable = sample.unverifiable,
+        precision = ?sample.precision(),
+        coverage = sample.coverage(),
+        "live overlay scored against Phase B"
+    );
+}
+
+/// Cumulative `(agree, disagree, unverifiable)` recorded so far.
+///
+/// A malformed or absent value reads as zeroes: the meter is diagnostic, and a
+/// corrupt counter must never fail a commit.
+fn read_precision_totals(store: &SqliteStore) -> (u64, u64, u64) {
+    let raw = store
+        .get_meta(LIVE_PRECISION_META)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let parts: Vec<u64> = raw
+        .split(',')
+        .filter_map(|p| p.trim().parse::<u64>().ok())
+        .collect();
+    match parts.as_slice() {
+        [a, d, u] => (*a, *d, *u),
+        _ => (0, 0, 0),
+    }
+}
+
+/// Cumulative live-lane precision counters, as `agree,disagree,unverifiable`.
+const LIVE_PRECISION_META: &str = "live_precision";
+
 /// RFC-027 section 8.3: retire the live overlay and clear resolved pendings.
 ///
 /// Extracted so the convergence property test can drive ratification directly
@@ -3703,6 +3782,10 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
 /// Fail-open on both steps: a sweep that errors leaves `live` rows labeled as
 /// what they are, which is stale but honest, and never wrong.
 fn ratify_live_overlay(store: &mut SqliteStore, ratified: &[String]) {
+    // RFC-027 section 12: score the overlay before retiring it. Order matters —
+    // after the Phase B writes, because that is the truth being compared
+    // against, and before the sweep, because the sweep discards the evidence.
+    measure_live_precision(store);
     match store.sweep_live_edges_for_languages(ratified) {
         Ok(0) => {}
         Ok(n) => tracing::debug!(
@@ -7549,6 +7632,191 @@ mod tests {
                 .contains_key(yml_rel),
             "`--fix` deleted an existing non-code file's tracking row"
         );
+    }
+
+    /// RFC-027 section 12 / Phase 3 gate: measured precision on a fixture corpus.
+    ///
+    /// This is the number that decides whether the lane ships. The bar is 0.99
+    /// with a target of zero false positives, because for a product whose thesis
+    /// is "zero structural hallucinations" a wrong edge is not a quality
+    /// regression but a breach of the value proposition.
+    ///
+    /// The fixture is deliberately adversarial rather than a happy path: one
+    /// unambiguous callee the lexical lane should resolve, and one name defined
+    /// on two different classes, which is exactly the method-on-receiver case it
+    /// must refuse. A meter that only ever sees resolvable calls proves nothing.
+    #[test]
+    fn measured_live_precision_clears_the_shipping_gate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        // Unambiguous: only one `charge` in the corpus.
+        std::fs::write(
+            tmp.path().join("src/billing.ts"),
+            "export class Billing {\n  charge(): void {}\n}\n",
+        )
+        .unwrap();
+        // Ambiguous: `ping` is defined on two classes, so the lexical lane must
+        // abstain rather than pick one.
+        std::fs::write(
+            tmp.path().join("src/a.ts"),
+            "export class A {\n  ping(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/b.ts"),
+            "export class B {\n  ping(): void {}\n}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("src/caller.ts");
+        std::fs::write(
+            &caller,
+            "import { Billing } from \"./billing\";\n             export function run(bill: Billing, x: any): void {\n             \x20 bill.charge();\n             \x20 x.ping();\n             }\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .get_meta("corpus")
+            .unwrap()
+            .unwrap_or_default();
+
+        // A save, then the overlay: this is the mid-edit state.
+        {
+            let mut text = std::fs::read_to_string(&caller).unwrap();
+            text.push_str("\nexport function again(bill: Billing): void {\n  bill.charge();\n}\n");
+            std::fs::write(&caller, text).unwrap();
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&caller), tmp.path(), &mut store).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+        }
+
+        // The ambiguous call must never have produced a claim at all: an
+        // abstention is not a low-confidence answer, it is no answer.
+        {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            let pending = store
+                .pending_refs_in_file(&corpus, "src/caller.ts")
+                .unwrap();
+            assert!(
+                pending.iter().any(|(name, _)| name == "ping"),
+                "the ambiguous receiver must abstain, got pending {pending:?}"
+            );
+        }
+
+        // Now commit and let Phase B run for real. The meter lives at
+        // ratification for a reason that only shows up here: `reindex_replace`
+        // deletes the edited file's `edge_sites` on save, so between the save and
+        // the next Phase B run there is no call-site evidence to check anything
+        // against. Measuring earlier does not produce a pessimistic number, it
+        // produces no number at all.
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "edit",
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let sha = read_head_commit_sha(tmp.path()).expect("HEAD after commit");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", &sha).unwrap();
+        }
+        let store_mutex = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        run_background_phase_b_inner(tmp.path(), &store_mutex);
+        drop(store_mutex);
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let sample = store.live_precision_sample().unwrap();
+
+        assert!(
+            sample.claims() > 0,
+            "precondition: the lane must have claimed something to score"
+        );
+        assert!(
+            sample.coverage() > 0.0,
+            "precondition: Phase B must have left call-site evidence, or this gate \
+             asserts nothing. Got {sample:?}"
+        );
+        assert_eq!(
+            sample.disagree, 0,
+            "a live edge that disagrees with Phase B is a false positive, and the \
+             target is zero: {sample:?}"
+        );
+        let precision = sample
+            .precision()
+            .expect("a verified sample must yield a precision");
+        assert!(
+            precision >= 0.99,
+            "measured precision {precision} is below the 0.99 shipping gate: {sample:?}"
+        );
+    }
+
+    /// The gate must not be clearable by an empty sample.
+    ///
+    /// A lane that resolved nothing verifiable has not earned a perfect score,
+    /// and reporting 1.0 there would let "we measured nothing" pass as "we
+    /// measured perfectly" — which is exactly how a precision gate stops meaning
+    /// anything.
+    #[test]
+    fn an_unverifiable_sample_reports_no_precision_rather_than_a_perfect_one() {
+        let empty = travsr_store::LivePrecision::default();
+        assert_eq!(empty.precision(), None);
+        assert_eq!(empty.coverage(), 0.0);
+
+        let all_unverifiable = travsr_store::LivePrecision {
+            agree: 0,
+            disagree: 0,
+            unverifiable: 40,
+        };
+        assert_eq!(
+            all_unverifiable.precision(),
+            None,
+            "forty unchecked claims must not read as perfect precision"
+        );
+        assert_eq!(all_unverifiable.coverage(), 0.0);
+
+        let mixed = travsr_store::LivePrecision {
+            agree: 99,
+            disagree: 1,
+            unverifiable: 100,
+        };
+        assert_eq!(mixed.precision(), Some(0.99));
+        assert_eq!(
+            mixed.coverage(),
+            0.5,
+            "coverage must expose the unchecked half"
+        );
+    }
+
+    /// The cumulative counter survives a malformed value rather than failing a
+    /// commit over a diagnostic.
+    #[test]
+    fn the_precision_counter_tolerates_a_corrupt_value() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        assert_eq!(read_precision_totals(&store), (0, 0, 0));
+        store.set_meta(LIVE_PRECISION_META, "not,a,number").unwrap();
+        assert_eq!(read_precision_totals(&store), (0, 0, 0));
+        store.set_meta(LIVE_PRECISION_META, "3,1,7").unwrap();
+        assert_eq!(read_precision_totals(&store), (3, 1, 7));
     }
 
     /// RFC-027 Phase 2 gate, Invariant #4: ratifying the live overlay returns

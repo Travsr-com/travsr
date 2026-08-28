@@ -226,22 +226,25 @@ pub fn resolve_unambiguous_lexical(
     // abstention is recorded, not dropped — "there is a call here and its
     // target is not yet known" is true and useful, and saying it is what makes
     // fail-closed honest rather than merely quiet.
-    let mut states: Vec<(NodeId, u32, u32, String, &'static str)> =
-        Vec::with_capacity(unresolved.len());
+    let mut states: Vec<travsr_store::RefResolution> = Vec::with_capacity(unresolved.len());
 
     for call in unresolved {
         let name = travsr_core::ident::leaf_of(&call.callee_sig).to_string();
-        let resolved = match lexical_one(store, call) {
+        // The target this lane claimed, kept whatever later happens to the edge.
+        // Section 12's meter needs the claim itself: by ratification a re-derived
+        // live edge has been relabelled and an unratified one is about to be
+        // swept, so the edges table can no longer say what the lane decided.
+        let claimed = match lexical_one(store, call) {
             Some(edge) => match store.put_edge_live(&edge) {
-                Ok(()) => true,
+                Ok(()) => Some(edge.dst),
                 Err(e) => {
                     tracing::debug!(error = %e, "live lexical edge write failed");
-                    false
+                    None
                 }
             },
-            None => false,
+            None => None,
         };
-        if resolved {
+        if claimed.is_some() {
             outcome.emit();
         } else {
             outcome.abstain();
@@ -249,14 +252,19 @@ pub fn resolve_unambiguous_lexical(
         // `ref_col` is 0: the native extractor records the call's line but not
         // its column. The PK tolerates it, and a second call to the same name
         // on one line is the only collision it can cause, which merges two
-        // identical pending facts rather than losing one.
-        states.push((
-            call.src,
-            call.caller_line,
-            0,
+        // identical facts rather than losing one.
+        states.push(travsr_store::RefResolution {
+            src: call.src,
+            ref_line: call.caller_line,
+            ref_col: 0,
             name,
-            if resolved { "resolved" } else { "pending" },
-        ));
+            state: if claimed.is_some() {
+                "resolved"
+            } else {
+                "pending"
+            },
+            resolved_dst: claimed,
+        });
     }
 
     if let Err(e) = store.replace_ref_resolution_states(corpus, path, &states) {
