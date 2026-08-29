@@ -70,18 +70,39 @@ const MAX_QUERIES_PER_FILE = 200;
  * Widening it beyond the daemon's set costs one empty request, never
  * correctness.
  *
- * The first four run the daemon's native extractor; `go` runs the generic
- * tree-sitter detector and reaches this lane through the editor alone
- * (RFC-027 section 8.3), which is why it must be listed here to work at all.
+ * The first block runs the daemon's native extractor. The rest run the generic
+ * tree-sitter detector and reach this lane through the editor **alone**
+ * (RFC-027 section 8.3), so omitting one here disables it outright: this filter
+ * gates the request itself, not just the round trip.
+ *
+ * These are VS Code `languageId` values, which are not always the name of the
+ * language: C# is `csharp`, Objective-C is `objective-c` / `objective-cpp`.
+ * Whether a given language resolves anything depends on the developer having
+ * its extension installed; with no provider the request simply returns nothing,
+ * which is the section 7.3c floor.
  */
 const SUPPORTED_LANGUAGES = new Set([
+  // Native extractor.
   "typescript",
   "typescriptreact",
   "javascript",
   "javascriptreact",
   "rust",
   "python",
+  // Generic detector, editor lane only.
   "go",
+  "java",
+  "csharp",
+  "cpp",
+  "c",
+  "objective-c",
+  "objective-cpp",
+  "ruby",
+  "php",
+  "kotlin",
+  "swift",
+  "dart",
+  "scala",
 ]);
 
 /** VS Code provider command for each daemon-named provider. */

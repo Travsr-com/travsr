@@ -3674,20 +3674,39 @@ enum LiveLane {
 /// The language of `abs_path` and the live lane it participates in, or `None`
 /// when the live lane does not apply to it at all.
 ///
-/// This is the one place a language is switched on. `Language::TypeScript`
-/// covers .ts/.tsx/.js/.jsx — there is no separate JavaScript variant, and the
-/// native extractor handles both.
+/// This is the one place a language is switched on, and it must stay in step
+/// with two others: `travsr_analysis::live_detect::detect_live_refs`, which has
+/// the query, and the extension's `SUPPORTED_LANGUAGES`, which gates the request
+/// that reaches here. A language listed here but missing from either is inert
+/// rather than wrong.
 ///
-/// The non-native arms are added one at a time, each measured against the
-/// per-`(language, kind)` precision gate before the next joins (RFC-027 §8.6).
-/// A language absent here costs nothing on save and keeps commit-gated behavior.
+/// `Language::TypeScript` covers .ts/.tsx/.js/.jsx — there is no separate
+/// JavaScript variant, and the native extractor handles both.
+///
+/// The data/config formats (JSON, YAML, TOML, XML) and Markdown are absent by
+/// design: they carry no call or inheritance semantics, so there is nothing for
+/// a language server to resolve.
+///
+/// Every editor-only language is subject to the per-`(language, kind)` precision
+/// gate (RFC-027 §12), which disables one on a measured adverse reading. A
+/// language absent here costs nothing on save and keeps commit-gated behavior.
 fn live_language(abs_path: &Path) -> Option<(travsr_core::Language, LiveLane)> {
+    use travsr_core::Language as L;
     let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    match travsr_core::Language::from_extension(ext)? {
-        lang @ (travsr_core::Language::TypeScript
-        | travsr_core::Language::Rust
-        | travsr_core::Language::Python) => Some((lang, LiveLane::Native)),
-        lang @ travsr_core::Language::Go => Some((lang, LiveLane::EditorOnly)),
+    match L::from_extension(ext)? {
+        lang @ (L::TypeScript | L::Rust | L::Python) => Some((lang, LiveLane::Native)),
+        lang @ (L::Go
+        | L::Java
+        | L::CSharp
+        | L::Cpp
+        | L::C
+        | L::ObjectiveC
+        | L::Ruby
+        | L::Php
+        | L::Kotlin
+        | L::Swift
+        | L::Dart
+        | L::Scala) => Some((lang, LiveLane::EditorOnly)),
         _ => None,
     }
 }
@@ -8866,6 +8885,54 @@ mod tests {
             .expect("the field read must be an editor target");
         assert_eq!(count.ref_line, 5);
         assert_eq!(count.edge_kind, "ref/field");
+    }
+
+    /// RFC-027 section 8: the generic path is one path, not a Go path. Java
+    /// exercises the two halves Go cannot: a grammar with *separate* call and
+    /// field nodes (so no callee disambiguation runs), and an `extends` /
+    /// `implements` clause, which Go has none of. The clause sits on the
+    /// implementing class's own declaration, so its edge source is that class in
+    /// the saved file and save-invalidation self-heals it (§8.4) — the property
+    /// Rust's detached `impl` block lacks (§7).
+    #[test]
+    fn a_java_file_yields_call_field_and_implements_targets() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(
+            tmp.path().join("Base.java"),
+            "public class Base {\n  public int total;\n  public void submit() {}\n}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("Order.java");
+        std::fs::write(
+            &caller,
+            "public class Order extends Base {\n  public int run(Base b) {\n    b.submit();\n    return b.total;\n  }\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
+        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller);
+
+        let by_name = |name: &str| {
+            targets
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} must be an editor target, got {targets:?}"))
+        };
+        assert_eq!(by_name("submit").edge_kind, "ref/call");
+        assert_eq!(by_name("total").edge_kind, "ref/field");
+        let base = by_name("Base");
+        assert_eq!(base.edge_kind, "is-implementation");
+        assert_eq!(base.ref_line, 1, "the clause is on the class declaration");
+        assert!(targets.iter().all(|t| t.provider == "definition"));
     }
 
     /// The lexical floor is native-only (section 8.3): the generic detector
