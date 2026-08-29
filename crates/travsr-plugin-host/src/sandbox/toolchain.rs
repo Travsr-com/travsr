@@ -551,41 +551,101 @@ fn php_access() -> ToolchainAccess {
 /// Resolve the dotnet install root that holds `host/`, `sdk/`, `shared/` — the
 /// value `DOTNET_ROOT` must point at, and the dir the sandbox must grant read +
 /// execute so scip-dotnet's apphost can load the runtime and shell out to
-/// `dotnet`. Uses `tool_path` (PATHEXT-aware, so `dotnet.exe` resolves on
-/// Windows — the old `dir.join("dotnet")` PATH scan never matched there, leaving
-/// Windows with no DOTNET_ROOT and no exec grant). Only accepts a root that
-/// actually carries an SDK/host, and falls back to the per-user
-/// `~/.dotnet` when `dotnet` on PATH is a runtime-only host.
+/// `dotnet`.
+///
+/// Tries a `dotnet` launcher — `tool_path` first (PATHEXT-aware, so `dotnet.exe`
+/// resolves on Windows), then the well-known installs a minimal-PATH daemon
+/// omits — and maps the first one carrying a real SDK to its root. **The
+/// non-PATH launchers are the load-bearing part**: a daemon launched from a GUI
+/// or a login shell without `/opt/homebrew/bin` on PATH left `tool_path` finding
+/// nothing, so no `DOTNET_ROOT` was injected and no exec grant issued, and
+/// scip-dotnet failed to launch — the C# lane then produced no reference edges.
+/// When no launcher is reachable at all, the well-known SDK roots are probed
+/// directly (this also covers the per-user `~/.dotnet` when `dotnet` on PATH is a
+/// runtime-only host).
 fn dotnet_sdk_root() -> Option<PathBuf> {
-    let exe = travsr_core::exec::tool_path("dotnet")?;
+    if let Some(root) = dotnet_launcher_candidates()
+        .into_iter()
+        .filter(|p| p.is_file())
+        .find_map(|exe| dotnet_sdk_root_from_binary(&exe))
+    {
+        return Some(root);
+    }
+    well_known_dotnet_roots()
+        .into_iter()
+        .find(|d| d.join("sdk").is_dir())
+}
+
+/// `dotnet` launcher locations to try, PATH-resolved first, then the well-known
+/// installs a sandboxed or GUI-launched daemon's PATH omits: Homebrew's
+/// version-independent `opt/` symlink (Apple silicon and Intel), the official
+/// installer directory (where `dotnet` sits directly in the SDK root), and a
+/// user-local `~/.dotnet`.
+fn dotnet_launcher_candidates() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(p) = travsr_core::exec::tool_path("dotnet") {
+        out.push(p);
+    }
+    out.extend(
+        [
+            "/opt/homebrew/opt/dotnet/bin/dotnet",
+            "/usr/local/opt/dotnet/bin/dotnet",
+            "/usr/local/share/dotnet/dotnet",
+            "/usr/share/dotnet/dotnet",
+        ]
+        .into_iter()
+        .map(PathBuf::from),
+    );
+    if let Some(h) = home() {
+        out.push(h.join(".dotnet").join("dotnet"));
+    }
+    out
+}
+
+/// The SDK-bearing root a `dotnet` launcher belongs to, or `None` if it carries
+/// no `sdk/`.
+///
+/// Requires an actual `sdk/` (not just `host/`): scip-dotnet runs `dotnet
+/// restore`/build, so a runtime-only host root is useless (`C:\Program
+/// Files\dotnet` carries `host/` even when SDK-less, so a `host/` check would
+/// wrongly pick it over a real SDK elsewhere). Two layouts:
+///   - **Standard** (Windows / dotnet-install / Linux tarball / Program Files):
+///     `dotnet(.exe)` sits directly in the root holding `host/ sdk/ shared/`.
+///   - **Homebrew macOS:** `…/Cellar/dotnet/<ver>/bin/dotnet` → `…/libexec`.
+fn dotnet_sdk_root_from_binary(exe: &std::path::Path) -> Option<PathBuf> {
     // canonicalize resolves symlinks (Homebrew's `bin/dotnet` shim) but adds the
     // `\\?\` verbatim prefix on Windows — strip it, or dotnet chokes on a
     // `\\?\`-prefixed DOTNET_ROOT / exec-grant path.
-    let real = strip_windows_verbatim(std::fs::canonicalize(&exe).unwrap_or(exe));
+    let real =
+        strip_windows_verbatim(std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf()));
     let dir = real.parent()?;
-    // Require an actual `sdk/` (not just `host/`): scip-dotnet runs `dotnet
-    // restore`/build, so a runtime-only host root is useless. `C:\Program
-    // Files\dotnet` carries `host/` even when SDK-less, so a `host/` check would
-    // wrongly pick it over a real SDK elsewhere.
-    // Standard layout (Windows / dotnet-install / Linux tarball / Program Files):
-    // `dotnet(.exe)` sits directly in the root holding host/ sdk/ shared/.
     if dir.join("sdk").is_dir() {
         return Some(dir.to_path_buf());
     }
-    // Homebrew macOS: …/Cellar/dotnet/<ver>/bin/dotnet → …/libexec holds the SDK.
     if let Some(libexec) = dir.parent().map(|p| p.join("libexec")) {
         if libexec.join("sdk").is_dir() {
             return Some(libexec);
         }
     }
-    // `dotnet` on PATH is a runtime-only host (no SDK): fall back to the per-user
-    // dotnet-install default that actually carries an SDK.
-    if let Some(d) = home().map(|h| h.join(".dotnet")) {
-        if d.join("sdk").is_dir() {
-            return Some(d);
-        }
-    }
     None
+}
+
+/// SDK roots to probe directly when no `dotnet` launcher is reachable, plus the
+/// per-user dotnet-install default. Filtered by an actual `sdk/` at the call site.
+fn well_known_dotnet_roots() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = [
+        "/opt/homebrew/opt/dotnet/libexec",
+        "/usr/local/opt/dotnet/libexec",
+        "/usr/local/share/dotnet",
+        "/usr/share/dotnet",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+    if let Some(h) = home() {
+        out.push(h.join(".dotnet"));
+    }
+    out
 }
 
 /// `scip-dotnet` resolves NuGet packages. Needs:
@@ -1017,8 +1077,68 @@ fn go_access() -> ToolchainAccess {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_windows_verbatim;
+    use super::{
+        dotnet_launcher_candidates, dotnet_sdk_root_from_binary, strip_windows_verbatim,
+        well_known_dotnet_roots,
+    };
     use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "travsr-toolchain-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// Homebrew layout: `<root>/bin/dotnet` with the SDK under `<root>/libexec`.
+    /// This is the install a minimal-PATH daemon could not resolve before the fix.
+    #[test]
+    fn dotnet_root_resolves_homebrew_layout() {
+        let root = scratch("dn-brew");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("libexec/sdk")).unwrap();
+        std::fs::write(root.join("bin/dotnet"), b"#!/bin/sh\n").unwrap();
+
+        let got = dotnet_sdk_root_from_binary(&root.join("bin/dotnet")).unwrap();
+        assert_eq!(got, std::fs::canonicalize(root.join("libexec")).unwrap());
+    }
+
+    /// Standard layout: `dotnet` sits directly in the SDK root beside `sdk/`.
+    #[test]
+    fn dotnet_root_resolves_standard_layout() {
+        let root = scratch("dn-std");
+        std::fs::create_dir_all(root.join("sdk")).unwrap();
+        std::fs::write(root.join("dotnet"), b"#!/bin/sh\n").unwrap();
+
+        let got = dotnet_sdk_root_from_binary(&root.join("dotnet")).unwrap();
+        assert_eq!(got, std::fs::canonicalize(&root).unwrap());
+    }
+
+    /// A runtime-only host (no `sdk/`) is rejected: scip-dotnet needs the SDK to
+    /// restore/build, so a runtime root is worse than falling through.
+    #[test]
+    fn dotnet_root_rejects_runtime_only_host() {
+        let root = scratch("dn-runtime");
+        std::fs::create_dir_all(root.join("host")).unwrap();
+        std::fs::write(root.join("dotnet"), b"#!/bin/sh\n").unwrap();
+        assert!(dotnet_sdk_root_from_binary(&root.join("dotnet")).is_none());
+    }
+
+    /// The Homebrew fallbacks a sandboxed / GUI-launched PATH omits are in the
+    /// search, both as launcher candidates and as direct-root candidates.
+    #[test]
+    fn dotnet_candidates_cover_the_sandbox_path_gap() {
+        assert!(dotnet_launcher_candidates()
+            .iter()
+            .any(|p| p.ends_with("opt/homebrew/opt/dotnet/bin/dotnet")));
+        assert!(well_known_dotnet_roots()
+            .iter()
+            .any(|p| p.ends_with("opt/homebrew/opt/dotnet/libexec")));
+    }
 
     #[test]
     fn strips_drive_verbatim_prefix() {
