@@ -4190,11 +4190,13 @@ const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
 ///   needs a Maven/Gradle build to emit references (a build-less fixture swept
 ///   and read `0,0,4`).
 /// - `csharp` — csharp-ls + scip-dotnet, 1.0000 (`6,0,0`, call/field/is-impl).
-///   Live edges resolve via csharp-ls with no extra setup; the oracle needs
-///   `DOTNET_ROOT` in the daemon env (the travsr-lang csharp emitter's
-///   `dotnet_root()` does not resolve a Homebrew install inside the sandbox — a
-///   fixable gap there). Without a working oracle the edges persist as `live`
-///   rather than ratifying, which is honest, not wrong.
+///   Live edges resolve via csharp-ls with no extra setup. The oracle needs
+///   `DOTNET_ROOT`; the plugin host resolves and injects it when `dotnet` is on
+///   the daemon's PATH, and the travsr-lang csharp emitter now self-resolves it
+///   from well-known installs when a minimal-PATH daemon leaves the host unable
+///   to (travsr-lang `fix/csharp-dotnet-root-sandbox-path`). If the oracle still
+///   cannot run, the edges persist as `live` rather than ratifying — honest,
+///   not wrong.
 ///
 /// Deliberately absent:
 /// - `c`, `objectivec` — edges ratify correctly but scip-clang writes no
