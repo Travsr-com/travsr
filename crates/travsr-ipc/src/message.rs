@@ -254,6 +254,42 @@ pub struct LiveResolutionTarget {
     pub provider: String,
 }
 
+/// The targets in one dependent file the editor should also resolve
+/// (RFC-027 section 8.7.5, the interface-edit closure).
+///
+/// When the saved file adds or renames a symbol other files reference by name,
+/// their edges into it were stranded and the editor, which only ever publishes
+/// the saved document, never re-resolves them. The daemon names those files
+/// here so the same target request restores them, keeping the editor the
+/// initiator (§10.1). The editor opens each file, resolves its `targets`, and
+/// reports back under that file's own path — so a dependent's edges attach to a
+/// definition in the dependent (self-healing on its next save), never to one in
+/// the saved file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DependentTargets {
+    /// Repo-relative path of the dependent, forward slashes.
+    pub file: String,
+    /// The references in `file` to resolve, same shape as the saved file's own.
+    pub targets: Vec<LiveResolutionTarget>,
+}
+
+/// The full answer to a target request: the saved file's own references plus the
+/// dependents the interface-edit closure wants re-resolved (RFC-027 §8.7.5).
+///
+/// Rides `ControlResponse::result` as a JSON object. An extension too old to
+/// know this shape reads `result` as an array, finds an object, and treats it as
+/// no targets — the live lane simply stays at its lexical floor for that save,
+/// which is fail-closed (§8.1), never a wrong edge. New extensions read `own`
+/// for the saved document and open each `dependents` file to resolve it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LiveResolutionTargets {
+    /// References in the saved file, resolved against its live buffer.
+    pub own: Vec<LiveResolutionTarget>,
+    /// Dependent files whose stranded edges this save can restore (§8.7.5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependents: Vec<DependentTargets>,
+}
+
 /// One file's current diagnostic state, as an editor sees it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileDiagnostics {
@@ -455,6 +491,50 @@ mod tests {
         assert_eq!(v["name"], "save");
         assert_eq!(v["edge_kind"], "ref/call");
         assert_eq!(v["provider"], "definition");
+    }
+
+    // RFC-027 section 8.7.5: the target response carries the saved file's own
+    // references under `own` and the interface-edit closure under `dependents`,
+    // each dependent naming its own file so the editor reports it back keyed
+    // there. `dependents` is omitted when empty so a body edit's answer stays the
+    // shape it always was, only nested one level under `own`.
+    #[test]
+    fn a_target_response_carries_own_and_dependents() {
+        let resp = LiveResolutionTargets {
+            own: vec![LiveResolutionTarget {
+                ref_line: 12,
+                name: "run".to_string(),
+                edge_kind: "ref/call".to_string(),
+                provider: "definition".to_string(),
+            }],
+            dependents: vec![DependentTargets {
+                file: "src/main.go".to_string(),
+                targets: vec![LiveResolutionTarget {
+                    ref_line: 4,
+                    name: "Start".to_string(),
+                    edge_kind: "ref/call".to_string(),
+                    provider: "definition".to_string(),
+                }],
+            }],
+        };
+        let v = serde_json::to_value(&resp).expect("serialise");
+        assert_eq!(v["own"][0]["name"], "run");
+        assert_eq!(v["dependents"][0]["file"], "src/main.go");
+        assert_eq!(v["dependents"][0]["targets"][0]["name"], "Start");
+
+        // A body edit yields no dependents, and the field is then absent.
+        let bare = LiveResolutionTargets {
+            own: vec![],
+            dependents: vec![],
+        };
+        let v = serde_json::to_value(&bare).expect("serialise");
+        assert!(v.get("dependents").is_none(), "empty dependents omitted");
+        // An old-shape answer (bare array) is not this struct, which is exactly
+        // why an old extension reading `result` as an array degrades to no
+        // targets rather than mis-parsing.
+        let round: LiveResolutionTargets =
+            serde_json::from_value(serde_json::json!({"own": []})).expect("default dependents");
+        assert!(round.dependents.is_empty());
     }
 
     // An empty resolution list is meaningful: the editor looked and resolved

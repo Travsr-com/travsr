@@ -3969,6 +3969,61 @@ fn live_resolution_targets(
     }
 }
 
+/// RFC-027 section 8.7.5: the interface-edit closure, as editor targets.
+///
+/// When the saved file adds or renames a symbol other files reference by name,
+/// their edges into it were stranded — `reindex_replace` invalidated them and
+/// nothing restores them, because the editor only ever publishes the document
+/// that was saved. This computes those dependents (a file with a `pending`
+/// reference the saved file can now satisfy) and returns each one's editor
+/// targets, so the same target request re-resolves them alongside the saved
+/// file. The editor keeps the initiator role (§10.1).
+///
+/// The dependent set is derived from durable `pending` rows plus the saved
+/// file's current parse, so it does not depend on this save's watcher event
+/// having already computed a closure — the two run on independent clocks and a
+/// request can arrive first.
+///
+/// Bounded at `LIVE_CLOSURE_FILE_CAP` files; the editor bounds the *total*
+/// provider round trips across the saved file and every dependent, so one rename
+/// in a hot utility cannot turn a save into an unbounded storm of queries. A
+/// dependent dirty in another editor tab is skipped by the editor, not here: the
+/// daemon reads the file from disk and cannot see an unsaved buffer.
+fn dependent_resolution_targets(
+    store: &SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+) -> Vec<travsr_ipc::message::DependentTargets> {
+    // Only a live-lane file the gate has not disabled can have dependents worth
+    // restoring; a disabled or unsupported language costs nothing here.
+    let Some((lang, _lane)) = live_language(abs_path) else {
+        return Vec::new();
+    };
+    if !live_lane_enabled_for(store, lang.as_str()) {
+        return Vec::new();
+    }
+    let vname_path = abs_path
+        .strip_prefix(repo_root)
+        .unwrap_or(abs_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let dependents = store
+        .dependents_pending_on_file(corpus, &vname_path, lang.as_str(), LIVE_CLOSURE_FILE_CAP)
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for dep in dependents {
+        let dep_abs = repo_root.join(&dep);
+        let targets = live_resolution_targets(store, corpus, repo_root, &dep_abs);
+        // A dependent with nothing for the editor to do (its references all
+        // settle lexically, or it holds none) is not worth sending.
+        if !targets.is_empty() {
+            out.push(travsr_ipc::message::DependentTargets { file: dep, targets });
+        }
+    }
+    out
+}
+
 /// RFC-027 section 12: the continuous precision meter.
 ///
 /// "Is the live lane worse than nothing?" is answered empirically, not by
@@ -8935,6 +8990,79 @@ mod tests {
         assert!(targets.iter().all(|t| t.provider == "definition"));
     }
 
+    /// RFC-027 section 8.7.5: the interface-edit closure reaches the editor lane.
+    ///
+    /// `run.go` references a method the graph cannot settle, so its save records
+    /// the reference as `pending`. When `session.go` — which defines that method
+    /// — is saved, its target request must name `run.go` as a dependent so the
+    /// editor re-resolves it, rather than leaving `run.go`'s live edge stranded
+    /// until `run.go` is itself saved. Before the fix `dependent_resolution_
+    /// targets` did not exist and the request answered with the saved file alone.
+    #[test]
+    fn saving_a_definition_names_its_pending_dependents_as_targets() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/m\n\ngo 1.21\n",
+        )
+        .unwrap();
+        let session = tmp.path().join("session.go");
+        std::fs::write(
+            &session,
+            "package main\n\ntype Session struct{}\n\nfunc (s *Session) Helper() {}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("run.go");
+        std::fs::write(
+            &caller,
+            "package main\n\nfunc Run(s *Session) {\n\ts.Helper()\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.get_meta("corpus").unwrap().unwrap_or_default()
+        };
+
+        // `run.go`'s save records its reference to `Helper` as pending: a generic
+        // language has no lexical floor, so every detected reference abstains
+        // (§8.3) and the pending row is the honest record the editor upgrades.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        // A save of `session.go` (which defines `Helper`) must surface `run.go`
+        // as a dependent carrying that reference as an editor target.
+        let dependents = dependent_resolution_targets(&store, &corpus, tmp.path(), &session);
+        let run = dependents
+            .iter()
+            .find(|d| d.file == "run.go")
+            .unwrap_or_else(|| panic!("run.go must be a dependent, got {dependents:?}"));
+        assert!(
+            run.targets.iter().any(|t| t.name == "Helper"),
+            "the stranded reference must be an editor target, got {:?}",
+            run.targets
+        );
+
+        // A file that defines nothing any pending reference names has no
+        // dependents — a body edit stays local (§6.1), no closure fan-out.
+        let none = dependent_resolution_targets(&store, &corpus, tmp.path(), &caller);
+        assert!(
+            none.iter().all(|d| d.file != "session.go"),
+            "run.go defines nothing session.go is pending on, got {none:?}"
+        );
+    }
+
     /// The lexical floor is native-only (section 8.3): the generic detector
     /// recovers no receiver type and builds no signature key, so there is
     /// nothing for it to match on and the save path must not parse the file to
@@ -11932,18 +12060,27 @@ fn handle_control_message(
             let s = store.lock().unwrap_or_else(|e| e.into_inner());
             let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
             let abs_path = repo_root.join(&file);
-            let targets = live_resolution_targets(&s, &corpus, repo_root, &abs_path);
+            let own = live_resolution_targets(&s, &corpus, repo_root, &abs_path);
+            // RFC-027 section 8.7.5: also re-resolve the files whose edges this
+            // save can restore, so a rename in one file heals its dependents
+            // without each being saved in turn.
+            let dependents = dependent_resolution_targets(&s, &corpus, repo_root, &abs_path);
             drop(s);
 
             tracing::debug!(
                 event = "live.targets",
                 session = %session,
                 file = %file,
-                count = targets.len(),
+                count = own.len(),
+                dependents = dependents.len(),
                 "live resolution targets computed"
             );
             let mut resp = ControlResponse::ok(None);
-            resp.result = serde_json::to_value(&targets).ok();
+            resp.result = serde_json::to_value(travsr_ipc::message::LiveResolutionTargets {
+                own,
+                dependents,
+            })
+            .ok();
             (resp, false)
         }
         Ok(ControlMessage::ReportLiveResolution {

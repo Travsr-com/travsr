@@ -45,6 +45,7 @@
 import * as vscode from "vscode";
 
 import {
+  DependentTargetsItem,
   LiveResolutionItem,
   LiveResolutionTargetItem,
   reportLiveResolution,
@@ -52,15 +53,18 @@ import {
 } from "./daemonIpc";
 
 /**
- * Cap on provider queries per file.
+ * Cap on provider queries for one save, across the saved file **and** every
+ * dependent the interface-edit closure pulls in (RFC-027 section 8.7.5).
  *
- * Each is an IPC round trip into another extension host. The daemon already
- * keeps the set surgical (only references its lexical lane could not settle), so
- * a hand-written file is far below this; the cap only bounds a pathological
- * generated file. Truncation degrades recall, which the commit-gated path
- * repairs.
+ * Each is an IPC round trip into another extension host. The daemon keeps the
+ * set surgical (only references its lexical lane could not settle), so a
+ * hand-written file is far below this; the cap only bounds a pathological
+ * generated file or a rename in a hot utility whose closure is large. It bounds
+ * the *total*, not each file, so one save can never fan out into an unbounded
+ * storm of queries (§10.1). Truncation degrades recall, which the commit-gated
+ * path repairs.
  */
-const MAX_QUERIES_PER_FILE = 200;
+const MAX_QUERIES_PER_SAVE = 200;
 
 /**
  * Languages the daemon's live lane detects references for. A cheap pre-filter
@@ -142,12 +146,22 @@ function columnOf(
   return m ? m.index : null;
 }
 
+/** A shared, mutable query budget spent across the saved file and dependents. */
+interface Budget {
+  remaining: number;
+}
+
 /**
  * Resolve the references the daemon asked about and publish the answers.
  *
- * Returns the number of resolutions reported, for tests and logging. Resolves
- * to 0 on every uninteresting path (unsupported language, file outside the
- * repo, no targets, no provider, nothing resolved) and never rejects.
+ * Resolves the saved document's own references, then the dependents whose live
+ * edges this save can restore (RFC-027 section 8.7.5): a rename in one file
+ * heals the files that reference it without each being saved in turn. All of it
+ * shares one query budget so a large closure cannot balloon a save.
+ *
+ * Returns the total number of resolutions reported, for tests and logging.
+ * Resolves to 0 on every uninteresting path (unsupported language, file outside
+ * the repo, no targets, no provider, nothing resolved) and never rejects.
  */
 export async function publishLiveResolutions(
   repoRoot: string,
@@ -158,25 +172,86 @@ export async function publishLiveResolutions(
   if (!file) return 0;
 
   const version = doc.version;
-  const targets = await requestLiveResolutionTargets(repoRoot, file, version);
-  if (targets.length === 0) return 0;
+  const { own, dependents } = await requestLiveResolutionTargets(
+    repoRoot,
+    file,
+    version
+  );
+  if (own.length === 0 && dependents.length === 0) return 0;
   // The buffer may have moved while the daemon was parsing; the target lines
   // would no longer describe this file.
   if (doc.version !== version) return 0;
 
-  const resolutions: LiveResolutionItem[] = [];
-  let queries = 0;
-  for (const target of targets) {
-    if (queries >= MAX_QUERIES_PER_FILE) break;
-    // Drop the whole batch if the buffer moved: answers computed against old
-    // text no longer describe this file (RFC-027 section 11).
-    if (doc.version !== version) return 0;
+  const budget: Budget = { remaining: MAX_QUERIES_PER_SAVE };
+  let total = 0;
 
-    const item = await resolveTarget(repoRoot, doc, target, version);
-    queries += 1;
-    if (item) resolutions.push(item);
+  // The saved file, resolved against its live buffer.
+  total += await resolveAndReport(repoRoot, doc, file, own, version, budget);
+
+  // Each dependent, resolved against its own file (RFC-027 section 8.7.5).
+  for (const dep of dependents) {
+    if (budget.remaining <= 0) break;
+    total += await resolveDependent(repoRoot, dep, budget);
   }
 
+  return total;
+}
+
+/**
+ * Resolve one dependent file's targets against its own document.
+ *
+ * A dependent dirty in another tab is **skipped**: its buffer differs from the
+ * text the daemon parsed from disk, so the target lines would not describe it,
+ * and resolving against stale text is exactly the wrong-edge risk the lane must
+ * avoid (RFC-027 section 10.1). Only the saved document's version is trustworthy
+ * here; for a clean or freshly opened dependent, disk equals what the daemon saw.
+ */
+async function resolveDependent(
+  repoRoot: string,
+  dep: DependentTargetsItem,
+  budget: Budget
+): Promise<number> {
+  const uri = vscode.Uri.joinPath(vscode.Uri.file(repoRoot), dep.file);
+  const open = vscode.workspace.textDocuments.find(
+    (d) => d.uri.fsPath === uri.fsPath
+  );
+  let depDoc: vscode.TextDocument;
+  if (open) {
+    if (open.isDirty) return 0; // unsaved edits — its buffer is not what the daemon parsed.
+    depDoc = open;
+  } else {
+    try {
+      depDoc = await vscode.workspace.openTextDocument(uri);
+    } catch {
+      return 0; // gone from disk or unreadable — skip, never guess.
+    }
+  }
+  return resolveAndReport(repoRoot, depDoc, dep.file, dep.targets, depDoc.version, budget);
+}
+
+/**
+ * Resolve `targets` against `doc` under the shared `budget` and report the
+ * answers for `file`. Returns the number reported. Drops the whole batch if the
+ * buffer moves mid-flight (RFC-027 section 11) — answers against old text no
+ * longer describe the file.
+ */
+async function resolveAndReport(
+  repoRoot: string,
+  doc: vscode.TextDocument,
+  file: string,
+  targets: LiveResolutionTargetItem[],
+  version: number,
+  budget: Budget
+): Promise<number> {
+  if (targets.length === 0) return 0;
+  const resolutions: LiveResolutionItem[] = [];
+  for (const target of targets) {
+    if (budget.remaining <= 0) break;
+    if (doc.version !== version) return 0;
+    const item = await resolveTarget(repoRoot, doc, target, version);
+    budget.remaining -= 1;
+    if (item) resolutions.push(item);
+  }
   if (resolutions.length === 0) return 0;
   if (doc.version !== version) return 0;
   await reportLiveResolution(repoRoot, file, resolutions);

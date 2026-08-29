@@ -226,19 +226,41 @@ export interface LiveResolutionTargetItem {
 }
 
 /**
+ * The targets in one dependent file the editor should also resolve
+ * (RFC-027 section 8.7.5, the interface-edit closure). The editor opens the
+ * file, resolves its `targets`, and reports back keyed to `file`.
+ */
+export interface DependentTargetsItem {
+  /** Repo-relative path of the dependent, forward slashes. */
+  file: string;
+  /** The references in `file` to resolve. */
+  targets: LiveResolutionTargetItem[];
+}
+
+/**
+ * The full answer to a target request: the saved file's own references plus the
+ * dependents the interface-edit closure wants re-resolved (RFC-027 §8.7.5).
+ */
+export interface LiveResolutionTargetsResult {
+  own: LiveResolutionTargetItem[];
+  dependents: DependentTargetsItem[];
+}
+
+/**
  * Ask the daemon which references in a dirty file this editor should resolve
  * (RFC-027 daemon-driven positions).
  *
  * Unlike the fire-and-forget reports, this reads a response: the owning daemon
- * answers with the target list, other daemons reject on the repo-identity guard.
- * Returns `[]` on every miss — no daemon, a daemon too old to know the op, a
- * malformed answer — so the caller simply resolves nothing that round.
+ * answers with `{ own, dependents }`, other daemons reject on the repo-identity
+ * guard. Returns empty on every miss — no daemon, a daemon too old to know the
+ * op or one that still answers with a bare array, a malformed answer — so the
+ * caller simply resolves nothing that round.
  */
 export async function requestLiveResolutionTargets(
   repoRoot: string,
   file: string,
   bufferVersion: number
-): Promise<LiveResolutionTargetItem[]> {
+): Promise<LiveResolutionTargetsResult> {
   const result = await request(repoRoot, {
     op: "request-live-resolution-targets",
     repo_root: repoRoot,
@@ -246,7 +268,13 @@ export async function requestLiveResolutionTargets(
     file,
     buffer_version: bufferVersion,
   });
-  return Array.isArray(result) ? (result as LiveResolutionTargetItem[]) : [];
+  const empty: LiveResolutionTargetsResult = { own: [], dependents: [] };
+  if (!result || typeof result !== "object" || Array.isArray(result)) return empty;
+  const r = result as Partial<LiveResolutionTargetsResult>;
+  return {
+    own: Array.isArray(r.own) ? r.own : [],
+    dependents: Array.isArray(r.dependents) ? r.dependents : [],
+  };
 }
 
 /**

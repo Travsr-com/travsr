@@ -5205,6 +5205,70 @@ LIMIT ?4",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// RFC-027 sections 6.3 and 8.7.5: the files whose stranded live edges the
+    /// save of `path` can now restore — a dependent holding a `pending`
+    /// reference that names a symbol `path` defines.
+    ///
+    /// This is the reverse-closure that the interface-edit fix (§8.7.5) hands to
+    /// the editor. The editor only ever publishes the document that was saved, so
+    /// a dependent whose edge into `path` was invalidated is never re-resolved on
+    /// its own; naming it here lets the target request pull it in beside the
+    /// saved file's own references, keeping the editor the initiator.
+    ///
+    /// Matched on the pending reference's leaf name against this file's
+    /// definition signatures — `kind:Leaf` (unqualified) or `kind:Qual.Leaf`
+    /// (qualified), the two shapes `signature` takes. Scoped to `language`: a
+    /// live edge stays within one language, both because §8.2 keeps it
+    /// intra-corpus and because a cross-language definition would not resolve
+    /// through the dependent's own provider anyway. Leaf names are identifiers,
+    /// so they carry no `LIKE` wildcard to escape.
+    ///
+    /// Capped at `limit` files (`LIVE_CLOSURE_FILE_CAP` at the call site): a
+    /// symbol thousands of files are pending on is a hot utility, and the
+    /// freshness is not worth re-resolving every one on each save. Truncation
+    /// costs recall, which the commit-gated path repairs. Over-inclusion (a leaf
+    /// name shared by an unrelated symbol) is recall-neutral: the editor resolves
+    /// the real position and the daemon maps it fail-closed, so a spurious file
+    /// costs a round trip, never a wrong edge.
+    pub fn dependents_pending_on_file(
+        &self,
+        corpus: &str,
+        path: &str,
+        language: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        (|| -> AnyResult<Vec<String>> {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "SELECT DISTINCT dep.path \
+                     FROM ref_resolution_state r \
+                     JOIN nodes dep ON dep.id = r.src \
+                     WHERE r.state = 'pending' \
+                       AND dep.corpus = ?1 AND dep.path <> ?2 AND dep.language = ?3 \
+                       AND EXISTS ( \
+                         SELECT 1 FROM nodes def \
+                         WHERE def.corpus = ?1 AND def.path = ?2 AND def.language = ?3 \
+                           AND (def.signature LIKE '%:' || r.name \
+                                OR def.signature LIKE '%.' || r.name) \
+                       ) \
+                     ORDER BY dep.path ASC LIMIT ?4",
+                )
+                .context("dependents_pending_on_file: prepare")?;
+            let rows = stmt
+                .query_map(params![corpus, path, language, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })
+                .context("dependents_pending_on_file: query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding dependents_pending_on_file row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// RFC-027 section 10: how many references are currently unresolved.
     ///
     /// The count half of [`pending_refs_in_file`], for the envelope note where
