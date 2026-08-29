@@ -1104,7 +1104,12 @@ mod tests {
         std::fs::write(root.join("bin/dotnet"), b"#!/bin/sh\n").unwrap();
 
         let got = dotnet_sdk_root_from_binary(&root.join("bin/dotnet")).unwrap();
-        assert_eq!(got, std::fs::canonicalize(root.join("libexec")).unwrap());
+        // `dotnet_sdk_root_from_binary` strips the Windows `\\?\` verbatim prefix
+        // `canonicalize` adds; strip `want` the same way (a no-op off Windows).
+        assert_eq!(
+            got,
+            strip_windows_verbatim(std::fs::canonicalize(root.join("libexec")).unwrap())
+        );
     }
 
     /// Standard layout: `dotnet` sits directly in the SDK root beside `sdk/`.
@@ -1115,7 +1120,11 @@ mod tests {
         std::fs::write(root.join("dotnet"), b"#!/bin/sh\n").unwrap();
 
         let got = dotnet_sdk_root_from_binary(&root.join("dotnet")).unwrap();
-        assert_eq!(got, std::fs::canonicalize(&root).unwrap());
+        // Strip the `\\?\` prefix from `want` to match the function (see above).
+        assert_eq!(
+            got,
+            strip_windows_verbatim(std::fs::canonicalize(&root).unwrap())
+        );
     }
 
     /// A runtime-only host (no `sdk/`) is rejected: scip-dotnet needs the SDK to
