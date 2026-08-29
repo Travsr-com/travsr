@@ -4186,13 +4186,30 @@ const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
 /// - `cpp` — clangd + scip-clang, 1.0000 (`1,0,0`); recall capped by §8.7.3
 ///   (out-of-line method defs abstain), so the field read is what it emits and
 ///   that is correct.
+/// - `java` — jdtls + scip-java, 1.0000 (`3,0,0`, call/field/is-impl); scip-java
+///   needs a Maven/Gradle build to emit references (a build-less fixture swept
+///   and read `0,0,4`).
 ///
-/// Deliberately absent: `c`, `objectivec` — their edges ratify correctly but
-/// scip-clang writes no matching `edge_sites`, so the meter reads them
-/// `unverifiable` (`0,0,2`) and cannot certify ≥ 0.99; they stay disabled until
-/// the oracle carries call-site evidence (§10 item 4). `java`, `csharp`,
-/// `kotlin`, `php`, `scala`, `ruby` — not yet measured against a real server.
-const LIVE_LANE_SHIPPED: &[&str] = &["typescript", "rust", "python", "go", "dart", "swift", "cpp"];
+/// Deliberately absent, each blocked by its **ratification oracle**, not the
+/// live lane (whose edges are correct wherever a server resolves them):
+/// - `c`, `objectivec` — edges ratify correctly but scip-clang writes no
+///   matching `edge_sites`, so the meter reads `0,0,2` unverifiable (§10 item 4).
+/// - `csharp`, `scala` — travsr-lang-csharp / travsr-lang-scala emit definitions
+///   but no reference edges in a minimal project, so there is nothing to ratify
+///   or measure against; the live edges resolve via the server but get swept.
+/// - `kotlin` — detection works, but kotlin-language-server needs a Gradle
+///   project model and long JVM warmup to resolve; not yet driven end to end.
+/// - `php`, `ruby` — server not installed on the measurement machine.
+const LIVE_LANE_SHIPPED: &[&str] = &[
+    "typescript",
+    "rust",
+    "python",
+    "go",
+    "dart",
+    "swift",
+    "cpp",
+    "java",
+];
 
 /// Force-enable a language for measurement, bypassing the strict opt-in gate
 /// (but never the adverse-meter safety below).
@@ -8428,14 +8445,14 @@ mod tests {
         // A vouched language with no reading is enabled; an un-vouched one is not.
         assert!(live_lane_enabled_for(&store, "go"), "go is shipped");
         assert!(
-            !live_lane_enabled_for(&store, "java"),
+            !live_lane_enabled_for(&store, "csharp"),
             "an unmeasured non-shipped language must be disabled by the strict gate"
         );
         assert!(!live_lane_enabled_for(&store, "kotlin"));
 
         // Force-enabling for measurement lifts the gate for exactly that language.
-        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "java,kotlin");
-        assert!(live_lane_enabled_for(&store, "java"));
+        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "csharp,kotlin");
+        assert!(live_lane_enabled_for(&store, "csharp"));
         assert!(live_lane_enabled_for(&store, "kotlin"));
         assert!(
             !live_lane_enabled_for(&store, "scala"),
@@ -8446,10 +8463,10 @@ mod tests {
         // The adverse-meter safety still wins over a force-enable: a measured
         // language below the bar stays disabled even while being measured.
         let mut store = store;
-        store.set_meta("live_precision.java", "18,5,0").unwrap();
-        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "java");
+        store.set_meta("live_precision.csharp", "18,5,0").unwrap();
+        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "csharp");
         assert!(
-            !live_lane_enabled_for(&store, "java"),
+            !live_lane_enabled_for(&store, "csharp"),
             "a meaningful adverse reading disables a language even under force"
         );
         std::env::remove_var("TRAVSR_LIVE_LANE_MEASURE");
@@ -9075,12 +9092,9 @@ mod tests {
         let db_path = tmp.path().join(".travsr/graph.db");
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
         let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
-        // Java is not on LIVE_LANE_SHIPPED (§8.7.6 strict gate): this test is
-        // about the generic detector's output, not the shipping decision, so it
-        // force-enables Java the way the §11.3 measurement harness does.
-        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "java");
+        // Java is on LIVE_LANE_SHIPPED (measured 3,0,0 → 1.0000, §11.3), so the
+        // gate admits it with no reading and no force flag needed.
         let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller);
-        std::env::remove_var("TRAVSR_LIVE_LANE_MEASURE");
 
         let by_name = |name: &str| {
             targets
