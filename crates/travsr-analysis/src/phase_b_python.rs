@@ -92,6 +92,68 @@ pub fn extract_native_phase_b(
     Ok((nodes, edges, unresolved))
 }
 
+/// RFC-027 live IsImplementation lane: `class Foo(Bar)` bases in `files`, as
+/// unresolved references (base name + line).
+///
+/// Unlike [`extract_native_phase_b`], which emits `IsImplementation` edges under
+/// a same-file assumption (`py_vname(corpus, vname_path, ...)` for the base, so a
+/// cross-file base dangles), this returns the raw base so the daemon resolves it
+/// against the real node table and abstains otherwise. The clause sits on the
+/// class's own declaration, so `impl_type` is `None`: the daemon derives the
+/// source from the line.
+pub fn extract_unresolved_inheritance(
+    root: &Path,
+    files: Option<&[(PathBuf, String)]>,
+) -> anyhow::Result<Vec<travsr_core::InheritanceRef>> {
+    let language = tree_sitter::Language::new(tree_sitter_python::LANGUAGE);
+    let inherit_q = Query::new(&language, INHERIT_QUERY).context("python inherit query")?;
+
+    let walked;
+    let file_pairs: &[(PathBuf, String)] = match files {
+        Some(f) => f,
+        None => {
+            walked = collect_source_files(root, &["py", "pyi"]);
+            &walked
+        }
+    };
+
+    let mut out: Vec<travsr_core::InheritanceRef> = Vec::new();
+    for (abs_path, _vname_path) in file_pairs {
+        let Ok(source) = std::fs::read(abs_path) else {
+            continue;
+        };
+        let mut parser = Parser::new();
+        if parser.set_language(&language).is_err() {
+            continue;
+        }
+        let Some(tree) = parser.parse(&source, None) else {
+            continue;
+        };
+        let cap_names: Vec<String> = inherit_q
+            .capture_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut cursor = QueryCursor::new();
+        let mut iter = cursor.matches(&inherit_q, tree.root_node(), source.as_slice());
+        while let Some(m) = iter.next() {
+            for &cap in m.captures {
+                if cap_names.get(cap.index as usize).map(String::as_str) != Some("base.name") {
+                    continue;
+                }
+                let Ok(text) = cap.node.utf8_text(source.as_slice()) else {
+                    continue;
+                };
+                out.push(travsr_core::InheritanceRef {
+                    base_name: text.to_string(),
+                    line: cap.node.start_position().row as u32 + 1,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ── Per-file analysis ─────────────────────────────────────────────────────────
 
 fn extract_file_edges(
@@ -540,6 +602,33 @@ fn walk(root: &Path, dir: &Path, exts: &[&str], out: &mut Vec<(PathBuf, String)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC-027 live IsImplementation lane: `class Dog(Animal, Mixin)` bases come
+    /// back as unresolved references, one per base, carrying the base name and
+    /// the line it is written on.
+    #[test]
+    fn class_bases_come_back_as_inheritance_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("animals.py");
+        std::fs::write(
+            &file,
+            b"class Animal:\n    pass\n\nclass Dog(Animal, Mixin):\n    pass\n",
+        )
+        .unwrap();
+        let files = vec![(file.clone(), "animals.py".to_string())];
+        let refs = extract_unresolved_inheritance(dir.path(), Some(&files)).unwrap();
+
+        // Both bases are on line 4 (the `class Dog(...)` line).
+        assert!(
+            refs.iter().any(|r| r.base_name == "Animal" && r.line == 4),
+            "base Animal captured at its line, got {refs:?}",
+        );
+        assert!(
+            refs.iter().any(|r| r.base_name == "Mixin" && r.line == 4),
+            "base Mixin captured at its line, got {refs:?}",
+        );
+        assert_eq!(refs.len(), 2, "exactly the two bases: {refs:?}");
+    }
 
     /// Bare-call tagging carries both candidate names, so a PascalCase free
     /// function is not silently lost (#716 review).

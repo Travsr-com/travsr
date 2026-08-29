@@ -200,6 +200,117 @@ export interface LiveResolutionItem {
   target_line: number;
   /** Document version this answer was computed against. */
   buffer_version: number;
+  /**
+   * Graph edge kind this reference resolves to, as `EdgeKind::as_str`
+   * (`ref/call`, `ref/field`, `ref/imports`, `is-implementation`, `overrides`).
+   * Echoed from the daemon's target so it emits an edge of exactly that kind
+   * (RFC-027 live edge-kind scope).
+   */
+  edge_kind: string;
+}
+
+/**
+ * One reference the daemon asked this editor to resolve (RFC-027 daemon-driven
+ * positions). The daemon detected it and named its edge kind; the editor finds
+ * the column and runs the provider.
+ */
+export interface LiveResolutionTargetItem {
+  /** 1-based line of the reference in the dirty file. */
+  ref_line: number;
+  /** The referenced name — the editor finds its column on `ref_line`. */
+  name: string;
+  /** Edge kind to carry back on the resolved `LiveResolutionItem`. */
+  edge_kind: string;
+  /** Which provider answers this reference: `definition` or `implementation`. */
+  provider: string;
+}
+
+/**
+ * Ask the daemon which references in a dirty file this editor should resolve
+ * (RFC-027 daemon-driven positions).
+ *
+ * Unlike the fire-and-forget reports, this reads a response: the owning daemon
+ * answers with the target list, other daemons reject on the repo-identity guard.
+ * Returns `[]` on every miss — no daemon, a daemon too old to know the op, a
+ * malformed answer — so the caller simply resolves nothing that round.
+ */
+export async function requestLiveResolutionTargets(
+  repoRoot: string,
+  file: string,
+  bufferVersion: number
+): Promise<LiveResolutionTargetItem[]> {
+  const result = await request(repoRoot, {
+    op: "request-live-resolution-targets",
+    repo_root: repoRoot,
+    session: SESSION_ID,
+    file,
+    buffer_version: bufferVersion,
+  });
+  return Array.isArray(result) ? (result as LiveResolutionTargetItem[]) : [];
+}
+
+/**
+ * Send one control message and read the daemon's response, best-first.
+ *
+ * Broadcasts like {@link send}, but the owning daemon is the one that answers
+ * with a truthy `result` (others reject on the repo guard), so the first such
+ * `result` is taken. Returns `null` when no daemon answered usefully.
+ */
+async function request(repoRoot: string, payload: object): Promise<unknown> {
+  const line = JSON.stringify(payload) + "\n";
+  const candidates = candidateSocketPaths(repoRoot);
+  const responses = await Promise.all(
+    candidates.map((c) => requestLine(c, line))
+  );
+  for (const r of responses) {
+    if (
+      r &&
+      typeof r === "object" &&
+      (r as { ok?: boolean }).ok === true &&
+      (r as { result?: unknown }).result != null
+    ) {
+      return (r as { result?: unknown }).result;
+    }
+  }
+  return null;
+}
+
+/** Write one control line and read back one newline-terminated JSON response. */
+function requestLine(socketPath: string, line: string): Promise<unknown> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let buf = "";
+    const finish = (v: unknown): void => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      resolve(v);
+    };
+    const tryParse = (): void => {
+      const nl = buf.indexOf("\n");
+      if (nl < 0) return;
+      try {
+        finish(JSON.parse(buf.slice(0, nl)));
+      } catch {
+        finish(null);
+      }
+    };
+
+    const sock = net.connect(socketPath);
+    sock.setTimeout(CONNECT_TIMEOUT_MS);
+    sock.on("connect", () => sock.write(line));
+    sock.on("data", (d: Buffer) => {
+      buf += d.toString("utf8");
+      tryParse();
+    });
+    // A short line with no trailing newline still parses on end.
+    sock.on("end", () => {
+      tryParse();
+      finish(null);
+    });
+    sock.on("error", () => finish(null));
+    sock.on("timeout", () => finish(null));
+  });
 }
 
 /**

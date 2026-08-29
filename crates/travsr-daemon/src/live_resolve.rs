@@ -30,8 +30,8 @@
 //! which for a "zero structural hallucinations" product is a breach of the
 //! value proposition rather than a quality regression.
 
-use travsr_core::{Edge, EdgeKind, NodeId, UnresolvedCall};
-use travsr_ipc::message::LiveResolution;
+use travsr_core::{Edge, EdgeKind, InheritanceRef, NodeId, UnresolvedCall};
+use travsr_ipc::message::{LiveResolution, LiveResolutionTarget};
 use travsr_store::{SqliteStore, Store};
 
 /// What one live-resolution pass did, for logging and the Phase 3 precision
@@ -68,20 +68,59 @@ pub fn apply_live_resolutions(
     resolutions: &[LiveResolution],
 ) -> LiveOutcome {
     let mut outcome = LiveOutcome::default();
+    // Section 12: what this lane claimed, so the precision meter can score it.
+    // Without a claim row an editor-resolved edge is invisible to the meter, and
+    // a language that runs this lane alone (every non-native one, §8.3) could
+    // never earn its per-language gate a reading.
+    let mut states: Vec<travsr_store::RefResolution> = Vec::with_capacity(resolutions.len());
     for r in resolutions {
-        match resolve_one(store, corpus, file, r) {
-            Some(edge) => {
-                if let Err(e) = store.put_edge_live(&edge) {
+        // The claim is keyed on the reference, so the edge's own source is the
+        // key's `src`. A resolution whose line maps to no enclosing definition
+        // has no reference to record and abstains below anyway.
+        let src = store
+            .enclosing_definition_at(corpus, file, r.ref_line)
+            .ok()
+            .flatten();
+        let claimed = match resolve_one(store, corpus, file, r) {
+            Some(edge) => match store.put_edge_live(&edge) {
+                Ok(()) => Some(edge.dst),
+                Err(e) => {
                     // A write failure is a freshness loss, never a correctness
                     // one: the commit-gated path still ratifies this region.
                     tracing::debug!(error = %e, "live edge write failed");
-                    outcome.abstain();
-                } else {
-                    outcome.emit();
+                    None
                 }
-            }
-            None => outcome.abstain(),
+            },
+            None => None,
+        };
+        if claimed.is_some() {
+            outcome.emit();
+        } else {
+            outcome.abstain();
         }
+        if let Some(src) = src {
+            // `ref_col` is 0, not the column the editor sent, so this row
+            // collides with the save-path pass's row for the same reference and
+            // upgrades it in place. Keying on the real column would fork one
+            // reference into a stale `pending` row and a `resolved` one.
+            states.push(travsr_store::RefResolution {
+                src,
+                ref_line: r.ref_line,
+                ref_col: 0,
+                name: r.name.clone(),
+                state: if claimed.is_some() {
+                    "resolved"
+                } else {
+                    "pending"
+                },
+                resolved_dst: claimed,
+            });
+        }
+    }
+    if let Err(e) = store.upsert_ref_resolution_states(&states) {
+        // Losing the claim costs the meter its evidence, never the graph its
+        // correctness.
+        tracing::debug!(error = %e, "recording editor-lane ref_resolution_state failed");
     }
     if outcome.emitted > 0 || outcome.pending > 0 {
         tracing::debug!(
@@ -97,20 +136,27 @@ pub fn apply_live_resolutions(
 
 /// Map one editor resolution to an edge, or `None` to abstain.
 fn resolve_one(store: &SqliteStore, corpus: &str, file: &str, r: &LiveResolution) -> Option<Edge> {
-    // The call site's enclosing definition is the edge's source. A reference at
+    // The editor names the edge kind it resolved (RFC-027 live edge-kind scope).
+    // Restricted to the Bucket-B kinds the lane may emit, so a malformed or
+    // hostile report cannot make it write a kind it was never scoped to.
+    let edge = live_edge_kind(&r.edge_kind)?;
+    // The reference's enclosing definition is the edge's source. A reference at
     // top level (no enclosing function) has no caller node to attach to.
     let src = store
         .enclosing_definition_at(corpus, file, r.ref_line)
         .ok()
         .flatten()?;
-    // Section 7.5: the definition the editor pointed at. If the position lands
-    // in no definition span the target is outside the graph (a node_modules
-    // file, a generated stub, a file the indexer skipped), so abstain.
+    // Section 7.5: the node the editor pointed at, restricted to the kinds valid
+    // for this edge kind (a field ref lands on a `field` node, an implements
+    // clause on an interface/trait, a call on a definition). The kind set is the
+    // gate: a target of the wrong kind, or a position in no matching span (a
+    // node_modules file, a generated stub, an unindexed file), maps to nothing
+    // and abstains (§8.1).
     let dst = store
-        .enclosing_definition_at(corpus, &r.target_path, r.target_line)
+        .enclosing_node_at(corpus, &r.target_path, r.target_line, target_kinds(edge))
         .ok()
         .flatten()?;
-    edge_if_sound(store, src, dst)
+    edge_if_sound(store, src, dst, edge)
 }
 
 /// RFC-027 section 6: what an edit actually invalidates.
@@ -220,13 +266,20 @@ pub fn resolve_unambiguous_lexical(
     corpus: &str,
     path: &str,
     unresolved: &[UnresolvedCall],
+    inheritance: &[InheritanceRef],
 ) -> LiveOutcome {
     let mut outcome = LiveOutcome::default();
     // Section 9.2: every reference this pass saw, and what became of it. An
     // abstention is recorded, not dropped — "there is a call here and its
     // target is not yet known" is true and useful, and saying it is what makes
     // fail-closed honest rather than merely quiet.
-    let mut states: Vec<travsr_store::RefResolution> = Vec::with_capacity(unresolved.len());
+    //
+    // Calls and inheritance clauses share one `states` vector because
+    // `replace_ref_resolution_states` clears the whole file's rows before
+    // inserting: recording them in two passes would make the second wipe the
+    // first. One pass, one replace.
+    let mut states: Vec<travsr_store::RefResolution> =
+        Vec::with_capacity(unresolved.len() + inheritance.len());
 
     for call in unresolved {
         let name = travsr_core::ident::leaf_of(&call.callee_sig).to_string();
@@ -267,6 +320,48 @@ pub fn resolve_unambiguous_lexical(
         });
     }
 
+    // RFC-027 live edge-kind scope: the IsImplementation floor. An `extends` /
+    // `implements` clause whose base type has exactly one definition repo-wide
+    // resolves with no language server, exactly as the call floor above does. An
+    // ambiguous or cross-file-only base abstains and becomes an editor target.
+    for r in inheritance {
+        // The clause sits on the implementing class's own declaration, so the
+        // edge source is the definition enclosing that line.
+        let src = store
+            .enclosing_definition_at(corpus, path, r.line)
+            .ok()
+            .flatten();
+        let claimed = match src.and_then(|src| inheritance_edge(store, src, &r.base_name)) {
+            Some(edge) => match store.put_edge_live(&edge) {
+                Ok(()) => Some(edge.dst),
+                Err(e) => {
+                    tracing::debug!(error = %e, "live inheritance edge write failed");
+                    None
+                }
+            },
+            None => None,
+        };
+        if claimed.is_some() {
+            outcome.emit();
+        } else {
+            outcome.abstain();
+        }
+        if let Some(src) = src {
+            states.push(travsr_store::RefResolution {
+                src,
+                ref_line: r.line,
+                ref_col: 0,
+                name: r.base_name.clone(),
+                state: if claimed.is_some() {
+                    "resolved"
+                } else {
+                    "pending"
+                },
+                resolved_dst: claimed,
+            });
+        }
+    }
+
     if let Err(e) = store.replace_ref_resolution_states(corpus, path, &states) {
         // Losing the pending record costs the freshness note its detail, never
         // the graph its correctness.
@@ -285,10 +380,202 @@ pub fn resolve_unambiguous_lexical(
 }
 
 fn lexical_one(store: &SqliteStore, call: &UnresolvedCall) -> Option<Edge> {
+    let edge = lexical_edge_kind(call);
     let dst = candidate_signatures(call)
         .into_iter()
-        .find_map(|sig| unique_definition(store, &sig))?;
-    edge_if_sound(store, call.src, dst)
+        .find_map(|sig| unique_definition(store, &sig, edge))?;
+    edge_if_sound(store, call.src, dst, edge)
+}
+
+/// The edge kind a native call-site record resolves to. The extractor encodes a
+/// field access as `field:...` (with a recovered receiver type); everything else
+/// it emits is a call. A field read must become `ref/field`, never `ref/call`,
+/// so it never surfaces as a caller in `get_callers` / `get_blast_radius` (#757)
+/// while still appearing as a use site in `find_references`.
+fn lexical_edge_kind(call: &UnresolvedCall) -> EdgeKind {
+    if call.callee_sig.starts_with("field:") {
+        EdgeKind::RefField
+    } else {
+        EdgeKind::RefCall
+    }
+}
+
+/// RFC-027 daemon-driven positions: the references the editor should resolve via
+/// a language provider, from the native extractor's reference set.
+///
+/// Fail-closed and surgical, the two properties §7.6 asks of the LSP lane:
+///
+/// - **A reference the lexical lane can settle is skipped.** `lexical_one`
+///   already resolves it repo-wide with no server, so sending it to the editor
+///   would waste a provider round trip on an answer the save-path lane produces
+///   deterministically. The two lanes therefore partition the reference set with
+///   no overlap: lexical takes the unambiguous ones, the editor takes the rest.
+/// - **Only method/field references go to the editor.** A bare free-function or
+///   constructor call the lexical lane could not resolve has no unique definition
+///   in the graph; the editor's provider would resolve it to that same
+///   (missing-or-ambiguous) target and the daemon would abstain anyway. Method
+///   and field references on a receiver whose type the extractor could not
+///   recover are exactly the disambiguation §7.3b exists for.
+///
+/// The editor is handed the line and the name, not a column: the native
+/// extractor records the reference's line but not its column, and the editor can
+/// recover the column by finding `name` on the line far more cheaply than the
+/// extractor could be taught to carry UTF-16 offsets.
+pub fn targets_needing_editor(
+    store: &SqliteStore,
+    unresolved: &[UnresolvedCall],
+) -> Vec<LiveResolutionTarget> {
+    unresolved
+        .iter()
+        .filter_map(|call| {
+            // The lexical lane owns anything it can resolve without a server.
+            if lexical_one(store, call).is_some() {
+                return None;
+            }
+            // Only a method or field reference benefits from LSP disambiguation.
+            let is_field = call.callee_sig.starts_with("field:");
+            if !(call.is_method_call || is_field) {
+                return None;
+            }
+            // No line means no position for the editor to query (older
+            // extractors record `0`); skip rather than send an unusable target.
+            if call.caller_line == 0 {
+                return None;
+            }
+            Some(LiveResolutionTarget {
+                ref_line: call.caller_line,
+                name: travsr_core::ident::leaf_of(&call.callee_sig).to_string(),
+                edge_kind: lexical_edge_kind(call).as_str().to_string(),
+                // Calls and fields are both answered by the definition provider;
+                // the implementation provider is for implements/override targets,
+                // which arrive through a different detector.
+                provider: "definition".to_string(),
+            })
+        })
+        .collect()
+}
+
+/// RFC-027 daemon-driven positions, IsImplementation half: the `extends` /
+/// `implements` clauses the lexical floor could not settle, as editor targets.
+///
+/// A clause whose base type is unique repo-wide is the lexical floor's job
+/// (`resolve_unambiguous_lexical`), so it is skipped here for the same
+/// no-overlap reason the call path skips resolvable calls. What remains — an
+/// ambiguous base, or one defined only in another file — is what the editor's
+/// **definition** provider resolves: the reference names the base type, and we
+/// want where that type is *defined* (the class/interface node), not its
+/// implementors, so the provider is `definition`, not `implementation`.
+pub fn inheritance_targets_needing_editor(
+    store: &SqliteStore,
+    corpus: &str,
+    path: &str,
+    inheritance: &[InheritanceRef],
+) -> Vec<LiveResolutionTarget> {
+    inheritance
+        .iter()
+        .filter_map(|r| {
+            let src = store.enclosing_definition_at(corpus, path, r.line).ok()??;
+            // The lexical floor owns any base with a unique repo-wide definition.
+            if inheritance_edge(store, src, &r.base_name).is_some() {
+                return None;
+            }
+            Some(LiveResolutionTarget {
+                ref_line: r.line,
+                name: r.base_name.clone(),
+                edge_kind: EdgeKind::IsImplementation.as_str().to_string(),
+                provider: "definition".to_string(),
+            })
+        })
+        .collect()
+}
+
+/// RFC-027 section 8.2/8.3: editor targets for a language with no native
+/// Phase B extractor (Go, Java, C#, C/C++, and the rest of the sixteen).
+///
+/// Where the native path partitions its reference set between two lanes — the
+/// lexical floor takes what it can settle repo-wide, the editor takes the rest —
+/// there is nothing to partition here. The generic detector deliberately
+/// recovers no receiver type and builds no signature key, so
+/// [`resolve_unambiguous_lexical`] has nothing to match on and never runs for
+/// these languages. Every detected reference is therefore an editor target:
+/// filtering one out on a guess about what the floor "might" have resolved would
+/// drop the reference outright rather than hand it to the other lane.
+///
+/// With no language server installed nothing is answered and every reference
+/// abstains, which is exactly section 7.3c — today's commit-gated behavior, zero
+/// regression.
+///
+/// Duplicates on `(line, name, kind)` are collapsed. The editor recovers a
+/// target's column by finding the name on its line, so two references to the
+/// same name on one line resolve to the same position; sending both would buy a
+/// second provider round trip for an answer already in hand.
+pub fn generic_targets_needing_editor(
+    refs: &travsr_analysis::live_detect::LiveRefs,
+) -> Vec<LiveResolutionTarget> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(refs.calls.len() + refs.fields.len());
+    let mut push = |line: u32, name: &str, kind: EdgeKind| {
+        // A reference with no line has no position for the editor to query.
+        if line == 0 || !seen.insert((line, name.to_string(), kind)) {
+            return;
+        }
+        out.push(LiveResolutionTarget {
+            ref_line: line,
+            name: name.to_string(),
+            edge_kind: kind.as_str().to_string(),
+            // All three kinds resolve to where the target is *defined*, which is
+            // the definition provider. `implementation` answers the opposite
+            // question (who implements this) and is not what any of these want.
+            provider: "definition".to_string(),
+        });
+    };
+    for c in &refs.calls {
+        push(c.line, &c.name, EdgeKind::RefCall);
+    }
+    for f in &refs.fields {
+        push(f.line, &f.name, EdgeKind::RefField);
+    }
+    for i in &refs.inheritance {
+        push(i.line, &i.base_name, EdgeKind::IsImplementation);
+    }
+    out
+}
+
+/// The unique `IsImplementation` edge from `src` (the implementing class) to the
+/// base type named `base_name`, or `None` to abstain.
+fn inheritance_edge(store: &SqliteStore, src: NodeId, base_name: &str) -> Option<Edge> {
+    let dst = unique_base_definition(store, base_name)?;
+    edge_if_sound(store, src, dst, EdgeKind::IsImplementation)
+}
+
+/// The single class / interface / trait / … named `base_name` repo-wide, or
+/// `None` when there are zero or more than one.
+///
+/// Tries the exact signature under each kind valid for an `IsImplementation`
+/// target (`class:Foo`, `interface:Foo`, …), which is how Phase A keys these
+/// nodes, and requires exactly one match across all of them. Two definitions of
+/// the same name — the cross-file ambiguity the editor's provider exists for —
+/// abstain rather than guess, the same precision guarantee as the call floor.
+fn unique_base_definition(store: &SqliteStore, base_name: &str) -> Option<NodeId> {
+    let kinds = target_kinds(EdgeKind::IsImplementation);
+    let mut found: Option<NodeId> = None;
+    for kind in kinds {
+        let sig = format!("{kind}:{base_name}");
+        let Ok(nodes) = store.lookup_nodes_exact(&sig, None) else {
+            continue;
+        };
+        for n in nodes {
+            if !kinds.contains(&n.kind.as_str()) {
+                continue;
+            }
+            match found {
+                Some(id) if id != n.id => return None,
+                Some(_) => {}
+                None => found = Some(n.id),
+            }
+        }
+    }
+    found
 }
 
 /// The exact signatures a call could name, most specific first.
@@ -329,18 +616,20 @@ fn candidate_signatures(call: &UnresolvedCall) -> Vec<String> {
     sigs
 }
 
-/// The single definition named by `signature`, or `None` when there are zero or
-/// more than one.
+/// The single node named by `signature` and valid as a `edge` target, or `None`
+/// when there are zero or more than one.
 ///
 /// `lookup_nodes_exact(sig, None)` documents exactly this contract: one row is
 /// an unambiguous match, more than one is "genuinely ambiguous; caller must
-/// disambiguate". Ambiguity abstains, which is the whole precision guarantee of
-/// section 7.3a.
-fn unique_definition(store: &SqliteStore, signature: &str) -> Option<NodeId> {
+/// disambiguate". Candidates whose kind is not valid for `edge` are filtered out
+/// first, so the count is over real targets. Ambiguity abstains, which is the
+/// whole precision guarantee of section 7.3a.
+fn unique_definition(store: &SqliteStore, signature: &str, edge: EdgeKind) -> Option<NodeId> {
     let candidates = store.lookup_nodes_exact(signature, None).ok()?;
+    let kinds = target_kinds(edge);
     let defs: Vec<&travsr_core::Node> = candidates
         .iter()
-        .filter(|n| is_definition(&n.kind))
+        .filter(|n| kinds.contains(&n.kind.as_str()))
         .collect();
     match defs.as_slice() {
         [only] => Some(only.id),
@@ -355,7 +644,11 @@ fn unique_definition(store: &SqliteStore, signature: &str) -> Option<NodeId> {
 /// synthetic symbol into the bridge registry (ADR-009 Rule 4). Self-edges are
 /// dropped because a symbol referencing itself carries no traversal value and
 /// would show up as a spurious self-loop in `get_callers`.
-fn edge_if_sound(store: &SqliteStore, src: NodeId, dst: NodeId) -> Option<Edge> {
+///
+/// `kind` is the edge kind to emit (RFC-027 live edge-kind scope): the lane is
+/// no longer call-only, so the caller names it. The target-kind gate lives in
+/// [`target_kinds`], applied before this by whichever lane found `dst`.
+fn edge_if_sound(store: &SqliteStore, src: NodeId, dst: NodeId, kind: EdgeKind) -> Option<Edge> {
     if src == dst {
         return None;
     }
@@ -364,34 +657,69 @@ fn edge_if_sound(store: &SqliteStore, src: NodeId, dst: NodeId) -> Option<Edge> 
     if src_node.vname.corpus != dst_node.vname.corpus {
         return None;
     }
-    Some(Edge::new(src, dst, EdgeKind::RefCall))
+    Some(Edge::new(src, dst, kind))
 }
 
-/// Kinds a reference can resolve to. Mirrors the definition kinds the store's
-/// own `definition_node_ids_in_file` recognises, so the two agree on what
-/// counts as a definition.
-fn is_definition(kind: &str) -> bool {
+/// The edge kinds the live lane is permitted to emit (Bucket B). Anything else —
+/// a structural kind, a cross-language `ffi/call`, an unknown string — is refused
+/// so a malformed or hostile editor report cannot make the lane write an edge
+/// kind it was never scoped to.
+fn live_edge_kind(s: &str) -> Option<EdgeKind> {
+    let kind = EdgeKind::from_str(s)?;
     matches!(
         kind,
-        "function"
-            | "method"
-            | "fn"
-            | "class"
-            | "interface"
-            | "struct"
-            | "trait"
-            | "enum"
-            | "type"
-            | "typedef"
-            | "union"
-            | "object"
-            | "protocol"
-            | "mixin"
-            | "extension"
-            | "namespace"
-            | "init"
+        EdgeKind::RefCall
+            | EdgeKind::RefField
+            | EdgeKind::RefImports
+            | EdgeKind::IsImplementation
+            | EdgeKind::Overrides
     )
+    .then_some(kind)
 }
+
+/// The node kinds a live edge of `edge` may point at. This is the whole
+/// precision gate on the *target*: a candidate of any other kind is filtered out
+/// and the reference abstains rather than mint an edge to the wrong node kind
+/// (§8.1). The *source* is always a code body, gated separately by
+/// `enclosing_definition_at`.
+fn target_kinds(edge: EdgeKind) -> &'static [&'static str] {
+    match edge {
+        EdgeKind::RefCall => DEFINITION_KINDS,
+        EdgeKind::RefField => &["field"],
+        // A named import specifier resolves to the exported definition it binds.
+        EdgeKind::RefImports => DEFINITION_KINDS,
+        // `class C implements I` / `impl Trait for T` points at the contract.
+        EdgeKind::IsImplementation => &["interface", "trait", "class", "struct", "protocol"],
+        // A subclass method overriding a base method points at the base method.
+        EdgeKind::Overrides => &["method", "fn", "function"],
+        // The live lane emits no other kind; `live_edge_kind` already refused it.
+        _ => &[],
+    }
+}
+
+/// Kinds a call / import reference can resolve to. Mirrors the store's
+/// `ENCLOSING_DEFINITION_KINDS` and `definition_node_ids_in_file`, so all three
+/// agree on what counts as a definition. Deliberately excludes `field`, which is
+/// a `ref/field` target, not a `ref/call` one.
+const DEFINITION_KINDS: &[&str] = &[
+    "function",
+    "method",
+    "fn",
+    "class",
+    "interface",
+    "struct",
+    "trait",
+    "enum",
+    "type",
+    "typedef",
+    "union",
+    "object",
+    "protocol",
+    "mixin",
+    "extension",
+    "namespace",
+    "init",
+];
 
 #[cfg(test)]
 mod tests {
@@ -429,6 +757,22 @@ mod tests {
             target_path: target_path.to_string(),
             target_line,
             buffer_version: 1,
+            edge_kind: "ref/call".to_string(),
+        }
+    }
+
+    /// Like [`resolution`] but naming a specific edge kind, for the Bucket-B
+    /// kinds beyond `ref/call` (RFC-027 live edge-kind scope).
+    fn resolution_kind(
+        ref_line: u32,
+        name: &str,
+        target_path: &str,
+        target_line: u32,
+        edge_kind: &str,
+    ) -> LiveResolution {
+        LiveResolution {
+            edge_kind: edge_kind.to_string(),
+            ..resolution(ref_line, name, target_path, target_line)
         }
     }
 
@@ -580,6 +924,7 @@ mod tests {
             CORPUS,
             "src/order.ts",
             &[call(src, "method:User.save", 18)],
+            &[],
         );
 
         assert_eq!(
@@ -620,6 +965,7 @@ mod tests {
             CORPUS,
             "src/order.ts",
             &[call(src, "method:save", 18)],
+            &[],
         );
 
         assert_eq!(
@@ -650,7 +996,7 @@ mod tests {
         let mut c = call(src, "class:Field", 18);
         c.alt_callee_sig = Some("fn:Field".to_string());
 
-        let out = resolve_unambiguous_lexical(&mut store, CORPUS, "src/order.ts", &[c]);
+        let out = resolve_unambiguous_lexical(&mut store, CORPUS, "src/order.ts", &[c], &[]);
         assert_eq!(
             out,
             LiveOutcome {
@@ -847,6 +1193,7 @@ mod tests {
             CORPUS,
             "src/main.rs",
             &[call(src, "method:Zoo.new", 3)],
+            &[],
         );
         assert_eq!(
             out,
@@ -864,15 +1211,16 @@ mod tests {
     /// Rust field access `x.count` is emitted with `callee_sig = "field:count"`
     /// AND a recovered `recv_type` — the extractor only emits field refs when
     /// the receiver type is recoverable (phase_b_rust.rs guards
-    /// `recv_type.is_none()`). So `candidate_signatures` DOES build
-    /// `field:Zoo.count`, and the field definition node is present. It still
-    /// abstains, because `is_definition` does not admit the `"field"` kind and
-    /// `unique_definition` filters the node out. The abstention is by
-    /// definition-kind, NOT (as an earlier note assumed) a missing receiver
-    /// type. Recorded, not closed: a field read is not a call and must not mint
-    /// a `RefCall` edge. Both facts are asserted here so neither can drift.
+    /// `recv_type.is_none()`). So `candidate_signatures` builds `field:Zoo.count`
+    /// and the field definition node is present.
+    ///
+    /// RFC-027 live edge-kind scope: a field read now resolves to a `ref/field`
+    /// edge, not abstention. The edge kind matters — it must be `ref/field`, never
+    /// `ref/call`, so a field read never surfaces as a caller in `get_callers` /
+    /// `get_blast_radius` (#757) while still appearing as a use site in
+    /// `find_references`. Both the emission and the kind are pinned here.
     #[test]
-    fn rust_field_access_abstains_on_definition_kind_not_missing_receiver() {
+    fn rust_field_access_resolves_to_a_ref_field_edge() {
         let mut c = call(
             rust_node_id("src/zoo.rs", "method:Zoo.tally"),
             "field:count",
@@ -884,19 +1232,521 @@ mod tests {
             vec!["field:Zoo.count".to_string()],
             "the owner-qualified field sig is built; recv_type is present",
         );
+        assert_eq!(
+            lexical_edge_kind(&c),
+            EdgeKind::RefField,
+            "a field:… call-site record resolves to ref/field, not ref/call",
+        );
 
         let mut store = rust_store_with(&[
             ("src/zoo.rs", "method:Zoo.tally", "method", 4, 9),
             ("src/zoo.rs", "field:Zoo.count", "field", 2, 2),
         ]);
-        let out = resolve_unambiguous_lexical(&mut store, CORPUS, "src/zoo.rs", &[c]);
+        let out = resolve_unambiguous_lexical(&mut store, CORPUS, "src/zoo.rs", &[c], &[]);
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+        );
+        let edge = store
+            .iter_edges_from(rust_node_id("src/zoo.rs", "method:Zoo.tally"))
+            .expect("iter_edges_from")
+            .into_iter()
+            .find(|e| e.dst == rust_node_id("src/zoo.rs", "field:Zoo.count"))
+            .expect("a live edge to the field must exist");
+        assert_eq!(
+            edge.kind,
+            EdgeKind::RefField,
+            "the edge kind must be ref/field"
+        );
+        assert_eq!(
+            edge.provenance.as_deref(),
+            Some("live"),
+            "and it must be tagged live",
+        );
+    }
+
+    /// Section 7.3b for a field target: an editor resolves `zoo.count` to the
+    /// field's declaration line, and the daemon maps that position to the
+    /// `field` node via `enclosing_node_at` (which the call-target kind set of
+    /// `enclosing_definition_at` would have excluded) and emits `ref/field`.
+    #[test]
+    fn an_editor_field_resolution_becomes_a_ref_field_edge() {
+        let mut store = rust_store_with(&[
+            ("src/zoo.rs", "method:Zoo.tally", "method", 4, 9),
+            ("src/zoo.rs", "field:Zoo.count", "field", 2, 2),
+        ]);
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/zoo.rs",
+            // The reference is on line 5 (inside tally); the field decl is line 2.
+            &[resolution_kind(5, "count", "src/zoo.rs", 2, "ref/field")],
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+        );
+        let edge = store
+            .iter_edges_from(rust_node_id("src/zoo.rs", "method:Zoo.tally"))
+            .expect("iter_edges_from")
+            .into_iter()
+            .find(|e| e.dst == rust_node_id("src/zoo.rs", "field:Zoo.count"))
+            .expect("a live edge to the field must exist");
+        assert_eq!(edge.kind, EdgeKind::RefField);
+    }
+
+    /// RFC-027 daemon-driven positions: the editor is handed exactly the
+    /// references the lexical lane could not settle, and no others. A resolvable
+    /// call is the lexical lane's job; a method call with no recovered receiver
+    /// type is the disambiguation §7.3b exists for, so only the latter becomes a
+    /// target — carrying the line, the leaf name, its edge kind, and the
+    /// definition provider.
+    #[test]
+    fn targets_are_only_the_references_the_lexical_lane_cannot_settle() {
+        let store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        let src = node_id("src/order.ts", "fn:placeOrder");
+
+        // Resolvable associated call — lexical owns it, so no editor target.
+        let resolvable = call(src, "method:User.save", 18);
+        // Method call with no recovered receiver type — lexical abstains.
+        let mut ambiguous = call(src, "fn:save", 19);
+        ambiguous.is_method_call = true;
+
+        let targets = targets_needing_editor(&store, &[resolvable, ambiguous]);
+        assert_eq!(
+            targets.len(),
+            1,
+            "only the unsettleable reference is a target"
+        );
+        assert_eq!(targets[0].ref_line, 19);
+        assert_eq!(targets[0].name, "save");
+        assert_eq!(targets[0].edge_kind, "ref/call");
+        assert_eq!(targets[0].provider, "definition");
+    }
+
+    /// A field access with no recovered receiver type becomes a `ref/field`
+    /// target for the definition provider — the daemon names the kind, the editor
+    /// runs the provider.
+    #[test]
+    fn a_field_reference_becomes_a_ref_field_target() {
+        let store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
+        let src = node_id("src/order.ts", "fn:placeOrder");
+        let field = call(src, "field:count", 20);
+        let targets = targets_needing_editor(&store, &[field]);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].edge_kind, "ref/field");
+        assert_eq!(targets[0].name, "count");
+        assert_eq!(targets[0].provider, "definition");
+    }
+
+    /// A bare free-function call the lexical lane could not resolve has no unique
+    /// definition in the graph; the editor's provider would resolve it to that
+    /// same missing target and abstain, so it is not sent (stay surgical, §7.6).
+    #[test]
+    fn an_unresolvable_free_call_is_not_sent_to_the_editor() {
+        let store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
+        let src = node_id("src/order.ts", "fn:placeOrder");
+        let bare = call(src, "fn:nowhere", 21);
+        assert!(targets_needing_editor(&store, &[bare]).is_empty());
+    }
+
+    /// RFC-027 section 12: the editor lane records what it claimed, so the
+    /// precision meter can score it. Without a claim row an editor-resolved edge
+    /// is invisible to the meter, and a language that runs this lane alone
+    /// (every non-native one, §8.3) could never earn its gate a reading.
+    #[test]
+    fn an_editor_resolution_is_recorded_as_a_scorable_claim() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "save", "src/user.ts", 17)],
+        );
+        let sample = store
+            .live_precision_sample_by_language()
+            .expect("precision sample");
+        let bucket = sample
+            .get("typescript")
+            .expect("the claim must be attributed to the source node's language");
+        assert_eq!(
+            bucket.claims(),
+            1,
+            "the editor lane's resolution must be a claim the meter can see"
+        );
+    }
+
+    /// An editor answer the daemon could not map abstains, and the abstention is
+    /// recorded rather than dropped: "there is a reference here and its target is
+    /// not yet known" is true and useful (§9.2).
+    #[test]
+    fn an_editor_abstention_is_recorded_as_pending() {
+        let mut store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "save", "src/nowhere.ts", 17)],
+        );
         assert_eq!(
             out,
             LiveOutcome {
                 emitted: 0,
                 pending: 1
             },
-            "the field node exists and its sig matches; abstention is the is_definition filter",
         );
+        let pending = store
+            .pending_refs_in_file(CORPUS, "src/order.ts")
+            .expect("pending_refs_in_file");
+        assert_eq!(pending, vec![("save".to_string(), 18)]);
+    }
+
+    /// The editor lane must upgrade the save-path pass's row for the same
+    /// reference, not fork it into a stale `pending` beside a `resolved`. Both
+    /// lanes key on `ref_col = 0` for exactly this reason.
+    #[test]
+    fn an_editor_answer_upgrades_the_save_paths_pending_row() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        let src = node_id("src/order.ts", "fn:placeOrder");
+        // The save-path pass abstains on a method call with no receiver type.
+        let mut ambiguous = call(src, "fn:save", 18);
+        ambiguous.is_method_call = true;
+        resolve_unambiguous_lexical(&mut store, CORPUS, "src/order.ts", &[ambiguous], &[]);
+        assert_eq!(
+            store
+                .pending_refs_in_file(CORPUS, "src/order.ts")
+                .expect("pending_refs_in_file")
+                .len(),
+            1,
+        );
+
+        apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "save", "src/user.ts", 17)],
+        );
+        assert!(
+            store
+                .pending_refs_in_file(CORPUS, "src/order.ts")
+                .expect("pending_refs_in_file")
+                .is_empty(),
+            "the resolved reference must leave no stale pending row behind"
+        );
+        assert_eq!(
+            store
+                .live_precision_sample_by_language()
+                .expect("precision sample")
+                .get("typescript")
+                .map(|b| b.claims()),
+            Some(1),
+            "one reference must produce one claim, not two rows",
+        );
+    }
+
+    /// RFC-027 section 8.3: a language with no native extractor has no lexical
+    /// floor, so every detected reference becomes an editor target — a call as
+    /// `ref/call`, a field read as `ref/field`, each for the definition
+    /// provider. Nothing is filtered: dropping one would lose the reference
+    /// outright rather than hand it to another lane.
+    #[test]
+    fn every_generic_reference_becomes_an_editor_target() {
+        let refs = travsr_analysis::live_detect::LiveRefs {
+            calls: vec![
+                travsr_analysis::live_detect::LiveRef {
+                    line: 12,
+                    name: "Start".to_string(),
+                },
+                travsr_analysis::live_detect::LiveRef {
+                    line: 13,
+                    name: "helper".to_string(),
+                },
+            ],
+            fields: vec![travsr_analysis::live_detect::LiveRef {
+                line: 14,
+                name: "count".to_string(),
+            }],
+            inheritance: Vec::new(),
+        };
+        let targets = generic_targets_needing_editor(&refs);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| (t.ref_line, t.name.as_str(), t.edge_kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (12, "Start", "ref/call"),
+                (13, "helper", "ref/call"),
+                (14, "count", "ref/field"),
+            ],
+        );
+        assert!(targets.iter().all(|t| t.provider == "definition"));
+    }
+
+    /// The editor recovers a target's column by finding the name on its line, so
+    /// two references to the same name on one line resolve to the same position.
+    /// Sending both would buy a second provider round trip for an answer already
+    /// in hand.
+    #[test]
+    fn generic_targets_are_deduplicated_per_line_and_name() {
+        let refs = travsr_analysis::live_detect::LiveRefs {
+            calls: vec![
+                travsr_analysis::live_detect::LiveRef {
+                    line: 7,
+                    name: "Get".to_string(),
+                },
+                travsr_analysis::live_detect::LiveRef {
+                    line: 7,
+                    name: "Get".to_string(),
+                },
+            ],
+            fields: Vec::new(),
+            inheritance: Vec::new(),
+        };
+        assert_eq!(generic_targets_needing_editor(&refs).len(), 1);
+    }
+
+    /// A live edge for a non-native language rides exactly the same emit path as
+    /// a native one: the daemon maps the reference line to its enclosing
+    /// definition and the editor's answer to a node, and neither endpoint is
+    /// minted here (§8.2). This is a Go file with no native extractor at all.
+    #[test]
+    fn a_generic_language_edge_emits_through_the_shared_path() {
+        let mut store = store_with(&[
+            ("cmd/run.go", "fn:Run", "function", 10, 20),
+            ("svc/session.go", "method:Session.Start", "method", 30, 40),
+        ]);
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "cmd/run.go",
+            &[resolution_kind(
+                12,
+                "Start",
+                "svc/session.go",
+                31,
+                "ref/call",
+            )],
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+        );
+        let edge = store
+            .iter_edges_from(node_id("cmd/run.go", "fn:Run"))
+            .expect("iter_edges_from")
+            .into_iter()
+            .find(|e| e.dst == node_id("svc/session.go", "method:Session.Start"))
+            .expect("a live edge to the Go method must exist");
+        assert_eq!(edge.kind, EdgeKind::RefCall);
+    }
+
+    /// An editor report naming an edge kind outside Bucket B (a structural kind,
+    /// a cross-language `ffi/call`, or an unknown string) is refused: the lane
+    /// emits only the kinds it was scoped to, so a malformed report abstains
+    /// rather than writing an out-of-scope edge.
+    #[test]
+    fn an_out_of_scope_edge_kind_is_refused() {
+        assert!(live_edge_kind("ffi/call").is_none());
+        assert!(live_edge_kind("depends").is_none());
+        assert!(live_edge_kind("not-a-kind").is_none());
+        assert_eq!(live_edge_kind("ref/field"), Some(EdgeKind::RefField));
+
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution_kind(18, "save", "src/user.ts", 17, "ffi/call")],
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+        );
+    }
+
+    // ── IsImplementation lane (RFC-027 live edge-kind scope, TypeScript) ────────
+
+    fn inherit(base_name: &str, line: u32) -> InheritanceRef {
+        InheritanceRef {
+            base_name: base_name.to_string(),
+            line,
+        }
+    }
+
+    /// Lexical floor: `class Order extends Base` where `Base` has exactly one
+    /// definition repo-wide resolves to an `is-implementation` edge with no
+    /// language server. The clause line is the class declaration line, which maps
+    /// to the implementing class as the edge source.
+    #[test]
+    fn an_unambiguous_base_resolves_to_a_live_is_implementation_edge() {
+        let mut store = store_with(&[
+            ("src/order.ts", "class:Order", "class", 3, 20),
+            ("src/base.ts", "class:Base", "class", 1, 10),
+        ]);
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[],
+            &[inherit("Base", 3)],
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+        );
+        let edge = store
+            .iter_edges_from(node_id("src/order.ts", "class:Order"))
+            .expect("iter_edges_from")
+            .into_iter()
+            .find(|e| e.dst == node_id("src/base.ts", "class:Base"))
+            .expect("a live is-implementation edge to the base must exist");
+        assert_eq!(edge.kind, EdgeKind::IsImplementation);
+        assert_eq!(edge.provenance.as_deref(), Some("live"));
+    }
+
+    /// An interface `implements` target resolves the same way, keyed on the
+    /// `interface:` signature the target-kind set admits.
+    #[test]
+    fn an_unambiguous_interface_resolves_to_a_live_edge() {
+        let mut store = store_with(&[
+            ("src/order.ts", "class:Order", "class", 3, 20),
+            ("src/shape.ts", "interface:Shape", "interface", 1, 5),
+        ]);
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[],
+            &[inherit("Shape", 3)],
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+        );
+        assert_eq!(
+            provenance_of(
+                &store,
+                node_id("src/order.ts", "class:Order"),
+                node_id("src/shape.ts", "interface:Shape"),
+            )
+            .as_deref(),
+            Some("live"),
+        );
+    }
+
+    /// A base with two definitions repo-wide is the cross-file ambiguity the
+    /// editor's provider exists for: the lexical floor abstains and it becomes a
+    /// `definition`-provider target, never a guessed edge.
+    #[test]
+    fn an_ambiguous_base_abstains_and_becomes_an_editor_target() {
+        let store = store_with(&[
+            ("src/order.ts", "class:Order", "class", 3, 20),
+            ("src/a.ts", "class:Base", "class", 1, 10),
+            ("src/b.ts", "class:Base", "class", 1, 10),
+        ]);
+        let targets = inheritance_targets_needing_editor(
+            &store,
+            CORPUS,
+            "src/order.ts",
+            &[inherit("Base", 3)],
+        );
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].edge_kind, "is-implementation");
+        assert_eq!(targets[0].name, "Base");
+        assert_eq!(targets[0].ref_line, 3);
+        assert_eq!(
+            targets[0].provider, "definition",
+            "the base type is resolved to its definition, not its implementors",
+        );
+    }
+
+    /// A base the lexical floor could settle is not also sent to the editor: the
+    /// two lanes partition inheritance clauses with no overlap, exactly as they
+    /// do calls.
+    #[test]
+    fn a_resolvable_base_is_not_sent_to_the_editor() {
+        let store = store_with(&[
+            ("src/order.ts", "class:Order", "class", 3, 20),
+            ("src/base.ts", "class:Base", "class", 1, 10),
+        ]);
+        let targets = inheritance_targets_needing_editor(
+            &store,
+            CORPUS,
+            "src/order.ts",
+            &[inherit("Base", 3)],
+        );
+        assert!(
+            targets.is_empty(),
+            "a unique base is the lexical floor's job"
+        );
+    }
+
+    /// Section 7.3b for an implements target: an editor resolves the base name to
+    /// its declaration and the daemon emits an `is-implementation` edge from the
+    /// implementing class to the interface node the position mapped to.
+    #[test]
+    fn an_editor_resolved_base_becomes_an_is_implementation_edge() {
+        let mut store = store_with(&[
+            ("src/order.ts", "class:Order", "class", 3, 20),
+            ("src/shape.ts", "interface:Shape", "interface", 1, 5),
+        ]);
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution_kind(
+                3,
+                "Shape",
+                "src/shape.ts",
+                1,
+                "is-implementation",
+            )],
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+        );
+        let edge = store
+            .iter_edges_from(node_id("src/order.ts", "class:Order"))
+            .expect("iter_edges_from")
+            .into_iter()
+            .find(|e| e.dst == node_id("src/shape.ts", "interface:Shape"))
+            .expect("an is-implementation edge must exist");
+        assert_eq!(edge.kind, EdgeKind::IsImplementation);
     }
 }

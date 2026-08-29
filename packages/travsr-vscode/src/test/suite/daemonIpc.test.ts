@@ -240,6 +240,7 @@ suite("daemonIpc: live resolution (RFC-027)", function () {
       target_path: "src/user.ts",
       target_line: 17,
       buffer_version: 9,
+      edge_kind: "ref/call",
     },
   ];
 

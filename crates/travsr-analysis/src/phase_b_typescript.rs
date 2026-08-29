@@ -109,6 +109,93 @@ pub fn extract_native_phase_b(
     Ok((nodes, edges, unresolved))
 }
 
+/// RFC-027 live IsImplementation lane: the `extends`/`implements` clauses in
+/// `files`, as unresolved references (base type name + line).
+///
+/// Unlike [`extract_native_phase_b`], which emits `IsImplementation` edges under
+/// a same-file assumption (`ts_vname(corpus, vname_path, ...)` for the base, so a
+/// cross-file base dangles), this returns the raw clause so the daemon can
+/// resolve the base against the *real* node table — lexically when it is unique
+/// repo-wide, or via the editor's definition provider — and abstain otherwise.
+/// It never resolves and never mints identity.
+pub fn extract_unresolved_inheritance(
+    root: &Path,
+    files: Option<&[(PathBuf, String)]>,
+) -> anyhow::Result<Vec<travsr_core::InheritanceRef>> {
+    let language = tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT);
+    let extends_q = Query::new(&language, EXTENDS_QUERY).context("ts extends query")?;
+    let implements_q = Query::new(&language, IMPLEMENTS_QUERY).context("ts implements query")?;
+
+    let walked;
+    let file_pairs: &[(PathBuf, String)] = match files {
+        Some(f) => f,
+        None => {
+            walked = collect_source_files(root, &["ts", "tsx", "mts", "cts"]);
+            &walked
+        }
+    };
+
+    let mut out: Vec<travsr_core::InheritanceRef> = Vec::new();
+    for (abs_path, _vname_path) in file_pairs {
+        let Ok(source) = std::fs::read(abs_path) else {
+            continue;
+        };
+        let mut parser = Parser::new();
+        if parser.set_language(&language).is_err() {
+            continue;
+        }
+        let Some(tree) = parser.parse(&source, None) else {
+            continue;
+        };
+        collect_inheritance(
+            &extends_q,
+            "extends.base",
+            tree.root_node(),
+            &source,
+            &mut out,
+        );
+        collect_inheritance(
+            &implements_q,
+            "implements.iface",
+            tree.root_node(),
+            &source,
+            &mut out,
+        );
+    }
+    Ok(out)
+}
+
+/// Push one `InheritanceRef` per match of `base_cap` in `q`, carrying the base
+/// name's text and its 1-based line.
+fn collect_inheritance(
+    q: &Query,
+    base_cap: &str,
+    root: tree_sitter::Node,
+    source: &[u8],
+    out: &mut Vec<travsr_core::InheritanceRef>,
+) {
+    let cap_names: Vec<String> = q.capture_names().iter().map(|s| s.to_string()).collect();
+    let mut cursor = QueryCursor::new();
+    let mut iter = cursor.matches(q, root, source);
+    while let Some(m) = iter.next() {
+        for &cap in m.captures {
+            let Some(name) = cap_names.get(cap.index as usize) else {
+                continue;
+            };
+            if name != base_cap {
+                continue;
+            }
+            let Ok(text) = cap.node.utf8_text(source) else {
+                continue;
+            };
+            out.push(travsr_core::InheritanceRef {
+                base_name: text.to_string(),
+                line: cap.node.start_position().row as u32 + 1,
+            });
+        }
+    }
+}
+
 // ── Per-file analysis ─────────────────────────────────────────────────────────
 
 fn extract_file_edges(
@@ -755,6 +842,36 @@ class App {
 }
 "#;
         assert_eq!(recv_type_for_call(source, "run"), None);
+    }
+
+    /// RFC-027 live IsImplementation lane: `extends`/`implements` clauses come
+    /// back as unresolved references carrying the base type's name and the line
+    /// it is written on, so the daemon can resolve them against the real node
+    /// table rather than the same-file assumption `extract_native_phase_b` makes.
+    #[test]
+    fn extends_and_implements_come_back_as_inheritance_refs() {
+        let dir = std::env::temp_dir().join(format!("rfc027_inherit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("order.ts");
+        std::fs::write(
+            &file,
+            b"import { Base } from './base';\nexport class Order extends Base implements Shape {\n  area() { return 0; }\n}\n",
+        )
+        .unwrap();
+        let files = vec![(file.clone(), "order.ts".to_string())];
+        let refs = extract_unresolved_inheritance(&dir, Some(&files)).unwrap();
+
+        // Both clauses are on line 2 (the class declaration line).
+        assert!(
+            refs.iter().any(|r| r.base_name == "Base" && r.line == 2),
+            "extends Base captured at its line, got {refs:?}",
+        );
+        assert!(
+            refs.iter().any(|r| r.base_name == "Shape" && r.line == 2),
+            "implements Shape captured at its line, got {refs:?}",
+        );
+        assert_eq!(refs.len(), 2, "exactly the two clauses, no more: {refs:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -30,6 +30,29 @@ pub const NODE_EXACT_LOOKUP_LIMIT: usize = 21;
 /// Row cap on [`SqliteStore::search_nodes_by_name`] (fuzzy simple-name Tier 2).
 pub const NODE_NAME_SEARCH_LIMIT: usize = 100;
 
+/// Definition kinds [`SqliteStore::enclosing_definition_at`] recognises as an
+/// enclosing scope. Mirrors `definition_node_ids_in_file`; deliberately excludes
+/// `field` so a field read never resolves to an enclosing "definition" (#757).
+const ENCLOSING_DEFINITION_KINDS: &[&str] = &[
+    "function",
+    "method",
+    "fn",
+    "class",
+    "interface",
+    "struct",
+    "trait",
+    "enum",
+    "type",
+    "typedef",
+    "union",
+    "object",
+    "protocol",
+    "mixin",
+    "extension",
+    "namespace",
+    "init",
+];
+
 /// Type alias for the RFC-018 Step 4 semantic-ANN callback injected by the daemon.
 /// Returns `(NodeId, cosine_similarity_score)` pairs in descending score order.
 pub type EmbedKnnHook =
@@ -4933,6 +4956,55 @@ LIMIT ?4",
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// RFC-027 section 12: upsert reference-resolution rows without clearing the
+    /// file's others.
+    ///
+    /// The editor lane arrives *after* the save-path pass has already recorded
+    /// every reference in the file, and it answers a subset of them. It must
+    /// therefore upgrade the rows it resolved rather than replace the set:
+    /// [`Self::replace_ref_resolution_states`] would delete the references the
+    /// editor did not answer, and those pending rows are the honest record of
+    /// what is still unresolved.
+    ///
+    /// Rows collide with the save-path pass on the `(src, ref_line, ref_col,
+    /// name)` primary key, so an editor answer flips that reference's existing
+    /// `pending` row to `resolved` in place instead of forking one reference
+    /// into two rows. That is what lets the precision meter score the editor
+    /// lane at all: without a claim row a resolution is invisible to
+    /// [`Self::live_precision_sample_by_language`], and a language that runs the
+    /// editor lane alone could never earn the per-language gate a reading.
+    pub fn upsert_ref_resolution_states(
+        &mut self,
+        rows: &[RefResolution],
+    ) -> Result<(), StoreError> {
+        (|| -> AnyResult<()> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("upsert_ref_resolution_states: begin")?;
+            for r in rows {
+                tx.execute(
+                    "INSERT INTO ref_resolution_state(src, ref_line, ref_col, name, state, resolved_dst) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT(src, ref_line, ref_col, name) DO UPDATE SET \
+                       state = excluded.state, resolved_dst = excluded.resolved_dst",
+                    params![
+                        node_id_to_i64(r.src),
+                        r.ref_line as i64,
+                        r.ref_col as i64,
+                        r.name,
+                        r.state,
+                        r.resolved_dst.map(node_id_to_i64),
+                    ],
+                )
+                .context("upserting ref_resolution_state row")?;
+            }
+            tx.commit().context("upsert_ref_resolution_states: commit")?;
+            Ok(())
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// RFC-027 section 9.2: replace a file's reference-resolution rows.
     ///
     /// Called once per live pass over a file, with every reference that pass
@@ -5190,24 +5262,61 @@ LIMIT ?4",
         path: &str,
         line: u32,
     ) -> Result<Option<NodeId>, StoreError> {
+        self.enclosing_node_at(corpus, path, line, ENCLOSING_DEFINITION_KINDS)
+    }
+
+    /// The tightest node whose span contains `line`, restricted to `kinds`.
+    ///
+    /// Generalizes [`Self::enclosing_definition_at`] so a caller can supply its
+    /// own valid endpoint kinds. RFC-027's live lane needs this: mapping the
+    /// target of a `ref/field` edge must find the `field` node the editor's
+    /// definition provider pointed at, which the definition-only kind set of
+    /// `enclosing_definition_at` deliberately excludes (`get_callers` must never
+    /// see a field read as a caller, #757). Each live edge kind therefore passes
+    /// the kinds that are valid *for it*, and the gate is the kind set itself.
+    ///
+    /// `kinds` must contain only internal constant strings; they are bound as
+    /// parameters, never interpolated, so no user input can reach the SQL text.
+    /// An empty `kinds` matches nothing (`Ok(None)`), never everything.
+    pub fn enclosing_node_at(
+        &self,
+        corpus: &str,
+        path: &str,
+        line: u32,
+        kinds: &[&str],
+    ) -> Result<Option<NodeId>, StoreError> {
+        if kinds.is_empty() {
+            return Ok(None);
+        }
         (|| -> AnyResult<Option<NodeId>> {
+            // Placeholders start at ?4: ?1 corpus, ?2 path, ?3 line.
+            let placeholders = (0..kinds.len())
+                .map(|i| format!("?{}", i + 4))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id FROM nodes \
+                 WHERE corpus = ?1 AND path = ?2 \
+                   AND line IS NOT NULL AND end_line IS NOT NULL \
+                   AND line <= ?3 AND end_line >= ?3 \
+                   AND kind IN ({placeholders}) \
+                 ORDER BY (end_line - line) ASC, id ASC LIMIT 1"
+            );
             let mut stmt = self
                 .conn
-                .prepare_cached(
-                    "SELECT id FROM nodes \
-                     WHERE corpus = ?1 AND path = ?2 \
-                       AND line IS NOT NULL AND end_line IS NOT NULL \
-                       AND line <= ?3 AND end_line >= ?3 \
-                       AND kind IN ('function','method','fn','class','interface','struct', \
-                                    'trait','enum','type','typedef','union','object', \
-                                    'protocol','mixin','extension','namespace','init') \
-                     ORDER BY (end_line - line) ASC, id ASC LIMIT 1",
-                )
-                .context("enclosing_definition_at: prepare")?;
+                .prepare_cached(&sql)
+                .context("enclosing_node_at: prepare")?;
+            use rusqlite::types::Value;
+            let mut vals: Vec<Value> = vec![
+                Value::Text(corpus.to_string()),
+                Value::Text(path.to_string()),
+                Value::Integer(line as i64),
+            ];
+            vals.extend(kinds.iter().map(|k| Value::Text((*k).to_string())));
             let id: Option<i64> = stmt
-                .query_row(params![corpus, path, line as i64], |row| row.get(0))
+                .query_row(params_from_iter(vals), |row| row.get(0))
                 .optional()
-                .context("enclosing_definition_at: query")?;
+                .context("enclosing_node_at: query")?;
             Ok(id.map(i64_to_node_id))
         })()
         .map_err(|e| StoreError::Database(e.to_string()))

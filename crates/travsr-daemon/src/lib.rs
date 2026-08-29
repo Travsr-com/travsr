@@ -3655,26 +3655,82 @@ fn run_with_phase_b_finish_guard(
 /// behavior, which is a recall cost the next Phase B run repairs.
 const LIVE_CLOSURE_FILE_CAP: usize = 32;
 
-fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, abs_path: &Path) {
+/// Which live lanes a language's on-save reference detection can feed
+/// (RFC-027 sections 7.3 and 8.3).
+enum LiveLane {
+    /// A native Phase B extractor detects the references. Its records carry the
+    /// caller's identity, the receiver type where it could be recovered, and a
+    /// per-language signature key, so the fail-closed lexical floor (§7.3a) and
+    /// the editor lane (§7.3b) both run.
+    Native,
+    /// The generic tree-sitter detector detects the references. It recovers no
+    /// receiver type and builds no signature key by design, so the lexical floor
+    /// has nothing to match on and these languages run the **editor lane
+    /// alone** (§8.3). With no language server they abstain, which is today's
+    /// commit-gated behavior exactly (§7.3c, zero regression).
+    EditorOnly,
+}
+
+/// The language of `abs_path` and the live lane it participates in, or `None`
+/// when the live lane does not apply to it at all.
+///
+/// This is the one place a language is switched on. `Language::TypeScript`
+/// covers .ts/.tsx/.js/.jsx — there is no separate JavaScript variant, and the
+/// native extractor handles both.
+///
+/// The non-native arms are added one at a time, each measured against the
+/// per-`(language, kind)` precision gate before the next joins (RFC-027 §8.6).
+/// A language absent here costs nothing on save and keeps commit-gated behavior.
+fn live_language(abs_path: &Path) -> Option<(travsr_core::Language, LiveLane)> {
+    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match travsr_core::Language::from_extension(ext)? {
+        lang @ (travsr_core::Language::TypeScript
+        | travsr_core::Language::Rust
+        | travsr_core::Language::Python) => Some((lang, LiveLane::Native)),
+        lang @ travsr_core::Language::Go => Some((lang, LiveLane::EditorOnly)),
+        _ => None,
+    }
+}
+
+/// The references detected in a saved file, in whichever shape its detector
+/// produces.
+enum LiveRefSet {
+    /// [`LiveLane::Native`]: the native extractor's typed reference records plus
+    /// the inheritance clauses its dedicated detector found.
+    Native {
+        unresolved: Vec<travsr_core::UnresolvedCall>,
+        inheritance: Vec<travsr_core::InheritanceRef>,
+    },
+    /// [`LiveLane::EditorOnly`]: positions and names only.
+    Generic(travsr_analysis::live_detect::LiveRefs),
+}
+
+/// The reference set for a saved file and its repo-relative path, or `None` when
+/// the live lane does not apply (unsupported language, the precision gate
+/// disabled it, detection failed, or the file holds no references).
+///
+/// Shared by the save-path lexical lane ([`live_resolve_file`]) and the editor's
+/// target request (RFC-027 daemon-driven positions), so the two agree on exactly
+/// which references exist in a dirty file. Takes `&SqliteStore` — detection and
+/// the gate are read-only — so a `&mut` caller can reborrow and keep writing.
+fn extract_live_unresolved(
+    store: &SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+) -> Option<(String, LiveRefSet)> {
     let vname_path = abs_path
         .strip_prefix(repo_root)
         .unwrap_or(abs_path)
         .to_string_lossy()
         .replace('\\', "/");
-    let vname_path = vname_path.as_str();
-    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    // Only the native call-site extractor is per-language; everything downstream
-    // (`resolve_unambiguous_lexical`, `candidate_signatures`, the emit path) is
-    // language-agnostic. `Language::TypeScript` covers .ts/.tsx/.js/.jsx — there
-    // is no separate JavaScript variant, and the native extractor handles both;
-    // Rust is `.rs`.
-    let lang = match travsr_core::Language::from_extension(ext) {
-        Some(lang @ (travsr_core::Language::TypeScript | travsr_core::Language::Rust)) => lang,
-        _ => return,
-    };
+    // Detection is the only per-language stage; everything downstream
+    // (`resolve_unambiguous_lexical`, `candidate_signatures`, node mapping,
+    // target production, emit, ratification, the meter) is language-agnostic.
+    let (lang, lane) = live_language(abs_path)?;
     // RFC-027 section 12: a language the cumulative meter has measured below the
     // shipping bar is disabled — the fail-closed floor (§7.3c) is better than an
-    // un-ratified wrong edge. Extraction is skipped entirely so a disabled
+    // un-ratified wrong edge. Detection is skipped entirely so a disabled
     // language costs nothing on save.
     if !live_lane_enabled_for(store, lang.as_str()) {
         tracing::debug!(
@@ -3682,10 +3738,27 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
             language = lang.as_str(),
             "live: lane disabled for language by the precision gate"
         );
-        return;
+        return None;
     }
-    let files = [(abs_path.to_path_buf(), vname_path.to_string())];
-    // The two extractors return different arities: TypeScript is
+    if let LiveLane::EditorOnly = lane {
+        // RFC-027 section 8.2: detection only — no receiver-type recovery, no
+        // signature building, no resolution. The editor's language server
+        // answers each position; the daemon owns both node ids (§8.2 fencing).
+        let source = std::fs::read(abs_path).ok()?;
+        let refs = match travsr_analysis::live_detect::detect_live_refs(lang, &source) {
+            Ok(refs) => refs,
+            Err(e) => {
+                tracing::debug!(path = %vname_path, error = %e, "live: reference detection failed");
+                return None;
+            }
+        };
+        if refs.is_empty() {
+            return None;
+        }
+        return Some((vname_path, LiveRefSet::Generic(refs)));
+    }
+    let files = [(abs_path.to_path_buf(), vname_path.clone())];
+    // The extractors return different arities: TypeScript and Python are
     // `(nodes, edges, unresolved)`, Rust is `(nodes, edges, unresolved, refs)`
     // (the same-file `refs` the live lane does not consume).
     let extraction = match lang {
@@ -3701,20 +3774,132 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
             travsr_analysis::phase_b_rust::extract_native_phase_b(corpus, repo_root, Some(&files))
                 .map(|(_, _, unresolved, _)| unresolved)
         }
-        // Unreachable: the gate above admits only the two arms handled here.
-        _ => return,
+        travsr_core::Language::Python => {
+            travsr_analysis::phase_b_python::extract_native_phase_b(corpus, repo_root, Some(&files))
+                .map(|(_, _, unresolved)| unresolved)
+        }
+        // Unreachable: the gate above admits only the three arms handled here.
+        _ => return None,
     };
     let unresolved = match extraction {
         Ok(unresolved) => unresolved,
         Err(e) => {
             tracing::debug!(path = %vname_path, error = %e, "live: call-site extraction failed");
+            return None;
+        }
+    };
+    // RFC-027 live edge-kind scope: the IsImplementation lane's `extends` /
+    // `implements` clauses. TypeScript only for now — the resolver is
+    // language-agnostic, but the detector is per-language and is measured before
+    // each language joins (RFC-027 live edge-kind scope §6.2). Never fails the
+    // whole pass: a detector error is a freshness miss, not a correctness one.
+    // TS and Python only. Rust's `impl Trait for Type` does not fit the live
+    // IsImplementation model and is deferred (see phase_b_rust.rs).
+    let inheritance = match lang {
+        travsr_core::Language::TypeScript => {
+            travsr_analysis::phase_b_typescript::extract_unresolved_inheritance(
+                repo_root,
+                Some(&files),
+            )
+            .unwrap_or_default()
+        }
+        travsr_core::Language::Python => {
+            travsr_analysis::phase_b_python::extract_unresolved_inheritance(repo_root, Some(&files))
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    if unresolved.is_empty() && inheritance.is_empty() {
+        return None;
+    }
+    Some((
+        vname_path,
+        LiveRefSet::Native {
+            unresolved,
+            inheritance,
+        },
+    ))
+}
+
+/// RFC-027 sections 8.3 and 9.2: record every reference an editor-only language
+/// detected as `pending`, replacing the file's previous rows.
+///
+/// "There is a reference here and its target is not yet known" is true and
+/// useful, and saying it is what makes fail-closed honest rather than merely
+/// quiet. It is also the row the editor lane upgrades in place when its provider
+/// answers, which is how a language with no lexical floor still produces the
+/// claims the precision meter scores (§12).
+///
+/// A reference with no enclosing definition has no node to own the row and is
+/// skipped, exactly as the resolver would abstain on it.
+fn record_generic_pendings(
+    store: &mut SqliteStore,
+    corpus: &str,
+    path: &str,
+    detected: &travsr_analysis::live_detect::LiveRefs,
+) {
+    let named = detected
+        .calls
+        .iter()
+        .chain(detected.fields.iter())
+        .map(|r| (r.line, r.name.as_str()))
+        .chain(
+            detected
+                .inheritance
+                .iter()
+                .map(|r| (r.line, r.base_name.as_str())),
+        );
+    let mut states: Vec<travsr_store::RefResolution> = Vec::new();
+    for (line, name) in named {
+        let Ok(Some(src)) = store.enclosing_definition_at(corpus, path, line) else {
+            continue;
+        };
+        states.push(travsr_store::RefResolution {
+            src,
+            ref_line: line,
+            // 0, matching the native lane, so the editor's answer for this same
+            // reference upgrades this row rather than adding a second one.
+            ref_col: 0,
+            name: name.to_string(),
+            state: "pending",
+            resolved_dst: None,
+        });
+    }
+    if let Err(e) = store.replace_ref_resolution_states(corpus, path, &states) {
+        tracing::debug!(error = %e, "recording ref_resolution_state failed");
+    }
+}
+
+fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, abs_path: &Path) {
+    let Some((vname_path, refs)) = extract_live_unresolved(store, corpus, repo_root, abs_path)
+    else {
+        return;
+    };
+    let (unresolved, inheritance) = match refs {
+        LiveRefSet::Native {
+            unresolved,
+            inheritance,
+        } => (unresolved, inheritance),
+        // RFC-027 section 8.3: an editor-only language has no lexical floor —
+        // the generic detector recovers no receiver type and builds no signature
+        // key, so there is nothing to resolve without a server. What this pass
+        // still owes the file is the honest abstention record (§9.2): every
+        // detected reference starts `pending`, and the editor lane upgrades the
+        // ones its provider answers. Writing them here is also what clears the
+        // rows describing the pre-edit text, which `reindex_replace` leaves
+        // alone.
+        LiveRefSet::Generic(detected) => {
+            record_generic_pendings(store, corpus, &vname_path, &detected);
             return;
         }
     };
-    if unresolved.is_empty() {
-        return;
-    }
-    let outcome = live_resolve::resolve_unambiguous_lexical(store, corpus, vname_path, &unresolved);
+    let outcome = live_resolve::resolve_unambiguous_lexical(
+        store,
+        corpus,
+        &vname_path,
+        &unresolved,
+        &inheritance,
+    );
     if outcome.emitted > 0 {
         tracing::debug!(
             event = "live.file",
@@ -3723,6 +3908,45 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
             pending = outcome.pending,
             "live overlay refreshed for saved file"
         );
+    }
+}
+
+/// RFC-027 daemon-driven positions: the references in `abs_path` the editor
+/// should resolve with a language provider, computed from the same native
+/// extractor the save-path lexical lane uses.
+///
+/// The daemon owns *which* references and *which* edge kind; the editor owns
+/// only the exact column and the provider round-trip. This is what replaces the
+/// editor's blind `identifier(` scan and lets the lane reach every language the
+/// native extractor covers, not just what an English-shaped regex could spot.
+fn live_resolution_targets(
+    store: &SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+) -> Vec<travsr_ipc::message::LiveResolutionTarget> {
+    let Some((vname_path, refs)) = extract_live_unresolved(store, corpus, repo_root, abs_path)
+    else {
+        return Vec::new();
+    };
+    match refs {
+        LiveRefSet::Native {
+            unresolved,
+            inheritance,
+        } => {
+            let mut targets = live_resolve::targets_needing_editor(store, &unresolved);
+            targets.extend(live_resolve::inheritance_targets_needing_editor(
+                store,
+                corpus,
+                &vname_path,
+                &inheritance,
+            ));
+            targets
+        }
+        // RFC-027 section 8.3: no lexical floor runs for these languages, so
+        // there is no lane to partition against and every detected reference is
+        // an editor target.
+        LiveRefSet::Generic(refs) => live_resolve::generic_targets_needing_editor(&refs),
     }
 }
 
@@ -8591,6 +8815,117 @@ mod tests {
     /// method-on-receiver case the lexical lane must refuse. Refusing quietly
     /// and refusing honestly look identical in the edge table; they differ in
     /// whether anything can later say *why* the answer is thin.
+    /// RFC-027 section 8: a non-native language reaches the live lane through
+    /// on-save reference *detection* alone. Go has Phase A nodes and no native
+    /// Phase B extractor, so its references become editor targets — a
+    /// same-package cross-file call the graph could never resolve on its own,
+    /// and a field read as `ref/field` so it never reads as a caller (#757).
+    #[test]
+    fn a_go_file_yields_editor_targets_from_the_generic_detector() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/m\n\ngo 1.21\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("session.go"),
+            "package main\n\ntype Session struct {\n\tcount int\n}\n\nfunc (s *Session) Start() {}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("run.go");
+        std::fs::write(
+            &caller,
+            "package main\n\nfunc Run(s *Session) int {\n\ts.Start()\n\treturn s.count\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
+        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller);
+
+        let start = targets
+            .iter()
+            .find(|t| t.name == "Start")
+            .expect("the method call must be an editor target");
+        assert_eq!(start.ref_line, 4);
+        assert_eq!(start.edge_kind, "ref/call");
+        assert_eq!(start.provider, "definition");
+
+        let count = targets
+            .iter()
+            .find(|t| t.name == "count")
+            .expect("the field read must be an editor target");
+        assert_eq!(count.ref_line, 5);
+        assert_eq!(count.edge_kind, "ref/field");
+    }
+
+    /// The lexical floor is native-only (section 8.3): the generic detector
+    /// recovers no receiver type and builds no signature key, so there is
+    /// nothing for it to match on and the save path must not parse the file to
+    /// discard the result.
+    #[test]
+    fn a_go_save_emits_nothing_without_an_editor() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/m\n\ngo 1.21\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("session.go"),
+            "package main\n\ntype Session struct{}\n\nfunc (s *Session) Start() {}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("run.go");
+        std::fs::write(
+            &caller,
+            "package main\n\nfunc Run(s *Session) {\n\ts.Start()\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.get_meta("corpus").unwrap().unwrap_or_default()
+        };
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+        }
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.count_edges_with_provenance("live").unwrap(),
+            0,
+            "an editor-only language must emit nothing on save"
+        );
+        // Abstention is recorded, not dropped (§9.2): every detected reference
+        // is a pending row the editor lane later upgrades in place, and it is
+        // what gives the precision meter a claim to score for this language.
+        let pending = store.pending_refs_in_file(&corpus, "run.go").unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|(name, line)| name == "Start" && *line == 4),
+            "the unresolved call must leave a pending row, got {pending:?}"
+        );
+    }
+
     #[test]
     fn an_abstention_is_recorded_as_pending() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -11510,6 +11845,39 @@ fn handle_control_message(
             drop(s);
             enqueue_dirty_callers(dirty, repo_root, index_tx);
             (ControlResponse::ok(None), false)
+        }
+        Ok(ControlMessage::RequestLiveResolutionTargets {
+            repo_root: reported_root,
+            session,
+            file,
+            buffer_version: _,
+        }) => {
+            // Same identity guard as ReportLiveResolution: discovery enumerates a
+            // namespace, so the request has to say which repo it is for.
+            let reported = travsr_ipc::normalize_repo_root(std::path::Path::new(&reported_root));
+            if reported != travsr_ipc::normalize_repo_root(repo_root) {
+                return (
+                    ControlResponse::err("request is for a different repo".to_string()),
+                    false,
+                );
+            }
+
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
+            let abs_path = repo_root.join(&file);
+            let targets = live_resolution_targets(&s, &corpus, repo_root, &abs_path);
+            drop(s);
+
+            tracing::debug!(
+                event = "live.targets",
+                session = %session,
+                file = %file,
+                count = targets.len(),
+                "live resolution targets computed"
+            );
+            let mut resp = ControlResponse::ok(None);
+            resp.result = serde_json::to_value(&targets).ok();
+            (resp, false)
         }
         Ok(ControlMessage::ReportLiveResolution {
             repo_root: reported_root,

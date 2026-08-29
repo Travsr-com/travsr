@@ -1,35 +1,41 @@
 /**
- * RFC-027 live semantic resolution — the editor half.
+ * RFC-027 live semantic resolution — the editor half (daemon-driven positions).
  *
  * Phase B (SCIP) is commit-gated, so between commits the graph knows *that*
  * `user.save()` is a call but not *which* `save`. The daemon closes most of
- * that gap on its own (an unambiguous callee needs no help), but a call on a
- * typed receiver is exactly what lexical matching cannot settle. That is the
- * one question a language server is authoritative for, so we ask the one the
- * developer is already running.
+ * that gap on its own (an unambiguous callee needs no help), but a reference on
+ * a typed receiver — a method or field on `user`, an `implements` clause — is
+ * exactly what lexical matching cannot settle. That is the one question a
+ * language server is authoritative for, so we ask the one the developer is
+ * already running.
+ *
+ * ## Daemon-driven, not editor-scanned
+ *
+ * The editor no longer guesses which references exist. It **asks the daemon**
+ * (`requestLiveResolutionTargets`), which runs the real parser over the dirty
+ * file, keeps the references its own lexical lane cannot settle, and answers
+ * with a position, a name, an edge kind, and which provider to run. Reference
+ * detection therefore lives with the parser and the graph, not in an
+ * English-shaped regex here — which is what lets the lane reach fields,
+ * implements clauses, and every language the native extractor covers, rather
+ * than only `identifier(` in the handful the old scan understood.
+ *
+ * The editor's residual job is small and mechanical: find the column of the
+ * named reference on its line, run the provider, and report the answer back.
  *
  * ## What this does and does not do
  *
- * It calls `vscode.executeDefinitionProvider`, which routes to whatever
- * extension owns the language. **No server is spawned and none is bundled** —
- * this reuses a process the developer already trusts and already pays for
- * (RFC-027 section 7.6), which is why it costs nothing and needs no new trust
- * decision.
+ * It calls `vscode.executeDefinitionProvider` / `executeImplementationProvider`,
+ * which route to whatever extension owns the language. **No server is spawned
+ * and none is bundled** — this reuses a process the developer already trusts and
+ * already pays for (RFC-027 section 7.6), which is why it costs nothing and
+ * needs no new trust decision.
  *
  * It reports **positions**, never identities. It never names a graph node,
  * never mints a VName, and never asserts a relationship. The daemon maps both
  * endpoints to nodes itself against SCIP-owned identity. This is the line that
  * separates it from the #688 editor plane, where the editor's own *claim*
  * (a diagnostic) is what is being reported and so must stay out of the graph.
- *
- * ## Why a rough candidate scan is safe
- *
- * We do not have a parser here, so call sites are found with a deliberately
- * simple scan for `identifier(`. That is imprecise, and it does not need to be
- * precise: the daemon is fail-closed. A position that is not really a call, or
- * that resolves outside the graph, produces a `pending` marker, never an edge.
- * A sloppy candidate therefore costs one wasted provider call and some recall
- * — never correctness. Precision is enforced where the graph is, not here.
  *
  * Everything is bounded and best-effort: a capped number of queries per file,
  * a stale-buffer check before reporting, and every failure path is silent. A
@@ -38,49 +44,51 @@
 
 import * as vscode from "vscode";
 
-import { LiveResolutionItem, reportLiveResolution } from "./daemonIpc";
+import {
+  LiveResolutionItem,
+  LiveResolutionTargetItem,
+  reportLiveResolution,
+  requestLiveResolutionTargets,
+} from "./daemonIpc";
 
 /**
- * Cap on definition queries per file.
+ * Cap on provider queries per file.
  *
- * Each is an IPC round trip into another extension host. A hand-written source
- * file is far below this; a generated one can hold thousands, and resolving all
- * of them would cost more than the freshness is worth. Truncation degrades
- * recall, which the commit-gated path then repairs.
+ * Each is an IPC round trip into another extension host. The daemon already
+ * keeps the set surgical (only references its lexical lane could not settle), so
+ * a hand-written file is far below this; the cap only bounds a pathological
+ * generated file. Truncation degrades recall, which the commit-gated path
+ * repairs.
  */
 const MAX_QUERIES_PER_FILE = 200;
 
-/** Languages whose Phase B call sites the daemon can currently ratify. */
+/**
+ * Languages the daemon's live lane detects references for. A cheap pre-filter
+ * kept in step with the daemon's own gate (`live_language` in travsr-daemon):
+ * the daemon is authoritative and returns no targets for anything else, so this
+ * only avoids a wasted round trip on a save the daemon could not act on.
+ * Widening it beyond the daemon's set costs one empty request, never
+ * correctness.
+ *
+ * The first four run the daemon's native extractor; `go` runs the generic
+ * tree-sitter detector and reaches this lane through the editor alone
+ * (RFC-027 section 8.3), which is why it must be listed here to work at all.
+ */
 const SUPPORTED_LANGUAGES = new Set([
   "typescript",
   "typescriptreact",
   "javascript",
   "javascriptreact",
+  "rust",
+  "python",
+  "go",
 ]);
 
-/**
- * Identifier immediately followed by `(`.
- *
- * Deliberately crude (see the module note): it matches inside strings and
- * comments, and it misses calls split across lines. Both are recall costs the
- * daemon absorbs safely.
- */
-const CALL_SITE = /\b([A-Za-z_$][\w$]*)\s*\(/g;
-
-/** Keywords that look like calls but never are. */
-const NOT_CALLS = new Set([
-  "if",
-  "for",
-  "while",
-  "switch",
-  "catch",
-  "return",
-  "function",
-  "typeof",
-  "await",
-  "super",
-  "constructor",
-]);
+/** VS Code provider command for each daemon-named provider. */
+const PROVIDER_COMMAND: Record<string, string> = {
+  definition: "vscode.executeDefinitionProvider",
+  implementation: "vscode.executeImplementationProvider",
+};
 
 /** Repo-relative, forward-slash path, matching the graph's own path keys. */
 function repoRelative(repoRoot: string, uri: vscode.Uri): string | null {
@@ -89,27 +97,36 @@ function repoRelative(repoRoot: string, uri: vscode.Uri): string | null {
   return full.slice(repoRoot.length).replace(/^[/\\]/, "").replace(/\\/g, "/");
 }
 
-/** Candidate call-site positions in `doc`, capped. */
-function callSites(doc: vscode.TextDocument): vscode.Position[] {
-  const out: vscode.Position[] = [];
-  const text = doc.getText();
-  CALL_SITE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = CALL_SITE.exec(text)) !== null) {
-    if (out.length >= MAX_QUERIES_PER_FILE) break;
-    if (NOT_CALLS.has(m[1])) continue;
-    out.push(doc.positionAt(m.index));
-  }
-  return out;
+/** Escape a name for use inside a `RegExp`. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
- * Ask the running language provider where each call site resolves, and publish
- * the answers to the daemon.
+ * Column of `name` on 1-based `line` in `doc`, or `null` if it is not there.
+ *
+ * The native extractor records a reference's line but not its column, so the
+ * editor recovers the column here. A whole-word match avoids resolving a
+ * substring of a longer identifier; if the name has moved off the line (a race
+ * against an edit) we return `null` and skip, never a wrong position.
+ */
+function columnOf(
+  doc: vscode.TextDocument,
+  line: number,
+  name: string
+): number | null {
+  if (line < 1 || line > doc.lineCount) return null;
+  const text = doc.lineAt(line - 1).text;
+  const m = new RegExp(`\\b${escapeRegExp(name)}\\b`).exec(text);
+  return m ? m.index : null;
+}
+
+/**
+ * Resolve the references the daemon asked about and publish the answers.
  *
  * Returns the number of resolutions reported, for tests and logging. Resolves
  * to 0 on every uninteresting path (unsupported language, file outside the
- * repo, no provider, nothing resolved) and never rejects.
+ * repo, no targets, no provider, nothing resolved) and never rejects.
  */
 export async function publishLiveResolutions(
   repoRoot: string,
@@ -120,44 +137,23 @@ export async function publishLiveResolutions(
   if (!file) return 0;
 
   const version = doc.version;
-  const sites = callSites(doc);
-  if (sites.length === 0) return 0;
+  const targets = await requestLiveResolutionTargets(repoRoot, file, version);
+  if (targets.length === 0) return 0;
+  // The buffer may have moved while the daemon was parsing; the target lines
+  // would no longer describe this file.
+  if (doc.version !== version) return 0;
 
   const resolutions: LiveResolutionItem[] = [];
-  for (const pos of sites) {
-    // The buffer moved while we were asking. Answers computed against the old
-    // text no longer describe this file, so drop the whole batch rather than
-    // report positions that have shifted (RFC-027 section 11).
+  let queries = 0;
+  for (const target of targets) {
+    if (queries >= MAX_QUERIES_PER_FILE) break;
+    // Drop the whole batch if the buffer moved: answers computed against old
+    // text no longer describe this file (RFC-027 section 11).
     if (doc.version !== version) return 0;
 
-    let locations: unknown;
-    try {
-      locations = await vscode.commands.executeCommand(
-        "vscode.executeDefinitionProvider",
-        doc.uri,
-        pos
-      );
-    } catch {
-      continue; // no provider, or it threw. Neither is worth reporting.
-    }
-
-    const target = firstLocation(locations);
-    if (!target) continue;
-    const targetPath = repoRelative(repoRoot, target.uri);
-    // Outside the workspace (node_modules, a .d.ts in the SDK) — dropped here
-    // so the live lane stays intra-corpus (RFC-027 section 8.2). The daemon
-    // would abstain anyway; not sending it saves the round trip.
-    if (!targetPath) continue;
-
-    const word = doc.getWordRangeAtPosition(pos);
-    resolutions.push({
-      ref_line: pos.line + 1,
-      ref_col: pos.character,
-      name: word ? doc.getText(word) : "",
-      target_path: targetPath,
-      target_line: target.range.start.line + 1,
-      buffer_version: version,
-    });
+    const item = await resolveTarget(repoRoot, doc, target, version);
+    queries += 1;
+    if (item) resolutions.push(item);
   }
 
   if (resolutions.length === 0) return 0;
@@ -167,13 +163,59 @@ export async function publishLiveResolutions(
 }
 
 /**
- * Normalize what a definition provider returned.
+ * Resolve one daemon-named target through its provider, or `null` to skip.
+ *
+ * Every skip is safe: the daemon is fail-closed, so a reference we cannot pin, a
+ * provider that throws, or a target outside the workspace simply does not become
+ * an edge. A sloppy skip costs recall, never correctness.
+ */
+async function resolveTarget(
+  repoRoot: string,
+  doc: vscode.TextDocument,
+  target: LiveResolutionTargetItem,
+  version: number
+): Promise<LiveResolutionItem | null> {
+  const command = PROVIDER_COMMAND[target.provider];
+  if (!command) return null;
+
+  const col = columnOf(doc, target.ref_line, target.name);
+  if (col === null) return null;
+  const pos = new vscode.Position(target.ref_line - 1, col);
+
+  let locations: unknown;
+  try {
+    locations = await vscode.commands.executeCommand(command, doc.uri, pos);
+  } catch {
+    return null; // no provider, or it threw. Neither is worth reporting.
+  }
+
+  const found = firstLocation(locations);
+  if (!found) return null;
+  const targetPath = repoRelative(repoRoot, found.uri);
+  // Outside the workspace (node_modules, a .d.ts in the SDK) — dropped here so
+  // the live lane stays intra-corpus (RFC-027 section 8.2). The daemon would
+  // abstain anyway; not sending it saves the round trip.
+  if (!targetPath) return null;
+
+  return {
+    ref_line: target.ref_line,
+    ref_col: col,
+    name: target.name,
+    target_path: targetPath,
+    target_line: found.range.start.line + 1,
+    buffer_version: version,
+    edge_kind: target.edge_kind,
+  };
+}
+
+/**
+ * Normalize what a definition/implementation provider returned.
  *
  * Providers may answer with `Location[]`, `LocationLink[]`, or a bare
- * `Location`, and a single call can resolve to several definitions (an
- * overload set, a merged declaration). We take the first: reporting several
- * targets for one position would ask the daemon to pick, which is precisely
- * the guess the fail-closed contract forbids.
+ * `Location`, and a single reference can resolve to several targets (an overload
+ * set, a merged declaration). We take the first: reporting several targets for
+ * one position would ask the daemon to pick, which is precisely the guess the
+ * fail-closed contract forbids.
  */
 function firstLocation(
   raw: unknown

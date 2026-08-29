@@ -1145,6 +1145,26 @@ pub struct UnresolvedCall {
     pub recv_type: Option<String>,
 }
 
+/// An `extends`/`implements` clause the native extractor found but does not
+/// resolve cross-file, for RFC-027's live `IsImplementation` lane.
+///
+/// Like [`UnresolvedCall`] it carries no identity — only the base type's simple
+/// name and the line it is written on, which is exactly what the live lane needs
+/// to resolve it (lexically against a unique repo-wide definition, or via the
+/// editor's definition provider) and to abstain otherwise. The daemon derives
+/// the edge's source (the implementing class) from the line and owns both node
+/// ids, so nothing here mints a VName.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct InheritanceRef {
+    /// The base type's simple name (the edge *target*), exactly as written: the
+    /// superclass in `class C extends B`, the interface in `implements I`.
+    pub base_name: String,
+    /// 1-based line the base name appears on — the class declaration line, which
+    /// the daemon maps to the implementing class (the edge source) via
+    /// `enclosing_definition_at`.
+    pub line: u32,
+}
+
 // ── Import Resolution ────────────────────────────────────────────────────────
 //
 // Query-time bridge over missing `ResolvesTo` edges.

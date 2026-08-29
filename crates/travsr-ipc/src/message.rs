@@ -108,6 +108,32 @@ pub enum ControlMessage {
         /// so are unknown rather than clean.
         undiagnosed: usize,
     },
+    /// RFC-027 daemon-driven positions: an editor asks the daemon which
+    /// references in a dirty file it should resolve.
+    ///
+    /// The daemon runs the native extractor over the file, keeps the references
+    /// its own lexical lane cannot settle, and answers with a
+    /// [`LiveResolutionTarget`] per reference — line, name, edge kind, and which
+    /// provider to run. The editor then resolves each and reports back with
+    /// [`ControlMessage::ReportLiveResolution`]. This replaces the editor's blind
+    /// `identifier(` scan, so reference detection lives with the parser and the
+    /// graph rather than in an English-shaped regex.
+    ///
+    /// The answer rides `ControlResponse::result` as a JSON array. Daemons older
+    /// than this variant answer with a parse error, which the extension treats as
+    /// "no targets" — the live lane simply stays at its lexical floor.
+    RequestLiveResolutionTargets {
+        /// Absolute workspace root, checked against the daemon's own repo exactly
+        /// as `ReportLiveResolution` does (#698 review, P1): discovery enumerates
+        /// a namespace, not a repo.
+        repo_root: String,
+        /// Stable for the lifetime of one editor window.
+        session: String,
+        /// The dirty file, repo-relative with forward slashes.
+        file: String,
+        /// Editor buffer version, echoed so the editor can drop a stale batch.
+        buffer_version: i64,
+    },
     /// RFC-027: an editor reports where a reference in a dirty file actually
     /// resolves to, so the daemon can close the between-commits semantic gap.
     ///
@@ -185,6 +211,47 @@ pub struct LiveResolution {
     /// a resolution whose buffer has moved on rather than trusting a stale
     /// position (RFC-027 section 11).
     pub buffer_version: i64,
+    /// The graph edge kind this reference resolves to, as the stable
+    /// `EdgeKind::as_str` string (`ref/call`, `ref/field`, `ref/imports`,
+    /// `is-implementation`, `overrides`). The editor knows which reference shape
+    /// it queried and which provider answered, so it names the kind; the daemon
+    /// emits an edge of exactly that kind rather than assuming a call
+    /// (RFC-027 live edge-kind scope). `#[serde(default)]` yields `ref/call`,
+    /// preserving the pre-expansion payload where every live edge was a call.
+    #[serde(default = "default_live_edge_kind")]
+    pub edge_kind: String,
+}
+
+/// Back-compat default for [`LiveResolution::edge_kind`]: an older extension
+/// only ever resolved calls, so a payload without the field means `ref/call`.
+fn default_live_edge_kind() -> String {
+    "ref/call".to_string()
+}
+
+/// One reference the editor should resolve, computed by the daemon from the
+/// native extractor's reference set (RFC-027 daemon-driven positions).
+///
+/// The daemon says *which* reference and *which* edge kind; the editor finds the
+/// exact column of `name` on `ref_line`, runs `provider`, and reports the answer
+/// back as a [`LiveResolution`]. This is what replaces the editor's blind
+/// `identifier(` scan: reference detection moves to the daemon (which has the
+/// parser and the graph), leaving the editor only the provider round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LiveResolutionTarget {
+    /// 1-based line of the reference in the dirty file. The editor searches this
+    /// line for `name` to recover the column the native extractor does not carry.
+    pub ref_line: u32,
+    /// The referenced name, so the editor can pin the column and so the daemon
+    /// can record an honest `pending` row if the editor's answer maps to nothing.
+    pub name: String,
+    /// The graph edge kind this reference resolves to, as `EdgeKind::as_str`
+    /// (`ref/call`, `ref/field`, `ref/imports`, `is-implementation`,
+    /// `overrides`). Echoed back on the [`LiveResolution`] so the daemon emits an
+    /// edge of exactly this kind.
+    pub edge_kind: String,
+    /// Which editor provider answers this reference shape: `definition` (calls,
+    /// fields, imports) or `implementation` (implements clauses, overrides).
+    pub provider: String,
 }
 
 /// One file's current diagnostic state, as an editor sees it.
@@ -324,9 +391,70 @@ mod tests {
                 assert_eq!(r.target_path, "src/user.ts");
                 assert_eq!(r.target_line, 17);
                 assert_eq!(r.buffer_version, 9);
+                // An extension too old to send edge_kind means the pre-expansion
+                // behaviour: every live edge was a call.
+                assert_eq!(
+                    r.edge_kind, "ref/call",
+                    "a payload without edge_kind defaults to ref/call"
+                );
             }
             other => panic!("expected ReportLiveResolution, got {other:?}"),
         }
+    }
+
+    // The expanded wire shape: an editor that resolved a field carries the edge
+    // kind, so the daemon emits ref/field rather than assuming a call.
+    #[test]
+    fn a_live_resolution_carries_its_edge_kind() {
+        let line = r#"{"op":"report-live-resolution","repo_root":"/r","session":"s",
+            "file":"src/zoo.rs","resolutions":[{"ref_line":5,"ref_col":8,"name":"count",
+              "target_path":"src/zoo.rs","target_line":2,"buffer_version":3,
+              "edge_kind":"ref/field"}]}"#;
+        match serde_json::from_str::<ControlMessage>(line).expect("must parse") {
+            ControlMessage::ReportLiveResolution { resolutions, .. } => {
+                assert_eq!(resolutions[0].edge_kind, "ref/field");
+            }
+            other => panic!("expected ReportLiveResolution, got {other:?}"),
+        }
+    }
+
+    // RFC-027 daemon-driven positions: the request the extension sends to ask
+    // which references it should resolve.
+    #[test]
+    fn request_live_resolution_targets_wire_shape_matches_the_extension() {
+        let line = r#"{"op":"request-live-resolution-targets","repo_root":"/home/alice/proj",
+            "session":"vscode-1-abc","file":"src/order.ts","buffer_version":9}"#;
+        match serde_json::from_str::<ControlMessage>(line).expect("request line must parse") {
+            ControlMessage::RequestLiveResolutionTargets {
+                repo_root,
+                session,
+                file,
+                buffer_version,
+            } => {
+                assert_eq!(repo_root, "/home/alice/proj");
+                assert_eq!(session, "vscode-1-abc");
+                assert_eq!(file, "src/order.ts");
+                assert_eq!(buffer_version, 9);
+            }
+            other => panic!("expected RequestLiveResolutionTargets, got {other:?}"),
+        }
+    }
+
+    // The daemon serialises targets into `ControlResponse::result`; the field
+    // names here are the contract the extension parses.
+    #[test]
+    fn a_resolution_target_serialises_to_the_shape_the_extension_reads() {
+        let target = LiveResolutionTarget {
+            ref_line: 19,
+            name: "save".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        };
+        let v = serde_json::to_value(&target).expect("serialise");
+        assert_eq!(v["ref_line"], 19);
+        assert_eq!(v["name"], "save");
+        assert_eq!(v["edge_kind"], "ref/call");
+        assert_eq!(v["provider"], "definition");
     }
 
     // An empty resolution list is meaningful: the editor looked and resolved
