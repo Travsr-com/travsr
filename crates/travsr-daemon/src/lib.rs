@@ -4155,22 +4155,65 @@ const LIVE_PRECISION_GATE: f64 = 0.99;
 
 /// Minimum verified live claims before the gate may DISABLE a language.
 ///
-/// Below this the sample is too small to act on, so the lane stays enabled and
-/// keeps gathering evidence — a language (a brand-new one especially) has to be
-/// allowed to run to be measured at all. Precision-first, but not so trigger-shy
-/// that one early disagreement silences a language for good.
+/// Below this the sample is too small to act on as an *adverse* reading, so an
+/// already-shipped language keeps running and gathering evidence rather than
+/// being silenced for good by one early disagreement. Precision-first, but not
+/// trigger-shy.
 const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
+
+/// RFC-027 sections 12 and 8.7.5: the languages the live lane ships ENABLED,
+/// each vouched at measured precision ≥ 0.99.
+///
+/// This is the strict-gate opt-in (§8.7.6 decision). RFC §12 says a language
+/// ships enabled only at measured precision ≥ 0.99, but the earlier policy left
+/// an *unmeasured* language enabled so it could earn a reading — which, when
+/// eleven non-native languages joined at once, meant nine shipped enabled with
+/// no reading at all. Strict gating inverts that default: a language is disabled
+/// until it is on this list, and it joins the list only after a real server plus
+/// its ratification oracle measured it at ≥ 0.99 (the §11.3 procedure). Adding a
+/// `nodes.language` value here is therefore the per-language opt-in the RFC asks
+/// for, auditable in git history against the reading that earned it.
+///
+/// `nodes.language` values (what the meter keys on). JavaScript has no value of
+/// its own — `.js`/`.jsx` map to `typescript` — so one entry covers both.
+///
+/// Starting set: the three native languages (gated at ship since RFC §14 Phase
+/// 0–4) plus Go and Dart, the two measured end to end at 1.0000 (§8.7.2). The
+/// remaining non-native languages join as §11.3 fills in.
+const LIVE_LANE_SHIPPED: &[&str] = &["typescript", "rust", "python", "go", "dart"];
+
+/// Force-enable a language for measurement, bypassing the strict opt-in gate
+/// (but never the adverse-meter safety below).
+///
+/// A language absent from [`LIVE_LANE_SHIPPED`] cannot run, so it can never
+/// produce the claims the meter needs to measure it — the deadlock the strict
+/// gate would otherwise create. `TRAVSR_LIVE_LANE_MEASURE` (comma-separated
+/// `nodes.language` values) lifts the gate for exactly the languages being
+/// measured, so the §11.3 harness can drive one long enough to earn a reading.
+/// Set on the daemon running a fixture; never in production, where the shipped
+/// list is authoritative.
+fn live_lane_measure_forced(language: &str) -> bool {
+    std::env::var("TRAVSR_LIVE_LANE_MEASURE")
+        .ok()
+        .is_some_and(|v| v.split(',').any(|l| l.trim() == language))
+}
 
 /// RFC-027 section 12: is the live lane enabled for `language`?
 ///
-/// Precision-driven and biased toward on: enabled unless the cumulative
-/// per-language meter carries a statistically meaningful adverse reading — at
-/// least [`LIVE_PRECISION_MIN_SAMPLE`] verified claims *and* precision below
-/// [`LIVE_PRECISION_GATE`]. A language with too little evidence, or none, stays
-/// enabled so it can earn a reading. This is what makes "disable the lane for a
-/// language" a measured decision rather than a config guess, and it is
-/// self-healing: a later run whose Phase B agreement lifts the cumulative
-/// precision back over the bar re-enables the language on its own.
+/// Two independent conditions, both of which must hold:
+///
+/// 1. **No adverse reading.** The cumulative per-language meter must not carry a
+///    statistically meaningful adverse sample — at least
+///    [`LIVE_PRECISION_MIN_SAMPLE`] verified claims *and* precision below
+///    [`LIVE_PRECISION_GATE`]. This disables even a shipped language whose
+///    measured precision has degraded, and it is self-healing: a later run whose
+///    Phase B agreement lifts the cumulative precision back over the bar
+///    re-enables it on its own.
+/// 2. **Vouched to ship** (§8.7.6). The language is on [`LIVE_LANE_SHIPPED`], or
+///    force-enabled for measurement ([`live_lane_measure_forced`]). An
+///    unmeasured language is disabled until it earns a reading and is opted in,
+///    which makes "ships enabled only at measured precision ≥ 0.99" literally
+///    true rather than aspirational.
 fn live_lane_enabled_for(store: &SqliteStore, language: &str) -> bool {
     let (agree, disagree, unverifiable) = read_precision_totals_for(store, Some(language));
     let sample = travsr_store::LivePrecision {
@@ -4179,10 +4222,12 @@ fn live_lane_enabled_for(store: &SqliteStore, language: &str) -> bool {
         unverifiable,
     };
     let verified = agree + disagree;
-    match sample.precision() {
-        Some(p) if verified >= LIVE_PRECISION_MIN_SAMPLE && p < LIVE_PRECISION_GATE => false,
-        _ => true,
+    if let Some(p) = sample.precision() {
+        if verified >= LIVE_PRECISION_MIN_SAMPLE && p < LIVE_PRECISION_GATE {
+            return false;
+        }
     }
+    LIVE_LANE_SHIPPED.contains(&language) || live_lane_measure_forced(language)
 }
 
 /// RFC-027 section 8.3: retire the live overlay and clear resolved pendings.
@@ -8319,10 +8364,11 @@ mod tests {
     fn the_precision_gate_disables_a_language_only_on_a_meaningful_adverse_sample() {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
 
-        // No reading at all: enabled, so a new language can earn one.
+        // No reading at all, but Rust is a shipped/vouched language, so enabled.
         assert!(live_lane_enabled_for(&store, "rust"));
 
-        // Below the bar but too few verified claims to act on: still enabled.
+        // Below the bar but too few verified claims to act on: still enabled
+        // (Rust is shipped, and the sample is not a meaningful adverse reading).
         store.set_meta("live_precision.rust", "4,1,0").unwrap();
         assert!(
             live_lane_enabled_for(&store, "rust"),
@@ -8352,6 +8398,49 @@ mod tests {
             live_lane_enabled_for(&store, "typescript"),
             "the gate must be scoped per language, not corpus-wide"
         );
+    }
+
+    /// RFC-027 section 8.7.6: an unmeasured, un-vouched language ships DISABLED.
+    ///
+    /// This is the strict-gate decision. The earlier policy left an unmeasured
+    /// language enabled to earn a reading; when eleven non-native languages
+    /// joined at once, that meant nine shipped enabled with no reading. Now a
+    /// language is disabled until it is on `LIVE_LANE_SHIPPED`, and the
+    /// measurement harness lifts the gate for exactly the language it is
+    /// measuring via `TRAVSR_LIVE_LANE_MEASURE`.
+    #[test]
+    fn an_unmeasured_language_ships_disabled_until_opted_in() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // A vouched language with no reading is enabled; an un-vouched one is not.
+        assert!(live_lane_enabled_for(&store, "go"), "go is shipped");
+        assert!(
+            !live_lane_enabled_for(&store, "java"),
+            "an unmeasured non-shipped language must be disabled by the strict gate"
+        );
+        assert!(!live_lane_enabled_for(&store, "kotlin"));
+
+        // Force-enabling for measurement lifts the gate for exactly that language.
+        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "java,kotlin");
+        assert!(live_lane_enabled_for(&store, "java"));
+        assert!(live_lane_enabled_for(&store, "kotlin"));
+        assert!(
+            !live_lane_enabled_for(&store, "scala"),
+            "the force list is per-language, not a blanket override"
+        );
+        std::env::remove_var("TRAVSR_LIVE_LANE_MEASURE");
+
+        // The adverse-meter safety still wins over a force-enable: a measured
+        // language below the bar stays disabled even while being measured.
+        let mut store = store;
+        store.set_meta("live_precision.java", "18,5,0").unwrap();
+        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "java");
+        assert!(
+            !live_lane_enabled_for(&store, "java"),
+            "a meaningful adverse reading disables a language even under force"
+        );
+        std::env::remove_var("TRAVSR_LIVE_LANE_MEASURE");
     }
 
     /// The gate must not be clearable by an empty sample.
@@ -8974,7 +9063,12 @@ mod tests {
         let db_path = tmp.path().join(".travsr/graph.db");
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
         let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
+        // Java is not on LIVE_LANE_SHIPPED (§8.7.6 strict gate): this test is
+        // about the generic detector's output, not the shipping decision, so it
+        // force-enables Java the way the §11.3 measurement harness does.
+        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "java");
         let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller);
+        std::env::remove_var("TRAVSR_LIVE_LANE_MEASURE");
 
         let by_name = |name: &str| {
             targets
