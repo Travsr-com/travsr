@@ -725,13 +725,18 @@ fn prov_of(e: &travsr_core::Edge) -> String {
         .unwrap_or_else(|| "tree-sitter".to_string())
 }
 
+/// One expansion step out of [`next_edges`]:
+/// `(edge_kind, next_id, expand, incoming, provenance)`. The 5th element is the
+/// edge's true `edges.provenance` (DEBT-75).
+pub type NextEdge = (travsr_core::EdgeKind, NodeId, bool, bool, String);
+
 pub fn next_edges(
     store: &SqliteStore,
     node_id: NodeId,
     direction: QueryDirection,
     edge_mode: QueryEdgeMode,
     is_seed: bool,
-) -> anyhow::Result<Vec<(travsr_core::EdgeKind, NodeId, bool, bool, String)>> {
+) -> anyhow::Result<Vec<NextEdge>> {
     // DEBT-75: the 5th element is the edge's true `edges.provenance`, carried
     // through from the store readers so callers no longer have to assume
     // "tree-sitter". `unwrap_or` only fires on a constructed (never-read) edge,

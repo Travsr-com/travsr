@@ -282,7 +282,7 @@ fn live_overlay_note(store: &SqliteStore) -> Option<String> {
         ));
     }
     Some(format!(
-        "[note: live overlay active \u{2014} {}. These resolve deterministically at the next commit; filter to provenance != live for ratified truth only.]",
+        "[note: live overlay active: {}. These resolve deterministically at the next commit; filter to provenance != live for ratified truth only.]",
         parts.join("; ")
     ))
 }
