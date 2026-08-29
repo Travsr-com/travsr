@@ -4189,17 +4189,26 @@ const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
 /// - `java` — jdtls + scip-java, 1.0000 (`3,0,0`, call/field/is-impl); scip-java
 ///   needs a Maven/Gradle build to emit references (a build-less fixture swept
 ///   and read `0,0,4`).
+/// - `csharp` — csharp-ls + scip-dotnet, 1.0000 (`6,0,0`, call/field/is-impl).
+///   Live edges resolve via csharp-ls with no extra setup; the oracle needs
+///   `DOTNET_ROOT` in the daemon env (the travsr-lang csharp emitter's
+///   `dotnet_root()` does not resolve a Homebrew install inside the sandbox — a
+///   fixable gap there). Without a working oracle the edges persist as `live`
+///   rather than ratifying, which is honest, not wrong.
 ///
-/// Deliberately absent, each blocked by its **ratification oracle**, not the
-/// live lane (whose edges are correct wherever a server resolves them):
+/// Deliberately absent:
 /// - `c`, `objectivec` — edges ratify correctly but scip-clang writes no
 ///   matching `edge_sites`, so the meter reads `0,0,2` unverifiable (§10 item 4).
-/// - `csharp`, `scala` — travsr-lang-csharp / travsr-lang-scala emit definitions
-///   but no reference edges in a minimal project, so there is nothing to ratify
-///   or measure against; the live edges resolve via the server but get swept.
-/// - `kotlin` — detection works, but kotlin-language-server needs a Gradle
-///   project model and long JVM warmup to resolve; not yet driven end to end.
-/// - `php`, `ruby` — server not installed on the measurement machine.
+/// - `ruby` — the LSP lane is fundamentally weak: an untyped receiver
+///   (`def run(s); s.start; end`) gives ruby-lsp nothing to resolve, so it
+///   abstains. This is the §8.4 dynamic-language limit, not an install gap.
+/// - `php` — the LSP lane *works* with a typed receiver (`run(Session $s)`) via
+///   Intelephense, but the oracle scip-php needs Composer (absent here), so no
+///   reading yet. Opt in once measured.
+/// - `scala`, `kotlin` — blocked by JVM build-toolchain setup, not the live
+///   lane: Scala's SemanticDB oracle needs `sbt compile`; Kotlin's KLS (its
+///   oracle *and* its live server) needs a working Gradle build, which the
+///   Gradle/Kotlin/JDK version matrix on this machine would not produce.
 const LIVE_LANE_SHIPPED: &[&str] = &[
     "typescript",
     "rust",
@@ -4209,6 +4218,7 @@ const LIVE_LANE_SHIPPED: &[&str] = &[
     "swift",
     "cpp",
     "java",
+    "csharp",
 ];
 
 /// Force-enable a language for measurement, bypassing the strict opt-in gate
@@ -8445,17 +8455,17 @@ mod tests {
         // A vouched language with no reading is enabled; an un-vouched one is not.
         assert!(live_lane_enabled_for(&store, "go"), "go is shipped");
         assert!(
-            !live_lane_enabled_for(&store, "csharp"),
+            !live_lane_enabled_for(&store, "scala"),
             "an unmeasured non-shipped language must be disabled by the strict gate"
         );
         assert!(!live_lane_enabled_for(&store, "kotlin"));
 
         // Force-enabling for measurement lifts the gate for exactly that language.
-        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "csharp,kotlin");
-        assert!(live_lane_enabled_for(&store, "csharp"));
+        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "scala,kotlin");
+        assert!(live_lane_enabled_for(&store, "scala"));
         assert!(live_lane_enabled_for(&store, "kotlin"));
         assert!(
-            !live_lane_enabled_for(&store, "scala"),
+            !live_lane_enabled_for(&store, "ruby"),
             "the force list is per-language, not a blanket override"
         );
         std::env::remove_var("TRAVSR_LIVE_LANE_MEASURE");
@@ -8463,10 +8473,10 @@ mod tests {
         // The adverse-meter safety still wins over a force-enable: a measured
         // language below the bar stays disabled even while being measured.
         let mut store = store;
-        store.set_meta("live_precision.csharp", "18,5,0").unwrap();
-        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "csharp");
+        store.set_meta("live_precision.scala", "18,5,0").unwrap();
+        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "scala");
         assert!(
-            !live_lane_enabled_for(&store, "csharp"),
+            !live_lane_enabled_for(&store, "scala"),
             "a meaningful adverse reading disables a language even under force"
         );
         std::env::remove_var("TRAVSR_LIVE_LANE_MEASURE");
