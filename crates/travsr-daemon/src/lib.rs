@@ -4177,10 +4177,22 @@ const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
 /// `nodes.language` values (what the meter keys on). JavaScript has no value of
 /// its own — `.js`/`.jsx` map to `typescript` — so one entry covers both.
 ///
-/// Starting set: the three native languages (gated at ship since RFC §14 Phase
-/// 0–4) plus Go and Dart, the two measured end to end at 1.0000 (§8.7.2). The
-/// remaining non-native languages join as §11.3 fills in.
-const LIVE_LANE_SHIPPED: &[&str] = &["typescript", "rust", "python", "go", "dart"];
+/// The list grows as §11.3 fills in. Each entry's earning reading:
+/// - `typescript`, `python` — native, gated at ship since RFC §14 Phase 0–4.
+/// - `rust` — native; re-measured end to end at 1.0000 (`4,0,0`, §11.3).
+/// - `go` — gopls, 1.0000 (`4,0,0`).
+/// - `dart` — Dart analysis server + travsr-lang-dart, 1.0000 (`3,0,1`).
+/// - `swift` — sourcekit-lsp + travsr-swift-index-emitter, 1.0000 (`3,0,1`).
+/// - `cpp` — clangd + scip-clang, 1.0000 (`1,0,0`); recall capped by §8.7.3
+///   (out-of-line method defs abstain), so the field read is what it emits and
+///   that is correct.
+///
+/// Deliberately absent: `c`, `objectivec` — their edges ratify correctly but
+/// scip-clang writes no matching `edge_sites`, so the meter reads them
+/// `unverifiable` (`0,0,2`) and cannot certify ≥ 0.99; they stay disabled until
+/// the oracle carries call-site evidence (§10 item 4). `java`, `csharp`,
+/// `kotlin`, `php`, `scala`, `ruby` — not yet measured against a real server.
+const LIVE_LANE_SHIPPED: &[&str] = &["typescript", "rust", "python", "go", "dart", "swift", "cpp"];
 
 /// Force-enable a language for measurement, bypassing the strict opt-in gate
 /// (but never the adverse-meter safety below).
