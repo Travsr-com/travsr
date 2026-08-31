@@ -261,7 +261,7 @@ pub fn spawn(
             // never worth refusing to watch the repo at all.
             unwatch_skipped_subtrees(&mut watcher, &repo_root, &gitignore);
 
-            // Signal ready — watch is established and skip dirs are unwatched,
+            // Signal ready, watch is established and skip dirs are unwatched,
             // so the caller can proceed.
             let _ = ready_tx.send(Ok(()));
 
