@@ -627,6 +627,27 @@ impl Migration for V24RefResolutionTarget {
     }
 }
 
+/// RFC-027 / DEBT-75: restore the covering property `Edge.provenance` broke.
+///
+/// Threading provenance to the MCP surface put it in the `iter_edges_from_kind`
+/// and `iter_edges_to` SELECT lists, which took both off the covering indexes v4
+/// and v14 added and reintroduced a main-table row fetch per edge on the PPR
+/// traversal step and on every reverse lookup. Appending the column to both
+/// index tails makes them index-only again.
+///
+/// Also adds a partial index for `WHERE provenance = 'live'`, which the
+/// live-overlay freshness note runs on every prose query and which had no index
+/// at all (a full scan of `edges` for a note that is usually about zero rows).
+struct V25EdgeProvenanceCovering;
+impl Migration for V25EdgeProvenanceCovering {
+    fn version(&self) -> u32 {
+        25
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        store.exec_ddl(include_str!("migrations/v25_edge_provenance_covering.sql"))
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -654,6 +675,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V22TestRole);
     r.register(V23RefResolutionState);
     r.register(V24RefResolutionTarget);
+    r.register(V25EdgeProvenanceCovering);
     r
 }
 
@@ -5171,6 +5193,37 @@ LIMIT ?4",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// RFC-027 section 12: consume the claims the precision meter just scored.
+    ///
+    /// Called at ratification immediately after
+    /// [`Self::live_precision_sample_by_language`], because the meter is
+    /// **cumulative**: it adds each run's sample onto the counters in `meta`.
+    /// Nothing else retires a resolved row —
+    /// [`Self::replace_ref_resolution_states`] only fires on that file's next
+    /// save and [`Self::clear_resolved_pending_refs`] only touches `pending` —
+    /// so without this a claim recorded once is re-scored at every subsequent
+    /// commit. The *ratio* survives (both buckets inflate together), but the
+    /// sample size does not, and the sample size is what
+    /// `LIVE_PRECISION_MIN_SAMPLE` gates on: four real claims would cross a bar
+    /// meant to need twenty. A re-score is also not stable, because a claim
+    /// whose `ref_line` now belongs to a different call after later edits can
+    /// flip from agree to disagree and penalise a resolution that was right when
+    /// it was made.
+    ///
+    /// Safe to run here because the claim has no reader left: the sweep needs
+    /// nothing from it, and the freshness note reports only `pending` rows.
+    ///
+    /// Returns the number of rows consumed.
+    pub fn consume_measured_ref_resolutions(&mut self) -> Result<usize, StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM ref_resolution_state \
+                 WHERE state = 'resolved' AND resolved_dst IS NOT NULL",
+                [],
+            )
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// RFC-027 section 10: the pending references in `path`, for the
     /// `live_overlay` freshness note.
     ///
@@ -5220,8 +5273,15 @@ LIMIT ?4",
     /// (qualified), the two shapes `signature` takes. Scoped to `language`: a
     /// live edge stays within one language, both because §8.2 keeps it
     /// intra-corpus and because a cross-language definition would not resolve
-    /// through the dependent's own provider anyway. Leaf names are identifiers,
-    /// so they carry no `LIKE` wildcard to escape.
+    /// through the dependent's own provider anyway.
+    ///
+    /// The comparison is an exact suffix test (`substr`), **not** a `LIKE`
+    /// pattern built from `r.name`. `_` is LIKE's single-character wildcard and
+    /// identifiers are full of underscores, so `LIKE '%:' || r.name` matched a
+    /// pending `do_thing` against a definition named `doXthing`. That is not
+    /// recall-neutral: `limit` is a hard cap with `ORDER BY dep.path ASC`, so
+    /// spurious matches consume the budget and crowd out the genuine dependents
+    /// this function exists to find.
     ///
     /// Capped at `limit` files (`LIVE_CLOSURE_FILE_CAP` at the call site): a
     /// symbol thousands of files are pending on is a hot utility, and the
@@ -5249,8 +5309,10 @@ LIMIT ?4",
                        AND EXISTS ( \
                          SELECT 1 FROM nodes def \
                          WHERE def.corpus = ?1 AND def.path = ?2 AND def.language = ?3 \
-                           AND (def.signature LIKE '%:' || r.name \
-                                OR def.signature LIKE '%.' || r.name) \
+                           AND (substr(def.signature, -(length(r.name) + 1)) \
+                                  = ':' || r.name \
+                                OR substr(def.signature, -(length(r.name) + 1)) \
+                                  = '.' || r.name) \
                        ) \
                      ORDER BY dep.path ASC LIMIT ?4",
                 )
@@ -5273,10 +5335,19 @@ LIMIT ?4",
     ///
     /// The count half of [`pending_refs_in_file`], for the envelope note where
     /// only the magnitude is wanted.
+    ///
+    /// Joins `nodes` for the same reason [`pending_refs_in_file`] does: a row
+    /// whose `src` node no longer exists describes a reference that no longer
+    /// exists either, and counting it inflates the number the MCP freshness note
+    /// shows an agent. [`Self::purge_orphan_ref_resolution_states`] removes such
+    /// rows at ratification; the join is what keeps the two readers agreeing in
+    /// between.
     pub fn pending_ref_count(&self) -> Result<u64, StoreError> {
         self.conn
             .query_row(
-                "SELECT count(*) FROM ref_resolution_state WHERE state = 'pending'",
+                "SELECT count(*) FROM ref_resolution_state r \
+                 JOIN nodes n ON n.id = r.src \
+                 WHERE r.state = 'pending'",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -5287,9 +5358,17 @@ LIMIT ?4",
 
     /// RFC-027 section 8.3: clear pending rows that Phase B has since resolved.
     ///
-    /// Run at ratification. A reference whose enclosing node now has an
-    /// outgoing edge is no longer pending, whatever resolved it, so this is
-    /// keyed on edge existence rather than on which lane won.
+    /// Run at ratification. A reference Phase B recorded a call site for is no
+    /// longer pending, whatever resolved it, so this is keyed on site existence
+    /// rather than on which lane won.
+    ///
+    /// Granularity is `(src, ref_line)`, matching [`Self::live_precision_sample`]
+    /// exactly. Anything coarser is not safe: keying on `src` alone asks "does
+    /// this *enclosing definition* have any outgoing edge at all", so one
+    /// resolved call cleared every other pending reference in the same function
+    /// on no evidence. Section 9.2's honest abstention is the deliverable the
+    /// whole precision-first argument rests on, and silently under-reporting it
+    /// is the one thing it cannot afford.
     ///
     /// Returns the number of rows cleared.
     pub fn clear_resolved_pending_refs(&mut self) -> Result<usize, StoreError> {
@@ -5297,7 +5376,35 @@ LIMIT ?4",
             .execute(
                 "DELETE FROM ref_resolution_state \
                  WHERE state = 'pending' \
-                   AND EXISTS (SELECT 1 FROM edges e WHERE e.src = ref_resolution_state.src)",
+                   AND EXISTS (SELECT 1 FROM edge_sites s \
+                               WHERE s.src = ref_resolution_state.src \
+                                 AND s.line = ref_resolution_state.ref_line)",
+                [],
+            )
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 9.2: drop reference rows whose `src` node is gone.
+    ///
+    /// [`Self::replace_ref_resolution_states`] scopes its delete through
+    /// `src IN (SELECT id FROM nodes WHERE corpus = ? AND path = ?)`, which
+    /// cannot reach a row whose node id no longer exists. A `NodeId` hashes the
+    /// VName, signature included, so renaming a symbol retires its id and takes
+    /// that delete's only handle with it: the row outlives every path that could
+    /// remove it (the next save cannot see it, and
+    /// [`Self::clear_resolved_pending_refs`] cannot either, because a deleted
+    /// node has no sites). Left alone the count the freshness note reports climbs
+    /// monotonically with every rename in the repo.
+    ///
+    /// Run once per ratification rather than per save: the readers already join
+    /// `nodes` and so stay correct in the meantime, and this is a table scan.
+    ///
+    /// Returns the number of rows purged.
+    pub fn purge_orphan_ref_resolution_states(&mut self) -> Result<usize, StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM ref_resolution_state \
+                 WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = ref_resolution_state.src)",
                 [],
             )
             .map_err(|e| StoreError::Database(e.to_string()))
@@ -8760,21 +8867,45 @@ mod tests {
         assert_eq!(old_exists, 0, "idx_edges_dst_kind must be dropped by v14");
     }
 
-    #[test]
-    fn v14_reverse_edge_query_uses_covering_index() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        // EXPLAIN QUERY PLAN — column 3 is the "detail" text in SQLite 3.36+.
-        let plan: String = store
+    /// The plan text for `sql`, as SQLite's EXPLAIN QUERY PLAN reports it
+    /// (column 3 is the "detail" string in SQLite 3.36+).
+    fn query_plan(store: &SqliteStore, sql: &str) -> String {
+        store
             .conn
-            .query_row(
-                "EXPLAIN QUERY PLAN SELECT src FROM edges WHERE dst=? AND kind=?",
-                rusqlite::params![0i64, "ref/call"],
-                |row| row.get(3),
-            )
-            .unwrap();
+            .query_row(&format!("EXPLAIN QUERY PLAN {sql}"), [], |row| row.get(3))
+            .unwrap()
+    }
+
+    /// The traversal hot paths must stay index-only.
+    ///
+    /// Asserts on the **exact SQL `iter_edges_from_kind` and `iter_edges_to`
+    /// issue**, not a hand-written stand-in. The earlier version of this test
+    /// hardcoded `SELECT src FROM edges WHERE dst=? AND kind=?` while the code
+    /// had moved to `SELECT src, kind, provenance ...`, and it only checked that
+    /// the plan *named* the index — which it does whether or not the index
+    /// covers. RFC-027's `provenance` column therefore took both queries off
+    /// their covering indexes with the guard test still green. Asserting
+    /// "COVERING INDEX" against the real query is what makes that lapse visible.
+    #[test]
+    fn edge_traversal_queries_stay_index_only() {
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let forward = query_plan(
+            &store,
+            "SELECT dst, provenance FROM edges WHERE src = 1 AND kind = 'ref/call'",
+        );
         assert!(
-            plan.contains("idx_edges_dst_kind_cov"),
-            "iter_edges_to query must use covering index; EXPLAIN detail: {plan}",
+            forward.contains("COVERING INDEX idx_edges_src_kind_cov"),
+            "iter_edges_from_kind must be index-only; EXPLAIN detail: {forward}",
+        );
+
+        let reverse = query_plan(
+            &store,
+            "SELECT src, kind, provenance FROM edges WHERE dst = 1",
+        );
+        assert!(
+            reverse.contains("COVERING INDEX idx_edges_dst_kind_cov"),
+            "iter_edges_to must be index-only; EXPLAIN detail: {reverse}",
         );
     }
 
@@ -9498,6 +9629,191 @@ mod tests {
         assert_eq!(
             store.resolve_scip_symbol("scip . a/b 1.0 X#m().").unwrap(),
             Some(n3.id)
+        );
+    }
+
+    // ── RFC-027 ref_resolution_state (review findings 3, 5 and 7) ────────────
+
+    /// A node in `corpus` at `path` with a signature and a span.
+    fn live_node(corpus: &str, path: &str, sig: &str, kind: &str, line: u32) -> Node {
+        let mut n = Node::new(VName::new(corpus, "", path, "typescript", sig), kind);
+        n.line = Some(line);
+        n.end_line = Some(line + 20);
+        n
+    }
+
+    fn pending(src: NodeId, line: u32, name: &str) -> RefResolution {
+        RefResolution {
+            src,
+            ref_line: line,
+            ref_col: 0,
+            name: name.to_string(),
+            state: "pending",
+            resolved_dst: None,
+        }
+    }
+
+    /// Finding 3: the predicate must be `(src, line)`, not `src`.
+    ///
+    /// Three pending references in one function and Phase B resolves one of
+    /// them. Keyed on `src` alone, any single outgoing edge on the enclosing
+    /// definition cleared all three, so section 9.2's honest abstention silently
+    /// under-reported the other two.
+    #[test]
+    fn clearing_pending_refs_is_line_wise_not_node_wide() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = live_node("c", "src/a.ts", "fn:caller", "function", 1);
+        let callee = live_node("c", "src/b.ts", "fn:callee", "function", 1);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/a.ts",
+                &[
+                    pending(caller.id, 3, "one"),
+                    pending(caller.id, 4, "two"),
+                    pending(caller.id, 5, "three"),
+                ],
+            )
+            .unwrap();
+
+        // Phase B resolved only the reference on line 4.
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 4)])
+            .unwrap();
+
+        assert_eq!(store.clear_resolved_pending_refs().unwrap(), 1);
+        assert_eq!(
+            store.pending_ref_count().unwrap(),
+            2,
+            "the two references Phase B said nothing about must stay pending"
+        );
+    }
+
+    /// Finding 5: a renamed symbol retires its `NodeId`, which is the only
+    /// handle `replace_ref_resolution_states` has, so its rows outlive every
+    /// delete path. `pending_ref_count` must not count them, and the ratification
+    /// purge must remove them.
+    #[test]
+    fn pending_rows_do_not_survive_the_rename_of_their_symbol() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let before = live_node("c", "src/a.ts", "fn:target", "function", 1);
+        store.put_node(&before).unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(before.id, 4, "target")])
+            .unwrap();
+        assert_eq!(store.pending_ref_count().unwrap(), 1);
+
+        // The rename: the old node is gone, a new id takes its place, and the
+        // file's rows are rewritten under the new id.
+        store
+            .reindex_replace("c", "src/a.ts", &[], &[], "h")
+            .unwrap();
+        let after = live_node("c", "src/a.ts", "fn:renamed", "function", 1);
+        store.put_node(&after).unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(after.id, 4, "renamed")])
+            .unwrap();
+
+        assert_eq!(
+            store.pending_ref_count().unwrap(),
+            1,
+            "the count the MCP freshness note reports must not inflate on a rename"
+        );
+        assert_eq!(store.purge_orphan_ref_resolution_states().unwrap(), 1);
+        assert_eq!(store.pending_ref_count().unwrap(), 1);
+    }
+
+    /// Finding 7: `_` is LIKE's single-character wildcard and identifiers are
+    /// full of underscores, so a pattern built from `r.name` matched `do_thing`
+    /// against a definition named `doXthing`. Spurious matches are not
+    /// recall-neutral — they consume the `limit` cap under `ORDER BY path`.
+    #[test]
+    fn a_dependent_match_is_exact_not_a_like_pattern() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let dep = live_node("c", "dep.ts", "fn:consumer", "function", 1);
+        // The only definition in def.ts differs from the pending name by one
+        // character in the position `_` would wildcard.
+        let decoy = live_node("c", "def.ts", "fn:doXthing", "function", 1);
+        store.put_node(&dep).unwrap();
+        store.put_node(&decoy).unwrap();
+        store
+            .replace_ref_resolution_states("c", "dep.ts", &[pending(dep.id, 4, "do_thing")])
+            .unwrap();
+
+        assert!(
+            store
+                .dependents_pending_on_file("c", "def.ts", "typescript", 32)
+                .unwrap()
+                .is_empty(),
+            "an underscore in an identifier must not act as a LIKE wildcard"
+        );
+
+        // The genuine match still resolves, in both signature shapes.
+        let unqualified = live_node("c", "def.ts", "fn:do_thing", "function", 5);
+        store.put_node(&unqualified).unwrap();
+        assert_eq!(
+            store
+                .dependents_pending_on_file("c", "def.ts", "typescript", 32)
+                .unwrap(),
+            vec!["dep.ts".to_string()],
+            "`kind:Leaf` must match"
+        );
+
+        let mut qualified_only = SqliteStore::open_in_memory().unwrap();
+        let dep2 = live_node("c", "dep.ts", "fn:consumer", "function", 1);
+        let method = live_node("c", "def.ts", "method:Thing.do_thing", "method", 5);
+        qualified_only.put_node(&dep2).unwrap();
+        qualified_only.put_node(&method).unwrap();
+        qualified_only
+            .replace_ref_resolution_states("c", "dep.ts", &[pending(dep2.id, 4, "do_thing")])
+            .unwrap();
+        assert_eq!(
+            qualified_only
+                .dependents_pending_on_file("c", "def.ts", "typescript", 32)
+                .unwrap(),
+            vec!["dep.ts".to_string()],
+            "`kind:Qual.Leaf` must match too"
+        );
+    }
+
+    /// Finding 4: the meter is cumulative, so a claim it has scored has to be
+    /// retired or every later commit counts it again.
+    #[test]
+    fn a_scored_claim_is_consumed_so_the_sample_size_stays_honest() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = live_node("c", "src/a.ts", "fn:caller", "function", 1);
+        let callee = live_node("c", "src/b.ts", "fn:callee", "function", 1);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/a.ts",
+                &[RefResolution {
+                    src: caller.id,
+                    ref_line: 4,
+                    ref_col: 0,
+                    name: "callee".to_string(),
+                    state: "resolved",
+                    resolved_dst: Some(callee.id),
+                }],
+            )
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 4)])
+            .unwrap();
+
+        assert_eq!(store.live_precision_sample().unwrap().agree, 1);
+        assert_eq!(store.consume_measured_ref_resolutions().unwrap(), 1);
+        assert_eq!(
+            store.live_precision_sample().unwrap().claims(),
+            0,
+            "a second ratification must not re-score a claim already counted"
         );
     }
 

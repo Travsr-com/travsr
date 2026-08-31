@@ -17,6 +17,7 @@ pub mod emit;
 pub mod ffi;
 pub mod generic;
 pub mod live_detect;
+pub mod live_scope;
 pub mod skeleton;
 pub mod snippet;
 pub mod test_role;

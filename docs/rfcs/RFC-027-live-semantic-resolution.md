@@ -257,6 +257,8 @@ Stated as an invariant: **every row the sweep can delete is a row the live lane 
 
 **The sweep is language-scoped, not blanket.** `made_progress` advances the `phase_b_commit` marker whenever *any* language produced results, even when another language's sidecar crashed (#712). A blanket `DELETE FROM edges WHERE provenance='live'` would therefore discard live edges for a language whose SCIP truth was never re-derived in that run. The sweep is restricted to the languages that completed, keyed on the src node's language. Live edges for a crashed language survive, still labeled `live`, which is honest. Invariant #4 is unaffected: a clean run has nothing crashed, so the scoped sweep is total, and that is the case the convergence property below asserts.
 
+**The sweep is repo-wide within a language, not region-scoped.** Issue #794 describes deleting live edges "in the region" — `changed_set` union its reverse closure. The implementation retires a completed language's whole overlay instead, and that is a deliberate deviation rather than an oversight: ratification rides the **whole-project** Phase B run (§9.3 above; incremental SCIP over a region is `DEBT(travsr-25)` and unbuilt), so every live edge in that language has just been either re-derived in place or left behind as one Phase B did not derive. Restricting the delete to a region would leave live edges outside it that nothing else will ever retire, which is precisely what Invariant #4 forbids. When region-scoped ratification lands, this scoping should narrow with it.
+
 **Property (must hold, property-tested):**
 ```
 graph(G) --overlay--> G' --ratify--> graph(G)

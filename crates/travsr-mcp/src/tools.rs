@@ -262,6 +262,15 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
 /// `None` when the overlay is empty and nothing is pending, which is the state
 /// of any repo with no uncommitted edits — so the note never fires on a clean
 /// tree and costs a reader nothing.
+///
+/// Both counts are **repo-wide**, and the wording says so. The note sits beside
+/// [`phase_b_degraded_note`] and the head-drift note, which are repo-wide
+/// advisories too; what it must not do is read as a statement about the answer
+/// it is appended to, so an agent asking "who calls `foo`" is not left thinking
+/// the pending references are `foo`'s. Scoping it to the files in the response
+/// would mean threading those files through every tool's note composition;
+/// `pending_refs_in_file` is there for a caller that wants the file-scoped
+/// detail directly.
 fn live_overlay_note(store: &SqliteStore) -> Option<String> {
     let live = store.count_edges_with_provenance("live").ok().unwrap_or(0);
     let pending = store.pending_ref_count().ok().unwrap_or(0);
@@ -282,7 +291,7 @@ fn live_overlay_note(store: &SqliteStore) -> Option<String> {
         ));
     }
     Some(format!(
-        "[note: live overlay active: {}. These resolve deterministically at the next commit; filter to provenance != live for ratified truth only.]",
+        "[note: live overlay active repo-wide (these counts describe the whole repo, not this answer): {}. These resolve deterministically at the next commit; filter to provenance != live for ratified truth only.]",
         parts.join("; ")
     ))
 }

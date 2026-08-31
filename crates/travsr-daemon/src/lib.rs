@@ -3719,6 +3719,12 @@ enum LiveRefSet {
     Native {
         unresolved: Vec<travsr_core::UnresolvedCall>,
         inheritance: Vec<travsr_core::InheritanceRef>,
+        /// RFC-027 section 7.3 step 1: the names this file binds to a local or a
+        /// parameter. Carried alongside the references because both consumers of
+        /// this set (the save-path floor and the editor-target producer) need the
+        /// same local-clean answer, and computing it twice would let them
+        /// disagree about which references the floor owns.
+        locally_bound: std::collections::HashSet<String>,
     },
     /// [`LiveLane::EditorOnly`]: positions and names only.
     Generic(travsr_analysis::live_detect::LiveRefs),
@@ -3831,11 +3837,22 @@ fn extract_live_unresolved(
     if unresolved.is_empty() && inheritance.is_empty() {
         return None;
     }
+    // RFC-027 section 7.3 step 1. Read once here rather than inside the floor:
+    // the extractor above already needs the file, and the target producer needs
+    // the identical answer.
+    let locally_bound = match std::fs::read(abs_path) {
+        Ok(source) => travsr_analysis::live_scope::local_binding_names(lang, &source),
+        Err(e) => {
+            tracing::debug!(path = %vname_path, error = %e, "live: binder scan could not read file");
+            std::collections::HashSet::new()
+        }
+    };
     Some((
         vname_path,
         LiveRefSet::Native {
             unresolved,
             inheritance,
+            locally_bound,
         },
     ))
 }
@@ -3894,11 +3911,12 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
     else {
         return;
     };
-    let (unresolved, inheritance) = match refs {
+    let (unresolved, inheritance, locally_bound) = match refs {
         LiveRefSet::Native {
             unresolved,
             inheritance,
-        } => (unresolved, inheritance),
+            locally_bound,
+        } => (unresolved, inheritance, locally_bound),
         // RFC-027 section 8.3: an editor-only language has no lexical floor —
         // the generic detector recovers no receiver type and builds no signature
         // key, so there is nothing to resolve without a server. What this pass
@@ -3918,6 +3936,7 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
         &vname_path,
         &unresolved,
         &inheritance,
+        &locally_bound,
     );
     if outcome.emitted > 0 {
         tracing::debug!(
@@ -3952,13 +3971,16 @@ fn live_resolution_targets(
         LiveRefSet::Native {
             unresolved,
             inheritance,
+            locally_bound,
         } => {
-            let mut targets = live_resolve::targets_needing_editor(store, &unresolved);
+            let mut targets =
+                live_resolve::targets_needing_editor(store, &unresolved, &locally_bound);
             targets.extend(live_resolve::inheritance_targets_needing_editor(
                 store,
                 corpus,
                 &vname_path,
                 &inheritance,
+                &locally_bound,
             ));
             targets
         }
@@ -4255,6 +4277,23 @@ fn live_lane_measure_forced(language: &str) -> bool {
 ///    unmeasured language is disabled until it earns a reading and is opted in,
 ///    which makes "ships enabled only at measured precision ≥ 0.99" literally
 ///    true rather than aspirational.
+///
+/// The two directions deliberately use different evidence bars, and the
+/// asymmetry is the point rather than an oversight. Enabling is a **human**
+/// decision, recorded in git next to the reading that earned it (the per-entry
+/// readings in [`LIVE_LANE_SHIPPED`]'s doc comment, which run from 1 to 6
+/// verified claims); a reviewer can see the evidence and refuse it. Disabling is
+/// **automatic** and irreversible-feeling to a user who cannot see why their
+/// lane went quiet, so it needs a bar noise cannot cross on its own, which is
+/// what [`LIVE_PRECISION_MIN_SAMPLE`] is. Requiring twenty verified claims to
+/// *enable* would instead mean shipping nothing at all: no language can produce
+/// claims while disabled, and `TRAVSR_LIVE_LANE_MEASURE` exists precisely
+/// because that deadlock is real.
+///
+/// Those recorded readings were taken while the meter double-counted a claim at
+/// every commit (each fixture runs one or two commits, so the inflation is small
+/// but not zero). They are worth re-taking against the corrected meter before
+/// any further language joins the list.
 fn live_lane_enabled_for(store: &SqliteStore, language: &str) -> bool {
     let (agree, disagree, unverifiable) = read_precision_totals_for(store, Some(language));
     let sample = travsr_store::LivePrecision {
@@ -4283,6 +4322,18 @@ fn ratify_live_overlay(store: &mut SqliteStore, ratified: &[String]) {
     // after the Phase B writes, because that is the truth being compared
     // against, and before the sweep, because the sweep discards the evidence.
     measure_live_precision(store);
+    // The meter is cumulative, so a scored claim has to be retired or the next
+    // commit counts it again: the ratio would survive but the sample size — the
+    // thing `LIVE_PRECISION_MIN_SAMPLE` gates on — would not.
+    match store.consume_measured_ref_resolutions() {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!(
+            event = "live.precision.consumed",
+            claims = n,
+            "retired the live claims this ratification scored"
+        ),
+        Err(e) => tracing::debug!("consuming measured live claims failed: {e:#}"),
+    }
     match store.sweep_live_edges_for_languages(ratified) {
         Ok(0) => {}
         Ok(n) => tracing::debug!(
@@ -4293,10 +4344,21 @@ fn ratify_live_overlay(store: &mut SqliteStore, ratified: &[String]) {
         ),
         Err(e) => tracing::warn!("live overlay sweep failed: {e:#}"),
     }
-    // A reference whose enclosing node now has an outgoing edge is no longer
-    // pending, whoever resolved it.
+    // A reference Phase B recorded a call site for is no longer pending, whoever
+    // resolved it.
     if let Err(e) = store.clear_resolved_pending_refs() {
         tracing::debug!("clearing resolved pending refs failed: {e:#}");
+    }
+    // Rows whose `src` node was renamed away are unreachable by every other
+    // delete path, so they would otherwise accumulate for the life of the repo.
+    match store.purge_orphan_ref_resolution_states() {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!(
+            event = "live.pending.purged",
+            rows = n,
+            "purged reference rows whose enclosing symbol no longer exists"
+        ),
+        Err(e) => tracing::debug!("purging orphan ref_resolution_state rows failed: {e:#}"),
     }
 }
 
@@ -8242,7 +8304,15 @@ mod tests {
         drop(store_mutex);
 
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
-        let sample = store.live_precision_sample().unwrap();
+        // Read the cumulative counters ratification wrote, not the claim rows:
+        // ratification consumes a claim once it has scored it, so the meter is
+        // the `meta` reading, which is also what the shipping gate consults.
+        let (agree, disagree, unverifiable) = read_precision_totals_for(&store, None);
+        let sample = travsr_store::LivePrecision {
+            agree,
+            disagree,
+            unverifiable,
+        };
 
         assert!(
             sample.claims() > 0,
@@ -8360,11 +8430,14 @@ mod tests {
         drop(store_mutex);
 
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
-        let by_lang = store.live_precision_sample_by_language().unwrap();
-        let rust = by_lang
-            .get("rust")
-            .copied()
-            .unwrap_or_else(|| panic!("no rust bucket in the meter; got {by_lang:?}"));
+        // As above: the per-language reading lives in `meta` after ratification
+        // has consumed the claims it scored.
+        let (agree, disagree, unverifiable) = read_precision_totals_for(&store, Some("rust"));
+        let rust = travsr_store::LivePrecision {
+            agree,
+            disagree,
+            unverifiable,
+        };
 
         assert!(
             rust.claims() > 0,
@@ -12237,9 +12310,29 @@ fn handle_control_message(
 
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
-            let outcome =
-                live_resolve::apply_live_resolutions(&mut s, &corpus, &file, &resolutions);
+            // RFC-027 section 11: answers are accepted only for questions this
+            // daemon is still asking. `buffer_version` cannot carry that on its
+            // own — it is the editor's counter, minted and checked by the
+            // editor, so it says nothing about whether the daemon re-parsed the
+            // file between handing out targets and receiving answers. It did
+            // have to, if the file changed on disk underneath an unchanged
+            // editor buffer, and `enclosing_definition_at` then reads spans from
+            // the newer parse. Re-detecting against the file as it stands now
+            // closes that window with the daemon's own evidence.
+            let current = live_resolution_targets(&s, &corpus, repo_root, &repo_root.join(&file));
+            let accepted = live_resolve::retain_current_targets(&resolutions, &current);
+            let stale = resolutions.len() - accepted.len();
+            let outcome = live_resolve::apply_live_resolutions(&mut s, &corpus, &file, &accepted);
             drop(s);
+            if stale > 0 {
+                tracing::debug!(
+                    event = "live.report.stale",
+                    session = %session,
+                    file = %file,
+                    dropped = stale,
+                    "dropped resolutions for references the current parse no longer has"
+                );
+            }
 
             tracing::debug!(
                 event = "live.report",

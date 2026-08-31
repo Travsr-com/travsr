@@ -134,6 +134,42 @@ pub fn apply_live_resolutions(
     outcome
 }
 
+/// RFC-027 section 11: keep only the resolutions that answer a question the
+/// daemon is still asking.
+///
+/// The editor reports `(ref_line, name, edge_kind)` triples it resolved from a
+/// target list the daemon produced earlier. `targets` is that list recomputed
+/// against the file **as the daemon now parses it**, so a reference that has
+/// moved, changed name, or stopped existing is simply absent and its answer is
+/// dropped.
+///
+/// This is what consumes the intent behind the protocol's `buffer_version`.
+/// The version number itself cannot be the guard: it is the editor's counter,
+/// minted and checked by the editor, and the window it cannot see is the one
+/// where the *daemon* re-parsed the file (a change on disk under an unchanged
+/// buffer) between handing out targets and receiving answers. In that window
+/// `enclosing_definition_at` and `enclosing_node_at` read spans from the newer
+/// parse and a resolution computed against the older text can land on a node
+/// that has moved. Comparing against the daemon's own current reference set
+/// answers exactly that question with evidence the daemon owns.
+///
+/// It also narrows the trust surface: an editor can no longer volunteer a
+/// position the daemon never asked about.
+pub fn retain_current_targets(
+    resolutions: &[LiveResolution],
+    targets: &[LiveResolutionTarget],
+) -> Vec<LiveResolution> {
+    let asked: std::collections::HashSet<(u32, &str, &str)> = targets
+        .iter()
+        .map(|t| (t.ref_line, t.name.as_str(), t.edge_kind.as_str()))
+        .collect();
+    resolutions
+        .iter()
+        .filter(|r| asked.contains(&(r.ref_line, r.name.as_str(), r.edge_kind.as_str())))
+        .cloned()
+        .collect()
+}
+
 /// Map one editor resolution to an edge, or `None` to abstain.
 fn resolve_one(store: &SqliteStore, corpus: &str, file: &str, r: &LiveResolution) -> Option<Edge> {
     // The editor names the edge kind it resolved (RFC-027 live edge-kind scope).
@@ -156,7 +192,54 @@ fn resolve_one(store: &SqliteStore, corpus: &str, file: &str, r: &LiveResolution
         .enclosing_node_at(corpus, &r.target_path, r.target_line, target_kinds(edge))
         .ok()
         .flatten()?;
+    // Does the node the editor landed on actually carry the name it said it was
+    // resolving? Nothing above checks this: the gates are edge kind, target node
+    // kind, span containment and corpus equality, none of which notice a
+    // provider that jumped to an unrelated symbol, a resolution computed against
+    // a stale buffer, or a column recovered from the wrong occurrence on the
+    // line. One signature-leaf comparison on a node already fetched catches all
+    // three, so it is the cheapest gate in the lane.
+    if !names_match(store, dst, &r.name) {
+        return None;
+    }
     edge_if_sound(store, src, dst, edge)
+}
+
+/// True when `dst`'s signature plausibly names `name`.
+///
+/// Signatures are `kind:Leaf` or `kind:Qual.Leaf`, and `leaf_of` returns the
+/// last segment of either, which is normally the identifier the editor was asked
+/// about. A node that cannot be read fails the check rather than passing it: an
+/// unreadable target is exactly the case to abstain on.
+///
+/// One shape legitimately differs: a **constructor call** names its *type*
+/// (`new Thing()` in Java/C#, `Thing()` in Swift/Dart, all captured by the
+/// detector as a `ref/call` to `Thing`), while a provider may jump to the
+/// initialiser rather than the type declaration — `method:Thing.init`, whose
+/// leaf is `init`. So a constructor leaf also matches on the qualifier. This is
+/// the only relaxation: the target must still carry the reported name somewhere
+/// in its own signature.
+fn names_match(store: &SqliteStore, dst: NodeId, name: &str) -> bool {
+    /// Leaves a provider may land on for a call written as the type's name.
+    const CONSTRUCTOR_LEAVES: &[&str] = &["init", "new", "constructor"];
+
+    let Some(node) = store.get_node(dst).ok().flatten() else {
+        return false;
+    };
+    let sig = &node.vname.signature;
+    let leaf = travsr_core::ident::leaf_of(sig);
+    if leaf == name {
+        return true;
+    }
+    if !CONSTRUCTOR_LEAVES.contains(&leaf) {
+        return false;
+    }
+    // The qualifier: `Thing` in `method:Thing.init`.
+    sig.split_once(':')
+        .map(|(_, body)| body)
+        .unwrap_or(sig)
+        .rsplit_once('.')
+        .is_some_and(|(qual, _)| qual.rsplit('.').next().unwrap_or(qual) == name)
 }
 
 /// RFC-027 section 6: what an edit actually invalidates.
@@ -261,12 +344,23 @@ const MAX_CLOSURE_FILES: usize = 64;
 /// size one is emitted. `alt_callee_sig` is tried when the primary misses (the
 /// #709 PascalCase class-vs-function ambiguity), under the same exactly-one
 /// rule, never to widen the net.
+///
+/// `locally_bound` is section 7.3's **step 1**, and step 3a needs both halves:
+/// `|candidates| == 1` **and** local-clean. It holds the names this file binds
+/// to a local variable or a parameter
+/// ([`travsr_analysis::live_scope::local_binding_names`]); a bare-identifier
+/// reference to one of them is not a free reference and must not be resolved
+/// repo-wide, however unique the name happens to be elsewhere. Uniqueness alone
+/// was the reported defect: a local `const save = () => 1` is not indexed by
+/// Phase A, so `fn:save` had exactly one definition in the graph and the floor
+/// pointed the call at an unrelated function in another file.
 pub fn resolve_unambiguous_lexical(
     store: &mut SqliteStore,
     corpus: &str,
     path: &str,
     unresolved: &[UnresolvedCall],
     inheritance: &[InheritanceRef],
+    locally_bound: &std::collections::HashSet<String>,
 ) -> LiveOutcome {
     let mut outcome = LiveOutcome::default();
     // Section 9.2: every reference this pass saw, and what became of it. An
@@ -287,7 +381,7 @@ pub fn resolve_unambiguous_lexical(
         // Section 12's meter needs the claim itself: by ratification a re-derived
         // live edge has been relabelled and an unratified one is about to be
         // swept, so the edges table can no longer say what the lane decided.
-        let claimed = match lexical_one(store, call) {
+        let claimed = match lexical_one(store, call, locally_bound) {
             Some(edge) => match store.put_edge_live(&edge) {
                 Ok(()) => Some(edge.dst),
                 Err(e) => {
@@ -331,16 +425,17 @@ pub fn resolve_unambiguous_lexical(
             .enclosing_definition_at(corpus, path, r.line)
             .ok()
             .flatten();
-        let claimed = match src.and_then(|src| inheritance_edge(store, src, &r.base_name)) {
-            Some(edge) => match store.put_edge_live(&edge) {
-                Ok(()) => Some(edge.dst),
-                Err(e) => {
-                    tracing::debug!(error = %e, "live inheritance edge write failed");
-                    None
-                }
-            },
-            None => None,
-        };
+        let claimed =
+            match src.and_then(|src| inheritance_edge(store, src, &r.base_name, locally_bound)) {
+                Some(edge) => match store.put_edge_live(&edge) {
+                    Ok(()) => Some(edge.dst),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "live inheritance edge write failed");
+                        None
+                    }
+                },
+                None => None,
+            };
         if claimed.is_some() {
             outcome.emit();
         } else {
@@ -379,8 +474,23 @@ pub fn resolve_unambiguous_lexical(
     outcome
 }
 
-fn lexical_one(store: &SqliteStore, call: &UnresolvedCall) -> Option<Edge> {
+fn lexical_one(
+    store: &SqliteStore,
+    call: &UnresolvedCall,
+    locally_bound: &std::collections::HashSet<String>,
+) -> Option<Edge> {
     let edge = lexical_edge_kind(call);
+    // Section 7.3 step 1: a bare identifier that this file also binds to a local
+    // or a parameter is not a free reference, so no repo-wide lookup is entitled
+    // to answer it. Only the bare-identifier shape is gated: a method or field
+    // reference resolves through a recovered receiver *type*, which a local
+    // binding of the member name cannot shadow.
+    if !call.is_method_call
+        && !call.callee_sig.starts_with("field:")
+        && locally_bound.contains(travsr_core::ident::leaf_of(&call.callee_sig))
+    {
+        return None;
+    }
     let dst = candidate_signatures(call)
         .into_iter()
         .find_map(|sig| unique_definition(store, &sig, edge))?;
@@ -424,12 +534,13 @@ fn lexical_edge_kind(call: &UnresolvedCall) -> EdgeKind {
 pub fn targets_needing_editor(
     store: &SqliteStore,
     unresolved: &[UnresolvedCall],
+    locally_bound: &std::collections::HashSet<String>,
 ) -> Vec<LiveResolutionTarget> {
-    unresolved
+    let targets: Vec<LiveResolutionTarget> = unresolved
         .iter()
         .filter_map(|call| {
             // The lexical lane owns anything it can resolve without a server.
-            if lexical_one(store, call).is_some() {
+            if lexical_one(store, call, locally_bound).is_some() {
                 return None;
             }
             // Only a method or field reference benefits from LSP disambiguation.
@@ -452,7 +563,8 @@ pub fn targets_needing_editor(
                 provider: "definition".to_string(),
             })
         })
-        .collect()
+        .collect();
+    drop_same_position_collisions(targets)
 }
 
 /// RFC-027 daemon-driven positions, IsImplementation half: the `extends` /
@@ -470,13 +582,14 @@ pub fn inheritance_targets_needing_editor(
     corpus: &str,
     path: &str,
     inheritance: &[InheritanceRef],
+    locally_bound: &std::collections::HashSet<String>,
 ) -> Vec<LiveResolutionTarget> {
-    inheritance
+    let targets: Vec<LiveResolutionTarget> = inheritance
         .iter()
         .filter_map(|r| {
             let src = store.enclosing_definition_at(corpus, path, r.line).ok()??;
             // The lexical floor owns any base with a unique repo-wide definition.
-            if inheritance_edge(store, src, &r.base_name).is_some() {
+            if inheritance_edge(store, src, &r.base_name, locally_bound).is_some() {
                 return None;
             }
             Some(LiveResolutionTarget {
@@ -486,7 +599,8 @@ pub fn inheritance_targets_needing_editor(
                 provider: "definition".to_string(),
             })
         })
-        .collect()
+        .collect();
+    drop_same_position_collisions(targets)
 }
 
 /// RFC-027 section 8.2/8.3: editor targets for a language with no native
@@ -505,18 +619,15 @@ pub fn inheritance_targets_needing_editor(
 /// abstains, which is exactly section 7.3c — today's commit-gated behavior, zero
 /// regression.
 ///
-/// Duplicates on `(line, name, kind)` are collapsed. The editor recovers a
-/// target's column by finding the name on its line, so two references to the
-/// same name on one line resolve to the same position; sending both would buy a
-/// second provider round trip for an answer already in hand.
+/// References that collide on `(line, name, kind)` are **dropped**, not
+/// collapsed — see [`drop_same_position_collisions`].
 pub fn generic_targets_needing_editor(
     refs: &travsr_analysis::live_detect::LiveRefs,
 ) -> Vec<LiveResolutionTarget> {
-    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(refs.calls.len() + refs.fields.len());
     let mut push = |line: u32, name: &str, kind: EdgeKind| {
         // A reference with no line has no position for the editor to query.
-        if line == 0 || !seen.insert((line, name.to_string(), kind)) {
+        if line == 0 {
             return;
         }
         out.push(LiveResolutionTarget {
@@ -538,12 +649,64 @@ pub fn generic_targets_needing_editor(
     for i in &refs.inheritance {
         push(i.line, &i.base_name, EdgeKind::IsImplementation);
     }
-    out
+    drop_same_position_collisions(out)
+}
+
+/// Drop every target the editor could not tell apart from another.
+///
+/// A target names a line and a name, not a column, and the editor recovers the
+/// column by finding the first whole-word match of that name on that line. Two
+/// references sharing `(line, name, edge_kind)` therefore both resolve to the
+/// *first* occurrence's position, so a provider that answers about one of them
+/// is answering about the other as well.
+///
+/// The earlier version collapsed such a group to its first member on the
+/// reasoning that "two references to the same name on one line resolve to the
+/// same position". That holds only when they are the same reference. For
+/// `a.save(); b.save();` with different receiver types there are two references,
+/// two positions and two correct targets, and keeping one silently attributes
+/// the first occurrence's answer to both — a wrong edge, which is the one
+/// outcome section 8.1 does not permit. The same happens when the name appears
+/// earlier on the line inside a string or a comment.
+///
+/// So the whole group is dropped rather than resolved. The references stay
+/// `pending`, which is honest, and the commit-gated path resolves them. Carrying
+/// the real column through the protocol would recover this recall — the
+/// detectors have it at capture time — but it is a protocol change, and until
+/// then abstaining is the only fail-closed option.
+fn drop_same_position_collisions(targets: Vec<LiveResolutionTarget>) -> Vec<LiveResolutionTarget> {
+    let mut counts: std::collections::HashMap<(u32, &str, &str), usize> =
+        std::collections::HashMap::new();
+    for t in &targets {
+        *counts
+            .entry((t.ref_line, t.name.as_str(), t.edge_kind.as_str()))
+            .or_default() += 1;
+    }
+    let unique: std::collections::HashSet<(u32, String, String)> = counts
+        .into_iter()
+        .filter(|(_, n)| *n == 1)
+        .map(|((line, name, kind), _)| (line, name.to_string(), kind.to_string()))
+        .collect();
+    targets
+        .into_iter()
+        .filter(|t| unique.contains(&(t.ref_line, t.name.clone(), t.edge_kind.clone())))
+        .collect()
 }
 
 /// The unique `IsImplementation` edge from `src` (the implementing class) to the
 /// base type named `base_name`, or `None` to abstain.
-fn inheritance_edge(store: &SqliteStore, src: NodeId, base_name: &str) -> Option<Edge> {
+fn inheritance_edge(
+    store: &SqliteStore,
+    src: NodeId,
+    base_name: &str,
+    locally_bound: &std::collections::HashSet<String>,
+) -> Option<Edge> {
+    // Same step-1 gate as the call floor: `class Foo extends Bar` where this
+    // file also binds `Bar` to a local is not a free reference to the repo-wide
+    // `Bar`.
+    if locally_bound.contains(base_name) {
+        return None;
+    }
     let dst = unique_base_definition(store, base_name)?;
     edge_if_sound(store, src, dst, EdgeKind::IsImplementation)
 }
@@ -660,19 +823,22 @@ fn edge_if_sound(store: &SqliteStore, src: NodeId, dst: NodeId, kind: EdgeKind) 
     Some(Edge::new(src, dst, kind))
 }
 
-/// The edge kinds the live lane is permitted to emit (Bucket B). Anything else —
-/// a structural kind, a cross-language `ffi/call`, an unknown string — is refused
+/// The edge kinds the live lane is permitted to emit. Anything else — a
+/// structural kind, a cross-language `ffi/call`, an unknown string — is refused
 /// so a malformed or hostile editor report cannot make the lane write an edge
 /// kind it was never scoped to.
+///
+/// Exactly the three kinds the lane actually ships. `Overrides` is **ruled out**
+/// (no single fail-closed LSP call resolves it) and `RefImports` is **deferred**,
+/// so admitting them here would have let an editor report get an edge written
+/// for a kind the RFC says cannot be resolved fail-closed — the precise thing
+/// this accept-list exists to stop. They earn a place here when they are scoped,
+/// not before.
 fn live_edge_kind(s: &str) -> Option<EdgeKind> {
     let kind = EdgeKind::from_str(s)?;
     matches!(
         kind,
-        EdgeKind::RefCall
-            | EdgeKind::RefField
-            | EdgeKind::RefImports
-            | EdgeKind::IsImplementation
-            | EdgeKind::Overrides
+        EdgeKind::RefCall | EdgeKind::RefField | EdgeKind::IsImplementation
     )
     .then_some(kind)
 }
@@ -727,6 +893,13 @@ mod tests {
     use travsr_core::{Node, VName};
 
     const CORPUS: &str = "testrepo";
+
+    /// Most tests exercise the uniqueness gate, not the section 7.3 step-1
+    /// local-scope gate, so they declare no local bindings. The tests that do
+    /// exercise it build their own set.
+    fn no_locals() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
 
     fn store_with(nodes: &[(&str, &str, &str, u32, u32)]) -> SqliteStore {
         let mut store = SqliteStore::open_in_memory().expect("in-memory store");
@@ -925,6 +1098,7 @@ mod tests {
             "src/order.ts",
             &[call(src, "method:User.save", 18)],
             &[],
+            &no_locals(),
         );
 
         assert_eq!(
@@ -966,6 +1140,7 @@ mod tests {
             "src/order.ts",
             &[call(src, "method:save", 18)],
             &[],
+            &no_locals(),
         );
 
         assert_eq!(
@@ -996,7 +1171,14 @@ mod tests {
         let mut c = call(src, "class:Field", 18);
         c.alt_callee_sig = Some("fn:Field".to_string());
 
-        let out = resolve_unambiguous_lexical(&mut store, CORPUS, "src/order.ts", &[c], &[]);
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[c],
+            &[],
+            &no_locals(),
+        );
         assert_eq!(
             out,
             LiveOutcome {
@@ -1194,6 +1376,7 @@ mod tests {
             "src/main.rs",
             &[call(src, "method:Zoo.new", 3)],
             &[],
+            &no_locals(),
         );
         assert_eq!(
             out,
@@ -1242,7 +1425,8 @@ mod tests {
             ("src/zoo.rs", "method:Zoo.tally", "method", 4, 9),
             ("src/zoo.rs", "field:Zoo.count", "field", 2, 2),
         ]);
-        let out = resolve_unambiguous_lexical(&mut store, CORPUS, "src/zoo.rs", &[c], &[]);
+        let out =
+            resolve_unambiguous_lexical(&mut store, CORPUS, "src/zoo.rs", &[c], &[], &no_locals());
         assert_eq!(
             out,
             LiveOutcome {
@@ -1266,6 +1450,179 @@ mod tests {
             Some("live"),
             "and it must be tagged live",
         );
+    }
+
+    /// RFC-027 section 7.3 **step 1**, the reported defect.
+    ///
+    /// `export function process() { const save = () => 1; return save(); }`
+    /// makes the extractor emit a bare `fn:save` with no receiver, and Phase A
+    /// does not index the local `const`. So `fn:save` has exactly one definition
+    /// repo-wide — an unrelated function in another file — and uniqueness alone
+    /// resolved the local call to it, writing a fabricated `provenance='live'`
+    /// `ref/call` edge that `get_callers` / `find_references` /
+    /// `get_blast_radius` would show until the next commit swept it.
+    #[test]
+    fn a_locally_bound_name_is_not_resolved_repo_wide() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:process", "function", 1, 4),
+            ("src/unrelated.ts", "fn:save", "function", 1, 3),
+        ]);
+        let src = node_id("src/order.ts", "fn:process");
+        let mut locals = std::collections::HashSet::new();
+        locals.insert("save".to_string());
+
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[call(src, "fn:save", 3)],
+            &[],
+            &locals,
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+            "a call to a locally bound name must abstain, not resolve repo-wide"
+        );
+        assert!(
+            store
+                .iter_edges_from(src)
+                .expect("iter_edges_from")
+                .is_empty(),
+            "no edge at all may be written for a local reference"
+        );
+    }
+
+    /// The gate is the *local-clean* half of step 3a, not a replacement for the
+    /// uniqueness half: the same call with nothing bound locally still resolves,
+    /// so the fix costs no recall on genuinely free references.
+    #[test]
+    fn a_free_reference_still_resolves_under_the_scope_gate() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:process", "function", 1, 4),
+            ("src/unrelated.ts", "fn:save", "function", 1, 3),
+        ]);
+        let src = node_id("src/order.ts", "fn:process");
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[call(src, "fn:save", 3)],
+            &[],
+            &no_locals(),
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+        );
+    }
+
+    /// A locally shadowed base type gets the same treatment as a call.
+    #[test]
+    fn a_locally_bound_base_type_abstains() {
+        let mut store = store_with(&[
+            ("src/order.ts", "class:Order", "class", 3, 8),
+            ("src/base.ts", "class:Base", "class", 1, 5),
+        ]);
+        let mut locals = std::collections::HashSet::new();
+        locals.insert("Base".to_string());
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[],
+            &[InheritanceRef {
+                base_name: "Base".to_string(),
+                line: 3,
+            }],
+            &locals,
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+        );
+    }
+
+    /// Section 7.3b: the node the editor landed on must actually carry the name
+    /// it said it was resolving. Without this a provider that jumped to an
+    /// unrelated symbol, a stale-buffer answer, or a column recovered from the
+    /// wrong occurrence all pass every other gate.
+    #[test]
+    fn a_target_whose_name_does_not_match_the_reference_abstains() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            // The editor says it resolved `load`, but the position it points at
+            // is `User.save`.
+            &[resolution(18, "load", "src/user.ts", 17)],
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+        );
+    }
+
+    /// A constructor call names its *type*, and a provider may jump to the
+    /// initialiser instead of the type declaration. The name check must not
+    /// abstain on that.
+    #[test]
+    fn a_constructor_target_matches_on_the_type_name() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/thing.ts", "method:Thing.init", "method", 15, 20),
+        ]);
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "Thing", "src/thing.ts", 17)],
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+        );
+    }
+
+    /// Section 11: an answer to a question the daemon is no longer asking is
+    /// dropped, which is what the protocol's `buffer_version` cannot do on its
+    /// own (it is the editor's counter, so it cannot see a daemon re-parse).
+    #[test]
+    fn a_resolution_the_current_parse_no_longer_asks_for_is_dropped() {
+        let targets = vec![LiveResolutionTarget {
+            ref_line: 18,
+            name: "save".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        }];
+        let reported = vec![
+            resolution(18, "save", "src/user.ts", 17),
+            // The reference moved a line since the targets were handed out.
+            resolution(21, "save", "src/user.ts", 17),
+        ];
+        let kept = retain_current_targets(&reported, &targets);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].ref_line, 18);
     }
 
     /// Section 7.3b for a field target: an editor resolves `zoo.count` to the
@@ -1321,7 +1678,7 @@ mod tests {
         let mut ambiguous = call(src, "fn:save", 19);
         ambiguous.is_method_call = true;
 
-        let targets = targets_needing_editor(&store, &[resolvable, ambiguous]);
+        let targets = targets_needing_editor(&store, &[resolvable, ambiguous], &no_locals());
         assert_eq!(
             targets.len(),
             1,
@@ -1341,7 +1698,7 @@ mod tests {
         let store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
         let src = node_id("src/order.ts", "fn:placeOrder");
         let field = call(src, "field:count", 20);
-        let targets = targets_needing_editor(&store, &[field]);
+        let targets = targets_needing_editor(&store, &[field], &no_locals());
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].edge_kind, "ref/field");
         assert_eq!(targets[0].name, "count");
@@ -1356,7 +1713,7 @@ mod tests {
         let store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
         let src = node_id("src/order.ts", "fn:placeOrder");
         let bare = call(src, "fn:nowhere", 21);
-        assert!(targets_needing_editor(&store, &[bare]).is_empty());
+        assert!(targets_needing_editor(&store, &[bare], &no_locals()).is_empty());
     }
 
     /// RFC-027 section 12: the editor lane records what it claimed, so the
@@ -1426,7 +1783,14 @@ mod tests {
         // The save-path pass abstains on a method call with no receiver type.
         let mut ambiguous = call(src, "fn:save", 18);
         ambiguous.is_method_call = true;
-        resolve_unambiguous_lexical(&mut store, CORPUS, "src/order.ts", &[ambiguous], &[]);
+        resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[ambiguous],
+            &[],
+            &no_locals(),
+        );
         assert_eq!(
             store
                 .pending_refs_in_file(CORPUS, "src/order.ts")
@@ -1499,12 +1863,13 @@ mod tests {
         assert!(targets.iter().all(|t| t.provider == "definition"));
     }
 
-    /// The editor recovers a target's column by finding the name on its line, so
-    /// two references to the same name on one line resolve to the same position.
-    /// Sending both would buy a second provider round trip for an answer already
-    /// in hand.
+    /// The editor recovers a target's column by finding the *first* whole-word
+    /// match of the name on its line, so two references sharing a line, a name
+    /// and a kind both resolve to the first occurrence's position. Collapsing
+    /// them to one would attribute that answer to both — for `a.save();
+    /// b.save();` with different receiver types, a wrong edge. Both abstain.
     #[test]
-    fn generic_targets_are_deduplicated_per_line_and_name() {
+    fn generic_targets_colliding_on_a_position_are_dropped() {
         let refs = travsr_analysis::live_detect::LiveRefs {
             calls: vec![
                 travsr_analysis::live_detect::LiveRef {
@@ -1519,7 +1884,11 @@ mod tests {
             fields: Vec::new(),
             inheritance: Vec::new(),
         };
-        assert_eq!(generic_targets_needing_editor(&refs).len(), 1);
+        assert!(
+            generic_targets_needing_editor(&refs).is_empty(),
+            "two references the editor cannot tell apart must both abstain, \
+             not collapse onto the first occurrence's answer"
+        );
     }
 
     /// A live edge for a non-native language rides exactly the same emit path as
@@ -1569,6 +1938,10 @@ mod tests {
         assert!(live_edge_kind("ffi/call").is_none());
         assert!(live_edge_kind("depends").is_none());
         assert!(live_edge_kind("not-a-kind").is_none());
+        // Ruled out and deferred respectively: admitting them made the
+        // accept-list pass exactly the kinds it exists to stop.
+        assert!(live_edge_kind("overrides").is_none());
+        assert!(live_edge_kind("ref/imports").is_none());
         assert_eq!(live_edge_kind("ref/field"), Some(EdgeKind::RefField));
 
         let mut store = store_with(&[
@@ -1615,6 +1988,7 @@ mod tests {
             "src/order.ts",
             &[],
             &[inherit("Base", 3)],
+            &no_locals(),
         );
         assert_eq!(
             out,
@@ -1647,6 +2021,7 @@ mod tests {
             "src/order.ts",
             &[],
             &[inherit("Shape", 3)],
+            &no_locals(),
         );
         assert_eq!(
             out,
@@ -1681,6 +2056,7 @@ mod tests {
             CORPUS,
             "src/order.ts",
             &[inherit("Base", 3)],
+            &no_locals(),
         );
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].edge_kind, "is-implementation");
@@ -1706,6 +2082,7 @@ mod tests {
             CORPUS,
             "src/order.ts",
             &[inherit("Base", 3)],
+            &no_locals(),
         );
         assert!(
             targets.is_empty(),

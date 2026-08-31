@@ -16,7 +16,15 @@
 --
 -- `state` is 'pending' or 'resolved'. Rows are owned by their `src` node's file
 -- the same way `edge_sites` rows are, so the live engine deletes a file's rows
--- before re-resolving it and a vanished symbol's rows go with its node.
+-- before re-resolving it.
+--
+-- That ownership is by convention, not by constraint: there is no foreign key
+-- and no cascade, so a vanished symbol's rows do NOT go with its node. A NodeId
+-- hashes the VName (signature included), so renaming a symbol retires its id and
+-- the per-file delete, which resolves `src` through `nodes`, can no longer reach
+-- the row. `purge_orphan_ref_resolution_states` sweeps those at ratification, and
+-- both readers (`pending_refs_in_file`, `pending_ref_count`) join `nodes` so they
+-- agree in between.
 CREATE TABLE IF NOT EXISTS ref_resolution_state (
     src      INTEGER NOT NULL,
     ref_line INTEGER NOT NULL,

@@ -115,11 +115,25 @@ const PROVIDER_COMMAND: Record<string, string> = {
   implementation: "vscode.executeImplementationProvider",
 };
 
-/** Repo-relative, forward-slash path, matching the graph's own path keys. */
+/**
+ * Repo-relative, forward-slash path, matching the graph's own path keys, or
+ * `null` when the file is outside the repo.
+ *
+ * The boundary test is on a separator, not a bare prefix: `startsWith(repoRoot)`
+ * alone accepts a *sibling* directory whose name merely extends the root, so
+ * `/work/repo-vendor/x.ts` would be reported to the daemon as the repo-relative
+ * `-vendor/x.ts` and mapped against a path that means something else in the
+ * graph.
+ */
 function repoRelative(repoRoot: string, uri: vscode.Uri): string | null {
   const full = uri.fsPath;
-  if (!full.startsWith(repoRoot)) return null;
-  return full.slice(repoRoot.length).replace(/^[/\\]/, "").replace(/\\/g, "/");
+  const root = repoRoot.replace(/[/\\]+$/, "");
+  const inside =
+    full === root ||
+    full.startsWith(root + "/") ||
+    full.startsWith(root + "\\");
+  if (!inside) return null;
+  return full.slice(root.length).replace(/^[/\\]/, "").replace(/\\/g, "/");
 }
 
 /** Escape a name for use inside a `RegExp`. */
@@ -285,7 +299,7 @@ async function resolveTarget(
     return null; // no provider, or it threw. Neither is worth reporting.
   }
 
-  const found = firstLocation(locations);
+  const found = soleLocation(locations);
   if (!found) return null;
   const targetPath = repoRelative(repoRoot, found.uri);
   // Outside the workspace (node_modules, a .d.ts in the SDK) — dropped here so
@@ -305,26 +319,44 @@ async function resolveTarget(
 }
 
 /**
- * Normalize what a definition/implementation provider returned.
+ * Normalize what a definition/implementation provider returned, or `null` when
+ * it did not name exactly one target.
  *
- * Providers may answer with `Location[]`, `LocationLink[]`, or a bare
- * `Location`, and a single reference can resolve to several targets (an overload
- * set, a merged declaration). We take the first: reporting several targets for
- * one position would ask the daemon to pick, which is precisely the guess the
- * fail-closed contract forbids.
+ * Providers answer with `Location[]`, `LocationLink[]`, or a bare `Location`,
+ * and a single reference can resolve to several: an overload set, TypeScript
+ * declaration merging across files, clangd's declaration plus its out-of-line
+ * definition. Taking `list[0]` of that *is* the guess the fail-closed contract
+ * forbids, just relocated into the extension where the daemon cannot see it —
+ * the daemon then receives one confident-looking target with no signal that a
+ * choice was made, and every downstream gate passes on an arbitrary pick.
+ *
+ * So more than one *distinct* target abstains and the reference stays `pending`,
+ * which is honest and which the commit-gated path then resolves. Distinctness is
+ * by URI plus start position, so a provider that repeats one location (or names
+ * the same symbol through both a `Location` and a `LocationLink`) still counts
+ * as one answer.
  */
-function firstLocation(
+function soleLocation(
   raw: unknown
 ): { uri: vscode.Uri; range: vscode.Range } | null {
   const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
-  if (list.length === 0) return null;
-  const first = list[0] as Partial<vscode.Location> &
-    Partial<vscode.LocationLink>;
-  if (first.uri && first.range) {
-    return { uri: first.uri, range: first.range as vscode.Range };
+  const found: { uri: vscode.Uri; range: vscode.Range }[] = [];
+  const seen = new Set<string>();
+  for (const entry of list) {
+    const e = entry as Partial<vscode.Location> & Partial<vscode.LocationLink>;
+    let one: { uri: vscode.Uri; range: vscode.Range } | null = null;
+    if (e.uri && e.range) {
+      one = { uri: e.uri, range: e.range as vscode.Range };
+    } else if (e.targetUri && e.targetRange) {
+      one = { uri: e.targetUri, range: e.targetRange };
+    }
+    if (!one) continue;
+    const key = `${one.uri.toString()}:${one.range.start.line}:${one.range.start.character}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    found.push(one);
+    // Two distinct targets is already ambiguous; nothing later can undo that.
+    if (found.length > 1) return null;
   }
-  if (first.targetUri && first.targetRange) {
-    return { uri: first.targetUri, range: first.targetRange };
-  }
-  return null;
+  return found.length === 1 ? found[0] : null;
 }
