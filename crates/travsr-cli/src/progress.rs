@@ -5,7 +5,7 @@
 //! stays clean for the final summary), adapting to context:
 //!
 //! - **TTY**: a single self-updating line — a pulsing graph-node spinner, an
-//!   eighth-precision bar, `done/total`, percent, elapsed, and a rough ETA.
+//!   eighth-precision bar, `done/total`, percent, and elapsed time.
 //!   Brand orange while working; the final summary node flips to fresh green.
 //! - **Non-TTY** (pipe/CI): occasional newline-terminated lines, no control
 //!   chars or color.
@@ -80,7 +80,7 @@ impl Palette {
     fn track(self, s: &str) -> String {
         self.paint("38;2;77;77;77", s)
     }
-    /// Muted secondary text (elapsed/eta/hints).
+    /// Muted secondary text (elapsed/hints).
     pub fn dim(self, s: &str) -> String {
         self.paint("2", s)
     }
@@ -240,16 +240,12 @@ impl ProgressReporter {
             }
             InitProgress::Indexing { done, total, .. } => {
                 let pct = (done * 100).checked_div(total).unwrap_or(0);
-                let tail = match eta(self.start, done, total) {
-                    Some(e) => format!("{elapsed} · eta {}", fmt_dur(e)),
-                    None => elapsed,
-                };
                 format!(
                     "  {spinner} indexing  {}  {}/{}  {pct}%   {}",
                     bar(pal, pct),
                     commas(done),
                     commas(total),
-                    pal.dim(&tail)
+                    pal.dim(&elapsed)
                 )
             }
             InitProgress::Finalizing => {
@@ -288,11 +284,8 @@ impl ProgressReporter {
             }
             InitProgress::Indexing { done, total, .. } => {
                 let pct = (done * 100).checked_div(total).unwrap_or(0);
-                let eta = eta(self.start, done, total)
-                    .map(|e| format!("  eta {}", fmt_dur(e)))
-                    .unwrap_or_default();
                 format!(
-                    "indexing {}/{} ({pct}%)  {elapsed}{eta}",
+                    "indexing {}/{} ({pct}%)  {elapsed}",
                     commas(done),
                     commas(total)
                 )
@@ -790,32 +783,6 @@ pub fn fmt_dur(d: Duration) -> String {
     }
 }
 
-/// Minimum samples + elapsed window before an ETA is trustworthy. UX-005:
-/// extrapolating from the first tick (1 file in 4 s) produced a 46-minute ETA on
-/// a job that finished in 13 s, inviting a premature Ctrl-C. Withhold the
-/// estimate until throughput has stabilised.
-const ETA_WARMUP_FILES: u64 = 8;
-const ETA_WARMUP_SECS: f64 = 2.0;
-
-/// Rough ETA from average throughput so far. `None` once done, at start, or
-/// still inside the warm-up window (see [`ETA_WARMUP_FILES`]).
-fn eta(start: Instant, done: u64, total: u64) -> Option<Duration> {
-    if done == 0 || done >= total {
-        return None;
-    }
-    let secs = start.elapsed().as_secs_f64();
-    // Warm-up floor: too few samples or too short a window still gives a wild
-    // extrapolation. Hold the ETA back and show only elapsed until then.
-    if done < ETA_WARMUP_FILES || secs < ETA_WARMUP_SECS {
-        return None;
-    }
-    let rate = done as f64 / secs; // files/sec
-    if rate <= 0.0 {
-        return None;
-    }
-    Some(Duration::from_secs_f64((total - done) as f64 / rate))
-}
-
 /// #724 Finding 4: scip-java generates a `javac` wrapper that expands empty
 /// arrays under `set -u`; that is an "unbound variable" error in bash 3.2 (the
 /// default `/bin/bash` on macOS) but legal in bash 4.4+. When the `bash`
@@ -882,29 +849,6 @@ mod tests {
     }
 
     #[test]
-    fn eta_none_at_edges() {
-        let start = Instant::now();
-        assert!(eta(start, 0, 100).is_none());
-        assert!(eta(start, 100, 100).is_none());
-        assert!(eta(start, 150, 100).is_none());
-    }
-
-    #[test]
-    fn eta_withheld_during_warmup() {
-        // UX-005: a fresh start with only a handful of files done must not emit an
-        // ETA — the sample count is below the warm-up floor.
-        let start = Instant::now();
-        assert!(
-            eta(start, 1, 566).is_none(),
-            "one file in must be inside the warm-up window"
-        );
-        assert!(
-            eta(start, ETA_WARMUP_FILES - 1, 566).is_none(),
-            "still under the file floor => no ETA"
-        );
-    }
-
-    #[test]
     fn bar_width_is_constant_and_clamped() {
         // No color so we can measure visible cells directly.
         let pal = Palette { color: false };
@@ -952,6 +896,29 @@ mod tests {
             Some((4, 4))
         );
         assert_eq!(parse_bash_version("not a version banner"), None);
+    }
+
+    #[test]
+    fn indexing_frame_drops_eta_keeps_elapsed() {
+        // D1: the projected ETA is gone from the live bar, but measured elapsed
+        // (a fact, not a projection) stays. describe_plain ignores the mode, so
+        // constructing in any mode is fine.
+        let r = ProgressReporter::new(true, false);
+        let line = r.describe_plain(InitProgress::Indexing {
+            done: 283,
+            total: 566,
+            workers: 4,
+        });
+        assert!(line.contains("283/566"), "counts must remain: {line}");
+        assert!(line.contains("(50%)"), "percent must remain: {line}");
+        assert!(
+            !line.to_ascii_lowercase().contains("eta"),
+            "projected ETA must be gone: {line}"
+        );
+        assert!(
+            line.trim_end().ends_with('s'),
+            "measured elapsed must remain: {line}"
+        );
     }
 }
 

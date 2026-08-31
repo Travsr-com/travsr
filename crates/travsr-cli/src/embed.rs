@@ -120,6 +120,17 @@ pub enum EmbedCommand {
         /// nearest git root).
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Rebuild every embedding from scratch, replacing the whole index.
+        ///
+        /// Use this after switching the embedding model, when older embeddings
+        /// may be inconsistent with newer ones. Slower than a normal reindex,
+        /// which only fills in what is missing.
+        ///
+        /// Cannot be combined with `--phase1`: the sidecar clears the whole
+        /// model before re-embedding, so a phase-restricted rebuild would delete
+        /// the phase 2 tier and never refill it.
+        #[arg(long, conflicts_with = "phase1")]
+        rebuild: bool,
         /// Only embed symbol nodes with shell_number >= N (Phase 1 high-centrality pass).
         /// Omit to embed all pending nodes.
         #[arg(long)]
@@ -230,6 +241,7 @@ pub fn run(cmd: EmbedCommand) -> Result<()> {
         }
         EmbedCommand::Reindex {
             db,
+            rebuild,
             phase1,
             capacity,
             jobs,
@@ -240,7 +252,7 @@ pub fn run(cmd: EmbedCommand) -> Result<()> {
                 max_workers: jobs,
                 priority: priority.map(Into::into),
             };
-            cmd_reindex(db, phase1, overrides)
+            cmd_reindex(db, phase1, rebuild, overrides)
         }
         EmbedCommand::Reconfigure {
             db,
@@ -595,7 +607,6 @@ fn cmd_init(
 /// "Full" default). Only called on an interactive terminal.
 fn prompt_cpu_budget() -> Result<Option<travsr_plugin_host::Capacity>> {
     use std::io::Write as _;
-    use travsr_plugin_host::Capacity;
 
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -617,28 +628,52 @@ fn prompt_cpu_budget() -> Result<Option<travsr_plugin_host::Capacity>> {
 
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
-    match input.trim() {
-        "" | "1" => Ok(None), // Full → defer to config/default (100%)
-        "2" => Ok(Some(Capacity::Percent(50))),
-        "3" => Ok(Some(Capacity::Percent(25))),
-        "4" => Ok(Some(Capacity::Auto)),
-        "5" => {
-            print!("  Percent (1-100): ");
-            std::io::stdout().flush()?;
-            let mut pct = String::new();
-            std::io::stdin().read_line(&mut pct)?;
-            match Capacity::parse(pct.trim()) {
-                Some(c) => Ok(Some(c)),
-                None => {
-                    println!("  (not a valid percent, using Full)");
-                    Ok(None)
-                }
-            }
-        }
-        _ => {
-            println!("  (unrecognised, using Full)");
-            Ok(None)
-        }
+    let choice = input.trim().to_string();
+
+    // The custom (percent) sub-prompt is the only branch that needs a second
+    // line of input; read it here so the parse itself stays pure/testable.
+    let custom = if choice == "5" {
+        print!("  Percent (1-100): ");
+        std::io::stdout().flush()?;
+        let mut pct = String::new();
+        std::io::stdin().read_line(&mut pct)?;
+        pct.trim().to_string()
+    } else {
+        String::new()
+    };
+
+    let parsed = parse_cpu_choice(&choice, &custom);
+    match choice.as_str() {
+        "" | "1" | "2" | "3" | "4" => {}
+        // parsed is None on these two arms, which means "no explicit choice,
+        // fall through to config/env/default" (F1) rather than Full, so the
+        // message must not claim Full or it repeats the very bug F1 fixed.
+        "5" if parsed.is_none() => println!("  (not a valid percent, using the configured budget)"),
+        "5" => {}
+        _ => println!("  (unrecognised, using the configured budget)"),
+    }
+    Ok(parsed)
+}
+
+/// Pure parse of the CPU-budget menu selection, split out of
+/// [`prompt_cpu_budget`] so it is testable without a TTY. `choice` is the
+/// top-level answer; `custom` is the percent entered for the "5" (Custom)
+/// path and is ignored otherwise.
+///
+/// `None` means "user made no explicit choice" — fall through to
+/// config/env/default. An explicit Full ("1"/Enter) returns `Percent(100)` so
+/// the just-made interactive selection overrides ambient global config (F1);
+/// returning `None` there is the bug, because `embed.capacity = auto` in config
+/// would then silently win over the user's Full choice.
+fn parse_cpu_choice(choice: &str, custom: &str) -> Option<travsr_plugin_host::Capacity> {
+    use travsr_plugin_host::Capacity;
+    match choice {
+        "" | "1" => Some(Capacity::Percent(100)),
+        "2" => Some(Capacity::Percent(50)),
+        "3" => Some(Capacity::Percent(25)),
+        "4" => Some(Capacity::Auto),
+        "5" => Capacity::parse(custom),
+        _ => None,
     }
 }
 
@@ -1020,7 +1055,7 @@ fn reindex_after_init(
     let gov = travsr_plugin_host::resolve_governance_for_db(db_path, overrides);
     println!("  {}", reindex_banner(workers, &gov));
 
-    run_reindex_with_progress(db_path, None, overrides)?;
+    run_reindex_with_progress(db_path, None, false, overrides)?;
 
     let embedded = query_embed_stats(db_path, &backend.id)
         .map(|s| s.stats.embedded)
@@ -1460,10 +1495,11 @@ fn reindex_banner(workers: usize, gov: &travsr_plugin_host::EmbedGovernance) -> 
 fn cmd_reindex(
     db_override: Option<PathBuf>,
     phase1: Option<u32>,
+    rebuild: bool,
     overrides: travsr_plugin_host::EmbedOverrides,
 ) -> Result<()> {
     let db_path = resolve_graph_db(db_override)?;
-    run_reindex_locked(&db_path, phase1, &overrides)
+    run_reindex_locked(&db_path, phase1, rebuild, &overrides)
 }
 
 /// The locked reindex core: `embed.lock` guard, embed-text regen, resolved-budget
@@ -1473,6 +1509,9 @@ fn cmd_reindex(
 fn run_reindex_locked(
     db_path: &Path,
     phase1: Option<u32>,
+    // `--rebuild`: clear + re-embed every node (a full rebuild), not just fill
+    // in what is missing. Always false on the reconfigure (WS4) path.
+    reembed: bool,
     overrides: &travsr_plugin_host::EmbedOverrides,
 ) -> Result<()> {
     // UX-015: fail fast when there is no backend to reindex with, before any
@@ -1518,7 +1557,7 @@ fn run_reindex_locked(
     install_reindex_cancel_handler(db_path);
 
     // RFC-020: delegate to the parallel orchestrator with a live progress bar.
-    run_reindex_with_progress(db_path, phase1, overrides)?;
+    run_reindex_with_progress(db_path, phase1, reembed, overrides)?;
 
     if REINDEX_CANCELLED.load(Ordering::SeqCst) {
         println!(
@@ -1653,7 +1692,7 @@ pub(crate) fn trigger_reindex_now(
 
     // A fresh reindex with the new budget. Blocks on embed.lock until the
     // cancelled run releases; resumes incrementally (no re-embed).
-    let result = run_reindex_locked(db_path, None, overrides);
+    let result = run_reindex_locked(db_path, None, false, overrides);
 
     if paused_daemon {
         if let Err(e) = crate::daemon_client::send_daemon_command(
@@ -1678,6 +1717,7 @@ pub(crate) fn trigger_reindex_now(
 fn run_reindex_with_progress(
     db_path: &Path,
     phase1: Option<u32>,
+    reembed: bool,
     overrides: &travsr_plugin_host::EmbedOverrides,
 ) -> Result<()> {
     // Same fallback as `resolve_backend` (embed_catalog.rs): a repo indexed
@@ -1715,7 +1755,8 @@ fn run_reindex_with_progress(
         })
     });
 
-    let result = travsr_plugin_host::run_parallel_reindex_blocking(db_path, phase1, overrides);
+    let result =
+        travsr_plugin_host::run_parallel_reindex_blocking(db_path, phase1, reembed, overrides);
 
     done_flag.store(true, Ordering::Relaxed);
     if let Some(m) = monitor {
@@ -1921,18 +1962,16 @@ fn query_embed_stats(db_path: &std::path::Path, model_id: &str) -> Result<EmbedS
     })
 }
 
-fn fmt_eta(remaining: u64, nodes_per_sec: f64) -> String {
-    if nodes_per_sec < 1.0 || remaining == 0 {
-        return String::new();
+/// Display-only completion percentage, clamped to 100 (F4). The denominator
+/// (`total`) is a tier snapshot that can lag the live `done` count as nodes
+/// shift tiers, so `done > total` is possible; the raw `done/total` counts stay
+/// honest, but the percentage must never read above 100%. An empty tier
+/// (`total == 0`) reports 100% (nothing left to do).
+fn pct_display(done: u64, total: u64) -> f64 {
+    if total == 0 {
+        return 100.0;
     }
-    let secs = (remaining as f64 / nodes_per_sec).round() as u64;
-    if secs < 60 {
-        format!("~{secs}s remaining")
-    } else if secs < 3600 {
-        format!("~{}m remaining", secs / 60)
-    } else {
-        format!("~{}h {}m remaining", secs / 3600, (secs % 3600) / 60)
-    }
+    ((done as f64 / total as f64) * 100.0).min(100.0)
 }
 
 fn fmt_count(n: u64) -> String {
@@ -2144,16 +2183,7 @@ fn cmd_status() -> Result<()> {
         return Ok(());
     }
 
-    let pct = stats.embedded as f64 / stats.total_symbols as f64 * 100.0;
-    // Phase 1 throughput ~400 nodes/sec (k8s: 109k nodes / 4.5 min).
-    // Phase 2 is background and ~10× slower on a loaded machine.
-    let nodes_per_sec: f64 = if stats.phase1_done < stats.phase1_total {
-        400.0
-    } else {
-        40.0
-    };
-    let remaining = stats.total_symbols.saturating_sub(stats.embedded);
-    let eta = fmt_eta(remaining, nodes_per_sec);
+    let pct = pct_display(stats.embedded, stats.total_symbols);
     let pal = Palette::for_stream(std::io::stdout().is_terminal());
     let bar = crate::progress::bar_of_width(pal, stats.embedded, stats.total_symbols, 36);
 
@@ -2163,52 +2193,44 @@ fn cmd_status() -> Result<()> {
         fmt_count(stats.embedded),
         pct
     );
-    if eta.is_empty() {
+    if stats.embedded >= stats.total_symbols {
         println!("{bar}  done");
     } else {
-        println!("{bar}  {eta}");
+        println!("{bar}");
     }
 
     // ── per-phase breakdown ───────────────────────────────────────────────────
     println!();
-    let p1_pct = if stats.phase1_total > 0 {
-        stats.phase1_done as f64 / stats.phase1_total as f64 * 100.0
-    } else {
-        100.0
-    };
+    let p1_pct = pct_display(stats.phase1_done, stats.phase1_total);
     let p1_bar = crate::progress::bar_of_width(pal, stats.phase1_done, stats.phase1_total, 24);
-    let p1_eta = fmt_eta(stats.phase1_total.saturating_sub(stats.phase1_done), 400.0);
+    let p1_done_marker = if stats.phase1_done >= stats.phase1_total {
+        "  \u{2713} complete"
+    } else {
+        ""
+    };
     println!(
-        "core symbols (centrality \u{2265}{threshold}) {} {}/{}  ({:.0}%)  {}",
+        "core symbols (centrality \u{2265}{threshold}) {} {}/{}  ({:.0}%){}",
         p1_bar,
         fmt_count(stats.phase1_done),
         fmt_count(stats.phase1_total),
         p1_pct,
-        if p1_eta.is_empty() {
-            "\u{2713} complete".to_string()
-        } else {
-            p1_eta
-        },
+        p1_done_marker,
     );
 
-    let p2_pct = if stats.phase2_total > 0 {
-        stats.phase2_done as f64 / stats.phase2_total as f64 * 100.0
-    } else {
-        100.0
-    };
+    let p2_pct = pct_display(stats.phase2_done, stats.phase2_total);
     let p2_bar = crate::progress::bar_of_width(pal, stats.phase2_done, stats.phase2_total, 24);
-    let p2_eta = fmt_eta(stats.phase2_total.saturating_sub(stats.phase2_done), 40.0);
+    let p2_done_marker = if stats.phase2_done >= stats.phase2_total {
+        "  \u{2713} complete"
+    } else {
+        ""
+    };
     println!(
-        "other symbols (centrality <{threshold}) {} {}/{}  ({:.0}%)  {}",
+        "other symbols (centrality <{threshold}) {} {}/{}  ({:.0}%){}",
         p2_bar,
         fmt_count(stats.phase2_done),
         fmt_count(stats.phase2_total),
         p2_pct,
-        if p2_eta.is_empty() {
-            "\u{2713} complete".to_string()
-        } else {
-            p2_eta
-        },
+        p2_done_marker,
     );
 
     // ── HNSW index ────────────────────────────────────────────────────────────
@@ -2235,7 +2257,7 @@ fn cmd_status() -> Result<()> {
             "hint: no symbols embedded yet, the daemon starts embedding after semantic indexing."
         );
         println!("      If the daemon is not running: travsr daemon start");
-    } else if remaining > 0 {
+    } else if stats.embedded < stats.total_symbols {
         println!();
         println!("hint: embedding is running in the background via the daemon.");
         println!("      Run `travsr embed status` again in a few minutes to see progress.");
@@ -2773,5 +2795,74 @@ mod issue_755_tests {
             !picked.id.is_empty() && !picked.description.is_empty(),
             "the recommended backend must be nameable in output"
         );
+    }
+}
+
+/// Track A: the CPU-budget menu parse (F1) and the clamped status percentage
+/// (F4). Both are pure so they are tested without a TTY.
+#[cfg(test)]
+mod embed_ux_tests {
+    use super::*;
+    use travsr_plugin_host::Capacity;
+
+    /// F1: an explicit Full ("1"/Enter) must resolve to `Percent(100)`, not
+    /// `None`. `None` defers to config, so a `None` here lets `embed.capacity =
+    /// auto` in global config silently override the just-made interactive choice
+    /// — the exact bug F1 fixes.
+    #[test]
+    fn full_choice_is_explicit_hundred_percent() {
+        assert_eq!(parse_cpu_choice("", ""), Some(Capacity::Percent(100)));
+        assert_eq!(parse_cpu_choice("1", ""), Some(Capacity::Percent(100)));
+    }
+
+    /// `--rebuild` and `--phase1` must be mutually exclusive: the sidecar clears
+    /// the whole model before re-embedding, so a phase-restricted rebuild would
+    /// delete the phase 2 tier and never refill it. clap must reject the combo.
+    #[test]
+    fn rebuild_and_phase1_conflict() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(subcommand)]
+            cmd: EmbedCommand,
+        }
+        // Each alone parses.
+        assert!(Wrap::try_parse_from(["x", "reindex", "--rebuild"]).is_ok());
+        assert!(Wrap::try_parse_from(["x", "reindex", "--phase1", "5"]).is_ok());
+        // Together they are rejected.
+        let err = Wrap::try_parse_from(["x", "reindex", "--rebuild", "--phase1", "5"])
+            .err()
+            .expect("--rebuild --phase1 must conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn preset_choices_map_to_their_budgets() {
+        assert_eq!(parse_cpu_choice("2", ""), Some(Capacity::Percent(50)));
+        assert_eq!(parse_cpu_choice("3", ""), Some(Capacity::Percent(25)));
+        assert_eq!(parse_cpu_choice("4", ""), Some(Capacity::Auto));
+    }
+
+    #[test]
+    fn custom_choice_parses_its_percent() {
+        assert_eq!(parse_cpu_choice("5", "73"), Some(Capacity::Percent(73)));
+        // An unparseable custom percent yields no override (falls through to config).
+        assert_eq!(parse_cpu_choice("5", "abc"), None);
+    }
+
+    #[test]
+    fn junk_makes_no_explicit_choice() {
+        assert_eq!(parse_cpu_choice("9", ""), None);
+        assert_eq!(parse_cpu_choice("xyz", ""), None);
+    }
+
+    /// F4: a lagging tier denominator can make `done > total`; the displayed
+    /// percentage must never exceed 100%. Raw counts stay honest elsewhere.
+    #[test]
+    fn pct_display_clamps_and_handles_empty_tier() {
+        assert_eq!(pct_display(6943, 6716), 100.0); // overshoot clamps
+        assert_eq!(pct_display(0, 0), 100.0); // empty tier => nothing to do
+        assert_eq!(pct_display(50, 100), 50.0); // normal case
+        assert_eq!(pct_display(0, 100), 0.0);
     }
 }

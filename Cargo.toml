@@ -55,8 +55,11 @@ rayon = "1"
 # pair templating + truncation), same crate travsr-embed uses for its
 # tokenizer. default-features disabled: the defaults (progressbar, onig,
 # esaxx_fast) are training/CLI-only concerns we never touch (we only load +
-# encode), and `progressbar` (indicatif -> console -> time-core) requires
-# edition2024, breaking this workspace's 1.75 MSRV for no functional gain.
+# encode), so they stay off for no functional loss. The MSRV half of this note
+# has expired: `progressbar` (indicatif -> console -> time-core) needs
+# edition2024, which was the blocker at the old 1.75 MSRV but is stable from
+# 1.85 and so is fine at the current 1.88. Being training-only is now the whole
+# reason, and it is reason enough.
 # One of onig/fancy-regex is mandatory (pre-tokenizer regex splitting) -
 # fancy-regex is pure Rust, unlike onig which needs the Oniguruma C library
 # and complicates cross-compiling for OCI ARM64 (CLAUDE.md ARM64 mandate).

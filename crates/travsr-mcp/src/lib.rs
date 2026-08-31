@@ -66,19 +66,13 @@ pub(crate) const SERVER_NAME: &str = "travsr";
 
 /// The version reported in `initialize`'s `serverInfo`, over both stdio and SSE.
 ///
-/// #728 gave the CLI and the daemon an injected `<version>+<shortsha>` build id
-/// so a tester's build could be identified, but this constant was left on the
-/// crate version. MCP is the only external interface travsr has, so the one
-/// surface an agent actually talks to was the one that could not report which
-/// build it was, which is the ambiguity #728 existed to remove.
-///
-/// `TRAVSR_BUILD_ID` is set by the release job for the whole cargo invocation,
-/// so this crate sees it too. Unset locally, where it falls back to the crate
-/// version exactly as before.
-pub(crate) const SERVER_VERSION: &str = match option_env!("TRAVSR_BUILD_ID") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
-};
+/// Reads this crate's own `Cargo.toml`, independently of `travsr-cli`'s. Nothing
+/// at the Cargo level keeps the two in lockstep (`verify-version` in release.yml
+/// only pins `travsr-cli` and npm's `package.json` to the tag); they agree today
+/// only because both files say `1.0.0`. The only thing that would catch a release
+/// that bumps one and forgets the other is `check_mcp_server_version_matches_cli`
+/// in `travsrAutomation`, which runs on every PR via `run.py --binary` in `ci.yml`.
+pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Start the MCP stdio server backed by the graph database at `db_path`.
 ///

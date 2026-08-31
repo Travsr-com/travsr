@@ -1470,7 +1470,17 @@ pub(crate) fn suggest_next(db_path: &std::path::Path, query: &str) -> Vec<Sugges
     // `ask` itself uses, so a suggestion can never name something unindexed.
     let nearest = nearest_symbol(db_path, query);
 
-    if let Some(sym) = nearest.as_deref() {
+    // #778: only suggest the nearest symbol when it differs from what the user
+    // already typed. When the query IS an exact symbol name (`ask "UI"`), the
+    // nearest match is that same string, so echoing `ask "UI"` -> `ask "UI"` is a
+    // dead-end loop. Skip it. `ask "UI"` matches no `INTENT_ROUTES` key either, so
+    // `suggest_next` then returns empty — which is correct: per this function's
+    // contract the caller falls back to the catalogue rather than printing a
+    // suggestion that suggests nothing.
+    if let Some(sym) = nearest
+        .as_deref()
+        .filter(|sym| !sym.eq_ignore_ascii_case(query.trim()))
+    {
         out.push(Suggestion {
             command: format!("travsr ask \"{sym}\""),
             why: "closest symbol in this repo to what you typed".to_string(),
@@ -1658,6 +1668,36 @@ mod suggestion_tests {
             first.1.contains("--direction both"),
             "expected the blast-radius route, got `{}`",
             first.1
+        );
+    }
+
+    /// #778: when the query IS an exact symbol name, `suggest_next` must never
+    /// echo it back — `ask "UI"` -> try `ask "UI"` is a dead-end loop. The guard
+    /// is load-bearing here, not the absence of a match: `nearest_symbol` DOES
+    /// resolve `UI` to `class:UI`, yet the echo filter drops the identical query
+    /// so the suggestion list carries no `travsr ask "UI"`.
+    #[test]
+    fn suggest_next_never_echoes_the_exact_query() {
+        use travsr_store::{SqliteStore, Store as _};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("graph.db");
+        {
+            let mut store = SqliteStore::open(&db).expect("open");
+            store
+                .put_node(&travsr_core::Node::new(
+                    travsr_core::VName::new("corpus", "root", "app/ui.rb", "ruby", "class:UI"),
+                    "class",
+                ))
+                .expect("put_node");
+        }
+        // Non-vacuous: the symbol really is found, so what suppresses the echo is
+        // the guard, not a missing match.
+        assert_eq!(super::nearest_symbol(&db, "UI").as_deref(), Some("UI"));
+        let suggestions = super::suggest_next(&db, "UI");
+        assert!(
+            suggestions.iter().all(|s| s.command != "travsr ask \"UI\""),
+            "suggest_next echoed the identical query back: {:?}",
+            suggestions.iter().map(|s| &s.command).collect::<Vec<_>>()
         );
     }
 
