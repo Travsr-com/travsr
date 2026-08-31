@@ -50,16 +50,30 @@ export function webviewShell(title: string, body: string, script: string): strin
     --error: #ef4444;
     --blue: #7dd3fc;
   }
-  @media (prefers-color-scheme: light) {
-    :root {
-      --bg: #f6f1ed; --bg-elev: #fbfaf9; --bg-input: #eee5de;
-      --border: #e2d4ca;
-      --fg: #1a1a1a; --fg-muted: #705f54; --fg-subtle: #8f7a6c;
-      --green: #429429; --green-deep: #dbf6db; --gold: #d89a02;
-      --orange: #b35500; --orange-deep: #fff7ed;
-      --error: #b91c1c;
-      --blue: #0369a1;
-    }
+  /* Light palette, keyed on the class VS Code stamps on a webview's body.
+
+     Deliberately NOT a prefers-color-scheme media query, which is what this was.
+     Inside an Electron window that resolves from the OS appearance rather than
+     from the editor theme, so a light Windows running a dark VS Code theme drew
+     a linen panel in the middle of a dark editor, and no amount of switching
+     themes could shift it: the panel was reporting the desktop, not the editor
+     it is docked in.
+
+     The body class is the authoritative signal and VS Code updates it live, so a
+     theme change repaints without a reload. High-contrast light is named
+     separately because it is a light theme kind of its own that vscode-light does
+     not cover. The reduced-motion query below stays a media query, since that one
+     genuinely is an OS preference.
+
+     No backticks in this comment: the stylesheet is inside a template literal. */
+  body.vscode-light, body.vscode-high-contrast-light {
+    --bg: #f6f1ed; --bg-elev: #fbfaf9; --bg-input: #eee5de;
+    --border: #e2d4ca;
+    --fg: #1a1a1a; --fg-muted: #705f54; --fg-subtle: #8f7a6c;
+    --green: #429429; --green-deep: #dbf6db; --gold: #d89a02;
+    --orange: #b35500; --orange-deep: #fff7ed;
+    --error: #b91c1c;
+    --blue: #0369a1;
   }
   @media (prefers-reduced-motion: reduce) {
     * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
@@ -162,6 +176,16 @@ export function webviewShell(title: string, body: string, script: string): strin
   .lvl-ERROR .msg { color: var(--error); }
   .log-line:hover { background: var(--bg-input); border-radius: 3px; }
 
+  /* Rotation boundary: the log spans daily files, and without a marker a jump
+     back to yesterday looks like a gap in one continuous stream. A rule with
+     the date on it, quiet enough not to compete with the entries either side. */
+  .log-day { display: flex; align-items: center; gap: 8px; margin: 8px 0 4px;
+    color: var(--fg-subtle); font-size: 10px; letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-family: var(--vscode-editor-font-family, ui-monospace, monospace); }
+  .log-day::before, .log-day::after { content: ""; flex: 1 1 auto;
+    border-top: 1px solid var(--border); }
+
   .pill { flex: 0 0 auto; min-width: 42px; text-align: center; font-size: 9.5px;
     font-weight: 700; letter-spacing: 0.06em; padding: 1px 5px; border-radius: 3px;
     border: 1px solid transparent; text-transform: uppercase; }
@@ -251,6 +275,11 @@ export function webviewShell(title: string, body: string, script: string): strin
     border-radius: 4px; padding: 2px 4px; font-size: 11px; font-family: inherit; }
   .tog { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
   .tog input { margin: 0; }
+  /* Quiet asides beside the File control: the day boundary is UTC, and the list
+     may be shorter than what is on disk. Both are things a reader needs once
+     and should not have to read twice. */
+  .hint { color: var(--fg-subtle); }
+  .hint[title] { cursor: help; border-bottom: 1px dotted var(--border); }
 
   /* JSON mode makes each row expandable rather than replacing the list with a
      wall of objects. The column line is already the summary, so collapsed costs
@@ -576,6 +605,35 @@ export interface LogEntry {
   iso: string;
   /** The stored line verbatim, for the JSON view. */
   raw: string;
+  /** Date of the rotated file this line came from (`daemon.log.<DATE>`), so the
+   *  panel can show where one day's file ends and the next begins. Absent when
+   *  the entry did not come from a file on disk (older callers, tests). */
+  day?: string;
+}
+
+/** One rotated log file, as the panel's File control needs it.
+ *
+ *  Carries no line count on purpose. A count cannot be known without reading
+ *  the whole file, so labelling every file with one would open all seven on
+ *  every redraw and undo the property the tail reader is built on, that older
+ *  files are never opened when the newest already answers the request. Size
+ *  comes free from `statSync` and answers the same question the count was
+ *  wanted for: whether there is anything in this file. */
+export interface LogFileInfo {
+  /** Name on disk, `daemon.log.<DATE>`. The option's value, and what comes back
+   *  on `setLogFile`. */
+  name: string;
+  /** The date in the name, or the whole name when the suffix is not one. */
+  day: string;
+  /** Size in bytes. */
+  size: number;
+  /** `today` or `yesterday` where that is true of `day`, absent otherwise.
+   *
+   *  Supplied by the caller rather than computed here, so this builder does not
+   *  depend on the clock. Only those two, because files are named for days the
+   *  daemon ran and not for consecutive days: seven files can span months, so
+   *  "3 days ago" on the third entry would be wrong more often than useful. */
+  rel?: string;
 }
 
 /**
@@ -591,6 +649,7 @@ const EVENT_LABELS: Record<string, string> = {
   "daemon.ready": "Daemon ready",
   "daemon.socket.bound": "Control socket bound",
   "daemon.session.stop": "Daemon stopped",
+  "daemon.log_pruned": "Old log files removed",
   "head.drift.detected": "HEAD moved, reconciling",
   "head.reconcile.complete": "Reindexed after HEAD moved",
   "tree.reconcile.pruned": "Pruned deleted files",
@@ -625,6 +684,7 @@ const EVENT_FAMILY: Record<string, string> = {
   "daemon.ready": "daemon",
   "daemon.socket.bound": "daemon",
   "daemon.session.stop": "daemon",
+  "daemon.log_pruned": "daemon",
   "head.drift.detected": "git",
   "head.reconcile.complete": "git",
   "tree.reconcile.pruned": "git",
@@ -651,11 +711,97 @@ export interface StatsView {
   lastIndexed: string;
 }
 
+/** Severity ranks, the same semantics `travsr daemon logs --level` uses: warn
+ *  means warn and above, not warn alone. */
+const LOG_RANK: Record<string, number> = { TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4 };
+const rankOf = (lvl: string): number => LOG_RANK[lvl] ?? 2;
+
+/** The intervals the log's Auto control offers, in seconds. 0 is off.
+ *
+ *  Exported so the extension can reject a value the control never offered
+ *  instead of trusting a number from the webview into `setInterval`. */
+export const LOG_AUTO_SECONDS: readonly number[] = [0, 5, 15, 30, 60];
+
+/** The `.log-line` rows for a log tail, newest first.
+ *
+ *  Its own function because auto-refresh sends only these rows into a live
+ *  webview rather than rebuilding the document. `refresh()` assigns
+ *  `panel.webview.html` wholesale, so redrawing every few seconds would throw
+ *  away the search box, the severity chip, the toggles, the scroll position and
+ *  every expanded row on each tick. Replacing the rows in place leaves all of
+ *  that standing, which is the difference between a poll you can read and a
+ *  poll that fights you. */
+export function buildLogRowsHtml(log: LogEntry[]): string {
+  // Every line the reader returned is rendered. It used to cap at 200 while the
+  // header and the chips counted the full array, so on a log over 200 lines the
+  // panel claimed 342 with 200 rows in the DOM, and the 500 option could never
+  // show more than 200. The reader's own cap is the only cap now.
+  if (log.length === 0) {
+    return `<div class="empty">No daemon log yet. Run <span class="mono">travsr daemon start</span>.</div>`;
+  }
+  // Copy first: reverse() is in place, and this array belongs to the caller.
+  return [...log]
+    .reverse()
+    .flatMap((e, i, rows) => {
+      const row =
+        `<div class="log-line lvl-${esc(e.level)}" data-rank="${rankOf(e.level)}"` +
+        ` data-iso="${esc(e.iso)}" data-json="${esc(e.raw)}" data-tg="${esc(e.target)}">` +
+        `<span class="caret" aria-hidden="true"></span>` +
+        `<span class="mono muted t" data-local="${esc(e.time)}">${esc(e.time)}</span>` +
+        `<span class="pill p-${esc(e.level)}">${esc(e.level || "\u2014")}</span>` +
+        `<span class="mono muted tg">${esc(e.target)}</span>` +
+        `<span class="msg" data-raw="${esc(e.message)}">${esc(e.message)}</span>` +
+        `<span class="mono muted detail" data-raw="${esc(e.detail)}">${renderDetail(e.detail)}</span>` +
+        `<span class="jsonline mono">${highlightJson(e.raw)}</span></div>`;
+      // Rows run newest first, so a day divider belongs ABOVE the first row of
+      // each older file: it labels the block that follows it. Emitted only where
+      // the day actually changes, so a single-day log has none. `log-day`,
+      // deliberately not `log-line`: filterLog() counts and filters
+      // `.log-line`, and a divider is neither a line nor a match.
+      //
+      // Unreachable from the panel now that the File control reads one file at a
+      // time, since a single file cannot change day. Kept because this is a pure
+      // builder over whatever entries it is handed, and `readDaemonLogTail`
+      // still produces multi-day input for the tests that hold it to parity with
+      // the CLI's `LogTail::backfill`.
+      const prev = i > 0 ? rows[i - 1].day : undefined;
+      const needsDivider = i > 0 && e.day !== undefined && e.day !== prev;
+      return needsDivider
+        ? [`<div class="log-day" data-day="${esc(e.day ?? "")}">${esc(e.day ?? "")}</div>`, row]
+        : [row];
+    })
+    .join("\n");
+}
+
 /** Graph stats dashboard: metric cards, recent activity, and the log tail. */
 export function buildStatsHtml(
   stats: StatsView,
   log: LogEntry[] = [],
-  diags: Diagnostic[] = []
+  diags: Diagnostic[] = [],
+  /** How many lines the reader was asked for, so the Lines control can show the
+   *  window actually loaded and know when a bigger pick needs a re-read rather
+   *  than a local filter.
+   *
+   *  This only ever moves up. Narrowing is a local hide that never tells the
+   *  extension, so picking 100 over a loaded 500 leaves the control marking 500
+   *  and the next full redraw shows 500 again. That is a symptom of something
+   *  wider rather than anything specific to Lines: `refresh()` assigns
+   *  `panel.webview.html` wholesale, so a redraw also discards the search box,
+   *  the severity chip and the UTC/JSON toggles. Fixing it means persisting
+   *  panel state across a redraw, which is its own change. */
+  loadedLines: number = 500,
+  /** The File control's contents: which rotated files to offer, which one is
+   *  showing, and how many are on disk so a truncated list can say so.
+   *
+   *  Absent renders no File control at all, so a caller that predates rotation
+   *  awareness (and every test that does not care) still gets a working panel
+   *  rather than an empty dropdown. */
+  logFiles?: { files: LogFileInfo[]; onDisk: number; selected: string },
+  /** The auto-refresh interval in seconds, 0 for off, so the Auto control comes
+   *  back set the way the user left it after a full redraw. The timer itself
+   *  lives in the extension, not in this document, because a redraw replaces
+   *  this document. */
+  autoSeconds: number = 0
 ): string {
   const card = (k: string, v: string): string =>
     `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
@@ -698,8 +844,6 @@ export function buildStatsHtml(
 
   // Severity threshold, the same semantics `travsr daemon logs --level` uses:
   // warn means warn and above, not warn alone.
-  const RANK: Record<string, number> = { TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4 };
-  const rankOf = (lvl: string): number => RANK[lvl] ?? 2;
   const counts = { all: log.length, info: 0, warn: 0, error: 0 };
   for (const e of log) {
     const r = rankOf(e.level);
@@ -712,28 +856,11 @@ export function buildStatsHtml(
     `<button class="chip-btn" data-level="${id}" onclick="setLevel('${id}',this)">` +
     `${esc(label)} <span class="chip-n">${n}</span></button>`;
 
-  // Every line the reader returned is rendered. It used to cap at 200 while the
-  // header and the chips counted the full array, so on a log over 200 lines the
-  // panel claimed 342 with 200 rows in the DOM, and the 500 option could never
-  // show more than 200. The reader's own cap is the only cap now.
-  const logRows = log.length
-    ? // Copy first: reverse() is in place, and this array belongs to the caller.
-      [...log]
-        .reverse()
-        .map(
-          (e) =>
-            `<div class="log-line lvl-${esc(e.level)}" data-rank="${rankOf(e.level)}"` +
-            ` data-iso="${esc(e.iso)}" data-json="${esc(e.raw)}" data-tg="${esc(e.target)}">` +
-            `<span class="caret" aria-hidden="true"></span>` +
-            `<span class="mono muted t" data-local="${esc(e.time)}">${esc(e.time)}</span>` +
-            `<span class="pill p-${esc(e.level)}">${esc(e.level || "\u2014")}</span>` +
-            `<span class="mono muted tg">${esc(e.target)}</span>` +
-            `<span class="msg" data-raw="${esc(e.message)}">${esc(e.message)}</span>` +
-            `<span class="mono muted detail" data-raw="${esc(e.detail)}">${renderDetail(e.detail)}</span>` +
-            `<span class="jsonline mono">${highlightJson(e.raw)}</span></div>`
-        )
-        .join("\n")
-    : `<div class="empty">No daemon log yet. Run <span class="mono">travsr daemon start</span>.</div>`;
+  const logRows = buildLogRowsHtml(log);
+  const autoOptions = LOG_AUTO_SECONDS.map(
+    (s) =>
+      `<option value="${s}"${s === autoSeconds ? " selected" : ""}>${s === 0 ? "Off" : `${s}s`}</option>`
+  ).join("\n      ");
 
   // Health reads before anything else, because "is something wrong" is the
   // question the panel is opened with. All clear is its own state, not an empty
@@ -765,6 +892,38 @@ export function buildStatsHtml(
         .join("\n") +
       `</div>`
     : "";
+
+  // The File control. One file at a time is the whole point: the panel used to
+  // read across rotations, which made "the last 500 lines" a stream with no way
+  // to ask for a particular day.
+  //
+  // The list is capped and says when it is capped. `MAX_LOG_FILES` is the
+  // daemon's cap, not a guarantee about what is on disk: it is applied by
+  // `prune`, and a `.travsr` restored from a backup, or written by a daemon
+  // that predates the rotation sweep, can hold more. The dropdown should not
+  // grow to match.
+  const fileControl =
+    logFiles !== undefined && logFiles.files.length > 0
+      ? `<label class="sel">File
+    <select id="logFile" onchange="onLogFileChange()">
+      ${logFiles.files
+        .map((f) => {
+          const label = [f.day, f.rel, formatLogSize(f.size)]
+            .filter((p): p is string => p !== undefined && p !== "")
+            .join(" · ");
+          const on = f.name === logFiles.selected ? " selected" : "";
+          return `<option value="${esc(f.name)}"${on}>${esc(label)}</option>`;
+        })
+        .join("\n      ")}
+    </select>
+  </label>
+  <span class="hint" title="The daemon rotates on the UTC date, so one file covers one UTC day. Turn on UTC below to read the times on the same clock.">UTC days</span>${
+    logFiles.onDisk > logFiles.files.length
+      ? `
+  <span class="hint">${logFiles.files.length} of ${logFiles.onDisk} files</span>`
+      : ""
+  }`
+      : "";
 
   const body = `
 <h2>Graph stats</h2>
@@ -806,11 +965,14 @@ ${activityRows}
   <span class="count" id="logCount">${log.length} lines</span>
 </div>
 <div class="log-bar modes">
+  ${fileControl}
   <label class="sel">Lines
-    <select id="logLines" onchange="filterLog()">
+    <select id="logLines" data-loaded="${loadedLines}" onchange="onLogLinesChange()">
       <option value="100">100</option>
-      <option value="200" selected>200</option>
-      <option value="500">500</option>
+      <option value="200"${loadedLines <= 200 ? " selected" : ""}>200</option>
+      <option value="500"${loadedLines > 200 && loadedLines <= 500 ? " selected" : ""}>500</option>
+      <option value="2000"${loadedLines > 500 && loadedLines <= 2000 ? " selected" : ""}>2000</option>
+      <option value="${LOG_MAX_LINES}"${loadedLines > 2000 ? " selected" : ""}>All (max ${LOG_MAX_LINES})</option>
     </select>
   </label>
   <label class="sel">Since
@@ -821,9 +983,14 @@ ${activityRows}
       <option value="1440">24h</option>
     </select>
   </label>
+  <label class="sel">Auto
+    <select id="logAuto" onchange="onLogAutoChange()"
+            title="Re-read the log on a timer. Only the lines are replaced, so the filter, the severity chip and the scroll position are kept; the metric cards and the health banner move on Refresh.">
+      ${autoOptions}
+    </select>
+  </label>
   <label class="tog"><input type="checkbox" id="logUtc" onchange="filterLog()"> UTC</label>
   <label class="tog"><input type="checkbox" id="logJson" onchange="filterLog()"> JSON</label>
-  <label class="tog"><input type="checkbox" id="logFollow" onchange="toggleFollow(this)"> Follow</label>
 </div>
 <div class="log" id="logBox" onclick="onLogClick(event)">
 <div class="empty" id="logEmpty" style="display:none">No lines match this filter.</div>
@@ -863,25 +1030,6 @@ function mark(el, q) {
   el.appendChild(document.createTextNode(raw.slice(i)));
 }
 
-var followTimer = null;
-var followTick = 0;
-function toggleFollow(cb) {
-  if (followTimer) { clearInterval(followTimer); followTimer = null; }
-  followTick = 0;
-  // Re-reads the file on a timer, which is what --follow does. 3s is slower
-  // than a tail and fast enough for a panel you glance at.
-  //
-  // Most ticks ask for the log alone. A full refresh costs a get_graph_stats
-  // round trip and a travsr status process, and paying that every three
-  // seconds to redraw a log is not what --follow does. Every tenth tick is
-  // full, so the health banner cannot claim the daemon is up for more than
-  // thirty seconds after it stops, which is the one thing that must not go
-  // stale while you are watching the log.
-  if (cb.checked) followTimer = setInterval(function () {
-    followTick += 1;
-    vscode.postMessage({ command: followTick % 10 === 0 ? 'refresh' : 'refreshLog' });
-  }, 3000);
-}
 
 function onLogClick(ev) {
   // A ref wins over the row toggle: clicking the filename should open the file,
@@ -900,6 +1048,60 @@ function toggleRow(ev) {
   if (!box || !box.classList.contains('json-mode')) return;
   var row = ev.target.closest('.log-line');
   if (row) row.classList.toggle('open');
+}
+
+// The Lines control does two different jobs. Narrowing is a local hide, which
+// is instant. Widening past what the reader actually loaded cannot be done in
+// the DOM at all, because those rows were never sent, so it asks the extension
+// to re-read the log with a bigger window. Without this the dropdown silently
+// topped out at whatever the reader had fetched.
+function onLogLinesChange() {
+  var sel = document.getElementById('logLines');
+  var want = Number(sel.value);
+  var loaded = Number(sel.getAttribute('data-loaded') || '0');
+  if (want > loaded) {
+    vscode.postMessage({ command: 'setLogLines', lines: want });
+    return;
+  }
+  filterLog();
+}
+
+// Auto-refresh. The interval is set in the EXTENSION, not here, and that is the
+// whole reason this works where the old Follow toggle did not: a refresh assigns
+// panel.webview.html wholesale, so a setInterval in this document dies with the
+// first tick it triggers. This only reports the choice.
+function onLogAutoChange() {
+  var sel = document.getElementById('logAuto');
+  if (sel) vscode.postMessage({ command: 'setLogAuto', seconds: Number(sel.value) });
+}
+
+// An auto tick replaces the rows and nothing else. The search box, the severity
+// chip (minRank is a variable in this document, and this document survives), the
+// UTC/JSON toggles and all four selects keep their state; filterLog() reapplies
+// them to the new rows.
+//
+// Scroll: pinned to the bottom if that is where the reader already was, since
+// watching the tail arrive is the point of a poll, and otherwise left where they
+// put it so a tick cannot yank the line they were reading off the screen.
+window.addEventListener('message', function (ev) {
+  var d = ev.data;
+  if (!d || d.command !== 'setLogRows') return;
+  var box = document.getElementById('logBox');
+  if (!box) return;
+  var atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 4;
+  var was = box.scrollTop;
+  box.innerHTML =
+    '<div class="empty" id="logEmpty" style="display:none">No lines match this filter.</div>' + d.rows;
+  filterLog();
+  box.scrollTop = atBottom ? box.scrollHeight : was;
+});
+
+// The File control has no local fast path of its own. Narrowing Lines hides
+// rows that are already in the DOM; another file's rows were never sent at all,
+// so every change here is a re-read.
+function onLogFileChange() {
+  var sel = document.getElementById('logFile');
+  if (sel) vscode.postMessage({ command: 'setLogFile', file: sel.value });
 }
 
 function filterLog() {
@@ -941,6 +1143,27 @@ function filterLog() {
       mark(line.querySelector('.detail'), q);
     }
   }
+  // A day divider labels the block beneath it, so it must go when every line in
+  // that block is filtered out — otherwise a severity chip leaves a date
+  // heading standing over nothing. Walk the children in order and show each
+  // divider only if a visible line follows it before the next one.
+  var kids = box.children;
+  var pendingDay = null;
+  for (var k = 0; k < kids.length; k++) {
+    var el = kids[k];
+    if (el.classList.contains('log-day')) {
+      el.style.display = 'none';
+      pendingDay = el;
+    } else if (
+      pendingDay &&
+      el.classList.contains('log-line') &&
+      el.style.display !== 'none'
+    ) {
+      pendingDay.style.display = '';
+      pendingDay = null;
+    }
+  }
+
   var total = lines.length;
   var label = document.getElementById('logCount');
   // Say when a filter is hiding something. A short list with no explanation
@@ -958,6 +1181,47 @@ function filterLog() {
 })();
 `;
   return webviewShell("Travsr Stats", body, script);
+}
+
+/** The largest log window the panel will read, whatever the caller asks for.
+ *
+ *  The daemon prunes its log directory at 50 MB, which is a fine amount to
+ *  stream to a terminal and far too much to turn into DOM nodes. The Lines
+ *  control's "All" resolves to this and names it, so the ceiling is stated
+ *  rather than discovered when the webview stops responding.
+ *
+ *  What the ceiling actually bounds is the HTML, not the read. Measured on a
+ *  three-file fixture of realistic daemon lines:
+ *
+ *      n=500   read  5ms   html  9ms   0.89 MB
+ *      n=2000  read 14ms   html 29ms   3.49 MB
+ *      n=5000  read 29ms   html 51ms   8.69 MB
+ *
+ *  So the reader is never the expensive half; 5000 costs ~8.7 MB of HTML, and
+ *  `refresh()` assigns `panel.webview.html` wholesale, so every redraw
+ *  reserializes and reparses all of it. Raising this number is a decision about
+ *  that figure, not about read time. */
+export const LOG_MAX_LINES = 5000;
+
+/** How many rotated files the File control will list, newest kept.
+ *
+ *  `MAX_LOG_FILES` on the daemon side is 7, but that is a cap the daemon
+ *  applies rather than a promise about the directory: it runs in `prune`, at
+ *  start and on rotation, so a `.travsr` copied from a backup or written by an
+ *  older daemon can hold more than seven. The control lists this many and says
+ *  so when there are more, instead of growing a dropdown to fit whatever is
+ *  there. */
+export const LOG_MAX_FILES_LISTED = 7;
+
+/** A log file's size for the File control.
+ *
+ *  Whole KB is the useful resolution: the question a size answers here is
+ *  whether the file has anything in it, which is why it stands in for a line
+ *  count that would cost a full read of every file to produce. */
+export function formatLogSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /** A per-language node count from the graph. */

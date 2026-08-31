@@ -167,6 +167,18 @@ suite("VSCODE-247: resolveDepSpec", () => {
 });
 
 suite("VSCODE-247: buildDepListHtml", () => {
+  test("its palette follows the editor theme, not the desktop", () => {
+    // Same fix as webviewShell: this webview had its own copy of the media
+    // query, so it went light on a light desktop under a dark editor theme too.
+    const html = buildDepListHtml("Deps", [], []);
+    assert.ok(
+      !/@media\s*\(\s*prefers-color-scheme/.test(html),
+      "the palette must not be keyed on the OS appearance"
+    );
+    assert.ok(html.includes("body.vscode-light"));
+    assert.ok(html.includes("body.vscode-high-contrast-light"));
+  });
+
   test("clickable entries get data-path, external entries get dep-ext class", () => {
     const html = buildDepListHtml("Deps", [
       { display: "./status", path: "src/status.ts" },

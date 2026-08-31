@@ -14,7 +14,7 @@ import * as https from "https";
 import * as os from "os";
 import * as path from "path";
 
-export const DOWNLOAD_VERSION = "0.11.0";
+export const DOWNLOAD_VERSION = "1.0.0";
 
 // #497: must stay in lockstep with the release workflow matrix
 // (.github/workflows/release.yml) and the npm TARGETS map
