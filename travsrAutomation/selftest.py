@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from checks import _corpus_from_hint  # noqa: E402
 from report import Outcome, Report, Result  # noqa: E402
-from travsr import BUILD_ID_RE, Run, build_id_in_binary, verify_sums  # noqa: E402
+from travsr import Run, verify_sums  # noqa: E402
 
 
 class CorpusHintParsing(unittest.TestCase):
@@ -58,43 +58,6 @@ class CorpusHintParsing(unittest.TestCase):
 
     def test_dangling_corpus_flag_yields_empty(self):
         self.assertEqual(_corpus_from_hint("... --corpus"), "")
-
-
-class BuildIdExtraction(unittest.TestCase):
-    """#728: a release binary must carry <version>+<shortsha>."""
-
-    def test_matches_a_release_build_id(self):
-        self.assertEqual(
-            BUILD_ID_RE.findall(b"junk\x00travsr 1.0.0+8b9af8f\x00more"),
-            [b"1.0.0+8b9af8f"],
-        )
-
-    def test_does_not_match_a_bare_version(self):
-        # The exact shape of the bug: a bare version is what every channel
-        # reported before the fix, and must not be accepted as a build id.
-        self.assertEqual(BUILD_ID_RE.findall(b"travsr 1.0.0"), [])
-
-    def test_does_not_match_a_prerelease_suffix(self):
-        # Baking the channel in would follow a promoted artifact into stable and
-        # misreport it, so this shape must never be produced or accepted.
-        self.assertEqual(BUILD_ID_RE.findall(b"1.0.0-beta.1"), [])
-
-    def test_multi_component_versions(self):
-        self.assertEqual(BUILD_ID_RE.findall(b"10.20.30+abcdef0"), [b"10.20.30+abcdef0"])
-
-    def test_reads_a_binary_without_executing_it(self):
-        # This is what lets one host verify all five targets, including the
-        # cross-built Linux one that cannot run here.
-        with tempfile.TemporaryDirectory() as d:
-            f = Path(d) / "fake-binary"
-            f.write_bytes(b"\x7fELF\x00\x00padding 2.3.4+deadbee trailing\x00")
-            self.assertEqual(build_id_in_binary(f), "2.3.4+deadbee")
-
-    def test_absent_build_id_is_none_not_an_exception(self):
-        with tempfile.TemporaryDirectory() as d:
-            f = Path(d) / "fake-binary"
-            f.write_bytes(b"no version here")
-            self.assertIsNone(build_id_in_binary(f))
 
 
 class WarningStripping(unittest.TestCase):
@@ -312,7 +275,9 @@ class CheckRegistry(unittest.TestCase):
         from checks import all_checks
 
         guarded = {i for c in all_checks() for i in c.issues}
-        for issue in ("724", "726", "727", "728", "741"):
+        # #728 (build-id injection) is deliberately not guarded here: the
+        # feature it protected was removed, not regressed.
+        for issue in ("724", "726", "727", "741"):
             self.assertIn(issue, guarded, f"#{issue} is no longer guarded by any check")
 
 

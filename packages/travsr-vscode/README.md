@@ -23,7 +23,7 @@ Travsr replaces vector RAG with a deterministic graph. Every function call, impo
 
 - VS Code 1.85 or later
 - The `travsr` binary. The extension resolves it from `travsr.binaryPath`, then `~/.travsr/bin`, then PATH, and offers to download a verified release build if none of those work.
-- travsr v1.0.0-beta.2 or later is recommended. An older binary does not report everything the Languages panel needs; the panel detects that and says so, rather than rendering the gaps as answers.
+- travsr v1.0.0 or later is recommended. An older binary does not report everything the Languages panel needs; the panel detects that and says so, rather than rendering the gaps as answers.
 
 ## Getting Started
 
