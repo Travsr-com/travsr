@@ -4233,6 +4233,7 @@ const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
 ///   lane: Scala's SemanticDB oracle needs `sbt compile`; Kotlin's KLS (its
 ///   oracle *and* its live server) needs a working Gradle build, which the
 ///   Gradle/Kotlin/JDK version matrix on this machine would not produce.
+///
 /// Each entry is `(nodes.language, verified claims behind the decision)`.
 ///
 /// The sample size is recorded **as data**, not only in the prose above, so the
