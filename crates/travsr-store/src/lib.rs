@@ -2690,6 +2690,16 @@ FROM nodes";
     const NAME_MATCH_SUBSTRING: &'static str = "(signature LIKE '%' || ?1 || '%'
    OR path LIKE '%' || ?1 || '%')";
 
+    /// #778: upper bound on [`Self::exact_leaf_name_count`]. Only the
+    /// rare-vs-generic distinction is used downstream (a small count grounds a
+    /// short exact symbol; anything past a few hundred is already "generic" for
+    /// any realistic corpus via IDF), so counting past this adds nothing and the
+    /// `LIMIT` caps the worst-case scan for a pathologically common short name.
+    /// Hitting the cap means "at least this many"; the caller saturates the
+    /// count to the corpus size so IDF floors to generic (a truncated 4096 would
+    /// still read as specific — `idf_weight` does not saturate near it).
+    const LEAF_NAME_COUNT_CAP: usize = 4096;
+
     /// Exact/word-boundary/prefix match: drops the loose `ELSE 40` substring
     /// tier so short, common names don't drag in unrelated symbols (#453).
     const NAME_MATCH_BOUNDARY: &'static str = "(signature = ?1
@@ -6241,11 +6251,19 @@ impl SqliteStore {
     /// means the token is generic ("get", "run") and should contribute low
     /// weight even when it matches a real symbol.
     ///
-    /// Returns `None` when `token` is absent from the vocabulary — including
-    /// every token shorter than 3 bytes (never indexed) and any token that
-    /// simply never occurs. "Absent from vocabulary" and "occurs in zero
-    /// nodes" are different facts; callers must supply their own fallback
-    /// (never conflate the two — see the seed.rs call site).
+    /// Returns `None` only when the token occurs in zero nodes. A token whose
+    /// identifier segments are all shorter than 3 bytes (e.g. the Ruby class
+    /// `UI`) is never in the word vocab (min segment len 3), so it cannot be
+    /// measured here; rather than conflate "unindexed" with "occurs nowhere"
+    /// (which floored a unique short symbol to the generic IDF and abstained on
+    /// an exact rank-0 match — #778), it falls back to the exact-leaf-name
+    /// document frequency ([`Self::exact_leaf_name_count`]): how many definition
+    /// nodes are named *exactly* this token. That is the same scale the exact
+    /// leg (`search_nodes_by_name_exact`, raw score 1.0) treats as a match, so a
+    /// genuinely unique short symbol reads as rare and a common member name
+    /// (borne by many `*.name` members) reads as generic — the segment vocab
+    /// above cannot distinguish them because it never indexed the short token.
+    /// A genuine zero still returns `None`, so nonsense short tokens abstain.
     ///
     /// `token` may itself be a compound identifier the caller has not
     /// pre-segmented (`tokenize_query`'s content tokens preserve `_`, e.g.
@@ -6262,12 +6280,28 @@ impl SqliteStore {
     /// from the vocabulary.
     pub fn symbol_frequency(&self, token: &str) -> Result<Option<usize>, StoreError> {
         (|| -> AnyResult<Option<usize>> {
+            if token.is_empty() {
+                return Ok(None);
+            }
             let segs: Vec<String> = travsr_core::ident::segments(token)
                 .into_iter()
                 .filter(|s| s.len() >= 3)
                 .collect();
             if segs.is_empty() {
-                return Ok(None);
+                // #778: a token whose identifier segments are all < 3 chars (e.g.
+                // the Ruby class `UI`) never enters `nodes_words_vocab` (min segment
+                // len 3), so the word-vocab path below cannot measure it. Returning
+                // `None` here let the caller fabricate `freq = n_total`, scoring a
+                // unique 2-char symbol as maximally generic (the idf floor) — the
+                // exact inverse of the truth, so `ask "UI"` abstained on an exact
+                // rank-0 match. Fall back to the exact-leaf-name document frequency:
+                // how many definition nodes are named *exactly* this token. A real,
+                // small count (`UI` -> 1) makes the token rare and lets it ground; a
+                // common member name borne by many `*.name` members counts them all
+                // and stays generic; a genuine zero (a nonsense short token) stays
+                // `None` so it is still treated as generic and abstains.
+                let count = self.exact_leaf_name_count(token)?;
+                return Ok((count > 0).then_some(count));
             }
             let mut min_doc: Option<i64> = None;
             for seg in &segs {
@@ -6288,6 +6322,82 @@ impl SqliteStore {
             Ok(min_doc.map(|d| d.max(0) as usize))
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// #778: how many definition nodes are named *exactly* `token` — i.e.
+    /// `token` is the leaf of their `kind:Qualified.leaf` signature
+    /// (`class:UI` -> `UI`, `method:Widget.id` -> `id`), case-insensitively.
+    /// This matches the exact leg's raw-score-1.0 name semantics
+    /// (`search_nodes_by_name_exact`), so it is the same scale the anchor path
+    /// treats as an exact match — unlike a substring or a segment count.
+    ///
+    /// The distinction that matters for the [`Self::symbol_frequency`] fallback:
+    /// `NAME_MATCH_BOUNDARY`'s unqualified tail forms cannot see a qualified
+    /// member (`method:Widget.id` is invisible to a bare-`id` boundary match)
+    /// yet its prefix form over-counts (`id%` catches `Identifier`), so it both
+    /// fabricates rarity for a common member name and inflates a unique one.
+    /// The two leaf clauses below (`'%:' || tok` for an unqualified body,
+    /// `'%.' || tok` for a qualified leaf) count exactly the nodes whose own
+    /// name is the token, and nothing else.
+    ///
+    /// Bounded by [`Self::LEAF_NAME_COUNT_CAP`]: only the rare/generic
+    /// distinction (via the resulting IDF band) is used downstream, so the true
+    /// count above the cap is irrelevant, and the `LIMIT` early-stops the scan
+    /// for a pathologically common short name. At the cap the count is
+    /// saturated to the corpus size (see the return below) rather than reported
+    /// as the truncated `LIMIT` value, so a name common enough to hit the cap
+    /// floors IDF to "generic" instead of reading as specific. Returns 0 when no
+    /// node bears the exact name — the caller keeps `None` on that genuine zero.
+    ///
+    /// `_` and `%` in `token` are escaped so a token like `a_b` is matched
+    /// literally, not as a LIKE wildcard. Used only as the `symbol_frequency`
+    /// fallback for tokens too short (< 3-char segments) to appear in
+    /// `nodes_words_vocab`; there is no index for the trailing-leaf match, so it
+    /// is a bounded scan on that cold, short-token path only.
+    fn exact_leaf_name_count(&self, token: &str) -> AnyResult<usize> {
+        // Escape SQL LIKE metacharacters so the token is matched literally,
+        // paired with `ESCAPE '\'` below. `\` itself is escaped first.
+        fn escape_like(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                if matches!(c, '\\' | '%' | '_') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out
+        }
+        let escaped = escape_like(token);
+        // `'%:' || ?1` matches an unqualified body (`class:UI`); `'%.' || ?1` a
+        // qualified leaf (`method:Widget.id`). Wrapped in a `LIMIT`-ed subquery
+        // so the scan stops after the cap is reached.
+        let sql = "SELECT count(*) FROM (\
+                     SELECT 1 FROM nodes \
+                     WHERE (signature LIKE '%:' || ?1 ESCAPE '\\' \
+                         OR signature LIKE '%.' || ?1 ESCAPE '\\') \
+                       AND kind != 'doc-chunk' \
+                     LIMIT ?2)";
+        let n: i64 = self
+            .conn
+            .query_row(
+                sql,
+                params![escaped, Self::LEAF_NAME_COUNT_CAP as i64],
+                |r| r.get(0),
+            )
+            .context("counting exact leaf-name matches for symbol_frequency")?;
+        // At the cap the true count is unknown but is >= the cap: the `LIMIT`
+        // truncated it. A truncated count reads as *specific* through
+        // `idf_weight`, which does not saturate anywhere near the cap, so a
+        // short leaf name borne by tens of thousands of nodes would clear the
+        // anchor-emit cut — the exact inversion this fallback exists to prevent.
+        // Saturate to the corpus size N so IDF floors to "generic" instead;
+        // below the cap the count is exact. Only the capped branch touches the
+        // store again.
+        Ok(if n >= Self::LEAF_NAME_COUNT_CAP as i64 {
+            self.total_node_count()?
+        } else {
+            n.max(0) as usize
+        })
     }
 
     /// Returns the total number of nodes in the graph.

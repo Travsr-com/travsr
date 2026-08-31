@@ -282,8 +282,90 @@ fn symbol_frequency_counts_sqlite_on_sqlitestore_fixture() {
 #[test]
 fn symbol_frequency_none_for_short_token() {
     let store = open();
-    // < 3 bytes is never indexed (ident::segments post-processing drops it).
+    // < 3 bytes never enters the word vocab (ident::segments drops it), and with
+    // no node named "ab" the #778 exact-leaf-name fallback is 0, so the token is
+    // still unmeasurable -> None (stays generic / abstains).
     assert_eq!(store.symbol_frequency("ab").unwrap(), None);
+}
+
+#[test]
+fn symbol_frequency_short_token_grounds_on_exact_symbol() {
+    // #778: a 2-char symbol (`UI`) is absent from the word vocab (min segment
+    // len 3), but it is a real, unique symbol in this repo. The exact-leaf-name
+    // fallback measures it as rare (Some(1)) rather than returning None and
+    // letting the seed path fabricate `freq = n_total` and abstain on the exact
+    // rank-0 match.
+    let mut store = open();
+    store
+        .put_node(&node("app/ui.rb", "class:UI", "class"))
+        .unwrap();
+    assert_eq!(store.symbol_frequency("UI").unwrap(), Some(1));
+    // A qualified leaf named exactly the token counts too (`method:Foo.ui` ->
+    // leaf `ui`), case-insensitively.
+    store
+        .put_node(&node("app/foo.rb", "method:Foo.ui", "method"))
+        .unwrap();
+    assert_eq!(store.symbol_frequency("UI").unwrap(), Some(2));
+    // A different short token with no matching symbol stays unmeasurable.
+    assert_eq!(store.symbol_frequency("QZ").unwrap(), None);
+}
+
+#[test]
+fn symbol_frequency_short_token_counts_qualified_members_as_generic() {
+    // #778 regression for PR #791 review: the earlier boundary-count fallback
+    // measured a short token on a DIFFERENT scale than the segment-vocab path it
+    // falls back from. `NAME_MATCH_BOUNDARY`'s tail forms cannot see a qualified
+    // member (`method:WidgetN.id`), so a corpus of hundreds of `.id` members plus
+    // one `class:Id` counted as 1 -> `freq <= rare_anchor_max` -> the strongest
+    // trust signal in the system, purely because `id` is 2 chars. The
+    // exact-leaf-name count instead counts every `*.id` member (leaf `id`), so a
+    // common member name reads as generic, exactly as the 3-char segment vocab
+    // would count the identical `.key` corpus.
+    let mut store = open();
+    for i in 0..40 {
+        store
+            .put_node(&node(
+                &format!("app/widget_{i}.rb"),
+                &format!("method:Widget{i}.id"),
+                "method",
+            ))
+            .unwrap();
+    }
+    store
+        .put_node(&node("app/id.rb", "class:Id", "class"))
+        .unwrap();
+    // 40 members + the class, all named exactly `id` at their leaf: measured, not
+    // fabricated as 1. Far above any rare-anchor bar, so it grounds nothing.
+    assert_eq!(store.symbol_frequency("id").unwrap(), Some(41));
+}
+
+#[test]
+fn symbol_frequency_short_token_saturates_at_cap() {
+    // #778 PR #791 review follow-up: when a short leaf name is common enough to
+    // hit LEAF_NAME_COUNT_CAP (4096), the LIMIT truncates the scan. The truncated
+    // count must NOT be reported verbatim: 4096 still reads as "specific" through
+    // idf_weight (which does not saturate near it), which would let a name borne
+    // by tens of thousands of nodes clear the anchor-emit cut. The count is
+    // instead saturated to the corpus size so IDF floors to generic.
+    let mut store = open();
+    // 4096 nodes named exactly `xy` at their leaf -> the leaf-count scan hits the
+    // LIMIT. One extra non-matching node makes the corpus 4097, so a saturated
+    // result is distinguishable from the truncated 4096.
+    for i in 0..4096 {
+        store
+            .put_node(&node(
+                &format!("app/w_{i}.rb"),
+                &format!("method:W{i}.xy"),
+                "method",
+            ))
+            .unwrap();
+    }
+    store
+        .put_node(&node("app/other.rb", "class:Other", "class"))
+        .unwrap();
+    // Saturated to the corpus size (4097), not the truncated cap (4096): proves
+    // the LIMIT value is not reported as-is.
+    assert_eq!(store.symbol_frequency("xy").unwrap(), Some(4097));
 }
 
 #[test]
