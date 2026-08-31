@@ -298,6 +298,21 @@ pub fn parse_with_config(
         }
     }
 
+    // #780: the capture loop emits one node per matched capture, so a symbol
+    // whose definition site recurs — a Ruby ivar `@x` reassigned in several
+    // methods, a constant redeclared — yields several nodes that share one
+    // VName/NodeId at different lines. `flush_staging_to_production` documents
+    // the invariant "same NodeId => same VName => same parse output, so all are
+    // equal" and breaks any tie with `MAX(line)`, which would anchor the node on
+    // the last reassignment and defeat the SCIP def's line-proximity match.
+    // Collapse duplicates to the first occurrence in document order (query
+    // matches arrive in start-position order) so the invariant holds and the
+    // anchor line stays the definition, not a later write.
+    {
+        let mut seen_ids = std::collections::HashSet::new();
+        nodes.retain(|n| seen_ids.insert(n.id));
+    }
+
     // #780: language-specific expansion the shared capture pipeline cannot
     // express (Ruby `attr_*` macros → accessor method nodes). No-op for every
     // config that leaves `post_parse` unset.

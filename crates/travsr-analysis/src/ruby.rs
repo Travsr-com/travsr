@@ -66,6 +66,17 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         // #780 (RC-3): `X = …` → `const:X` (file-level; the VName's path keeps
         // same-named constants in different files distinct). Matches scip-ruby's
         // `const:X` unification candidate.
+        //
+        // Deliberately file-level, not container-qualified like `field` below:
+        // Ruby constants are overwhelmingly referenced by their bare name and
+        // scip-ruby's `variable` candidate ladder falls back to unqualified
+        // `const:X` regardless, so a qualified `const:C.X` node would simply not
+        // be found. Accepted limitation: two same-named constants in different
+        // classes of ONE file (`class B; NAME=…; end; class C; NAME=…; end`)
+        // collapse onto a single `const:NAME` node and references to either
+        // resolve to it. This is rare, and qualifying would require routing
+        // `const` through the shared `member_qual` path in `generic.rs`, which
+        // governs every language's `const` capture — out of scope for #780.
         ("const.name", "constant", "const"),
         // #780 (RC-3): `@x = …` → `field:C.@x`, qualified by the enclosing type
         // via the shared `field` member-qualification path, matching scip-ruby's
@@ -256,6 +267,24 @@ fn expand_struct_defs(ctx: &PostParseCtx<'_>, nodes: &mut Vec<Node>, edges: &mut
         if !is_struct_new {
             continue;
         }
+
+        // `Name = Struct.new(...)` is an `assignment`, so the shared constant
+        // capture already emitted a `const:Name` node at this line. scip-ruby
+        // models the construct as a class (`…#Name#`), which is the node the
+        // members and refs unify against, so the constant is a duplicate
+        // identity for the same location — exactly what this PR removes
+        // elsewhere. Retract it (node plus its file edge) before emitting the
+        // class so `travsr graph Name` is unambiguous.
+        let const_id = VName::new(
+            ctx.corpus,
+            "",
+            ctx.vname_path,
+            ctx.lang,
+            format!("const:{name}"),
+        )
+        .id();
+        nodes.retain(|n| n.id != const_id);
+        edges.retain(|e| !(e.src == ctx.file_id && e.dst == const_id));
 
         let line = node.start_position().row as u32 + 1;
         let end_line = node.end_position().row as u32 + 1;
@@ -599,6 +628,16 @@ mod tests {
         ] {
             assert!(sigs.contains(&want), "missing {want}: {sigs:?}");
         }
+        // Defect 2: `Name = Struct.new(...)` is an `assignment`, so the constant
+        // capture emitted `const:ServiceOption` / `const:URLLog` too. The class is
+        // the node scip unifies against, so the constant must be retracted — one
+        // definition, one node — leaving no duplicate identity for `graph Name`.
+        for gone in ["const:ServiceOption", "const:URLLog"] {
+            assert!(
+                !sigs.contains(&gone),
+                "Struct.new constant must be retracted, found {gone}: {sigs:?}"
+            );
+        }
         // class:ServiceOption is parented to the file (as tree-sitter class nodes
         // are), so scip's `…#ServiceOption#` class ref unifies onto it.
         let file_id = out.nodes.iter().find(|n| n.kind == "file").unwrap().id;
@@ -612,6 +651,13 @@ mod tests {
             .edges
             .iter()
             .any(|e| e.src == file_id && e.dst == class_id));
+        // The retracted constant's file edge is gone too (no orphan edge).
+        let const_id =
+            travsr_core::VName::new("corp", "", "a.rb", "ruby", "const:ServiceOption").id();
+        assert!(
+            !out.edges.iter().any(|e| e.dst == const_id),
+            "retracted constant's edge must be removed"
+        );
     }
 
     #[test]
@@ -636,6 +682,34 @@ mod tests {
             .find(|n| n.vname.signature == "field:C.@count")
             .unwrap();
         assert_eq!(ivar.kind, "field");
+    }
+
+    #[test]
+    fn reassigned_ivar_is_one_node_anchored_on_first_write() {
+        // Defect 3: an ivar assigned in several methods matches the capture once
+        // per assignment. All share one VName/NodeId, so they must collapse to a
+        // single node anchored on the FIRST write (the definition) — not the last,
+        // which `flush_staging_to_production`'s MAX(line) tie-break would pick and
+        // which would push the node past the scip def's +/-5 line window.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rb");
+        std::fs::write(
+            &path,
+            "class C\n  def initialize\n    @count = 0\n  end\n  def reset\n    @count = 0\n  end\nend\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "a.rb").unwrap();
+        let ivars: Vec<&travsr_core::Node> = out
+            .nodes
+            .iter()
+            .filter(|n| n.vname.signature == "field:C.@count")
+            .collect();
+        assert_eq!(ivars.len(), 1, "one node per VName, not one per assignment");
+        assert_eq!(
+            ivars[0].line,
+            Some(3),
+            "anchored on the first write, not line 6"
+        );
     }
 
     #[test]

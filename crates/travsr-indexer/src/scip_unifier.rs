@@ -204,18 +204,51 @@ fn unwrap_meta_container(s: &str) -> &str {
 /// True when the leaf `name` or its `container` is a DSL meta-scope: a bracketed
 /// `<…>` segment that [`unwrap_meta_container`] does NOT resolve to a real
 /// `<Class:Name>`/`<Module:Name>`.
+///
+/// This is the leaf-OR-container disjunction. The unification pass must NOT act
+/// on it directly — a real def inside a `describe` block ([`is_dsl_scope_container`])
+/// has a Phase A twin and must be reconciled, not dropped. Use the split
+/// predicates below and drop only the [`is_dsl_scope_leaf`] case outright.
 pub fn is_synthetic_dsl_scope(parsed: &ScipName<'_>) -> bool {
-    is_dsl_meta_scope(parsed.name) || parsed.container.is_some_and(is_dsl_meta_scope)
+    is_dsl_scope_leaf(parsed) || is_dsl_scope_container(parsed)
+}
+
+/// The definition's own leaf `name` is a DSL meta-scope (`<it 'does x'>`,
+/// `<describe 'Foo'>` as the name itself). scip-ruby emits this for the RSpec
+/// block; tree-sitter sees a method call with a block, not a definition, so no
+/// Phase A twin exists or can. Drop it outright.
+pub fn is_dsl_scope_leaf(parsed: &ScipName<'_>) -> bool {
+    is_dsl_meta_scope(parsed.name)
+}
+
+/// The leaf is a real name but its `container` is a DSL meta-scope — a helper
+/// (`class Helper`, `def helper`) defined inside an RSpec `describe`/`context`
+/// block. Phase A emits it unqualified (a block is not a `method_container`),
+/// so the SCIP def CAN reconcile once the unreconcilable container is cleared.
+/// The caller retries unification against the unqualified candidates rather than
+/// dropping the def, and counts it only if it unifies.
+pub fn is_dsl_scope_container(parsed: &ScipName<'_>) -> bool {
+    !is_dsl_meta_scope(parsed.name) && parsed.container.is_some_and(is_dsl_meta_scope)
 }
 
 /// A single descriptor segment is a Sorbet DSL meta-scope: bracketed `<…>`, its
 /// first inner character alphabetic (so a Ruby operator method whose name merely
 /// starts with `<` — `<`, `<<`, `<=>` — is NOT misread as a scope), and not a
-/// real singleton class/module that [`unwrap_meta_container`] would unwrap.
+/// real singleton class/module.
 fn is_dsl_meta_scope(s: &str) -> bool {
     let Some(inner) = s.strip_prefix('<').and_then(|i| i.strip_suffix('>')) else {
         return false;
     };
+    // A `<Class:…>` / `<Module:…>` singleton marker is a real scope, never a DSL
+    // block — even when its name does not reduce via `unwrap_meta_container` (a
+    // namespaced `<Class:Foo::Bar>`, whose `::` fails the alphanumeric check).
+    // Without this guard such a metaclass would be misread as a DSL scope and
+    // its methods dropped.
+    if let Some((tag, _)) = inner.split_once(':') {
+        if matches!(tag, "Class" | "Module") {
+            return false;
+        }
+    }
     inner.chars().next().is_some_and(|c| c.is_alphabetic()) && unwrap_meta_container(s) == s
 }
 
@@ -661,6 +694,53 @@ mod tests {
         assert_eq!(p.container, Some("GeneratedUniversalApk"));
         assert_eq!(p.name, "package_name");
         assert!(!is_synthetic_dsl_scope(&p));
+    }
+
+    #[test]
+    fn describe_block_leaf_vs_container_split() {
+        // #780 defect 1: a def whose *leaf* is the block (`<it '...'>`) has no
+        // twin and is a leaf-drop; a real def *inside* a `describe` block
+        // (`<describe 'Foo'>#helper().`) is a container-only case that the
+        // unifier must recover by clearing the container, not drop.
+        let leaf =
+            scip_name_kind("scip-ruby gem fastlane 0.0.0 `<describe 'Foo'>`#`<it 'does x'>`().")
+                .unwrap();
+        assert!(is_dsl_scope_leaf(&leaf), "block-as-leaf is a leaf drop");
+        assert!(!is_dsl_scope_container(&leaf));
+
+        let contained =
+            scip_name_kind("scip-ruby gem fastlane 0.0.0 `<describe 'Foo'>`#`helper`().").unwrap();
+        assert!(
+            !is_dsl_scope_leaf(&contained),
+            "real leaf is not a leaf drop"
+        );
+        assert!(
+            is_dsl_scope_container(&contained),
+            "real def inside a describe block is a container case"
+        );
+        assert_eq!(contained.name, "helper");
+        assert_eq!(contained.container, Some("<describe 'Foo'>"));
+        // Both are still `synthetic` under the disjunction (existing callers).
+        assert!(is_synthetic_dsl_scope(&leaf) && is_synthetic_dsl_scope(&contained));
+
+        // A real class inside the block: container-only, recoverable to class:Helper.
+        let cls =
+            scip_name_kind("scip-ruby gem fastlane 0.0.0 `<describe 'Foo'>`#Helper#").unwrap();
+        assert!(!is_dsl_scope_leaf(&cls));
+        assert!(is_dsl_scope_container(&cls));
+        assert_eq!(cls.name, "Helper");
+    }
+
+    #[test]
+    fn namespaced_metaclass_is_not_a_dsl_scope() {
+        // Hardening: `<Class:Foo::Bar>` does not reduce via unwrap_meta_container
+        // (the `::` fails the alphanumeric check), but a `<Class:…>` singleton
+        // marker is a real scope, never a DSL block. It must NOT be classified
+        // synthetic, or a namespaced metaclass's methods would be dropped.
+        assert!(!is_dsl_meta_scope("<Class:Foo::Bar>"));
+        assert!(!is_dsl_meta_scope("<Module:Foo::Bar>"));
+        // A genuine DSL block still is.
+        assert!(is_dsl_meta_scope("<describe 'Foo'>"));
     }
 
     #[test]

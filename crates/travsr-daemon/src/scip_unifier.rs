@@ -33,13 +33,15 @@ pub struct UnifyOutcome {
     pub attempted: usize,
     /// Callable/type candidates that matched an existing Phase A node.
     pub unified: usize,
-    /// SCIP def nodes with no reconcilable Phase A counterpart that must not be
-    /// counted as misses (#780): Sorbet synthetic DSL meta-scopes (RSpec
-    /// `describe`/`context`/`it` blocks), and defs in files the tree-sitter parser
-    /// never indexed (gitignored vendored code scip-ruby indexes anyway). Neither
-    /// is a reconciliation failure — no twin exists or can. Excluded from
-    /// `attempted`/`unified`, and dropped by the caller (node plus its inbound
+    /// SCIP def nodes that are Sorbet synthetic DSL meta-scopes with no twin and
+    /// no possibility of one (#780): RSpec `describe`/`context`/`it` blocks whose
+    /// *leaf* is the block itself, and a def defined inside a block that still
+    /// found no Phase A twin after its unreconcilable container was cleared.
+    /// Neither is a reconciliation failure, so both are excluded from
+    /// `attempted`/`unified` and dropped by the caller (node plus its inbound
     /// refs/edges) so they stop surviving as orphan duplicates that steal edges.
+    /// Defs in tree-sitter-unindexed files (vendored gem code) are NOT dropped:
+    /// they are real navigable definitions, only excluded from the counters.
     pub dropped: HashSet<NodeId>,
 }
 
@@ -124,25 +126,46 @@ pub fn unify_all(
             }
             None => continue,
         };
+        // #780: Sorbet models RSpec `describe`/`context`/`it` blocks as singleton
+        // scopes and emits SCIP defs for them. When the *leaf* itself is the
+        // block (`<it 'does x'>` as the def's own name) tree-sitter (correctly)
+        // sees a method call with a block, not a definition, so no Phase A twin
+        // exists or can — in ANY file, so this is checked before the
+        // unindexed-path rule below. Drop it so it stops orphaning as a duplicate
+        // that steals spec-file reference edges (~70% of #780's headline rate).
+        // (The *container*-only block case — a real `class Helper` / `def helper`
+        // defined inside `describe 'Foo' do … end` — is handled after the path
+        // check: Phase A emits an unqualified twin, so it can reconcile.)
+        if travsr_indexer::scip_unifier::is_dsl_scope_leaf(&parsed) {
+            dropped.insert(node.id);
+            continue;
+        }
         // #780: a SCIP def in a file the tree-sitter parser never indexed
         // (gitignored vendored code that scip-ruby indexes anyway) has no twin
-        // and none can exist — it is not a reconciliation failure. Drop it and
-        // exclude it from the counters. Native sidecar nodes (kotlin/swift/dart)
-        // are never path-excluded: their twins live in the same indexed sources.
+        // and none can exist — it is not a reconciliation failure. Exclude it
+        // from the counters but KEEP the node: it is a real definition at a real
+        // on-disk file (`vendor/bundle/.../rake/task.rb`), and calls from app
+        // code into gem code are exactly the cross-boundary edges the graph is
+        // most useful for. Dropping it would take every inbound `ScipRef` with
+        // it. Native sidecar nodes (kotlin/swift/dart) are never path-excluded:
+        // their twins live in the same indexed sources.
         if is_scip && !indexed_paths.contains(&node.vname.path) {
-            dropped.insert(node.id);
             continue;
         }
-        // #780: Sorbet models RSpec `describe`/`context`/`it` blocks as singleton
-        // scopes and emits SCIP defs for them, but tree-sitter (correctly) sees a
-        // method call with a block, so no Phase A twin exists or can. These are
-        // not definitions: exclude them from the miss counters entirely and drop
-        // the node so it stops orphaning as a duplicate that steals spec-file
-        // reference edges (~70% of issue #780's headline rate).
-        if travsr_indexer::scip_unifier::is_synthetic_dsl_scope(&parsed) {
-            dropped.insert(node.id);
-            continue;
-        }
+        // Container-only DSL block: Phase A DOES emit a twin, unqualified,
+        // because a block is not a `method_container`. Clearing the
+        // unreconcilable container lets the def unify onto that twin. It is
+        // counted only if it unifies (below), so recovering it can never regress
+        // the reported miss rate.
+        let dsl_contained = travsr_indexer::scip_unifier::is_dsl_scope_container(&parsed);
+        let parsed = if dsl_contained {
+            travsr_indexer::scip_unifier::ScipName {
+                container: None,
+                ..parsed
+            }
+        } else {
+            parsed
+        };
         // No definition line means line-proximity matching is meaningless —
         // unwrapping to 0 would let any same-named node on lines 1..=5 of the
         // file match wrongly. Skip instead.
@@ -151,8 +174,11 @@ pub fn unify_all(
         };
         let candidates = travsr_indexer::scip_unifier::candidate_signatures(&parsed);
         let scip_line = line as i64;
-        let counts_toward_miss_rate = matches!(parsed.kind, "function" | "class");
-        if counts_toward_miss_rate {
+        let is_callable_type = matches!(parsed.kind, "function" | "class");
+        // A normal callable/type def is an attempt up front — a miss raises the
+        // rate. A DSL-contained def is credited only when it unifies (in the
+        // match arm), so its recovery cannot push the miss rate up.
+        if is_callable_type && !dsl_contained {
             attempted_syms.insert(scip_sym);
         }
 
@@ -167,10 +193,20 @@ pub fn unify_all(
                 aliases.push((scip_sym.to_string(), ts_id));
                 alias_map.insert(node.id, ts_id);
                 sym_to_ts.entry(scip_sym).or_insert(ts_id);
-                if counts_toward_miss_rate {
+                if is_callable_type {
+                    // A DSL-contained def enters `attempted` only now, on the
+                    // success path, so the pair stays metric-neutral.
+                    attempted_syms.insert(scip_sym);
                     unified_syms.insert(scip_sym);
                 }
                 tracing::trace!(symbol = %scip_sym, ?ts_id, "G1: unified");
+            }
+            // A DSL-contained def that still misses after the container clear has
+            // no reconcilable twin — drop it un-counted rather than counting a
+            // synthetic miss or letting the cross-file rungs key on its
+            // block-qualified symbol.
+            Ok(None) if dsl_contained => {
+                dropped.insert(node.id);
             }
             Ok(None) => unmatched.push((node.id, scip_sym, candidates, parsed.kind)),
             Err(e) => tracing::warn!(symbol = %scip_sym, "G1: DB lookup: {e:#}"),
@@ -259,10 +295,15 @@ pub fn unify_all(
         }
     }
 
+    // #780: report the excluded-outright count alongside the attempt/miss
+    // figures so a mass silent exclusion (e.g. Phase A having indexed nothing,
+    // so every DSL-contained def fails to unify and is dropped) is
+    // distinguishable from a genuinely low miss rate on the same debug line.
     tracing::debug!(
         aliased = alias_map.len(),
         callable_unified = unified,
         callable_attempted = attempted,
+        dropped = dropped.len(),
         total = nodes.len(),
         "G1: unification complete"
     );
@@ -341,11 +382,13 @@ mod tests {
     }
 
     #[test]
-    fn scip_def_in_unindexed_file_is_dropped_not_counted() {
+    fn scip_def_in_unindexed_file_is_kept_not_counted() {
         // #780: scip-ruby indexes gitignored vendored code the tree-sitter parser
         // skips, so those files hold only SCIP defs and no Phase A node. Such a
-        // def can never reconcile — it must be dropped and excluded from the miss
-        // rate, not counted as a failure.
+        // def can never reconcile, so it is excluded from the miss rate — but it
+        // is a real navigable definition (calls from app code into gem code are
+        // exactly the cross-boundary edges the graph is most useful for), so it
+        // is KEPT, not dropped.
         let mut store = SqliteStore::open_in_memory().unwrap();
         // An indexed app file with a real Phase A twin (so its path is "indexed").
         let ts = Node::new(
@@ -373,9 +416,107 @@ mod tests {
         assert_eq!(out.attempted, 1, "only the indexed-file def is an attempt");
         assert_eq!(out.unified, 1);
         assert!(
-            out.dropped.contains(&vendored.id),
-            "def in an unindexed (vendored) file must be dropped"
+            !out.dropped.contains(&vendored.id),
+            "def in an unindexed (vendored) file must be kept, not dropped"
+        );
+        assert!(
+            !out.alias_map.contains_key(&vendored.id),
+            "the vendored def has no twin, so it is not aliased away either"
         );
         assert!(!out.dropped.contains(&app.id));
+    }
+
+    #[test]
+    fn real_def_inside_describe_block_unifies_not_dropped() {
+        // #780 defect 1: a spec routinely defines helpers inside a `describe`
+        // block. scip-ruby qualifies them by the block (`<describe 'Foo'>#…`),
+        // but Phase A emits an unqualified twin (a block is not a
+        // `method_container`). Only the container is a DSL scope, so clearing it
+        // lets the def reconcile onto the real twin instead of being deleted with
+        // every reference to it.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let spec = "fastlane/spec/foo_spec.rb";
+        // Phase A twins: an unqualified helper method and a helper class, both
+        // inside the `describe` block, on the lines scip-ruby reports them.
+        let helper_fn = Node::new(
+            VName::new("c", "main", spec, "ruby", "fn:helper"),
+            "function",
+        )
+        .with_line(4)
+        .with_end_line(4);
+        let helper_class = Node::new(
+            VName::new("c", "main", spec, "ruby", "class:Helper"),
+            "class",
+        )
+        .with_line(2)
+        .with_end_line(2);
+        store
+            .write_phase_b_batch(&[helper_fn.clone(), helper_class.clone()], &[], "scip")
+            .unwrap();
+
+        let scip_fn = scip_node(
+            spec,
+            "scip-ruby gem fastlane 0.0.0 `<describe 'Foo'>`#`helper`().",
+            4,
+        );
+        let scip_class = scip_node(
+            spec,
+            "scip-ruby gem fastlane 0.0.0 `<describe 'Foo'>`#Helper#",
+            2,
+        );
+
+        let nodes = vec![scip_fn.clone(), scip_class.clone()];
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", &nodes, &mut refs);
+
+        assert_eq!(
+            out.alias_map.get(&scip_fn.id),
+            Some(&helper_fn.id),
+            "describe-block helper method must unify onto its unqualified twin"
+        );
+        assert_eq!(
+            out.alias_map.get(&scip_class.id),
+            Some(&helper_class.id),
+            "describe-block helper class must unify onto its twin"
+        );
+        assert!(
+            !out.dropped.contains(&scip_fn.id) && !out.dropped.contains(&scip_class.id),
+            "recovered defs must not be dropped"
+        );
+        assert_eq!(out.attempted, 2, "both count once they have unified");
+        assert_eq!(out.unified, 2);
+    }
+
+    #[test]
+    fn unreconcilable_describe_block_def_is_dropped_not_counted() {
+        // A def qualified only by a `describe` block that has NO Phase A twin
+        // (e.g. metaprogramming the parser cannot see) still misses after the
+        // container clear. It is dropped un-counted, so it neither steals edges
+        // nor regresses the miss rate.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let spec = "fastlane/spec/bar_spec.rb";
+        // An unrelated indexed twin so the path is "indexed".
+        let other = Node::new(
+            VName::new("c", "main", spec, "ruby", "fn:other"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(1);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&other), &[], "scip")
+            .unwrap();
+
+        let orphan = scip_node(
+            spec,
+            "scip-ruby gem fastlane 0.0.0 `<describe 'Bar'>`#`ghost`().",
+            9,
+        );
+        let nodes = vec![orphan.clone()];
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", &nodes, &mut refs);
+
+        assert!(out.dropped.contains(&orphan.id), "no twin -> dropped");
+        assert_eq!(out.attempted, 0, "a DSL-contained miss is not an attempt");
+        assert_eq!(out.unified, 0);
     }
 }
