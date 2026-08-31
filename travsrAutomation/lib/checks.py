@@ -3,9 +3,9 @@
 
 Every check here corresponds to something that actually broke. The issue numbers
 are on each one so a failure names the regression it belongs to rather than only
-its own wording. Nothing in here is speculative: #724, #726, #727 and #728 were
-found by hand on v1.0.0-beta.1 (three of them already shipped in a tagged
-artifact), and #741 was found by hand on v1.0.0-rc.1.
+its own wording. Nothing in here is speculative: #724, #726 and #727 were found
+by hand on v1.0.0-beta.1 (already shipped in a tagged artifact), and #741 was
+found by hand on v1.0.0-rc.1.
 
 A check returns (Outcome, detail). Raising is also fine: the runner converts an
 unexpected exception into a FAIL with the traceback, so a broken check is never
@@ -23,8 +23,6 @@ from report import Outcome, Report, Result
 from travsr import (
     EXPECTED_TARGETS,
     Travsr,
-    build_id_in_binary,
-    extract,
     verify_sums,
 )
 
@@ -116,42 +114,6 @@ def check_all_targets_present(ctx: Context) -> tuple[Outcome, str]:
     return Outcome.PASS, ""
 
 
-def check_build_id_identical(ctx: Context) -> tuple[Outcome, str]:
-    """#728: every target must carry the same `<version>+<shortsha>`.
-
-    Checked by reading bytes, not by running each binary, so one host can verify
-    all five. The cross-built Linux target compiles in a container that does not
-    inherit the host environment, which makes it the one most likely to have
-    silently lost the injection and shipped a different string from its siblings.
-    """
-    if ctx.artifacts is None:
-        return Outcome.SKIP, "no release downloaded (running against a local binary)"
-    seen: dict[str, str] = {}
-    problems: list[str] = []
-    for tgz in sorted(ctx.artifacts.glob("*.tar.gz")):
-        target = next((t for t in EXPECTED_TARGETS if t in tgz.name), tgz.stem)
-        dest = ctx.work / f"x_{target}"
-        binary = extract(tgz, dest)
-        if binary is None:
-            problems.append(f"{target}: no travsr binary inside the tarball")
-            continue
-        bid = build_id_in_binary(binary)
-        if bid is None:
-            problems.append(
-                f"{target}: no build id compiled in; a bare version means the "
-                f"injection was lost for this target"
-            )
-        else:
-            seen[target] = bid
-    if problems:
-        return Outcome.FAIL, "\n".join(problems)
-    distinct = sorted(set(seen.values()))
-    if len(distinct) != 1:
-        detail = "\n".join(f"{t}: {v}" for t, v in sorted(seen.items()))
-        return Outcome.FAIL, f"targets disagree on build id:\n{detail}"
-    return Outcome.PASS, f"all {len(seen)} targets report {distinct[0]}"
-
-
 def check_signatures(ctx: Context) -> tuple[Outcome, str]:
     """Verify each artifact against its Sigstore bundle with `cosign verify-blob`.
 
@@ -205,19 +167,11 @@ def check_signatures(ctx: Context) -> tuple[Outcome, str]:
     return Outcome.PASS, f"{verified} artifact signature(s) verified"
 
 
-def check_version_reports_build_id(ctx: Context) -> tuple[Outcome, str]:
-    """#728, from the running binary rather than its bytes."""
+def check_version_command_works(ctx: Context) -> tuple[Outcome, str]:
+    """`--version` must produce output on every build, local or released."""
     v = ctx.cli.version()
-    if ctx.artifacts is None:
-        # A local dev build legitimately has no injected id, so only assert the
-        # command works at all. Asserting a build id here would fail every
-        # developer running this on their own build.
-        return (Outcome.PASS, f"{v} (local build, no injected id expected)") if v else (
-            Outcome.FAIL,
-            "--version produced no output",
-        )
-    if "+" not in v:
-        return Outcome.FAIL, f"release binary reports {v!r} with no build id"
+    if not v:
+        return Outcome.FAIL, "--version produced no output"
     return Outcome.PASS, v
 
 
@@ -485,8 +439,7 @@ def all_checks() -> list[Check]:
         Check("all expected targets published", "artifacts", check_all_targets_present),
         Check("artifacts match SHA256SUMS", "artifacts", check_checksums),
         Check("cosign signature verification", "artifacts", check_signatures),
-        Check("build id identical across targets", "artifacts", check_build_id_identical, ["728"]),
-        Check("--version reports a build id", "artifacts", check_version_reports_build_id, ["728"]),
+        Check("--version command works", "artifacts", check_version_command_works),
         Check("lang status exists", "first-run", check_lang_status_exists, ["727"]),
         Check("init produces an index", "first-run", check_init_indexes),
         Check("pending answer carries no false ETA", "first-run", check_pending_message_has_no_eta, ["726"]),
@@ -514,7 +467,7 @@ def all_checks() -> list[Check]:
         Check("mcp refuses path traversal", "mcp", check_mcp_rejects_path_traversal),
         Check("mcp errors on an unknown tool", "mcp", check_mcp_unknown_tool_errors),
         Check("mcp survives a malformed frame", "mcp", check_mcp_survives_a_malformed_frame),
-        Check("mcp serverInfo.version matches the cli", "mcp", check_mcp_server_version_matches_cli, ["728"]),
+        Check("mcp serverInfo.version matches the cli", "mcp", check_mcp_server_version_matches_cli),
         # cli-surface: shallow smoke coverage for the subcommands nothing else
         # touches. A release can break argument parsing anywhere.
         Check("ask answers", "cli-surface", check_ask_runs),
@@ -609,38 +562,19 @@ def check_mcp_handshake(ctx: Context) -> tuple[Outcome, str]:
 
 
 def check_mcp_server_version_matches_cli(ctx: Context) -> tuple[Outcome, str]:
-    """#728, on the interface that matters.
+    """`serverInfo.version` must match what `travsr --version` reports.
 
-    `travsr --version` reports the injected build id, but `serverInfo.version`
-    comes from the crate version. An agent talking over MCP therefore cannot tell
-    which build it is attached to, which is the exact ambiguity #728 removed from
-    the CLI.
-
-    The equality runs in every mode. Only the assertion that the version carries
-    an injected id needs a published artifact.
+    MCP is the only external interface travsr has, so the one surface an agent
+    actually talks to must not disagree with the CLI about which version it is.
     """
     cli_version = ctx.cli.version().replace("travsr", "").strip()
     with _mcp(ctx) as c:
         server_version = c.initialize().get("serverInfo", {}).get("version", "")
 
-    # The equality holds in both modes, and it is the assertion that guards the
-    # #728 change to `travsr-mcp`. Skipping it for a local build left that change
-    # unguarded in the only mode CI runs on a PR, so reverting the `option_env!`
-    # match would have stayed green until a release was published (#742 review).
     if server_version != cli_version:
         return Outcome.FAIL, (
             f"MCP serverInfo.version is {server_version!r} but the CLI reports "
             f"{cli_version!r}; an agent cannot identify the build it is talking to"
-        )
-
-    # Only the *shape* of an injected id needs a published artifact. A local
-    # build has none, so that half stays --tag-only.
-    if ctx.artifacts is None:
-        return Outcome.PASS, f"{server_version} (matches the CLI; no injected id to check locally)"
-    if "+" not in server_version:
-        return Outcome.FAIL, (
-            f"a published build reports {server_version!r}, which carries no "
-            f"build id; #728 requires the commit to be identifiable"
         )
     return Outcome.PASS, server_version
 

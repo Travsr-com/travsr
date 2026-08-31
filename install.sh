@@ -29,7 +29,7 @@ Installs the travsr CLI binary for this platform.
 
 Options:
   --version TAG   Install a specific release instead of the latest stable,
-                   e.g. --version v0.11.0. Must be an existing release tag.
+                   e.g. --version v1.0.0. Must be an existing release tag.
   --system        Install to ${SYSTEM_DIR} instead of the default user
                    directory. Escalates with sudo unless already running
                    as root.
@@ -91,7 +91,7 @@ resolve_tag() {
     case "$tag" in
       *[!A-Za-z0-9._-]*) err "invalid --version '${tag}': release tags contain only letters, digits, '.', '_' and '-'" ;;
       v[0-9]*) ;;
-      *) err "invalid --version '${tag}': expected a release tag like v0.11.0" ;;
+      *) err "invalid --version '${tag}': expected a release tag like v1.0.0" ;;
     esac
     return
   fi
@@ -210,12 +210,12 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --version)
-        [ $# -ge 2 ] || err "--version requires an argument, e.g. --version v0.11.0"
+        [ $# -ge 2 ] || err "--version requires an argument, e.g. --version v1.0.0"
         # An empty value must fail rather than fall through to the latest-release
         # path: the realistic source is --version "$VAR" in automation with VAR
         # unset, and silently turning a pinned install into a floating one is the
         # exact failure mode pinning exists to prevent.
-        [ -n "$2" ] || err "--version requires a non-empty release tag, e.g. --version v0.11.0"
+        [ -n "$2" ] || err "--version requires a non-empty release tag, e.g. --version v1.0.0"
         version="$2"
         shift
         ;;
