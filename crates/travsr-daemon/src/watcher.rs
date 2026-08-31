@@ -285,6 +285,37 @@ pub fn spawn(
                             gitignore = build_ignore_matcher(&repo_root);
                         }
                         for path in &event.paths {
+                            // #801 review: the startup unwatch is a one-shot
+                            // snapshot, and notify re-adds a recursive watch for
+                            // any directory created later under a watched parent.
+                            // So `cargo clean && cargo build`, or `npm install`
+                            // on a fresh clone, put the whole tree back under
+                            // watch and bring the original failure with it. That
+                            // is the common case for the repo shape this issue
+                            // was reported on, not an edge case.
+                            //
+                            // Re-drop it the moment it appears. Gated on Create
+                            // first, which is a cheap enum match and rare next to
+                            // Modify, so the `should_skip_dir` and `is_dir` cost
+                            // is paid only when a directory is actually born.
+                            //
+                            // `should_skip_dir`, not `should_skip_all`: a
+                            // `build/` gitignore rule is directory only, so
+                            // asking the file-shaped question about a directory
+                            // answers "not ignored" and the tree stays watched.
+                            if matches!(event.kind, EventKind::Create(_))
+                                && should_skip_dir(path, &repo_root, &gitignore)
+                                && path.is_dir()
+                            {
+                                if let Err(e) = watcher.unwatch(path) {
+                                    tracing::debug!(
+                                        "unwatch {} not applied (non-fatal): {e}",
+                                        path.display()
+                                    );
+                                }
+                                continue;
+                            }
+
                             // #801: the cheap prefix test runs FIRST. It used to
                             // run after the `metadata` call below, so every event
                             // from a skipped tree paid a stat syscall before being
@@ -741,6 +772,52 @@ mod tests {
             "`!vendored/` is re-included by .travsrignore, so the filter keeps it \
              and the watch must be kept: unwatching it would silently stop \
              indexing a tree the user asked to index"
+        );
+    }
+
+    /// #801 review: a skip dir created AFTER spawn must be dropped too.
+    ///
+    /// The startup unwatch is a snapshot, and notify re-adds a recursive watch
+    /// for any directory born later under a watched parent. Without the
+    /// re-drop in the event loop, `cargo clean && cargo build` on a fresh clone
+    /// puts the whole of `target/` back under watch and reproduces #801 in
+    /// full. The reviewer measured 1604 raw events from that path against the
+    /// under-40 the startup case produces.
+    ///
+    /// That is the common case for the repo shape this issue was reported on:
+    /// a Rust repo whose `target/` does not exist until the first build.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_skip_dir_created_after_spawn_is_dropped_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // Deliberately NOT created before spawn: that is the whole point.
+        let (tx, _rx) = mpsc::channel::<WatchEvent>(4096);
+        let handle = spawn(root, tx, Instant::now()).expect("watcher spawns");
+
+        for i in 0..20 {
+            std::fs::write(root.join(format!("src/f{i}.ts")), "x").unwrap();
+        }
+        wait_until(|| handle.raw_events() > 0, Duration::from_secs(5));
+        let base = settled(|| handle.raw_events(), Duration::from_secs(10));
+        assert!(base > 0, "control: a watched dir must move the counter");
+
+        // What `cargo build` does on a fresh clone.
+        std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+        for i in 0..400 {
+            std::fs::write(root.join(format!("target/debug/deps/x{i}.rlib")), "junk").unwrap();
+        }
+        let from_target = settled(|| handle.raw_events(), Duration::from_secs(15)) - base;
+
+        // Not zero: creating the directory is itself an event on the watched
+        // parent, and a few files can land before the unwatch is processed. The
+        // bar is that it stops, not that it never starts.
+        assert!(
+            from_target < 120,
+            "target/ created after spawn produced {from_target} raw events: the \
+             startup unwatch is a snapshot and notify re-watched the new tree, so \
+             `cargo clean && cargo build` reproduces #801 (#801 review)"
         );
     }
 
