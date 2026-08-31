@@ -579,8 +579,8 @@ fn dotnet_sdk_root() -> Option<PathBuf> {
 /// `dotnet` launcher locations to try, PATH-resolved first, then the well-known
 /// installs a sandboxed or GUI-launched daemon's PATH omits: Homebrew's
 /// version-independent `opt/` symlink (Apple silicon and Intel), the official
-/// installer directory (where `dotnet` sits directly in the SDK root), and a
-/// user-local `~/.dotnet`.
+/// installer directory (where `dotnet` sits directly in the SDK root), the
+/// Windows machine-wide install, and a user-local `~/.dotnet`.
 fn dotnet_launcher_candidates() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     if let Some(p) = travsr_core::exec::tool_path("dotnet") {
@@ -596,8 +596,45 @@ fn dotnet_launcher_candidates() -> Vec<PathBuf> {
         .into_iter()
         .map(PathBuf::from),
     );
+    out.extend(
+        windows_dotnet_roots()
+            .into_iter()
+            .map(|r| r.join("dotnet.exe")),
+    );
     if let Some(h) = home() {
         out.push(h.join(".dotnet").join("dotnet"));
+    }
+    out
+}
+
+/// The machine-wide dotnet install directories on Windows.
+///
+/// Without these the minimal-PATH case this whole fallback targets was covered
+/// on Windows only when the user happened to have a per-user `~/.dotnet`, even
+/// though [`dotnet_sdk_root_from_binary`] already reasons about
+/// `C:\Program Files\dotnet` carrying an SDK-less `host/`. `ProgramFiles` /
+/// `ProgramFiles(x86)` are honoured so a non-default system drive or a 32-bit
+/// install still resolves; the literal paths are the fallback for when the
+/// variables are unset. The `sdk/` requirement at both call sites is what keeps
+/// a runtime-only root from being chosen.
+///
+/// Empty on non-Windows, where these paths do not exist and probing them would
+/// only cost a stat.
+fn windows_dotnet_roots() -> Vec<PathBuf> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(base) = std::env::var(var) {
+            out.push(PathBuf::from(base).join("dotnet"));
+        }
+    }
+    for literal in [r"C:\Program Files\dotnet", r"C:\Program Files (x86)\dotnet"] {
+        let p = PathBuf::from(literal);
+        if !out.contains(&p) {
+            out.push(p);
+        }
     }
     out
 }
@@ -642,6 +679,7 @@ fn well_known_dotnet_roots() -> Vec<PathBuf> {
     .into_iter()
     .map(PathBuf::from)
     .collect();
+    out.extend(windows_dotnet_roots());
     if let Some(h) = home() {
         out.push(h.join(".dotnet"));
     }
