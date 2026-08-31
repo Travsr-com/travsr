@@ -598,53 +598,32 @@ impl Migration for V22TestRole {
     }
 }
 
-/// RFC-027 section 9.2: `ref_resolution_state`, so an unresolved reference can
-/// be reported as pending instead of silently vanishing or being guessed at.
+/// RFC-027: `ref_resolution_state` (so an unresolved reference can be reported
+/// as pending instead of silently vanishing or being guessed at) plus the
+/// read-path indexes `Edge.provenance` needs (DEBT-75).
+///
+/// One migration rather than three. The table and its `resolved_dst` column
+/// started as two, which meant creating a table and immediately altering it
+/// within the same change, and the index work started as a third. None of them
+/// ever shipped — released code is at v22 — so they are collapsed here rather
+/// than spending three schema versions on one feature.
 struct V23RefResolutionState;
 impl Migration for V23RefResolutionState {
     fn version(&self) -> u32 {
         23
     }
     fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
-        // CREATE TABLE / INDEX IF NOT EXISTS — idempotent on re-run.
-        store.exec_ddl(include_str!("migrations/v23_ref_resolution_state.sql"))
-    }
-}
-
-/// RFC-027 section 12: `ref_resolution_state.resolved_dst`, so the precision
-/// meter can compare what the live lane claimed against what Phase B derived.
-struct V24RefResolutionTarget;
-impl Migration for V24RefResolutionTarget {
-    fn version(&self) -> u32 {
-        24
-    }
-    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
-        // ALTER TABLE … ADD COLUMN has no IF NOT EXISTS in SQLite — guard.
+        // CREATE TABLE / INDEX IF NOT EXISTS is idempotent, and the two edge
+        // indexes are DROP-then-CREATE because their names already exist.
+        store.exec_ddl(include_str!("migrations/v23_ref_resolution_state.sql"))?;
+        // `CREATE TABLE IF NOT EXISTS` cannot widen a table an earlier build of
+        // this same change already created without `resolved_dst`. Guarded
+        // rather than assumed, matching V21/V22, because a missing column
+        // surfaces as a confusing runtime error rather than a clean failure.
         if !store.column_exists("ref_resolution_state", "resolved_dst")? {
-            store.exec_ddl(include_str!("migrations/v24_ref_resolution_target.sql"))?;
+            store.exec_ddl("ALTER TABLE ref_resolution_state ADD COLUMN resolved_dst INTEGER")?;
         }
         Ok(())
-    }
-}
-
-/// RFC-027 / DEBT-75: restore the covering property `Edge.provenance` broke.
-///
-/// Threading provenance to the MCP surface put it in the `iter_edges_from_kind`
-/// and `iter_edges_to` SELECT lists, which took both off the covering indexes v4
-/// and v14 added and reintroduced a main-table row fetch per edge on the PPR
-/// traversal step and on every reverse lookup. Appending the column to both
-/// index tails makes them index-only again.
-///
-/// Also adds a partial index for `WHERE provenance = 'live'`, which the
-/// live-overlay freshness note runs on every prose query and which had no index
-/// at all (a full scan of `edges` for a note that is usually about zero rows).
-struct V25EdgeProvenanceCovering;
-impl Migration for V25EdgeProvenanceCovering {
-    fn version(&self) -> u32 {
-        25
-    }
-    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
-        store.exec_ddl(include_str!("migrations/v25_edge_provenance_covering.sql"))
     }
 }
 
@@ -674,8 +653,6 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V21LexicalSplit);
     r.register(V22TestRole);
     r.register(V23RefResolutionState);
-    r.register(V24RefResolutionTarget);
-    r.register(V25EdgeProvenanceCovering);
     r
 }
 
@@ -8260,8 +8237,20 @@ impl Store for SqliteStore {
     }
 
     /// Indexed variant — uses `WHERE src = ?1 AND kind = ?2` so SQLite can
-    /// satisfy the query from the `(src, dst, kind)` primary-key index without
-    /// a full `src`-partition scan. Overrides the trait default.
+    /// satisfy the query from `idx_edges_src_kind_cov` (src, kind, dst) as an
+    /// index-only scan, without a main-table row fetch. Overrides the trait
+    /// default.
+    ///
+    /// Carries `provenance` (DEBT-75), like every other edge reader. No current
+    /// caller consults it here — `travsr-retrieval` never reads the field, and
+    /// `query.rs::next_edges` takes the deps direction through
+    /// `iter_edges_from` — but returning `None` would not be a neutral omission:
+    /// `query.rs::prov_of` maps `None` to `"tree-sitter"`, so an unlabelled edge
+    /// is reported as *ratified truth* rather than as unknown. For a lane whose
+    /// whole point is never presenting a `live` edge as ratified, a reader that
+    /// silently mislabels the moment someone consults it is the wrong trade for
+    /// one `String` per edge. The index tail carries the column instead, so the
+    /// query stays index-only.
     fn iter_edges_from_kind(&self, src: NodeId, kind: EdgeKind) -> Result<Vec<Edge>, StoreError> {
         let _span =
             tracing::debug_span!("store.iter_edges_from_kind", src = src.0, kind = ?kind).entered();
