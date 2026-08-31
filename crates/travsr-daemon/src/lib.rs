@@ -4233,16 +4233,24 @@ const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
 ///   lane: Scala's SemanticDB oracle needs `sbt compile`; Kotlin's KLS (its
 ///   oracle *and* its live server) needs a working Gradle build, which the
 ///   Gradle/Kotlin/JDK version matrix on this machine would not produce.
-const LIVE_LANE_SHIPPED: &[&str] = &[
-    "typescript",
-    "rust",
-    "python",
-    "go",
-    "dart",
-    "swift",
-    "cpp",
-    "java",
-    "csharp",
+/// Each entry is `(nodes.language, verified claims behind the decision)`.
+///
+/// The sample size is recorded **as data**, not only in the prose above, so the
+/// evidence behind each opt-in is visible at the point the gate reads it and a
+/// reviewer can weigh `cpp`'s single claim against `csharp`'s six without
+/// reconstructing them from a doc comment. `verified` counts agree + disagree;
+/// `unverifiable` claims are excluded, because a claim Phase B left no evidence
+/// for vouches for nothing.
+const LIVE_LANE_SHIPPED: &[(&str, u64)] = &[
+    ("typescript", 2),
+    ("rust", 4),
+    ("python", 2),
+    ("go", 4),
+    ("dart", 3),
+    ("swift", 3),
+    ("cpp", 1),
+    ("java", 3),
+    ("csharp", 6),
 ];
 
 /// Force-enable a language for measurement, bypassing the strict opt-in gate
@@ -4280,9 +4288,9 @@ fn live_lane_measure_forced(language: &str) -> bool {
 ///
 /// The two directions deliberately use different evidence bars, and the
 /// asymmetry is the point rather than an oversight. Enabling is a **human**
-/// decision, recorded in git next to the reading that earned it (the per-entry
-/// readings in [`LIVE_LANE_SHIPPED`]'s doc comment, which run from 1 to 6
-/// verified claims); a reviewer can see the evidence and refuse it. Disabling is
+/// decision, recorded in git next to the reading that earned it: each
+/// [`LIVE_LANE_SHIPPED`] entry carries its verified-claim count as data (1 to 6
+/// today), so a reviewer can see the evidence and refuse it. Disabling is
 /// **automatic** and irreversible-feeling to a user who cannot see why their
 /// lane went quiet, so it needs a bar noise cannot cross on its own, which is
 /// what [`LIVE_PRECISION_MIN_SAMPLE`] is. Requiring twenty verified claims to
@@ -4307,7 +4315,7 @@ fn live_lane_enabled_for(store: &SqliteStore, language: &str) -> bool {
             return false;
         }
     }
-    LIVE_LANE_SHIPPED.contains(&language) || live_lane_measure_forced(language)
+    LIVE_LANE_SHIPPED.iter().any(|(l, _)| *l == language) || live_lane_measure_forced(language)
 }
 
 /// RFC-027 section 8.3: retire the live overlay and clear resolved pendings.
@@ -8467,6 +8475,37 @@ mod tests {
         assert!(
             live_lane_enabled_for(&store, "rust"),
             "a Rust reading at or above the bar must keep the lane enabled"
+        );
+    }
+
+    /// Every shipped language must carry the evidence that put it there.
+    ///
+    /// The review of PR #795 flagged that the two directions of the gate
+    /// disagree by more than an order of magnitude: languages were opted in on 1
+    /// to 6 verified claims while `LIVE_PRECISION_MIN_SAMPLE` needs 20 before it
+    /// will act on an adverse reading. That asymmetry is deliberate (see
+    /// `live_lane_enabled_for`), but it has to be *visible*, so the sample sits
+    /// in the list as data and this test keeps it honest: a future entry cannot
+    /// be added with no reading behind it, which is the failure the strict
+    /// opt-in gate exists to prevent.
+    #[test]
+    fn every_shipped_language_records_the_sample_that_vouched_for_it() {
+        for (lang, verified) in LIVE_LANE_SHIPPED {
+            assert!(
+                *verified > 0,
+                "{lang} ships enabled with no verified claim behind it; \
+                 measure it per RFC-027 section 11.3 before adding it"
+            );
+        }
+        // The asymmetry is real and recorded rather than accidental. If an entry
+        // ever reaches the disable threshold's sample size, this assertion is
+        // the prompt to revisit whether the two bars should still differ.
+        assert!(
+            LIVE_LANE_SHIPPED
+                .iter()
+                .all(|(_, v)| *v < LIVE_PRECISION_MIN_SAMPLE),
+            "an entry now meets the disable-direction bar; reconsider whether \
+             the enable direction should still use a lower one"
         );
     }
 

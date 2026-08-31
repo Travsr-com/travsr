@@ -286,8 +286,25 @@ fn dart_access() -> ToolchainAccess {
     }
 }
 
+/// The user's home directory, on every platform this ships to.
+///
+/// `HOME` alone is not enough. Windows sets `USERPROFILE` and normally leaves
+/// `HOME` unset, so this returned `None` there and every caller below silently
+/// dropped its grant: the NuGet package cache, `~/.gradle`, `~/.m2`, the
+/// Coursier and Composer caches, `~/.dotnet`. Each toolchain that depends on one
+/// was therefore missing a read path it needs on Windows, which reads as "the
+/// analyzer produced nothing" rather than as a configuration error.
+///
+/// This is not a widening of the sandbox policy: every one of those paths is
+/// already granted by deliberate design on macOS and Linux, and each is a
+/// well-known subdirectory of the invoking user's own home. Honouring the
+/// variable Windows actually sets makes the platforms agree rather than giving
+/// Windows anything the others do not have. `phase_b_dart` in `travsr-analysis`
+/// already reads the pair this way.
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// Resolve the JDK installation dir (`JAVA_HOME`): the env var if set, else

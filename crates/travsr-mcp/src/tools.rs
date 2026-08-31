@@ -263,35 +263,49 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
 /// of any repo with no uncommitted edits — so the note never fires on a clean
 /// tree and costs a reader nothing.
 ///
-/// Both counts are **repo-wide**, and the wording says so. The note sits beside
-/// [`phase_b_degraded_note`] and the head-drift note, which are repo-wide
-/// advisories too; what it must not do is read as a statement about the answer
-/// it is appended to, so an agent asking "who calls `foo`" is not left thinking
-/// the pending references are `foo`'s. Scoping it to the files in the response
-/// would mean threading those files through every tool's note composition;
-/// `pending_refs_in_file` is there for a caller that wants the file-scoped
-/// detail directly.
-fn live_overlay_note(store: &SqliteStore) -> Option<String> {
+/// `answer` is the rendered response this note will decorate. The **pending**
+/// half is scoped to the files that answer actually names, which is what makes
+/// it actionable rather than ambient: an agent asking "who calls `foo`" was
+/// previously told how many references are pending everywhere in the repo,
+/// which reads as though they relate to the answer it just got. Matching by
+/// substring rather than by parsing keeps this independent of each tool's output
+/// format, and the file set it tests against is capped, which also bounds a
+/// query that runs on every prose call.
+///
+/// The **live** half stays repo-wide and says so: it reports that an un-ratified
+/// overlay is in play at all, which is true of the whole graph the answer was
+/// drawn from, not of any one file in it.
+fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
+    /// Files considered when scoping the pending half. Beyond this the note is
+    /// advisory anyway, and the cap is what keeps the group-by bounded.
+    const PENDING_FILE_CAP: usize = 64;
+
     let live = store.count_edges_with_provenance("live").ok().unwrap_or(0);
-    let pending = store.pending_ref_count().ok().unwrap_or(0);
+    let pending: u64 = store
+        .pending_ref_counts_by_file(PENDING_FILE_CAP)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(path, _)| answer.contains(path.as_str()))
+        .map(|(_, n)| n)
+        .sum();
     if live == 0 && pending == 0 {
         return None;
     }
     let mut parts = Vec::new();
     if live > 0 {
         parts.push(format!(
-            "{live} edge{} resolved from uncommitted edits and not yet ratified",
+            "{live} edge{} resolved from uncommitted edits and not yet ratified (repo-wide)",
             if live == 1 { "" } else { "s" }
         ));
     }
     if pending > 0 {
         parts.push(format!(
-            "{pending} reference{} detected but not resolved",
+            "{pending} reference{} in the files above detected but not resolved",
             if pending == 1 { "" } else { "s" }
         ));
     }
     Some(format!(
-        "[note: live overlay active repo-wide (these counts describe the whole repo, not this answer): {}. These resolve deterministically at the next commit; filter to provenance != live for ratified truth only.]",
+        "[note: live overlay active: {}. These resolve deterministically at the next commit; filter to provenance != live for ratified truth only.]",
         parts.join("; ")
     ))
 }
@@ -465,15 +479,16 @@ fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> S
         .ok()
         .flatten()
         .unwrap_or_default();
-    let mut out = body;
-    for note in [
+    // Computed against the answer as it stands, before any note is appended:
+    // `live_overlay_note` scopes its pending half to the files this answer
+    // names, and a note already appended is not part of the answer.
+    let notes = [
         phase_b_degraded_note(store),
-        live_overlay_note(store),
+        live_overlay_note(store, &body),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    ];
+    let mut out = body;
+    for note in notes.into_iter().flatten() {
         if out.is_empty() {
             out = note;
         } else {
@@ -528,7 +543,11 @@ fn with_head_note(store: &SqliteStore, body: String) -> String {
 /// (#617) and the index/HEAD mismatch note (#645), each already carried in the
 /// `signals` array the global aggregator merges. `head` is injectable for the
 /// same testability reason as [`append_head_note`].
-fn read_note_signals(store: &SqliteStore, head: Option<&str>) -> Vec<serde_json::Value> {
+fn read_note_signals(
+    store: &SqliteStore,
+    head: Option<&str>,
+    answer: &str,
+) -> Vec<serde_json::Value> {
     let stored = store
         .get_meta("last_commit")
         .ok()
@@ -538,8 +557,9 @@ fn read_note_signals(store: &SqliteStore, head: Option<&str>) -> Vec<serde_json:
         phase_b_degraded_note(store),
         // RFC-027 section 10: the same live-overlay note the prose tools get,
         // so a renderer or agent reading JSON is told just as plainly that this
-        // answer includes un-ratified edges.
-        live_overlay_note(store),
+        // answer includes un-ratified edges, and scoped against the same kind of
+        // evidence (here the serialized nodes, which carry the file paths).
+        live_overlay_note(store, answer),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
     ]
     .into_iter()
@@ -7158,7 +7178,7 @@ fn get_graph_json_raw(
     // incomplete (#617) and index/HEAD drift (#645) are independent and may both
     // apply. Carried as JSON `signals` array items (never appended as prose) so
     // the JSON body still parses; the global aggregator already merges `signals`.
-    let signals = read_note_signals(store, head);
+    let signals = read_note_signals(store, head, &out["nodes"].to_string());
     if !signals.is_empty() {
         out["signals"] = serde_json::Value::Array(signals);
     }
@@ -11894,7 +11914,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "idx0000").unwrap();
         assert!(
-            live_overlay_note(&store).is_none(),
+            live_overlay_note(&store, "a.ts").is_none(),
             "a repo with no uncommitted edits must get no note"
         );
 
@@ -11910,7 +11930,7 @@ mod snippet_tests {
             ))
             .unwrap();
 
-        let note = live_overlay_note(&store).expect("an overlay must be announced");
+        let note = live_overlay_note(&store, "a.ts").expect("an overlay must be announced");
         assert!(note.contains("1 edge resolved"), "singular form: {note}");
         assert!(
             note.contains("provenance != live"),
@@ -11941,10 +11961,18 @@ mod snippet_tests {
             )
             .unwrap();
 
-        let note = live_overlay_note(&store).expect("a pending reference must be announced");
+        let note = live_overlay_note(&store, "callers in a.ts:3")
+            .expect("a pending reference must be announced");
         assert!(
-            note.contains("1 reference detected but not resolved"),
+            note.contains("1 reference in the files above detected but not resolved"),
             "the abstention must be visible: {note}"
+        );
+
+        // Scoped, not ambient: an answer that never mentions `a.ts` must not be
+        // told about `a.ts`'s gaps.
+        assert!(
+            live_overlay_note(&store, "callers in unrelated.ts:9").is_none(),
+            "the pending half must not fire for a file the answer never names"
         );
     }
 
@@ -12018,7 +12046,7 @@ mod snippet_tests {
         let prose = append_read_notes(&store, "body".to_string(), None);
         assert!(prose.contains("live overlay active"), "prose: {prose}");
 
-        let signals = read_note_signals(&store, None);
+        let signals = read_note_signals(&store, None, "a.ts");
         assert!(
             signals
                 .iter()
@@ -12091,7 +12119,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "old9999").unwrap();
 
-        let signals = read_note_signals(&store, Some("chk1111"));
+        let signals = read_note_signals(&store, Some("chk1111"), "a.ts");
         assert_eq!(signals.len(), 2, "both signals present: {signals:?}");
 
         // Embedding them in a graph-json envelope must still parse as JSON.
@@ -12113,9 +12141,9 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "idx0000").unwrap();
         // Markers agree (no Phase-B signal) and no caller HEAD ⇒ no signals at all.
-        assert!(read_note_signals(&store, None).is_empty());
+        assert!(read_note_signals(&store, None, "a.ts").is_empty());
         // Caller at the same commit ⇒ still no head signal.
-        assert!(read_note_signals(&store, Some("idx0000")).is_empty());
+        assert!(read_note_signals(&store, Some("idx0000"), "a.ts").is_empty());
     }
 
     /// get_callers must carry the note alongside real results when the marker

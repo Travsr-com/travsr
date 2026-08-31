@@ -5275,13 +5275,23 @@ LIMIT ?4",
     /// intra-corpus and because a cross-language definition would not resolve
     /// through the dependent's own provider anyway.
     ///
-    /// The comparison is an exact suffix test (`substr`), **not** a `LIKE`
-    /// pattern built from `r.name`. `_` is LIKE's single-character wildcard and
-    /// identifiers are full of underscores, so `LIKE '%:' || r.name` matched a
-    /// pending `do_thing` against a definition named `doXthing`. That is not
-    /// recall-neutral: `limit` is a hard cap with `ORDER BY dep.path ASC`, so
-    /// spurious matches consume the budget and crowd out the genuine dependents
-    /// this function exists to find.
+    /// Matching is an exact comparison against the saved file's definition leaf
+    /// names, resolved **once** with [`travsr_core::ident::leaf_of`] — the same
+    /// function the daemon's resolver uses, so the two agree on what a leaf is.
+    ///
+    /// It is deliberately not a `LIKE` pattern built from `r.name`: `_` is
+    /// LIKE's single-character wildcard and identifiers are full of underscores,
+    /// so `LIKE '%:' || r.name` matched a pending `do_thing` against a definition
+    /// named `doXthing`. That is not recall-neutral either, because `limit` is a
+    /// hard cap and spurious matches crowd out the genuine dependents.
+    ///
+    /// Nor is it a correlated sub-select. Comparing in SQL, per pending row,
+    /// against every node in the saved file is quadratic, and `DISTINCT` plus
+    /// `ORDER BY` force the whole product to be evaluated before `LIMIT` can
+    /// apply. Measured on this repo (15.7k nodes, 4.7k pending rows, a 597-node
+    /// saved file) that shape cost **925ms**, at request time, on every save.
+    /// Resolving the leaf set first turns it into one hash lookup per pending
+    /// row and lets the scan stop as soon as `limit` distinct files are found.
     ///
     /// Capped at `limit` files (`LIVE_CLOSURE_FILE_CAP` at the call site): a
     /// symbol thousands of files are pending on is a hot utility, and the
@@ -5298,33 +5308,67 @@ LIMIT ?4",
         limit: usize,
     ) -> Result<Vec<String>, StoreError> {
         (|| -> AnyResult<Vec<String>> {
+            // The saved file's definition leaves, resolved once. Bounded by the
+            // node count of one file, and served by the (corpus, path) index.
+            // A signature with no `kind:` prefix is not a definition signature
+            // and is skipped, matching what the previous `':' || name` /
+            // `'.' || name` shape test admitted.
+            let mut defs = self
+                .conn
+                .prepare_cached(
+                    "SELECT signature FROM nodes \
+                     WHERE corpus = ?1 AND path = ?2 AND language = ?3",
+                )
+                .context("dependents_pending_on_file: prepare defs")?;
+            let leaves: std::collections::HashSet<String> = defs
+                .query_map(params![corpus, path, language], |row| {
+                    row.get::<_, String>(0)
+                })
+                .context("dependents_pending_on_file: query defs")?
+                .filter_map(|r| r.ok())
+                .filter(|sig| sig.contains(':'))
+                .map(|sig| travsr_core::ident::leaf_of(&sig).to_string())
+                .collect();
+            if leaves.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // Pending references in other files of the same language, in path
+            // order so truncation stays deterministic. Filtering in Rust rather
+            // than through an `IN (...)` list keeps this clear of SQLite's
+            // 999-variable ceiling, which a large file's leaf set would exceed.
             let mut stmt = self
                 .conn
                 .prepare_cached(
-                    "SELECT DISTINCT dep.path \
+                    "SELECT dep.path, r.name \
                      FROM ref_resolution_state r \
                      JOIN nodes dep ON dep.id = r.src \
                      WHERE r.state = 'pending' \
                        AND dep.corpus = ?1 AND dep.path <> ?2 AND dep.language = ?3 \
-                       AND EXISTS ( \
-                         SELECT 1 FROM nodes def \
-                         WHERE def.corpus = ?1 AND def.path = ?2 AND def.language = ?3 \
-                           AND (substr(def.signature, -(length(r.name) + 1)) \
-                                  = ':' || r.name \
-                                OR substr(def.signature, -(length(r.name) + 1)) \
-                                  = '.' || r.name) \
-                       ) \
-                     ORDER BY dep.path ASC LIMIT ?4",
+                     ORDER BY dep.path ASC",
                 )
                 .context("dependents_pending_on_file: prepare")?;
             let rows = stmt
-                .query_map(params![corpus, path, language, limit as i64], |row| {
-                    row.get::<_, String>(0)
+                .query_map(params![corpus, path, language], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .context("dependents_pending_on_file: query")?;
-            let mut out = Vec::new();
+
+            let mut out: Vec<String> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for row in rows {
-                out.push(row.context("decoding dependents_pending_on_file row")?);
+                let (dep_path, name) = row.context("decoding dependents_pending_on_file row")?;
+                if !leaves.contains(&name) {
+                    continue;
+                }
+                if seen.insert(dep_path.clone()) {
+                    out.push(dep_path);
+                    // Rows arrive in path order, so the cap can stop the scan
+                    // instead of being applied after a full evaluation.
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
             }
             Ok(out)
         })()
@@ -5354,6 +5398,48 @@ LIMIT ?4",
             .map(|n| n as u64)
             .context("counting pending references")
             .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 10: unresolved references grouped by the file they sit
+    /// in, for a freshness note that can scope itself to the answer it decorates.
+    ///
+    /// [`Self::pending_ref_count`] answers "how many, repo-wide", which is
+    /// ambient: an agent asking who calls one symbol was told how many
+    /// references are pending everywhere, which reads as though they relate to
+    /// the answer. This returns the per-file split so a caller can keep only the
+    /// files its response actually mentions.
+    ///
+    /// Capped at `limit` files, ordered by descending count then path so the cap
+    /// keeps the largest gaps and stays deterministic. The cap is what bounds
+    /// the work: this runs on every prose query, against a table that grows one
+    /// row per detected reference per saved file.
+    pub fn pending_ref_counts_by_file(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>, StoreError> {
+        (|| -> AnyResult<Vec<(String, u64)>> {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "SELECT n.path, count(*) AS c FROM ref_resolution_state r \
+                     JOIN nodes n ON n.id = r.src \
+                     WHERE r.state = 'pending' \
+                     GROUP BY n.path \
+                     ORDER BY c DESC, n.path ASC LIMIT ?1",
+                )
+                .context("pending_ref_counts_by_file: prepare")?;
+            let rows = stmt
+                .query_map(params![limit as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                })
+                .context("pending_ref_counts_by_file: query")?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.context("decoding pending_ref_counts_by_file row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// RFC-027 section 8.3: clear pending rows that Phase B has since resolved.
