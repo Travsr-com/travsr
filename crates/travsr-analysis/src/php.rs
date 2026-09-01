@@ -51,6 +51,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     ],
     decl_kinds: &[],
     type_refinements: &[],
+    post_parse: None,
     get_grammar: || tree_sitter::Language::new(tree_sitter_php::LANGUAGE_PHP),
 };
 
