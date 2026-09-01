@@ -607,6 +607,14 @@ impl Migration for V22TestRole {
 /// within the same change, and the index work started as a third. None of them
 /// ever shipped — released code is at v22 — so they are collapsed here rather
 /// than spending three schema versions on one feature.
+///
+/// The collapse strands one population: a dev database an earlier revision of
+/// this branch already stamped at 24 or 25 sits above this max version and the
+/// runner skips it, so it keeps the pre-RFC-027 narrow indexes. That is healed
+/// outside the runner, at open, by
+/// [`SqliteStore::reconcile_provenance_indexes_if_needed`], which keeps the max
+/// schema version at 23. Shipped databases are at v22 and receive this v23 in
+/// full, so they never depend on the reconcile.
 struct V23RefResolutionState;
 impl Migration for V23RefResolutionState {
     fn version(&self) -> u32 {
@@ -1012,6 +1020,9 @@ impl SqliteStore {
                 .run(&mut store)
                 .context("running SQLite migrations")?;
             store
+                .reconcile_provenance_indexes_if_needed()
+                .context("reconciling RFC-027 provenance indexes (issue B)")?;
+            store
                 .backfill_fts_if_needed()
                 .context("backfilling FTS index")?;
             store
@@ -1110,6 +1121,9 @@ impl SqliteStore {
             sqlite_migration_runner()
                 .run(&mut store)
                 .context("running SQLite migrations (in-memory)")?;
+            store
+                .reconcile_provenance_indexes_if_needed()
+                .context("reconciling RFC-027 provenance indexes in-memory (issue B)")?;
             store
                 .backfill_fts_if_needed()
                 .context("backfilling FTS index (in-memory)")?;
@@ -5190,14 +5204,34 @@ LIMIT ?4",
     /// Safe to run here because the claim has no reader left: the sweep needs
     /// nothing from it, and the freshness note reports only `pending` rows.
     ///
+    /// **Scoped to `languages`**, the same set the ratification sweep uses and
+    /// for the same #712 reason: only a language whose Phase B just completed had
+    /// its claims scored by [`Self::live_precision_sample_by_language`], so only
+    /// those may be retired. A crashed sidecar's claims must survive — deleting
+    /// them here would score them against evidence that was never refreshed
+    /// (landing in `unverifiable`) and then discard them before the language's
+    /// real ratification could score them against the truth. Keyed on the
+    /// **src** node's language, matching the meter's attribution key exactly.
+    ///
     /// Returns the number of rows consumed.
-    pub fn consume_measured_ref_resolutions(&mut self) -> Result<usize, StoreError> {
+    pub fn consume_measured_ref_resolutions(
+        &mut self,
+        languages: &[String],
+    ) -> Result<usize, StoreError> {
+        if languages.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(languages.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM ref_resolution_state \
+             WHERE state = 'resolved' AND resolved_dst IS NOT NULL \
+             AND src IN (SELECT id FROM nodes WHERE language IN ({placeholders}))"
+        );
         self.conn
-            .execute(
-                "DELETE FROM ref_resolution_state \
-                 WHERE state = 'resolved' AND resolved_dst IS NOT NULL",
-                [],
-            )
+            .execute(&sql, params_from_iter(languages.iter()))
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
@@ -6120,6 +6154,67 @@ impl SqliteStore {
             Self::vocab_decrement(conn, &tokens)?;
         }
 
+        Ok(())
+    }
+
+    /// Reconcile the RFC-027 `Edge.provenance` read-path indexes on open,
+    /// independent of `schema_version` (review issue B).
+    ///
+    /// The three RFC-027 migrations were collapsed into a single v23 while
+    /// released code was still at v22, so shipped databases receive the complete
+    /// v23 and never see this. But an earlier revision of this branch numbered
+    /// the same work v23/v24/v25, so a **dev** database it stamped at 24 or 25
+    /// now sits *above* the runner's max version (23): the runner applies only
+    /// migrations with `version() > current`, finds none, and the database
+    /// silently keeps the pre-RFC-027 narrow edge indexes forever — finding 6
+    /// (a lost covering index, invisible until an EXPLAIN) one level up, in the
+    /// runner instead of a query.
+    ///
+    /// The runner cannot reach it and bumping the max version would re-spend the
+    /// numbers the collapse reclaimed, so the reconcile lives here, beside
+    /// [`Self::backfill_fts_if_needed`] and for the same reason: an idempotent
+    /// convergence step gated on a cheap data check, never on the stamp. A
+    /// writable open always runs it (the daemon on startup, `init`, and the
+    /// CLI's read-only-then-writable fallback for a database newer than the
+    /// binary), which is where a stranded database heals.
+    ///
+    /// Gate: the covering index carries `provenance` iff the rework is already
+    /// applied, so a fresh v23 database and an already-healed one both return
+    /// here doing no work.
+    fn reconcile_provenance_indexes_if_needed(&mut self) -> AnyResult<()> {
+        let already_wide: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_edges_dst_kind_cov' \
+                   AND sql LIKE '%provenance%')",
+                [],
+                |r| r.get(0),
+            )
+            .context("checking whether the covering edge index carries provenance")?;
+        if already_wide {
+            return Ok(());
+        }
+
+        tracing::info!(
+            event = "store.reconcile.provenance_indexes",
+            "widening the edge covering indexes a collapsed-migration database missed"
+        );
+        // The same idempotent DDL `V23RefResolutionState::up` runs: every
+        // statement is `IF NOT EXISTS` or DROP-then-CREATE, so it converges a
+        // stranded database without depending on its stamp, and re-stamps
+        // nothing (the collapse deliberately keeps the max at v23).
+        self.conn
+            .execute_batch(include_str!("migrations/v23_ref_resolution_state.sql"))
+            .context("reconciling RFC-027 provenance indexes")?;
+        if !self.column_exists("ref_resolution_state", "resolved_dst")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE ref_resolution_state ADD COLUMN resolved_dst INTEGER",
+                    [],
+                )
+                .context("adding resolved_dst to a stranded ref_resolution_state")?;
+        }
         Ok(())
     }
 
@@ -8984,6 +9079,102 @@ mod tests {
         );
     }
 
+    /// Review issue B: a dev database an earlier revision of this branch stamped
+    /// above the collapsed v23 (at 24 or 25) must regain the covering edge
+    /// indexes on open, and it must do so **without** bumping the schema version
+    /// — the collapse keeps the max at v23 on purpose.
+    ///
+    /// The migration runner cannot reach such a database (`version() > current`
+    /// is never true for a stamp already ahead of the max), so the heal is the
+    /// ungated `reconcile_provenance_indexes_if_needed` step that runs at every
+    /// writable open. `edge_traversal_queries_stay_index_only` cannot catch this
+    /// regression: it builds a fresh store that lands on the collapsed schema
+    /// correctly.
+    #[test]
+    fn a_database_stranded_above_v23_regains_covering_indexes_on_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+
+        // A fresh open lands on the collapsed v23 with the wide indexes; roll it
+        // back to the pre-RFC-027 narrow ones and stamp 24 to mimic the earlier
+        // branch revision that numbered the index rework v25.
+        {
+            let store = SqliteStore::open(&db_path).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP INDEX IF EXISTS idx_edges_src_kind_cov; \
+                     CREATE INDEX idx_edges_src_kind_cov ON edges(src, kind, dst); \
+                     DROP INDEX IF EXISTS idx_edges_dst_kind_cov; \
+                     CREATE INDEX idx_edges_dst_kind_cov ON edges(dst, kind, src); \
+                     DROP INDEX IF EXISTS idx_edges_live_provenance;",
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES('schema_version', '24') \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )
+                .unwrap();
+
+            let reverse = query_plan(
+                &store,
+                "SELECT src, kind, provenance FROM edges WHERE dst = 1",
+            );
+            assert!(
+                !reverse.contains("COVERING INDEX"),
+                "precondition: the stranded db must not already cover this: {reverse}"
+            );
+        }
+
+        // Reopen writable: the runner applies nothing (24 > 23 is false), and the
+        // ungated reconcile widens the indexes.
+        let store = SqliteStore::open(&db_path).unwrap();
+
+        let forward = query_plan(
+            &store,
+            "SELECT dst, provenance FROM edges WHERE src = 1 AND kind = 'ref/call'",
+        );
+        assert!(
+            forward.contains("COVERING INDEX idx_edges_src_kind_cov"),
+            "the reconcile must restore the forward covering index: {forward}"
+        );
+        let reverse = query_plan(
+            &store,
+            "SELECT src, kind, provenance FROM edges WHERE dst = 1",
+        );
+        assert!(
+            reverse.contains("COVERING INDEX idx_edges_dst_kind_cov"),
+            "the reconcile must restore the reverse covering index: {reverse}"
+        );
+        let live_count = query_plan(
+            &store,
+            "SELECT count(*) FROM edges WHERE provenance = 'live'",
+        );
+        assert!(
+            live_count.contains("idx_edges_live_provenance"),
+            "the reconcile must restore the partial live-provenance index: {live_count}"
+        );
+
+        // The stamp is deliberately left untouched: the collapse keeps the max
+        // schema version at 23, and re-stamping is neither needed (the runner is
+        // a no-op here) nor safe once a future migration reuses 24/25.
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            version, "24",
+            "the reconcile heals indexes without bumping the schema version"
+        );
+    }
+
     #[test]
     fn put_and_get_node_round_trip() {
         let mut store = SqliteStore::open_in_memory().unwrap();
@@ -9884,7 +10075,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.live_precision_sample().unwrap().agree, 1);
-        assert_eq!(store.consume_measured_ref_resolutions().unwrap(), 1);
+        // A language that did not complete must not consume the claim: the row
+        // survives to be scored at its own ratification (issue A).
+        assert_eq!(
+            store
+                .consume_measured_ref_resolutions(&["rust".to_string()])
+                .unwrap(),
+            0,
+            "a crashed language's claim must not be retired by another's ratification"
+        );
+        assert_eq!(store.live_precision_sample().unwrap().claims(), 1);
+        assert_eq!(
+            store
+                .consume_measured_ref_resolutions(&["typescript".to_string()])
+                .unwrap(),
+            1
+        );
         assert_eq!(
             store.live_precision_sample().unwrap().claims(),
             0,

@@ -4062,7 +4062,7 @@ fn dependent_resolution_targets(
 /// individually at warn, because one wrong edge is the failure this whole design
 /// is built to avoid, and it should be visible the moment it happens rather than
 /// averaged into a ratio.
-fn measure_live_precision(store: &mut SqliteStore) {
+fn measure_live_precision(store: &mut SqliteStore, ratified: &[String]) {
     let by_lang = match store.live_precision_sample_by_language() {
         Ok(s) => s,
         Err(e) => {
@@ -4082,6 +4082,16 @@ fn measure_live_precision(store: &mut SqliteStore) {
     let (mut run_agree, mut run_disagree, mut run_unverifiable) = (0u64, 0u64, 0u64);
     for (lang, sample) in &by_lang {
         if sample.claims() == 0 {
+            continue;
+        }
+        // Score only the languages whose Phase B just completed. A crashed
+        // sidecar leaves its `edge_sites` un-refreshed, so scoring its claims now
+        // would land every reference added since the last commit in
+        // `unverifiable` against evidence that was never re-derived — and
+        // `consume_measured_ref_resolutions` (also `ratified`-scoped) would then
+        // delete those claims before their own ratification could score them.
+        // Same #712 reasoning as `sweep_live_edges_for_languages` below.
+        if !ratified.iter().any(|r| r == lang) {
             continue;
         }
         let prior = read_precision_totals_for(store, Some(lang));
@@ -4330,11 +4340,15 @@ fn ratify_live_overlay(store: &mut SqliteStore, ratified: &[String]) {
     // RFC-027 section 12: score the overlay before retiring it. Order matters —
     // after the Phase B writes, because that is the truth being compared
     // against, and before the sweep, because the sweep discards the evidence.
-    measure_live_precision(store);
+    measure_live_precision(store, ratified);
     // The meter is cumulative, so a scored claim has to be retired or the next
     // commit counts it again: the ratio would survive but the sample size — the
-    // thing `LIVE_PRECISION_MIN_SAMPLE` gates on — would not.
-    match store.consume_measured_ref_resolutions() {
+    // thing `LIVE_PRECISION_MIN_SAMPLE` gates on — would not. Scoped to
+    // `ratified` for the same reason `measure_live_precision` is: a claim scored
+    // by this commit is a claim whose language completed, and only those may be
+    // retired — a crashed language's claims must survive to be scored at its own
+    // ratification.
+    match store.consume_measured_ref_resolutions(ratified) {
         Ok(0) => {}
         Ok(n) => tracing::debug!(
             event = "live.precision.consumed",
