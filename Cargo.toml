@@ -127,7 +127,7 @@ fs2              = "0.4"
 # this version transitively via ctrlc, so no new external code enters the build
 # graph. `signal` is the only feature needed; default features are off so this
 # does not pull in the rest of nix.
-nix              = { version = "0.31", default-features = false, features = ["signal"] }
+nix              = { version = "0.31", default-features = false, features = ["signal", "user"] }
 # Already resolved transitively (liquid-lib, tokenizers' spm_precompiled) at
 # 1.13.3, so a direct dependency here introduces no new external code into
 # the build graph (#636 round-2 review: grapheme-cluster-aware username
