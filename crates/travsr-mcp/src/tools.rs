@@ -3892,9 +3892,23 @@ fn resolve_endpoint(
 
 /// The candidate list for an ambiguous `get_execution_path` endpoint.
 ///
-/// Mirrors `graph`'s wording so the two tools teach the same escape hatch: an
-/// exact signature always resolves uniquely (Tier 1 of the resolver), so the
-/// listed signatures are directly re-runnable.
+/// The advice is chosen per candidate set rather than fixed, because the
+/// signature hatch is only real when the candidates differ by signature.
+///
+/// This borrowed `graph`'s wording, but `graph` leads with `--path` "(for
+/// cross-file matches)" and offers the signature as the same-file fallback;
+/// only the signature half came over, onto the one tool with no `path`
+/// argument (schema in `server.rs`). For the fastlane `Runner.run` case #779
+/// exists for, all four definitions carry the identical `method:Runner.run`
+/// and differ only in path, and Tier 1 (`lookup_nodes_exact`) matches on
+/// `signature = ?1`, so following the advice returned this same message: a
+/// dead loop, and the same "restore a brace that is right in front of you"
+/// shape the tool was fixed for (#799 review).
+///
+/// So a signature is advertised as re-runnable only when it appears once. When
+/// it does not, the caller is pointed at the tools that do carry a path lever:
+/// `find_references` takes a `path` hint, and the `graph` CLI takes `--path`.
+/// `get_callers` deliberately is not named, it has no `path` argument either.
 fn ambiguous_endpoint_message(which: &str, name: &str, candidates: &[CoreNode]) -> String {
     let limit = crate::AMBIGUOUS_DISPLAY_LIMIT;
     let count = candidates.len();
@@ -3904,11 +3918,46 @@ fn ambiguous_endpoint_message(which: &str, name: &str, candidates: &[CoreNode]) 
     } else {
         format!("{which} '{name}' is ambiguous, {count} definitions.")
     };
-    let mut out = format!(
-        "{head} Re-run with one of the exact signatures below, which each resolve \
-         uniquely, instead of the bare name:"
-    );
-    for n in candidates.iter().take(limit) {
+    // Counted over every candidate, not just the displayed ones: a signature is
+    // re-runnable when the resolver holds exactly one node for it, which
+    // truncation does not change.
+    let mut per_signature: HashMap<&str, usize> = HashMap::new();
+    for n in candidates {
+        *per_signature.entry(n.vname.signature.as_str()).or_insert(0) += 1;
+    }
+    let all_unique = per_signature.len() == count;
+    // Sorted by path so same-signature candidates print adjacent, which is what
+    // makes "listed more than once" checkable by eye. Node id order is a hash,
+    // so the old order was arbitrary as well as unhelpful (#799 review).
+    let mut candidates: Vec<&CoreNode> = candidates.iter().collect();
+    candidates.sort_by(|a, b| {
+        a.vname
+            .path
+            .cmp(&b.vname.path)
+            .then_with(|| a.vname.signature.cmp(&b.vname.signature))
+    });
+    let mut out = if all_unique {
+        format!(
+            "{head} Re-run with one of the exact signatures below, which each resolve \
+             uniquely, instead of the bare name:"
+        )
+    } else {
+        // A real path off the candidate list, not a `<dir>` placeholder: the MCP
+        // sanitizer escapes angle brackets, so a placeholder reaches the caller
+        // as `&lt;dir&gt;`. `graph` uses the same idiom for its signature hint.
+        let example = candidates
+            .first()
+            .map(|n| n.vname.path.as_str())
+            .filter(|p| !p.is_empty())
+            .unwrap_or("<the file you want>");
+        format!(
+            "{head} A signature listed once below resolves uniquely on a re-run; one \
+             listed more than once returns this same list, and get_execution_path takes \
+             no path argument. For those, narrow by location first with find_references \
+             (`path` hint) or `travsr graph {name} --path {example}`:"
+        )
+    };
+    for n in candidates.into_iter().take(limit) {
         // " at " rather than the em-dash `graph` uses for the same list. This
         // is a diagnostic message, not the `<sig> (<kind>) \u{2014} <path>` wire
         // header packages/travsr-vscode parses, so it has no separator to
@@ -12344,6 +12393,103 @@ mod snippet_tests {
             result.contains("method:Runner.run"),
             "the candidate signatures are the escape hatch, so they must be \
              listed; got: {result}"
+        );
+        // #799 review: this is the case the message must NOT promise unique
+        // resolution for. All four share `method:Runner.run`, so the advice
+        // to re-run with the exact signature returned this same message.
+        assert!(
+            !result.contains("which each resolve uniquely"),
+            "all four definitions share one signature, so re-running with it \
+             returns this list again; promising unique resolution sends the \
+             caller round a loop; got: {result}"
+        );
+        assert!(
+            result.contains("find_references") && result.contains("--path"),
+            "when the signature is not a lever the message must name one that \
+             is; got: {result}"
+        );
+        assert!(
+            !result.contains("get_callers"),
+            "get_callers has no `path` argument either, so naming it would \
+             repeat the dead end; got: {result}"
+        );
+    }
+
+    /// #799 review: the other half of the same rule. When the candidates really
+    /// do differ by signature, the signature IS a working lever (Tier 1 matches
+    /// on `signature = ?1`), so the message must still teach it rather than
+    /// sending everyone to a path hint they do not need.
+    #[test]
+    fn get_execution_path_ambiguity_keeps_the_signature_hatch_when_it_works() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Same bare name `run`, two genuinely different signatures.
+        for (path, sig) in [("a/x.rb", "fn:run"), ("b/y.rb", "method:Runner.run")] {
+            store
+                .put_node(&Node::new(VName::new("t", "", path, "ruby", sig), "method"))
+                .unwrap();
+        }
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "b/y.rb", "ruby", "method:Runner.sink"),
+                "method",
+            ))
+            .unwrap();
+
+        let result = get_execution_path(&store, "run", "sink");
+        assert!(
+            result.contains("ambiguous"),
+            "two distinct signatures for one bare name is still ambiguous; got: {result}"
+        );
+        assert!(
+            result.contains("which each resolve uniquely"),
+            "distinct signatures each resolve uniquely, so the hatch is real \
+             here and must be offered; got: {result}"
+        );
+    }
+
+    /// #799 review: the candidate list is sorted by path, so same-signature
+    /// definitions print adjacent and "listed more than once" is checkable by
+    /// eye. Node id order is a hash, so the previous order was arbitrary.
+    #[test]
+    fn get_execution_path_ambiguity_lists_candidates_in_path_order() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for dir in ["gym", "scan", "sigh", "match"] {
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "t",
+                        "",
+                        format!("{dir}/runner.rb"),
+                        "ruby",
+                        "method:Runner.run",
+                    ),
+                    "method",
+                ))
+                .unwrap();
+        }
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "match/runner.rb", "ruby", "method:Runner.sink"),
+                "method",
+            ))
+            .unwrap();
+
+        let result = get_execution_path(&store, "Runner.run", "sink");
+        let paths: Vec<&str> = result
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("method:Runner.run (method) at "))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "gym/runner.rb",
+                "match/runner.rb",
+                "scan/runner.rb",
+                "sigh/runner.rb"
+            ],
+            "candidates must print in path order; got: {result}"
         );
     }
 
