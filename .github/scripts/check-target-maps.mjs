@@ -159,7 +159,8 @@ function applyBraces(line, depth) {
  * non-blank line back at the declaration's own indentation means the literal
  * should already have closed. Lines opening with `{` or `}` are exempt, since
  * the literal's own closing `};` sits at exactly that indentation. A map
- * entry commented out at column 0 would trip this; indent it with the rest.
+ * entry at column 0, commented out or not, would trip this; indent it with
+ * the rest.
  *
  * Returns `{ endIdx, reason, atLine, atText }`. On success endIdx is the
  * closing brace's line and reason is null. On failure endIdx is -1 and
@@ -236,7 +237,7 @@ function extractObjectValues(text, absPath, objectName) {
     const whyStopped = atLine
       ? `${where}, which is back at the declaration's own indentation and so ` +
         `cannot be part of the literal`
-      : `${where}, with no closing brace anywhere below the declaration`;
+      : `${where}, with its braces never returning to balance`;
     const site = `${objectName} in ${rel(absPath)} (declared on line ${startIdx + 1})`;
     throw new Error(
       reason === "unopened"
@@ -360,7 +361,8 @@ function extractShellTargets(text) {
  * This guard had no test harness at all, which is how #690 survived: against
  * a clean tree the broken brace scan and a correct one produce identical
  * output, so nothing on the happy path could ever notice. Same shape as
- * build-id.sh --self-test: stdlib only, no npm install, runs in a second.
+ * bench/run-phase2-gate.mjs --self-test: stdlib only, no npm install, runs
+ * in a second.
  * // O(1)
  */
 function selfTest() {
@@ -486,7 +488,7 @@ function selfTest() {
   check("a map running off the end of the file does not claim an indentation", () => {
     const src = `const TARGETS = {\n  'linux-x64': 'x86_64-unknown-linux-gnu',\n`;
     throwsMatching(
-      /still open at the end of the file, with no closing brace anywhere below the declaration/,
+      /still open at the end of the file, with its braces never returning to balance/,
       () => extractObjectValues(src, INSTALL_JS, "TARGETS")
     );
     // and must NOT carry the clause that only fits a real line
@@ -499,6 +501,35 @@ function selfTest() {
     if (msg.includes("back at the declaration's own indentation")) {
       throw new Error(
         `the end of a file has no indentation, so the message must not cite one: ${msg}`
+      );
+    }
+  });
+
+  // Braces can reopen below a missing closer and never rebalance, so closing
+  // braces do exist under the declaration even though the scan ran to the end
+  // of the file. The justification has to hold on this shape too, or it sends
+  // the reader looking for a brace that is sitting in front of them (#769).
+  check("the EOF message does not deny closing braces that are present", () => {
+    const src =
+      `const TARGETS = {\n` +
+      `  'linux-x64': 'x86_64-unknown-linux-gnu',\n` +
+      `  const f = () => {\n` +
+      `    return 1;\n` +
+      `  };\n`;
+    throwsMatching(
+      /still open at the end of the file, with its braces never returning to balance/,
+      () => extractObjectValues(src, INSTALL_JS, "TARGETS")
+    );
+    let msg = "";
+    try {
+      extractObjectValues(src, INSTALL_JS, "TARGETS");
+    } catch (e) {
+      msg = e.message;
+    }
+    if (msg.includes("no closing brace anywhere")) {
+      throw new Error(
+        `two closing braces sit below the declaration, so the message must not ` +
+          `deny them: ${msg}`
       );
     }
   });
