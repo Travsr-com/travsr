@@ -56,6 +56,13 @@ __pycache__/
 
 design/
 
+# Ad-hoc scratch probe / calibration example binaries (never committed).
+# The one real tracked example, crates/travsr-rerank/examples/rerank_bench.rs,
+# does not match these patterns and stays tracked.
+crates/*/examples/probe_*.rs
+crates/*/examples/*_probe.rs
+crates/*/examples/calib_*.rs
+
 # travsr:begin (generated AI-tool config, `travsr connect --remove` to undo)
 /.mcp.json
 # travsr:end
