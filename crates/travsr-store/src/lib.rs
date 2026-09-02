@@ -2453,6 +2453,48 @@ impl SqliteStore {
                 }
                 _ => std::collections::HashSet::new(),
             };
+
+            // RFC-027 #813 P2: per preserved definition, the line delta from its
+            // committed position to its current one. A preserved body is
+            // byte-identical, so the whole definition shifted as a block by
+            // `new_start - old_start`, and every occurrence inside it shifted by
+            // the same amount. This remaps its occurrence rows onto their current
+            // lines (below) instead of dropping them, so `find_references` stays
+            // correct mid-edit and the remapped line matches what the next commit
+            // records (no phantom row, Invariant #4). A definition whose old or
+            // new line is unknown is left out and its sites are simply purged.
+            let preserved_line_delta: HashMap<i64, i64> = if preserved.is_empty() {
+                HashMap::new()
+            } else {
+                let new_lines: HashMap<i64, i64> = nodes
+                    .iter()
+                    .filter_map(|n| n.line.map(|l| (node_id_to_i64(n.id), l as i64)))
+                    .collect();
+                let old_lines: HashMap<i64, i64> = {
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT id, line FROM nodes \
+                             WHERE corpus=?1 AND path=?2 AND line IS NOT NULL",
+                        )
+                        .context("preparing old line load")?;
+                    let rows: HashMap<i64, i64> = stmt
+                        .query_map(params![corpus, path], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                        })
+                        .context("executing old line load")?
+                        .collect::<rusqlite::Result<_>>()
+                        .context("collecting old lines")?;
+                    rows
+                };
+                preserved
+                    .iter()
+                    .filter_map(|id| {
+                        let old = old_lines.get(id)?;
+                        let new = new_lines.get(id)?;
+                        Some((*id, new - old))
+                    })
+                    .collect()
+            };
             // Body hashes to stamp on every node this parse writes, so the next
             // save can decide preservation against the text this one committed.
             let new_body_hashes: HashMap<i64, String> = match content {
@@ -2514,6 +2556,37 @@ impl SqliteStore {
             )
             .context("deleting owned edges for reindex_replace")?;
 
+            // RFC-027 #813 P2: capture the preserved definitions' occurrence rows
+            // before the purge, so they can be re-recorded on their current lines
+            // rather than dropped. A preserved definition shifted as a block, so
+            // each occurrence's new line is its old line plus the definition's
+            // delta; that keeps `find_references` correct mid-edit and matches the
+            // line the next commit records, so the site store never diverges from
+            // a full reindex (Invariant #4). Captured only when a delta is known.
+            let preserved_sites: Vec<(i64, i64, String, i64)> = if preserved_line_delta.is_empty() {
+                Vec::new()
+            } else {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT src, dst, kind, line FROM edge_sites \
+                         WHERE src IN (SELECT id FROM _preserved_src)",
+                    )
+                    .context("preparing preserved edge_sites capture")?;
+                let rows: Vec<(i64, i64, String, i64)> = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })
+                    .context("executing preserved edge_sites capture")?
+                    .collect::<rusqlite::Result<_>>()
+                    .context("collecting preserved edge_sites")?;
+                rows
+            };
+
             // #299 F7: purge OWNED occurrence rows only — an occurrence's `src` is
             // the enclosing node in the *same* file, so `src ∈ this file` selects
             // exactly the sites that live in this file and will be re-derived by
@@ -2522,24 +2595,39 @@ impl SqliteStore {
             // a blank-line/body edit stays lossless. (A blanket FK cascade would
             // wrongly nuke those inbound sites when the node is deleted+reinserted.)
             //
-            // RFC-027 #813: occurrence sites are NOT preserved for a preserved
-            // definition even though its edge is. A preserved definition may have
-            // drifted lines (an edit above it moved it down), so its stored sites
-            // carry stale line numbers; the site PK is `(src, dst, kind, line)` and
-            // Phase B re-inserts with `INSERT OR IGNORE`, so a preserved stale-line
-            // site plus a fresh correct-line site at the next commit would be two
-            // rows for one call — a phantom occurrence, and a divergence from a
-            // full reindex (Invariant #4). Purging them whole-file keeps the site
-            // store byte-identical to a full reindex at commit; a preserved edge
-            // with no mid-edit occurrence line is still a live edge (`get_callers`,
-            // `get_blast_radius` traverse the `edges` table, not `edge_sites`), and
-            // restoring the occurrence line mid-edit is the line-remap in P2 (§7.5).
+            // The whole owned set is deleted, preserved definitions included,
+            // because a preserved definition may have drifted lines; its sites are
+            // then re-inserted below on their current lines (RFC-027 #813 P2), so
+            // the row a preserved definition keeps carries the same line the next
+            // commit would write, never a stale duplicate.
             tx.execute(
                 "DELETE FROM edge_sites \
                  WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
                 params![corpus, path],
             )
             .context("deleting owned edge_sites for reindex_replace")?;
+
+            // RFC-027 #813 P2: re-record the preserved definitions' occurrences on
+            // their current lines.
+            if !preserved_sites.is_empty() {
+                let mut ins = tx
+                    .prepare(
+                        "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) \
+                         VALUES(?1, ?2, ?3, ?4)",
+                    )
+                    .context("preparing preserved edge_sites reinsert")?;
+                for (src, dst, kind, line) in &preserved_sites {
+                    let Some(delta) = preserved_line_delta.get(src) else {
+                        continue;
+                    };
+                    let new_line = line + delta;
+                    if new_line < 1 {
+                        continue; // a nonsensical remap is dropped, healed at commit
+                    }
+                    ins.execute(params![src, dst, kind, new_line])
+                        .context("re-inserting preserved edge_site")?;
+                }
+            }
 
             // Retract FTS for old nodes.
             tx.execute(
@@ -2693,9 +2781,20 @@ impl SqliteStore {
             tx.commit()
                 .context("committing reindex_replace transaction")?;
 
+            // RFC-027 #813: the definitions this edit changed are every node the
+            // parse produced whose committed edges were not preserved. On a pure
+            // body edit that is just the edited definitions; otherwise it is the
+            // whole file. The live lane re-resolves exactly these.
+            let changed_defs: Vec<NodeId> = nodes
+                .iter()
+                .filter(|n| !preserved.contains(&node_id_to_i64(n.id)))
+                .map(|n| n.id)
+                .collect();
+
             Ok(ReplaceReport {
                 removed_count: removed_ids.len(),
                 callers,
+                changed_defs,
             })
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -10423,19 +10522,91 @@ mod tests {
             Some("lsif"),
             "b's committed edge must be preserved with its lsif provenance"
         );
-        // Occurrence sites are purged whole-file (P0 preserves the edge, not the
-        // site, to keep the site store free of stale-line phantoms; the mid-edit
-        // occurrence line is restored by P2's line-remap and by the next commit).
+        // RFC-027 #813 P2: b did not move (delta 0), so its occurrence row is
+        // re-recorded on its current line rather than dropped, keeping
+        // `find_references` correct mid-edit.
         assert_eq!(
             store.reference_sites(y.id).unwrap(),
-            vec![],
-            "occurrence sites are purged; the edge is preserved, the site is not"
+            vec![travsr_core::RefSite {
+                path: "a.rs".into(),
+                line: 5
+            }],
+            "a preserved definition's occurrence is remapped onto its current line"
         );
         // a changed: its committed edge is purged so the live lane re-resolves it.
         assert_eq!(
             edge_provenance(&store, a.id, x.id),
             None,
             "the edited definition's stale edge must be purged"
+        );
+    }
+
+    /// RFC-027 #813 P2: when an edit above a preserved definition shifts it down,
+    /// the definition's occurrence rows are re-recorded on their current lines
+    /// (old line plus the definition's shift), not dropped, so `find_references`
+    /// stays correct mid-edit and the line matches what the next commit records.
+    #[test]
+    fn reindex_replace_remaps_a_shifted_preserved_definitions_occurrences() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "a.rs", "rust", sig),
+                "function",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        // The occurrence targets are external, so they need not be nodes here.
+        let x = travsr_core::VName::new("c", "", "z.rs", "rust", "fn:x").id();
+        let y = travsr_core::VName::new("c", "", "z.rs", "rust", "fn:y").id();
+        // v1: a occupies lines 1-3, b occupies 5-7. b calls y at line 6.
+        let a1 = mk("fn:a", 1, 3);
+        let b1 = mk("fn:b", 5, 7);
+        let content_v1 = "fn a() {\n  x();\n}\n\nfn b() {\n  y();\n}\n";
+        store
+            .reindex_replace(
+                "c",
+                "a.rs",
+                &[a1.clone(), b1.clone()],
+                &[],
+                "h1",
+                Some(content_v1),
+            )
+            .unwrap();
+        store
+            .record_edge_sites(&[(a1.id, x, 2), (b1.id, y, 6)])
+            .unwrap();
+
+        // v2: a grows by two lines (body changed), pushing b down to 7-9. b's
+        // body is byte-identical, so it is preserved and shifts by +2.
+        let a2 = mk("fn:a", 1, 5);
+        let b2 = mk("fn:b", 7, 9);
+        let content_v2 = "fn a() {\n  x();\n  x();\n  x();\n}\n\nfn b() {\n  y();\n}\n";
+        store
+            .reindex_replace(
+                "c",
+                "a.rs",
+                &[a2.clone(), b2.clone()],
+                &[],
+                "h2",
+                Some(content_v2),
+            )
+            .unwrap();
+
+        // b's occurrence of y moved from line 6 to line 8 (delta +2).
+        assert_eq!(
+            store.reference_sites(y).unwrap(),
+            vec![travsr_core::RefSite {
+                path: "a.rs".into(),
+                line: 8
+            }],
+            "the preserved definition's occurrence must be remapped to its current line"
+        );
+        // a changed, so its occurrence was purged and not restored.
+        assert_eq!(
+            store.reference_sites(x).unwrap(),
+            vec![],
+            "the edited definition's occurrence is purged, to be re-derived at commit"
         );
     }
 

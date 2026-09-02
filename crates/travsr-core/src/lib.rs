@@ -1555,6 +1555,15 @@ pub struct ReplaceReport {
     pub removed_count: usize,
     /// Paths of files that had inbound edges to the removed symbols.
     pub callers: DirtySet,
+    /// RFC-027 #813: the definitions in the reparsed file this edit actually
+    /// changed, so the live lane re-resolves exactly these and leaves the rest.
+    /// It is every node this parse produced whose committed edges were NOT
+    /// preserved: the edited definitions on a pure body edit, or the whole file
+    /// when the edit added or removed a symbol (or no `content` was supplied, so
+    /// nothing could be proven unchanged). Empty means every definition was
+    /// preserved, so there is no changed region to re-resolve.
+    #[serde(default)]
+    pub changed_defs: Vec<NodeId>,
 }
 
 /// Summary returned by `reconcile` / `travsr fsck`.
