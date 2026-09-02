@@ -1806,13 +1806,11 @@ pub fn init_repo_with_progress(
                 }
                 Err(e) => tracing::warn!("positional ref resolution: {e:#}"),
             }
-            let (resolved, resolved_sites) = resolve_unresolved_calls(
-                &store,
-                &pb_unresolved,
-                &pb_nodes,
-                &pb_edges,
-                &lsif_covered,
-            );
+            let resolved_calls =
+                resolve_calls(&store, &pb_unresolved, &pb_nodes, &pb_edges, &lsif_covered);
+            let resolved = resolved_calls.edges;
+            let resolved_sites = resolved_calls.sites;
+            let ambiguous_sites = resolved_calls.ambiguous_sites;
             tracing::debug!(
                 resolved_cross_crate_edges = resolved.len(),
                 "semantic analysis cross-reference resolution complete"
@@ -1848,6 +1846,10 @@ pub fn init_repo_with_progress(
             }
             if let Err(e) = store.record_field_sites(&field_sites) {
                 tracing::warn!("recording field-access edge_sites: {e:#}");
+            }
+            let ambiguous_sites = remap_resolved_sites(ambiguous_sites, &alias_map, &dropped);
+            if let Err(e) = store.record_ambiguous_sites(&ambiguous_sites) {
+                tracing::warn!("recording ambiguous edge_sites: {e:#}");
             }
             // E1: label-only reconcile of edge languages to their endpoints
             // (the schema default 'typescript' otherwise mislabels every edge).
@@ -2136,6 +2138,69 @@ fn call_target_reachable(caller_path: &str, candidate_path: &str, crates: &Crate
         .unwrap_or(false)
 }
 
+/// Count of shared leading directory segments between two file paths, excluding
+/// the file name: `a/b/c/x.ts` vs `a/b/d/y.ts` → 2.
+fn shared_dir_prefix_len(a: &str, b: &str) -> usize {
+    let a_dirs: Vec<&str> = a.split('/').collect();
+    let b_dirs: Vec<&str> = b.split('/').collect();
+    let a_dirs = &a_dirs[..a_dirs.len().saturating_sub(1)];
+    let b_dirs = &b_dirs[..b_dirs.len().saturating_sub(1)];
+    a_dirs
+        .iter()
+        .zip(b_dirs.iter())
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+/// #810: narrow same-named bare-call candidates to the one the caller means,
+/// most-authoritative first: (1) same file, (2) a candidate whose file the
+/// caller imports (`import → resolves-to`; beats proximity, cross-package
+/// correct), (3) same-package proximity. Only ever narrows — an unbroken tie is
+/// returned unchanged for the CO-A1 uniqueness gate to drop.
+fn scope_bare_call<'a>(
+    caller_path: &str,
+    imported_files: Option<&[String]>,
+    candidates: &[(travsr_core::NodeId, &'a str, &'a str)],
+) -> Vec<(travsr_core::NodeId, &'a str, &'a str)> {
+    if caller_path.is_empty() || candidates.len() < 2 {
+        return candidates.to_vec();
+    }
+
+    let same_file: Vec<_> = candidates
+        .iter()
+        .filter(|(_, path, _)| *path == caller_path)
+        .copied()
+        .collect();
+    if !same_file.is_empty() {
+        return same_file;
+    }
+
+    if let Some(imports) = imported_files {
+        let imported: Vec<_> = candidates
+            .iter()
+            .filter(|(_, path, _)| imports.iter().any(|f| f == path))
+            .copied()
+            .collect();
+        if !imported.is_empty() {
+            return imported;
+        }
+    }
+
+    let nearest_depth = candidates
+        .iter()
+        .map(|(_, path, _)| shared_dir_prefix_len(caller_path, path))
+        .max()
+        .unwrap_or(0);
+    if nearest_depth == 0 {
+        return candidates.to_vec();
+    }
+    candidates
+        .iter()
+        .filter(|(_, path, _)| shared_dir_prefix_len(caller_path, path) == nearest_depth)
+        .copied()
+        .collect()
+}
+
 /// Leaf identifier from a `kind:Qualified.Name` signature, e.g. `"filter"`
 /// from `"fn:Session.filter"` or `"method:Type.method"`. Shared by the E7
 /// LSIF per-callee suppression key and the native leaf-uniqueness resolver
@@ -2207,7 +2272,36 @@ fn lsif_covered_keys(
 ///     what gives `find_references` occurrence `path:line` for Rust cross-crate
 ///     bare/lowercase-scoped calls, which are not visible to the same-file
 ///     ScipRef pass.
+type CallSite = (travsr_core::NodeId, travsr_core::NodeId, u32);
+
+/// Outcome of resolving a batch of `UnresolvedCall`s.
+///
+/// `edges`/`sites` are the precise `ref/call` resolutions (unchanged behaviour).
+/// `ambiguous_sites` are calls to a name defined more than once that scoping
+/// could not narrow to one definition — recorded per candidate so the ambiguous
+/// references tier can surface them without asserting a target (#810 follow-up).
+struct ResolvedCalls {
+    edges: Vec<travsr_core::Edge>,
+    sites: Vec<CallSite>,
+    ambiguous_sites: Vec<CallSite>,
+}
+
+/// Edges/sites-only adapter over [`resolve_calls`] for the resolver tests, which
+/// assert precise resolution and ignore the ambiguous tier. Production indexing
+/// reads `ambiguous_sites`, so it calls [`resolve_calls`] directly.
+#[cfg(test)]
 fn resolve_unresolved_calls(
+    store: &SqliteStore,
+    unresolved: &[travsr_core::UnresolvedCall],
+    pb_nodes: &[travsr_core::Node],
+    pb_edges: &[travsr_core::Edge],
+    lsif_covered: &std::collections::HashSet<(String, u32, String)>,
+) -> (Vec<travsr_core::Edge>, Vec<CallSite>) {
+    let r = resolve_calls(store, unresolved, pb_nodes, pb_edges, lsif_covered);
+    (r.edges, r.sites)
+}
+
+fn resolve_calls(
     store: &SqliteStore,
     unresolved: &[travsr_core::UnresolvedCall],
     pb_nodes: &[travsr_core::Node],
@@ -2217,12 +2311,13 @@ fn resolve_unresolved_calls(
     // to them, per callee — not per line, so a second real call sharing the
     // line with an LSIF-covered one is not also dropped (#I2).
     lsif_covered: &std::collections::HashSet<(String, u32, String)>,
-) -> (
-    Vec<travsr_core::Edge>,
-    Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
-) {
+) -> ResolvedCalls {
     if unresolved.is_empty() {
-        return (Vec::new(), Vec::new());
+        return ResolvedCalls {
+            edges: Vec::new(),
+            sites: Vec::new(),
+            ambiguous_sites: Vec::new(),
+        };
     }
 
     let sigs: Vec<String> = {
@@ -2239,7 +2334,11 @@ fn resolve_unresolved_calls(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("resolve_unresolved_calls: store query failed: {e}");
-            return (Vec::new(), Vec::new());
+            return ResolvedCalls {
+                edges: Vec::new(),
+                sites: Vec::new(),
+                ambiguous_sites: Vec::new(),
+            };
         }
     };
 
@@ -2442,8 +2541,14 @@ fn resolve_unresolved_calls(
         .map(|n| (n.id, n.vname.language))
         .collect();
 
+    let import_map = store.import_resolution_map().unwrap_or_else(|e| {
+        tracing::warn!("resolve_unresolved_calls: import map lookup failed: {e}");
+        std::collections::HashMap::new()
+    });
+
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
-    let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
+    let mut sites: Vec<CallSite> = Vec::new();
+    let mut ambiguous_sites: Vec<CallSite> = Vec::new();
     for u in unresolved {
         // #757: field-access reference (`x.foo`). Handled ahead of the call
         // paths below because it is not a call: it resolves to the exact Phase A
@@ -2668,13 +2773,32 @@ fn resolve_unresolved_calls(
         } else {
             matches
         };
+        let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
+        // #810: disambiguate by locality before the uniqueness gate below.
+        let filtered: Vec<_> = if u.hint_crate.is_none() && filtered.len() > 1 {
+            scope_bare_call(
+                caller_path,
+                import_map.get(caller_path).map(|v| v.as_slice()),
+                &filtered,
+            )
+        } else {
+            filtered
+        };
         // CO-A1: bare calls with no crate hint resolve to ALL same-named functions
         // across all crates → false edges that flood get_callers / blast_radius.
         // Only emit a RefCall when the match is unambiguous (exactly one candidate).
         if u.hint_crate.is_none() && filtered.len() != 1 {
+            // The call is real but its target is undecidable. Record it per
+            // reachable candidate as an ambiguous site (no edge — kept out of the
+            // call graph), so the ambiguous references tier can surface it without
+            // asserting a target.
+            for (dst, path, _lang) in filtered {
+                if u.src != dst && call_target_reachable(caller_path, path, &crates) {
+                    ambiguous_sites.push((u.src, dst, u.caller_line));
+                }
+            }
             continue;
         }
-        let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
         for (dst, path, _lang) in filtered {
             // #521 F1/F2: never emit an edge the caller's own crate could not
             // possibly reach.
@@ -2696,7 +2820,13 @@ fn resolve_unresolved_calls(
     edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst);
     sites.sort_unstable_by_key(|(s, d, l)| (s.0, d.0, *l));
     sites.dedup();
-    (edges, sites)
+    ambiguous_sites.sort_unstable_by_key(|(s, d, l)| (s.0, d.0, *l));
+    ambiguous_sites.dedup();
+    ResolvedCalls {
+        edges,
+        sites,
+        ambiguous_sites,
+    }
 }
 
 /// Factored out of `init_repo_with_progress` so the background refresh
@@ -4537,8 +4667,10 @@ fn run_background_phase_b_inner(
         Err(e) => tracing::warn!("positional ref resolution: {e:#}"),
     }
 
-    let (resolved, resolved_sites) =
-        resolve_unresolved_calls(&s, &pb_unresolved, &pb_nodes, &pb_edges, &lsif_covered);
+    let resolved_calls = resolve_calls(&s, &pb_unresolved, &pb_nodes, &pb_edges, &lsif_covered);
+    let resolved = resolved_calls.edges;
+    let resolved_sites = resolved_calls.sites;
+    let ambiguous_sites = resolved_calls.ambiguous_sites;
     tracing::debug!(
         resolved_cross_crate_edges = resolved.len(),
         "semantic analysis cross-reference resolution complete"
@@ -4579,6 +4711,10 @@ fn run_background_phase_b_inner(
     }
     if let Err(e) = s.record_field_sites(&field_sites) {
         tracing::warn!("recording field-access edge_sites: {e:#}");
+    }
+    let ambiguous_sites = remap_resolved_sites(ambiguous_sites, &alias_map, &dropped);
+    if let Err(e) = s.record_ambiguous_sites(&ambiguous_sites) {
+        tracing::warn!("recording ambiguous edge_sites: {e:#}");
     }
     // E1: reconcile edge languages to their endpoints (label-only).
     if let Err(e) = s.reconcile_edge_languages() {
@@ -5287,6 +5423,110 @@ mod tests {
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
 
+    fn cand(id: u64, path: &'static str) -> (travsr_core::NodeId, &'static str, &'static str) {
+        (travsr_core::NodeId(id), path, "typescript")
+    }
+
+    #[test]
+    fn shared_dir_prefix_len_counts_directories_only() {
+        assert_eq!(shared_dir_prefix_len("a/b/c/x.ts", "a/b/d/y.ts"), 2);
+        assert_eq!(shared_dir_prefix_len("a/b/x.ts", "a/b/x.ts"), 2);
+        assert_eq!(shared_dir_prefix_len("a/x.ts", "b/y.ts"), 0);
+        assert_eq!(shared_dir_prefix_len("p/q/sec.ts", "p/r/sec.ts"), 1);
+    }
+
+    #[test]
+    fn locality_prefers_same_file_definition() {
+        let caller = "packages/lsif-ts/src/security.ts";
+        let cands = [
+            cand(1, "packages/lsif-ts/src/security.ts"),
+            cand(2, "packages/lsif-py/src/security.ts"),
+        ];
+        let out = scope_bare_call(caller, None, &cands);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, travsr_core::NodeId(1));
+    }
+
+    #[test]
+    fn locality_prefers_same_package_over_sibling_package() {
+        let caller = "packages/lsif-ts/src/walker.ts";
+        let cands = [
+            cand(1, "packages/lsif-ts/src/security.ts"),
+            cand(2, "packages/lsif-py/src/security.ts"),
+        ];
+        let out = scope_bare_call(caller, None, &cands);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, travsr_core::NodeId(1));
+    }
+
+    #[test]
+    fn locality_leaves_genuine_ambiguity_for_the_gate() {
+        let caller = "packages/lsif-ts/src/walker.ts";
+        let cands = [
+            cand(1, "packages/lsif-ts/src/a.ts"),
+            cand(2, "packages/lsif-ts/src/b.ts"),
+        ];
+        let out = scope_bare_call(caller, None, &cands);
+        assert_eq!(out.len(), 2, "an unbroken tie must not be narrowed");
+    }
+
+    #[test]
+    fn locality_no_shared_package_is_left_ambiguous() {
+        let caller = "app/src/main.ts";
+        let cands = [cand(1, "vendor/a/x.ts"), cand(2, "vendor/b/y.ts")];
+        let out = scope_bare_call(caller, None, &cands);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn import_resolution_beats_proximity() {
+        // cand 1 is nearer, but the call imports cand 2's file — imports win.
+        let caller = "packages/lsif-ts/src/walker.ts";
+        let cands = [
+            cand(1, "packages/lsif-ts/src/security.ts"),
+            cand(2, "packages/lsif-py/src/security.ts"),
+        ];
+        let imports = vec!["packages/lsif-py/src/security.ts".to_string()];
+        let out = scope_bare_call(caller, Some(&imports), &cands);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, travsr_core::NodeId(2));
+    }
+
+    #[test]
+    fn import_resolution_scopes_cross_package_call() {
+        let caller = "packages/lsif-ts/src/walker.ts";
+        let cands = [
+            cand(1, "packages/lsif-ts/src/security.ts"),
+            cand(2, "packages/lsif-py/src/security.ts"),
+        ];
+        let imports = vec!["packages/lsif-ts/src/security.ts".to_string()];
+        let out = scope_bare_call(caller, Some(&imports), &cands);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, travsr_core::NodeId(1));
+    }
+
+    #[test]
+    fn falls_back_to_proximity_when_no_import_matches() {
+        let caller = "packages/lsif-ts/src/walker.ts";
+        let cands = [
+            cand(1, "packages/lsif-ts/src/security.ts"),
+            cand(2, "packages/lsif-py/src/security.ts"),
+        ];
+        let imports = vec!["packages/unrelated/other.ts".to_string()];
+        let out = scope_bare_call(caller, Some(&imports), &cands);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, travsr_core::NodeId(1));
+    }
+
+    #[test]
+    fn importing_both_same_named_files_stays_ambiguous() {
+        let caller = "app/src/main.ts";
+        let cands = [cand(1, "pkg/a/util.ts"), cand(2, "pkg/b/util.ts")];
+        let imports = vec!["pkg/a/util.ts".to_string(), "pkg/b/util.ts".to_string()];
+        let out = scope_bare_call(caller, Some(&imports), &cands);
+        assert_eq!(out.len(), 2);
+    }
+
     /// #735: the embed tick body must be single-flight. A tick that fires
     /// while the previous body still runs used to start a second concurrent
     /// full-repo embed-text pass; on repos where one pass outlives the tick
@@ -5590,6 +5830,116 @@ mod tests {
             "method call must not resolve to an unrelated free function: {edges:?}"
         );
         assert!(sites.is_empty());
+    }
+
+    // ── ambiguous-references tier ────────────────────────────────────────
+
+    #[test]
+    fn ambiguous_bare_call_records_ambiguous_sites_not_edges() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "app/main.ts", "typescript", "fn:run"),
+            "function",
+        );
+        let def_x = Node::new(
+            VName::new("", "", "libx/helper.ts", "typescript", "fn:helper"),
+            "function",
+        );
+        let def_y = Node::new(
+            VName::new("", "", "liby/helper.ts", "typescript", "fn:helper"),
+            "function",
+        );
+        for n in [&caller, &def_x, &def_y] {
+            store.put_node(n).unwrap();
+        }
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:helper".to_string(),
+            alt_callee_sig: None,
+            hint_crate: None,
+            caller_line: 5,
+            is_method_call: false,
+            recv_type: None,
+        }];
+
+        let resolved = resolve_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(
+            resolved.edges.is_empty() && resolved.sites.is_empty(),
+            "a genuinely ambiguous call must produce no precise edge/site"
+        );
+        let mut dsts: Vec<_> = resolved
+            .ambiguous_sites
+            .iter()
+            .map(|(_, d, _)| *d)
+            .collect();
+        dsts.sort_by_key(|d| d.0);
+        let mut want = vec![def_x.id, def_y.id];
+        want.sort_by_key(|d| d.0);
+        assert_eq!(dsts, want, "one ambiguous site per candidate definition");
+        assert!(
+            resolved
+                .ambiguous_sites
+                .iter()
+                .all(|(s, _, l)| *s == caller.id && *l == 5),
+            "ambiguous site carries the caller node and call line"
+        );
+    }
+
+    #[test]
+    fn same_file_call_resolves_precise_with_no_ambiguous_sites() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "pkg/security.ts", "typescript", "fn:outer"),
+            "function",
+        );
+        let def_local = Node::new(
+            VName::new("", "", "pkg/security.ts", "typescript", "fn:safe"),
+            "function",
+        );
+        let def_other = Node::new(
+            VName::new("", "", "other/security.ts", "typescript", "fn:safe"),
+            "function",
+        );
+        for n in [&caller, &def_local, &def_other] {
+            store.put_node(n).unwrap();
+        }
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:safe".to_string(),
+            alt_callee_sig: None,
+            hint_crate: None,
+            caller_line: 12,
+            is_method_call: false,
+            recv_type: None,
+        }];
+
+        let resolved = resolve_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(resolved.edges.len(), 1, "same-file call resolves precisely");
+        assert_eq!(resolved.edges[0].dst, def_local.id);
+        assert!(
+            resolved.ambiguous_sites.is_empty(),
+            "a precisely-resolved call leaves no ambiguous residue"
+        );
     }
 
     // ── #757: field-access reference resolution ──────────────────────────

@@ -4553,6 +4553,38 @@ LIMIT ?4",
         Ok(out)
     }
 
+    /// #810: caller file → the files it imports (`import → resolves-to → file`
+    /// edges), so the reference resolver can pin a bare, name-ambiguous call to
+    /// the exact definition the caller imported. Whole map; the set is small.
+    pub fn import_resolution_map(&self) -> anyhow::Result<HashMap<String, Vec<String>>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT imp.path AS caller, tgt.path AS imported \
+                 FROM nodes imp \
+                 JOIN edges e ON e.src = imp.id AND e.kind = 'resolves-to' \
+                 JOIN nodes tgt ON tgt.id = e.dst \
+                 WHERE imp.kind = 'import'",
+            )
+            .context("preparing import_resolution_map query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let caller: String = row.get(0)?;
+                let imported: String = row.get(1)?;
+                Ok((caller, imported))
+            })
+            .context("executing import_resolution_map query")?;
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let (caller, imported) = row.context("decoding import_resolution_map row")?;
+            let entry = map.entry(caller).or_default();
+            if !entry.contains(&imported) {
+                entry.push(imported);
+            }
+        }
+        Ok(map)
+    }
+
     /// Whether the occurrence index was actually built for `language` in this
     /// repo, i.e. at least one `ref/call` occurrence row has an endpoint in a
     /// file of that language.
@@ -4738,6 +4770,70 @@ LIMIT ?4",
             .context("record_field_sites: insert")?;
         }
         tx.commit().context("record_field_sites: commit")
+    }
+
+    /// Record occurrence lines for calls whose target could not be attributed to
+    /// a single definition (a bare name defined more than once). Stored under
+    /// kind 'ref/call/ambiguous' with one row per candidate definition and **no**
+    /// backing `ref/call` edge — so `find_references` can surface them as a
+    /// distinct, lower-confidence tier ([`Self::ambiguous_reference_sites`]),
+    /// while `get_callers` / `get_blast_radius` / PageRank (which traverse the
+    /// `ref/call` *edge* set) never treat an unattributed call as a real caller.
+    /// Mirrors [`Self::record_field_sites`]; skips unknown and self-loop rows.
+    pub fn record_ambiguous_sites(
+        &mut self,
+        sites: &[(NodeId, NodeId, u32)],
+    ) -> anyhow::Result<()> {
+        if sites.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .context("record_ambiguous_sites: begin")?;
+        for &(src, dst, line) in sites {
+            if line == 0 || src == dst {
+                continue;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, 'ref/call/ambiguous', ?3)",
+                params![node_id_to_i64(src), node_id_to_i64(dst), line as i64],
+            )
+            .context("record_ambiguous_sites: insert")?;
+        }
+        tx.commit().context("record_ambiguous_sites: commit")
+    }
+
+    /// Occurrence sites of calls that might target `dst` but could not be
+    /// attributed to it (or to any single definition of its name). The
+    /// lower-confidence counterpart to [`Self::reference_sites`], kept separate
+    /// so the two tiers never merge in `find_references` output.
+    pub fn ambiguous_reference_sites(
+        &self,
+        dst: NodeId,
+    ) -> anyhow::Result<Vec<travsr_core::RefSite>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT n.path AS path, es.line AS line \
+                 FROM edge_sites es JOIN nodes n ON n.id = es.src \
+                 WHERE es.dst = ?1 AND es.kind = 'ref/call/ambiguous' \
+                 ORDER BY n.path, es.line",
+            )
+            .context("preparing ambiguous_reference_sites")?;
+        let rows = stmt
+            .query_map(params![node_id_to_i64(dst)], |row| {
+                Ok(travsr_core::RefSite {
+                    path: row.get(0)?,
+                    line: row.get::<_, i64>(1)? as u32,
+                })
+            })
+            .context("executing ambiguous_reference_sites")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding ambiguous_reference_sites row")?);
+        }
+        Ok(out)
     }
 
     /// G1: Register a mapping from a raw SCIP symbol string to a unified tree-sitter `NodeId`.
@@ -9626,6 +9722,52 @@ mod tests {
                 line: 14
             }]
         );
+    }
+
+    #[test]
+    fn ambiguous_sites_are_separate_from_precise_references() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "app/main.ts", "typescript", "fn:run"),
+            "function",
+        );
+        let def_x = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "libx/helper.ts", "typescript", "fn:helper"),
+            "function",
+        );
+        let def_y = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "liby/helper.ts", "typescript", "fn:helper"),
+            "function",
+        );
+        for n in [&caller, &def_x, &def_y] {
+            store.put_node(n).unwrap();
+        }
+
+        store
+            .record_ambiguous_sites(&[(caller.id, def_x.id, 5), (caller.id, def_y.id, 5)])
+            .unwrap();
+
+        // Surfaced by the ambiguous tier for each candidate...
+        assert_eq!(
+            store.ambiguous_reference_sites(def_x.id).unwrap(),
+            vec![travsr_core::RefSite {
+                path: "app/main.ts".into(),
+                line: 5
+            }]
+        );
+        assert_eq!(store.ambiguous_reference_sites(def_y.id).unwrap().len(), 1);
+
+        // ...but never counted as a precise reference, and never a ref/call row.
+        assert!(store.reference_sites(def_x.id).unwrap().is_empty());
+        let call_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM edge_sites WHERE kind = 'ref/call'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(call_rows, 0, "ambiguous sites must not be ref/call rows");
     }
 
     #[test]

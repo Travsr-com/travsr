@@ -159,12 +159,21 @@ pub fn run(
         // narrows nothing. The exact signature always resolves uniquely (Tier 1
         // of the resolver), so point at it explicitly and use the first
         // candidate's signature as a concrete example.
+        // #810: but only when signatures differ. Same-named defs in different
+        // files share a signature, so "pick an exact signature" cannot
+        // disambiguate them — suppress that half when every candidate shares one.
+        let all_same_sig = candidates
+            .iter()
+            .all(|n| n.signature == candidates[0].signature);
         let example_sig = candidates.first().map(|n| n.signature.as_str());
         let escape_hatch = match example_sig {
-            Some(sig) => format!(
+            Some(sig) if !all_same_sig => format!(
                 "Re-run with a `--path` hint (for cross-file matches) or with one of the \
                  exact signatures listed below (e.g. `{sig}`) to pick one:"
             ),
+            Some(_) => "Re-run with a `--path` hint to pick one (these definitions share \
+                 an identical signature, so only the path distinguishes them):"
+                .to_string(),
             None => "Re-run with a `--path` hint to pick one:".to_string(),
         };
         if truncated {

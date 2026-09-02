@@ -1372,6 +1372,10 @@ fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String 
         resolved_loc
     );
 
+    // Lower-confidence tier: calls to this name that could not be attributed to
+    // one definition. Kept separate from the precise list so the two never merge.
+    let ambiguous = ambiguous_reference_tier(store, target);
+
     // Primary path: occurrence sites from edge_sites.
     match store.reference_sites(target.id) {
         Ok(sites) if !sites.is_empty() => {
@@ -1391,19 +1395,57 @@ fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String 
             if phase_b_lang_crashed(store, &target.vname.language) {
                 lines.push(crash_caveat(&target.vname.language));
             }
+            if let Some(block) = ambiguous {
+                lines.push(block);
+            }
             lines.join("\n")
         }
         Ok(_) => {
-            // Fallback: no occurrence rows for this dst. Degrade to caller
-            // definition lines from structural ref/call edges (labelled), so a
-            // language not yet feeding edge_sites still returns something useful.
-            reference_fallback_from_edges(store, target, &header)
+            let fallback = reference_fallback_from_edges(store, target, &header);
+            match ambiguous {
+                // A def whose only call sites are ambiguous must not read as a
+                // definitive zero — surface the ambiguous tier as the answer.
+                Some(block) if fallback.contains("has no recorded uses") => {
+                    format!("{header}\n0 confident reference(s).\n{block}")
+                }
+                Some(block) => format!("{fallback}\n{block}"),
+                None => fallback,
+            }
         }
         Err(e) => {
             tracing::warn!("find_references reference_sites error: {e}");
             reference_fallback_from_edges(store, target, &header)
         }
     }
+}
+
+/// The ambiguous references block for `target`, or `None` when there are none.
+/// These are calls whose bare name matches several definitions and which the
+/// resolver could not attribute — real uses, unknown target.
+fn ambiguous_reference_tier(store: &SqliteStore, target: &CoreNode) -> Option<String> {
+    let sites = match store.ambiguous_reference_sites(target.id) {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => return None,
+        Err(e) => {
+            tracing::warn!("find_references ambiguous_reference_sites error: {e}");
+            return None;
+        }
+    };
+    let total = sites.len();
+    let mut lines = Vec::with_capacity(total.min(MAX_REFERENCE_SITES) + 1);
+    lines.push(format!(
+        "{total} ambiguous reference(s) (this name is defined more than once; \
+         could not attribute to this definition):"
+    ));
+    for s in sites.into_iter().take(MAX_REFERENCE_SITES) {
+        lines.push(format!("  {}:{}", s.path, s.line));
+    }
+    if total > MAX_REFERENCE_SITES {
+        lines.push(format!(
+            "  [truncated: showing {MAX_REFERENCE_SITES} of {total} ambiguous sites]"
+        ));
+    }
+    Some(lines.join("\n"))
 }
 
 /// Structural fallback: enumerate caller definitions of `target` via `RefCall`
