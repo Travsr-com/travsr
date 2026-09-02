@@ -345,8 +345,16 @@ async function resolveTarget(
  * by URI plus start position, so a provider that repeats one location (or names
  * the same symbol through both a `Location` and a `LocationLink`) still counts
  * as one answer.
+ *
+ * Issue #816 defect 2: a `LocationLink`'s `targetRange` spans the whole item,
+ * INCLUDING leading doc comments and attributes, so its start line falls above
+ * the daemon's node span (which begins at the `fn`/`pub` declaration) and the
+ * daemon abstains. `targetSelectionRange` is the symbol name identifier, which
+ * sits on the declaration line, so it is preferred when the provider supplies
+ * it; a provider that omits it (or answers with a bare `Location`) still falls
+ * back to the full range, which the daemon's own backstop then tolerates.
  */
-function soleLocation(
+export function soleLocation(
   raw: unknown
 ): { uri: vscode.Uri; range: vscode.Range } | null {
   const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
@@ -357,8 +365,11 @@ function soleLocation(
     let one: { uri: vscode.Uri; range: vscode.Range } | null = null;
     if (e.uri && e.range) {
       one = { uri: e.uri, range: e.range as vscode.Range };
-    } else if (e.targetUri && e.targetRange) {
-      one = { uri: e.targetUri, range: e.targetRange };
+    } else if (e.targetUri && (e.targetSelectionRange || e.targetRange)) {
+      one = {
+        uri: e.targetUri,
+        range: (e.targetSelectionRange ?? e.targetRange) as vscode.Range,
+      };
     }
     if (!one) continue;
     const key = `${one.uri.toString()}:${one.range.start.line}:${one.range.start.character}`;
