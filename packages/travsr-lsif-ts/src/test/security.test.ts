@@ -123,6 +123,19 @@ test('isUnderRoot: correctly identifies contained and escaped paths', () => {
 // injecting the flavour explicitly. Inputs are fully qualified — a
 // drive-relative path would pick up the host's cwd and stop being
 // deterministic.
+//
+// The drive-letter asymmetry itself is NOT reproducible off Windows, and it is
+// worth being precise about why, because it is the reason the earlier version
+// of these tests passed against the unfixed body. path.win32.resolve() takes
+// the drive from process.cwd(), and a POSIX cwd has none, so on macOS/Linux it
+// yields "\home\user\project\src\foo.ts" — the same prefix normalize() alone
+// produces, which is exactly what the bug needed to differ.
+//
+// What does discriminate on every host is a repoRoot that resolve() changes and
+// normalize() does not: a trailing separator. normalize("C:\\p\\") keeps it,
+// normalize(resolve("C:\\p\\")) strips it, so the unfixed body compares against
+// "C:\\p\\" + sep and rejects a contained file. That assertion is the actual
+// regression guard here; the rest pin surrounding behaviour.
 test('isUnderRoot: Windows semantics, verified from any host (#806)', () => {
   const root = 'C:\\home\\user\\project';
   assert.ok(isUnderRoot('C:\\home\\user\\project\\src\\foo.ts', root, path.win32));
@@ -144,6 +157,10 @@ test('isUnderRoot: Windows semantics, verified from any host (#806)', () => {
     !isUnderRoot('C:\\home\\user\\project\\src\\..\\..\\..\\etc\\passwd', root, path.win32),
     'traversal collapses before comparing'
   );
+  assert.ok(
+    isUnderRoot('C:\\home\\user\\project\\src\\foo.ts', root + '\\', path.win32),
+    'an unresolved root (trailing separator) must still contain its files'
+  );
 });
 
 test('isUnderRoot: POSIX semantics, verified from any host (#806)', () => {
@@ -158,6 +175,10 @@ test('isUnderRoot: POSIX semantics, verified from any host (#806)', () => {
   assert.ok(
     !isUnderRoot('/home/user/project/../project-evil/foo.ts', root, path.posix),
     'traversal collapses before comparing'
+  );
+  assert.ok(
+    isUnderRoot('/home/user/project/src/foo.ts', root + '/', path.posix),
+    'an unresolved root (trailing separator) must still contain its files'
   );
 });
 
