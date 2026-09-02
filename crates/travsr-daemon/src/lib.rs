@@ -2989,15 +2989,21 @@ fn write_phase_b_results(
 
     // H3: stamp phase_b_warnings in the meta table so `travsr status` can surface
     // actionable issues without the user having to re-read init output.
+    //
+    // #760: every class name below comes from `PhaseBWarningClass`, which
+    // `travsr status` and the MCP `get_index_status` tool both iterate. A class
+    // added here that a consumer does not handle used to be dropped silently and
+    // could surface as a terminal `done`; now it fails their guards instead.
+    use travsr_plugin_host::phase_b::PhaseBWarningClass as Warn;
     let mut warnings: Vec<String> = Vec::new();
     for lang in &pb_outcome.crashed {
-        warnings.push(format!("crashed:{lang}"));
+        warnings.push(Warn::Crashed.entry(lang));
     }
     // #712: a language whose analyzer ran but produced no nodes over its source
     // files. Surfaced so a silent zero-node "success" (e.g. scip-ruby invoked
     // without an input path) is visible and actionable in `travsr status`.
     for lang in &pb_outcome.produced_no_nodes {
-        warnings.push(format!("zero_nodes:{lang}"));
+        warnings.push(Warn::ZeroNodes.entry(lang));
     }
     // #724: a sidecar that returned definitions and not one occurrence. No call
     // edge can be derived from it, so the run is a success with nothing
@@ -3006,40 +3012,43 @@ fn write_phase_b_results(
     // `init` path defers Phase B to the daemon, so the java user this exists for
     // saw nothing anywhere (#752 review).
     for lang in &pb_outcome.produced_no_references {
-        warnings.push(format!("no_references:{lang}"));
+        warnings.push(Warn::NoReferences.entry(lang));
     }
     for (lang, expected, got) in &pb_outcome.version_mismatch {
-        warnings.push(format!("version_mismatch:{lang}:{expected}:{got}"));
+        warnings.push(format!(
+            "{}:{expected}:{got}",
+            Warn::VersionMismatch.entry(lang)
+        ));
     }
     for lang in &pb_outcome.skipped_needs_approval {
-        warnings.push(format!("needs_approval:{lang}"));
+        warnings.push(Warn::NeedsApproval.entry(lang));
     }
     // Windows-only: an analyzer that cannot run isolated here and has no
     // permission on record. Surface the exact `travsr lang allow-unsandboxed
     // <lang>` fix rather than leaving the language silently absent.
     for lang in &pb_outcome.skipped_needs_consent {
-        warnings.push(format!("needs_consent:{lang}"));
+        warnings.push(Warn::NeedsConsent.entry(lang));
     }
     // #449: a language present in the repo whose sidecar is not installed or
     // not registered used to be skipped silently, and the user saw "0 references"
     // with no hint that Phase B never ran. Surface both skip classes so
     // `travsr status` can print the exact `travsr lang install <lang>` fix.
     for lang in &pb_outcome.skipped_unregistered {
-        warnings.push(format!("skipped_unregistered:{lang}"));
+        warnings.push(Warn::SkippedUnregistered.entry(lang));
     }
     // #414 (ADR-017 Rule 3): a registered language whose corpus has no trust
     // grant is skipped before spawn — surface the exact `travsr lang add
     // <lang> --corpus <corpus>` fix.
     for lang in &pb_outcome.skipped_untrusted_corpus {
-        warnings.push(format!("untrusted_corpus:{lang}"));
+        warnings.push(Warn::UntrustedCorpus.entry(lang));
     }
     for lang in &pb_outcome.skipped_no_analyzer {
-        warnings.push(format!("skipped_no_analyzer:{lang}"));
+        warnings.push(Warn::SkippedNoAnalyzer.entry(lang));
     }
     // L5a: scip-clang (c/cpp) needs a compile_commands.json — surface it the
     // same way as the other user-actionable skip classes above.
     for lang in &pb_outcome.skipped_no_compdb {
-        warnings.push(format!("skipped_no_compdb:{lang}"));
+        warnings.push(Warn::SkippedNoCompdb.entry(lang));
     }
     // E6: surface SCIP def-unification misses (orphaned twins). Positional
     // span-containment makes this near-zero; a non-zero rate means Phase A
