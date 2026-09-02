@@ -2217,10 +2217,7 @@ fn resolve_unresolved_calls(
     // to them, per callee — not per line, so a second real call sharing the
     // line with an LSIF-covered one is not also dropped (#I2).
     lsif_covered: &std::collections::HashSet<(String, u32, String)>,
-) -> (
-    Vec<travsr_core::Edge>,
-    Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
-) {
+) -> (Vec<travsr_core::Edge>, Vec<SiteRow>) {
     if unresolved.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -2443,7 +2440,7 @@ fn resolve_unresolved_calls(
         .collect();
 
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
-    let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
+    let mut sites: Vec<SiteRow> = Vec::new();
     for u in unresolved {
         // #757: field-access reference (`x.foo`). Handled ahead of the call
         // paths below because it is not a call: it resolves to the exact Phase A
@@ -2485,7 +2482,7 @@ fn resolve_unresolved_calls(
                     *dst,
                     travsr_core::EdgeKind::RefField,
                 ));
-                sites.push((u.src, *dst, u.caller_line));
+                sites.push((u.src, *dst, u.caller_line, u.caller_col));
             }
             continue;
         }
@@ -2687,14 +2684,14 @@ fn resolve_unresolved_calls(
                 // #299: record the call-site occurrence. `u.src` is the caller
                 // function node (same file as the call), so nodes.path[src] is the
                 // occurrence file — exactly what reference_sites returns.
-                sites.push((u.src, dst, u.caller_line));
+                sites.push((u.src, dst, u.caller_line, u.caller_col));
             }
         }
     }
 
     edges.sort_unstable_by_key(|e| (e.src.0, e.dst.0));
     edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst);
-    sites.sort_unstable_by_key(|(s, d, l)| (s.0, d.0, *l));
+    sites.sort_unstable_by_key(|(s, d, l, _)| (s.0, d.0, *l));
     sites.dedup();
     (edges, sites)
 }
@@ -3096,8 +3093,11 @@ fn write_phase_b_results(
     (report, alias_map, dropped)
 }
 
-/// A resolved occurrence row: `(src caller node, dst target node, 1-based line)`.
-type SiteRow = (travsr_core::NodeId, travsr_core::NodeId, u32);
+/// A resolved occurrence row: `(src caller node, dst target node, 1-based line,
+/// 0-based UTF-8 byte column of the reference on that line)`. RFC-027 #813 P2:
+/// `col` is `None` for a call the extractor emitted without a position, in which
+/// case the editor lane name-searches the line as before.
+type SiteRow = (travsr_core::NodeId, travsr_core::NodeId, u32, Option<u32>);
 
 /// #757: split resolved occurrence sites into call sites (`ref/call`) and
 /// field-access sites (`ref/field`) by matching each site's `(src, dst)` against
@@ -3120,7 +3120,7 @@ fn split_field_sites(
     }
     sites
         .into_iter()
-        .partition(|(s, d, _)| !field_pairs.contains(&(*s, *d)))
+        .partition(|(s, d, _, _)| !field_pairs.contains(&(*s, *d)))
 }
 
 /// #299 F2: remap `resolved_sites.dst` through the unification alias map and
@@ -3137,21 +3137,21 @@ fn split_field_sites(
 /// and dropped) are kept symmetric so no site records against a node the batch
 /// never wrote.
 fn remap_resolved_sites(
-    sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
+    sites: Vec<SiteRow>,
     alias_map: &std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId>,
     dropped: &std::collections::HashSet<travsr_core::NodeId>,
-) -> Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> {
+) -> Vec<SiteRow> {
     if alias_map.is_empty() && dropped.is_empty() {
         return sites;
     }
     sites
         .into_iter()
-        .filter_map(|(src, dst, line)| {
+        .filter_map(|(src, dst, line, col)| {
             if dropped.contains(&dst) {
                 return None;
             }
             let dst = alias_map.get(&dst).copied().unwrap_or(dst);
-            (src != dst).then_some((src, dst, line))
+            (src != dst).then_some((src, dst, line, col))
         })
         .collect()
 }
@@ -5362,19 +5362,22 @@ mod tests {
         let dropped: std::collections::HashSet<NodeId> = [gone].into_iter().collect();
 
         let sites = vec![
-            (src, scip_dst, 10),  // dst remaps 2 → 3
-            (src, NodeId(9), 11), // dst not in alias — unchanged
-            (src, collapses, 12), // dst remaps 4 → 1 == src → dropped
-            (src, gone, 13),      // dst was dropped → discarded
+            (src, scip_dst, 10, None),  // dst remaps 2 → 3
+            (src, NodeId(9), 11, None), // dst not in alias — unchanged
+            (src, collapses, 12, None), // dst remaps 4 → 1 == src → dropped
+            (src, gone, 13, None),      // dst was dropped → discarded
         ];
         let out = remap_resolved_sites(sites, &alias, &dropped);
-        assert_eq!(out, vec![(src, ts_dst, 10), (src, NodeId(9), 11)]);
+        assert_eq!(
+            out,
+            vec![(src, ts_dst, 10, None), (src, NodeId(9), 11, None)]
+        );
     }
 
     #[test]
     fn remap_resolved_sites_empty_alias_is_identity() {
         use travsr_core::NodeId;
-        let sites = vec![(NodeId(1), NodeId(2), 5)];
+        let sites = vec![(NodeId(1), NodeId(2), 5, None)];
         let out = remap_resolved_sites(
             sites.clone(),
             &std::collections::HashMap::new(),
@@ -5624,10 +5627,7 @@ mod tests {
     fn resolve_one_field_ref(
         store: &SqliteStore,
         recv_type: Option<&str>,
-    ) -> (
-        Vec<travsr_core::Edge>,
-        Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
-    ) {
+    ) -> (Vec<travsr_core::Edge>, Vec<SiteRow>) {
         use travsr_core::{Node, VName};
         let caller = Node::new(
             VName::new(
@@ -5694,7 +5694,7 @@ mod tests {
             travsr_core::EdgeKind::RefField,
             "field read must be ref/field, never ref/call"
         );
-        assert_eq!(sites, vec![(caller.id, field.id, 9)]);
+        assert_eq!(sites, vec![(caller.id, field.id, 9, None)]);
     }
 
     #[test]
@@ -5816,11 +5816,11 @@ mod tests {
             Edge::new(a, b, EdgeKind::RefCall),
             Edge::new(a, c, EdgeKind::RefField),
         ];
-        let sites = vec![(a, b, 10), (a, c, 20), (a, d, 30)];
+        let sites = vec![(a, b, 10, None), (a, c, 20, None), (a, d, 30, None)];
         let (calls, fields) = split_field_sites(&edges, sites);
         // b is a call target, c is a field; d has no field edge → treated as call.
-        assert_eq!(calls, vec![(a, b, 10), (a, d, 30)]);
-        assert_eq!(fields, vec![(a, c, 20)]);
+        assert_eq!(calls, vec![(a, b, 10, None), (a, d, 30, None)]);
+        assert_eq!(fields, vec![(a, c, 20, None)]);
     }
 
     #[test]
@@ -5944,7 +5944,7 @@ mod tests {
         );
         assert_eq!(edges[0].src, caller.id);
         assert_eq!(edges[0].dst, callee.id);
-        assert_eq!(sites, vec![(caller.id, callee.id, 3)]);
+        assert_eq!(sites, vec![(caller.id, callee.id, 3, None)]);
     }
 
     #[test]
@@ -6013,14 +6013,14 @@ mod tests {
         assert!(
             sites
                 .iter()
-                .any(|(s, d, _)| *s == index_node.id && *d == class_node.id),
+                .any(|(s, d, _, _)| *s == index_node.id && *d == class_node.id),
             "constructor call must record an occurrence site for find_references: {sites:?}"
         );
         // Method reference: `resp.render()` → method:HttpResponse.render.
         assert!(
             sites
                 .iter()
-                .any(|(s, d, _)| *s == index_node.id && *d == render_node.id),
+                .any(|(s, d, _, _)| *s == index_node.id && *d == render_node.id),
             "method call must record an occurrence site: {sites:?}"
         );
 
@@ -6125,7 +6125,7 @@ mod tests {
             "recv_type exact match should resolve: {edges:?}"
         );
         assert_eq!(edges[0].dst, callee.id);
-        assert_eq!(sites, vec![(caller.id, callee.id, 5)]);
+        assert_eq!(sites, vec![(caller.id, callee.id, 5, None)]);
     }
 
     #[test]
@@ -7259,6 +7259,7 @@ mod tests {
                 caller_line: *line,
                 callee_id,
                 is_call: true,
+                caller_col: None,
             });
         }
 
@@ -8219,7 +8220,7 @@ mod tests {
             store
                 .put_edge(&Edge::new(n.id, n.id, EdgeKind::RefCall))
                 .unwrap();
-            store.record_edge_sites(&[(n.id, n.id, 1)]).unwrap();
+            store.record_edge_sites(&[(n.id, n.id, 1, None)]).unwrap();
             n.id
         };
 

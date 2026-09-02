@@ -1082,6 +1082,9 @@ impl SqliteStore {
                 .backfill_body_hashes_if_needed()
                 .context("backfilling RFC-027 #813 node body hashes")?;
             store
+                .ensure_edge_sites_col_column()
+                .context("adding RFC-027 #813 P2 edge_sites col column")?;
+            store
                 .backfill_fts_if_needed()
                 .context("backfilling FTS index")?;
             store
@@ -1186,6 +1189,9 @@ impl SqliteStore {
             store
                 .ensure_body_hash_column()
                 .context("adding RFC-027 #813 body_hash column (in-memory)")?;
+            store
+                .ensure_edge_sites_col_column()
+                .context("adding RFC-027 #813 P2 edge_sites col column (in-memory)")?;
             store
                 .backfill_fts_if_needed()
                 .context("backfilling FTS index (in-memory)")?;
@@ -2563,29 +2569,31 @@ impl SqliteStore {
             // delta; that keeps `find_references` correct mid-edit and matches the
             // line the next commit records, so the site store never diverges from
             // a full reindex (Invariant #4). Captured only when a delta is known.
-            let preserved_sites: Vec<(i64, i64, String, i64)> = if preserved_line_delta.is_empty() {
-                Vec::new()
-            } else {
-                let mut stmt = tx
-                    .prepare(
-                        "SELECT src, dst, kind, line FROM edge_sites \
-                         WHERE src IN (SELECT id FROM _preserved_src)",
-                    )
-                    .context("preparing preserved edge_sites capture")?;
-                let rows: Vec<(i64, i64, String, i64)> = stmt
-                    .query_map([], |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, i64>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, i64>(3)?,
-                        ))
-                    })
-                    .context("executing preserved edge_sites capture")?
-                    .collect::<rusqlite::Result<_>>()
-                    .context("collecting preserved edge_sites")?;
-                rows
-            };
+            let preserved_sites: Vec<(i64, i64, String, i64, Option<i64>)> =
+                if preserved_line_delta.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT src, dst, kind, line, col FROM edge_sites \
+                             WHERE src IN (SELECT id FROM _preserved_src)",
+                        )
+                        .context("preparing preserved edge_sites capture")?;
+                    let rows: Vec<(i64, i64, String, i64, Option<i64>)> = stmt
+                        .query_map([], |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, i64>(3)?,
+                                r.get::<_, Option<i64>>(4)?,
+                            ))
+                        })
+                        .context("executing preserved edge_sites capture")?
+                        .collect::<rusqlite::Result<_>>()
+                        .context("collecting preserved edge_sites")?;
+                    rows
+                };
 
             // #299 F7: purge OWNED occurrence rows only — an occurrence's `src` is
             // the enclosing node in the *same* file, so `src ∈ this file` selects
@@ -2612,11 +2620,14 @@ impl SqliteStore {
             if !preserved_sites.is_empty() {
                 let mut ins = tx
                     .prepare(
-                        "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) \
-                         VALUES(?1, ?2, ?3, ?4)",
+                        "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line, col) \
+                         VALUES(?1, ?2, ?3, ?4, ?5)",
                     )
                     .context("preparing preserved edge_sites reinsert")?;
-                for (src, dst, kind, line) in &preserved_sites {
+                // RFC-027 #813 P2: the body is byte-identical so the occurrence
+                // column is unchanged; only its line shifted by the definition's
+                // block delta. Carry the stored col through verbatim.
+                for (src, dst, kind, line, col) in &preserved_sites {
                     let Some(delta) = preserved_line_delta.get(src) else {
                         continue;
                     };
@@ -2624,7 +2635,7 @@ impl SqliteStore {
                     if new_line < 1 {
                         continue; // a nonsensical remap is dropped, healed at commit
                     }
-                    ins.execute(params![src, dst, kind, new_line])
+                    ins.execute(params![src, dst, kind, new_line, col])
                         .context("re-inserting preserved edge_site")?;
                 }
             }
@@ -4655,9 +4666,19 @@ LIMIT ?4",
             // other non-call) so `find_references` covers all use sites. Field
             // occurrences go under `ref/field`; everything else under `ref/call`.
             let site_kind = if is_field { "ref/field" } else { "ref/call" };
+            // RFC-027 #813 P2: carry the occurrence byte column when the source
+            // supplied one, filling a NULL from a later real position and never
+            // duplicating the row (col is not in the PK).
             tx.execute(
-                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, ?3, ?4)",
-                params![caller_id, callee_id, site_kind, occ_line],
+                "INSERT INTO edge_sites(src, dst, kind, line, col) VALUES(?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(src, dst, kind, line) DO UPDATE SET col = COALESCE(edge_sites.col, excluded.col)",
+                params![
+                    caller_id,
+                    callee_id,
+                    site_kind,
+                    occ_line,
+                    scip_ref.caller_col.map(|c| c as i64)
+                ],
             )
             .context("write_scip_attributed_batch: insert edge_site")?;
         }
@@ -4786,6 +4807,9 @@ LIMIT ?4",
                 caller_line: p.caller_line,
                 callee_id: i64_to_node_id(callee_i64),
                 is_call: p.is_call,
+                // RFC-027 #813 P2: the positional LSIF ref already carries the
+                // occurrence byte column; pass it through unchanged.
+                caller_col: p.caller_col,
             });
         }
         Ok(out)
@@ -4977,7 +5001,10 @@ LIMIT ?4",
     /// resolution, where `src` is the caller function node and `line` is the
     /// call-site line. Rows with `line == 0` (unknown) are skipped. Idempotent
     /// via the `edge_sites` PK; safe to re-run on every reindex.
-    pub fn record_edge_sites(&mut self, sites: &[(NodeId, NodeId, u32)]) -> anyhow::Result<()> {
+    pub fn record_edge_sites(
+        &mut self,
+        sites: &[(NodeId, NodeId, u32, Option<u32>)],
+    ) -> anyhow::Result<()> {
         if sites.is_empty() {
             return Ok(());
         }
@@ -4985,7 +5012,7 @@ LIMIT ?4",
             .conn
             .transaction()
             .context("record_edge_sites: begin")?;
-        for &(src, dst, line) in sites {
+        for &(src, dst, line, col) in sites {
             if line == 0 {
                 continue;
             }
@@ -4997,9 +5024,15 @@ LIMIT ?4",
             if src == dst {
                 continue;
             }
+            // RFC-027 #813 P2: the PK is (src, dst, kind, line), so `col` is
+            // metadata on that row. INSERT OR IGNORE keeps the first-written row;
+            // the UPSERT below fills a NULL `col` from a later real position
+            // without ever creating a duplicate row (col is not in the PK) or
+            // clobbering a non-NULL col.
             tx.execute(
-                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, 'ref/call', ?3)",
-                params![node_id_to_i64(src), node_id_to_i64(dst), line as i64],
+                "INSERT INTO edge_sites(src, dst, kind, line, col) VALUES(?1, ?2, 'ref/call', ?3, ?4) \
+                 ON CONFLICT(src, dst, kind, line) DO UPDATE SET col = COALESCE(edge_sites.col, excluded.col)",
+                params![node_id_to_i64(src), node_id_to_i64(dst), line as i64, col.map(|c| c as i64)],
             )
             .context("record_edge_sites: insert")?;
         }
@@ -5014,7 +5047,10 @@ LIMIT ?4",
     /// traverse the `ref/call` *edge* set, never surface it as a caller. Skips
     /// unknown (`line == 0`) and self-loop rows for the same reasons
     /// [`Self::record_edge_sites`] does.
-    pub fn record_field_sites(&mut self, sites: &[(NodeId, NodeId, u32)]) -> anyhow::Result<()> {
+    pub fn record_field_sites(
+        &mut self,
+        sites: &[(NodeId, NodeId, u32, Option<u32>)],
+    ) -> anyhow::Result<()> {
         if sites.is_empty() {
             return Ok(());
         }
@@ -5022,13 +5058,17 @@ LIMIT ?4",
             .conn
             .transaction()
             .context("record_field_sites: begin")?;
-        for &(src, dst, line) in sites {
+        for &(src, dst, line, col) in sites {
             if line == 0 || src == dst {
                 continue;
             }
+            // RFC-027 #813 P2: carry the occurrence byte column, filling a NULL
+            // from a later real position and never duplicating the row (see
+            // [`Self::record_edge_sites`]).
             tx.execute(
-                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, 'ref/field', ?3)",
-                params![node_id_to_i64(src), node_id_to_i64(dst), line as i64],
+                "INSERT INTO edge_sites(src, dst, kind, line, col) VALUES(?1, ?2, 'ref/field', ?3, ?4) \
+                 ON CONFLICT(src, dst, kind, line) DO UPDATE SET col = COALESCE(edge_sites.col, excluded.col)",
+                params![node_id_to_i64(src), node_id_to_i64(dst), line as i64, col.map(|c| c as i64)],
             )
             .context("record_field_sites: insert")?;
         }
@@ -6589,6 +6629,25 @@ impl SqliteStore {
             self.conn
                 .execute("ALTER TABLE nodes ADD COLUMN body_hash TEXT", [])
                 .context("adding body_hash column to nodes (RFC-027 #813)")?;
+        }
+        Ok(())
+    }
+
+    /// RFC-027 #813 P2: add the nullable `edge_sites.col` column via an open-time
+    /// backfill, so an occurrence carries the exact column of its reference and
+    /// the live overlay can resolve it at the precise editor position instead of
+    /// name-searching the line. Column is a 0-based UTF-8 BYTE offset within the
+    /// occurrence line (tree-sitter and the SCIP/LSIF sources all normalise to
+    /// bytes before recording; the daemon converts to the editor's UTF-16 column
+    /// at use). `NULL` for rows written before this shipped or by a source that
+    /// cannot give a reliable position, in which case the daemon falls back to
+    /// its word-boundary search (no regression). Not a schema bump: the PK stays
+    /// `(src, dst, kind, line)` and `col` is metadata on that row.
+    fn ensure_edge_sites_col_column(&mut self) -> AnyResult<()> {
+        if !self.column_exists("edge_sites", "col")? {
+            self.conn
+                .execute("ALTER TABLE edge_sites ADD COLUMN col INTEGER", [])
+                .context("adding col column to edge_sites (RFC-027 #813 P2)")?;
         }
         Ok(())
     }
@@ -9998,10 +10057,10 @@ mod tests {
         // Out-of-order + a duplicate (a.rs:10 twice) to exercise ORDER BY + PK dedup.
         store
             .record_edge_sites(&[
-                (a.id, callee.id, 10),
-                (b.id, callee.id, 3),
-                (a.id, callee.id, 2),
-                (a.id, callee.id, 10),
+                (a.id, callee.id, 10, None),
+                (b.id, callee.id, 3, None),
+                (a.id, callee.id, 2, None),
+                (a.id, callee.id, 10, None),
             ])
             .unwrap();
 
@@ -10026,6 +10085,74 @@ mod tests {
     }
 
     #[test]
+    fn record_edge_sites_persists_and_backfills_occurrence_column() {
+        // RFC-027 #813 P2: a recorded occurrence round-trips its byte column;
+        // a later NULL-col re-record keeps the stored col (no duplicate row, no
+        // clobber); and a NULL-col row is filled when a real col arrives later.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:caller"),
+            "fn",
+        );
+        let callee = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "b.rs", "rust", "fn:callee"),
+            "fn",
+        );
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+
+        // First write carries a real byte column.
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 7, Some(12))])
+            .unwrap();
+        let col: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT col FROM edge_sites WHERE src=?1 AND dst=?2 AND line=7",
+                params![node_id_to_i64(caller.id), node_id_to_i64(callee.id)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(col, Some(12), "the byte column must round-trip");
+
+        // A re-record with no column must not duplicate the row nor clobber col.
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 7, None)])
+            .unwrap();
+        let (count, col): (i64, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*), MAX(col) FROM edge_sites WHERE src=?1 AND dst=?2 AND line=7",
+                params![node_id_to_i64(caller.id), node_id_to_i64(callee.id)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "re-recording must not create a duplicate row");
+        assert_eq!(
+            col,
+            Some(12),
+            "a NULL-col re-record must not clobber the col"
+        );
+
+        // A NULL-col row is filled when a real column arrives later.
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 9, None)])
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 9, Some(4))])
+            .unwrap();
+        let col: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT col FROM edge_sites WHERE src=?1 AND dst=?2 AND line=9",
+                params![node_id_to_i64(caller.id), node_id_to_i64(callee.id)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(col, Some(4), "a later real col must fill a NULL col");
+    }
+
+    #[test]
     fn reference_sites_includes_ref_field_occurrences() {
         // #757: a field node's use-sites are recorded under kind 'ref/field'
         // (a read is not a call). find_references must surface them, so
@@ -10043,7 +10170,7 @@ mod tests {
         store.put_node(&field).unwrap();
 
         store
-            .record_field_sites(&[(caller.id, field.id, 14)])
+            .record_field_sites(&[(caller.id, field.id, 14, None)])
             .unwrap();
 
         // Stored under 'ref/field', not 'ref/call'.
@@ -10081,7 +10208,7 @@ mod tests {
         store.put_node(&n).unwrap();
         store.put_node(&m).unwrap();
         store
-            .record_field_sites(&[(m.id, n.id, 0), (n.id, n.id, 5)])
+            .record_field_sites(&[(m.id, n.id, 0, None), (n.id, n.id, 5, None)])
             .unwrap();
         let count: i64 = store
             .conn
@@ -10121,7 +10248,7 @@ mod tests {
         store.put_node(&java_fn).unwrap();
 
         store
-            .record_edge_sites(&[(caller.id, rust_fn.id, 12)])
+            .record_edge_sites(&[(caller.id, rust_fn.id, 12, None)])
             .unwrap();
 
         assert!(store.language_has_edge_sites("rust").unwrap());
@@ -10163,7 +10290,7 @@ mod tests {
         store.put_node(&type_only).unwrap();
 
         store
-            .record_edge_sites(&[(caller.id, callee.id, 7)])
+            .record_edge_sites(&[(caller.id, callee.id, 7, None)])
             .unwrap();
 
         assert!(store.file_has_occurrences("covered.rs").unwrap());
@@ -10206,7 +10333,7 @@ mod tests {
         for n in [&a, &b, &b2, &t] {
             store.put_node(n).unwrap();
         }
-        store.record_edge_sites(&[(a.id, b.id, 3)]).unwrap();
+        store.record_edge_sites(&[(a.id, b.id, 3, None)]).unwrap();
 
         // a.rs and b.rs carry occurrences; t.rs does not. Three distinct files.
         let (with_occ, total) = store.language_occurrence_coverage("rust").unwrap();
@@ -10290,7 +10417,10 @@ mod tests {
         store.put_node(&caller).unwrap();
         store.put_node(&callee).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 0), (caller.id, callee.id, 5)])
+            .record_edge_sites(&[
+                (caller.id, callee.id, 0, None),
+                (caller.id, callee.id, 5, None),
+            ])
             .unwrap();
         let sites = store.reference_sites(callee.id).unwrap();
         assert_eq!(
@@ -10313,7 +10443,7 @@ mod tests {
             "function",
         );
         store.put_node(&n).unwrap();
-        store.record_edge_sites(&[(n.id, n.id, 5)]).unwrap();
+        store.record_edge_sites(&[(n.id, n.id, 5, None)]).unwrap();
         assert!(store.reference_sites(n.id).unwrap().is_empty());
     }
 
@@ -10336,7 +10466,7 @@ mod tests {
         store.put_node(&caller).unwrap();
         store.put_node(&callee).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 7)])
+            .record_edge_sites(&[(caller.id, callee.id, 7, None)])
             .unwrap();
         // go has a real occurrence row -> built.
         assert!(store.language_has_edge_sites("go").unwrap());
@@ -10364,7 +10494,7 @@ mod tests {
         store.put_node(&caller).unwrap();
         store.put_node(&blank).unwrap();
         store
-            .record_edge_sites(&[(caller.id, blank.id, 4)])
+            .record_edge_sites(&[(caller.id, blank.id, 4, None)])
             .unwrap();
         // rust is detected via the src endpoint even though dst language is empty.
         assert!(store.language_has_edge_sites("rust").unwrap());
@@ -10416,7 +10546,10 @@ mod tests {
         store.put_node(&external).unwrap();
         // Owned site (src in a.rs) + inbound site (src in b.rs → dst in a.rs).
         store
-            .record_edge_sites(&[(owned_src.id, callee.id, 3), (external.id, callee.id, 9)])
+            .record_edge_sites(&[
+                (owned_src.id, callee.id, 3, None),
+                (external.id, callee.id, 9, None),
+            ])
             .unwrap();
 
         // Re-index a.rs with the same nodes.
@@ -10500,7 +10633,7 @@ mod tests {
             .put_edge_lsif(&Edge::new(b.id, y.id, EdgeKind::RefCall))
             .unwrap();
         store
-            .record_edge_sites(&[(a.id, x.id, 2), (b.id, y.id, 5)])
+            .record_edge_sites(&[(a.id, x.id, 2, None), (b.id, y.id, 5, None)])
             .unwrap();
         assert_eq!(edge_provenance(&store, a.id, x.id).as_deref(), Some("lsif"));
         assert_eq!(edge_provenance(&store, b.id, y.id).as_deref(), Some("lsif"));
@@ -10573,8 +10706,10 @@ mod tests {
                 Some(content_v1),
             )
             .unwrap();
+        // b's y-call carries a byte column; the block shift must keep it (the
+        // body is byte-identical, so only the line moved).
         store
-            .record_edge_sites(&[(a1.id, x, 2), (b1.id, y, 6)])
+            .record_edge_sites(&[(a1.id, x, 2, None), (b1.id, y, 6, Some(2))])
             .unwrap();
 
         // v2: a grows by two lines (body changed), pushing b down to 7-9. b's
@@ -10602,6 +10737,16 @@ mod tests {
             }],
             "the preserved definition's occurrence must be remapped to its current line"
         );
+        // RFC-027 #813 P2: the remap keeps the occurrence's byte column intact.
+        let col: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT col FROM edge_sites WHERE dst=?1 AND line=8",
+                params![node_id_to_i64(y)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(col, Some(2), "the remapped occurrence must keep its column");
         // a changed, so its occurrence was purged and not restored.
         assert_eq!(
             store.reference_sites(x).unwrap(),
@@ -10792,7 +10937,7 @@ mod tests {
         // a.rs references b.rs (dst in a-file-to-delete would be inbound; here we
         // also record b→a so both directions exist w.r.t. a.rs).
         store
-            .record_edge_sites(&[(a_fn.id, b_fn.id, 2), (b_fn.id, a_fn.id, 7)])
+            .record_edge_sites(&[(a_fn.id, b_fn.id, 2, None), (b_fn.id, a_fn.id, 7, None)])
             .unwrap();
         store.delete_file("c", "a.rs").unwrap();
         // Every edge_sites row touching a.rs is gone; b→a (inbound) also removed.
@@ -10894,7 +11039,7 @@ mod tests {
             .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
             .unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 4)])
+            .record_edge_sites(&[(caller.id, callee.id, 4, None)])
             .unwrap();
 
         assert_eq!(store.clear_resolved_pending_refs().unwrap(), 1);
@@ -11016,7 +11161,7 @@ mod tests {
             )
             .unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 4)])
+            .record_edge_sites(&[(caller.id, callee.id, 4, None)])
             .unwrap();
 
         assert_eq!(store.live_precision_sample().unwrap().agree, 1);
@@ -13011,6 +13156,7 @@ mod tests {
             callee_id: field.id,
             // Even if a producer marks it a call, a field callee is never a call.
             is_call: true,
+            caller_col: None,
         }];
         store
             .write_scip_attributed_batch(corpus, &[], &refs)
@@ -13080,18 +13226,21 @@ mod tests {
                 caller_line: 7,
                 callee_id: callee.id,
                 is_call: true,
+                caller_col: None,
             },
             travsr_core::ScipRef {
                 caller_path: path.to_string(),
                 caller_line: 15,
                 callee_id: callee.id,
                 is_call: true,
+                caller_col: None,
             },
             travsr_core::ScipRef {
                 caller_path: path.to_string(),
                 caller_line: 25,
                 callee_id: callee.id,
                 is_call: true,
+                caller_col: None,
             },
         ];
 
@@ -13186,6 +13335,7 @@ mod tests {
                     caller_line: 5,
                     callee_id: selfish.id,
                     is_call: true,
+                    caller_col: None,
                 },
                 // Genuine recursion has the same shape and is also dropped:
                 // recursion is not represented as a self-edge anywhere in the graph.
@@ -13194,6 +13344,7 @@ mod tests {
                     caller_line: 8,
                     callee_id: selfish.id,
                     is_call: true,
+                    caller_col: None,
                 },
                 // Genuine cross-function call at line 25 (inside `user`) → `helper`.
                 travsr_core::ScipRef {
@@ -13201,6 +13352,7 @@ mod tests {
                     caller_line: 25,
                     callee_id: helper.id,
                     is_call: true,
+                    caller_col: None,
                 },
             ];
             store
@@ -13270,6 +13422,7 @@ mod tests {
             caller_line: 5,
             callee_id: widget.id,
             is_call: false,
+            caller_col: None,
         }];
         store
             .write_scip_attributed_batch(corpus, &[], &refs)
@@ -13328,6 +13481,7 @@ mod tests {
                 callee_def_path: "a.rs".to_string(),
                 callee_def_line: 1,
                 is_call: true,
+                caller_col: None,
             },
             // Genuine call: occurrence at a.rs:25 (inside g) → callee def b.rs:1 (h).
             travsr_core::LsifPositionalRef {
@@ -13336,6 +13490,7 @@ mod tests {
                 callee_def_path: "b.rs".to_string(),
                 callee_def_line: 1,
                 is_call: true,
+                caller_col: None,
             },
         ];
 
@@ -13384,7 +13539,7 @@ mod tests {
         store
             .put_edge(&Edge::new(g.id, f.id, EdgeKind::RefCall))
             .unwrap();
-        store.record_edge_sites(&[(g.id, f.id, 5)]).unwrap();
+        store.record_edge_sites(&[(g.id, f.id, 5, None)]).unwrap();
 
         assert_eq!(store.count_self_ref_call_edges().unwrap(), 1);
         assert_eq!(

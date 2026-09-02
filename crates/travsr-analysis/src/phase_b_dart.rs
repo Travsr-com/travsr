@@ -393,6 +393,12 @@ fn parse_emitter_output(
                         // The Dart emitter reports call references; treat as calls
                         // so they create `ref/call` edges as before (#650).
                         is_call: true,
+                        // RFC-027 #813 P2: the Dart emitter reports only a line, and
+                        // this path has no source text to convert a column against,
+                        // so leave the occurrence column unknown; the daemon falls
+                        // back to its word-boundary search. Recording a non-byte
+                        // column here would be a wrong editor position (a wrong edge).
+                        caller_col: None,
                     });
                 } else {
                     edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));

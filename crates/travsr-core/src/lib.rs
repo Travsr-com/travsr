@@ -717,6 +717,16 @@ pub struct ScipRef {
     /// edge-emitting behavior with no regression.
     #[serde(default = "default_true")]
     pub is_call: bool,
+    /// 0-based UTF-8 BYTE column of the reference occurrence on `caller_line`
+    /// (RFC-027 #813 P2). Recorded on the `edge_sites` row so the live overlay
+    /// resolves the reference at its exact editor position instead of searching
+    /// the line for the name. Each source (SCIP sidecar, rust-analyzer LSIF,
+    /// Dart emitter) converts its own occurrence unit to a byte offset before
+    /// building this; the daemon converts byte to the editor's UTF-16 column at
+    /// use. `None` when the source cannot give a reliable position, in which case
+    /// the daemon falls back to its word-boundary search (no regression).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_col: Option<u32>,
 }
 
 /// serde default for [`ScipRef::is_call`] / [`LsifPositionalRef::is_call`].
@@ -748,6 +758,14 @@ pub struct LsifPositionalRef {
     /// record a `find_references` occurrence without creating a call edge (#650).
     #[serde(default = "default_true")]
     pub is_call: bool,
+    /// 0-based UTF-8 BYTE column of the reference occurrence on `caller_line`
+    /// (RFC-027 #813 P2). LSIF/LSP ranges are UTF-16 code units, so the indexer
+    /// converts the range's start character to a byte offset against the caller
+    /// line before setting this. Carried through to the resolved [`ScipRef`] and
+    /// recorded on the `edge_sites` row. `None` for a dump built before this
+    /// shipped, in which case the daemon name-searches the line (no regression).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_col: Option<u32>,
 }
 
 /// A single reference occurrence returned by `find_references` (issue #299):

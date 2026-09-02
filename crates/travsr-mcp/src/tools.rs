@@ -7582,7 +7582,7 @@ mod tests {
         store.put_node(&callee).unwrap();
         store.put_node(&caller).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 12)])
+            .record_edge_sites(&[(caller.id, callee.id, 12, None)])
             .unwrap();
 
         let clean = find_references_raw(&store, "charge", None);
@@ -13151,7 +13151,10 @@ mod snippet_tests {
         store.put_node(&caller).unwrap();
         // Two distinct occurrence lines from the same caller must both appear.
         store
-            .record_edge_sites(&[(caller.id, callee.id, 9), (caller.id, callee.id, 10)])
+            .record_edge_sites(&[
+                (caller.id, callee.id, 9, None),
+                (caller.id, callee.id, 10, None),
+            ])
             .unwrap();
 
         let out = find_references(&store, "charge", None);
@@ -13188,7 +13191,7 @@ mod snippet_tests {
         store.put_node(&callee).unwrap();
         store.put_node(&orphan).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 11)])
+            .record_edge_sites(&[(caller.id, callee.id, 11, None)])
             .unwrap();
 
         let out = find_references(&store, "orphan", None);
@@ -13232,7 +13235,7 @@ mod snippet_tests {
         store.put_node(&callee).unwrap();
         store.put_node(&unused).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 5)])
+            .record_edge_sites(&[(caller.id, callee.id, 5, None)])
             .unwrap();
 
         let out = find_references(&store, "unused", None);
@@ -13402,7 +13405,9 @@ mod snippet_tests {
         );
         store.put_node(&def).unwrap();
         store.put_node(&caller).unwrap();
-        store.record_edge_sites(&[(caller.id, def.id, 42)]).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, def.id, 42, None)])
+            .unwrap();
 
         for hint in [
             "crates/travsr-retrieval",  // directory prefix
@@ -13482,7 +13487,7 @@ mod snippet_tests {
         store.put_node(&shared_d).unwrap();
         store.put_node(&caller).unwrap();
         store
-            .record_edge_sites(&[(caller.id, shared_c.id, 7)])
+            .record_edge_sites(&[(caller.id, shared_c.id, 7, None)])
             .unwrap();
 
         let out = find_references(&store, "ClassC.shared", None);
@@ -13545,7 +13550,7 @@ mod snippet_tests {
         store.put_node(&shared).unwrap();
         store.put_node(&caller).unwrap();
         store
-            .record_edge_sites(&[(caller.id, shared.id, 4)])
+            .record_edge_sites(&[(caller.id, shared.id, 4, None)])
             .unwrap();
 
         let out = find_references(&store, "ClassC.shared", None);
@@ -15181,7 +15186,7 @@ mod issue_755_tests {
         store.put_node(&dog).unwrap();
         store.put_node(&target).unwrap();
         store
-            .record_edge_sites(&[(cat.id, target.id, 4), (dog.id, target.id, 7)])
+            .record_edge_sites(&[(cat.id, target.id, 4, None), (dog.id, target.id, 7, None)])
             .unwrap();
         let got = find_references_structured(&store, "speak", None);
         assert_eq!(got.status, "resolved");

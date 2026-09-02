@@ -331,6 +331,12 @@ pub fn ingest_g2_from_reader(
                 // ranges only for call expressions and imports, so these are
                 // already call-scoped — flag as calls to preserve their edges.
                 is_call: true,
+                // RFC-027 #813 P2: this streaming graph parse carries no source
+                // text, so the range's UTF-16 start character cannot be converted
+                // to the byte column the occurrence store keeps. Leave it None
+                // rather than record a wrong (non-ASCII) column; the daemon falls
+                // back to its word-boundary search for these occurrences.
+                caller_col: None,
             });
         }
     }
@@ -1153,12 +1159,21 @@ pub fn ingest_rust_positional_from_reader(
         // (that is what collapses into `src == dst` self-loops and spurious
         // non-call edges). Fail open (treat as a call) when the source line is
         // unreadable — in production the file always exists.
-        let is_call = match range_cols.get(&range_id) {
-            Some(&col) => src
-                .line(std::path::Path::new(caller_abs), caller_line0 + 1)
-                .map(|t| crate::callsite::occurrence_is_call(t, col))
-                .unwrap_or(true),
-            None => true,
+        // RFC-027 #813 P2: read the caller line once to classify the occurrence
+        // AND convert its UTF-16 range start to a byte column. LSIF positions are
+        // UTF-16 code units (metaData positionEncoding); source is UTF-8, so the
+        // stored occurrence column must be the byte offset the daemon can convert
+        // back at use. Fail open (treat as a call, no column) when the line is
+        // unreadable; in production the file always exists.
+        let (is_call, caller_col) = match range_cols.get(&range_id) {
+            Some(&col) => match src.line(std::path::Path::new(caller_abs), caller_line0 + 1) {
+                Some(t) => (
+                    crate::callsite::occurrence_is_call(t, col),
+                    Some(crate::callsite::utf16_col_to_byte(t, col) as u32),
+                ),
+                None => (true, None),
+            },
+            None => (true, None),
         };
         let Some(defres) = result_def.get(&rs) else {
             continue; // occurrence with no definition (e.g. a keyword range)
@@ -1178,6 +1193,7 @@ pub fn ingest_rust_positional_from_reader(
                 callee_def_path: relative_to_base(&base_prefix, def_abs),
                 callee_def_line: def_line0 + 1,
                 is_call,
+                caller_col,
             });
         }
     }
@@ -1706,11 +1722,23 @@ pub fn ingest_scip_g2(
                 } else {
                     true
                 };
+                // RFC-027 #813 P2: convert the occurrence's 0-based UTF-16 start
+                // column (SCIP positions are UTF-16 code units) to the byte offset
+                // the occurrence store keeps, reading the source line via the same
+                // cache `is_call` used. None when the range carries no column or
+                // the line is unreadable, in which case the daemon name-searches.
+                let caller_col: Option<u32> = match occ.range.get(1) {
+                    Some(&col) => src
+                        .line(&repo_root.join(path), caller_line)
+                        .map(|t| crate::callsite::utf16_col_to_byte(t, col.max(0) as u32) as u32),
+                    None => None,
+                };
                 out.refs.push(travsr_core::ScipRef {
                     caller_path: path.clone(),
                     caller_line,
                     callee_id,
                     is_call,
+                    caller_col,
                 });
             }
         }
