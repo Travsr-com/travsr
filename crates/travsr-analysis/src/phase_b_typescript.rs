@@ -252,6 +252,7 @@ fn extract_file_edges(
 
                 // 1-based call-site line (#299) for edge_sites → find_references.
                 let occ_line = cap.node.start_position().row.saturating_add(1) as u32;
+                let occ_col = cap.node.start_position().column as u32;
 
                 let Some((caller_fn, caller_class)) =
                     find_enclosing_fn_ts(cap.node, source.as_slice())
@@ -294,6 +295,7 @@ fn extract_file_edges(
                             alt_callee_sig: None,
                             hint_crate: None,
                             caller_line: occ_line,
+                            caller_col: Some(occ_col),
                             is_method_call: true,
                             recv_type,
                         });
@@ -307,6 +309,7 @@ fn extract_file_edges(
                             alt_callee_sig: None,
                             hint_crate: None,
                             caller_line: occ_line,
+                            caller_col: Some(occ_col),
                             is_method_call: false,
                             recv_type: None,
                         });
@@ -319,6 +322,7 @@ fn extract_file_edges(
                             alt_callee_sig: None,
                             hint_crate: None,
                             caller_line: occ_line,
+                            caller_col: Some(occ_col),
                             is_method_call: false,
                             recv_type: None,
                         });

@@ -4004,6 +4004,10 @@ fn live_resolution_targets(
     else {
         return Vec::new();
     };
+    // The file text pins each target's exact column (RFC-027 #813 P1/P2). Read
+    // once and share it: the native builder uses the extractor's occurrence
+    // column, and `fill_target_columns` fills the rest by name search.
+    let content = std::fs::read_to_string(abs_path).unwrap_or_default();
     let mut targets = match refs {
         LiveRefSet::Native {
             unresolved,
@@ -4011,7 +4015,7 @@ fn live_resolution_targets(
             locally_bound,
         } => {
             let mut targets =
-                live_resolve::targets_needing_editor(store, &unresolved, &locally_bound);
+                live_resolve::targets_needing_editor(store, &content, &unresolved, &locally_bound);
             targets.extend(live_resolve::inheritance_targets_needing_editor(
                 store,
                 corpus,
@@ -4026,11 +4030,10 @@ fn live_resolution_targets(
         // an editor target.
         LiveRefSet::Generic(refs) => live_resolve::generic_targets_needing_editor(&refs),
     };
-    // RFC-027 #813 P1: pin each target's column against the file text so the
+    // RFC-027 #813 P1: pin each remaining target's column against the file text
+    // (the ones the extractor left without an exact occurrence column) so the
     // editor resolves at the exact position instead of searching the line.
-    if let Ok(content) = std::fs::read_to_string(abs_path) {
-        live_resolve::fill_target_columns(&content, &mut targets);
-    }
+    live_resolve::fill_target_columns(&content, &mut targets);
     targets
 }
 
@@ -5594,6 +5597,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 42,
+            caller_col: None,
             is_method_call: true,
             recv_type: None,
         }];
@@ -5641,6 +5645,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9,
+            caller_col: None,
             is_method_call: false,
             recv_type: recv_type.map(str::to_string),
         }];
@@ -5785,6 +5790,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9,
+            caller_col: None,
             is_method_call: false,
             recv_type: Some("Config".to_string()),
         }];
@@ -5858,6 +5864,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -5918,6 +5925,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 3,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -6049,6 +6057,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -6098,6 +6107,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 5,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -6152,6 +6162,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 12,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("HashSet".to_string()),
         }];
@@ -6224,6 +6235,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -6289,6 +6301,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9773,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Command".to_string()),
         }];
@@ -6350,6 +6363,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 3,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -6408,6 +6422,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 8,
+            caller_col: None,
             is_method_call: true,
             recv_type: None,
         }];
@@ -6469,6 +6484,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 12,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -6524,6 +6540,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 45,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -6575,6 +6592,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -6628,6 +6646,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 8,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -6690,6 +6709,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 4,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("SqliteStore".to_string()),
         }];
@@ -6766,6 +6786,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: line,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         };
@@ -6860,6 +6881,7 @@ mod tests {
                 alt_callee_sig: None,
                 hint_crate: None,
                 caller_line: 8,
+                caller_col: None,
                 is_method_call: true,
                 recv_type: Some("Session".to_string()),
             },
@@ -6869,6 +6891,7 @@ mod tests {
                 alt_callee_sig: None,
                 hint_crate: None,
                 caller_line: 8,
+                caller_col: None,
                 is_method_call: true,
                 recv_type: Some("Session".to_string()),
             },
@@ -6913,6 +6936,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 4,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -6973,6 +6997,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 4,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("App".to_string()),
         }];
@@ -7026,6 +7051,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 5,
+            caller_col: None,
             is_method_call: true,
             recv_type: None, // chain receiver — unrecoverable
         }];
@@ -7068,6 +7094,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 2,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         };

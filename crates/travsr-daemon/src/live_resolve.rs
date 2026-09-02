@@ -533,9 +533,11 @@ fn lexical_edge_kind(call: &UnresolvedCall) -> EdgeKind {
 /// extractor could be taught to carry UTF-16 offsets.
 pub fn targets_needing_editor(
     store: &SqliteStore,
+    content: &str,
     unresolved: &[UnresolvedCall],
     locally_bound: &std::collections::HashSet<String>,
 ) -> Vec<LiveResolutionTarget> {
+    let lines: Vec<&str> = content.lines().collect();
     let targets: Vec<LiveResolutionTarget> = unresolved
         .iter()
         .filter_map(|call| {
@@ -553,11 +555,21 @@ pub fn targets_needing_editor(
             if call.caller_line == 0 {
                 return None;
             }
+            // RFC-027 #813 P2: prefer the extractor's exact occurrence column,
+            // converted from a byte offset to the editor's UTF-16 column. It
+            // points at the precise identifier the extractor captured, so it is
+            // right even when the name repeats on the line, where the
+            // `fill_target_columns` name search would pick the first match and
+            // could resolve the wrong occurrence. `None` leaves it for the name
+            // search fallback.
+            let ref_col = call.caller_col.and_then(|bc| {
+                lines
+                    .get((call.caller_line - 1) as usize)
+                    .map(|line| byte_to_utf16_col(line, bc))
+            });
             Some(LiveResolutionTarget {
                 ref_line: call.caller_line,
-                // Filled by the daemon's `fill_target_columns` pass, which has
-                // the file text; the builders here do not (RFC-027 #813 P1).
-                ref_col: None,
+                ref_col,
                 name: travsr_core::ident::leaf_of(&call.callee_sig).to_string(),
                 edge_kind: lexical_edge_kind(call).as_str().to_string(),
                 // Calls and fields are both answered by the definition provider;
@@ -692,13 +704,28 @@ pub fn generic_targets_needing_editor(
 pub fn fill_target_columns(content: &str, targets: &mut [LiveResolutionTarget]) {
     let lines: Vec<&str> = content.lines().collect();
     for t in targets.iter_mut() {
-        if t.ref_line == 0 {
+        // A target the extractor already pinned to its exact occurrence column
+        // keeps it; the name search is only the fallback for the rest.
+        if t.ref_col.is_some() || t.ref_line == 0 {
             continue;
         }
         if let Some(line) = lines.get((t.ref_line - 1) as usize) {
             t.ref_col = word_boundary_col_utf16(line, &t.name);
         }
     }
+}
+
+/// Convert a 0-based byte offset within `line` to the 0-based UTF-16 column the
+/// editor's `vscode.Position` expects (RFC-027 #813 P2). Equal for ASCII, which
+/// identifiers are; a byte offset landing inside a multibyte char is clamped
+/// back to the previous char boundary, and one past the end clamps to the line
+/// length, so the result is always a valid column.
+fn byte_to_utf16_col(line: &str, byte_col: u32) -> u32 {
+    let mut b = (byte_col as usize).min(line.len());
+    while b > 0 && !line.is_char_boundary(b) {
+        b -= 1;
+    }
+    line[..b].encode_utf16().count() as u32
 }
 
 /// The 0-based UTF-16 column of the first whole-word (`\bname\b`, ASCII word
@@ -1771,7 +1798,7 @@ mod tests {
         let mut ambiguous = call(src, "fn:save", 19);
         ambiguous.is_method_call = true;
 
-        let targets = targets_needing_editor(&store, &[resolvable, ambiguous], &no_locals());
+        let targets = targets_needing_editor(&store, "", &[resolvable, ambiguous], &no_locals());
         assert_eq!(
             targets.len(),
             1,
@@ -1791,11 +1818,32 @@ mod tests {
         let store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
         let src = node_id("src/order.ts", "fn:placeOrder");
         let field = call(src, "field:count", 20);
-        let targets = targets_needing_editor(&store, &[field], &no_locals());
+        let targets = targets_needing_editor(&store, "", &[field], &no_locals());
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].edge_kind, "ref/field");
         assert_eq!(targets[0].name, "count");
         assert_eq!(targets[0].provider, "definition");
+    }
+
+    /// RFC-027 #813 P2: the extractor's exact occurrence column wins over the
+    /// name search when the name repeats on the line. The name search finds the
+    /// first `save`, which is the wrong occurrence and would resolve the wrong
+    /// call; the captured column points at the one the extractor actually meant.
+    #[test]
+    fn the_extractor_column_beats_the_name_search_when_a_name_repeats() {
+        let store = store_with(&[("src/a.ts", "fn:f", "function", 1, 3)]);
+        let src = node_id("src/a.ts", "fn:f");
+        let content = "  a.save(); b.save()\n";
+        let mut c = call(src, "fn:save", 1);
+        c.is_method_call = true;
+        c.caller_col = Some(14); // byte column of the second `save`
+        let targets = targets_needing_editor(&store, content, &[c], &no_locals());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].ref_col,
+            Some(14),
+            "the exact occurrence column must win over the first name match"
+        );
     }
 
     /// A bare free-function call the lexical lane could not resolve has no unique
@@ -1806,7 +1854,7 @@ mod tests {
         let store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
         let src = node_id("src/order.ts", "fn:placeOrder");
         let bare = call(src, "fn:nowhere", 21);
-        assert!(targets_needing_editor(&store, &[bare], &no_locals()).is_empty());
+        assert!(targets_needing_editor(&store, "", &[bare], &no_locals()).is_empty());
     }
 
     /// RFC-027 section 12: the editor lane records what it claimed, so the

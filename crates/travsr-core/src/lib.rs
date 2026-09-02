@@ -1126,6 +1126,16 @@ pub struct UnresolvedCall {
     /// skips `edge_sites` emission for zero lines.
     #[serde(default)]
     pub caller_line: u32,
+    /// 0-based byte column of the callee-name occurrence on `caller_line`
+    /// (RFC-027 #813 P2). It is the start column of the exact identifier node the
+    /// extractor captured, so it points at the reference the editor resolves,
+    /// which is strictly better than a name search when the name repeats on the
+    /// line. Byte offset, in the file's own encoding; the daemon converts it to
+    /// the editor's UTF-16 column against the current line. `None` for an emitter
+    /// that predates this field, in which case the daemon falls back to its
+    /// word-boundary search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_col: Option<u32>,
     /// True when this call came from a method-call receiver (`recv.method()`)
     /// whose type is not known syntactically. A method call can never resolve
     /// to a bare free function — the daemon resolver requires a qualified
@@ -2201,6 +2211,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 42,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         };
@@ -2220,6 +2231,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 42,
+            caller_col: None,
             is_method_call: true,
             recv_type: None,
         };
