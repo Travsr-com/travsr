@@ -72,6 +72,85 @@ fn body_hashes_for_spans(
     out
 }
 
+/// True when `name` occurs as a whole word starting at byte column `col` of
+/// `line` (RFC-027 #813 P2, issue #816 defect 1). The column is a 0-based byte
+/// offset, matching the occurrence column persisted from SCIP. A word boundary
+/// on both sides keeps a substring of a longer identifier from matching.
+fn occurrence_at_col(line: &str, name: &str, col: usize) -> bool {
+    let bytes = line.as_bytes();
+    let nb = name.as_bytes();
+    if nb.is_empty() || col + nb.len() > bytes.len() || !line.is_char_boundary(col) {
+        return false;
+    }
+    if &bytes[col..col + nb.len()] != nb {
+        return false;
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let before_ok = col == 0 || !is_word(bytes[col - 1]);
+    let after = col + nb.len();
+    let after_ok = after >= bytes.len() || !is_word(bytes[after]);
+    before_ok && after_ok
+}
+
+/// The current line of a changed definition's committed occurrence, or `None`
+/// to abstain (issue #816 defect 1).
+///
+/// The committed line is first remapped by the definition's start delta, which
+/// is correct for an occurrence above the edit point but stale by the net
+/// inserted or deleted line count for one below it: a body edit does not move
+/// the definition's start, so the start delta alone leaves later occurrences
+/// off. A pure line insertion or deletion preserves each occurrence's byte
+/// column, so the occurrence is re-anchored by that column: the line nearest to
+/// the start-delta `estimate`, within the definition's current span
+/// `[span_start, span_end]`, that carries `name` at byte column `col` as a whole
+/// word. Ties prefer the line at or after the estimate, since an insert (which
+/// pushes occurrences down to a larger line number) is the common edit.
+///
+/// Returns `None` when no such line exists in the span (the occurrence's own
+/// line was reflowed, or the name moved off its column), so a body edit that
+/// rewrites a reference abstains and heals at commit rather than serving a stale
+/// position. A mis-snap to another occurrence of the same `(name, col)` inside
+/// the same definition is harmless: the editor resolves the same callee, so the
+/// daemon derives the same `(enclosing def -> callee)` edge either way.
+///
+/// The search fans OUT from the estimate and returns the first hit, so its cost
+/// is the shift distance (near zero for a typical one-line edit), not the
+/// definition's length: a huge definition with many occurrences never turns into
+/// an occurrence-times-span scan on the save path.
+fn snap_changed_occurrence_line(
+    lines: &[&str],
+    name: &str,
+    col: usize,
+    estimate: i64,
+    span_start: i64,
+    span_end: i64,
+) -> Option<u32> {
+    let lo = span_start.max(1);
+    let hi = span_end.max(lo);
+    let hit = |l: i64| -> bool {
+        l >= lo
+            && l <= hi
+            && lines
+                .get((l - 1) as usize)
+                .is_some_and(|line| occurrence_at_col(line, name, col))
+    };
+    // Radius 0 first, then each ring outward. A tie at the same distance prefers
+    // the line after the estimate (a larger line number): an insert, the common
+    // edit, pushes occurrences down, so the true line is at or after the
+    // estimate. Bounded by how far either end of the span is from the estimate,
+    // so the loop always terminates.
+    let max_radius = (estimate - lo).abs().max((hi - estimate).abs());
+    for r in 0..=max_radius {
+        if hit(estimate + r) {
+            return Some((estimate + r) as u32);
+        }
+        if r > 0 && hit(estimate - r) {
+            return Some((estimate - r) as u32);
+        }
+    }
+    None
+}
+
 /// Row cap on [`SqliteStore::lookup_nodes_exact`] (exact-signature Tier 1).
 ///
 /// This is intentionally one greater than `travsr-mcp`'s `AMBIGUOUS_DISPLAY_LIMIT`
@@ -82,6 +161,17 @@ fn body_hashes_for_spans(
 /// or the `travsr graph` ambiguity truncation notice (#565 / RFC-002) silently
 /// stops firing on the Tier-1 path.
 pub const NODE_EXACT_LOOKUP_LIMIT: usize = 21;
+
+/// Header window for [`SqliteStore::node_starting_at_or_below`] (issue #816
+/// defect 2 backstop): how many lines above a definition's declaration a
+/// provider-reported position may sit and still map to it. Covers a realistic
+/// stack of attributes and doc-comment lines while staying bounded, so a stray
+/// position in a large gap between definitions never attaches to a distant node.
+/// The primary fix (the extension preferring `targetSelectionRange`) already
+/// puts the reported line on the declaration for providers that supply it; this
+/// window only backstops providers that report the item's full range or a bare
+/// location, whose headers are typically short.
+const LIVE_DECL_HEADER_LINES: u32 = 64;
 
 /// Row cap on [`SqliteStore::search_nodes_by_name`] (fuzzy simple-name Tier 2).
 pub const NODE_NAME_SEARCH_LIMIT: usize = 100;
@@ -2492,6 +2582,19 @@ impl SqliteStore {
                     };
                     (new_lines, old_lines)
                 };
+            // RFC-027 #813 P2 (issue #816 defect 1): current end line of every
+            // definition, so a changed definition's occurrences can be re-anchored
+            // within its current span. Only needed when preservation happened.
+            let new_ends: HashMap<i64, i64> = if preserved.is_empty() {
+                HashMap::new()
+            } else {
+                nodes
+                    .iter()
+                    .filter_map(|n| {
+                        n.end_line.map(|e| (node_id_to_i64(n.id), e as i64))
+                    })
+                    .collect()
+            };
             // Per preserved definition, the line delta from its committed position
             // to its current one. A preserved body is byte-identical, so the whole
             // definition shifted as a block by `new_start - old_start`, and every
@@ -2626,6 +2729,12 @@ impl SqliteStore {
             // added/removed symbol, or no `content`) the tree-sitter reparse
             // already re-emits the file's references, so this capture is skipped
             // to avoid enumerating the whole file on every bulk reindex.
+            //
+            // Issue #816 defect 1: the current buffer text, split once, so each
+            // changed occurrence can be re-anchored by its preserved byte column
+            // (below). Present here because preservation implies `content` is
+            // `Some` (a body hash needs the text).
+            let content_lines: Option<Vec<&str>> = content.map(|t| t.lines().collect());
             let changed_occurrences: Vec<travsr_core::ChangedOccurrence> = if preserved.is_empty() {
                 Vec::new()
             } else {
@@ -2654,16 +2763,32 @@ impl SqliteStore {
                     .context("collecting changed-def occurrences")?
                     .into_iter()
                     .filter_map(|(src, line, col, kind, signature)| {
+                        let name = travsr_core::ident::leaf_of(&signature).to_string();
                         // Remap the committed occurrence line onto the current
-                        // buffer by the changed definition's block delta. The body
-                        // changed, so this is a best-effort estimate; the daemon
-                        // fences the served position against the definition's
-                        // CURRENT span and the editor resolves the live position,
-                        // so a stale estimate is fail-closed, never a wrong edge. A
-                        // definition whose old or new start is unknown cannot be
-                        // remapped, so it is dropped rather than served pre-edit.
-                        let delta = new_lines.get(&src)? - old_lines.get(&src)?;
-                        let new_line = line + delta;
+                        // buffer. The definition's start delta is the first
+                        // estimate; it is correct above the edit point but stale
+                        // below it, because a body edit does not move the start
+                        // (issue #816 defect 1).
+                        let start = *new_lines.get(&src)?;
+                        let delta = start - old_lines.get(&src)?;
+                        let estimate = line + delta;
+                        // With a committed column and the current text, re-anchor
+                        // the occurrence by that column to its true current line
+                        // inside the definition's current span; abstain (heal at
+                        // commit) when it cannot be found, rather than serving a
+                        // stale position. Without a column or text, keep the
+                        // start-delta estimate: the daemon fences it against the
+                        // definition's current span and the editor resolves the
+                        // live position, so a stale estimate is fail-closed.
+                        let new_line = match (col, content_lines.as_deref()) {
+                            (Some(c), Some(lines)) => {
+                                let end = new_ends.get(&src).copied().unwrap_or(estimate);
+                                snap_changed_occurrence_line(
+                                    lines, &name, c as usize, estimate, start, end,
+                                )? as i64
+                            }
+                            _ => estimate,
+                        };
                         if new_line < 1 {
                             return None;
                         }
@@ -2672,7 +2797,7 @@ impl SqliteStore {
                             line: new_line as u32,
                             col: col.map(|c| c as u32),
                             kind,
-                            name: travsr_core::ident::leaf_of(&signature).to_string(),
+                            name,
                         })
                     })
                     .collect();
@@ -6090,6 +6215,66 @@ LIMIT ?4",
                 .query_row(params_from_iter(vals), |row| row.get(0))
                 .optional()
                 .context("enclosing_node_at: query")?;
+            Ok(id.map(i64_to_node_id))
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// The nearest node of one of `kinds` whose declaration begins at or just
+    /// below `line`, for a definition position reported ABOVE the node's span
+    /// (issue #816 defect 2 backstop).
+    ///
+    /// A definition provider may report the item's full range or a bare
+    /// `Location` whose start sits on a leading doc comment, attribute, or
+    /// decorator line, above the daemon node's declaration line, so
+    /// [`Self::enclosing_node_at`] (exact span containment) finds nothing. This
+    /// maps such a position to the definition it heads: the node of a valid kind
+    /// whose start line is the smallest value at or after `line`, bounded to a
+    /// header window (`LIVE_DECL_HEADER_LINES`) so a stray position in a large
+    /// gap cannot attach to a distant node. The caller still gates on the node's
+    /// name, so a wrong header match abstains rather than minting an edge.
+    ///
+    /// `kinds` are internal constant strings, bound as parameters, never
+    /// interpolated. An empty `kinds` matches nothing (`Ok(None)`).
+    pub fn node_starting_at_or_below(
+        &self,
+        corpus: &str,
+        path: &str,
+        line: u32,
+        kinds: &[&str],
+    ) -> Result<Option<NodeId>, StoreError> {
+        if kinds.is_empty() {
+            return Ok(None);
+        }
+        (|| -> AnyResult<Option<NodeId>> {
+            // Placeholders start at ?4: ?1 corpus, ?2 path, ?3 line.
+            let placeholders = (0..kinds.len())
+                .map(|i| format!("?{}", i + 4))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id FROM nodes \
+                 WHERE corpus = ?1 AND path = ?2 \
+                   AND line IS NOT NULL AND end_line IS NOT NULL \
+                   AND line >= ?3 AND line <= ?3 + {LIVE_DECL_HEADER_LINES} \
+                   AND kind IN ({placeholders}) \
+                 ORDER BY line ASC, (end_line - line) ASC, id ASC LIMIT 1"
+            );
+            let mut stmt = self
+                .conn
+                .prepare_cached(&sql)
+                .context("node_starting_at_or_below: prepare")?;
+            use rusqlite::types::Value;
+            let mut vals: Vec<Value> = vec![
+                Value::Text(corpus.to_string()),
+                Value::Text(path.to_string()),
+                Value::Integer(line as i64),
+            ];
+            vals.extend(kinds.iter().map(|k| Value::Text((*k).to_string())));
+            let id: Option<i64> = stmt
+                .query_row(params_from_iter(vals), |row| row.get(0))
+                .optional()
+                .context("node_starting_at_or_below: query")?;
             Ok(id.map(i64_to_node_id))
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -10814,16 +10999,19 @@ mod tests {
             .record_edge_sites(&[(a.id, x.id, 2, Some(2)), (b.id, y.id, 5, Some(2))])
             .unwrap();
 
-        // Edit only a's body; b, x, y stay byte-identical (preserved).
+        // Edit only a's body; b, x, y stay byte-identical (preserved). The x
+        // call itself stays on line 2 at col 2 (a trailing comment changes the
+        // body hash without moving the reference), so the occurrence is still a
+        // live target to enumerate.
         let content_v2 =
-            "fn a() {\n  z();\n}\n\nfn b() {\n  y();\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
+            "fn a() {\n  x(); // edit\n}\n\nfn b() {\n  y();\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
         let report = store
             .reindex_replace("c", "a.rs", &nodes, &[], "h2", Some(content_v2))
             .unwrap();
 
         // Only a's occurrence is captured (b, x, y are preserved). a did not
-        // move (delta 0), so its remapped line equals its committed line, and it
-        // carries the column and the callee's leaf name, not the stale dst.
+        // move (delta 0) and the x call is still on line 2, so it is captured on
+        // line 2 with its column and the callee's leaf name, not the stale dst.
         assert_eq!(
             report.changed_occurrences,
             vec![travsr_core::ChangedOccurrence {
@@ -10834,6 +11022,63 @@ mod tests {
                 name: "x".into(),
             }],
             "the changed definition's occurrence must be captured with col and name"
+        );
+    }
+
+    /// Issue #816 defect 1: an edit that inserts a line INSIDE the changed
+    /// definition's body shifts every occurrence below the edit point, but the
+    /// definition's start does not move (start delta 0). The occurrence must be
+    /// captured on its CURRENT line (re-anchored by its preserved byte column),
+    /// not the stale committed line the start delta alone would leave.
+    #[test]
+    fn reindex_replace_remaps_a_changed_defs_occurrence_below_an_intra_body_insert() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "a.rs", "rust", sig),
+                "function",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        // v1: a is [1,3] and calls x at line 2, col 2. b and x are preserved
+        // across the edit so the changed-occurrence capture runs.
+        let a1 = mk("fn:a", 1, 3);
+        let b1 = mk("fn:b", 5, 6);
+        let x1 = mk("fn:x", 8, 9);
+        let nodes_v1 = vec![a1.clone(), b1.clone(), x1.clone()];
+        let content_v1 = "fn a() {\n  x();\n}\n\nfn b() {\n}\n\nfn x() {\n}\n";
+        store
+            .reindex_replace("c", "a.rs", &nodes_v1, &[], "h1", Some(content_v1))
+            .unwrap();
+        store
+            .record_edge_sites(&[(a1.id, x1.id, 2, Some(2))])
+            .unwrap();
+
+        // v2: insert `  w;` at the top of a's body. a grows to [1,4]; its start
+        // is unchanged, so the start delta is 0, but the x call moved to line 3.
+        // b and x shift down by one and stay byte-identical (preserved).
+        let a2 = mk("fn:a", 1, 4);
+        let b2 = mk("fn:b", 6, 7);
+        let x2 = mk("fn:x", 9, 10);
+        let nodes_v2 = vec![a2.clone(), b2.clone(), x2.clone()];
+        let content_v2 = "fn a() {\n  w;\n  x();\n}\n\nfn b() {\n}\n\nfn x() {\n}\n";
+        let report = store
+            .reindex_replace("c", "a.rs", &nodes_v2, &[], "h2", Some(content_v2))
+            .unwrap();
+
+        // The occurrence is captured on its current line 3, not the stale 2 the
+        // start delta alone would give.
+        assert_eq!(
+            report.changed_occurrences,
+            vec![travsr_core::ChangedOccurrence {
+                src: a2.id,
+                line: 3,
+                col: Some(2),
+                kind: "ref/call".into(),
+                name: "x".into(),
+            }],
+            "a changed def's occurrence below an intra-body insert must remap to its current line"
         );
     }
 
