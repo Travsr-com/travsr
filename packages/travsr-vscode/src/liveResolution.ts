@@ -288,8 +288,13 @@ async function resolveTarget(
   const command = PROVIDER_COMMAND[target.provider];
   if (!command) return null;
 
-  const col = columnOf(doc, target.ref_line, target.name);
-  if (col === null) return null;
+  // RFC-027 #813 P1: prefer the column the daemon pinned against the file text,
+  // which resolves the reference at its exact position (including a target whose
+  // name is not literally on the line, e.g. `s.node.0`). Fall back to searching
+  // the line for `name` when the daemon sent no column (an older daemon, or a
+  // name it could not pin).
+  const col = target.ref_col ?? columnOf(doc, target.ref_line, target.name);
+  if (col === null || col === undefined) return null;
   const pos = new vscode.Position(target.ref_line - 1, col);
 
   let locations: unknown;

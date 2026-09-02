@@ -555,6 +555,9 @@ pub fn targets_needing_editor(
             }
             Some(LiveResolutionTarget {
                 ref_line: call.caller_line,
+                // Filled by the daemon's `fill_target_columns` pass, which has
+                // the file text; the builders here do not (RFC-027 #813 P1).
+                ref_col: None,
                 name: travsr_core::ident::leaf_of(&call.callee_sig).to_string(),
                 edge_kind: lexical_edge_kind(call).as_str().to_string(),
                 // Calls and fields are both answered by the definition provider;
@@ -594,6 +597,7 @@ pub fn inheritance_targets_needing_editor(
             }
             Some(LiveResolutionTarget {
                 ref_line: r.line,
+                ref_col: None,
                 name: r.base_name.clone(),
                 edge_kind: EdgeKind::IsImplementation.as_str().to_string(),
                 provider: "definition".to_string(),
@@ -632,6 +636,7 @@ pub fn generic_targets_needing_editor(
         }
         out.push(LiveResolutionTarget {
             ref_line: line,
+            ref_col: None,
             name: name.to_string(),
             edge_kind: kind.as_str().to_string(),
             // All three kinds resolve to where the target is *defined*, which is
@@ -674,6 +679,52 @@ pub fn generic_targets_needing_editor(
 /// the real column through the protocol would recover this recall — the
 /// detectors have it at capture time — but it is a protocol change, and until
 /// then abstaining is the only fail-closed option.
+/// RFC-027 #813 P1: pin each target's 0-based column against the file text, so
+/// the editor resolves at the exact position instead of searching the line for
+/// `name`.
+///
+/// Mirrors the extension's `\bname\b` search and its column unit: `vscode.Position`
+/// counts UTF-16 code units, and JS `\b` (no `u` flag) is ASCII, so a
+/// daemon-pinned column and the editor's own fallback search agree byte for byte.
+/// A name the daemon cannot pin as a whole word on its line is left `None`, and
+/// the editor falls back to its own search, which abstains the same way. `content`
+/// is the current file text; a target whose line is out of range is left as is.
+pub fn fill_target_columns(content: &str, targets: &mut [LiveResolutionTarget]) {
+    let lines: Vec<&str> = content.lines().collect();
+    for t in targets.iter_mut() {
+        if t.ref_line == 0 {
+            continue;
+        }
+        if let Some(line) = lines.get((t.ref_line - 1) as usize) {
+            t.ref_col = word_boundary_col_utf16(line, &t.name);
+        }
+    }
+}
+
+/// The 0-based UTF-16 column of the first whole-word (`\bname\b`, ASCII word
+/// boundary) occurrence of `name` in `line`, or `None`.
+fn word_boundary_col_utf16(line: &str, name: &str) -> Option<u32> {
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let nb = name.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0usize;
+    while i + nb.len() <= bytes.len() {
+        if &bytes[i..i + nb.len()] == nb && line.is_char_boundary(i) {
+            let before_ok = i == 0 || !is_word(bytes[i - 1]);
+            let after = i + nb.len();
+            let after_ok = after >= bytes.len() || !is_word(bytes[after]);
+            if before_ok && after_ok {
+                return Some(line[..i].encode_utf16().count() as u32);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 fn drop_same_position_collisions(targets: Vec<LiveResolutionTarget>) -> Vec<LiveResolutionTarget> {
     let mut counts: std::collections::HashMap<(u32, &str, &str), usize> =
         std::collections::HashMap::new();
@@ -893,6 +944,47 @@ mod tests {
     use travsr_core::{Node, VName};
 
     const CORPUS: &str = "testrepo";
+
+    #[test]
+    fn fill_target_columns_pins_word_boundary_positions() {
+        let content = "fn a() {\n    self.save(x);\n    let save = 1;\n}\n";
+        let mut targets = vec![
+            LiveResolutionTarget {
+                ref_line: 2,
+                ref_col: None,
+                name: "save".to_string(),
+                edge_kind: "ref/call".to_string(),
+                provider: "definition".to_string(),
+            },
+            // A name that is not present on its line stays None; the editor
+            // falls back to its own search, which abstains the same way.
+            LiveResolutionTarget {
+                ref_line: 2,
+                ref_col: None,
+                name: "missing".to_string(),
+                edge_kind: "ref/call".to_string(),
+                provider: "definition".to_string(),
+            },
+        ];
+        fill_target_columns(content, &mut targets);
+        // "    self.save(x);" - `save` starts at column 9 (0-based), after the
+        // word boundary at the dot, not inside `self`.
+        assert_eq!(targets[0].ref_col, Some(9));
+        assert_eq!(targets[1].ref_col, None);
+    }
+
+    #[test]
+    fn word_boundary_col_is_utf16_and_whole_word_only() {
+        // `saved` must not match the target `save` (no trailing boundary).
+        assert_eq!(
+            word_boundary_col_utf16("let saved = save()", "save"),
+            Some(12)
+        );
+        // A multibyte prefix: `é` is one UTF-16 code unit, so `x` is at col 2.
+        assert_eq!(word_boundary_col_utf16("é x", "x"), Some(2));
+        // Substring inside a larger identifier never matches.
+        assert_eq!(word_boundary_col_utf16("reservation", "server"), None);
+    }
 
     /// Most tests exercise the uniqueness gate, not the section 7.3 step-1
     /// local-scope gate, so they declare no local bindings. The tests that do
@@ -1611,6 +1703,7 @@ mod tests {
     fn a_resolution_the_current_parse_no_longer_asks_for_is_dropped() {
         let targets = vec![LiveResolutionTarget {
             ref_line: 18,
+            ref_col: None,
             name: "save".to_string(),
             edge_kind: "ref/call".to_string(),
             provider: "definition".to_string(),

@@ -4004,7 +4004,7 @@ fn live_resolution_targets(
     else {
         return Vec::new();
     };
-    match refs {
+    let mut targets = match refs {
         LiveRefSet::Native {
             unresolved,
             inheritance,
@@ -4025,7 +4025,13 @@ fn live_resolution_targets(
         // there is no lane to partition against and every detected reference is
         // an editor target.
         LiveRefSet::Generic(refs) => live_resolve::generic_targets_needing_editor(&refs),
+    };
+    // RFC-027 #813 P1: pin each target's column against the file text so the
+    // editor resolves at the exact position instead of searching the line.
+    if let Ok(content) = std::fs::read_to_string(abs_path) {
+        live_resolve::fill_target_columns(&content, &mut targets);
     }
+    targets
 }
 
 /// RFC-027 section 8.7.5: the interface-edit closure, as editor targets.
