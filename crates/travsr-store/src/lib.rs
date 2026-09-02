@@ -2460,47 +2460,55 @@ impl SqliteStore {
                 _ => std::collections::HashSet::new(),
             };
 
-            // RFC-027 #813 P2: per preserved definition, the line delta from its
-            // committed position to its current one. A preserved body is
-            // byte-identical, so the whole definition shifted as a block by
-            // `new_start - old_start`, and every occurrence inside it shifted by
-            // the same amount. This remaps its occurrence rows onto their current
-            // lines (below) instead of dropping them, so `find_references` stays
-            // correct mid-edit and the remapped line matches what the next commit
-            // records (no phantom row, Invariant #4). A definition whose old or
-            // new line is unknown is left out and its sites are simply purged.
-            let preserved_line_delta: HashMap<i64, i64> = if preserved.is_empty() {
-                HashMap::new()
-            } else {
-                let new_lines: HashMap<i64, i64> = nodes
-                    .iter()
-                    .filter_map(|n| n.line.map(|l| (node_id_to_i64(n.id), l as i64)))
-                    .collect();
-                let old_lines: HashMap<i64, i64> = {
-                    let mut stmt = tx
-                        .prepare(
-                            "SELECT id, line FROM nodes \
-                             WHERE corpus=?1 AND path=?2 AND line IS NOT NULL",
-                        )
-                        .context("preparing old line load")?;
-                    let rows: HashMap<i64, i64> = stmt
-                        .query_map(params![corpus, path], |r| {
-                            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-                        })
-                        .context("executing old line load")?
-                        .collect::<rusqlite::Result<_>>()
-                        .context("collecting old lines")?;
-                    rows
+            // RFC-027 #813 P2: current and committed start line of every
+            // definition, so both a preserved definition's occurrences (below)
+            // and a changed definition's committed occurrences (captured for the
+            // live lane) can be remapped onto the current buffer by their block
+            // delta `new_start - old_start`. Only loaded when preservation
+            // happened, which is the only case that remaps rather than purges.
+            let (new_lines, old_lines): (HashMap<i64, i64>, HashMap<i64, i64>) =
+                if preserved.is_empty() {
+                    (HashMap::new(), HashMap::new())
+                } else {
+                    let new_lines: HashMap<i64, i64> = nodes
+                        .iter()
+                        .filter_map(|n| n.line.map(|l| (node_id_to_i64(n.id), l as i64)))
+                        .collect();
+                    let old_lines: HashMap<i64, i64> = {
+                        let mut stmt = tx
+                            .prepare(
+                                "SELECT id, line FROM nodes \
+                                 WHERE corpus=?1 AND path=?2 AND line IS NOT NULL",
+                            )
+                            .context("preparing old line load")?;
+                        let rows: HashMap<i64, i64> = stmt
+                            .query_map(params![corpus, path], |r| {
+                                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                            })
+                            .context("executing old line load")?
+                            .collect::<rusqlite::Result<_>>()
+                            .context("collecting old lines")?;
+                        rows
+                    };
+                    (new_lines, old_lines)
                 };
-                preserved
-                    .iter()
-                    .filter_map(|id| {
-                        let old = old_lines.get(id)?;
-                        let new = new_lines.get(id)?;
-                        Some((*id, new - old))
-                    })
-                    .collect()
-            };
+            // Per preserved definition, the line delta from its committed position
+            // to its current one. A preserved body is byte-identical, so the whole
+            // definition shifted as a block by `new_start - old_start`, and every
+            // occurrence inside it shifted by the same amount. This remaps its
+            // occurrence rows onto their current lines (below) instead of dropping
+            // them, so `find_references` stays correct mid-edit and the remapped
+            // line matches what the next commit records (no phantom row, Invariant
+            // #4). A definition whose old or new line is unknown is left out and
+            // its sites are simply purged.
+            let preserved_line_delta: HashMap<i64, i64> = preserved
+                .iter()
+                .filter_map(|id| {
+                    let old = old_lines.get(id)?;
+                    let new = new_lines.get(id)?;
+                    Some((*id, new - old))
+                })
+                .collect();
             // Body hashes to stamp on every node this parse writes, so the next
             // save can decide preservation against the text this one committed.
             let new_body_hashes: HashMap<i64, String> = match content {
@@ -2608,6 +2616,69 @@ impl SqliteStore {
             // then re-inserted below on their current lines (RFC-027 #813 P2), so
             // the row a preserved definition keeps carries the same line the next
             // commit would write, never a stale duplicate.
+            // RFC-027 #813 P2: capture the CHANGED definitions' committed
+            // occurrences before the purge, so the live lane can enumerate them
+            // as editor-resolution targets and reach references the tree-sitter
+            // live extractor never detects (macro, desugared, trait-dispatched).
+            // Only when preservation happened: a scoped body edit is exactly the
+            // case where the changed region is small and the rest is committed
+            // truth. On a whole-file re-derive (nothing preserved: first index,
+            // added/removed symbol, or no `content`) the tree-sitter reparse
+            // already re-emits the file's references, so this capture is skipped
+            // to avoid enumerating the whole file on every bulk reindex.
+            let changed_occurrences: Vec<travsr_core::ChangedOccurrence> = if preserved.is_empty() {
+                Vec::new()
+            } else {
+                // Join the callee node for the reference's leaf name; a dst with
+                // no node (external synthetic) cannot be named, so it is skipped.
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT es.src, es.line, es.col, es.kind, n.signature \
+                         FROM edge_sites es JOIN nodes n ON n.id = es.dst \
+                         WHERE es.src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2) \
+                           AND es.src NOT IN (SELECT id FROM _preserved_src)",
+                    )
+                    .context("preparing changed-def occurrence capture")?;
+                let rows: Vec<travsr_core::ChangedOccurrence> = stmt
+                    .query_map(params![corpus, path], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, Option<i64>>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    })
+                    .context("executing changed-def occurrence capture")?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .context("collecting changed-def occurrences")?
+                    .into_iter()
+                    .filter_map(|(src, line, col, kind, signature)| {
+                        // Remap the committed occurrence line onto the current
+                        // buffer by the changed definition's block delta. The body
+                        // changed, so this is a best-effort estimate; the daemon
+                        // fences the served position against the definition's
+                        // CURRENT span and the editor resolves the live position,
+                        // so a stale estimate is fail-closed, never a wrong edge. A
+                        // definition whose old or new start is unknown cannot be
+                        // remapped, so it is dropped rather than served pre-edit.
+                        let delta = new_lines.get(&src)? - old_lines.get(&src)?;
+                        let new_line = line + delta;
+                        if new_line < 1 {
+                            return None;
+                        }
+                        Some(travsr_core::ChangedOccurrence {
+                            src: i64_to_node_id(src),
+                            line: new_line as u32,
+                            col: col.map(|c| c as u32),
+                            kind,
+                            name: travsr_core::ident::leaf_of(&signature).to_string(),
+                        })
+                    })
+                    .collect();
+                rows
+            };
+
             tx.execute(
                 "DELETE FROM edge_sites \
                  WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
@@ -2806,6 +2877,7 @@ impl SqliteStore {
                 removed_count: removed_ids.len(),
                 callers,
                 changed_defs,
+                changed_occurrences,
             })
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -4869,6 +4941,40 @@ LIMIT ?4",
             });
         }
         tracing::debug!(sites_returned = out.len());
+        Ok(out)
+    }
+
+    /// RFC-027 #813 P2: current `(line, end_line)` span of each given node, so the
+    /// live lane can bound a changed definition's enumerated occurrences to that
+    /// definition's current extent (an occurrence whose remapped line fell outside
+    /// it after the body changed is not served). A node absent from the graph or
+    /// carrying no line is simply absent from the returned map.
+    pub fn current_spans(
+        &self,
+        ids: &[NodeId],
+    ) -> anyhow::Result<std::collections::HashMap<NodeId, (u32, Option<u32>)>> {
+        let mut out = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT line, end_line FROM nodes WHERE id = ?1 AND line IS NOT NULL")
+            .context("preparing current_spans query")?;
+        for &id in ids {
+            let span = stmt
+                .query_row(params![node_id_to_i64(id)], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u32,
+                        r.get::<_, Option<i64>>(1)?.map(|e| e as u32),
+                    ))
+                })
+                .optional()
+                .context("executing current_spans query")?;
+            if let Some(span) = span {
+                out.insert(id, span);
+            }
+        }
         Ok(out)
     }
 
@@ -10671,6 +10777,63 @@ mod tests {
             edge_provenance(&store, a.id, x.id),
             None,
             "the edited definition's stale edge must be purged"
+        );
+    }
+
+    /// RFC-027 #813 P2: on a body edit, `reindex_replace` captures the CHANGED
+    /// definition's committed occurrences (for the live lane to enumerate as
+    /// editor targets) and NOT the preserved definitions', carrying each
+    /// occurrence's column and the reference's leaf name, never the stale dst.
+    #[test]
+    fn reindex_replace_captures_changed_def_occurrences_for_the_live_lane() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "a.rs", "rust", sig),
+                "function",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        let a = mk("fn:a", 1, 2);
+        let b = mk("fn:b", 4, 5);
+        let x = mk("fn:x", 7, 8);
+        let y = mk("fn:y", 10, 11);
+        let nodes = vec![a.clone(), b.clone(), x.clone(), y.clone()];
+        let ts_edges = vec![
+            Edge::new(a.id, x.id, EdgeKind::RefCall),
+            Edge::new(b.id, y.id, EdgeKind::RefCall),
+        ];
+        let content_v1 =
+            "fn a() {\n  x();\n}\n\nfn b() {\n  y();\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
+        store
+            .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h1", Some(content_v1))
+            .unwrap();
+        // Committed occurrences, each with a byte column.
+        store
+            .record_edge_sites(&[(a.id, x.id, 2, Some(2)), (b.id, y.id, 5, Some(2))])
+            .unwrap();
+
+        // Edit only a's body; b, x, y stay byte-identical (preserved).
+        let content_v2 =
+            "fn a() {\n  z();\n}\n\nfn b() {\n  y();\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
+        let report = store
+            .reindex_replace("c", "a.rs", &nodes, &[], "h2", Some(content_v2))
+            .unwrap();
+
+        // Only a's occurrence is captured (b, x, y are preserved). a did not
+        // move (delta 0), so its remapped line equals its committed line, and it
+        // carries the column and the callee's leaf name, not the stale dst.
+        assert_eq!(
+            report.changed_occurrences,
+            vec![travsr_core::ChangedOccurrence {
+                src: a.id,
+                line: 2,
+                col: Some(2),
+                kind: "ref/call".into(),
+                name: "x".into(),
+            }],
+            "the changed definition's occurrence must be captured with col and name"
         );
     }
 

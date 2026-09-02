@@ -3999,10 +3999,26 @@ fn live_resolution_targets(
     corpus: &str,
     repo_root: &Path,
     abs_path: &Path,
+    // RFC-027 #813 P2: the changed-definition committed occurrences stashed for
+    // this file at its last save, enumerated as extra editor targets. Empty for
+    // a request with no fresh save (or from a test with no editor plane).
+    stashed: &[travsr_core::ChangedOccurrence],
 ) -> Vec<travsr_ipc::message::LiveResolutionTarget> {
     let Some((vname_path, refs)) = extract_live_unresolved(store, corpus, repo_root, abs_path)
     else {
-        return Vec::new();
+        // Even with no native/generic references, a stashed occurrence set can
+        // still hold editor targets, so fall through to the merge rather than
+        // returning early when there is something to enumerate.
+        if stashed.is_empty() {
+            return Vec::new();
+        }
+        let content = std::fs::read_to_string(abs_path).unwrap_or_default();
+        return live_resolve::merge_changed_occurrence_targets(
+            store,
+            &content,
+            Vec::new(),
+            stashed,
+        );
     };
     // The file text pins each target's exact column (RFC-027 #813 P1/P2). Read
     // once and share it: the native builder uses the extractor's occurrence
@@ -4034,7 +4050,9 @@ fn live_resolution_targets(
     // (the ones the extractor left without an exact occurrence column) so the
     // editor resolves at the exact position instead of searching the line.
     live_resolve::fill_target_columns(&content, &mut targets);
-    targets
+    // RFC-027 #813 P2: enumerate the changed definitions' committed occurrences
+    // as editor targets, deduped against the native lane above.
+    live_resolve::merge_changed_occurrence_targets(store, &content, targets, stashed)
 }
 
 /// RFC-027 section 8.7.5: the interface-edit closure, as editor targets.
@@ -4062,6 +4080,10 @@ fn dependent_resolution_targets(
     corpus: &str,
     repo_root: &Path,
     abs_path: &Path,
+    // RFC-027 #813 P2: the editor plane, so each dependent file's own stashed
+    // changed occurrences are enumerated alongside its native targets. `None`
+    // from a test with no plane.
+    sessions: Option<&std::sync::Mutex<EditorPlane>>,
 ) -> Vec<travsr_ipc::message::DependentTargets> {
     // Only a live-lane file the gate has not disabled can have dependents worth
     // restoring; a disabled or unsupported language costs nothing here.
@@ -4082,7 +4104,14 @@ fn dependent_resolution_targets(
     let mut out = Vec::new();
     for dep in dependents {
         let dep_abs = repo_root.join(&dep);
-        let targets = live_resolution_targets(store, corpus, repo_root, &dep_abs);
+        let stashed = sessions
+            .map(|s| {
+                s.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .stashed_changed_occurrences(&dep)
+            })
+            .unwrap_or_default();
+        let targets = live_resolution_targets(store, corpus, repo_root, &dep_abs, &stashed);
         // A dependent with nothing for the editor to do (its references all
         // settle lexically, or it holds none) is not worth sending.
         if !targets.is_empty() {
@@ -4787,18 +4816,29 @@ pub fn reconcile_tracked_tree(
     Ok((dirty, paths.len()))
 }
 
-/// Re-index a set of changed files into `store`.
+/// RFC-027 #813 P2: per-file changed-definition committed occurrences, keyed by
+/// repo-relative path, as [`reindex_files_reporting`] returns them for the save
+/// path to stash.
+type ChangedOccurrencesByFile = Vec<(String, Vec<travsr_core::ChangedOccurrence>)>;
+
+/// Re-index a set of changed files into `store`, also surfacing each file's
+/// changed-definition committed occurrences (RFC-027 #813 P2) for the live
+/// overlay to enumerate as editor targets.
 ///
 /// For each file:
 /// - Compute its SHA-256 hash.
 /// - Skip if the stored hash matches (file unchanged).
 /// - Otherwise: delete its nodes/edges, re-parse, persist new records,
 ///   update the file hash, and record the HEAD commit SHA in `meta`.
-pub fn reindex_files(
+///
+/// Most callers want only the dirty-caller set and use the thin
+/// [`reindex_files`] wrapper; the save path uses this variant to stash the
+/// occurrences for the file the editor is about to request targets for.
+pub fn reindex_files_reporting(
     paths: &[PathBuf],
     repo_root: &Path,
     store: &mut SqliteStore,
-) -> anyhow::Result<travsr_core::DirtySet> {
+) -> anyhow::Result<(travsr_core::DirtySet, ChangedOccurrencesByFile)> {
     // Keep `repo_root` current. This path runs on every commit and on every
     // watcher batch, and it already knows the root, so stamping here closes the
     // window where a moved checkout keeps a stale value until someone runs an
@@ -4864,6 +4904,9 @@ pub fn reindex_files(
     let mut any_changed = false;
     // Accumulate Tier-0 dirty callers across all files in this batch.
     let mut callers_all = travsr_core::DirtySet::default();
+    // RFC-027 #813 P2: per-file changed-definition committed occurrences, for the
+    // save path to stash and the live lane to enumerate as editor targets.
+    let mut changed_occ_all: ChangedOccurrencesByFile = Vec::new();
     // Paths this batch rewrote, for the end-of-batch orphan sweep below.
     let mut written_paths: Vec<String> = Vec::new();
 
@@ -4983,6 +5026,9 @@ pub fn reindex_files(
                         report.callers.len()
                     );
                     callers_all.extend(report.callers);
+                }
+                if !report.changed_occurrences.is_empty() {
+                    changed_occ_all.push((vname_path.clone(), report.changed_occurrences));
                 }
                 any_changed = true;
                 written_paths.push(vname_path.clone());
@@ -5134,7 +5180,18 @@ pub fn reindex_files(
         }
     }
 
-    Ok(callers_all)
+    Ok((callers_all, changed_occ_all))
+}
+
+/// Phase A reindex of `paths`, returning only the Tier-0 dirty-caller set. The
+/// thin wrapper over [`reindex_files_reporting`] for the callers (commit hook,
+/// bulk refresh, CLI, tests) that do not consume the changed-occurrence stash.
+pub fn reindex_files(
+    paths: &[PathBuf],
+    repo_root: &Path,
+    store: &mut SqliteStore,
+) -> anyhow::Result<travsr_core::DirtySet> {
+    reindex_files_reporting(paths, repo_root, store).map(|(callers, _)| callers)
 }
 
 /// Run the LSIF semantic pass if `tsconfig.json` is present at the repo root,
@@ -9428,7 +9485,7 @@ mod tests {
         let db_path = tmp.path().join(".travsr/graph.db");
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
         let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
-        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller);
+        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller, &[]);
 
         let start = targets
             .iter()
@@ -9480,7 +9537,7 @@ mod tests {
         let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
         // Java is on LIVE_LANE_SHIPPED (measured 3,0,0 → 1.0000, §11.3), so the
         // gate admits it with no reading and no force flag needed.
-        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller);
+        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller, &[]);
 
         let by_name = |name: &str| {
             targets
@@ -9549,7 +9606,7 @@ mod tests {
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
         // A save of `session.go` (which defines `Helper`) must surface `run.go`
         // as a dependent carrying that reference as an editor target.
-        let dependents = dependent_resolution_targets(&store, &corpus, tmp.path(), &session);
+        let dependents = dependent_resolution_targets(&store, &corpus, tmp.path(), &session, None);
         let run = dependents
             .iter()
             .find(|d| d.file == "run.go")
@@ -9562,7 +9619,7 @@ mod tests {
 
         // A file that defines nothing any pending reference names has no
         // dependents — a body edit stays local (§6.1), no closure fan-out.
-        let none = dependent_resolution_targets(&store, &corpus, tmp.path(), &caller);
+        let none = dependent_resolution_targets(&store, &corpus, tmp.path(), &caller, None);
         assert!(
             none.iter().all(|d| d.file != "session.go"),
             "run.go defines nothing session.go is pending on, got {none:?}"
@@ -11713,11 +11770,20 @@ impl Daemon {
             let repo_worker = Arc::clone(&repo_root_arc);
             let index_tx_worker = index_tx.clone();
             let worker_stop_inner = Arc::clone(&worker_stop);
+            // RFC-027 #813 P2: the worker stashes each save's changed-def
+            // occurrences into the same plane the control loop serves from.
+            let lsp_sessions_worker = Arc::clone(&lsp_sessions);
             tokio::task::spawn_blocking(move || {
                 loop {
                     match index_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                         Ok(ev) => {
-                            handle_watch_event(ev, &repo_worker, &store_worker, &index_tx_worker);
+                            handle_watch_event(
+                                ev,
+                                &repo_worker,
+                                &store_worker,
+                                &index_tx_worker,
+                                &lsp_sessions_worker,
+                            );
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             if worker_stop_inner.load(std::sync::atomic::Ordering::Acquire) {
@@ -12292,14 +12358,17 @@ fn handle_watch_event(
     repo_root: &std::path::Path,
     store: &std::sync::Mutex<SqliteStore>,
     index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
+    // RFC-027 #813 P2: the editor plane, so a save can stash its changed-def
+    // committed occurrences for the target request that follows it.
+    lsp_sessions: &std::sync::Mutex<EditorPlane>,
 ) {
     use watcher::WatchEvent;
 
     match ev {
         WatchEvent::Upsert(path) => {
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-            match reindex_files(std::slice::from_ref(&path), repo_root, &mut s) {
-                Ok(callers) => {
+            match reindex_files_reporting(std::slice::from_ref(&path), repo_root, &mut s) {
+                Ok((callers, changed_occ)) => {
                     // RFC-027 sections 6 and 7.3a: refresh this file's live
                     // overlay, and on an interface edit the overlay of the files
                     // that reference it.
@@ -12319,6 +12388,18 @@ fn handle_watch_event(
                         let abs = repo_root.join(dependent);
                         if abs != path && abs.is_file() {
                             live_resolve_file(&mut s, &corpus, repo_root, &abs);
+                        }
+                    }
+                    // RFC-027 #813 P2: stash this save's changed-def committed
+                    // occurrences so the editor target request that follows can
+                    // enumerate them. Release the store lock first, then take the
+                    // plane lock, keeping the store->plane order the serve path
+                    // also uses.
+                    drop(s);
+                    {
+                        let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+                        for (file, occ) in changed_occ {
+                            plane.stash_changed_occurrences(file, occ);
                         }
                     }
                     enqueue_dirty_callers(callers, repo_root, index_tx)
@@ -12391,6 +12472,80 @@ pub struct EditorPlane {
     pub refused: std::collections::HashMap<String, usize>,
     /// Refusals whose root arrived after `MAX_REFUSED_ROOTS` was reached.
     pub refused_overflow: usize,
+    /// RFC-027 #813 P2: repo-relative file path -> the changed-definition
+    /// committed occurrences captured at that file's last save, for the live
+    /// lane to enumerate as editor targets while the mid-edit window is open.
+    /// Bounded in files retained and TTL-expired on read, like the sessions.
+    pub changed_occurrences: std::collections::HashMap<String, StashedOccurrences>,
+}
+
+/// RFC-027 #813 P2: one file's changed-definition committed occurrences, stashed
+/// at save so a target request that arrives moments later can enumerate them.
+#[derive(Debug, Clone)]
+pub struct StashedOccurrences {
+    pub occurrences: Vec<travsr_core::ChangedOccurrence>,
+    /// When this stash stops being servable (see [`STASHED_OCCURRENCE_TTL`]).
+    pub expires_at: std::time::Instant,
+}
+
+/// Files whose changed-occurrence enumeration is retained at once. A person
+/// edits a handful of files in a mid-edit window; past this the soonest-to-
+/// expire entry is evicted.
+const MAX_STASHED_OCCURRENCE_FILES: usize = 64;
+/// How long a saved file's changed-occurrence enumeration stays servable. A
+/// target request follows its save within a keystroke or two; past this the
+/// buffer has almost certainly moved on and the committed positions are stale.
+const STASHED_OCCURRENCE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Occurrences retained per file. One changed function's references fit well
+/// under this; a whole-file rewrite that blows past it is not the case this
+/// enumeration serves, so it is truncated rather than grown.
+const MAX_OCCURRENCES_PER_STASHED_FILE: usize = 500;
+
+impl EditorPlane {
+    /// RFC-027 #813 P2: stash a file's changed-def committed occurrences after a
+    /// save, bounded per file and in the number of files retained. An empty set
+    /// clears any prior stash for the file rather than leaving a stale one.
+    fn stash_changed_occurrences(
+        &mut self,
+        path: String,
+        mut occ: Vec<travsr_core::ChangedOccurrence>,
+    ) {
+        occ.truncate(MAX_OCCURRENCES_PER_STASHED_FILE);
+        if occ.is_empty() {
+            self.changed_occurrences.remove(&path);
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.changed_occurrences.retain(|_, e| e.expires_at > now);
+        if self.changed_occurrences.len() >= MAX_STASHED_OCCURRENCE_FILES
+            && !self.changed_occurrences.contains_key(&path)
+        {
+            if let Some(soonest) = self
+                .changed_occurrences
+                .iter()
+                .min_by_key(|(_, e)| e.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.changed_occurrences.remove(&soonest);
+            }
+        }
+        self.changed_occurrences.insert(
+            path,
+            StashedOccurrences {
+                occurrences: occ,
+                expires_at: now + STASHED_OCCURRENCE_TTL,
+            },
+        );
+    }
+
+    /// RFC-027 #813 P2: the live changed-def occurrences stashed for `path`,
+    /// empty if none or expired (expiry evaluated on read, like the sessions).
+    fn stashed_changed_occurrences(&self, path: &str) -> Vec<travsr_core::ChangedOccurrence> {
+        match self.changed_occurrences.get(path) {
+            Some(e) if e.expires_at > std::time::Instant::now() => e.occurrences.clone(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// Distinct refused roots retained per daemon lifetime. Small because the
@@ -12566,11 +12721,18 @@ fn handle_control_message(
             let s = store.lock().unwrap_or_else(|e| e.into_inner());
             let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
             let abs_path = repo_root.join(&file);
-            let own = live_resolution_targets(&s, &corpus, repo_root, &abs_path);
+            // RFC-027 #813 P2: enumerate this file's changed-def occurrences
+            // stashed at its last save (empty when none is fresh).
+            let stashed = lsp_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .stashed_changed_occurrences(&file);
+            let own = live_resolution_targets(&s, &corpus, repo_root, &abs_path, &stashed);
             // RFC-027 section 8.7.5: also re-resolve the files whose edges this
             // save can restore, so a rename in one file heals its dependents
             // without each being saved in turn.
-            let dependents = dependent_resolution_targets(&s, &corpus, repo_root, &abs_path);
+            let dependents =
+                dependent_resolution_targets(&s, &corpus, repo_root, &abs_path, Some(lsp_sessions));
             drop(s);
 
             tracing::debug!(
@@ -12620,7 +12782,15 @@ fn handle_control_message(
             // editor buffer, and `enclosing_definition_at` then reads spans from
             // the newer parse. Re-detecting against the file as it stands now
             // closes that window with the daemon's own evidence.
-            let current = live_resolution_targets(&s, &corpus, repo_root, &repo_root.join(&file));
+            // RFC-027 #813 P2: validate against the same enumerated set the
+            // request served, so a resolution for a changed-def occurrence is
+            // recognized as current rather than rejected as stale.
+            let stashed = lsp_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .stashed_changed_occurrences(&file);
+            let current =
+                live_resolution_targets(&s, &corpus, repo_root, &repo_root.join(&file), &stashed);
             let accepted = live_resolve::retain_current_targets(&resolutions, &current);
             let stale = resolutions.len() - accepted.len();
             let outcome = live_resolve::apply_live_resolutions(&mut s, &corpus, &file, &accepted);

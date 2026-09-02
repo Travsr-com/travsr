@@ -1592,6 +1592,46 @@ pub struct ReplaceReport {
     /// preserved, so there is no changed region to re-resolve.
     #[serde(default)]
     pub changed_defs: Vec<NodeId>,
+    /// RFC-027 #813 P2: the committed occurrence rows the reparse is about to
+    /// purge for the changed definitions, captured before the purge (see
+    /// [`ChangedOccurrence`]). The live lane enumerates
+    /// these as editor-resolution targets so it reaches references the
+    /// tree-sitter live extractor never detects (macro, desugared,
+    /// trait-dispatched) but the committed SCIP occurrence set did capture, and
+    /// resolves each at its exact stored column. The `dst` is deliberately NOT
+    /// carried: it is the stale committed target, and the editor must re-resolve
+    /// the CURRENT buffer position (RFC-027 section 8.2 fencing), so only the
+    /// position is trustworthy. Empty on a pure preserve or when no `content`
+    /// was supplied.
+    #[serde(default)]
+    pub changed_occurrences: Vec<ChangedOccurrence>,
+}
+
+/// RFC-027 #813 P2: one committed occurrence of a changed definition, captured
+/// by `reindex_replace` before it purges the file's owned sites, for the live
+/// lane to re-resolve at the editor. Carries only the position and kind, never
+/// the stale committed `dst` (see [`ReplaceReport::changed_occurrences`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChangedOccurrence {
+    /// The changed source definition this occurrence lived in (its enclosing
+    /// node), so the daemon can bound the occurrence to that def's current span.
+    pub src: NodeId,
+    /// 1-based line of the occurrence, already remapped to the current buffer by
+    /// the changed definition's block delta when captured.
+    pub line: u32,
+    /// 0-based UTF-8 byte column of the occurrence, or `None` when the committed
+    /// row carried no column (the daemon then name-searches the line).
+    pub col: Option<u32>,
+    /// The occurrence's edge kind (`ref/call` or `ref/field`), so the served
+    /// editor target requests the matching resolution.
+    pub kind: String,
+    /// Leaf name of the reference identifier at this occurrence (the committed
+    /// callee's signature leaf), so the editor can name-search the line when no
+    /// column is stored and label the target. Never a node identity: the editor
+    /// resolves the CURRENT buffer position and the daemon maps the result to a
+    /// SCIP-owned node (RFC-027 section 8.2 fencing), so the stale committed
+    /// target is deliberately not carried, only this name hint.
+    pub name: String,
 }
 
 /// Summary returned by `reconcile` / `travsr fsck`.

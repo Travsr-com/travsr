@@ -63,6 +63,11 @@ import {
  * the *total*, not each file, so one save can never fan out into an unbounded
  * storm of queries (§10.1). Truncation degrades recall, which the commit-gated
  * path repairs.
+ *
+ * RFC-027 #813 P2: stays at 200 even though the daemon now also enumerates the
+ * changed definitions' committed occurrences. That enumeration is scoped to the
+ * edited region (one function's references), so it comfortably fits under this
+ * cap alongside the native lane's targets rather than needing a larger budget.
  */
 const MAX_QUERIES_PER_SAVE = 200;
 

@@ -771,6 +771,77 @@ fn drop_same_position_collisions(targets: Vec<LiveResolutionTarget>) -> Vec<Live
         .collect()
 }
 
+/// RFC-027 #813 P2: merge a saved file's changed-definition committed
+/// occurrences into its native/generic editor targets.
+///
+/// These reach references the tree-sitter live extractor never detects (macro,
+/// desugared, trait-dispatched) that the committed SCIP occurrence set did
+/// capture, resolved at their exact stored column. Precision is safe by
+/// construction: the editor resolves the CURRENT buffer position and the daemon
+/// maps the result to a SCIP-owned node (section 8.2 fencing), so a stale
+/// position is fail-closed (it resolves current code or nothing), never a
+/// fabricated target.
+///
+/// Each occurrence is bounded to its changed definition's CURRENT span (the body
+/// changed, so an occurrence whose remapped line drifted outside it is no longer
+/// trusted), given the editor's UTF-16 column from its stored byte column (or
+/// left for the editor's name search when it has none), dropped when a native
+/// target already covers its `(line, name, kind)` (the native lane owns it), and
+/// finally deduped within the enumerated set the same way the native lane is.
+pub fn merge_changed_occurrence_targets(
+    store: &SqliteStore,
+    content: &str,
+    native: Vec<LiveResolutionTarget>,
+    stashed: &[travsr_core::ChangedOccurrence],
+) -> Vec<LiveResolutionTarget> {
+    if stashed.is_empty() {
+        return native;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let src_ids: Vec<travsr_core::NodeId> = {
+        let mut v: Vec<travsr_core::NodeId> = stashed.iter().map(|o| o.src).collect();
+        v.sort_unstable_by_key(|id| id.0);
+        v.dedup();
+        v
+    };
+    let spans = store.current_spans(&src_ids).unwrap_or_default();
+    let native_positions: std::collections::HashSet<(u32, String, String)> = native
+        .iter()
+        .map(|t| (t.ref_line, t.name.clone(), t.edge_kind.clone()))
+        .collect();
+    let enumerated: Vec<LiveResolutionTarget> = stashed
+        .iter()
+        .filter_map(|occ| {
+            // Bound to the definition's current span; drop an occurrence that
+            // drifted outside it (an unknown end is a start-only lower bound).
+            let &(start, end) = spans.get(&occ.src)?;
+            if occ.line < start || end.is_some_and(|e| occ.line > e) {
+                return None;
+            }
+            // The native lane already owns this position; do not double-count it.
+            if native_positions.contains(&(occ.line, occ.name.clone(), occ.kind.clone())) {
+                return None;
+            }
+            let ref_col = occ.col.and_then(|bc| {
+                lines
+                    .get((occ.line - 1) as usize)
+                    .map(|l| byte_to_utf16_col(l, bc))
+            });
+            Some(LiveResolutionTarget {
+                ref_line: occ.line,
+                ref_col,
+                name: occ.name.clone(),
+                // Calls and fields are both answered by the definition provider.
+                edge_kind: occ.kind.clone(),
+                provider: "definition".to_string(),
+            })
+        })
+        .collect();
+    let mut out = native;
+    out.extend(drop_same_position_collisions(enumerated));
+    out
+}
+
 /// The unique `IsImplementation` edge from `src` (the implementing class) to the
 /// base type named `base_name`, or `None` to abstain.
 fn inheritance_edge(
@@ -998,6 +1069,75 @@ mod tests {
         // word boundary at the dot, not inside `self`.
         assert_eq!(targets[0].ref_col, Some(9));
         assert_eq!(targets[1].ref_col, None);
+    }
+
+    #[test]
+    fn merge_changed_occurrence_targets_enumerates_bounds_and_dedups() {
+        use travsr_core::ChangedOccurrence;
+        // A caller def spanning lines 5-9. Its committed occurrences are what the
+        // live lane enumerates as editor targets after a body edit.
+        let store = store_with(&[("a.ts", "fn:caller", "function", 5, 9)]);
+        let src = node_id("a.ts", "fn:caller");
+        // Line 6 has a non-ASCII prefix, so the stored byte column and the
+        // editor's UTF-16 column genuinely differ: `bar` is at byte col 8 but
+        // UTF-16 col 7 (the accented `é` is two bytes, one UTF-16 unit). A wrong
+        // conversion here is a wrong editor position.
+        // Lines 5-9 are the function body; line 6 carries the accented call.
+        let content = "\n\n\n\nfn caller() {\n  café.bar();\n  qux();\n}\n\n";
+        let stashed = vec![
+            // In-span, with a column: enumerated at the exact UTF-16 position.
+            ChangedOccurrence {
+                src,
+                line: 6,
+                col: Some(8),
+                kind: "ref/call".into(),
+                name: "bar".into(),
+            },
+            // Out of the def's current span (line 20 > end 9): dropped.
+            ChangedOccurrence {
+                src,
+                line: 20,
+                col: Some(2),
+                kind: "ref/call".into(),
+                name: "gone".into(),
+            },
+            // In-span but a position the native lane already owns: dropped so it
+            // is not double-counted (native target retained below).
+            ChangedOccurrence {
+                src,
+                line: 7,
+                col: Some(2),
+                kind: "ref/call".into(),
+                name: "qux".into(),
+            },
+        ];
+        let native = vec![LiveResolutionTarget {
+            ref_line: 7,
+            ref_col: Some(2),
+            name: "qux".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        }];
+
+        let out = merge_changed_occurrence_targets(&store, content, native, &stashed);
+
+        // The native target is kept; the enumerated `bar` is added at its UTF-16
+        // column; the out-of-span and native-owned occurrences are dropped.
+        assert_eq!(out.len(), 2, "native target plus one enumerated occurrence");
+        assert!(out
+            .iter()
+            .any(|t| t.name == "qux" && t.ref_line == 7 && t.provider == "definition"));
+        let bar = out
+            .iter()
+            .find(|t| t.name == "bar")
+            .expect("bar occurrence enumerated");
+        assert_eq!(bar.ref_line, 6);
+        assert_eq!(
+            bar.ref_col,
+            Some(7),
+            "byte col 8 must convert to UTF-16 col 7 across the accented prefix"
+        );
+        assert_eq!(bar.edge_kind, "ref/call");
     }
 
     #[test]
