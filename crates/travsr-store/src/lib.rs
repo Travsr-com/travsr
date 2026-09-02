@@ -16,6 +16,62 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
+/// RFC-027 #813: SHA-256 hex of the source text spanned by a definition, keyed
+/// by NodeId (`i64`). It is the byte-identity witness the live overlay uses to
+/// tell a definition the edit left untouched (its committed edges stay valid and
+/// are preserved) from one whose body changed (its edges are re-resolved).
+///
+/// `spans` are `(node_id, start_line, end_line)` with 1-based line numbers; a
+/// node whose span falls outside the file (a stale span) is omitted, which makes
+/// the caller treat its body as changed and re-resolve — the fail-safe
+/// direction. Line-start offsets are computed once, so this is O(file + nodes).
+fn body_hashes_for_spans(
+    content: &str,
+    spans: impl IntoIterator<Item = (i64, u32, Option<u32>)>,
+) -> HashMap<i64, String> {
+    // `line_starts[L - 1]` is the byte offset where 1-based line L begins.
+    let mut line_starts: Vec<usize> = Vec::with_capacity(content.len() / 24 + 1);
+    line_starts.push(0);
+    for (i, b) in content.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let total_lines = line_starts.len();
+    let mut out = HashMap::new();
+    for (id, start, end) in spans {
+        let start = start as usize;
+        if start == 0 || start > total_lines {
+            continue;
+        }
+        let end = end
+            .map(|e| e as usize)
+            .unwrap_or(start)
+            .max(start)
+            .min(total_lines);
+        let begin = line_starts[start - 1];
+        // `end` is 1-based inclusive: take bytes up to the start of line end + 1
+        // (or EOF for the final line), so the definition's full text is hashed.
+        let finish = if end >= total_lines {
+            content.len()
+        } else {
+            line_starts[end]
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(&content.as_bytes()[begin..finish]);
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write;
+            let _ = write!(hex, "{byte:02x}");
+        }
+        out.insert(id, hex);
+    }
+    out
+}
+
 /// Row cap on [`SqliteStore::lookup_nodes_exact`] (exact-signature Tier 1).
 ///
 /// This is intentionally one greater than `travsr-mcp`'s `AMBIGUOUS_DISPLAY_LIMIT`
@@ -1023,6 +1079,9 @@ impl SqliteStore {
                 .reconcile_provenance_indexes_if_needed()
                 .context("reconciling RFC-027 provenance indexes (issue B)")?;
             store
+                .backfill_body_hashes_if_needed()
+                .context("backfilling RFC-027 #813 node body hashes")?;
+            store
                 .backfill_fts_if_needed()
                 .context("backfilling FTS index")?;
             store
@@ -1124,6 +1183,9 @@ impl SqliteStore {
             store
                 .reconcile_provenance_indexes_if_needed()
                 .context("reconciling RFC-027 provenance indexes in-memory (issue B)")?;
+            store
+                .ensure_body_hash_column()
+                .context("adding RFC-027 #813 body_hash column (in-memory)")?;
             store
                 .backfill_fts_if_needed()
                 .context("backfilling FTS index (in-memory)")?;
@@ -2294,6 +2356,24 @@ impl SqliteStore {
     ///   edits are lossless).
     /// - Symbols that vanished have their inbound edges deleted eagerly so PPR/BFS
     ///   never traverses into a missing node.
+    ///
+    /// RFC-027 #813 (Mechanism A): when `content` is the file's current text and
+    /// the edit is a *pure body edit* — the file's set of NodeIds is unchanged,
+    /// so no symbol or import was added or removed and the whole file's
+    /// resolution context is fixed — the committed owned edges (and their
+    /// occurrence rows) of every definition whose body is byte-identical are
+    /// **preserved** instead of purged, and this parse's tree-sitter edges for
+    /// them are skipped. Only the definitions the edit actually changed lose
+    /// their edges and get re-resolved by the live lane. This is what raises
+    /// mid-edit recovery from ~71% to ~99% with no language server. Preserved
+    /// edges keep their `scip`/`lsif` provenance (they are truth, not overlay),
+    /// so the commit sweep and Invariant #4 are unaffected.
+    ///
+    /// Precision-first: a definition is preserved only when it is *provably*
+    /// unchanged (its NodeId survived AND its body hash matches the stored one).
+    /// Any doubt — `content` is `None`, a symbol was added or removed, or a body
+    /// hash is missing or differs — falls back to the whole-file purge, because a
+    /// stale preserved edge is a wrong edge.
     pub fn reindex_replace(
         &mut self,
         corpus: &str,
@@ -2301,6 +2381,7 @@ impl SqliteStore {
         nodes: &[Node],
         edges: &[Edge],
         new_hash: &str,
+        content: Option<&str>,
     ) -> Result<ReplaceReport, StoreError> {
         (|| -> AnyResult<ReplaceReport> {
             let tx = self
@@ -2321,6 +2402,69 @@ impl SqliteStore {
                 rows
             };
 
+            // The NodeIds this parse produced. Computed up front so the
+            // pure-body-edit test and the preserved set are known before any
+            // delete.
+            let new_ids: std::collections::HashSet<i64> =
+                nodes.iter().map(|n| node_id_to_i64(n.id)).collect();
+
+            // RFC-027 #813 Mechanism A: the set of definitions whose committed
+            // owned edges/sites survive this reparse untouched.
+            //
+            // Sound only when the edit is a *pure body edit*: the file's NodeId
+            // set is unchanged (`old_ids == new_ids`), so no symbol or import was
+            // added or removed and the whole file's resolution context is fixed.
+            // Under that condition a definition whose body bytes are identical
+            // resolves to exactly the same targets, so its committed edges are
+            // still correct and re-deriving them is pure waste. Any doubt keeps
+            // the set empty and the code below purges the whole file, exactly as
+            // before this change.
+            let preserved: std::collections::HashSet<i64> = match content {
+                Some(text) if old_ids == new_ids => {
+                    // Body hashes stored for this file's definitions at their last
+                    // (re)resolution, and the hashes the current text produces.
+                    let stored: HashMap<i64, String> = {
+                        let mut stmt = tx
+                            .prepare(
+                                "SELECT id, body_hash FROM nodes \
+                                 WHERE corpus=?1 AND path=?2 AND body_hash IS NOT NULL",
+                            )
+                            .context("preparing stored body_hash load")?;
+                        let rows: HashMap<i64, String> = stmt
+                            .query_map(params![corpus, path], |r| {
+                                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                            })
+                            .context("executing stored body_hash load")?
+                            .collect::<rusqlite::Result<_>>()
+                            .context("collecting stored body_hash")?;
+                        rows
+                    };
+                    let current = body_hashes_for_spans(
+                        text,
+                        nodes
+                            .iter()
+                            .filter_map(|n| n.line.map(|l| (node_id_to_i64(n.id), l, n.end_line))),
+                    );
+                    stored
+                        .iter()
+                        .filter(|(id, hash)| current.get(*id) == Some(*hash))
+                        .map(|(id, _)| *id)
+                        .collect()
+                }
+                _ => std::collections::HashSet::new(),
+            };
+            // Body hashes to stamp on every node this parse writes, so the next
+            // save can decide preservation against the text this one committed.
+            let new_body_hashes: HashMap<i64, String> = match content {
+                Some(text) => body_hashes_for_spans(
+                    text,
+                    nodes
+                        .iter()
+                        .filter_map(|n| n.line.map(|l| (node_id_to_i64(n.id), l, n.end_line))),
+                ),
+                None => HashMap::new(),
+            };
+
             // Load token strings for vocab decrement BEFORE removing map rows.
             let token_strings: Vec<String> = {
                 let mut stmt = tx
@@ -2338,10 +2482,34 @@ impl SqliteStore {
                 rows
             };
 
-            // Delete only OWNED (outbound) edges — inbound edges from other files retained.
+            // RFC-027 #813: hold the preserved definitions in a temp table so the
+            // owned-edge and owned-site deletes can exclude them without a bound
+            // parameter per id (a hot utility can have thousands). Always present
+            // (and empty on the common purge path, where `NOT IN` an empty set
+            // matches every owned row — exactly the pre-#813 whole-file purge).
+            tx.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS _preserved_src(id INTEGER PRIMARY KEY); \
+                 DELETE FROM _preserved_src;",
+            )
+            .context("creating _preserved_src temp table")?;
+            if !preserved.is_empty() {
+                let mut ins = tx
+                    .prepare("INSERT OR IGNORE INTO _preserved_src(id) VALUES(?1)")
+                    .context("preparing _preserved_src insert")?;
+                for id in &preserved {
+                    ins.execute(params![id])
+                        .context("inserting preserved src id")?;
+                }
+            }
+
+            // Delete only OWNED (outbound) edges — inbound edges from other files
+            // retained. RFC-027 #813: an owned edge whose src is a preserved
+            // definition is committed truth still valid after a pure body edit, so
+            // it is left in place rather than purged and re-derived.
             tx.execute(
                 "DELETE FROM edges \
-                 WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                 WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2) \
+                   AND src NOT IN (SELECT id FROM _preserved_src)",
                 params![corpus, path],
             )
             .context("deleting owned edges for reindex_replace")?;
@@ -2353,6 +2521,19 @@ impl SqliteStore {
             // this file's symbols) are preserved, mirroring the owned-edge rule so
             // a blank-line/body edit stays lossless. (A blanket FK cascade would
             // wrongly nuke those inbound sites when the node is deleted+reinserted.)
+            //
+            // RFC-027 #813: occurrence sites are NOT preserved for a preserved
+            // definition even though its edge is. A preserved definition may have
+            // drifted lines (an edit above it moved it down), so its stored sites
+            // carry stale line numbers; the site PK is `(src, dst, kind, line)` and
+            // Phase B re-inserts with `INSERT OR IGNORE`, so a preserved stale-line
+            // site plus a fresh correct-line site at the next commit would be two
+            // rows for one call — a phantom occurrence, and a divergence from a
+            // full reindex (Invariant #4). Purging them whole-file keeps the site
+            // store byte-identical to a full reindex at commit; a preserved edge
+            // with no mid-edit occurrence line is still a live edge (`get_callers`,
+            // `get_blast_radius` traverse the `edges` table, not `edge_sites`), and
+            // restoring the occurrence line mid-edit is the line-remap in P2 (§7.5).
             tx.execute(
                 "DELETE FROM edge_sites \
                  WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
@@ -2408,15 +2589,21 @@ impl SqliteStore {
             for node in nodes {
                 let id_i64 = node_id_to_i64(node.id);
                 new_ids.insert(id_i64);
+                // RFC-027 #813: stamp the body hash so the next save can tell
+                // whether this definition was left untouched. `NULL` when no
+                // `content` was supplied (the pre-#813 behaviour) or the node has
+                // no line span, in which case that definition is never preserved.
+                let body_hash = new_body_hashes.get(&id_i64);
                 tx.execute(
-                    "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise, test_role) \
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+                    "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise, test_role, body_hash) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
                      ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                      package = excluded.package, \
                      line = COALESCE(excluded.line, nodes.line), \
                      end_line = COALESCE(excluded.end_line, nodes.end_line), \
                      is_noise = excluded.is_noise, \
-                     test_role = excluded.test_role",
+                     test_role = excluded.test_role, \
+                     body_hash = excluded.body_hash",
                     params![
                         id_i64,
                         node.vname.corpus,
@@ -2430,6 +2617,7 @@ impl SqliteStore {
                         node.end_line.map(|l| l as i64),
                         travsr_core::noise::is_structural_noise(node),
                         node.test_role.as_i64(),
+                        body_hash,
                     ],
                 )
                 .context("inserting node in reindex_replace")?;
@@ -2438,14 +2626,22 @@ impl SqliteStore {
                     .context("put_node_fts_words in reindex_replace")?;
             }
 
-            // Write new edges.
+            // Write new edges. RFC-027 #813: skip this parse's tree-sitter edges
+            // for a preserved definition — its committed (scip/lsif) edges were
+            // left in place above and already dominate the tree-sitter row, so
+            // re-inserting it is at best a no-op and at worst reintroduces a
+            // by-name edge the committed graph had resolved away.
             for edge in edges {
+                let src_i64 = node_id_to_i64(edge.src);
+                if preserved.contains(&src_i64) {
+                    continue;
+                }
                 tx.execute(
                     "INSERT INTO edges(src, dst, kind, provenance, confidence) \
                      VALUES(?1, ?2, ?3, 'tree-sitter', ?4) \
                      ON CONFLICT(src, dst, kind) DO NOTHING",
                     params![
-                        node_id_to_i64(edge.src),
+                        src_i64,
                         node_id_to_i64(edge.dst),
                         edge.kind.as_str(),
                         edge.confidence.map(|c| c as i64),
@@ -5006,6 +5202,33 @@ LIMIT ?4",
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// RFC-027 #813: how many *ratified* `ref/call` edges the definitions in one
+    /// file own — the "ratified in-repo call edges" the mid-edit recovery metric
+    /// counts. Ratified means committed provenance (`scip`/`lsif`, or the
+    /// `tree-sitter` a native Phase B leaf-name resolution writes), excluding the
+    /// `live` overlay: recovering a ratified edge is preserving it in place, which
+    /// is the win, whereas a `live` re-emission is the fail-open floor that
+    /// already existed and cannot reach an ambiguous callee. A save that
+    /// preserves an unchanged definition keeps its ratified edge in this count;
+    /// the pre-#813 whole-file purge dropped it to zero until the next commit.
+    pub fn owned_ratified_ref_call_edges(
+        &self,
+        corpus: &str,
+        path: &str,
+    ) -> Result<u64, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM edges e JOIN nodes n ON n.id = e.src \
+                 WHERE e.kind = 'ref/call' AND e.provenance != 'live' \
+                   AND n.corpus = ?1 AND n.path = ?2",
+                params![corpus, path],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .context("counting owned ratified ref/call edges")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// RFC-027 section 12: upsert reference-resolution rows without clearing the
     /// file's others.
     ///
@@ -6253,6 +6476,123 @@ impl SqliteStore {
                 .context("adding resolved_dst to a stranded ref_resolution_state")?;
         }
         Ok(())
+    }
+
+    /// RFC-027 #813: add the `nodes.body_hash` column when a database predates
+    /// it. Follows the collapsed-migration convention documented on
+    /// [`Self::reconcile_provenance_indexes_if_needed`]: an idempotent open-time
+    /// step gated on a cheap data check, never a schema-version bump (the RFC-027
+    /// migrations were deliberately collapsed to keep the max at v23). The column
+    /// is nullable, so existing rows read as "unknown body" and are never
+    /// preserved until a reparse stamps them, which is the fail-safe direction.
+    fn ensure_body_hash_column(&mut self) -> AnyResult<()> {
+        if !self.column_exists("nodes", "body_hash")? {
+            self.conn
+                .execute("ALTER TABLE nodes ADD COLUMN body_hash TEXT", [])
+                .context("adding body_hash column to nodes (RFC-027 #813)")?;
+        }
+        Ok(())
+    }
+
+    /// RFC-027 #813: populate `nodes.body_hash` for definitions written without
+    /// it (the bulk-init and commit-batch write paths do not compute it), so the
+    /// first save after `travsr init` can already preserve the file's unchanged
+    /// definitions instead of falling back to the whole-file purge.
+    ///
+    /// Cheap gate: returns immediately once no line-bearing node is missing a
+    /// hash, which is the steady state after one pass (and `reindex_replace`
+    /// keeps new nodes stamped, so the gate does not re-trip). When it does run,
+    /// it reads each file with unstamped definitions once from disk, under the
+    /// repo root derived from the database location, and skips any file it cannot
+    /// read — leaving those hashes `NULL`, which only forgoes the optimisation.
+    fn backfill_body_hashes_if_needed(&mut self) -> AnyResult<()> {
+        self.ensure_body_hash_column()?;
+        let any_missing: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM nodes \
+                 WHERE body_hash IS NULL AND line IS NOT NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .context("checking for nodes missing a body hash")?;
+        if !any_missing {
+            return Ok(());
+        }
+        let Some(repo_root) = self.body_hash_repo_root() else {
+            return Ok(());
+        };
+
+        // Files that still hold an unstamped, line-bearing definition.
+        let files: Vec<(String, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT DISTINCT corpus, path FROM nodes \
+                     WHERE body_hash IS NULL AND line IS NOT NULL",
+                )
+                .context("preparing file list for body-hash backfill")?;
+            let rows: Vec<(String, String)> = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .context("executing file list for body-hash backfill")?
+                .collect::<rusqlite::Result<_>>()
+                .context("collecting file list for body-hash backfill")?;
+            rows
+        };
+
+        for (corpus, path) in files {
+            let abs = repo_root.join(&path);
+            let Ok(content) = std::fs::read_to_string(&abs) else {
+                continue; // unreadable/binary: leave NULL, forgoing the optimisation
+            };
+            // (id, start_line, end_line) for this file's line-bearing nodes.
+            let spans: Vec<(i64, u32, Option<u32>)> = {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT id, line, end_line FROM nodes \
+                         WHERE corpus=?1 AND path=?2 AND line IS NOT NULL",
+                    )
+                    .context("preparing span load for body-hash backfill")?;
+                let rows: Vec<(i64, u32, Option<u32>)> = stmt
+                    .query_map(params![corpus, path], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)? as u32,
+                            r.get::<_, Option<i64>>(2)?.map(|e| e as u32),
+                        ))
+                    })
+                    .context("executing span load for body-hash backfill")?
+                    .collect::<rusqlite::Result<_>>()
+                    .context("collecting spans for body-hash backfill")?;
+                rows
+            };
+            let hashes = body_hashes_for_spans(&content, spans);
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting body-hash backfill transaction")?;
+            {
+                let mut upd = tx
+                    .prepare("UPDATE nodes SET body_hash=?1 WHERE id=?2")
+                    .context("preparing body-hash backfill update")?;
+                for (id, hash) in hashes {
+                    upd.execute(params![hash, id])
+                        .context("updating a node's body hash")?;
+                }
+            }
+            tx.commit().context("committing body-hash backfill")?;
+        }
+        Ok(())
+    }
+
+    /// The repo root the body-hash backfill resolves node paths against. The
+    /// database lives at `<repo>/.travsr/graph.db`, so the root is two parents
+    /// up. `None` for an in-memory store (its tests drive `reindex_replace`
+    /// directly with `content`, bypassing this backfill).
+    fn body_hash_repo_root(&self) -> Option<std::path::PathBuf> {
+        let db = self.db_path.as_ref()?;
+        Some(db.parent()?.parent()?.to_path_buf())
     }
 
     /// Idempotent FTS backfill called once after migrations at `open()` /
@@ -9988,6 +10328,7 @@ mod tests {
                 &[owned_src.clone(), callee.clone()],
                 &[],
                 "hash1",
+                None,
             )
             .unwrap();
 
@@ -10000,6 +10341,267 @@ mod tests {
                 line: 9
             }]
         );
+    }
+
+    // ── RFC-027 #813: scope-aware preservation (Mechanism A) ──────────────────
+
+    /// Provenance of a specific edge, or `None` if the edge is absent. Tests
+    /// read `store.conn` directly, as the reconcile/index tests above do.
+    fn edge_provenance(store: &SqliteStore, src: NodeId, dst: NodeId) -> Option<String> {
+        store
+            .conn
+            .query_row(
+                "SELECT provenance FROM edges WHERE src=?1 AND dst=?2",
+                params![node_id_to_i64(src), node_id_to_i64(dst)],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// Two callers (`a`, `b`) in one file, each with a committed `lsif` edge to a
+    /// target. A pure body edit that changes only `a`'s body must leave `b`'s
+    /// committed edge exactly as it was — same row, same `lsif` provenance,
+    /// occurrence site intact — while `a`'s edge is purged so the live lane can
+    /// re-resolve it. This is the ~71% -> ~99% win, and it is proven by `b`'s
+    /// edge keeping `lsif` rather than being re-derived as `tree-sitter`.
+    #[test]
+    fn reindex_replace_preserves_unchanged_definition_committed_edges() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "a.rs", "rust", sig),
+                "function",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        // a: lines 1-2, b: lines 4-5, plus two callee targets.
+        let a = mk("fn:a", 1, 2);
+        let b = mk("fn:b", 4, 5);
+        let x = mk("fn:x", 7, 8);
+        let y = mk("fn:y", 10, 11);
+        let nodes = vec![a.clone(), b.clone(), x.clone(), y.clone()];
+        let ts_edges = vec![
+            Edge::new(a.id, x.id, EdgeKind::RefCall),
+            Edge::new(b.id, y.id, EdgeKind::RefCall),
+        ];
+
+        let content_v1 =
+            "fn a() {\n  x();\n}\n\nfn b() {\n  y();\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
+        store
+            .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h1", Some(content_v1))
+            .unwrap();
+
+        // Commit ratification would relabel these as semantic truth; simulate it.
+        store
+            .put_edge_lsif(&Edge::new(a.id, x.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(b.id, y.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .record_edge_sites(&[(a.id, x.id, 2), (b.id, y.id, 5)])
+            .unwrap();
+        assert_eq!(edge_provenance(&store, a.id, x.id).as_deref(), Some("lsif"));
+        assert_eq!(edge_provenance(&store, b.id, y.id).as_deref(), Some("lsif"));
+
+        // v2: edit only a's body (line 2). b, x, y are byte-identical. The new
+        // parse no longer sees a's call (a's body changed), but still sees b's.
+        let content_v2 =
+            "fn a() {\n  z();\n}\n\nfn b() {\n  y();\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
+        let ts_edges_v2 = vec![Edge::new(b.id, y.id, EdgeKind::RefCall)];
+        store
+            .reindex_replace("c", "a.rs", &nodes, &ts_edges_v2, "h2", Some(content_v2))
+            .unwrap();
+
+        // b unchanged: its committed edge is preserved, not re-derived — proven
+        // by the provenance staying `lsif` rather than being rebuilt as
+        // `tree-sitter`.
+        assert_eq!(
+            edge_provenance(&store, b.id, y.id).as_deref(),
+            Some("lsif"),
+            "b's committed edge must be preserved with its lsif provenance"
+        );
+        // Occurrence sites are purged whole-file (P0 preserves the edge, not the
+        // site, to keep the site store free of stale-line phantoms; the mid-edit
+        // occurrence line is restored by P2's line-remap and by the next commit).
+        assert_eq!(
+            store.reference_sites(y.id).unwrap(),
+            vec![],
+            "occurrence sites are purged; the edge is preserved, the site is not"
+        );
+        // a changed: its committed edge is purged so the live lane re-resolves it.
+        assert_eq!(
+            edge_provenance(&store, a.id, x.id),
+            None,
+            "the edited definition's stale edge must be purged"
+        );
+    }
+
+    /// Soundness gate: preservation is allowed only when the file's NodeId set is
+    /// unchanged. If any symbol is added (the intra-file analogue of adding an
+    /// import that could re-point an untouched call), no definition is preserved
+    /// even with a byte-identical body — the whole file is re-derived. Proven by
+    /// the unchanged definition's edge losing its `lsif` provenance.
+    #[test]
+    fn reindex_replace_does_not_preserve_when_a_symbol_is_added() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "a.rs", "rust", sig),
+                "function",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        let a = mk("fn:a", 1, 2);
+        let y = mk("fn:y", 4, 5);
+        let content_v1 = "fn a() {\n  y();\n}\n\nfn y() {\n}\n";
+        store
+            .reindex_replace(
+                "c",
+                "a.rs",
+                &[a.clone(), y.clone()],
+                &[Edge::new(a.id, y.id, EdgeKind::RefCall)],
+                "h1",
+                Some(content_v1),
+            )
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(a.id, y.id, EdgeKind::RefCall))
+            .unwrap();
+        assert_eq!(edge_provenance(&store, a.id, y.id).as_deref(), Some("lsif"));
+
+        // v2: a's body is byte-identical, but a new function c is added. The
+        // NodeId set changed, so this is not a pure body edit and nothing is
+        // preserved — a's edge is re-derived as tree-sitter.
+        let c = mk("fn:c", 7, 8);
+        let content_v2 = "fn a() {\n  y();\n}\n\nfn y() {\n}\n\nfn c() {\n}\n";
+        store
+            .reindex_replace(
+                "c",
+                "a.rs",
+                &[a.clone(), y.clone(), c.clone()],
+                &[Edge::new(a.id, y.id, EdgeKind::RefCall)],
+                "h2",
+                Some(content_v2),
+            )
+            .unwrap();
+        assert_eq!(
+            edge_provenance(&store, a.id, y.id).as_deref(),
+            Some("tree-sitter"),
+            "an added symbol must disable preservation for the whole file"
+        );
+    }
+
+    /// Property (acceptance criterion): under random body and interface edits, a
+    /// preserved edge is never stale-wrong — a definition's edges survive a save
+    /// iff its body is byte-identical AND the file's symbol set is unchanged;
+    /// otherwise they are re-derived from the new parse. Fuzzes which
+    /// definitions are edited and whether a symbol is added/removed, and checks
+    /// the graph equals the intended post-edit graph every time.
+    #[test]
+    fn reindex_replace_preservation_never_produces_a_stale_edge() {
+        // Deterministic LCG so a failure reproduces from the seed in the message.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as u32
+        };
+
+        for iter in 0..200u32 {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            let mk = |sig: &str, line: u32, end: u32| {
+                travsr_core::Node::new(
+                    travsr_core::VName::new("c", "", "a.rs", "rust", sig),
+                    "function",
+                )
+                .with_line(line)
+                .with_end_line(end)
+            };
+            // Four callers f0..f3 (2 lines each) that each call target `t`.
+            let callers: Vec<_> = (0..4)
+                .map(|i| mk(&format!("fn:f{i}"), 1 + i * 3, 2 + i * 3))
+                .collect();
+            let t = mk("fn:t", 13, 14);
+            let body = |bodies: &[u32]| {
+                let mut s = String::new();
+                for (i, b) in bodies.iter().enumerate() {
+                    // 3 lines per caller (2 body lines + 1 blank), body byte varies.
+                    s.push_str(&format!("fn f{i}() {{\n  call_{b}();\n}}\n"));
+                }
+                s.push_str("fn t() {\n}\n");
+                s
+            };
+
+            let v1_bodies = [0u32, 0, 0, 0];
+            let mut nodes: Vec<_> = callers.clone();
+            nodes.push(t.clone());
+            let v1_edges: Vec<_> = callers
+                .iter()
+                .map(|c| Edge::new(c.id, t.id, EdgeKind::RefCall))
+                .collect();
+            store
+                .reindex_replace(
+                    "c",
+                    "a.rs",
+                    &nodes,
+                    &v1_edges,
+                    "h1",
+                    Some(&body(&v1_bodies)),
+                )
+                .unwrap();
+            // Ratify: every caller->t edge becomes committed lsif truth.
+            for c in &callers {
+                store
+                    .put_edge_lsif(&Edge::new(c.id, t.id, EdgeKind::RefCall))
+                    .unwrap();
+            }
+
+            // Random edit: flip each caller's body byte with prob 1/2, and with
+            // prob 1/3 also add a fifth function (interface edit).
+            let mut v2_bodies = v1_bodies;
+            let mut edited = [false; 4];
+            for (i, edited_i) in edited.iter_mut().enumerate() {
+                if next() % 2 == 0 {
+                    v2_bodies[i] = 1;
+                    *edited_i = true;
+                }
+            }
+            let add_symbol = next() % 3 == 0;
+
+            let mut v2_src = body(&v2_bodies);
+            let mut v2_nodes = callers.clone();
+            v2_nodes.push(t.clone());
+            if add_symbol {
+                let extra = mk("fn:extra", 15, 16);
+                v2_src.push_str("fn extra() {\n}\n");
+                v2_nodes.push(extra);
+            }
+            // The new parse re-emits each caller->t call (bodies still call
+            // something), as tree-sitter edges.
+            let v2_edges: Vec<_> = callers
+                .iter()
+                .map(|c| Edge::new(c.id, t.id, EdgeKind::RefCall))
+                .collect();
+            store
+                .reindex_replace("c", "a.rs", &v2_nodes, &v2_edges, "h2", Some(&v2_src))
+                .unwrap();
+
+            for (i, c) in callers.iter().enumerate() {
+                let prov = edge_provenance(&store, c.id, t.id);
+                let preserved = !add_symbol && !edited[i];
+                let expected = if preserved { "lsif" } else { "tree-sitter" };
+                assert_eq!(
+                    prov.as_deref(),
+                    Some(expected),
+                    "iter {iter}: f{i} preserved={preserved} add_symbol={add_symbol} \
+                     edited={}: edge provenance wrong (a stale preserved edge is a breach)",
+                    edited[i]
+                );
+            }
+        }
     }
 
     #[test]
@@ -10149,7 +10751,7 @@ mod tests {
         // The rename: the old node is gone, a new id takes its place, and the
         // file's rows are rewritten under the new id.
         store
-            .reindex_replace("c", "src/a.ts", &[], &[], "h")
+            .reindex_replace("c", "src/a.ts", &[], &[], "h", None)
             .unwrap();
         let after = live_node("c", "src/a.ts", "fn:renamed", "function", 1);
         store.put_node(&after).unwrap();

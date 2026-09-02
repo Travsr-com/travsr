@@ -87,6 +87,7 @@ fn reindex_replace_retracts_and_repopulates_fts_words() {
             std::slice::from_ref(&new),
             &[],
             "newhash",
+            None,
         )
         .unwrap();
 

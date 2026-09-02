@@ -4949,7 +4949,21 @@ pub fn reindex_files(
         // §2: owned-edge-only atomic replace — preserves inbound edges to surviving
         // symbols (blank-line/body edits lossless) and eagerly deletes orphans for
         // removed symbols. Hash upsert is inside the same transaction.
-        match store.reindex_replace(&corpus, &vname_path, &out.nodes, &all_edges, &new_hex) {
+        //
+        // RFC-027 #813: hand the current text to the store so a pure body edit
+        // preserves the committed edges of every definition it left untouched
+        // instead of purging and re-deriving the whole file. `None` for a file
+        // that is not valid UTF-8 (the store then falls back to the whole-file
+        // purge), which a source file the parser accepted will not be.
+        let content = std::fs::read_to_string(abs_path).ok();
+        match store.reindex_replace(
+            &corpus,
+            &vname_path,
+            &out.nodes,
+            &all_edges,
+            &new_hex,
+            content.as_deref(),
+        ) {
             Ok(report) => {
                 if !report.callers.is_empty() {
                     tracing::debug!(
@@ -8537,6 +8551,158 @@ mod tests {
         assert!(
             live_lane_enabled_for(&store, "rust"),
             "a Rust reading at or above the bar must keep the lane enabled"
+        );
+    }
+
+    /// RFC-027 #813 Mechanism A, end to end through the real save path: a body
+    /// edit to one function preserves every other function's committed call edge
+    /// (mid-edit recovery, the ~71% -> ~99% win), and the next commit restores
+    /// the full committed graph with no live overlay left (Invariant #4). The
+    /// headless daemon reaches this recovery with no language server at all.
+    #[test]
+    fn body_edit_preserves_committed_call_edges_and_commit_reconverges() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        const N: usize = 25;
+        // types.rs: two structs whose method names collide, so every `m{i}` is
+        // ambiguous by name — the lexical lane must abstain on it, and only a
+        // type-aware resolver (Phase B) or a preserved committed edge can carry
+        // the call. This is the ambiguous-callee case where the whole-file purge
+        // lost recall (RFC-027 §7.3a).
+        let mut types = String::from("pub struct A;\npub struct B;\n\nimpl A {\n");
+        for i in 0..N {
+            types.push_str(&format!("    pub fn m{i}(&self) -> i32 {{ {i} }}\n"));
+        }
+        types.push_str("}\n\nimpl B {\n");
+        for i in 0..N {
+            types.push_str(&format!("    pub fn m{i}(&self) -> i32 {{ {i} }}\n"));
+        }
+        types.push_str("}\n");
+        std::fs::write(tmp.path().join("src/types.rs"), types).unwrap();
+
+        // main.rs: N caller functions, each a type-resolved call `a.m{i}()` on an
+        // `A`. `edit0` rewrites only c0's body (signature and its call unchanged,
+        // so its NodeId is stable and the edit is a pure body edit).
+        let main = tmp.path().join("src/main.rs");
+        let build_main = |edit0: bool| {
+            let mut s = String::from("mod types;\nuse types::A;\n\n");
+            for i in 0..N {
+                if i == 0 && edit0 {
+                    s.push_str(
+                        "pub fn c0(a: &A) -> i32 {\n    let _changed = 1 + 1;\n    a.m0()\n}\n",
+                    );
+                } else {
+                    s.push_str(&format!("pub fn c{i}(a: &A) -> i32 {{\n    a.m{i}()\n}}\n"));
+                }
+            }
+            s
+        };
+        std::fs::write(&main, build_main(false)).unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .get_meta("corpus")
+            .unwrap()
+            .unwrap_or_default();
+
+        // Commit the initial tree and run Phase B so the cross-file calls are
+        // ratified into committed (scip) edges — the baseline the mid-edit save
+        // must preserve.
+        let commit = |msg: &str| {
+            std::process::Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-qm",
+                    msg,
+                ])
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            let sha = read_head_commit_sha(tmp.path()).expect("HEAD after commit");
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", &sha).unwrap();
+        };
+        let run_phase_b = || {
+            let store_mutex =
+                std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+            run_background_phase_b_inner(tmp.path(), &store_mutex);
+        };
+        commit("initial");
+        run_phase_b();
+
+        // Ratified baseline: main.rs's committed type-resolved call edges.
+        let baseline = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .owned_ratified_ref_call_edges(&corpus, "src/main.rs")
+            .unwrap();
+        assert!(
+            baseline >= 20,
+            "precondition: native Phase B must ratify the type-resolved calls; got {baseline}"
+        );
+
+        // Save a pure body edit to c0 only, then run the overlay — the mid-edit
+        // state. No language server is involved on this path.
+        std::fs::write(&main, build_main(true)).unwrap();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&main), tmp.path(), &mut store).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &main);
+        }
+
+        let after = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .owned_ratified_ref_call_edges(&corpus, "src/main.rs")
+            .unwrap();
+        // Only c0's ratified edge is dropped (c0's body changed, so it is
+        // re-resolved into the live overlay, which this count excludes); every
+        // other function's committed edge is preserved in place. The pre-#813
+        // whole-file purge dropped all `baseline` of them to zero.
+        assert_eq!(
+            after,
+            baseline - 1,
+            "exactly the edited function's committed edge should drop; got {after} of {baseline}"
+        );
+        let recovery = after as f64 / baseline as f64;
+        assert!(
+            recovery >= 0.95,
+            "mid-edit recovery {recovery:.3} is below the 0.95 acceptance bar \
+             (after {after} of baseline {baseline})"
+        );
+
+        // Commit and run Phase B for real: the committed graph must fully
+        // reconverge and carry no live overlay (Invariant #4).
+        commit("edit");
+        run_phase_b();
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let reconverged = store
+            .owned_ratified_ref_call_edges(&corpus, "src/main.rs")
+            .unwrap();
+        assert_eq!(
+            reconverged, baseline,
+            "commit must restore every committed edge (Invariant #4): {reconverged} vs {baseline}"
+        );
+        assert_eq!(
+            store.count_edges_with_provenance("live").unwrap(),
+            0,
+            "no live overlay may survive ratification (Invariant #4)"
         );
     }
 
