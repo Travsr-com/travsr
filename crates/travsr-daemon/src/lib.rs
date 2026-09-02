@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod hook;
+pub mod live_resolve;
 pub mod logfile;
 mod phase_b_sched;
 mod query_cache;
@@ -3657,6 +3658,804 @@ fn run_with_phase_b_finish_guard(
 /// tick), and [`AllCrashed`](phase_b_sched::RunOutcome::AllCrashed) when every
 /// sidecar crashed, which increments the retry-cap counter in
 /// `PhaseBScheduler`.
+/// RFC-027 section 7.3a: emit the unambiguous-lexical live overlay for one file.
+///
+/// Re-runs the native Phase B call-site extractor over just this file to get its
+/// [`UnresolvedCall`]s, then hands them to the precision-first live resolver.
+/// Reusing the extractor (rather than a second call-site parser) is what keeps
+/// the live lane detecting exactly the references Phase B will later ratify.
+///
+/// Only languages with a native Phase B call-site extractor participate; every
+/// other language keeps today's commit-gated behavior exactly, which is the
+/// RFC's zero-regression floor.
+///
+/// **Called from the save path only, never from the commit path.** It lives
+/// beside `reindex_files` rather than inside it because `reindex_files` is
+/// shared by the watcher and the commit hook, and on commit this work is pure
+/// waste: the hook arms a Phase B refresh immediately afterwards, which
+/// re-derives the same edges and ratifies them. Doing it there would buy
+/// nothing and would put a second tree-sitter parse per changed file directly
+/// in `git commit`'s latency, which the parse timeout in the Phase A parsers
+/// exists to protect.
+///
+/// It re-resolves the **whole** file, not only references that look new,
+/// because `reindex_replace` has just deleted every outbound edge the file
+/// owned. `put_edge_live` upserts, so re-emitting is idempotent.
+///
+/// Fail-open: a live edge is a freshness gain, never a correctness dependency,
+/// so every error here is logged at debug and dropped.
+/// Upper bound on files re-resolved by one interface edit (RFC-027 Risk R4).
+///
+/// A save must stay a save. Editing a hot utility can dirty hundreds of files,
+/// and re-parsing all of them on every keystroke would cost more than the
+/// freshness is worth. Beyond the cap those files keep their commit-gated
+/// behavior, which is a recall cost the next Phase B run repairs.
+const LIVE_CLOSURE_FILE_CAP: usize = 32;
+
+/// Which live lanes a language's on-save reference detection can feed
+/// (RFC-027 sections 7.3 and 8.3).
+enum LiveLane {
+    /// A native Phase B extractor detects the references. Its records carry the
+    /// caller's identity, the receiver type where it could be recovered, and a
+    /// per-language signature key, so the fail-closed lexical floor (§7.3a) and
+    /// the editor lane (§7.3b) both run.
+    Native,
+    /// The generic tree-sitter detector detects the references. It recovers no
+    /// receiver type and builds no signature key by design, so the lexical floor
+    /// has nothing to match on and these languages run the **editor lane
+    /// alone** (§8.3). With no language server they abstain, which is today's
+    /// commit-gated behavior exactly (§7.3c, zero regression).
+    EditorOnly,
+}
+
+/// The language of `abs_path` and the live lane it participates in, or `None`
+/// when the live lane does not apply to it at all.
+///
+/// This is the one place a language is switched on, and it must stay in step
+/// with two others: `travsr_analysis::live_detect::detect_live_refs`, which has
+/// the query, and the extension's `SUPPORTED_LANGUAGES`, which gates the request
+/// that reaches here. A language listed here but missing from either is inert
+/// rather than wrong.
+///
+/// `Language::TypeScript` covers .ts/.tsx/.js/.jsx — there is no separate
+/// JavaScript variant, and the native extractor handles both.
+///
+/// The data/config formats (JSON, YAML, TOML, XML) and Markdown are absent by
+/// design: they carry no call or inheritance semantics, so there is nothing for
+/// a language server to resolve.
+///
+/// Every editor-only language is subject to the per-`(language, kind)` precision
+/// gate (RFC-027 §12), which disables one on a measured adverse reading. A
+/// language absent here costs nothing on save and keeps commit-gated behavior.
+fn live_language(abs_path: &Path) -> Option<(travsr_core::Language, LiveLane)> {
+    use travsr_core::Language as L;
+    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match L::from_extension(ext)? {
+        lang @ (L::TypeScript | L::Rust | L::Python) => Some((lang, LiveLane::Native)),
+        lang @ (L::Go
+        | L::Java
+        | L::CSharp
+        | L::Cpp
+        | L::C
+        | L::ObjectiveC
+        | L::Ruby
+        | L::Php
+        | L::Kotlin
+        | L::Swift
+        | L::Dart
+        | L::Scala) => Some((lang, LiveLane::EditorOnly)),
+        _ => None,
+    }
+}
+
+/// The references detected in a saved file, in whichever shape its detector
+/// produces.
+enum LiveRefSet {
+    /// [`LiveLane::Native`]: the native extractor's typed reference records plus
+    /// the inheritance clauses its dedicated detector found.
+    Native {
+        unresolved: Vec<travsr_core::UnresolvedCall>,
+        inheritance: Vec<travsr_core::InheritanceRef>,
+        /// RFC-027 section 7.3 step 1: the names this file binds to a local or a
+        /// parameter. Carried alongside the references because both consumers of
+        /// this set (the save-path floor and the editor-target producer) need the
+        /// same local-clean answer, and computing it twice would let them
+        /// disagree about which references the floor owns.
+        locally_bound: std::collections::HashSet<String>,
+    },
+    /// [`LiveLane::EditorOnly`]: positions and names only.
+    Generic(travsr_analysis::live_detect::LiveRefs),
+}
+
+/// The reference set for a saved file and its repo-relative path, or `None` when
+/// the live lane does not apply (unsupported language, the precision gate
+/// disabled it, detection failed, or the file holds no references).
+///
+/// Shared by the save-path lexical lane ([`live_resolve_file`]) and the editor's
+/// target request (RFC-027 daemon-driven positions), so the two agree on exactly
+/// which references exist in a dirty file. Takes `&SqliteStore` — detection and
+/// the gate are read-only — so a `&mut` caller can reborrow and keep writing.
+fn extract_live_unresolved(
+    store: &SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+) -> Option<(String, LiveRefSet)> {
+    let vname_path = abs_path
+        .strip_prefix(repo_root)
+        .unwrap_or(abs_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    // Detection is the only per-language stage; everything downstream
+    // (`resolve_unambiguous_lexical`, `candidate_signatures`, node mapping,
+    // target production, emit, ratification, the meter) is language-agnostic.
+    let (lang, lane) = live_language(abs_path)?;
+    // RFC-027 section 12: a language the cumulative meter has measured below the
+    // shipping bar is disabled — the fail-closed floor (§7.3c) is better than an
+    // un-ratified wrong edge. Detection is skipped entirely so a disabled
+    // language costs nothing on save.
+    if !live_lane_enabled_for(store, lang.as_str()) {
+        tracing::debug!(
+            path = %vname_path,
+            language = lang.as_str(),
+            "live: lane disabled for language by the precision gate"
+        );
+        return None;
+    }
+    if let LiveLane::EditorOnly = lane {
+        // RFC-027 section 8.2: detection only — no receiver-type recovery, no
+        // signature building, no resolution. The editor's language server
+        // answers each position; the daemon owns both node ids (§8.2 fencing).
+        let source = std::fs::read(abs_path).ok()?;
+        let refs = match travsr_analysis::live_detect::detect_live_refs(lang, &source) {
+            Ok(refs) => refs,
+            Err(e) => {
+                tracing::debug!(path = %vname_path, error = %e, "live: reference detection failed");
+                return None;
+            }
+        };
+        if refs.is_empty() {
+            return None;
+        }
+        return Some((vname_path, LiveRefSet::Generic(refs)));
+    }
+    let files = [(abs_path.to_path_buf(), vname_path.clone())];
+    // The extractors return different arities: TypeScript and Python are
+    // `(nodes, edges, unresolved)`, Rust is `(nodes, edges, unresolved, refs)`
+    // (the same-file `refs` the live lane does not consume).
+    let extraction = match lang {
+        travsr_core::Language::TypeScript => {
+            travsr_analysis::phase_b_typescript::extract_native_phase_b(
+                corpus,
+                repo_root,
+                Some(&files),
+            )
+            .map(|(_, _, unresolved)| unresolved)
+        }
+        travsr_core::Language::Rust => {
+            travsr_analysis::phase_b_rust::extract_native_phase_b(corpus, repo_root, Some(&files))
+                .map(|(_, _, unresolved, _)| unresolved)
+        }
+        travsr_core::Language::Python => {
+            travsr_analysis::phase_b_python::extract_native_phase_b(corpus, repo_root, Some(&files))
+                .map(|(_, _, unresolved)| unresolved)
+        }
+        // Unreachable: the gate above admits only the three arms handled here.
+        _ => return None,
+    };
+    let unresolved = match extraction {
+        Ok(unresolved) => unresolved,
+        Err(e) => {
+            tracing::debug!(path = %vname_path, error = %e, "live: call-site extraction failed");
+            return None;
+        }
+    };
+    // RFC-027 live edge-kind scope: the IsImplementation lane's `extends` /
+    // `implements` clauses. TypeScript only for now — the resolver is
+    // language-agnostic, but the detector is per-language and is measured before
+    // each language joins (RFC-027 live edge-kind scope §6.2). Never fails the
+    // whole pass: a detector error is a freshness miss, not a correctness one.
+    // TS and Python only. Rust's `impl Trait for Type` does not fit the live
+    // IsImplementation model and is deferred (see phase_b_rust.rs).
+    let inheritance = match lang {
+        travsr_core::Language::TypeScript => {
+            travsr_analysis::phase_b_typescript::extract_unresolved_inheritance(
+                repo_root,
+                Some(&files),
+            )
+            .unwrap_or_default()
+        }
+        travsr_core::Language::Python => {
+            travsr_analysis::phase_b_python::extract_unresolved_inheritance(repo_root, Some(&files))
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    if unresolved.is_empty() && inheritance.is_empty() {
+        return None;
+    }
+    // RFC-027 section 7.3 step 1. Read once here rather than inside the floor:
+    // the extractor above already needs the file, and the target producer needs
+    // the identical answer.
+    let locally_bound = match std::fs::read(abs_path) {
+        Ok(source) => travsr_analysis::live_scope::local_binding_names(lang, &source),
+        Err(e) => {
+            tracing::debug!(path = %vname_path, error = %e, "live: binder scan could not read file");
+            std::collections::HashSet::new()
+        }
+    };
+    Some((
+        vname_path,
+        LiveRefSet::Native {
+            unresolved,
+            inheritance,
+            locally_bound,
+        },
+    ))
+}
+
+/// RFC-027 sections 8.3 and 9.2: record every reference an editor-only language
+/// detected as `pending`, replacing the file's previous rows.
+///
+/// "There is a reference here and its target is not yet known" is true and
+/// useful, and saying it is what makes fail-closed honest rather than merely
+/// quiet. It is also the row the editor lane upgrades in place when its provider
+/// answers, which is how a language with no lexical floor still produces the
+/// claims the precision meter scores (§12).
+///
+/// A reference with no enclosing definition has no node to own the row and is
+/// skipped, exactly as the resolver would abstain on it.
+fn record_generic_pendings(
+    store: &mut SqliteStore,
+    corpus: &str,
+    path: &str,
+    detected: &travsr_analysis::live_detect::LiveRefs,
+) {
+    let named = detected
+        .calls
+        .iter()
+        .chain(detected.fields.iter())
+        .map(|r| (r.line, r.name.as_str()))
+        .chain(
+            detected
+                .inheritance
+                .iter()
+                .map(|r| (r.line, r.base_name.as_str())),
+        );
+    let mut states: Vec<travsr_store::RefResolution> = Vec::new();
+    for (line, name) in named {
+        let Ok(Some(src)) = store.enclosing_definition_at(corpus, path, line) else {
+            continue;
+        };
+        states.push(travsr_store::RefResolution {
+            src,
+            ref_line: line,
+            // 0, matching the native lane, so the editor's answer for this same
+            // reference upgrades this row rather than adding a second one.
+            ref_col: 0,
+            name: name.to_string(),
+            state: "pending",
+            resolved_dst: None,
+        });
+    }
+    if let Err(e) = store.replace_ref_resolution_states(corpus, path, &states) {
+        tracing::debug!(error = %e, "recording ref_resolution_state failed");
+    }
+}
+
+fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, abs_path: &Path) {
+    let Some((vname_path, refs)) = extract_live_unresolved(store, corpus, repo_root, abs_path)
+    else {
+        return;
+    };
+    let (unresolved, inheritance, locally_bound) = match refs {
+        LiveRefSet::Native {
+            unresolved,
+            inheritance,
+            locally_bound,
+        } => (unresolved, inheritance, locally_bound),
+        // RFC-027 section 8.3: an editor-only language has no lexical floor —
+        // the generic detector recovers no receiver type and builds no signature
+        // key, so there is nothing to resolve without a server. What this pass
+        // still owes the file is the honest abstention record (§9.2): every
+        // detected reference starts `pending`, and the editor lane upgrades the
+        // ones its provider answers. Writing them here is also what clears the
+        // rows describing the pre-edit text, which `reindex_replace` leaves
+        // alone.
+        LiveRefSet::Generic(detected) => {
+            record_generic_pendings(store, corpus, &vname_path, &detected);
+            return;
+        }
+    };
+    let outcome = live_resolve::resolve_unambiguous_lexical(
+        store,
+        corpus,
+        &vname_path,
+        &unresolved,
+        &inheritance,
+        &locally_bound,
+    );
+    if outcome.emitted > 0 {
+        tracing::debug!(
+            event = "live.file",
+            path = %vname_path,
+            emitted = outcome.emitted,
+            pending = outcome.pending,
+            "live overlay refreshed for saved file"
+        );
+    }
+}
+
+/// RFC-027 daemon-driven positions: the references in `abs_path` the editor
+/// should resolve with a language provider, computed from the same native
+/// extractor the save-path lexical lane uses.
+///
+/// The daemon owns *which* references and *which* edge kind; the editor owns
+/// only the exact column and the provider round-trip. This is what replaces the
+/// editor's blind `identifier(` scan and lets the lane reach every language the
+/// native extractor covers, not just what an English-shaped regex could spot.
+fn live_resolution_targets(
+    store: &SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+) -> Vec<travsr_ipc::message::LiveResolutionTarget> {
+    let Some((vname_path, refs)) = extract_live_unresolved(store, corpus, repo_root, abs_path)
+    else {
+        return Vec::new();
+    };
+    match refs {
+        LiveRefSet::Native {
+            unresolved,
+            inheritance,
+            locally_bound,
+        } => {
+            let mut targets =
+                live_resolve::targets_needing_editor(store, &unresolved, &locally_bound);
+            targets.extend(live_resolve::inheritance_targets_needing_editor(
+                store,
+                corpus,
+                &vname_path,
+                &inheritance,
+                &locally_bound,
+            ));
+            targets
+        }
+        // RFC-027 section 8.3: no lexical floor runs for these languages, so
+        // there is no lane to partition against and every detected reference is
+        // an editor target.
+        LiveRefSet::Generic(refs) => live_resolve::generic_targets_needing_editor(&refs),
+    }
+}
+
+/// RFC-027 section 8.7.5: the interface-edit closure, as editor targets.
+///
+/// When the saved file adds or renames a symbol other files reference by name,
+/// their edges into it were stranded — `reindex_replace` invalidated them and
+/// nothing restores them, because the editor only ever publishes the document
+/// that was saved. This computes those dependents (a file with a `pending`
+/// reference the saved file can now satisfy) and returns each one's editor
+/// targets, so the same target request re-resolves them alongside the saved
+/// file. The editor keeps the initiator role (§10.1).
+///
+/// The dependent set is derived from durable `pending` rows plus the saved
+/// file's current parse, so it does not depend on this save's watcher event
+/// having already computed a closure — the two run on independent clocks and a
+/// request can arrive first.
+///
+/// Bounded at `LIVE_CLOSURE_FILE_CAP` files; the editor bounds the *total*
+/// provider round trips across the saved file and every dependent, so one rename
+/// in a hot utility cannot turn a save into an unbounded storm of queries. A
+/// dependent dirty in another editor tab is skipped by the editor, not here: the
+/// daemon reads the file from disk and cannot see an unsaved buffer.
+fn dependent_resolution_targets(
+    store: &SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+) -> Vec<travsr_ipc::message::DependentTargets> {
+    // Only a live-lane file the gate has not disabled can have dependents worth
+    // restoring; a disabled or unsupported language costs nothing here.
+    let Some((lang, _lane)) = live_language(abs_path) else {
+        return Vec::new();
+    };
+    if !live_lane_enabled_for(store, lang.as_str()) {
+        return Vec::new();
+    }
+    let vname_path = abs_path
+        .strip_prefix(repo_root)
+        .unwrap_or(abs_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let dependents = store
+        .dependents_pending_on_file(corpus, &vname_path, lang.as_str(), LIVE_CLOSURE_FILE_CAP)
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for dep in dependents {
+        let dep_abs = repo_root.join(&dep);
+        let targets = live_resolution_targets(store, corpus, repo_root, &dep_abs);
+        // A dependent with nothing for the editor to do (its references all
+        // settle lexically, or it holds none) is not worth sending.
+        if !targets.is_empty() {
+            out.push(travsr_ipc::message::DependentTargets { file: dep, targets });
+        }
+    }
+    out
+}
+
+/// RFC-027 section 12: the continuous precision meter.
+///
+/// "Is the live lane worse than nothing?" is answered empirically, not by
+/// assertion, and ground truth is on tap every commit. Each run compares what
+/// the lane claimed against what Phase B derived at the same call sites, and
+/// records the result so the per-language shipping gate has a number to read.
+///
+/// Persisted to `meta` as well as logged. A log line scrolls away; the gate
+/// needs a value `travsr status` can show and a human can act on.
+///
+/// The reading is cumulative across runs rather than last-run-only: a single
+/// commit can carry two claims, and a gate computed from a sample that small
+/// would swing between 0.0 and 1.0 on noise. Disagreements are logged
+/// individually at warn, because one wrong edge is the failure this whole design
+/// is built to avoid, and it should be visible the moment it happens rather than
+/// averaged into a ratio.
+fn measure_live_precision(store: &mut SqliteStore, ratified: &[String]) {
+    let by_lang = match store.live_precision_sample_by_language() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("live precision sample failed: {e:#}");
+            return;
+        }
+    };
+    if by_lang.is_empty() {
+        return;
+    }
+
+    // Accumulate each language's counters under its own key, and roll the same
+    // deltas into the corpus-wide `live_precision` key `travsr status` reads.
+    // The per-language keys are what the shipping gate (`live_lane_enabled_for`)
+    // consults; the aggregate stays a faithful sum so the status line is
+    // unchanged.
+    let (mut run_agree, mut run_disagree, mut run_unverifiable) = (0u64, 0u64, 0u64);
+    for (lang, sample) in &by_lang {
+        if sample.claims() == 0 {
+            continue;
+        }
+        // Score only the languages whose Phase B just completed. A crashed
+        // sidecar leaves its `edge_sites` un-refreshed, so scoring its claims now
+        // would land every reference added since the last commit in
+        // `unverifiable` against evidence that was never re-derived — and
+        // `consume_measured_ref_resolutions` (also `ratified`-scoped) would then
+        // delete those claims before their own ratification could score them.
+        // Same #712 reasoning as `sweep_live_edges_for_languages` below.
+        if !ratified.iter().any(|r| r == lang) {
+            continue;
+        }
+        let prior = read_precision_totals_for(store, Some(lang));
+        let _ = store.set_meta(
+            &live_precision_meta_key(Some(lang)),
+            &format!(
+                "{},{},{}",
+                prior.0 + sample.agree,
+                prior.1 + sample.disagree,
+                prior.2 + sample.unverifiable
+            ),
+        );
+
+        if sample.disagree > 0 {
+            tracing::warn!(
+                event = "live.precision.disagreement",
+                language = %lang,
+                disagreed = sample.disagree,
+                agreed = sample.agree,
+                "the live lane resolved a reference differently from Phase B"
+            );
+        }
+        tracing::info!(
+            event = "live.precision",
+            language = %lang,
+            agree = sample.agree,
+            disagree = sample.disagree,
+            unverifiable = sample.unverifiable,
+            precision = ?sample.precision(),
+            coverage = sample.coverage(),
+            "live overlay scored against Phase B"
+        );
+
+        run_agree += sample.agree;
+        run_disagree += sample.disagree;
+        run_unverifiable += sample.unverifiable;
+    }
+
+    let prior = read_precision_totals(store);
+    let _ = store.set_meta(
+        LIVE_PRECISION_META,
+        &format!(
+            "{},{},{}",
+            prior.0 + run_agree,
+            prior.1 + run_disagree,
+            prior.2 + run_unverifiable
+        ),
+    );
+}
+
+/// Cumulative corpus-wide `(agree, disagree, unverifiable)` recorded so far.
+fn read_precision_totals(store: &SqliteStore) -> (u64, u64, u64) {
+    read_precision_totals_for(store, None)
+}
+
+/// Cumulative `(agree, disagree, unverifiable)` for one language, or the
+/// corpus-wide aggregate when `language` is `None`.
+///
+/// A malformed or absent value reads as zeroes: the meter is diagnostic, and a
+/// corrupt counter must never fail a commit or wrongly disable a language.
+fn read_precision_totals_for(store: &SqliteStore, language: Option<&str>) -> (u64, u64, u64) {
+    let raw = store
+        .get_meta(&live_precision_meta_key(language))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let parts: Vec<u64> = raw
+        .split(',')
+        .filter_map(|p| p.trim().parse::<u64>().ok())
+        .collect();
+    match parts.as_slice() {
+        [a, d, u] => (*a, *d, *u),
+        _ => (0, 0, 0),
+    }
+}
+
+/// The `meta` key holding cumulative live-lane precision counters. The
+/// corpus-wide aggregate is `live_precision`; each language namespaces under it
+/// as `live_precision.<language>` (matching `nodes.language`).
+fn live_precision_meta_key(language: Option<&str>) -> String {
+    match language {
+        Some(lang) => format!("{LIVE_PRECISION_META}.{lang}"),
+        None => LIVE_PRECISION_META.to_string(),
+    }
+}
+
+/// Cumulative live-lane precision counters, as `agree,disagree,unverifiable`.
+const LIVE_PRECISION_META: &str = "live_precision";
+
+/// RFC-027 section 12: the per-language shipping bar. Below this the lane is
+/// disabled for a language ("a measured decision, not a guess").
+const LIVE_PRECISION_GATE: f64 = 0.99;
+
+/// Minimum verified live claims before the gate may DISABLE a language.
+///
+/// Below this the sample is too small to act on as an *adverse* reading, so an
+/// already-shipped language keeps running and gathering evidence rather than
+/// being silenced for good by one early disagreement. Precision-first, but not
+/// trigger-shy.
+const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
+
+/// RFC-027 sections 12 and 8.7.5: the languages the live lane ships ENABLED,
+/// each vouched at measured precision ≥ 0.99.
+///
+/// This is the strict-gate opt-in (§8.7.6 decision). RFC §12 says a language
+/// ships enabled only at measured precision ≥ 0.99, but the earlier policy left
+/// an *unmeasured* language enabled so it could earn a reading — which, when
+/// eleven non-native languages joined at once, meant nine shipped enabled with
+/// no reading at all. Strict gating inverts that default: a language is disabled
+/// until it is on this list, and it joins the list only after a real server plus
+/// its ratification oracle measured it at ≥ 0.99 (the §11.3 procedure). Adding a
+/// `nodes.language` value here is therefore the per-language opt-in the RFC asks
+/// for, auditable in git history against the reading that earned it.
+///
+/// `nodes.language` values (what the meter keys on). JavaScript has no value of
+/// its own — `.js`/`.jsx` map to `typescript` — so one entry covers both.
+///
+/// The list grows as §11.3 fills in. Each entry's earning reading:
+/// - `typescript`, `python` — native, gated at ship since RFC §14 Phase 0–4.
+/// - `rust` — native; re-measured end to end at 1.0000 (`4,0,0`, §11.3).
+/// - `go` — gopls, 1.0000 (`4,0,0`).
+/// - `dart` — Dart analysis server + travsr-lang-dart, 1.0000 (`3,0,1`).
+/// - `swift` — sourcekit-lsp + travsr-swift-index-emitter, 1.0000 (`3,0,1`).
+/// - `cpp` — clangd + scip-clang, 1.0000 (`1,0,0`); recall capped by §8.7.3
+///   (out-of-line method defs abstain), so the field read is what it emits and
+///   that is correct.
+/// - `java` — jdtls + scip-java, 1.0000 (`3,0,0`, call/field/is-impl); scip-java
+///   needs a Maven/Gradle build to emit references (a build-less fixture swept
+///   and read `0,0,4`).
+/// - `csharp` — csharp-ls + scip-dotnet, 1.0000 (`6,0,0`, call/field/is-impl).
+///   Live edges resolve via csharp-ls with no extra setup. The oracle needs
+///   `DOTNET_ROOT`; the plugin host resolves and injects it when `dotnet` is on
+///   the daemon's PATH, and the travsr-lang csharp emitter now self-resolves it
+///   from well-known installs when a minimal-PATH daemon leaves the host unable
+///   to (travsr-lang `fix/csharp-dotnet-root-sandbox-path`). If the oracle still
+///   cannot run, the edges persist as `live` rather than ratifying — honest,
+///   not wrong.
+///
+/// Deliberately absent:
+/// - `c`, `objectivec` — edges ratify correctly but scip-clang writes no
+///   matching `edge_sites`, so the meter reads `0,0,2` unverifiable (§10 item 4).
+/// - `ruby` — the LSP lane is fundamentally weak: an untyped receiver
+///   (`def run(s); s.start; end`) gives ruby-lsp nothing to resolve, so it
+///   abstains. This is the §8.4 dynamic-language limit, not an install gap.
+/// - `php` — the LSP lane *works* with a typed receiver (`run(Session $s)`) via
+///   Intelephense, but the oracle scip-php needs Composer (absent here), so no
+///   reading yet. Opt in once measured.
+/// - `scala`, `kotlin` — blocked by JVM build-toolchain setup, not the live
+///   lane: Scala's SemanticDB oracle needs `sbt compile`; Kotlin's KLS (its
+///   oracle *and* its live server) needs a working Gradle build, which the
+///   Gradle/Kotlin/JDK version matrix on this machine would not produce.
+///
+/// Each entry is `(nodes.language, verified claims behind the decision)`.
+///
+/// The sample size is recorded **as data**, not only in the prose above, so the
+/// evidence behind each opt-in is visible at the point the gate reads it and a
+/// reviewer can weigh `cpp`'s single claim against `csharp`'s six without
+/// reconstructing them from a doc comment. `verified` counts agree + disagree;
+/// `unverifiable` claims are excluded, because a claim Phase B left no evidence
+/// for vouches for nothing.
+const LIVE_LANE_SHIPPED: &[(&str, u64)] = &[
+    ("typescript", 2),
+    ("rust", 4),
+    ("python", 2),
+    ("go", 4),
+    ("dart", 3),
+    ("swift", 3),
+    ("cpp", 1),
+    ("java", 3),
+    ("csharp", 6),
+];
+
+/// Force-enable a language for measurement, bypassing the strict opt-in gate
+/// (but never the adverse-meter safety below).
+///
+/// A language absent from [`LIVE_LANE_SHIPPED`] cannot run, so it can never
+/// produce the claims the meter needs to measure it — the deadlock the strict
+/// gate would otherwise create. `TRAVSR_LIVE_LANE_MEASURE` (comma-separated
+/// `nodes.language` values) lifts the gate for exactly the languages being
+/// measured, so the §11.3 harness can drive one long enough to earn a reading.
+/// Set on the daemon running a fixture; never in production, where the shipped
+/// list is authoritative.
+fn live_lane_measure_forced(language: &str) -> bool {
+    std::env::var("TRAVSR_LIVE_LANE_MEASURE")
+        .ok()
+        .is_some_and(|v| v.split(',').any(|l| l.trim() == language))
+}
+
+/// RFC-027 section 12: is the live lane enabled for `language`?
+///
+/// Two independent conditions, both of which must hold:
+///
+/// 1. **No adverse reading.** The cumulative per-language meter must not carry a
+///    statistically meaningful adverse sample — at least
+///    [`LIVE_PRECISION_MIN_SAMPLE`] verified claims *and* precision below
+///    [`LIVE_PRECISION_GATE`]. This disables even a shipped language whose
+///    measured precision has degraded, and it is self-healing: a later run whose
+///    Phase B agreement lifts the cumulative precision back over the bar
+///    re-enables it on its own.
+/// 2. **Vouched to ship** (§8.7.6). The language is on [`LIVE_LANE_SHIPPED`], or
+///    force-enabled for measurement ([`live_lane_measure_forced`]). An
+///    unmeasured language is disabled until it earns a reading and is opted in,
+///    which makes "ships enabled only at measured precision ≥ 0.99" literally
+///    true rather than aspirational.
+///
+/// The two directions deliberately use different evidence bars, and the
+/// asymmetry is the point rather than an oversight. Enabling is a **human**
+/// decision, recorded in git next to the reading that earned it: each
+/// [`LIVE_LANE_SHIPPED`] entry carries its verified-claim count as data (1 to 6
+/// today), so a reviewer can see the evidence and refuse it. Disabling is
+/// **automatic** and irreversible-feeling to a user who cannot see why their
+/// lane went quiet, so it needs a bar noise cannot cross on its own, which is
+/// what [`LIVE_PRECISION_MIN_SAMPLE`] is. Requiring twenty verified claims to
+/// *enable* would instead mean shipping nothing at all: no language can produce
+/// claims while disabled, and `TRAVSR_LIVE_LANE_MEASURE` exists precisely
+/// because that deadlock is real.
+///
+/// Those recorded readings were taken while the meter double-counted a claim at
+/// every commit (each fixture runs one or two commits, so the inflation is small
+/// but not zero). They are worth re-taking against the corrected meter before
+/// any further language joins the list.
+fn live_lane_enabled_for(store: &SqliteStore, language: &str) -> bool {
+    let (agree, disagree, unverifiable) = read_precision_totals_for(store, Some(language));
+    let sample = travsr_store::LivePrecision {
+        agree,
+        disagree,
+        unverifiable,
+    };
+    let verified = agree + disagree;
+    if let Some(p) = sample.precision() {
+        if verified >= LIVE_PRECISION_MIN_SAMPLE && p < LIVE_PRECISION_GATE {
+            return false;
+        }
+    }
+    LIVE_LANE_SHIPPED.iter().any(|(l, _)| *l == language) || live_lane_measure_forced(language)
+}
+
+/// RFC-027 section 8.3: retire the live overlay and clear resolved pendings.
+///
+/// Extracted so the convergence property test can drive ratification directly
+/// instead of racing the background scheduler.
+///
+/// Fail-open on both steps: a sweep that errors leaves `live` rows labeled as
+/// what they are, which is stale but honest, and never wrong.
+fn ratify_live_overlay(store: &mut SqliteStore, ratified: &[String]) {
+    // RFC-027 section 12: score the overlay before retiring it. Order matters —
+    // after the Phase B writes, because that is the truth being compared
+    // against, and before the sweep, because the sweep discards the evidence.
+    measure_live_precision(store, ratified);
+    // The meter is cumulative, so a scored claim has to be retired or the next
+    // commit counts it again: the ratio would survive but the sample size — the
+    // thing `LIVE_PRECISION_MIN_SAMPLE` gates on — would not. Scoped to
+    // `ratified` for the same reason `measure_live_precision` is: a claim scored
+    // by this commit is a claim whose language completed, and only those may be
+    // retired — a crashed language's claims must survive to be scored at its own
+    // ratification.
+    match store.consume_measured_ref_resolutions(ratified) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!(
+            event = "live.precision.consumed",
+            claims = n,
+            "retired the live claims this ratification scored"
+        ),
+        Err(e) => tracing::debug!("consuming measured live claims failed: {e:#}"),
+    }
+    match store.sweep_live_edges_for_languages(ratified) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!(
+            event = "live.swept",
+            swept = n,
+            languages = ?ratified,
+            "retired live edges Phase B did not re-derive"
+        ),
+        Err(e) => tracing::warn!("live overlay sweep failed: {e:#}"),
+    }
+    // A reference Phase B recorded a call site for is no longer pending, whoever
+    // resolved it.
+    if let Err(e) = store.clear_resolved_pending_refs() {
+        tracing::debug!("clearing resolved pending refs failed: {e:#}");
+    }
+    // Rows whose `src` node was renamed away are unreachable by every other
+    // delete path, so they would otherwise accumulate for the life of the repo.
+    match store.purge_orphan_ref_resolution_states() {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!(
+            event = "live.pending.purged",
+            rows = n,
+            "purged reference rows whose enclosing symbol no longer exists"
+        ),
+        Err(e) => tracing::debug!("purging orphan ref_resolution_state rows failed: {e:#}"),
+    }
+}
+
+/// The `nodes.language` values whose live overlay this Phase B run may retire.
+///
+/// `report.ran` names the languages whose analyzers completed. Two adjustments
+/// map that onto how nodes are actually labeled:
+///
+/// - JavaScript has no `nodes.language` of its own. `Language::from_extension`
+///   maps `.js`/`.jsx` to `TypeScript`, so a run that analysed JavaScript
+///   ratifies rows labeled `typescript`.
+/// - The LSIF pass is TypeScript's and is not represented in `report.ran`, so
+///   `typescript` is added whenever it produced edges.
+///
+/// A language absent from this set keeps its live edges. That is the #712
+/// partial-success case: the marker advances because *something* progressed,
+/// but a crashed sidecar's truth was never re-derived, and discarding its
+/// overlay would take away precision without replacing it.
+fn ratified_languages(report: &PhaseBReport, lsif_ran: bool) -> Vec<String> {
+    let mut langs: Vec<String> = Vec::with_capacity(report.ran.len() + 1);
+    for lang in &report.ran {
+        // JavaScript nodes are labeled `typescript`; see above.
+        let mapped = if lang == "javascript" {
+            "typescript"
+        } else {
+            lang.as_str()
+        };
+        if !langs.iter().any(|l| l == mapped) {
+            langs.push(mapped.to_string());
+        }
+    }
+    if lsif_ran && !langs.iter().any(|l| l == "typescript") {
+        langs.push("typescript".to_string());
+    }
+    langs
+}
+
 fn run_background_phase_b_inner(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
@@ -3803,6 +4602,26 @@ fn run_background_phase_b_inner(
     // --force`, not on an endless background loop.
     let made_progress =
         report.crashed.is_empty() || !report.ran.is_empty() || !lsif_edges.is_empty();
+
+    // RFC-027 section 8.3: ratify the live overlay.
+    //
+    // Position matters twice over. This runs *after* every SCIP/LSIF/native
+    // write above, so any live edge Phase B re-derived has already been
+    // relabelled in place by those writes and what remains marked `live` is
+    // exactly what Phase B did not re-derive. And it runs *before* the marker
+    // advance below, while the same store lock is still held, so no in-process
+    // reader can observe the graph between ratification and the marker.
+    //
+    // Not one WAL transaction, and it does not need to be. The Phase B write
+    // path is already several self-committing statements under a process-local
+    // mutex, so there is no single transaction to append this to. Because the
+    // order is insert-then-delete, the only state an out-of-process reader can
+    // catch mid-flight is a superset of the ratified graph, never a gap. The
+    // hazard the RFC worried about was the gap; the ordering dissolves it.
+    if made_progress {
+        ratify_live_overlay(&mut s, &ratified_languages(&report, !lsif_edges.is_empty()));
+    }
+
     if made_progress {
         let _ = s.set_meta("phase_b_commit", &target_sha);
         // #583: the semantic layer now matches the working tree again.
@@ -4036,6 +4855,8 @@ pub fn reindex_files(
     let mut any_changed = false;
     // Accumulate Tier-0 dirty callers across all files in this batch.
     let mut callers_all = travsr_core::DirtySet::default();
+    // Paths this batch rewrote, for the end-of-batch orphan sweep below.
+    let mut written_paths: Vec<String> = Vec::new();
 
     // L5b: unlike `index_paths_parallel`'s full-repo `paths`, this commit-hook
     // batch only contains changed files — a `.m`/`.mm` sibling may not be in it
@@ -4141,6 +4962,7 @@ pub fn reindex_files(
                     callers_all.extend(report.callers);
                 }
                 any_changed = true;
+                written_paths.push(vname_path.clone());
                 // Collect FFI markers for the repo-level pass (RFC-005).
                 all_ffi_markers.extend(out.ffi_markers);
                 // Collect Cargo workspace dep markers for the A2 repo-level pass.
@@ -4265,6 +5087,29 @@ pub fn reindex_files(
     //
     // The LSIF pass now runs only from `init_repo` (full initial index).
     // Per-commit LSIF delta is tracked as DEBT(travsr-25).
+
+    // Bring the incremental path up to the init path's "no orphan edges"
+    // invariant. `flush_staging_to_production` drops staged edges with a
+    // missing endpoint once every node in the batch has landed; nothing did the
+    // equivalent here, so speculative import candidates (`./user` becomes
+    // `user.ts`/`user.tsx`/`user.js`, only one of which exists) survived every
+    // incremental write. A full index and an incremental index of the same tree
+    // therefore disagreed by two edges per TypeScript import, and `fsck`
+    // reported orphans on a healthy repo.
+    //
+    // After the loop, not inside it: an edge from an already-processed file to
+    // one later in this same batch is legitimately dangling until that file's
+    // nodes land. This is the same position the staging flush occupies.
+    if any_changed {
+        match store.sweep_orphan_edges_for_paths(&corpus, &written_paths) {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(
+                swept = n,
+                "reindex: dropped speculative edges with no destination node"
+            ),
+            Err(e) => tracing::warn!("reindex: orphan edge sweep failed: {e}"),
+        }
+    }
 
     Ok(callers_all)
 }
@@ -7418,6 +8263,1226 @@ mod tests {
         );
     }
 
+    /// RFC-027 section 12 / Phase 3 gate: measured precision on a fixture corpus.
+    ///
+    /// This is the number that decides whether the lane ships. The bar is 0.99
+    /// with a target of zero false positives, because for a product whose thesis
+    /// is "zero structural hallucinations" a wrong edge is not a quality
+    /// regression but a breach of the value proposition.
+    ///
+    /// The fixture is deliberately adversarial rather than a happy path: one
+    /// unambiguous callee the lexical lane should resolve, and one name defined
+    /// on two different classes, which is exactly the method-on-receiver case it
+    /// must refuse. A meter that only ever sees resolvable calls proves nothing.
+    #[test]
+    fn measured_live_precision_clears_the_shipping_gate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        // Unambiguous: only one `charge` in the corpus.
+        std::fs::write(
+            tmp.path().join("src/billing.ts"),
+            "export class Billing {\n  charge(): void {}\n}\n",
+        )
+        .unwrap();
+        // Ambiguous: `ping` is defined on two classes, so the lexical lane must
+        // abstain rather than pick one.
+        std::fs::write(
+            tmp.path().join("src/a.ts"),
+            "export class A {\n  ping(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/b.ts"),
+            "export class B {\n  ping(): void {}\n}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("src/caller.ts");
+        std::fs::write(
+            &caller,
+            "import { Billing } from \"./billing\";\n             export function run(bill: Billing, x: any): void {\n             \x20 bill.charge();\n             \x20 x.ping();\n             }\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .get_meta("corpus")
+            .unwrap()
+            .unwrap_or_default();
+
+        // A save, then the overlay: this is the mid-edit state.
+        {
+            let mut text = std::fs::read_to_string(&caller).unwrap();
+            text.push_str("\nexport function again(bill: Billing): void {\n  bill.charge();\n}\n");
+            std::fs::write(&caller, text).unwrap();
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&caller), tmp.path(), &mut store).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+        }
+
+        // The ambiguous call must never have produced a claim at all: an
+        // abstention is not a low-confidence answer, it is no answer.
+        {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            let pending = store
+                .pending_refs_in_file(&corpus, "src/caller.ts")
+                .unwrap();
+            assert!(
+                pending.iter().any(|(name, _)| name == "ping"),
+                "the ambiguous receiver must abstain, got pending {pending:?}"
+            );
+        }
+
+        // Now commit and let Phase B run for real. The meter lives at
+        // ratification for a reason that only shows up here: `reindex_replace`
+        // deletes the edited file's `edge_sites` on save, so between the save and
+        // the next Phase B run there is no call-site evidence to check anything
+        // against. Measuring earlier does not produce a pessimistic number, it
+        // produces no number at all.
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "edit",
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let sha = read_head_commit_sha(tmp.path()).expect("HEAD after commit");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", &sha).unwrap();
+        }
+        let store_mutex = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        run_background_phase_b_inner(tmp.path(), &store_mutex);
+        drop(store_mutex);
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        // Read the cumulative counters ratification wrote, not the claim rows:
+        // ratification consumes a claim once it has scored it, so the meter is
+        // the `meta` reading, which is also what the shipping gate consults.
+        let (agree, disagree, unverifiable) = read_precision_totals_for(&store, None);
+        let sample = travsr_store::LivePrecision {
+            agree,
+            disagree,
+            unverifiable,
+        };
+
+        assert!(
+            sample.claims() > 0,
+            "precondition: the lane must have claimed something to score"
+        );
+        assert!(
+            sample.coverage() > 0.0,
+            "precondition: Phase B must have left call-site evidence, or this gate \
+             asserts nothing. Got {sample:?}"
+        );
+        assert_eq!(
+            sample.disagree, 0,
+            "a live edge that disagrees with Phase B is a false positive, and the \
+             target is zero: {sample:?}"
+        );
+        let precision = sample
+            .precision()
+            .expect("a verified sample must yield a precision");
+        assert!(
+            precision >= 0.99,
+            "measured precision {precision} is below the 0.99 shipping gate: {sample:?}"
+        );
+    }
+
+    /// RFC-027 Phase 4 gate: the same shipping bar, measured for **Rust**, split
+    /// out by language. This is the differential the phase turns on — the live
+    /// lane's Rust claims scored against what the commit-time Phase B (native
+    /// tree-sitter resolution, and rust-analyzer LSIF when present) derived at
+    /// the same call sites.
+    ///
+    /// The fixture is cross-file on purpose: a same-file call is resolved by
+    /// Phase A and never becomes an `UnresolvedCall`, so the live lane would have
+    /// nothing to claim. It exercises the three Rust shapes the lane resolves:
+    /// `Zoo::assemble()` (associated call — the already-qualified `method:Zoo.*`
+    /// sig used verbatim), `z.describe()` (method call whose receiver type the
+    /// extractor recovers, rebuilt to `method:Zoo.describe`), and `helper()` (a
+    /// bare free function). The names are deliberately NOT in the extractor's
+    /// `NOISE_NAMES` set (`new`, `from`, `clone`, …), which would drop them
+    /// before the lane ever saw them. All are unambiguous repo-wide, so §7.3a
+    /// resolves them with no language server, which keeps the test hermetic.
+    #[test]
+    fn measured_rust_live_precision_clears_the_per_language_gate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        std::fs::write(
+            tmp.path().join("src/zoo.rs"),
+            "pub struct Zoo;\n\nimpl Zoo {\n    pub fn assemble() -> Zoo {\n        Zoo\n    }\n    pub fn describe(&self) -> i32 {\n        7\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/util.rs"),
+            "pub fn helper() -> i32 {\n    42\n}\n",
+        )
+        .unwrap();
+        let main = tmp.path().join("src/main.rs");
+        std::fs::write(
+            &main,
+            "mod zoo;\nmod util;\nuse zoo::Zoo;\nuse util::helper;\n\nfn run(z: &Zoo) {\n    let _a = Zoo::assemble();\n    let _d = z.describe();\n    let _n = helper();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .get_meta("corpus")
+            .unwrap()
+            .unwrap_or_default();
+
+        // A save, then the overlay: the mid-edit state. The appended function
+        // adds a third cross-file call the live lane must resolve.
+        {
+            let mut text = std::fs::read_to_string(&main).unwrap();
+            text.push_str("\nfn run_again(z: &Zoo) {\n    let _a = Zoo::assemble();\n    let _d = z.describe();\n}\n");
+            std::fs::write(&main, text).unwrap();
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&main), tmp.path(), &mut store).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &main);
+        }
+
+        // Commit and let Phase B run for real, so the meter has ratified
+        // call-site evidence to score against (see the TS gate test for why the
+        // meter must run here and not on save).
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "edit",
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let sha = read_head_commit_sha(tmp.path()).expect("HEAD after commit");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", &sha).unwrap();
+        }
+        let store_mutex = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        run_background_phase_b_inner(tmp.path(), &store_mutex);
+        drop(store_mutex);
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        // As above: the per-language reading lives in `meta` after ratification
+        // has consumed the claims it scored.
+        let (agree, disagree, unverifiable) = read_precision_totals_for(&store, Some("rust"));
+        let rust = travsr_store::LivePrecision {
+            agree,
+            disagree,
+            unverifiable,
+        };
+
+        assert!(
+            rust.claims() > 0,
+            "precondition: the Rust lane must have claimed something to score: {rust:?}"
+        );
+        assert!(
+            rust.coverage() > 0.0,
+            "precondition: Phase B must have left Rust call-site evidence, or this \
+             gate asserts nothing. Got {rust:?}"
+        );
+        assert_eq!(
+            rust.disagree, 0,
+            "a live Rust edge that disagrees with Phase B is a false positive, and \
+             the target is zero: {rust:?}"
+        );
+        let precision = rust
+            .precision()
+            .expect("a verified Rust sample must yield a precision");
+        assert!(
+            precision >= LIVE_PRECISION_GATE,
+            "measured Rust precision {precision} is below the {LIVE_PRECISION_GATE} \
+             per-language shipping gate: {rust:?}"
+        );
+
+        // The gate is per-language: the enable switch reads Rust's own reading,
+        // which this run has just written above the bar.
+        assert!(
+            live_lane_enabled_for(&store, "rust"),
+            "a Rust reading at or above the bar must keep the lane enabled"
+        );
+    }
+
+    /// Every shipped language must carry the evidence that put it there.
+    ///
+    /// The review of PR #795 flagged that the two directions of the gate
+    /// disagree by more than an order of magnitude: languages were opted in on 1
+    /// to 6 verified claims while `LIVE_PRECISION_MIN_SAMPLE` needs 20 before it
+    /// will act on an adverse reading. That asymmetry is deliberate (see
+    /// `live_lane_enabled_for`), but it has to be *visible*, so the sample sits
+    /// in the list as data and this test keeps it honest: a future entry cannot
+    /// be added with no reading behind it, which is the failure the strict
+    /// opt-in gate exists to prevent.
+    #[test]
+    fn every_shipped_language_records_the_sample_that_vouched_for_it() {
+        for (lang, verified) in LIVE_LANE_SHIPPED {
+            assert!(
+                *verified > 0,
+                "{lang} ships enabled with no verified claim behind it; \
+                 measure it per RFC-027 section 11.3 before adding it"
+            );
+        }
+        // The asymmetry is real and recorded rather than accidental. If an entry
+        // ever reaches the disable threshold's sample size, this assertion is
+        // the prompt to revisit whether the two bars should still differ.
+        assert!(
+            LIVE_LANE_SHIPPED
+                .iter()
+                .all(|(_, v)| *v < LIVE_PRECISION_MIN_SAMPLE),
+            "an entry now meets the disable-direction bar; reconsider whether \
+             the enable direction should still use a lower one"
+        );
+    }
+
+    /// The enable switch is measured, not vacuous: it disables a language ONLY on
+    /// a meaningful adverse sample, and re-enables when the cumulative reading
+    /// recovers. Driven directly through the per-language meta keys so it does not
+    /// depend on a live Phase B run.
+    #[test]
+    fn the_precision_gate_disables_a_language_only_on_a_meaningful_adverse_sample() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // No reading at all, but Rust is a shipped/vouched language, so enabled.
+        assert!(live_lane_enabled_for(&store, "rust"));
+
+        // Below the bar but too few verified claims to act on: still enabled
+        // (Rust is shipped, and the sample is not a meaningful adverse reading).
+        store.set_meta("live_precision.rust", "4,1,0").unwrap();
+        assert!(
+            live_lane_enabled_for(&store, "rust"),
+            "5 verified claims is below the min sample; must not disable yet"
+        );
+
+        // Enough claims AND below the bar: disabled. (18 agree, 5 disagree =>
+        // 23 verified, precision ~0.78.)
+        store.set_meta("live_precision.rust", "18,5,3").unwrap();
+        assert!(
+            !live_lane_enabled_for(&store, "rust"),
+            "a meaningful sample below 0.99 must disable the language"
+        );
+
+        // A disagreement-free follow-up lifts the cumulative reading back over
+        // the bar: self-healing, re-enabled. (198 agree, 2 disagree => 0.99.)
+        store.set_meta("live_precision.rust", "198,2,0").unwrap();
+        assert!(
+            live_lane_enabled_for(&store, "rust"),
+            "recovered precision at the bar must re-enable the language"
+        );
+
+        // The switch is per-language: a disabled Rust must not disable TypeScript.
+        store.set_meta("live_precision.rust", "18,5,3").unwrap();
+        assert!(!live_lane_enabled_for(&store, "rust"));
+        assert!(
+            live_lane_enabled_for(&store, "typescript"),
+            "the gate must be scoped per language, not corpus-wide"
+        );
+    }
+
+    /// RFC-027 section 8.7.6: an unmeasured, un-vouched language ships DISABLED.
+    ///
+    /// This is the strict-gate decision. The earlier policy left an unmeasured
+    /// language enabled to earn a reading; when eleven non-native languages
+    /// joined at once, that meant nine shipped enabled with no reading. Now a
+    /// language is disabled until it is on `LIVE_LANE_SHIPPED`, and the
+    /// measurement harness lifts the gate for exactly the language it is
+    /// measuring via `TRAVSR_LIVE_LANE_MEASURE`.
+    #[test]
+    fn an_unmeasured_language_ships_disabled_until_opted_in() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // A vouched language with no reading is enabled; an un-vouched one is not.
+        assert!(live_lane_enabled_for(&store, "go"), "go is shipped");
+        assert!(
+            !live_lane_enabled_for(&store, "scala"),
+            "an unmeasured non-shipped language must be disabled by the strict gate"
+        );
+        assert!(!live_lane_enabled_for(&store, "kotlin"));
+
+        // Force-enabling for measurement lifts the gate for exactly that language.
+        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "scala,kotlin");
+        assert!(live_lane_enabled_for(&store, "scala"));
+        assert!(live_lane_enabled_for(&store, "kotlin"));
+        assert!(
+            !live_lane_enabled_for(&store, "ruby"),
+            "the force list is per-language, not a blanket override"
+        );
+        std::env::remove_var("TRAVSR_LIVE_LANE_MEASURE");
+
+        // The adverse-meter safety still wins over a force-enable: a measured
+        // language below the bar stays disabled even while being measured.
+        let mut store = store;
+        store.set_meta("live_precision.scala", "18,5,0").unwrap();
+        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "scala");
+        assert!(
+            !live_lane_enabled_for(&store, "scala"),
+            "a meaningful adverse reading disables a language even under force"
+        );
+        std::env::remove_var("TRAVSR_LIVE_LANE_MEASURE");
+    }
+
+    /// The gate must not be clearable by an empty sample.
+    ///
+    /// A lane that resolved nothing verifiable has not earned a perfect score,
+    /// and reporting 1.0 there would let "we measured nothing" pass as "we
+    /// measured perfectly" — which is exactly how a precision gate stops meaning
+    /// anything.
+    #[test]
+    fn an_unverifiable_sample_reports_no_precision_rather_than_a_perfect_one() {
+        let empty = travsr_store::LivePrecision::default();
+        assert_eq!(empty.precision(), None);
+        assert_eq!(empty.coverage(), 0.0);
+
+        let all_unverifiable = travsr_store::LivePrecision {
+            agree: 0,
+            disagree: 0,
+            unverifiable: 40,
+        };
+        assert_eq!(
+            all_unverifiable.precision(),
+            None,
+            "forty unchecked claims must not read as perfect precision"
+        );
+        assert_eq!(all_unverifiable.coverage(), 0.0);
+
+        let mixed = travsr_store::LivePrecision {
+            agree: 99,
+            disagree: 1,
+            unverifiable: 100,
+        };
+        assert_eq!(mixed.precision(), Some(0.99));
+        assert_eq!(
+            mixed.coverage(),
+            0.5,
+            "coverage must expose the unchecked half"
+        );
+    }
+
+    /// The cumulative counter survives a malformed value rather than failing a
+    /// commit over a diagnostic.
+    #[test]
+    fn the_precision_counter_tolerates_a_corrupt_value() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        assert_eq!(read_precision_totals(&store), (0, 0, 0));
+        store.set_meta(LIVE_PRECISION_META, "not,a,number").unwrap();
+        assert_eq!(read_precision_totals(&store), (0, 0, 0));
+        store.set_meta(LIVE_PRECISION_META, "3,1,7").unwrap();
+        assert_eq!(read_precision_totals(&store), (3, 1, 7));
+    }
+
+    /// RFC-027 Phase 2 gate, Invariant #4: ratifying the live overlay returns
+    /// the graph to exactly what it was before the overlay existed.
+    ///
+    /// ```text
+    /// graph(G) --overlay--> G' --ratify--> G
+    /// ```
+    ///
+    /// This is the load-bearing half of the convergence argument. The overlay
+    /// is allowed to be non-deterministic — it depends on which language server
+    /// a developer happens to be running — and this is the fence that makes
+    /// that safe: whatever it contained, retiring it cannot leave a trace.
+    ///
+    /// It holds because the overlay is purely **additive**. `put_edge_live`
+    /// creates edges that were absent and refreshes its own, but never relabels
+    /// a row another lane wrote, so every row the sweep can delete is one the
+    /// live lane created. An earlier version relabelled `tree-sitter` rows,
+    /// and this test is what caught it: the sweep then deleted pre-existing
+    /// truth instead of returning the graph to it.
+    ///
+    /// Fingerprints compare provenance as well as endpoints, so a `live` row
+    /// left sitting where a ratified one belongs fails here rather than
+    /// passing on a matching count.
+    #[test]
+    fn ratifying_the_overlay_restores_the_pre_overlay_graph() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        let order = tmp.path().join("src/order.ts");
+
+        // Phase A only, exactly what a save does: content changes, the file's
+        // outgoing edges are rebuilt from the parse, and the new call site has
+        // no semantic edge. This is the mid-edit degradation RFC-027 covers.
+        {
+            let mut text = std::fs::read_to_string(&order).unwrap();
+            text.push_str("\nexport function expressOrder(u: User): void {\n  u.save();\n}\n");
+            std::fs::write(&order, text).unwrap();
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&order), tmp.path(), &mut store).unwrap();
+        }
+        let degraded = graph_fingerprint(&db_path);
+
+        // Overlay.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &order);
+        }
+        let live_rows = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .count_edges_with_provenance("live")
+            .unwrap();
+        assert!(
+            live_rows > 0,
+            "precondition: the overlay must be non-empty or this asserts nothing"
+        );
+        assert_ne!(
+            graph_fingerprint(&db_path),
+            degraded,
+            "precondition: the overlay must actually have changed the graph"
+        );
+
+        // Ratify with nothing re-derived: the strictest case for the sweep.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            ratify_live_overlay(&mut store, &["typescript".to_string()]);
+        }
+
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_edges_with_provenance("live")
+                .unwrap(),
+            0,
+            "no live edge may survive the run that ratifies it"
+        );
+        assert_eq!(
+            graph_fingerprint(&db_path),
+            degraded,
+            "retiring the overlay must restore the graph exactly, not merely its size"
+        );
+    }
+
+    /// The destructive case the additive rule exists to prevent.
+    ///
+    /// An interface edit re-resolves the files that *reference* the edited one
+    /// (section 6.3). Those files were never re-parsed, so their existing
+    /// `tree-sitter` edges are still in place. If the overlay relabelled them
+    /// `live`, the ratification sweep would delete pre-existing truth rather
+    /// than returning the graph to it, and a caller edge would simply vanish.
+    ///
+    /// So: run the overlay over a file that was *not* re-indexed, then ratify,
+    /// and require the graph to be unchanged throughout.
+    #[test]
+    fn the_overlay_cannot_destroy_an_edge_it_did_not_create() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        let order = tmp.path().join("src/order.ts");
+
+        // order.ts keeps every edge the full index gave it. This is a closure
+        // re-resolution, not a save.
+        let before = graph_fingerprint(&db_path);
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &order);
+        }
+        assert_eq!(
+            graph_fingerprint(&db_path),
+            before,
+            "resolving a file whose edges already exist must change nothing"
+        );
+
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            ratify_live_overlay(&mut store, &["typescript".to_string()]);
+        }
+        assert_eq!(
+            graph_fingerprint(&db_path),
+            before,
+            "ratification must not delete an edge the overlay did not create"
+        );
+    }
+
+    /// The other half: an overlay edge Phase B *does* re-derive is ratified in
+    /// place and survives the sweep, now carrying the ratified provenance.
+    ///
+    /// This is why the sweep can be a blunt delete. By the time it runs, every
+    /// edge Phase B re-derived has already been relabelled by the ratification
+    /// write, so what is still marked `live` is exactly what Phase B did not
+    /// re-derive.
+    #[test]
+    fn an_overlay_edge_phase_b_rederives_is_ratified_in_place() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        edit_and_reindex_order(&tmp, &db_path, &corpus);
+        let overlay: Vec<travsr_core::Edge> = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_edges(&store)
+        };
+        assert!(!overlay.is_empty(), "precondition: an overlay edge exists");
+
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            // Stand in for Phase B re-deriving these edges natively. This is the
+            // same call the daemon makes after a Phase B run.
+            store
+                .write_phase_b_batch(&[], &overlay, "tree-sitter")
+                .unwrap();
+            ratify_live_overlay(&mut store, &["typescript".to_string()]);
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.count_edges_with_provenance("live").unwrap(),
+            0,
+            "the row is no longer live once Phase B has re-derived it"
+        );
+        for e in &overlay {
+            let survived = store
+                .iter_edges_from(e.src)
+                .unwrap()
+                .into_iter()
+                .any(|x| x.dst == e.dst && x.kind == e.kind);
+            assert!(
+                survived,
+                "an edge Phase B re-derived must survive ratification, not be swept"
+            );
+        }
+    }
+
+    /// The sweep is scoped to languages that completed, so a crashed sidecar's
+    /// overlay survives rather than being discarded with nothing to replace it
+    /// (#712 partial success advances the marker regardless).
+    #[test]
+    fn ratification_spares_a_language_that_did_not_complete() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        edit_and_reindex_order(&tmp, &db_path, &corpus);
+        let before = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .count_edges_with_provenance("live")
+            .unwrap();
+        assert!(before > 0, "precondition: an overlay exists");
+
+        // Rust "completed"; TypeScript did not. The TypeScript overlay stays.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            ratify_live_overlay(&mut store, &["rust".to_string()]);
+        }
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_edges_with_provenance("live")
+                .unwrap(),
+            before,
+            "a language whose truth was never re-derived must keep its overlay"
+        );
+    }
+
+    /// `ratified_languages` maps analyzer names onto how nodes are labeled.
+    #[test]
+    fn ratified_languages_maps_javascript_and_the_lsif_pass_onto_typescript() {
+        let js_only = PhaseBReport {
+            ran: vec!["javascript".to_string()],
+            ..PhaseBReport::default()
+        };
+        assert_eq!(
+            ratified_languages(&js_only, false),
+            vec!["typescript".to_string()],
+            "JavaScript nodes are labeled typescript, so that is what ratifies"
+        );
+
+        // The LSIF pass is TypeScript's and never appears in `ran`.
+        let nothing_ran = PhaseBReport::default();
+        assert_eq!(
+            ratified_languages(&nothing_ran, true),
+            vec!["typescript".to_string()]
+        );
+
+        // Nothing ran and no LSIF edges: sweep nothing at all.
+        assert!(ratified_languages(&nothing_ran, false).is_empty());
+
+        // No duplicate when both signals point at typescript.
+        let both = PhaseBReport {
+            ran: vec!["typescript".to_string(), "javascript".to_string()],
+            ..PhaseBReport::default()
+        };
+        assert_eq!(
+            ratified_languages(&both, true),
+            vec!["typescript".to_string()]
+        );
+    }
+
+    /// Append a second caller to `order.ts` and re-index it, the way a save
+    /// lands: content changes, so `reindex_files` does not skip it on the hash,
+    /// Phase A rewrites the file's outgoing edges, and the new call site has no
+    /// semantic edge until something resolves it.
+    ///
+    /// Returns the overlay outcome so a caller can assert on it.
+    fn edit_and_reindex_order(
+        tmp: &tempfile::TempDir,
+        db_path: &std::path::Path,
+        corpus: &str,
+    ) -> std::path::PathBuf {
+        let order = tmp.path().join("src/order.ts");
+        let mut text = std::fs::read_to_string(&order).unwrap();
+        text.push_str("\nexport function expressOrder(u: User): void {\n  u.save();\n}\n");
+        std::fs::write(&order, text).unwrap();
+        let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
+        reindex_files(std::slice::from_ref(&order), tmp.path(), &mut store).unwrap();
+        live_resolve_file(&mut store, corpus, tmp.path(), &order);
+        order
+    }
+
+    /// A two-file TypeScript repo where `order.ts` calls into `user.ts`,
+    /// indexed. Shared by the RFC-027 Phase 1 and Phase 2 tests.
+    fn repo_with_a_call() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/user.ts"),
+            "export class User {\n  save(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/order.ts"),
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.save();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .get_meta("corpus")
+            .unwrap()
+            .unwrap_or_default();
+        (tmp, db_path, corpus)
+    }
+
+    /// Every `provenance='live'` edge currently in the store.
+    ///
+    /// `all_edges` returns `(src, dst, kind, provenance)` tuples, so rebuild the
+    /// core `Edge` from them for the ratification write.
+    fn live_edges(store: &travsr_store::SqliteStore) -> Vec<travsr_core::Edge> {
+        store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, _, _, prov)| prov == "live")
+            .filter_map(|(src, dst, kind, _)| {
+                travsr_core::EdgeKind::from_str(&kind).map(|k| travsr_core::Edge::new(src, dst, k))
+            })
+            .collect()
+    }
+
+    /// A content fingerprint of the whole graph: every node, and every edge with
+    /// its provenance, in a stable order. Comparing counts alone would miss a
+    /// live edge sitting where a ratified one belongs, which is the exact
+    /// failure the convergence property exists to rule out.
+    fn graph_fingerprint(db_path: &std::path::Path) -> (Vec<String>, Vec<String>) {
+        let store = travsr_store::SqliteStore::open(db_path).unwrap();
+        (
+            store.node_fingerprint().unwrap(),
+            store.edge_fingerprint().unwrap(),
+        )
+    }
+
+    /// Invariant #4, orphan dimension: an incremental edit must leave the graph
+    /// as free of dangling edges as a full index would.
+    ///
+    /// TypeScript import resolution is speculative by construction — `./user`
+    /// emits a `resolves-to` candidate for `user.ts`, `user.tsx` and `user.js`
+    /// because it cannot know which exists without touching the store. The init
+    /// path drops the losers when staging is flushed, which its own comment
+    /// calls making "no orphan edges" a store invariant. The incremental path
+    /// had no equivalent, so every ordinary edit to a file with a relative
+    /// import left two dead edges behind and `fsck` reported orphans on a
+    /// perfectly healthy repo.
+    #[test]
+    fn an_incremental_edit_leaves_no_orphan_edges() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        let user = tmp.path().join("src/user.ts");
+        let order = tmp.path().join("src/order.ts");
+        std::fs::write(&user, "export class User {\n  save(): void {}\n}\n").unwrap();
+        std::fs::write(
+            &order,
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.save();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
+            "precondition: a full index leaves no orphans"
+        );
+
+        // Edit both files, the way a rename lands incrementally.
+        std::fs::write(&user, "export class User {\n  persist(): void {}\n}\n").unwrap();
+        std::fs::write(
+            &order,
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.persist();\n}\n",
+        )
+        .unwrap();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(&[user.clone(), order.clone()], tmp.path(), &mut store).unwrap();
+        }
+
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
+            "an incremental edit must not leave dangling edges the full path drops"
+        );
+    }
+
+    /// The sweep runs after the whole batch, so an edge into a file that is
+    /// created later in the same batch survives. Sweeping per file would delete
+    /// it, since its destination node does not exist yet at that point.
+    #[test]
+    fn the_orphan_sweep_spares_a_forward_reference_within_one_batch() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        // Only the importer exists at index time.
+        let order = tmp.path().join("src/order.ts");
+        std::fs::write(&order, "export function placeOrder(): void {}\n").unwrap();
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        // Now add both the import and its target in one batch, importer first.
+        let user = tmp.path().join("src/user.ts");
+        std::fs::write(
+            &order,
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {}\n",
+        )
+        .unwrap();
+        std::fs::write(&user, "export class User {\n  save(): void {}\n}\n").unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(&[order.clone(), user.clone()], tmp.path(), &mut store).unwrap();
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(store.count_orphans().unwrap(), 0, "no orphans either way");
+        let resolves: u64 = store.count_edges_with_provenance("tree-sitter").unwrap();
+        assert!(
+            resolves > 0,
+            "the real import edge must survive a same-batch forward reference"
+        );
+    }
+
+    /// RFC-027 Phase 1 gate: a rename must leave no ghost live edge.
+    ///
+    /// The hazard the live lane introduces is an edge to a symbol that no
+    /// longer exists. `reindex_replace` deletes the inbound edges of a symbol
+    /// whose NodeId vanished, so a `live` edge is cleaned up exactly as a
+    /// `tree-sitter` or `scip` one is. This test is what keeps that true, and
+    /// it is the difference between honest staleness and a fabricated target.
+    #[test]
+    fn a_rename_leaves_no_ghost_live_edge() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        let user = tmp.path().join("src/user.ts");
+        // A real save adds a call site the overlay then resolves, which is the
+        // only way a live edge exists to be renamed away from.
+        edit_and_reindex_order(&tmp, &db_path, &corpus);
+        assert!(
+            count_live_edges(&db_path) > 0,
+            "precondition: a live edge must exist to rename away from"
+        );
+
+        // Rename User.save -> User.persist. The old NodeId vanishes, so every
+        // inbound edge to it, live included, must go with it.
+        std::fs::write(&user, "export class User {\n  persist(): void {}\n}\n").unwrap();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&user), tmp.path(), &mut store).unwrap();
+        }
+
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
+            "a rename must leave no edge pointing at a node that no longer exists"
+        );
+    }
+
+    /// A deleted file takes its inbound live edges with it, the same way
+    /// `delete_file` takes both directions for every other provenance.
+    #[test]
+    fn a_delete_leaves_no_ghost_live_edge() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        let user = tmp.path().join("src/user.ts");
+        edit_and_reindex_order(&tmp, &db_path, &corpus);
+        assert!(
+            count_live_edges(&db_path) > 0,
+            "precondition: a live edge exists"
+        );
+
+        std::fs::remove_file(&user).unwrap();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&user), tmp.path(), &mut store).unwrap();
+        }
+
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
+            "a deleted file must take its inbound live edges with it"
+        );
+    }
+
+    /// RFC-027 section 9.2: an abstention is recorded, not dropped.
+    ///
+    /// `save` here is ambiguous (two classes define it), which is exactly the
+    /// method-on-receiver case the lexical lane must refuse. Refusing quietly
+    /// and refusing honestly look identical in the edge table; they differ in
+    /// whether anything can later say *why* the answer is thin.
+    /// RFC-027 section 8: a non-native language reaches the live lane through
+    /// on-save reference *detection* alone. Go has Phase A nodes and no native
+    /// Phase B extractor, so its references become editor targets — a
+    /// same-package cross-file call the graph could never resolve on its own,
+    /// and a field read as `ref/field` so it never reads as a caller (#757).
+    #[test]
+    fn a_go_file_yields_editor_targets_from_the_generic_detector() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/m\n\ngo 1.21\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("session.go"),
+            "package main\n\ntype Session struct {\n\tcount int\n}\n\nfunc (s *Session) Start() {}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("run.go");
+        std::fs::write(
+            &caller,
+            "package main\n\nfunc Run(s *Session) int {\n\ts.Start()\n\treturn s.count\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
+        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller);
+
+        let start = targets
+            .iter()
+            .find(|t| t.name == "Start")
+            .expect("the method call must be an editor target");
+        assert_eq!(start.ref_line, 4);
+        assert_eq!(start.edge_kind, "ref/call");
+        assert_eq!(start.provider, "definition");
+
+        let count = targets
+            .iter()
+            .find(|t| t.name == "count")
+            .expect("the field read must be an editor target");
+        assert_eq!(count.ref_line, 5);
+        assert_eq!(count.edge_kind, "ref/field");
+    }
+
+    /// RFC-027 section 8: the generic path is one path, not a Go path. Java
+    /// exercises the two halves Go cannot: a grammar with *separate* call and
+    /// field nodes (so no callee disambiguation runs), and an `extends` /
+    /// `implements` clause, which Go has none of. The clause sits on the
+    /// implementing class's own declaration, so its edge source is that class in
+    /// the saved file and save-invalidation self-heals it (§8.4) — the property
+    /// Rust's detached `impl` block lacks (§7).
+    #[test]
+    fn a_java_file_yields_call_field_and_implements_targets() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(
+            tmp.path().join("Base.java"),
+            "public class Base {\n  public int total;\n  public void submit() {}\n}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("Order.java");
+        std::fs::write(
+            &caller,
+            "public class Order extends Base {\n  public int run(Base b) {\n    b.submit();\n    return b.total;\n  }\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
+        // Java is on LIVE_LANE_SHIPPED (measured 3,0,0 → 1.0000, §11.3), so the
+        // gate admits it with no reading and no force flag needed.
+        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller);
+
+        let by_name = |name: &str| {
+            targets
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} must be an editor target, got {targets:?}"))
+        };
+        assert_eq!(by_name("submit").edge_kind, "ref/call");
+        assert_eq!(by_name("total").edge_kind, "ref/field");
+        let base = by_name("Base");
+        assert_eq!(base.edge_kind, "is-implementation");
+        assert_eq!(base.ref_line, 1, "the clause is on the class declaration");
+        assert!(targets.iter().all(|t| t.provider == "definition"));
+    }
+
+    /// RFC-027 section 8.7.5: the interface-edit closure reaches the editor lane.
+    ///
+    /// `run.go` references a method the graph cannot settle, so its save records
+    /// the reference as `pending`. When `session.go` — which defines that method
+    /// — is saved, its target request must name `run.go` as a dependent so the
+    /// editor re-resolves it, rather than leaving `run.go`'s live edge stranded
+    /// until `run.go` is itself saved. Before the fix `dependent_resolution_
+    /// targets` did not exist and the request answered with the saved file alone.
+    #[test]
+    fn saving_a_definition_names_its_pending_dependents_as_targets() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/m\n\ngo 1.21\n",
+        )
+        .unwrap();
+        let session = tmp.path().join("session.go");
+        std::fs::write(
+            &session,
+            "package main\n\ntype Session struct{}\n\nfunc (s *Session) Helper() {}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("run.go");
+        std::fs::write(
+            &caller,
+            "package main\n\nfunc Run(s *Session) {\n\ts.Helper()\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.get_meta("corpus").unwrap().unwrap_or_default()
+        };
+
+        // `run.go`'s save records its reference to `Helper` as pending: a generic
+        // language has no lexical floor, so every detected reference abstains
+        // (§8.3) and the pending row is the honest record the editor upgrades.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        // A save of `session.go` (which defines `Helper`) must surface `run.go`
+        // as a dependent carrying that reference as an editor target.
+        let dependents = dependent_resolution_targets(&store, &corpus, tmp.path(), &session);
+        let run = dependents
+            .iter()
+            .find(|d| d.file == "run.go")
+            .unwrap_or_else(|| panic!("run.go must be a dependent, got {dependents:?}"));
+        assert!(
+            run.targets.iter().any(|t| t.name == "Helper"),
+            "the stranded reference must be an editor target, got {:?}",
+            run.targets
+        );
+
+        // A file that defines nothing any pending reference names has no
+        // dependents — a body edit stays local (§6.1), no closure fan-out.
+        let none = dependent_resolution_targets(&store, &corpus, tmp.path(), &caller);
+        assert!(
+            none.iter().all(|d| d.file != "session.go"),
+            "run.go defines nothing session.go is pending on, got {none:?}"
+        );
+    }
+
+    /// The lexical floor is native-only (section 8.3): the generic detector
+    /// recovers no receiver type and builds no signature key, so there is
+    /// nothing for it to match on and the save path must not parse the file to
+    /// discard the result.
+    #[test]
+    fn a_go_save_emits_nothing_without_an_editor() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/m\n\ngo 1.21\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("session.go"),
+            "package main\n\ntype Session struct{}\n\nfunc (s *Session) Start() {}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("run.go");
+        std::fs::write(
+            &caller,
+            "package main\n\nfunc Run(s *Session) {\n\ts.Start()\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.get_meta("corpus").unwrap().unwrap_or_default()
+        };
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+        }
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.count_edges_with_provenance("live").unwrap(),
+            0,
+            "an editor-only language must emit nothing on save"
+        );
+        // Abstention is recorded, not dropped (§9.2): every detected reference
+        // is a pending row the editor lane later upgrades in place, and it is
+        // what gives the precision meter a claim to score for this language.
+        let pending = store.pending_refs_in_file(&corpus, "run.go").unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|(name, line)| name == "Start" && *line == 4),
+            "the unresolved call must leave a pending row, got {pending:?}"
+        );
+    }
+
+    #[test]
+    fn an_abstention_is_recorded_as_pending() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        std::fs::write(
+            tmp.path().join("src/a.ts"),
+            "export class A {\n  ping(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/b.ts"),
+            "export class B {\n  ping(): void {}\n}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("src/caller.ts");
+        std::fs::write(
+            &caller,
+            "export function go(x: any): void {\n  x.ping();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.get_meta("corpus").unwrap().unwrap_or_default()
+        };
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let pending = store
+            .pending_refs_in_file(&corpus, "src/caller.ts")
+            .unwrap();
+        assert!(
+            pending.iter().any(|(name, _)| name == "ping"),
+            "an untyped receiver must leave a pending row, got {pending:?}"
+        );
+    }
+
+    /// Count `provenance='live'` rows. Shared by the Phase 1 ghost-edge tests.
+    fn count_live_edges(db_path: &std::path::Path) -> u64 {
+        travsr_store::SqliteStore::open(db_path)
+            .unwrap()
+            .count_edges_with_provenance("live")
+            .unwrap()
+    }
+
     /// §9 CI invariant: incremental delete + reindex must produce the same
     /// node and edge counts as a full rebuild on the mutated tree.
     ///
@@ -10034,7 +12099,30 @@ fn handle_watch_event(
         WatchEvent::Upsert(path) => {
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             match reindex_files(std::slice::from_ref(&path), repo_root, &mut s) {
-                Ok(callers) => enqueue_dirty_callers(callers, repo_root, index_tx),
+                Ok(callers) => {
+                    // RFC-027 sections 6 and 7.3a: refresh this file's live
+                    // overlay, and on an interface edit the overlay of the files
+                    // that reference it.
+                    //
+                    // Only here, on the save path — the commit path arms a Phase
+                    // B refresh that re-derives the same edges, so doing it
+                    // there would be waste inside `git commit`'s latency.
+                    //
+                    // `callers` is non-empty exactly when a symbol other files
+                    // reference vanished, which is the interface-edit signal
+                    // (section 6.2). Their edges into this file were deleted by
+                    // `reindex_replace`, so re-resolving them is what stops a
+                    // rename from silently dropping every inbound live edge.
+                    let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
+                    live_resolve_file(&mut s, &corpus, repo_root, &path);
+                    for dependent in callers.iter().take(LIVE_CLOSURE_FILE_CAP) {
+                        let abs = repo_root.join(dependent);
+                        if abs != path && abs.is_file() {
+                            live_resolve_file(&mut s, &corpus, repo_root, &abs);
+                        }
+                    }
+                    enqueue_dirty_callers(callers, repo_root, index_tx)
+                }
                 Err(e) => tracing::warn!(path=%path.display(), err=%e, "watcher reindex failed"),
             }
         }
@@ -10258,6 +12346,110 @@ fn handle_control_message(
             drop(s);
             enqueue_dirty_callers(dirty, repo_root, index_tx);
             (ControlResponse::ok(None), false)
+        }
+        Ok(ControlMessage::RequestLiveResolutionTargets {
+            repo_root: reported_root,
+            session,
+            file,
+            buffer_version: _,
+        }) => {
+            // Same identity guard as ReportLiveResolution: discovery enumerates a
+            // namespace, so the request has to say which repo it is for.
+            let reported = travsr_ipc::normalize_repo_root(std::path::Path::new(&reported_root));
+            if reported != travsr_ipc::normalize_repo_root(repo_root) {
+                return (
+                    ControlResponse::err("request is for a different repo".to_string()),
+                    false,
+                );
+            }
+
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
+            let abs_path = repo_root.join(&file);
+            let own = live_resolution_targets(&s, &corpus, repo_root, &abs_path);
+            // RFC-027 section 8.7.5: also re-resolve the files whose edges this
+            // save can restore, so a rename in one file heals its dependents
+            // without each being saved in turn.
+            let dependents = dependent_resolution_targets(&s, &corpus, repo_root, &abs_path);
+            drop(s);
+
+            tracing::debug!(
+                event = "live.targets",
+                session = %session,
+                file = %file,
+                count = own.len(),
+                dependents = dependents.len(),
+                "live resolution targets computed"
+            );
+            let mut resp = ControlResponse::ok(None);
+            resp.result = serde_json::to_value(travsr_ipc::message::LiveResolutionTargets {
+                own,
+                dependents,
+            })
+            .ok();
+            (resp, false)
+        }
+        Ok(ControlMessage::ReportLiveResolution {
+            repo_root: reported_root,
+            session,
+            file,
+            resolutions,
+        }) => {
+            // Same identity guard as ReportLspDiagnostics (#698 review, P1):
+            // discovery enumerates a namespace, not a repo, so a report has to
+            // say who it is for. Here the stakes are higher than for the editor
+            // plane, because these positions become graph edges: accepting
+            // another repo's report would write edges between nodes chosen by
+            // paths that mean something else in this graph.
+            let reported = travsr_ipc::normalize_repo_root(std::path::Path::new(&reported_root));
+            if reported != travsr_ipc::normalize_repo_root(repo_root) {
+                return (
+                    ControlResponse::err("report is for a different repo".to_string()),
+                    false,
+                );
+            }
+
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
+            // RFC-027 section 11: answers are accepted only for questions this
+            // daemon is still asking. `buffer_version` cannot carry that on its
+            // own — it is the editor's counter, minted and checked by the
+            // editor, so it says nothing about whether the daemon re-parsed the
+            // file between handing out targets and receiving answers. It did
+            // have to, if the file changed on disk underneath an unchanged
+            // editor buffer, and `enclosing_definition_at` then reads spans from
+            // the newer parse. Re-detecting against the file as it stands now
+            // closes that window with the daemon's own evidence.
+            let current = live_resolution_targets(&s, &corpus, repo_root, &repo_root.join(&file));
+            let accepted = live_resolve::retain_current_targets(&resolutions, &current);
+            let stale = resolutions.len() - accepted.len();
+            let outcome = live_resolve::apply_live_resolutions(&mut s, &corpus, &file, &accepted);
+            drop(s);
+            if stale > 0 {
+                tracing::debug!(
+                    event = "live.report.stale",
+                    session = %session,
+                    file = %file,
+                    dropped = stale,
+                    "dropped resolutions for references the current parse no longer has"
+                );
+            }
+
+            tracing::debug!(
+                event = "live.report",
+                session = %session,
+                file = %file,
+                emitted = outcome.emitted,
+                pending = outcome.pending,
+                "live resolution report applied"
+            );
+            (
+                ControlResponse::ok(Some(format!(
+                    "{} live, {} pending",
+                    outcome.emitted, outcome.pending
+                ))),
+                false,
+            )
         }
         Ok(ControlMessage::ReportLspDiagnostics {
             repo_root: reported_root,

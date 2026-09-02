@@ -253,6 +253,9 @@ fn handle_tool_call(
             // #319 P3: LOD repo-map overview mode + package drill path_prefix.
             let mode = args["mode"].as_str().unwrap_or("");
             let path_prefix = args["path_prefix"].as_str().unwrap_or("");
+            // RFC-027 section 10: optional, and absent means "everything", so an
+            // existing caller keeps seeing the fresher graph unchanged.
+            let provenance = args["provenance"].as_str().unwrap_or("");
             tools::get_graph_json(
                 store,
                 &tools::GraphJsonParams {
@@ -263,6 +266,7 @@ fn handle_tool_call(
                     token_budget,
                     mode,
                     path_prefix,
+                    provenance,
                 },
             )
         }
@@ -497,6 +501,7 @@ pub fn tools_list() -> serde_json::Value {
                         "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
+                        "provenance": { "type": "string", "enum": ["", "ratified", "tree-sitter", "lsif", "scip", "live"], "description": "Restrict edges by how they were derived. Default empty returns everything, including 'live' edges resolved from uncommitted edits and not yet ratified. Use 'ratified' to exclude those and see only what the commit-gated pipeline has confirmed. Every edge in the response carries its own 'provenance' field." },
                         "token_budget": { "type": "integer", "description": "Cap the payload to roughly this many tokens (0 or omitted = unlimited). Truncation is reported via truncated_by_budget." },
                         "mode": { "type": "string", "enum": ["", "overview"], "description": "'overview' returns directory-level component tiles (each with file_count and dependents) plus cross-component dependency edges from the resolved graph, ranked by how depended-upon each component is. Combine with path_prefix to drill into a component." },
                         "path_prefix": { "type": "string", "description": "When mode='overview', scope to files under this path prefix (e.g. 'src/components/'). Returns file nodes inside the prefix plus external package nodes for cross-boundary dependencies." }
@@ -886,6 +891,9 @@ fn handle_tool_call_global(
             let kind_filter = args["kind_filter"].as_str().unwrap_or("");
             let mode = args["mode"].as_str().unwrap_or("");
             let path_prefix = args["path_prefix"].as_str().unwrap_or("");
+            // RFC-027 section 10: optional, and absent means "everything", so an
+            // existing caller keeps seeing the fresher graph unchanged.
+            let provenance = args["provenance"].as_str().unwrap_or("");
             tools::get_graph_json_global(
                 repos,
                 repo_arg,
@@ -897,6 +905,7 @@ fn handle_tool_call_global(
                     token_budget: 0,
                     mode,
                     path_prefix,
+                    provenance,
                 },
             )
         }
@@ -1142,6 +1151,7 @@ pub fn tools_list_global() -> serde_json::Value {
                         "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
+                        "provenance": { "type": "string", "enum": ["", "ratified", "tree-sitter", "lsif", "scip", "live"], "description": "Restrict edges by how they were derived. Default empty returns everything, including 'live' edges resolved from uncommitted edits and not yet ratified. Use 'ratified' to exclude those and see only what the commit-gated pipeline has confirmed. Every edge in the response carries its own 'provenance' field." },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." },
                         "mode": { "type": "string", "enum": ["", "overview"], "description": "'overview' returns directory-level component tiles (each with file_count and dependents) plus cross-component dependency edges from the resolved graph." },
                         "path_prefix": { "type": "string", "description": "When mode='overview', scope to files under this path prefix. Returns file nodes inside the prefix plus external package nodes for cross-boundary dependencies." }

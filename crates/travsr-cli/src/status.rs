@@ -15,6 +15,41 @@ use crate::repo::find_git_root;
 /// #583: equal markers are not sufficient evidence of freshness. A watcher
 /// reindex rewrites a file's Phase A nodes and drops that file's `ref/call`
 /// edges without moving HEAD, so both markers still agree while `get_callers`
+/// RFC-027 section 12: render the cumulative live-lane precision reading.
+///
+/// Returns `None` when nothing has been measured, so the line never appears on a
+/// repo that has not exercised the lane.
+///
+/// Coverage is always shown beside precision. A precision figure alone invites
+/// the reading "1.00 means it is perfect", when it may mean "two of four hundred
+/// claims were checkable and both happened to be right". The gate is on
+/// precision; coverage is what tells you whether the gate saw anything.
+fn live_precision_line(store: &travsr_store::SqliteStore) -> Option<String> {
+    let raw = store.get_meta("live_precision").ok().flatten()?;
+    let parts: Vec<u64> = raw
+        .split(',')
+        .filter_map(|p| p.trim().parse::<u64>().ok())
+        .collect();
+    let [agree, disagree, unverifiable] = parts.as_slice() else {
+        return None;
+    };
+    let total = agree + disagree + unverifiable;
+    if total == 0 {
+        return None;
+    }
+    let verified = agree + disagree;
+    let precision = if verified > 0 {
+        format!("{:.4}", *agree as f64 / verified as f64)
+    } else {
+        // Not "1.0000": nothing was checked, and saying so is the point.
+        "n/a".to_string()
+    };
+    Some(format!(
+        "live lane: precision {precision} over {verified}/{total} verifiable claims \
+         ({disagree} disagreed with semantic analysis)"
+    ))
+}
+
 /// and `get_blast_radius` answer from a graph degraded below the committed
 /// snapshot. Reporting `complete` there is the actual harm; the edges
 /// themselves return on the next commit's Phase B run.
@@ -171,6 +206,22 @@ pub fn run() -> anyhow::Result<()> {
         "nodes: {} | edges: {} | schema: v{} | last_commit: {} | semantic: {}{}",
         payload.nodes, payload.edges, payload.schema, last_commit, phase_b_state, rerank_segment
     );
+
+    // RFC-027 section 12: the live lane's measured precision, so the per-language
+    // shipping gate has a number a human can read rather than a log line that
+    // scrolled away.
+    //
+    // Read straight from the store rather than added to `StatusPayload`: this is
+    // a diagnostic, and threading it through the query payload would mean a
+    // protocol bump that every mixed CLI/daemon pair then has to survive.
+    //
+    // Silent when the lane has never claimed anything, which is every repo that
+    // has not used it — a counter of zero is not news.
+    if let Ok(store) = daemon_client::open_read_store(&db_path) {
+        if let Some(line) = live_precision_line(&store) {
+            println!("{line}");
+        }
+    }
 
     // #645 WS-B: the freshness markers only ever compare against each other,
     // never against the repository. Compare the caller's live HEAD (read at cwd,
@@ -399,6 +450,52 @@ mod tests {
     /// `Command::output()`. These pin the two answers it must give without
     /// hanging for either: a real repo reports a short SHA, a directory that is
     /// not a repo reports nothing.
+    /// The line never appears on a repo that has not used the live lane, and
+    /// never reports a precision it did not measure.
+    #[test]
+    fn live_precision_line_is_silent_until_something_is_measured() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        assert_eq!(live_precision_line(&store), None, "no reading, no line");
+
+        store.set_meta("live_precision", "0,0,0").unwrap();
+        assert_eq!(
+            live_precision_line(&store),
+            None,
+            "an empty tally is not news"
+        );
+
+        store.set_meta("live_precision", "garbage").unwrap();
+        assert_eq!(
+            live_precision_line(&store),
+            None,
+            "a corrupt value is not a reading"
+        );
+    }
+
+    /// Coverage is always shown, and an unverified sample says so instead of
+    /// rendering a perfect score it did not earn.
+    #[test]
+    fn live_precision_line_reports_coverage_beside_precision() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        store.set_meta("live_precision", "99,1,100").unwrap();
+        let line = live_precision_line(&store).unwrap();
+        assert!(line.contains("0.9900"), "precision: {line}");
+        assert!(line.contains("100/200"), "coverage must be visible: {line}");
+        assert!(
+            line.contains("1 disagreed"),
+            "false positives named: {line}"
+        );
+
+        // Nothing checkable: must not read as perfect.
+        store.set_meta("live_precision", "0,0,40").unwrap();
+        let line = live_precision_line(&store).unwrap();
+        assert!(
+            line.contains("n/a"),
+            "forty unchecked claims must not render as 1.0000: {line}"
+        );
+    }
+
     #[test]
     fn head_at_reports_a_sha_inside_a_repo_and_none_outside() {
         let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

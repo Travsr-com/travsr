@@ -717,17 +717,35 @@ fn is_containment_edge(kind: &travsr_core::EdgeKind) -> bool {
 /// containment edge reached in `Callers`/`Both` direction (#517 DD-1): the
 /// node is still recorded and displayed, but the traversal does not walk
 /// further from it, so a file's other definitions never enter the BFS queue.
+/// The read-side provenance of an edge that came out of a store reader, with a
+/// `tree-sitter` fallback for a constructed edge that never carried one.
+fn prov_of(e: &travsr_core::Edge) -> String {
+    e.provenance
+        .clone()
+        .unwrap_or_else(|| "tree-sitter".to_string())
+}
+
+/// One expansion step out of [`next_edges`]:
+/// `(edge_kind, next_id, expand, incoming, provenance)`. The 5th element is the
+/// edge's true `edges.provenance` (DEBT-75).
+pub type NextEdge = (travsr_core::EdgeKind, NodeId, bool, bool, String);
+
 pub fn next_edges(
     store: &SqliteStore,
     node_id: NodeId,
     direction: QueryDirection,
     edge_mode: QueryEdgeMode,
     is_seed: bool,
-) -> anyhow::Result<Vec<(travsr_core::EdgeKind, NodeId, bool, bool)>> {
+) -> anyhow::Result<Vec<NextEdge>> {
+    // DEBT-75: the 5th element is the edge's true `edges.provenance`, carried
+    // through from the store readers so callers no longer have to assume
+    // "tree-sitter". `unwrap_or` only fires on a constructed (never-read) edge,
+    // which cannot reach here.
     let mut out = Vec::new();
     if matches!(direction, QueryDirection::Deps | QueryDirection::Both) {
         for e in store.iter_edges_from(node_id)? {
-            out.push((e.kind, e.dst, true, false));
+            let prov = e.provenance.unwrap_or_else(|| "tree-sitter".to_string());
+            out.push((e.kind, e.dst, true, false, prov));
         }
     }
     if matches!(direction, QueryDirection::Callers | QueryDirection::Both) {
@@ -769,7 +787,7 @@ pub fn next_edges(
                 for e in &incoming {
                     let s = &e.kind;
                     if is_semantic_edge(s) || matches!(s, travsr_core::EdgeKind::DefinesBinding) {
-                        out.push((*s, e.src, !is_containment_edge(s), true));
+                        out.push((*s, e.src, !is_containment_edge(s), true, prov_of(e)));
                     }
                 }
             } else {
@@ -779,24 +797,24 @@ pub fn next_edges(
                 // judged from coverage in graph_query, not from this one node.
                 for e in &incoming {
                     let s = &e.kind;
-                    out.push((*s, e.src, !is_containment_edge(s), true));
+                    out.push((*s, e.src, !is_containment_edge(s), true, prov_of(e)));
                 }
             }
         } else {
             for e in &incoming {
                 let s = &e.kind;
-                out.push((*s, e.src, !is_containment_edge(s), true));
+                out.push((*s, e.src, !is_containment_edge(s), true, prov_of(e)));
             }
         }
     }
     // Multiple call sites (and the file-node definition splice) can yield the
     // same (kind, src, orientation) triple — collapse them for display.
     let mut seen = HashSet::new();
-    out.retain(|(kind, id, _, incoming)| seen.insert((*kind, *id, *incoming)));
+    out.retain(|(kind, id, _, incoming, _)| seen.insert((*kind, *id, *incoming)));
     // #517 DD-1: non-containment edges (the answer) precede containment edges
     // (orientation) from the same parent. Stable sort preserves DB order
     // within each group, so output stays deterministic.
-    out.sort_by_key(|(kind, _, _, _)| is_containment_edge(kind));
+    out.sort_by_key(|(kind, _, _, _, _)| is_containment_edge(kind));
     Ok(out)
 }
 
@@ -909,7 +927,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             continue;
         }
 
-        for (edge_kind, next_id, child_expand, edge_incoming) in next_edges(
+        for (edge_kind, next_id, child_expand, edge_incoming, edge_provenance) in next_edges(
             store,
             current_id,
             args.direction,
@@ -923,15 +941,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             } else {
                 (current_id, next_id)
             };
-            // DEBT(travsr-75): iter_edges_from/to do not return provenance, so
-            // BFS-traversed edges always show "tree-sitter" in JSON output even
-            // when the DB row is "lsif". Only --all mode (all_edges) is correct.
-            edges_raw.push((
-                src,
-                dst,
-                edge_kind.as_str().to_string(),
-                "tree-sitter".to_string(),
-            ));
+            edges_raw.push((src, dst, edge_kind.as_str().to_string(), edge_provenance));
 
             if !visited.contains(&next_id) {
                 if let Some(next_node) = store.get_node(next_id)? {

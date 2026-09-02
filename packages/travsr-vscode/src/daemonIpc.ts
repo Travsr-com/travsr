@@ -186,6 +186,185 @@ export async function reportLspDiagnostics(
   });
 }
 
+/** One reference an editor's language provider resolved (RFC-027). */
+export interface LiveResolutionItem {
+  /** 1-based line of the reference in the dirty file. */
+  ref_line: number;
+  /** 0-based UTF-16 column, as VS Code counts them. */
+  ref_col: number;
+  /** The referenced name, for the daemon's pending bookkeeping. */
+  name: string;
+  /** Repo-relative path of the definition, forward slashes. */
+  target_path: string;
+  /** 1-based line of the definition. */
+  target_line: number;
+  /** Document version this answer was computed against. */
+  buffer_version: number;
+  /**
+   * Graph edge kind this reference resolves to, as `EdgeKind::as_str`
+   * (`ref/call`, `ref/field`, `ref/imports`, `is-implementation`, `overrides`).
+   * Echoed from the daemon's target so it emits an edge of exactly that kind
+   * (RFC-027 live edge-kind scope).
+   */
+  edge_kind: string;
+}
+
+/**
+ * One reference the daemon asked this editor to resolve (RFC-027 daemon-driven
+ * positions). The daemon detected it and named its edge kind; the editor finds
+ * the column and runs the provider.
+ */
+export interface LiveResolutionTargetItem {
+  /** 1-based line of the reference in the dirty file. */
+  ref_line: number;
+  /** The referenced name — the editor finds its column on `ref_line`. */
+  name: string;
+  /** Edge kind to carry back on the resolved `LiveResolutionItem`. */
+  edge_kind: string;
+  /** Which provider answers this reference: `definition` or `implementation`. */
+  provider: string;
+}
+
+/**
+ * The targets in one dependent file the editor should also resolve
+ * (RFC-027 section 8.7.5, the interface-edit closure). The editor opens the
+ * file, resolves its `targets`, and reports back keyed to `file`.
+ */
+export interface DependentTargetsItem {
+  /** Repo-relative path of the dependent, forward slashes. */
+  file: string;
+  /** The references in `file` to resolve. */
+  targets: LiveResolutionTargetItem[];
+}
+
+/**
+ * The full answer to a target request: the saved file's own references plus the
+ * dependents the interface-edit closure wants re-resolved (RFC-027 §8.7.5).
+ */
+export interface LiveResolutionTargetsResult {
+  own: LiveResolutionTargetItem[];
+  dependents: DependentTargetsItem[];
+}
+
+/**
+ * Ask the daemon which references in a dirty file this editor should resolve
+ * (RFC-027 daemon-driven positions).
+ *
+ * Unlike the fire-and-forget reports, this reads a response: the owning daemon
+ * answers with `{ own, dependents }`, other daemons reject on the repo-identity
+ * guard. Returns empty on every miss — no daemon, a daemon too old to know the
+ * op or one that still answers with a bare array, a malformed answer — so the
+ * caller simply resolves nothing that round.
+ */
+export async function requestLiveResolutionTargets(
+  repoRoot: string,
+  file: string,
+  bufferVersion: number
+): Promise<LiveResolutionTargetsResult> {
+  const result = await request(repoRoot, {
+    op: "request-live-resolution-targets",
+    repo_root: repoRoot,
+    session: SESSION_ID,
+    file,
+    buffer_version: bufferVersion,
+  });
+  const empty: LiveResolutionTargetsResult = { own: [], dependents: [] };
+  if (!result || typeof result !== "object" || Array.isArray(result)) return empty;
+  const r = result as Partial<LiveResolutionTargetsResult>;
+  return {
+    own: Array.isArray(r.own) ? r.own : [],
+    dependents: Array.isArray(r.dependents) ? r.dependents : [],
+  };
+}
+
+/**
+ * Send one control message and read the daemon's response, best-first.
+ *
+ * Broadcasts like {@link send}, but the owning daemon is the one that answers
+ * with a truthy `result` (others reject on the repo guard), so the first such
+ * `result` is taken. Returns `null` when no daemon answered usefully.
+ */
+async function request(repoRoot: string, payload: object): Promise<unknown> {
+  const line = JSON.stringify(payload) + "\n";
+  const candidates = candidateSocketPaths(repoRoot);
+  const responses = await Promise.all(
+    candidates.map((c) => requestLine(c, line))
+  );
+  for (const r of responses) {
+    if (
+      r &&
+      typeof r === "object" &&
+      (r as { ok?: boolean }).ok === true &&
+      (r as { result?: unknown }).result != null
+    ) {
+      return (r as { result?: unknown }).result;
+    }
+  }
+  return null;
+}
+
+/** Write one control line and read back one newline-terminated JSON response. */
+function requestLine(socketPath: string, line: string): Promise<unknown> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let buf = "";
+    const finish = (v: unknown): void => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      resolve(v);
+    };
+    const tryParse = (): void => {
+      const nl = buf.indexOf("\n");
+      if (nl < 0) return;
+      try {
+        finish(JSON.parse(buf.slice(0, nl)));
+      } catch {
+        finish(null);
+      }
+    };
+
+    const sock = net.connect(socketPath);
+    sock.setTimeout(CONNECT_TIMEOUT_MS);
+    sock.on("connect", () => sock.write(line));
+    sock.on("data", (d: Buffer) => {
+      buf += d.toString("utf8");
+      tryParse();
+    });
+    // A short line with no trailing newline still parses on end.
+    sock.on("end", () => {
+      tryParse();
+      finish(null);
+    });
+    sock.on("error", () => finish(null));
+    sock.on("timeout", () => finish(null));
+  });
+}
+
+/**
+ * Publish where references in a dirty file actually resolve (RFC-027).
+ *
+ * Unlike `reportLspDiagnostics` this carries no lease: a live edge's lifetime
+ * is bounded by commit-time ratification in the daemon, not by a TTL here.
+ *
+ * Same fire-and-forget contract as everything else in this file. Losing a
+ * report costs freshness, never truth: the daemon abstains rather than
+ * guessing, and the commit-gated path resolves the same references anyway.
+ */
+export async function reportLiveResolution(
+  repoRoot: string,
+  file: string,
+  resolutions: LiveResolutionItem[]
+): Promise<boolean> {
+  return send(repoRoot, {
+    op: "report-live-resolution",
+    repo_root: repoRoot,
+    session: SESSION_ID,
+    file,
+    resolutions,
+  });
+}
+
 /**
  * Drop this window's view now, rather than leaving it to expire.
  *

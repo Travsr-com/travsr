@@ -1013,7 +1013,7 @@ pub fn is_scip_anonymous_local(sig: &str) -> bool {
 }
 
 /// A directed, typed edge between two nodes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct Edge {
     pub src: NodeId,
     pub dst: NodeId,
@@ -1022,6 +1022,32 @@ pub struct Edge {
     /// `None` for all non-FFI edges. Stored in `edges.confidence` (migration v6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<u8>,
+    /// How this edge was derived: the `edges.provenance` tag required by
+    /// ADR-002 Rule 1 (`tree-sitter` / `lsif` / `scip` / `bridge:<mech>`).
+    ///
+    /// This is a **read-side** field, populated by the store's `iter_edges_*`
+    /// readers so consumers (the MCP surface, `travsr graph --format json`) can
+    /// report an edge's true origin instead of assuming `tree-sitter`
+    /// (DEBT-75). It is `None` on an edge that was constructed rather than read.
+    /// Writers are unaffected: every insert path still takes its provenance as
+    /// an explicit argument, so there is exactly one source of truth on write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
+}
+
+/// Equality is over `(src, dst, kind, confidence)` and deliberately **excludes**
+/// `provenance`: an edge's identity in the store is its `(src, dst, kind)`
+/// primary key, and provenance is metadata about how that one edge was derived,
+/// not a second edge. Two `Edge` values that differ only in provenance denote
+/// the same edge, so comparing a constructed edge against a read-back one stays
+/// meaningful.
+impl PartialEq for Edge {
+    fn eq(&self, other: &Self) -> bool {
+        self.src == other.src
+            && self.dst == other.dst
+            && self.kind == other.kind
+            && self.confidence == other.confidence
+    }
 }
 
 impl Edge {
@@ -1031,7 +1057,15 @@ impl Edge {
             dst,
             kind,
             confidence: None,
+            provenance: None,
         }
+    }
+
+    /// Attach a read-side provenance tag. Used by the store readers; see the
+    /// `provenance` field docs.
+    pub fn with_provenance(mut self, provenance: impl Into<String>) -> Self {
+        self.provenance = Some(provenance.into());
+        self
     }
 
     /// Build a cross-language FFI edge with a confidence score (RFC-005).
@@ -1047,6 +1081,7 @@ impl Edge {
             dst,
             kind: EdgeKind::FFICall,
             confidence: Some(confidence),
+            provenance: None,
         }
     }
 }
@@ -1108,6 +1143,26 @@ pub struct UnresolvedCall {
     /// were introduced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recv_type: Option<String>,
+}
+
+/// An `extends`/`implements` clause the native extractor found but does not
+/// resolve cross-file, for RFC-027's live `IsImplementation` lane.
+///
+/// Like [`UnresolvedCall`] it carries no identity — only the base type's simple
+/// name and the line it is written on, which is exactly what the live lane needs
+/// to resolve it (lexically against a unique repo-wide definition, or via the
+/// editor's definition provider) and to abstain otherwise. The daemon derives
+/// the edge's source (the implementing class) from the line and owns both node
+/// ids, so nothing here mints a VName.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct InheritanceRef {
+    /// The base type's simple name (the edge *target*), exactly as written: the
+    /// superclass in `class C extends B`, the interface in `implements I`.
+    pub base_name: String,
+    /// 1-based line the base name appears on — the class declaration line, which
+    /// the daemon maps to the implementing class (the edge source) via
+    /// `enclosing_definition_at`.
+    pub line: u32,
 }
 
 // ── Import Resolution ────────────────────────────────────────────────────────

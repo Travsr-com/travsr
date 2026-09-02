@@ -176,6 +176,23 @@ pub fn extract_native_phase_b(
     Ok((nodes, edges, unresolved, refs))
 }
 
+// RFC-027 live IsImplementation lane, Rust — DEFERRED, not implemented here.
+//
+// Rust's `impl Trait for Type` does not fit the live model TS/Python use, for
+// reasons that are structural, not effort:
+//   1. The `impl` block is a separate item from the type, so the natural edge
+//      source (`struct:Foo`) lives in a different file than the clause. Saving
+//      the impl file would not invalidate that edge, so deleting an impl would
+//      leave a stale (wrong) edge until the next commit — the exact §8.1 failure.
+//   2. Rust's own `impl:Foo` node carries no span and collapses every impl of a
+//      type into one node, so it cannot serve as a per-impl source either.
+//   3. Rust native Phase B emits no `IsImplementation` edge at all, so a live one
+//      has nothing to ratify against (swept every commit) and no oracle for the
+//      precision meter.
+// Making it correct requires teaching Rust's committed Phase B to emit
+// IsImplementation from a properly-spanned per-impl node first — a change to the
+// deterministic pipeline, tracked separately.
+
 // ── Cargo.toml dependency graph ───────────────────────────────────────────────
 
 fn extract_cargo_deps(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {

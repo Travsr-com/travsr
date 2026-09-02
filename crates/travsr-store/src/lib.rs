@@ -30,6 +30,29 @@ pub const NODE_EXACT_LOOKUP_LIMIT: usize = 21;
 /// Row cap on [`SqliteStore::search_nodes_by_name`] (fuzzy simple-name Tier 2).
 pub const NODE_NAME_SEARCH_LIMIT: usize = 100;
 
+/// Definition kinds [`SqliteStore::enclosing_definition_at`] recognises as an
+/// enclosing scope. Mirrors `definition_node_ids_in_file`; deliberately excludes
+/// `field` so a field read never resolves to an enclosing "definition" (#757).
+const ENCLOSING_DEFINITION_KINDS: &[&str] = &[
+    "function",
+    "method",
+    "fn",
+    "class",
+    "interface",
+    "struct",
+    "trait",
+    "enum",
+    "type",
+    "typedef",
+    "union",
+    "object",
+    "protocol",
+    "mixin",
+    "extension",
+    "namespace",
+    "init",
+];
+
 /// Type alias for the RFC-018 Step 4 semantic-ANN callback injected by the daemon.
 /// Returns `(NodeId, cosine_similarity_score)` pairs in descending score order.
 pub type EmbedKnnHook =
@@ -575,6 +598,43 @@ impl Migration for V22TestRole {
     }
 }
 
+/// RFC-027: `ref_resolution_state` (so an unresolved reference can be reported
+/// as pending instead of silently vanishing or being guessed at) plus the
+/// read-path indexes `Edge.provenance` needs (DEBT-75).
+///
+/// One migration rather than three. The table and its `resolved_dst` column
+/// started as two, which meant creating a table and immediately altering it
+/// within the same change, and the index work started as a third. None of them
+/// ever shipped — released code is at v22 — so they are collapsed here rather
+/// than spending three schema versions on one feature.
+///
+/// The collapse strands one population: a dev database an earlier revision of
+/// this branch already stamped at 24 or 25 sits above this max version and the
+/// runner skips it, so it keeps the pre-RFC-027 narrow indexes. That is healed
+/// outside the runner, at open, by
+/// [`SqliteStore::reconcile_provenance_indexes_if_needed`], which keeps the max
+/// schema version at 23. Shipped databases are at v22 and receive this v23 in
+/// full, so they never depend on the reconcile.
+struct V23RefResolutionState;
+impl Migration for V23RefResolutionState {
+    fn version(&self) -> u32 {
+        23
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // CREATE TABLE / INDEX IF NOT EXISTS is idempotent, and the two edge
+        // indexes are DROP-then-CREATE because their names already exist.
+        store.exec_ddl(include_str!("migrations/v23_ref_resolution_state.sql"))?;
+        // `CREATE TABLE IF NOT EXISTS` cannot widen a table an earlier build of
+        // this same change already created without `resolved_dst`. Guarded
+        // rather than assumed, matching V21/V22, because a missing column
+        // surfaces as a confusing runtime error rather than a clean failure.
+        if !store.column_exists("ref_resolution_state", "resolved_dst")? {
+            store.exec_ddl("ALTER TABLE ref_resolution_state ADD COLUMN resolved_dst INTEGER")?;
+        }
+        Ok(())
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -600,7 +660,73 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V20PurgeOrphanEdgeSites);
     r.register(V21LexicalSplit);
     r.register(V22TestRole);
+    r.register(V23RefResolutionState);
     r
+}
+
+/// RFC-027 section 9.2: one reference the live lane examined, and what became
+/// of it.
+///
+/// `resolved_dst` is `None` for a `pending` row — an abstention resolved to
+/// nothing, which is the whole point of it.
+#[derive(Debug, Clone)]
+pub struct RefResolution {
+    pub src: NodeId,
+    pub ref_line: u32,
+    pub ref_col: u32,
+    pub name: String,
+    /// `"resolved"` or `"pending"`.
+    pub state: &'static str,
+    pub resolved_dst: Option<NodeId>,
+}
+
+/// RFC-027 section 12: how the live lane scored against Phase B.
+///
+/// Deliberately three buckets, not two. `unverifiable` is the honest home for a
+/// live claim Phase B left no call-site evidence for — Phase B has its own
+/// recall gaps, and the code can change between the edit and the commit, so
+/// "Phase B did not produce this" is not the same statement as "the live lane
+/// was wrong". Folding those into `disagree` would make the meter pessimistic
+/// and unactionable, and a meter nobody believes does not gate anything.
+///
+/// Precision is therefore reported over the verified subset only, with coverage
+/// beside it. Precision without coverage would let 1.0 over two of five hundred
+/// claims read as a passing grade.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LivePrecision {
+    /// Live claims Phase B resolved to the same target at the same call site.
+    pub agree: u64,
+    /// Live claims Phase B resolved to a *different* target at that site. These
+    /// are true false positives, and the number the shipping gate exists for.
+    pub disagree: u64,
+    /// Live claims with no ratified call-site evidence either way.
+    pub unverifiable: u64,
+}
+
+impl LivePrecision {
+    /// Agreement over the verified subset, or `None` when nothing was verifiable.
+    ///
+    /// `None` rather than `1.0`: a lane that resolved nothing verifiable has not
+    /// earned a perfect score, and returning one would let an empty sample clear
+    /// the shipping gate.
+    pub fn precision(&self) -> Option<f64> {
+        let verified = self.agree + self.disagree;
+        (verified > 0).then(|| self.agree as f64 / verified as f64)
+    }
+
+    /// Fraction of live claims that could be checked at all.
+    pub fn coverage(&self) -> f64 {
+        let total = self.agree + self.disagree + self.unverifiable;
+        if total == 0 {
+            return 0.0;
+        }
+        (self.agree + self.disagree) as f64 / total as f64
+    }
+
+    /// Total live claims this sample covers.
+    pub fn claims(&self) -> u64 {
+        self.agree + self.disagree + self.unverifiable
+    }
 }
 
 /// The storage interface every Travsr backend must satisfy.
@@ -894,6 +1020,9 @@ impl SqliteStore {
                 .run(&mut store)
                 .context("running SQLite migrations")?;
             store
+                .reconcile_provenance_indexes_if_needed()
+                .context("reconciling RFC-027 provenance indexes (issue B)")?;
+            store
                 .backfill_fts_if_needed()
                 .context("backfilling FTS index")?;
             store
@@ -992,6 +1121,9 @@ impl SqliteStore {
             sqlite_migration_runner()
                 .run(&mut store)
                 .context("running SQLite migrations (in-memory)")?;
+            store
+                .reconcile_provenance_indexes_if_needed()
+                .context("reconciling RFC-027 provenance indexes in-memory (issue B)")?;
             store
                 .backfill_fts_if_needed()
                 .context("backfilling FTS index (in-memory)")?;
@@ -2476,6 +2608,165 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Stable content fingerprint of every node, for equality assertions.
+    ///
+    /// Ordered by id so two graphs built by different routes compare directly.
+    pub fn node_fingerprint(&self) -> Result<Vec<String>, StoreError> {
+        (|| -> AnyResult<Vec<String>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT corpus || '|' || path || '|' || signature || '|' || kind \
+                     FROM nodes ORDER BY id",
+                )
+                .context("node_fingerprint: prepare")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .context("node_fingerprint: query")?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.context("node_fingerprint: decode")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Stable content fingerprint of every edge **including its provenance**.
+    ///
+    /// Provenance is in the fingerprint on purpose. The RFC-027 convergence
+    /// property is not "the same number of edges" but "the same graph", and an
+    /// un-ratified `live` row sitting where a `scip` row belongs has the same
+    /// count and the wrong meaning. Counting alone would let exactly the
+    /// failure this property exists to rule out slip through.
+    pub fn edge_fingerprint(&self) -> Result<Vec<String>, StoreError> {
+        (|| -> AnyResult<Vec<String>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT src || '|' || dst || '|' || kind || '|' || provenance \
+                     FROM edges ORDER BY src, dst, kind",
+                )
+                .context("edge_fingerprint: prepare")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .context("edge_fingerprint: query")?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.context("edge_fingerprint: decode")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 8.3: retire the live overlay for the languages that just
+    /// completed a Phase B run.
+    ///
+    /// Most live edges never reach this. When Phase B re-derives an edge the
+    /// live lane had already found, the ratification write upserts the same
+    /// `(src, dst, kind)` row and relabels its provenance, so the edge is
+    /// ratified *in place*. What is still marked `live` afterwards is exactly
+    /// the set Phase B did **not** re-derive, which is why deleting it cannot
+    /// lose a real edge. That is also why the ratification writes must run
+    /// first, and must not be prevented from overwriting a `live` row.
+    ///
+    /// **Scoped, not blanket.** The Phase B completion marker advances whenever
+    /// *any* language produced results, even when another language's sidecar
+    /// crashed (#712). A blanket delete would therefore discard the overlay for
+    /// a language whose truth was never re-derived, taking away precision the
+    /// developer had a moment earlier and not giving it back until that sidecar
+    /// is fixed and a later commit runs. Live edges for a crashed language
+    /// survive, still labeled `live`, which is honest.
+    ///
+    /// Keyed on the **src node's** language rather than `edges.language`, which
+    /// is a derived label reconciled after the fact and defaulted at insert
+    /// time, so it cannot be trusted as the scoping key.
+    ///
+    /// Invariant #4 is unaffected: a clean run has nothing crashed, so every
+    /// language that has nodes is in `languages` and the sweep is total.
+    pub fn sweep_live_edges_for_languages(
+        &mut self,
+        languages: &[String],
+    ) -> Result<u64, StoreError> {
+        if languages.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(languages.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM edges WHERE provenance = 'live' \
+             AND src IN (SELECT id FROM nodes WHERE language IN ({placeholders}))"
+        );
+        self.conn
+            .execute(&sql, params_from_iter(languages.iter()))
+            .map(|n| n as u64)
+            .context("sweeping live edges for ratified languages")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Scoped orphan sweep for the incremental path: drop edges *owned by*
+    /// `paths` whose destination is absent from `nodes`.
+    ///
+    /// The init path already guarantees this. `flush_staging_to_production`
+    /// promotes every node in the batch and then drops any staged edge with a
+    /// missing endpoint, which it calls making "no orphan edges" a store
+    /// invariant at the staging boundary. `reindex_replace` had no equivalent,
+    /// so the two paths disagreed and Invariant #4 (incremental == full) failed
+    /// in the orphan dimension.
+    ///
+    /// The edges this matters for are speculative by construction. TypeScript
+    /// import resolution emits a `resolves-to` candidate per plausible
+    /// extension (`./user` becomes `user.ts`, `user.tsx`, `user.js`) because it
+    /// cannot know which one exists without touching the store. On a full index
+    /// the losers are dropped at the staging boundary; incrementally they
+    /// survived, so every ordinary TypeScript edit left two dead edges behind
+    /// and `fsck` reported orphans on a healthy repo.
+    ///
+    /// **Call this after the whole batch is written, never per file.** That is
+    /// the same position the staging flush occupies: an edge from an
+    /// already-processed file to one later in the same batch is legitimately
+    /// dangling until that file's nodes land, and sweeping mid-batch would
+    /// delete it.
+    ///
+    /// Scoped to `paths` rather than the whole table because the unscoped
+    /// [`sweep_orphans`] is a full edge scan, which is a fine cost for `fsck`
+    /// and not one to pay on every save.
+    pub fn sweep_orphan_edges_for_paths(
+        &mut self,
+        corpus: &str,
+        paths: &[String],
+    ) -> Result<u64, StoreError> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        (|| -> AnyResult<u64> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("sweep_orphan_edges_for_paths: begin")?;
+            let mut swept = 0u64;
+            for path in paths {
+                // `src IN (…)` hits the edges primary key prefix, so this is a
+                // bounded probe per path rather than a scan of the edge table.
+                swept += tx
+                    .execute(
+                        "DELETE FROM edges \
+                         WHERE src IN (SELECT id FROM nodes WHERE corpus = ?1 AND path = ?2) \
+                           AND dst NOT IN (SELECT id FROM nodes)",
+                        params![corpus, path],
+                    )
+                    .context("sweeping orphan edges for path")? as u64;
+            }
+            tx.commit()
+                .context("sweep_orphan_edges_for_paths: commit")?;
+            Ok(swept)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Orphan-edge sweep: deletes every edge whose src or dst is absent from
     /// `nodes`. Should return 0 in correct operation after Tiers 0–2; a non-zero
     /// count indicates a write-path invariant violation.
@@ -3659,6 +3950,54 @@ LIMIT ?4",
         Ok(())
     }
 
+    /// Persist an edge resolved by the RFC-027 live lane (`provenance='live'`).
+    ///
+    /// Live edges are an ephemeral overlay over the commit-gated semantic graph:
+    /// Tree-sitter detected the reference, the live engine resolved it precisely
+    /// (unambiguous-lexical or LSP-disambiguated), and the next Phase B run
+    /// ratifies it.
+    ///
+    /// **The overlay is purely additive: this never relabels an edge that
+    /// already exists.** That is what makes retiring it safe. The sweep in
+    /// [`sweep_live_edges_for_languages`] deletes rows, so anything it can
+    /// reach must be something the live lane itself created — otherwise
+    /// retiring the overlay would destroy pre-existing truth rather than
+    /// returning the graph to what it was.
+    ///
+    /// The hazard is concrete, not theoretical. An interface edit re-resolves
+    /// the files that reference the edited one (section 6.3), and those files
+    /// were *not* re-parsed, so their `tree-sitter` edges are still in place. An
+    /// upsert that relabelled them `live` would hand them to the sweep, and any
+    /// one Phase B did not happen to re-derive would be deleted outright. The
+    /// convergence property test is what surfaced this.
+    ///
+    /// So the `ON CONFLICT` only refreshes a row that is *already* `live`, which
+    /// keeps re-emission idempotent — `reindex_replace` deletes every outbound
+    /// edge of a file on each save, so the engine re-emits whole-file rather
+    /// than only for references it believes are new. Every other provenance is
+    /// left exactly as it was.
+    ///
+    /// This never mints identity (RFC-027 section 8.2): both endpoints must
+    /// already exist as nodes, so the fencing rule and VName uniqueness hold.
+    pub fn put_edge_live(&mut self, edge: &Edge) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO edges(src, dst, kind, provenance, confidence) VALUES(?1, ?2, ?3, 'live', ?4) \
+                 ON CONFLICT(src, dst, kind) DO UPDATE SET \
+                   confidence = excluded.confidence \
+                 WHERE edges.provenance = 'live'",
+                params![
+                    node_id_to_i64(edge.src),
+                    node_id_to_i64(edge.dst),
+                    edge.kind.as_str(),
+                    edge.confidence.map(|c| c as i64),
+                ],
+            )
+            .context("inserting live edge")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// PR #715: batch-check which of `ids` already exist in `nodes`, one query per
     /// chunk rather than a `SELECT 1` per id, for the Phase B half-edge guard.
     ///
@@ -3800,6 +4139,15 @@ LIMIT ?4",
                 // ('lsif'/'scip') already on the row is never demoted by a later
                 // write (ADR-002), so a heuristic 'tree-sitter' write cannot
                 // overwrite it.
+                //
+                // RFC-027: the ELSE arm demoting a 'live' row to 'tree-sitter'
+                // is deliberate, not a leak. Both callers that pass a
+                // 'tree-sitter' provenance (`init_repo_with_progress` and
+                // `run_background_phase_b_inner`) are Phase B runs, so reaching
+                // here means Phase B just re-derived this edge and it is no
+                // longer a live guess. Demotion IS ratification for a
+                // co-located edge, and it is what leaves the section 8.3 sweep
+                // holding only the live edges Phase B did not re-derive.
                 tx.execute(
                     "INSERT INTO edges(src, dst, kind, provenance, confidence) \
                      VALUES(?1, ?2, ?3, ?4, ?5) \
@@ -4641,6 +4989,644 @@ LIMIT ?4",
         Ok(ids.into_iter().map(i64_to_node_id).collect())
     }
 
+    /// Count edges carrying `provenance`.
+    ///
+    /// RFC-027 leans on this twice: the Invariant #4 convergence check asserts
+    /// zero `live` rows in a committed graph, and the precision meter needs the
+    /// overlay's size. Cheap enough to call per assertion at fixture scale.
+    pub fn count_edges_with_provenance(&self, provenance: &str) -> Result<u64, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM edges WHERE provenance = ?1",
+                params![provenance],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .context("counting edges by provenance")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 12: upsert reference-resolution rows without clearing the
+    /// file's others.
+    ///
+    /// The editor lane arrives *after* the save-path pass has already recorded
+    /// every reference in the file, and it answers a subset of them. It must
+    /// therefore upgrade the rows it resolved rather than replace the set:
+    /// [`Self::replace_ref_resolution_states`] would delete the references the
+    /// editor did not answer, and those pending rows are the honest record of
+    /// what is still unresolved.
+    ///
+    /// Rows collide with the save-path pass on the `(src, ref_line, ref_col,
+    /// name)` primary key, so an editor answer flips that reference's existing
+    /// `pending` row to `resolved` in place instead of forking one reference
+    /// into two rows. That is what lets the precision meter score the editor
+    /// lane at all: without a claim row a resolution is invisible to
+    /// [`Self::live_precision_sample_by_language`], and a language that runs the
+    /// editor lane alone could never earn the per-language gate a reading.
+    pub fn upsert_ref_resolution_states(
+        &mut self,
+        rows: &[RefResolution],
+    ) -> Result<(), StoreError> {
+        (|| -> AnyResult<()> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("upsert_ref_resolution_states: begin")?;
+            for r in rows {
+                tx.execute(
+                    "INSERT INTO ref_resolution_state(src, ref_line, ref_col, name, state, resolved_dst) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT(src, ref_line, ref_col, name) DO UPDATE SET \
+                       state = excluded.state, resolved_dst = excluded.resolved_dst",
+                    params![
+                        node_id_to_i64(r.src),
+                        r.ref_line as i64,
+                        r.ref_col as i64,
+                        r.name,
+                        r.state,
+                        r.resolved_dst.map(node_id_to_i64),
+                    ],
+                )
+                .context("upserting ref_resolution_state row")?;
+            }
+            tx.commit().context("upsert_ref_resolution_states: commit")?;
+            Ok(())
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 9.2: replace a file's reference-resolution rows.
+    ///
+    /// Called once per live pass over a file, with every reference that pass
+    /// saw and what became of it. Whole-file replacement rather than
+    /// incremental patching, for the same reason the live engine re-emits
+    /// whole-file: `reindex_replace` has just rewritten the file's nodes, so
+    /// any row keyed on a node that no longer exists is stale by construction.
+    ///
+    /// `rows` are `(src, ref_line, ref_col, name, state)` where `state` is
+    /// `"pending"` or `"resolved"`. Owned by `src`'s file, mirroring how
+    /// `edge_sites` scopes ownership, so the delete below can be keyed on the
+    /// same `(corpus, path)` predicate.
+    pub fn replace_ref_resolution_states(
+        &mut self,
+        corpus: &str,
+        path: &str,
+        rows: &[RefResolution],
+    ) -> Result<(), StoreError> {
+        (|| -> AnyResult<()> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("replace_ref_resolution_states: begin")?;
+            tx.execute(
+                "DELETE FROM ref_resolution_state \
+                 WHERE src IN (SELECT id FROM nodes WHERE corpus = ?1 AND path = ?2)",
+                params![corpus, path],
+            )
+            .context("clearing this file's ref_resolution_state rows")?;
+            for r in rows {
+                tx.execute(
+                    "INSERT INTO ref_resolution_state(src, ref_line, ref_col, name, state, resolved_dst) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT(src, ref_line, ref_col, name) DO UPDATE SET \
+                       state = excluded.state, resolved_dst = excluded.resolved_dst",
+                    params![
+                        node_id_to_i64(r.src),
+                        r.ref_line as i64,
+                        r.ref_col as i64,
+                        r.name,
+                        r.state,
+                        r.resolved_dst.map(node_id_to_i64),
+                    ],
+                )
+                .context("inserting ref_resolution_state row")?;
+            }
+            tx.commit()
+                .context("replace_ref_resolution_states: commit")?;
+            Ok(())
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 12: score the live lane's claims against Phase B's truth.
+    ///
+    /// Run at ratification, **after** the Phase B writes and **before** the
+    /// sweep. After, because it compares against what Phase B derived; before,
+    /// because the sweep is about to discard the evidence.
+    ///
+    /// Verification is at **call-site line** granularity, joining each live
+    /// claim in `ref_resolution_state` to the `edge_sites` rows Phase B recorded
+    /// for the same `(src, line)`. Anything coarser is not safe to gate on: a
+    /// function that calls several things would let a mis-targeted claim match
+    /// some *other* call's correct answer and score as agreement. An optimistic
+    /// meter is worse than none, because it clears a bar the lane has not met.
+    ///
+    /// A claim whose site Phase B recorded nothing for is `unverifiable`, not
+    /// wrong — Phase B has recall gaps of its own, and the code can change
+    /// between the edit and the commit.
+    ///
+    /// `SCIP wins all ties` (section 12) falls out of the ordering rather than
+    /// needing a rule here: by the time this runs, Phase B has already written
+    /// its answer over any co-located live row.
+    pub fn live_precision_sample(&self) -> Result<LivePrecision, StoreError> {
+        (|| -> AnyResult<LivePrecision> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    // Per claim: does Phase B have any site at this line, and does
+                    // one of them name the same target?
+                    "SELECT \
+                       EXISTS (SELECT 1 FROM edge_sites s \
+                               WHERE s.src = r.src AND s.line = r.ref_line) AS has_site, \
+                       EXISTS (SELECT 1 FROM edge_sites s \
+                               WHERE s.src = r.src AND s.line = r.ref_line \
+                                 AND s.dst = r.resolved_dst) AS matches \
+                     FROM ref_resolution_state r \
+                     WHERE r.state = 'resolved' AND r.resolved_dst IS NOT NULL",
+                )
+                .context("live_precision_sample: prepare")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)? == 1, row.get::<_, i64>(1)? == 1))
+                })
+                .context("live_precision_sample: query")?;
+
+            let mut out = LivePrecision::default();
+            for row in rows {
+                match row.context("live_precision_sample: decode")? {
+                    (false, _) => out.unverifiable += 1,
+                    (true, true) => out.agree += 1,
+                    (true, false) => out.disagree += 1,
+                }
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 12: [`live_precision_sample`], split by language.
+    ///
+    /// The shipping gate is **per-language** ("if it cannot hold that bar for a
+    /// language, the lane is disabled for that language"), so the meter has to
+    /// attribute each claim to one. Attribution is by the **source** node's
+    /// language — the file that was edited, which is the file the live lane ran
+    /// on — the same key the ratification sweep scopes its delete on, so the
+    /// meter and the sweep never disagree about which language a row belongs to.
+    ///
+    /// Bucketing is in Rust rather than a SQL `GROUP BY` so the two per-claim
+    /// `EXISTS` sub-selects stay identical to [`live_precision_sample`]; the
+    /// only change is carrying `n.language` alongside them.
+    pub fn live_precision_sample_by_language(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, LivePrecision>, StoreError> {
+        (|| -> AnyResult<std::collections::BTreeMap<String, LivePrecision>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT n.language, \
+                       EXISTS (SELECT 1 FROM edge_sites s \
+                               WHERE s.src = r.src AND s.line = r.ref_line) AS has_site, \
+                       EXISTS (SELECT 1 FROM edge_sites s \
+                               WHERE s.src = r.src AND s.line = r.ref_line \
+                                 AND s.dst = r.resolved_dst) AS matches \
+                     FROM ref_resolution_state r \
+                     JOIN nodes n ON n.id = r.src \
+                     WHERE r.state = 'resolved' AND r.resolved_dst IS NOT NULL",
+                )
+                .context("live_precision_sample_by_language: prepare")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? == 1,
+                        row.get::<_, i64>(2)? == 1,
+                    ))
+                })
+                .context("live_precision_sample_by_language: query")?;
+
+            let mut out: std::collections::BTreeMap<String, LivePrecision> =
+                std::collections::BTreeMap::new();
+            for row in rows {
+                let (lang, has_site, matches) =
+                    row.context("live_precision_sample_by_language: decode")?;
+                let bucket = out.entry(lang).or_default();
+                match (has_site, matches) {
+                    (false, _) => bucket.unverifiable += 1,
+                    (true, true) => bucket.agree += 1,
+                    (true, false) => bucket.disagree += 1,
+                }
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 12: consume the claims the precision meter just scored.
+    ///
+    /// Called at ratification immediately after
+    /// [`Self::live_precision_sample_by_language`], because the meter is
+    /// **cumulative**: it adds each run's sample onto the counters in `meta`.
+    /// Nothing else retires a resolved row —
+    /// [`Self::replace_ref_resolution_states`] only fires on that file's next
+    /// save and [`Self::clear_resolved_pending_refs`] only touches `pending` —
+    /// so without this a claim recorded once is re-scored at every subsequent
+    /// commit. The *ratio* survives (both buckets inflate together), but the
+    /// sample size does not, and the sample size is what
+    /// `LIVE_PRECISION_MIN_SAMPLE` gates on: four real claims would cross a bar
+    /// meant to need twenty. A re-score is also not stable, because a claim
+    /// whose `ref_line` now belongs to a different call after later edits can
+    /// flip from agree to disagree and penalise a resolution that was right when
+    /// it was made.
+    ///
+    /// Safe to run here because the claim has no reader left: the sweep needs
+    /// nothing from it, and the freshness note reports only `pending` rows.
+    ///
+    /// **Scoped to `languages`**, the same set the ratification sweep uses and
+    /// for the same #712 reason: only a language whose Phase B just completed had
+    /// its claims scored by [`Self::live_precision_sample_by_language`], so only
+    /// those may be retired. A crashed sidecar's claims must survive — deleting
+    /// them here would score them against evidence that was never refreshed
+    /// (landing in `unverifiable`) and then discard them before the language's
+    /// real ratification could score them against the truth. Keyed on the
+    /// **src** node's language, matching the meter's attribution key exactly.
+    ///
+    /// Returns the number of rows consumed.
+    pub fn consume_measured_ref_resolutions(
+        &mut self,
+        languages: &[String],
+    ) -> Result<usize, StoreError> {
+        if languages.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(languages.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM ref_resolution_state \
+             WHERE state = 'resolved' AND resolved_dst IS NOT NULL \
+             AND src IN (SELECT id FROM nodes WHERE language IN ({placeholders}))"
+        );
+        self.conn
+            .execute(&sql, params_from_iter(languages.iter()))
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 10: the pending references in `path`, for the
+    /// `live_overlay` freshness note.
+    ///
+    /// Returns `(name, ref_line)` per unresolved reference, so a consumer can
+    /// say *which* call sites are un-targeted rather than only how many.
+    pub fn pending_refs_in_file(
+        &self,
+        corpus: &str,
+        path: &str,
+    ) -> Result<Vec<(String, u32)>, StoreError> {
+        (|| -> AnyResult<Vec<(String, u32)>> {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "SELECT r.name, r.ref_line FROM ref_resolution_state r \
+                     JOIN nodes n ON n.id = r.src \
+                     WHERE r.state = 'pending' AND n.corpus = ?1 AND n.path = ?2 \
+                     ORDER BY r.ref_line ASC",
+                )
+                .context("pending_refs_in_file: prepare")?;
+            let rows = stmt
+                .query_map(params![corpus, path], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+                })
+                .context("pending_refs_in_file: query")?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.context("decoding pending ref row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 sections 6.3 and 8.7.5: the files whose stranded live edges the
+    /// save of `path` can now restore — a dependent holding a `pending`
+    /// reference that names a symbol `path` defines.
+    ///
+    /// This is the reverse-closure that the interface-edit fix (§8.7.5) hands to
+    /// the editor. The editor only ever publishes the document that was saved, so
+    /// a dependent whose edge into `path` was invalidated is never re-resolved on
+    /// its own; naming it here lets the target request pull it in beside the
+    /// saved file's own references, keeping the editor the initiator.
+    ///
+    /// Matched on the pending reference's leaf name against this file's
+    /// definition signatures — `kind:Leaf` (unqualified) or `kind:Qual.Leaf`
+    /// (qualified), the two shapes `signature` takes. Scoped to `language`: a
+    /// live edge stays within one language, both because §8.2 keeps it
+    /// intra-corpus and because a cross-language definition would not resolve
+    /// through the dependent's own provider anyway.
+    ///
+    /// Matching is an exact comparison against the saved file's definition leaf
+    /// names, resolved **once** with [`travsr_core::ident::leaf_of`] — the same
+    /// function the daemon's resolver uses, so the two agree on what a leaf is.
+    ///
+    /// It is deliberately not a `LIKE` pattern built from `r.name`: `_` is
+    /// LIKE's single-character wildcard and identifiers are full of underscores,
+    /// so `LIKE '%:' || r.name` matched a pending `do_thing` against a definition
+    /// named `doXthing`. That is not recall-neutral either, because `limit` is a
+    /// hard cap and spurious matches crowd out the genuine dependents.
+    ///
+    /// Nor is it a correlated sub-select. Comparing in SQL, per pending row,
+    /// against every node in the saved file is quadratic, and `DISTINCT` plus
+    /// `ORDER BY` force the whole product to be evaluated before `LIMIT` can
+    /// apply. Measured on this repo (15.7k nodes, 4.7k pending rows, a 597-node
+    /// saved file) that shape cost **925ms**, at request time, on every save.
+    /// Resolving the leaf set first turns it into one hash lookup per pending
+    /// row and lets the scan stop as soon as `limit` distinct files are found.
+    ///
+    /// Capped at `limit` files (`LIVE_CLOSURE_FILE_CAP` at the call site): a
+    /// symbol thousands of files are pending on is a hot utility, and the
+    /// freshness is not worth re-resolving every one on each save. Truncation
+    /// costs recall, which the commit-gated path repairs. Over-inclusion (a leaf
+    /// name shared by an unrelated symbol) is recall-neutral: the editor resolves
+    /// the real position and the daemon maps it fail-closed, so a spurious file
+    /// costs a round trip, never a wrong edge.
+    pub fn dependents_pending_on_file(
+        &self,
+        corpus: &str,
+        path: &str,
+        language: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        (|| -> AnyResult<Vec<String>> {
+            // The saved file's definition leaves, resolved once. Bounded by the
+            // node count of one file, and served by the (corpus, path) index.
+            // A signature with no `kind:` prefix is not a definition signature
+            // and is skipped, matching what the previous `':' || name` /
+            // `'.' || name` shape test admitted.
+            let mut defs = self
+                .conn
+                .prepare_cached(
+                    "SELECT signature FROM nodes \
+                     WHERE corpus = ?1 AND path = ?2 AND language = ?3",
+                )
+                .context("dependents_pending_on_file: prepare defs")?;
+            let leaves: std::collections::HashSet<String> = defs
+                .query_map(params![corpus, path, language], |row| {
+                    row.get::<_, String>(0)
+                })
+                .context("dependents_pending_on_file: query defs")?
+                .filter_map(|r| r.ok())
+                .filter(|sig| sig.contains(':'))
+                .map(|sig| travsr_core::ident::leaf_of(&sig).to_string())
+                .collect();
+            if leaves.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // Pending references in other files of the same language, in path
+            // order so truncation stays deterministic. Filtering in Rust rather
+            // than through an `IN (...)` list keeps this clear of SQLite's
+            // 999-variable ceiling, which a large file's leaf set would exceed.
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "SELECT dep.path, r.name \
+                     FROM ref_resolution_state r \
+                     JOIN nodes dep ON dep.id = r.src \
+                     WHERE r.state = 'pending' \
+                       AND dep.corpus = ?1 AND dep.path <> ?2 AND dep.language = ?3 \
+                     ORDER BY dep.path ASC",
+                )
+                .context("dependents_pending_on_file: prepare")?;
+            let rows = stmt
+                .query_map(params![corpus, path, language], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .context("dependents_pending_on_file: query")?;
+
+            let mut out: Vec<String> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for row in rows {
+                let (dep_path, name) = row.context("decoding dependents_pending_on_file row")?;
+                if !leaves.contains(&name) {
+                    continue;
+                }
+                if seen.insert(dep_path.clone()) {
+                    out.push(dep_path);
+                    // Rows arrive in path order, so the cap can stop the scan
+                    // instead of being applied after a full evaluation.
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 10: how many references are currently unresolved.
+    ///
+    /// The count half of [`pending_refs_in_file`], for the envelope note where
+    /// only the magnitude is wanted.
+    ///
+    /// Joins `nodes` for the same reason [`pending_refs_in_file`] does: a row
+    /// whose `src` node no longer exists describes a reference that no longer
+    /// exists either, and counting it inflates the number the MCP freshness note
+    /// shows an agent. [`Self::purge_orphan_ref_resolution_states`] removes such
+    /// rows at ratification; the join is what keeps the two readers agreeing in
+    /// between.
+    pub fn pending_ref_count(&self) -> Result<u64, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM ref_resolution_state r \
+                 JOIN nodes n ON n.id = r.src \
+                 WHERE r.state = 'pending'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .context("counting pending references")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 10: unresolved references grouped by the file they sit
+    /// in, for a freshness note that can scope itself to the answer it decorates.
+    ///
+    /// [`Self::pending_ref_count`] answers "how many, repo-wide", which is
+    /// ambient: an agent asking who calls one symbol was told how many
+    /// references are pending everywhere, which reads as though they relate to
+    /// the answer. This returns the per-file split so a caller can keep only the
+    /// files its response actually mentions.
+    ///
+    /// Capped at `limit` files, ordered by descending count then path so the cap
+    /// keeps the largest gaps and stays deterministic. The cap is what bounds
+    /// the work: this runs on every prose query, against a table that grows one
+    /// row per detected reference per saved file.
+    pub fn pending_ref_counts_by_file(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>, StoreError> {
+        (|| -> AnyResult<Vec<(String, u64)>> {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "SELECT n.path, count(*) AS c FROM ref_resolution_state r \
+                     JOIN nodes n ON n.id = r.src \
+                     WHERE r.state = 'pending' \
+                     GROUP BY n.path \
+                     ORDER BY c DESC, n.path ASC LIMIT ?1",
+                )
+                .context("pending_ref_counts_by_file: prepare")?;
+            let rows = stmt
+                .query_map(params![limit as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                })
+                .context("pending_ref_counts_by_file: query")?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.context("decoding pending_ref_counts_by_file row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 8.3: clear pending rows that Phase B has since resolved.
+    ///
+    /// Run at ratification. A reference Phase B recorded a call site for is no
+    /// longer pending, whatever resolved it, so this is keyed on site existence
+    /// rather than on which lane won.
+    ///
+    /// Granularity is `(src, ref_line)`, matching [`Self::live_precision_sample`]
+    /// exactly. Anything coarser is not safe: keying on `src` alone asks "does
+    /// this *enclosing definition* have any outgoing edge at all", so one
+    /// resolved call cleared every other pending reference in the same function
+    /// on no evidence. Section 9.2's honest abstention is the deliverable the
+    /// whole precision-first argument rests on, and silently under-reporting it
+    /// is the one thing it cannot afford.
+    ///
+    /// Returns the number of rows cleared.
+    pub fn clear_resolved_pending_refs(&mut self) -> Result<usize, StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM ref_resolution_state \
+                 WHERE state = 'pending' \
+                   AND EXISTS (SELECT 1 FROM edge_sites s \
+                               WHERE s.src = ref_resolution_state.src \
+                                 AND s.line = ref_resolution_state.ref_line)",
+                [],
+            )
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 9.2: drop reference rows whose `src` node is gone.
+    ///
+    /// [`Self::replace_ref_resolution_states`] scopes its delete through
+    /// `src IN (SELECT id FROM nodes WHERE corpus = ? AND path = ?)`, which
+    /// cannot reach a row whose node id no longer exists. A `NodeId` hashes the
+    /// VName, signature included, so renaming a symbol retires its id and takes
+    /// that delete's only handle with it: the row outlives every path that could
+    /// remove it (the next save cannot see it, and
+    /// [`Self::clear_resolved_pending_refs`] cannot either, because a deleted
+    /// node has no sites). Left alone the count the freshness note reports climbs
+    /// monotonically with every rename in the repo.
+    ///
+    /// Run once per ratification rather than per save: the readers already join
+    /// `nodes` and so stay correct in the meantime, and this is a table scan.
+    ///
+    /// Returns the number of rows purged.
+    pub fn purge_orphan_ref_resolution_states(&mut self) -> Result<usize, StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM ref_resolution_state \
+                 WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = ref_resolution_state.src)",
+                [],
+            )
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-027 section 7.5: map a `(path, line)` position to the graph node
+    /// that owns it, returning the **narrowest** enclosing definition.
+    ///
+    /// This is the `location_to_node` primitive the live lane needs at both
+    /// ends: the call site's enclosing function becomes the edge's `src`, and
+    /// the definition the editor pointed at becomes its `dst`.
+    ///
+    /// The RFC describes this as range-source-aware (current Tree-sitter spans
+    /// for dirty files, SCIP ranges for clean ones). In this store one lookup
+    /// covers both, because a node's `line`/`end_line` always come from the most
+    /// recent parse of its file and Phase A re-parses a file on save before the
+    /// live engine runs. A position that lands in no definition span returns
+    /// `None`, which the caller must treat as an abstention rather than
+    /// guessing: fail-closed is the whole precision argument (section 8.1).
+    ///
+    /// Ordering matches [`find_narrowest_enclosing`]: widest-last, so the first
+    /// containing span is the tightest one.
+    pub fn enclosing_definition_at(
+        &self,
+        corpus: &str,
+        path: &str,
+        line: u32,
+    ) -> Result<Option<NodeId>, StoreError> {
+        self.enclosing_node_at(corpus, path, line, ENCLOSING_DEFINITION_KINDS)
+    }
+
+    /// The tightest node whose span contains `line`, restricted to `kinds`.
+    ///
+    /// Generalizes [`Self::enclosing_definition_at`] so a caller can supply its
+    /// own valid endpoint kinds. RFC-027's live lane needs this: mapping the
+    /// target of a `ref/field` edge must find the `field` node the editor's
+    /// definition provider pointed at, which the definition-only kind set of
+    /// `enclosing_definition_at` deliberately excludes (`get_callers` must never
+    /// see a field read as a caller, #757). Each live edge kind therefore passes
+    /// the kinds that are valid *for it*, and the gate is the kind set itself.
+    ///
+    /// `kinds` must contain only internal constant strings; they are bound as
+    /// parameters, never interpolated, so no user input can reach the SQL text.
+    /// An empty `kinds` matches nothing (`Ok(None)`), never everything.
+    pub fn enclosing_node_at(
+        &self,
+        corpus: &str,
+        path: &str,
+        line: u32,
+        kinds: &[&str],
+    ) -> Result<Option<NodeId>, StoreError> {
+        if kinds.is_empty() {
+            return Ok(None);
+        }
+        (|| -> AnyResult<Option<NodeId>> {
+            // Placeholders start at ?4: ?1 corpus, ?2 path, ?3 line.
+            let placeholders = (0..kinds.len())
+                .map(|i| format!("?{}", i + 4))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id FROM nodes \
+                 WHERE corpus = ?1 AND path = ?2 \
+                   AND line IS NOT NULL AND end_line IS NOT NULL \
+                   AND line <= ?3 AND end_line >= ?3 \
+                   AND kind IN ({placeholders}) \
+                 ORDER BY (end_line - line) ASC, id ASC LIMIT 1"
+            );
+            let mut stmt = self
+                .conn
+                .prepare_cached(&sql)
+                .context("enclosing_node_at: prepare")?;
+            use rusqlite::types::Value;
+            let mut vals: Vec<Value> = vec![
+                Value::Text(corpus.to_string()),
+                Value::Text(path.to_string()),
+                Value::Integer(line as i64),
+            ];
+            vals.extend(kinds.iter().map(|k| Value::Text((*k).to_string())));
+            let id: Option<i64> = stmt
+                .query_row(params_from_iter(vals), |row| row.get(0))
+                .optional()
+                .context("enclosing_node_at: query")?;
+            Ok(id.map(i64_to_node_id))
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// G1: Look up the unified `NodeId` for a raw SCIP symbol string.
     ///
     /// Returns `None` if the symbol has not been aliased (i.e. no tree-sitter
@@ -5205,6 +6191,67 @@ impl SqliteStore {
             Self::vocab_decrement(conn, &tokens)?;
         }
 
+        Ok(())
+    }
+
+    /// Reconcile the RFC-027 `Edge.provenance` read-path indexes on open,
+    /// independent of `schema_version` (review issue B).
+    ///
+    /// The three RFC-027 migrations were collapsed into a single v23 while
+    /// released code was still at v22, so shipped databases receive the complete
+    /// v23 and never see this. But an earlier revision of this branch numbered
+    /// the same work v23/v24/v25, so a **dev** database it stamped at 24 or 25
+    /// now sits *above* the runner's max version (23): the runner applies only
+    /// migrations with `version() > current`, finds none, and the database
+    /// silently keeps the pre-RFC-027 narrow edge indexes forever — finding 6
+    /// (a lost covering index, invisible until an EXPLAIN) one level up, in the
+    /// runner instead of a query.
+    ///
+    /// The runner cannot reach it and bumping the max version would re-spend the
+    /// numbers the collapse reclaimed, so the reconcile lives here, beside
+    /// [`Self::backfill_fts_if_needed`] and for the same reason: an idempotent
+    /// convergence step gated on a cheap data check, never on the stamp. A
+    /// writable open always runs it (the daemon on startup, `init`, and the
+    /// CLI's read-only-then-writable fallback for a database newer than the
+    /// binary), which is where a stranded database heals.
+    ///
+    /// Gate: the covering index carries `provenance` iff the rework is already
+    /// applied, so a fresh v23 database and an already-healed one both return
+    /// here doing no work.
+    fn reconcile_provenance_indexes_if_needed(&mut self) -> AnyResult<()> {
+        let already_wide: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_edges_dst_kind_cov' \
+                   AND sql LIKE '%provenance%')",
+                [],
+                |r| r.get(0),
+            )
+            .context("checking whether the covering edge index carries provenance")?;
+        if already_wide {
+            return Ok(());
+        }
+
+        tracing::info!(
+            event = "store.reconcile.provenance_indexes",
+            "widening the edge covering indexes a collapsed-migration database missed"
+        );
+        // The same idempotent DDL `V23RefResolutionState::up` runs: every
+        // statement is `IF NOT EXISTS` or DROP-then-CREATE, so it converges a
+        // stranded database without depending on its stamp, and re-stamps
+        // nothing (the collapse deliberately keeps the max at v23).
+        self.conn
+            .execute_batch(include_str!("migrations/v23_ref_resolution_state.sql"))
+            .context("reconciling RFC-027 provenance indexes")?;
+        if !self.column_exists("ref_resolution_state", "resolved_dst")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE ref_resolution_state ADD COLUMN resolved_dst INTEGER",
+                    [],
+                )
+                .context("adding resolved_dst to a stranded ref_resolution_state")?;
+        }
         Ok(())
     }
 
@@ -7387,20 +8434,24 @@ impl Store for SqliteStore {
         (|| -> AnyResult<Vec<Edge>> {
             let mut stmt = self
                 .conn
-                .prepare_cached("SELECT dst, kind, confidence FROM edges WHERE src = ?1")
+                .prepare_cached(
+                    "SELECT dst, kind, confidence, provenance FROM edges WHERE src = ?1",
+                )
                 .context("preparing iter_edges_from query")?;
             let rows = stmt
                 .query_map(params![node_id_to_i64(src)], |row| {
                     let dst_i64: i64 = row.get(0)?;
                     let kind_str: String = row.get(1)?;
                     let confidence: Option<i64> = row.get(2)?;
-                    Ok((dst_i64, kind_str, confidence))
+                    let provenance: String = row.get(3)?;
+                    Ok((dst_i64, kind_str, confidence, provenance))
                 })
                 .context("executing iter_edges_from query")?;
 
             let mut out = Vec::new();
             for row in rows {
-                let (dst_i64, kind_str, confidence) = row.context("decoding edge row")?;
+                let (dst_i64, kind_str, confidence, provenance) =
+                    row.context("decoding edge row")?;
                 let kind = EdgeKind::from_str(&kind_str)
                     .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
                 out.push(Edge {
@@ -7408,6 +8459,7 @@ impl Store for SqliteStore {
                     dst: i64_to_node_id(dst_i64),
                     kind,
                     confidence: confidence.map(|c| c as u8),
+                    provenance: Some(provenance),
                 });
             }
             tracing::debug!(edges_returned = out.len());
@@ -7417,26 +8469,38 @@ impl Store for SqliteStore {
     }
 
     /// Indexed variant — uses `WHERE src = ?1 AND kind = ?2` so SQLite can
-    /// satisfy the query from the `(src, dst, kind)` primary-key index without
-    /// a full `src`-partition scan. Overrides the trait default.
+    /// satisfy the query from `idx_edges_src_kind_cov` (src, kind, dst) as an
+    /// index-only scan, without a main-table row fetch. Overrides the trait
+    /// default.
+    ///
+    /// Carries `provenance` (DEBT-75), like every other edge reader. No current
+    /// caller consults it here — `travsr-retrieval` never reads the field, and
+    /// `query.rs::next_edges` takes the deps direction through
+    /// `iter_edges_from` — but returning `None` would not be a neutral omission:
+    /// `query.rs::prov_of` maps `None` to `"tree-sitter"`, so an unlabelled edge
+    /// is reported as *ratified truth* rather than as unknown. For a lane whose
+    /// whole point is never presenting a `live` edge as ratified, a reader that
+    /// silently mislabels the moment someone consults it is the wrong trade for
+    /// one `String` per edge. The index tail carries the column instead, so the
+    /// query stays index-only.
     fn iter_edges_from_kind(&self, src: NodeId, kind: EdgeKind) -> Result<Vec<Edge>, StoreError> {
         let _span =
             tracing::debug_span!("store.iter_edges_from_kind", src = src.0, kind = ?kind).entered();
         (|| -> AnyResult<Vec<Edge>> {
             let mut stmt = self
                 .conn
-                .prepare("SELECT dst FROM edges WHERE src = ?1 AND kind = ?2")
+                .prepare("SELECT dst, provenance FROM edges WHERE src = ?1 AND kind = ?2")
                 .context("preparing iter_edges_from_kind query")?;
             let rows = stmt
                 .query_map(params![node_id_to_i64(src), kind.as_str()], |row| {
-                    row.get::<_, i64>(0)
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })
                 .context("executing iter_edges_from_kind query")?;
 
             let mut out = Vec::new();
             for row in rows {
-                let dst_i64 = row.context("decoding iter_edges_from_kind row")?;
-                out.push(Edge::new(src, i64_to_node_id(dst_i64), kind));
+                let (dst_i64, provenance) = row.context("decoding iter_edges_from_kind row")?;
+                out.push(Edge::new(src, i64_to_node_id(dst_i64), kind).with_provenance(provenance));
             }
             tracing::debug!(edges_returned = out.len());
             Ok(out)
@@ -7453,7 +8517,7 @@ impl Store for SqliteStore {
         (|| -> AnyResult<Vec<Edge>> {
             let placeholders = srcs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT src, dst, kind, confidence FROM edges WHERE src IN ({placeholders})"
+                "SELECT src, dst, kind, confidence, provenance FROM edges WHERE src IN ({placeholders})"
             );
             // prepare() not prepare_cached(): the SQL string varies per chunk length
             // (different number of '?' placeholders), so prepare_cached would create a
@@ -7471,12 +8535,14 @@ impl Store for SqliteStore {
                     let dst_i64: i64 = row.get(1)?;
                     let kind_str: String = row.get(2)?;
                     let confidence: Option<i64> = row.get(3)?;
-                    Ok((src_i64, dst_i64, kind_str, confidence))
+                    let provenance: String = row.get(4)?;
+                    Ok((src_i64, dst_i64, kind_str, confidence, provenance))
                 })
                 .context("executing iter_edges_from_batch")?;
             let mut out = Vec::new();
             for row in rows {
-                let (src_i64, dst_i64, kind_str, confidence) = row.context("decoding edge row")?;
+                let (src_i64, dst_i64, kind_str, confidence, provenance) =
+                    row.context("decoding edge row")?;
                 let kind = EdgeKind::from_str(&kind_str)
                     .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
                 out.push(Edge {
@@ -7484,6 +8550,7 @@ impl Store for SqliteStore {
                     dst: i64_to_node_id(dst_i64),
                     kind,
                     confidence: confidence.map(|c| c as u8),
+                    provenance: Some(provenance),
                 });
             }
             tracing::debug!(edges_returned = out.len());
@@ -7497,22 +8564,23 @@ impl Store for SqliteStore {
         (|| -> AnyResult<Vec<Edge>> {
             let mut stmt = self
                 .conn
-                .prepare("SELECT src, kind FROM edges WHERE dst = ?1")
+                .prepare("SELECT src, kind, provenance FROM edges WHERE dst = ?1")
                 .context("preparing iter_edges_to query")?;
             let rows = stmt
                 .query_map(params![node_id_to_i64(dst)], |row| {
                     let src_i64: i64 = row.get(0)?;
                     let kind_str: String = row.get(1)?;
-                    Ok((src_i64, kind_str))
+                    let provenance: String = row.get(2)?;
+                    Ok((src_i64, kind_str, provenance))
                 })
                 .context("executing iter_edges_to query")?;
 
             let mut out = Vec::new();
             for row in rows {
-                let (src_i64, kind_str) = row.context("decoding edge row")?;
+                let (src_i64, kind_str, provenance) = row.context("decoding edge row")?;
                 let kind = EdgeKind::from_str(&kind_str)
                     .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
-                out.push(Edge::new(i64_to_node_id(src_i64), dst, kind));
+                out.push(Edge::new(i64_to_node_id(src_i64), dst, kind).with_provenance(provenance));
             }
             tracing::debug!(edges_returned = out.len());
             Ok(out)
@@ -8106,21 +9174,141 @@ mod tests {
         assert_eq!(old_exists, 0, "idx_edges_dst_kind must be dropped by v14");
     }
 
+    /// The plan text for `sql`, as SQLite's EXPLAIN QUERY PLAN reports it
+    /// (column 3 is the "detail" string in SQLite 3.36+).
+    fn query_plan(store: &SqliteStore, sql: &str) -> String {
+        store
+            .conn
+            .query_row(&format!("EXPLAIN QUERY PLAN {sql}"), [], |row| row.get(3))
+            .unwrap()
+    }
+
+    /// The traversal hot paths must stay index-only.
+    ///
+    /// Asserts on the **exact SQL `iter_edges_from_kind` and `iter_edges_to`
+    /// issue**, not a hand-written stand-in. The earlier version of this test
+    /// hardcoded `SELECT src FROM edges WHERE dst=? AND kind=?` while the code
+    /// had moved to `SELECT src, kind, provenance ...`, and it only checked that
+    /// the plan *named* the index — which it does whether or not the index
+    /// covers. RFC-027's `provenance` column therefore took both queries off
+    /// their covering indexes with the guard test still green. Asserting
+    /// "COVERING INDEX" against the real query is what makes that lapse visible.
     #[test]
-    fn v14_reverse_edge_query_uses_covering_index() {
+    fn edge_traversal_queries_stay_index_only() {
         let store = SqliteStore::open_in_memory().unwrap();
-        // EXPLAIN QUERY PLAN — column 3 is the "detail" text in SQLite 3.36+.
-        let plan: String = store
+
+        let forward = query_plan(
+            &store,
+            "SELECT dst, provenance FROM edges WHERE src = 1 AND kind = 'ref/call'",
+        );
+        assert!(
+            forward.contains("COVERING INDEX idx_edges_src_kind_cov"),
+            "iter_edges_from_kind must be index-only; EXPLAIN detail: {forward}",
+        );
+
+        let reverse = query_plan(
+            &store,
+            "SELECT src, kind, provenance FROM edges WHERE dst = 1",
+        );
+        assert!(
+            reverse.contains("COVERING INDEX idx_edges_dst_kind_cov"),
+            "iter_edges_to must be index-only; EXPLAIN detail: {reverse}",
+        );
+    }
+
+    /// Review issue B: a dev database an earlier revision of this branch stamped
+    /// above the collapsed v23 (at 24 or 25) must regain the covering edge
+    /// indexes on open, and it must do so **without** bumping the schema version
+    /// — the collapse keeps the max at v23 on purpose.
+    ///
+    /// The migration runner cannot reach such a database (`version() > current`
+    /// is never true for a stamp already ahead of the max), so the heal is the
+    /// ungated `reconcile_provenance_indexes_if_needed` step that runs at every
+    /// writable open. `edge_traversal_queries_stay_index_only` cannot catch this
+    /// regression: it builds a fresh store that lands on the collapsed schema
+    /// correctly.
+    #[test]
+    fn a_database_stranded_above_v23_regains_covering_indexes_on_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+
+        // A fresh open lands on the collapsed v23 with the wide indexes; roll it
+        // back to the pre-RFC-027 narrow ones and stamp 24 to mimic the earlier
+        // branch revision that numbered the index rework v25.
+        {
+            let store = SqliteStore::open(&db_path).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP INDEX IF EXISTS idx_edges_src_kind_cov; \
+                     CREATE INDEX idx_edges_src_kind_cov ON edges(src, kind, dst); \
+                     DROP INDEX IF EXISTS idx_edges_dst_kind_cov; \
+                     CREATE INDEX idx_edges_dst_kind_cov ON edges(dst, kind, src); \
+                     DROP INDEX IF EXISTS idx_edges_live_provenance;",
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES('schema_version', '24') \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )
+                .unwrap();
+
+            let reverse = query_plan(
+                &store,
+                "SELECT src, kind, provenance FROM edges WHERE dst = 1",
+            );
+            assert!(
+                !reverse.contains("COVERING INDEX"),
+                "precondition: the stranded db must not already cover this: {reverse}"
+            );
+        }
+
+        // Reopen writable: the runner applies nothing (24 > 23 is false), and the
+        // ungated reconcile widens the indexes.
+        let store = SqliteStore::open(&db_path).unwrap();
+
+        let forward = query_plan(
+            &store,
+            "SELECT dst, provenance FROM edges WHERE src = 1 AND kind = 'ref/call'",
+        );
+        assert!(
+            forward.contains("COVERING INDEX idx_edges_src_kind_cov"),
+            "the reconcile must restore the forward covering index: {forward}"
+        );
+        let reverse = query_plan(
+            &store,
+            "SELECT src, kind, provenance FROM edges WHERE dst = 1",
+        );
+        assert!(
+            reverse.contains("COVERING INDEX idx_edges_dst_kind_cov"),
+            "the reconcile must restore the reverse covering index: {reverse}"
+        );
+        let live_count = query_plan(
+            &store,
+            "SELECT count(*) FROM edges WHERE provenance = 'live'",
+        );
+        assert!(
+            live_count.contains("idx_edges_live_provenance"),
+            "the reconcile must restore the partial live-provenance index: {live_count}"
+        );
+
+        // The stamp is deliberately left untouched: the collapse keeps the max
+        // schema version at 23, and re-stamping is neither needed (the runner is
+        // a no-op here) nor safe once a future migration reuses 24/25.
+        let version: String = store
             .conn
             .query_row(
-                "EXPLAIN QUERY PLAN SELECT src FROM edges WHERE dst=? AND kind=?",
-                rusqlite::params![0i64, "ref/call"],
-                |row| row.get(3),
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
             )
             .unwrap();
-        assert!(
-            plan.contains("idx_edges_dst_kind_cov"),
-            "iter_edges_to query must use covering index; EXPLAIN detail: {plan}",
+        assert_eq!(
+            version, "24",
+            "the reconcile heals indexes without bumping the schema version"
         );
     }
 
@@ -8882,6 +10070,206 @@ mod tests {
         );
     }
 
+    // ── RFC-027 ref_resolution_state (review findings 3, 5 and 7) ────────────
+
+    /// A node in `corpus` at `path` with a signature and a span.
+    fn live_node(corpus: &str, path: &str, sig: &str, kind: &str, line: u32) -> Node {
+        let mut n = Node::new(VName::new(corpus, "", path, "typescript", sig), kind);
+        n.line = Some(line);
+        n.end_line = Some(line + 20);
+        n
+    }
+
+    fn pending(src: NodeId, line: u32, name: &str) -> RefResolution {
+        RefResolution {
+            src,
+            ref_line: line,
+            ref_col: 0,
+            name: name.to_string(),
+            state: "pending",
+            resolved_dst: None,
+        }
+    }
+
+    /// Finding 3: the predicate must be `(src, line)`, not `src`.
+    ///
+    /// Three pending references in one function and Phase B resolves one of
+    /// them. Keyed on `src` alone, any single outgoing edge on the enclosing
+    /// definition cleared all three, so section 9.2's honest abstention silently
+    /// under-reported the other two.
+    #[test]
+    fn clearing_pending_refs_is_line_wise_not_node_wide() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = live_node("c", "src/a.ts", "fn:caller", "function", 1);
+        let callee = live_node("c", "src/b.ts", "fn:callee", "function", 1);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/a.ts",
+                &[
+                    pending(caller.id, 3, "one"),
+                    pending(caller.id, 4, "two"),
+                    pending(caller.id, 5, "three"),
+                ],
+            )
+            .unwrap();
+
+        // Phase B resolved only the reference on line 4.
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 4)])
+            .unwrap();
+
+        assert_eq!(store.clear_resolved_pending_refs().unwrap(), 1);
+        assert_eq!(
+            store.pending_ref_count().unwrap(),
+            2,
+            "the two references Phase B said nothing about must stay pending"
+        );
+    }
+
+    /// Finding 5: a renamed symbol retires its `NodeId`, which is the only
+    /// handle `replace_ref_resolution_states` has, so its rows outlive every
+    /// delete path. `pending_ref_count` must not count them, and the ratification
+    /// purge must remove them.
+    #[test]
+    fn pending_rows_do_not_survive_the_rename_of_their_symbol() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let before = live_node("c", "src/a.ts", "fn:target", "function", 1);
+        store.put_node(&before).unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(before.id, 4, "target")])
+            .unwrap();
+        assert_eq!(store.pending_ref_count().unwrap(), 1);
+
+        // The rename: the old node is gone, a new id takes its place, and the
+        // file's rows are rewritten under the new id.
+        store
+            .reindex_replace("c", "src/a.ts", &[], &[], "h")
+            .unwrap();
+        let after = live_node("c", "src/a.ts", "fn:renamed", "function", 1);
+        store.put_node(&after).unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(after.id, 4, "renamed")])
+            .unwrap();
+
+        assert_eq!(
+            store.pending_ref_count().unwrap(),
+            1,
+            "the count the MCP freshness note reports must not inflate on a rename"
+        );
+        assert_eq!(store.purge_orphan_ref_resolution_states().unwrap(), 1);
+        assert_eq!(store.pending_ref_count().unwrap(), 1);
+    }
+
+    /// Finding 7: `_` is LIKE's single-character wildcard and identifiers are
+    /// full of underscores, so a pattern built from `r.name` matched `do_thing`
+    /// against a definition named `doXthing`. Spurious matches are not
+    /// recall-neutral — they consume the `limit` cap under `ORDER BY path`.
+    #[test]
+    fn a_dependent_match_is_exact_not_a_like_pattern() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let dep = live_node("c", "dep.ts", "fn:consumer", "function", 1);
+        // The only definition in def.ts differs from the pending name by one
+        // character in the position `_` would wildcard.
+        let decoy = live_node("c", "def.ts", "fn:doXthing", "function", 1);
+        store.put_node(&dep).unwrap();
+        store.put_node(&decoy).unwrap();
+        store
+            .replace_ref_resolution_states("c", "dep.ts", &[pending(dep.id, 4, "do_thing")])
+            .unwrap();
+
+        assert!(
+            store
+                .dependents_pending_on_file("c", "def.ts", "typescript", 32)
+                .unwrap()
+                .is_empty(),
+            "an underscore in an identifier must not act as a LIKE wildcard"
+        );
+
+        // The genuine match still resolves, in both signature shapes.
+        let unqualified = live_node("c", "def.ts", "fn:do_thing", "function", 5);
+        store.put_node(&unqualified).unwrap();
+        assert_eq!(
+            store
+                .dependents_pending_on_file("c", "def.ts", "typescript", 32)
+                .unwrap(),
+            vec!["dep.ts".to_string()],
+            "`kind:Leaf` must match"
+        );
+
+        let mut qualified_only = SqliteStore::open_in_memory().unwrap();
+        let dep2 = live_node("c", "dep.ts", "fn:consumer", "function", 1);
+        let method = live_node("c", "def.ts", "method:Thing.do_thing", "method", 5);
+        qualified_only.put_node(&dep2).unwrap();
+        qualified_only.put_node(&method).unwrap();
+        qualified_only
+            .replace_ref_resolution_states("c", "dep.ts", &[pending(dep2.id, 4, "do_thing")])
+            .unwrap();
+        assert_eq!(
+            qualified_only
+                .dependents_pending_on_file("c", "def.ts", "typescript", 32)
+                .unwrap(),
+            vec!["dep.ts".to_string()],
+            "`kind:Qual.Leaf` must match too"
+        );
+    }
+
+    /// Finding 4: the meter is cumulative, so a claim it has scored has to be
+    /// retired or every later commit counts it again.
+    #[test]
+    fn a_scored_claim_is_consumed_so_the_sample_size_stays_honest() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = live_node("c", "src/a.ts", "fn:caller", "function", 1);
+        let callee = live_node("c", "src/b.ts", "fn:callee", "function", 1);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/a.ts",
+                &[RefResolution {
+                    src: caller.id,
+                    ref_line: 4,
+                    ref_col: 0,
+                    name: "callee".to_string(),
+                    state: "resolved",
+                    resolved_dst: Some(callee.id),
+                }],
+            )
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 4)])
+            .unwrap();
+
+        assert_eq!(store.live_precision_sample().unwrap().agree, 1);
+        // A language that did not complete must not consume the claim: the row
+        // survives to be scored at its own ratification (issue A).
+        assert_eq!(
+            store
+                .consume_measured_ref_resolutions(&["rust".to_string()])
+                .unwrap(),
+            0,
+            "a crashed language's claim must not be retired by another's ratification"
+        );
+        assert_eq!(store.live_precision_sample().unwrap().claims(), 1);
+        assert_eq!(
+            store
+                .consume_measured_ref_resolutions(&["typescript".to_string()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.live_precision_sample().unwrap().claims(),
+            0,
+            "a second ratification must not re-score a claim already counted"
+        );
+    }
+
     fn node_with_path(path: &str, sig: &str) -> Node {
         Node::new(VName::new("", "", path, "typescript", sig), "function")
     }
@@ -9551,6 +10939,178 @@ mod tests {
         assert!(
             edges.iter().all(|e| e.dst == c.id),
             "dst must be C for all edges"
+        );
+    }
+
+    /// DEBT-75: every `iter_edges_*` reader must carry the row's true
+    /// `edges.provenance`, so a consumer that traverses the graph (the MCP
+    /// surface, `travsr graph --format json`) reports how an edge was actually
+    /// derived instead of assuming `tree-sitter`. Before this, an `lsif` edge
+    /// read back through BFS was indistinguishable from a heuristic one.
+    #[test]
+    fn edge_readers_carry_true_provenance() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = node_with_path("a.ts", "fn:a");
+        let b = node_with_path("b.ts", "fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+
+        // One tree-sitter edge and one lsif edge out of the same source.
+        let ts_edge = Edge::new(a.id, b.id, EdgeKind::DefinesBinding);
+        let lsif_edge = Edge::new(a.id, b.id, EdgeKind::RefCall);
+        store.put_edge(&ts_edge).unwrap();
+        store.put_edge_lsif(&lsif_edge).unwrap();
+
+        let prov = |edges: &[Edge], kind: EdgeKind| -> String {
+            edges
+                .iter()
+                .find(|e| e.kind == kind)
+                .and_then(|e| e.provenance.clone())
+                .unwrap_or_else(|| panic!("no {kind:?} edge returned"))
+        };
+
+        let from = store.iter_edges_from(a.id).unwrap();
+        assert_eq!(prov(&from, EdgeKind::RefCall), "lsif");
+        assert_eq!(prov(&from, EdgeKind::DefinesBinding), "tree-sitter");
+
+        let to = store.iter_edges_to(b.id).unwrap();
+        assert_eq!(prov(&to, EdgeKind::RefCall), "lsif");
+        assert_eq!(prov(&to, EdgeKind::DefinesBinding), "tree-sitter");
+
+        let batch = store.iter_edges_from_batch(&[a.id]).unwrap();
+        assert_eq!(prov(&batch, EdgeKind::RefCall), "lsif");
+        assert_eq!(prov(&batch, EdgeKind::DefinesBinding), "tree-sitter");
+
+        let by_kind = store.iter_edges_from_kind(a.id, EdgeKind::RefCall).unwrap();
+        assert_eq!(prov(&by_kind, EdgeKind::RefCall), "lsif");
+    }
+
+    /// RFC-027: the live overlay is purely additive.
+    ///
+    /// It creates edges that were absent and refreshes its own, but never
+    /// relabels a row another lane wrote. That is the property that makes the
+    /// ratification sweep safe: everything the sweep can delete is something
+    /// the live lane created, so retiring the overlay returns the graph to what
+    /// it was instead of destroying pre-existing truth.
+    #[test]
+    fn the_live_overlay_is_additive_and_never_relabels_another_lane() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = node_with_path("a.ts", "fn:a");
+        let b = node_with_path("b.ts", "fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let e = Edge::new(a.id, b.id, EdgeKind::RefCall);
+
+        let prov = |st: &SqliteStore| -> String {
+            st.iter_edges_from(a.id).unwrap()[0]
+                .provenance
+                .clone()
+                .expect("reader must carry provenance")
+        };
+
+        // Absent -> live: the overlay's actual job.
+        store.put_edge_live(&e).unwrap();
+        assert_eq!(prov(&store), "live", "a missing edge is created as live");
+
+        // live -> live: idempotent. reindex_replace wipes a file's outbound
+        // edges on every save, so the engine re-emits whole-file (plan R5).
+        store.put_edge_live(&e).unwrap();
+        assert_eq!(prov(&store), "live");
+
+        // live -> lsif: ratification wins.
+        store.put_edge_lsif(&e).unwrap();
+        assert_eq!(prov(&store), "lsif", "lsif must overwrite live");
+
+        // lsif -> live: must NOT demote ratified truth.
+        store.put_edge_live(&e).unwrap();
+        assert_eq!(
+            prov(&store),
+            "lsif",
+            "a live write must never demote lsif/scip"
+        );
+
+        // tree-sitter -> live: must NOT relabel. This is the one the sweep
+        // depends on. An interface edit re-resolves files that were never
+        // re-parsed and still hold their tree-sitter edges; relabelling those
+        // would hand pre-existing truth to the sweep to delete.
+        let e2 = Edge::new(a.id, b.id, EdgeKind::DefinesBinding);
+        store.put_edge(&e2).unwrap();
+        store.put_edge_live(&e2).unwrap();
+        let ts = store
+            .iter_edges_from(a.id)
+            .unwrap()
+            .into_iter()
+            .find(|x| x.kind == EdgeKind::DefinesBinding)
+            .and_then(|x| x.provenance)
+            .unwrap();
+        assert_eq!(
+            ts, "tree-sitter",
+            "a live write must leave an existing tree-sitter row untouched"
+        );
+    }
+
+    /// RFC-027: a Phase B write over a `live` row ratifies it.
+    ///
+    /// Both callers that pass a 'tree-sitter' provenance are Phase B runs
+    /// (`init_repo_with_progress`, `run_background_phase_b_inner`), so such a
+    /// write reaching an existing `live` row means Phase B just re-derived that
+    /// edge by native leaf-name resolution. Relabelling it is correct: it is no
+    /// longer a live guess. This is what leaves the section 8.3 sweep holding
+    /// only the live edges Phase B did *not* re-derive, so deleting those
+    /// cannot lose a real edge.
+    #[test]
+    fn write_phase_b_batch_ratifies_a_live_edge() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = node_with_path("a.ts", "fn:a");
+        let b = node_with_path("b.ts", "fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let e = Edge::new(a.id, b.id, EdgeKind::RefCall);
+        store.put_edge_live(&e).unwrap();
+
+        store
+            .write_phase_b_batch(&[], std::slice::from_ref(&e), "tree-sitter")
+            .unwrap();
+        assert_eq!(
+            store.iter_edges_from(a.id).unwrap()[0]
+                .provenance
+                .as_deref(),
+            Some("tree-sitter"),
+            "Phase B re-derived this edge natively, so it is ratified, not live"
+        );
+
+        // And a SCIP-provenance batch ratifies it as compiler truth.
+        store
+            .write_phase_b_batch(&[], std::slice::from_ref(&e), "scip")
+            .unwrap();
+        assert_eq!(
+            store.iter_edges_from(a.id).unwrap()[0]
+                .provenance
+                .as_deref(),
+            Some("scip"),
+            "scip must overwrite live"
+        );
+    }
+
+    /// Provenance is metadata about how an edge was derived, not part of its
+    /// identity: the store's primary key is `(src, dst, kind)`. A read-back edge
+    /// must therefore still compare equal to the constructed one it came from.
+    #[test]
+    fn provenance_is_not_part_of_edge_identity() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = node_with_path("a.ts", "fn:a");
+        let b = node_with_path("b.ts", "fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let built = Edge::new(a.id, b.id, EdgeKind::RefCall);
+        store.put_edge_lsif(&built).unwrap();
+
+        let read_back = store.iter_edges_from(a.id).unwrap();
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].provenance.as_deref(), Some("lsif"));
+        assert_eq!(
+            read_back[0], built,
+            "an edge differing only in provenance is the same edge"
         );
     }
 
@@ -10292,6 +11852,7 @@ mod tests {
             dst: node_b.id,
             kind: travsr_core::EdgeKind::RefCall,
             confidence: None,
+            provenance: None,
         };
 
         let batch = vec![
@@ -10357,6 +11918,7 @@ mod tests {
             dst: node.id,
             kind: travsr_core::EdgeKind::RefCall,
             confidence: None,
+            provenance: None,
         };
 
         let batch = vec![
