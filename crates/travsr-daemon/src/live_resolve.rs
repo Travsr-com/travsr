@@ -188,10 +188,25 @@ fn resolve_one(store: &SqliteStore, corpus: &str, file: &str, r: &LiveResolution
     // gate: a target of the wrong kind, or a position in no matching span (a
     // node_modules file, a generated stub, an unindexed file), maps to nothing
     // and abstains (§8.1).
-    let dst = store
+    let dst = match store
         .enclosing_node_at(corpus, &r.target_path, r.target_line, target_kinds(edge))
         .ok()
-        .flatten()?;
+        .flatten()
+    {
+        Some(dst) => dst,
+        // Issue #816 defect 2 backstop: a provider that reports the item's full
+        // range (rust-analyzer's `targetRange`) or a bare `Location` puts the
+        // definition line on a leading doc comment, attribute, or decorator,
+        // above the node's declaration, so exact span containment misses. Map
+        // such a position to the definition it heads. Language-server-agnostic:
+        // it needs no `targetSelectionRange`, so a server that supplies only a
+        // range still resolves. The name gate below still guards precision, so a
+        // wrong header match abstains.
+        None => store
+            .node_starting_at_or_below(corpus, &r.target_path, r.target_line, target_kinds(edge))
+            .ok()
+            .flatten()?,
+    };
     // Does the node the editor landed on actually carry the name it said it was
     // resolving? Nothing above checks this: the gates are edge kind, target node
     // kind, span containment and corpus equality, none of which notice a
@@ -1299,6 +1314,70 @@ mod tests {
             "src/order.ts",
             &[resolution(2, "save", "src/user.ts", 17)],
         );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            }
+        );
+    }
+
+    /// Issue #816 defect 2 backstop: a provider that reports the item's full
+    /// range (or a bare `Location`) puts the definition line on a leading doc
+    /// comment or attribute, above the node's declaration. The daemon maps such
+    /// a position to the definition it heads and emits, so a server that does not
+    /// supply `targetSelectionRange` still resolves.
+    #[test]
+    fn a_definition_line_just_above_the_node_maps_to_the_node() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        // The provider reports line 13, a doc comment / attribute two lines above
+        // User.save's declaration at 15, which is inside no node span.
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "save", "src/user.ts", 13)],
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            }
+        );
+        assert_eq!(
+            provenance_of(
+                &store,
+                node_id("src/order.ts", "fn:placeOrder"),
+                node_id("src/user.ts", "method:User.save"),
+            )
+            .as_deref(),
+            Some("live"),
+            "a header position above the node must still resolve to the definition",
+        );
+    }
+
+    /// The backstop is name-gated: a header position above a node whose name does
+    /// not match the reported reference abstains rather than attaching.
+    #[test]
+    fn a_header_position_above_a_mismatched_node_still_abstains() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        // Line 13 heads User.save, but the reference names `load`, not `save`.
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "load", "src/user.ts", 13)],
+        );
+
         assert_eq!(
             out,
             LiveOutcome {
