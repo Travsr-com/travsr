@@ -1590,14 +1590,15 @@ pub struct ReplaceReport {
     /// supplied, so nothing could be proven unchanged). Empty means every
     /// definition was preserved, so there is no changed region to re-resolve.
     ///
-    /// The save-path lexical lane (`live_resolve_file`) scopes to exactly these,
-    /// so a preserved definition's already-committed references are not
-    /// re-recorded as `pending` and the freshness count stays honest. The
-    /// request-path editor targets (`live_resolution_targets`) are not yet scoped
-    /// to this set: they still span the file, which costs extra provider round
-    /// trips on preserved definitions but never a wrong edge, because a native
-    /// target inside a preserved definition is a no-op for the committed graph
-    /// (`put_edge_live` only touches `live` rows).
+    /// Both lanes scope to exactly these. The save-path lexical lane
+    /// (`live_resolve_file`) filters to them so a preserved definition's
+    /// already-committed references are not re-recorded as `pending` and the
+    /// freshness count stays honest. The request-path editor targets
+    /// (`live_resolution_targets`) filter to them too, via the set stashed on the
+    /// `EditorPlane` at save, so a preserved definition emits no native provider
+    /// round trip. A whole-file re-derive stashes nothing, so the request path
+    /// stays whole-file; a dependent file (not reparsed by this save) is also
+    /// resolved whole-file.
     #[serde(default)]
     pub changed_defs: Vec<NodeId>,
     /// RFC-027 #813 P2: the committed occurrence rows the reparse is about to
