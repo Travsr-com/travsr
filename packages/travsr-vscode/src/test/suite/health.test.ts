@@ -230,6 +230,28 @@ suite("health panel rendering", () => {
     assert.ok(html.includes("not reported by this binary"));
   });
 
+  test("a missing index status blames the right thing", () => {
+    // An empty reply is not evidence about the binary's age when Travsr is not
+    // answering, or when the daemon is stopped. Saying "not reported by this
+    // binary" there sends the reader to check the wrong thing.
+    const offline = buildStatsHtml(STATS, [], [], 500, undefined, 0, UNKNOWN_INDEX, STOPPED);
+    assert.ok(offline.includes("Travsr is not answering"), offline.slice(0, 0) || "offline reason");
+    const noDaemon = buildStatsHtml(STATS, [], [], 500, undefined, 0, UNKNOWN_INDEX, {
+      ...RUNNING,
+      daemonRunning: false,
+    });
+    assert.ok(noDaemon.includes("while the daemon is stopped"), "stopped-daemon reason");
+    assert.ok(!noDaemon.includes("not reported by this binary"), "and not the binary's age");
+  });
+
+  test("the header carries a timestamp the document can count from", () => {
+    // "checked just now" was a literal, so it never changed and a Refresh on an
+    // otherwise unchanged page produced no visible result at all.
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, RUNNING);
+    assert.ok(/data-at="\d{13}"/.test(html), "a real epoch timestamp is rendered");
+    assert.ok(html.includes("tickChecked"), "and the document ticks it");
+  });
+
   test("being unable to query is stated, not implied by the numbers being old", () => {
     // STOPPED is both: no daemon and no answers. The banner has to say the
     // numbers came off disk rather than leaving the reader to infer it.

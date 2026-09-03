@@ -1320,7 +1320,17 @@ export function buildStatsHtml(
         : health.commitHook
           ? row("Commit hook", "installed", "ok")
           : row("Commit hook", "not installed, so commits do not refresh", "warn", act("Install", "installHook", "primary")))
-    : unavailable("Index status is not reported by this binary.");
+    : // Why it is missing matters, and these are different faults. An empty
+      // reply while Travsr is not answering, or while the daemon is stopped, is
+      // not evidence about the binary's age, and saying so sent the reader to
+      // check the wrong thing.
+      unavailable(
+        !health.mcpConnected
+          ? "Index status could not be read: Travsr is not answering."
+          : !daemonRunning
+            ? "Index status could not be read while the daemon is stopped."
+            : "Index status is not reported by this binary."
+      );
 
   const indexSec = section(
     "Index freshness",
@@ -1555,7 +1565,7 @@ export function buildStatsHtml(
     <p class="sub mono">${esc(repoPath)}</p>
   </div>
   <div class="phead-a">
-    <span class="checked">checked just now</span>
+    <span class="checked" id="checkedAt" data-at="${Date.now()}">checked just now</span>
     <button class="btn" id="refreshBtn" onclick="doRefresh(this)">Refresh</button>
   </div>
 </div>
@@ -1637,6 +1647,35 @@ ${logRows}
 
   const script = `
 function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({command:'refresh'}); }
+
+// How long ago this document was built, ticking so the reader can tell whether
+// what they are looking at is seconds or an hour old. Without it the header
+// said "checked just now" forever, which also meant a Refresh produced no
+// visible change on an otherwise unchanged page.
+//
+// The timestamp is stamped into the markup at render time and the timer lives
+// in the document, which is the right way round: a refresh assigns
+// the whole webview HTML, so the timer dies with the document it describes
+// and the replacement starts its own. No backticks in this comment: it lives
+// inside a template literal.
+function agoText(ms){
+  var s = Math.max(0, Math.round(ms / 1000));
+  if (s < 5) return 'checked just now';
+  if (s < 60) return 'checked ' + s + 's ago';
+  var m = Math.floor(s / 60);
+  if (m < 60) return 'checked ' + m + 'm ago';
+  var h = Math.floor(m / 60);
+  return 'checked ' + h + 'h ' + (m % 60) + 'm ago';
+}
+function tickChecked(){
+  var el = document.getElementById('checkedAt');
+  if (!el) return;
+  var at = Number(el.getAttribute('data-at'));
+  if (!at) return;
+  el.textContent = agoText(Date.now() - at);
+}
+setInterval(tickChecked, 1000);
+tickChecked();
 
 // The verdict's action and the per-diagnostic fixes. Only an index reaches the
 // extension, never the command text: the extension holds the diagnostics it
