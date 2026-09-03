@@ -1306,7 +1306,6 @@ type PanelMessage =
   | { command: "restartEmbed" }
   | { command: "runFsck" }
   | { command: "compact" }
-  | { command: "pruneLogs" }
   | { command: "registerMcp" }
   | { command: "fixLang"; index: number }
   | { command: "runFix"; index: number }
@@ -1588,7 +1587,10 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
       restartEmbed: ["embed", "init", "--reinstall"],
       runFsck: ["fsck"],
       compact: ["fsck", "--fix"],
-      pruneLogs: ["repos", "--prune"],
+      // Without `--yes` this prompts per language. That is deliberate: it runs
+      // in a real terminal where the prompt works, and `--yes` would have the
+      // panel download several analyzers off one click.
+      detectLangs: ["lang", "detect"],
     };
     const argv = TERMINAL_ACTIONS[msg.command];
     if (argv !== undefined) {
@@ -1597,7 +1599,6 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
       const DESTRUCTIVE: Partial<Record<string, string>> = {
         fullRebuild: "Rebuild the graph from scratch? The current index is discarded and rebuilt.",
         compact: "Repair the index? Entries pointing at files that no longer exist are removed.",
-        pruneLogs: "Prune stale repositories from the registry?",
       };
       const warning = DESTRUCTIVE[msg.command];
       if (warning !== undefined) {
@@ -1614,6 +1615,30 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
     }
     if (msg.command === "registerMcp") {
       await vscode.commands.executeCommand("travsr.registerMcpServer");
+      await refresh();
+      return;
+    }
+    // Registry edits. These existed only in the Repos panel's own handler, so
+    // the same buttons on this page posted a message nothing listened for and
+    // silently did nothing.
+    if (msg.command === "prune") {
+      const stale = (lastHealth.repos ?? []).filter((r) => !r.exists).length;
+      const go = await vscode.window.showWarningMessage(
+        stale > 0
+          ? `Remove ${stale} registry entr${stale === 1 ? "y" : "ies"} whose database is missing? The repositories themselves are not touched.`
+          : "Prune stale registry entries?",
+        { modal: true },
+        "Prune"
+      );
+      if (go !== "Prune") return;
+      const result = stripEnvelope(await client.callTool("repos_prune"));
+      const m = /^pruned:\s*(\d+)/.exec(result.trim());
+      void vscode.window.showInformationMessage(`Travsr: pruned ${m ? m[1] : "0"} stale repo(s).`);
+      await refresh();
+      return;
+    }
+    if (msg.command === "remove") {
+      await client.callTool("repos_remove", { name: msg.name });
       await refresh();
       return;
     }

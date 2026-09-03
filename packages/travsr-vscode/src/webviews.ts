@@ -1365,7 +1365,14 @@ export function buildStatsHtml(
     integ === null
       ? unavailable("Could not read the integrity report.")
       : row("graph.db", integ.dbSize) +
-        row("Logs", `${integ.logSize}, ${integ.logFiles} file${integ.logFiles === 1 ? "" : "s"}`, undefined, act("Prune", "pruneLogs")) +
+        // No action. Log pruning is the daemon's own job, applied at start and
+        // when the day rolls, against a 7 file and 50 MB budget; there is no
+        // user-facing command to trigger it and offering one here would mean
+        // wiring a button to something else.
+        row(
+          "Logs",
+          `${integ.logSize}, ${integ.logFiles} file${integ.logFiles === 1 ? "" : "s"}, pruned by the daemon`
+        ) +
         row(
           "Ghost paths",
           integ.ghostCount === null
@@ -1452,20 +1459,42 @@ export function buildStatsHtml(
       : "",
     health.repos === null
       ? unavailable("Could not read the repository registry.")
-      : health.repos
-          .map((r) =>
-            row(
-              r.name,
-              r.exists
-                ? r.name === health.activeRepo
-                  ? "active"
-                  : "ok"
-                : "database missing",
-              r.exists ? "ok" : "warn",
-              r.exists ? "" : `<button class="btn mini ghost" onclick="removeRepoRow(this, '${esc(r.name)}')">Remove</button>`
-            )
-          )
-          .join("")
+      : (() => {
+          // Capped. A machine that has run the test suite accumulates one
+          // registry entry per temp repo, so this reached seventy rows of
+          // `.tmpXXXXXX` and buried every real repository. The ones that still
+          // exist come first, since those are the ones worth acting on, and
+          // Prune stale in the header clears the rest in one go.
+          const REPO_ROWS = 8;
+          const sorted = [...health.repos].sort(
+            (a, b) => Number(b.exists) - Number(a.exists)
+          );
+          const shown = sorted.slice(0, REPO_ROWS);
+          const hidden = sorted.length - shown.length;
+          return (
+            shown
+              .map((r) =>
+                row(
+                  r.name,
+                  r.exists
+                    ? r.name === health.activeRepo
+                      ? "active"
+                      : "ok"
+                    : "database missing",
+                  r.exists ? "ok" : "warn",
+                  r.exists
+                    ? ""
+                    : `<button class="btn mini ghost" onclick="removeRepoRow(this, '${esc(r.name)}')">Remove</button>`
+                )
+              )
+              .join("") +
+            (hidden > 0
+              ? `<div class="hrow muted">and ${hidden} more, ${
+                  sorted.filter((r) => !r.exists).length
+                } of which have no database</div>`
+              : "")
+          );
+        })()
   );
 
   const sections =

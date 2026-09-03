@@ -327,6 +327,60 @@ suite("health panel rendering", () => {
     assert.ok(!html.includes("fixLang(this, 'go')"), "never the language name itself");
   });
 
+  test("every button on the page posts a message the panel handles", () => {
+    // The Remove and Prune stale buttons were rendered here but their handlers
+    // lived only in the Repos panel, so clicking them did nothing at all. This
+    // pins the set of messages this page can emit against the set the
+    // controller implements, so a new button cannot ship dead.
+    const html = buildStatsHtml(STATS, [], [WARN], 500, undefined, 0, STALE, FULL);
+    const HANDLED = new Set([
+      "refresh", "startDaemon", "restartDaemon", "reindex", "fullRebuild",
+      "reindexSemantic", "installHook", "installEmbed", "restartEmbed",
+      "runFsck", "compact", "registerMcp", "prune", "remove", "fixLang",
+      "runFix", "copyFix", "openFile", "setLogLines", "setLogFile", "setLogAuto",
+      "initRepo", "detectLangs",
+    ]);
+    const posted = new Set<string>();
+    for (const m of html.matchAll(/command:\s*'([a-zA-Z]+)'/g)) posted.add(m[1]);
+    for (const m of html.matchAll(/panelAction\(this,\s*'([a-zA-Z]+)'\)/g)) posted.add(m[1]);
+    for (const m of html.matchAll(/verdictAction\(this,\s*'([a-zA-Z]+)'\)/g)) posted.add(m[1]);
+    assert.ok(posted.size > 5, `expected several messages, saw ${[...posted]}`);
+    for (const p of posted) {
+      assert.ok(HANDLED.has(p), `${p} is posted by the page but not handled`);
+    }
+  });
+
+  test("the logs row offers no action, because pruning them is the daemon's job", () => {
+    // This button was wired to `repos --prune`, so a click beside Logs would
+    // have pruned the repository registry instead.
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, FULL);
+    assert.ok(html.includes("pruned by the daemon"), "the row says who prunes");
+    assert.ok(!html.includes("pruneLogs"), "and offers no button of its own");
+  });
+
+  test("the repository list is capped, with the live ones first", () => {
+    // A machine that has run the test suite accumulates a registry entry per
+    // temp repo. This reached seventy rows of .tmpXXXXXX and buried the real
+    // repositories.
+    const many: HealthData = {
+      ...FULL,
+      repos: [
+        ...Array.from({ length: 68 }, (_, i) => ({
+          name: `.tmp${i}`,
+          path: `c:/t/${i}`,
+          exists: false,
+        })),
+        { name: "travsr", path: "c:/r/travsr", exists: true },
+        { name: "menuservice", path: "c:/r/menu", exists: true },
+      ],
+    };
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, many);
+    assert.ok(html.includes("travsr"), "a live repo is shown");
+    assert.ok(html.includes("and 62 more"), "the rest are counted, not listed");
+    assert.ok(html.includes("Prune stale (68)"), "and the bulk fix is offered");
+    assert.ok((html.match(/removeRepoRow\(/g) ?? []).length <= 8, "rows are capped");
+  });
+
   test("no section signals its state by colour alone", () => {
     const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, STALE, FULL);
     // Each chip tone carries a word beside it.
