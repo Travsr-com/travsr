@@ -6041,6 +6041,27 @@ LIMIT ?4",
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// References the live overlay resolved mid-edit (`state = 'resolved'`), the
+    /// positive counterpart of [`Self::pending_ref_count`].
+    ///
+    /// With a `phase_b_dirty` marker set, a non-zero count is positive evidence
+    /// the editor/lexical lane recovered the edited region, so the status surface
+    /// can say the overlay is fresh rather than a blanket "stale". Joins `nodes`
+    /// for the same orphan-row reason `pending_ref_count` does.
+    pub fn resolved_ref_count(&self) -> Result<u64, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM ref_resolution_state r \
+                 JOIN nodes n ON n.id = r.src \
+                 WHERE r.state = 'resolved'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .context("counting resolved references")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// RFC-027 section 10: unresolved references grouped by the file they sit
     /// in, for a freshness note that can scope itself to the answer it decorates.
     ///
@@ -11456,6 +11477,40 @@ mod tests {
             2,
             "the two references Phase B said nothing about must stay pending"
         );
+    }
+
+    /// `resolved_ref_count` tallies the live overlay's settled references, the
+    /// positive evidence the status surface needs to downgrade a `phase_b_dirty`
+    /// edit from "stale" to "fresh". It counts only `resolved` rows, and (like
+    /// `pending_ref_count`) only those whose `src` node still exists.
+    #[test]
+    fn resolved_ref_count_tallies_only_resolved_rows() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = live_node("c", "src/a.ts", "fn:caller", "function", 1);
+        let callee = live_node("c", "src/b.ts", "fn:callee", "function", 1);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        let resolved = |line: u32, name: &str| RefResolution {
+            src: caller.id,
+            ref_line: line,
+            ref_col: 0,
+            name: name.to_string(),
+            state: "resolved",
+            resolved_dst: Some(callee.id),
+        };
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/a.ts",
+                &[
+                    resolved(3, "one"),
+                    resolved(4, "two"),
+                    pending(caller.id, 5, "three"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.resolved_ref_count().unwrap(), 2);
+        assert_eq!(store.pending_ref_count().unwrap(), 1);
     }
 
     /// Finding 5: a renamed symbol retires its `NodeId`, which is the only

@@ -80,7 +80,32 @@ fn phase_b_state(payload: &StatusPayload) -> String {
     match payload.phase_b_commit.as_deref() {
         Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => {
             if payload.phase_b_dirty {
-                "stale (run travsr init --semantic to refresh)".to_string()
+                // A mid-edit reindex dropped the changed region's committed
+                // edges. Whether that is a real degradation depends on the live
+                // overlay, in three cases:
+                //   - live lane inactive (no ref_resolution rows at all: a
+                //     headless daemon with no editor, or a generic-detector
+                //     language with no lexical floor): nothing recovered the
+                //     edit, so it is genuinely stale until a refresh.
+                //   - active with references still pending: name how many are
+                //     unknown until commit.
+                //   - active and fully resolved: the overlay is queryable at
+                //     HEAD, so "stale, re-run init" would be wrong advice.
+                // The counts are repo-wide (phase_b_dirty is a single flag), so
+                // a mix of an editor-resolved file and a headless generic-language
+                // edit can read "active" on the strength of the resolved file;
+                // the commit-gated path still repairs the rest.
+                let live_active = payload.live_refs_resolved > 0 || payload.live_refs_pending > 0;
+                if !live_active {
+                    "stale (run travsr init --semantic to refresh)".to_string()
+                } else if payload.live_refs_pending > 0 {
+                    format!(
+                        "{} reference(s) in uncommitted edits not yet resolved",
+                        payload.live_refs_pending
+                    )
+                } else {
+                    "up to date (uncommitted edits resolved)".to_string()
+                }
             } else {
                 // #712: the marker now advances even when a language crashed, so
                 // the healthy languages are complete and queryable at HEAD. Name
@@ -543,6 +568,8 @@ mod tests {
             rust_lsif_degraded: None,
             rerank: String::new(),
             phase_b_dirty: dirty,
+            live_refs_resolved: 0,
+            live_refs_pending: 0,
             dart_deps_unresolved: None,
         }
     }
@@ -559,6 +586,43 @@ mod tests {
         assert_eq!(
             phase_b_state(&payload("abc", "abc", true)),
             "stale (run travsr init --semantic to refresh)"
+        );
+    }
+
+    #[test]
+    fn phase_b_reports_fresh_when_the_live_overlay_recovered_the_edit() {
+        // The live lane resolved every reference in the edited region, so the
+        // dirty marker must not read as "stale, re-run init": the graph is
+        // queryable at HEAD via the overlay.
+        let mut p = payload("abc", "abc", true);
+        p.live_refs_resolved = 12;
+        p.live_refs_pending = 0;
+        assert_eq!(phase_b_state(&p), "up to date (uncommitted edits resolved)");
+    }
+
+    #[test]
+    fn phase_b_names_pending_references_instead_of_a_blanket_stale() {
+        // Live lane active with some references still unresolved; report how many
+        // are unknown until commit rather than a flat "stale".
+        let mut p = payload("abc", "abc", true);
+        p.live_refs_resolved = 5;
+        p.live_refs_pending = 3;
+        assert_eq!(
+            phase_b_state(&p),
+            "3 reference(s) in uncommitted edits not yet resolved"
+        );
+    }
+
+    #[test]
+    fn phase_b_names_pending_even_when_nothing_resolved_yet() {
+        // The lane ran (rows exist) but settled nothing so far: still "active
+        // with pending", not the inactive "stale", so the count is honest.
+        let mut p = payload("abc", "abc", true);
+        p.live_refs_resolved = 0;
+        p.live_refs_pending = 4;
+        assert_eq!(
+            phase_b_state(&p),
+            "4 reference(s) in uncommitted edits not yet resolved"
         );
     }
 

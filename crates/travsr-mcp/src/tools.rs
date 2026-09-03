@@ -243,7 +243,32 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
     match (phase_b, last) {
         (None, Some(_)) => Some(PENDING.to_string()),
         (Some(pb), Some(lc)) if pb != lc => Some(PENDING.to_string()),
-        _ if dirty => Some(STALE.to_string()),
+        _ if dirty => {
+            // #583 set this flag on any mid-edit reindex, on the pre-live-lane
+            // premise that the dropped call edges are simply gone. The live
+            // overlay may have recovered them, so report the truth in three
+            // cases rather than a blanket "degraded, run init":
+            //   - no overlay ran (no resolution rows): the edges are genuinely
+            //     missing, so the stale note stands.
+            //   - the overlay resolved the edited region with nothing pending:
+            //     results are current, so no degraded note (fall through to the
+            //     per-language completeness check).
+            //   - some references are still pending: name that a few call edges
+            //     may be missing until commit, without the heavy "run init".
+            let resolved = store.resolved_ref_count().unwrap_or(0);
+            let pending = store.pending_ref_count().unwrap_or(0);
+            if resolved == 0 && pending == 0 {
+                Some(STALE.to_string())
+            } else if pending == 0 {
+                phase_b_unanalyzed_note(store)
+            } else {
+                Some(format!(
+                    "[note: {pending} reference(s) in uncommitted edits are not \
+                     yet resolved, so a few call edges may be missing until the \
+                     next commit; other results are current.]"
+                ))
+            }
+        }
         // Current index, but not every language in it was analyzed.
         _ => phase_b_unanalyzed_note(store),
     }
@@ -11716,6 +11741,76 @@ mod snippet_tests {
         store.set_meta("phase_b_dirty", "1").unwrap();
         let note = phase_b_degraded_note(&store).expect("must flag stale");
         assert!(note.contains("call-graph edges degraded"), "got: {note}");
+    }
+
+    #[test]
+    fn phase_b_note_not_degraded_when_the_live_overlay_resolved_the_edit() {
+        // dirty, but the overlay resolved the edited region with nothing
+        // pending: results are current, so no "degraded, run init" note.
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let n = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+            "function",
+        )
+        .with_line(1);
+        store.put_node(&n).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "a.rs",
+                &[travsr_store::RefResolution {
+                    src: n.id,
+                    ref_line: 2,
+                    ref_col: 0,
+                    name: "b".into(),
+                    state: "resolved",
+                    resolved_dst: None,
+                }],
+            )
+            .unwrap();
+        let note = phase_b_degraded_note(&store);
+        assert!(
+            note.as_deref().map_or(true, |s| !s.contains("degraded")),
+            "a fully-resolved overlay must not read as degraded, got: {note:?}"
+        );
+    }
+
+    #[test]
+    fn phase_b_note_names_pending_references_instead_of_run_init() {
+        // dirty with an unresolved reference: name the gap honestly, without the
+        // heavy "run travsr init".
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let n = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+            "function",
+        )
+        .with_line(1);
+        store.put_node(&n).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "a.rs",
+                &[travsr_store::RefResolution {
+                    src: n.id,
+                    ref_line: 2,
+                    ref_col: 0,
+                    name: "b".into(),
+                    state: "pending",
+                    resolved_dst: None,
+                }],
+            )
+            .unwrap();
+        let note = phase_b_degraded_note(&store).expect("a pending overlay must note the gap");
+        assert!(
+            note.contains("not yet resolved") && !note.contains("travsr init"),
+            "got: {note}"
+        );
     }
 
     #[test]
