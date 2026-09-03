@@ -550,6 +550,27 @@ impl Tool {
         }
     }
 
+    /// A follow-up step a tool needs after its server file is written but before
+    /// the server actually loads. Distinct from `note`: `note` marks a rules-only
+    /// adapter whose MCP config lives in a global file travsr does not write,
+    /// whereas this is for a tool travsr *does* wire, that still gates the server
+    /// behind a user action.
+    ///
+    /// Claude Code will not load a project-scoped `.mcp.json` until it is approved
+    /// once (`enabledMcpjsonServers`). Writing the file reports `ok`, but the
+    /// travsr tools stay inert until that approval, so a bare `ok` reads as done
+    /// when it is not (#829).
+    fn approval_hint(&self) -> Option<&'static str> {
+        match self {
+            Tool::ClaudeCode => Some(
+                "  note: Claude Code loads a project .mcp.json only after a one-time \
+                 approval. If the travsr tools are not available, restart Claude Code \
+                 and accept the trust prompt, or run /mcp to enable the travsr server.",
+            ),
+            _ => None,
+        }
+    }
+
     /// Snippet printed when only a global marker is present.
     fn snippet(&self, repo: &Path, cmd: &McpCommand) -> String {
         let server = indent(&mcp_servers_json(cmd));
@@ -1214,6 +1235,13 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                     if let Some(note) = tool.note(&cmd) {
                         say!("{note}");
                     }
+                    // #829: naming the still-pending approval where a bare `ok`
+                    // otherwise reads as done. Not gated on the write outcome:
+                    // approval is still needed whether the file was just written
+                    // or already present and committed.
+                    if let Some(hint) = tool.approval_hint() {
+                        say!("{hint}");
+                    }
                 }
             }
             Detection::Print => {
@@ -1820,6 +1848,22 @@ mod tests {
             rules_only.len() >= 3,
             "expected Antigravity, Codex and Windsurf to be rules-only, got {rules_only:?}"
         );
+    }
+
+    /// #829: writing `.mcp.json` reports `ok`, but Claude Code will not load a
+    /// project server until it is approved once. The report must name that step,
+    /// or the wiring looks done while it is inert.
+    #[test]
+    fn claude_code_names_the_one_time_approval_step() {
+        let hint = Tool::ClaudeCode
+            .approval_hint()
+            .expect("claude-code writes a project .mcp.json and needs an approval hint");
+        assert!(
+            hint.contains("approval") && hint.contains("/mcp"),
+            "hint should name the approval and how to grant it: {hint}"
+        );
+        // The hint is Claude Code specific; a rules-only tool must not carry it.
+        assert!(Tool::Codex.approval_hint().is_none());
     }
 
     #[test]
