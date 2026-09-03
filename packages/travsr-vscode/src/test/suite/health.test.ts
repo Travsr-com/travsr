@@ -28,13 +28,15 @@ const FRESH: IndexHealth = {
   available: true,
 };
 
-const RUNNING: HealthData = { ...EMPTY_HEALTH, daemonRunning: true };
-const STOPPED: HealthData = { ...EMPTY_HEALTH, daemonRunning: false };
+const RUNNING: HealthData = { ...EMPTY_HEALTH, daemonRunning: true, mcpConnected: true };
+const STOPPED: HealthData = { ...EMPTY_HEALTH, daemonRunning: false, mcpConnected: false };
 
 /** A gather that succeeded, with one problem in each section, so a render can
  *  be checked against every branch that has something to say. */
 const FULL: HealthData = {
   daemonRunning: false,
+  daemonDetail: "not running",
+  mcpConnected: true,
   daemonPid: "24188",
   daemonStopped: "11:38:50",
   lastEditor: "vscode-10580 detached 11:38:26",
@@ -57,8 +59,9 @@ const FULL: HealthData = {
   ],
   activeRepo: "menuservice",
   languages: [
-    { language: "Java", analysis: "structural only", full: false, symbols: "0 symbols" },
-    { language: "XML", analysis: "full", full: true, symbols: "318 from 46 files" },
+    { language: "Java", analysis: "structural only", full: false, statusLine: "partial", flagged: true, fix: "semantic" },
+    { language: "XML", analysis: "full", full: true, statusLine: "installed and enabled", flagged: false, fix: "none" },
+    { language: "Go", analysis: "structural only", full: false, statusLine: "partial (run: travsr lang install go for full analysis)", flagged: false, fix: "install" },
   ],
   integrity: {
     healthy: false,
@@ -126,21 +129,34 @@ suite("verdict", () => {
   test("a stopped daemon outranks everything else", () => {
     // Nothing below the banner is live in this state, so it has to lead even
     // when there are analyzer warnings to report as well.
-    const v = computeVerdict(false, STALE, [WARN], true);
+    const v = computeVerdict(false, false, STALE, [WARN], true);
     assert.strictEqual(v.verdict, "offline");
-    assert.strictEqual(v.headline, "Not running");
+    assert.strictEqual(v.headline, "Not answering");
     assert.strictEqual(v.action?.message, "startDaemon");
     assert.ok(/read from the graph on disk/.test(v.detail));
   });
 
+  test("a stopped daemon is reported even while queries still answer", () => {
+    // The regression this pins: the page read the MCP client's connection
+    // state as the daemon's state. The extension spawns its own
+    // `travsr mcp --stdio` child, which opens the database directly and keeps
+    // answering with no daemon anywhere, so the page said "running" beside a
+    // terminal saying `daemon: not running`.
+    const v = computeVerdict(true, false, FRESH, [], true);
+    assert.strictEqual(v.verdict, "degraded");
+    assert.strictEqual(v.headline, "Not watching");
+    assert.strictEqual(v.action?.message, "startDaemon");
+    assert.ok(/will not refresh/.test(v.detail), v.detail);
+  });
+
   test("no graph is its own state, not an error", () => {
-    const v = computeVerdict(true, UNKNOWN_INDEX, [], false);
+    const v = computeVerdict(true, true, UNKNOWN_INDEX, [], false);
     assert.strictEqual(v.verdict, "unindexed");
     assert.strictEqual(v.action?.message, "initRepo");
   });
 
   test("staleness outranks analyzer warnings, and names both commits", () => {
-    const v = computeVerdict(true, STALE, [WARN], true);
+    const v = computeVerdict(true, true, STALE, [WARN], true);
     assert.strictEqual(v.verdict, "stale");
     assert.strictEqual(v.action?.message, "reindex");
     assert.ok(v.detail.includes("a1b2c3d"), v.detail);
@@ -148,7 +164,7 @@ suite("verdict", () => {
   });
 
   test("warnings alone read as degraded, and are counted", () => {
-    const v = computeVerdict(true, FRESH, [WARN, { ...WARN, severity: "error" }], true);
+    const v = computeVerdict(true, true, FRESH, [WARN, { ...WARN, severity: "error" }], true);
     assert.strictEqual(v.verdict, "degraded");
     assert.ok(v.detail.includes("1 error"), v.detail);
     assert.ok(v.detail.includes("1 warning"), v.detail);
@@ -156,7 +172,7 @@ suite("verdict", () => {
   });
 
   test("clean is healthy", () => {
-    const v = computeVerdict(true, FRESH, [], true);
+    const v = computeVerdict(true, true, FRESH, [], true);
     assert.strictEqual(v.verdict, "healthy");
     assert.strictEqual(v.headline, "Healthy");
   });
@@ -170,7 +186,7 @@ suite("verdict", () => {
       [true, FRESH, [], true],
     ];
     for (const [running, idx, ds, has] of cases) {
-      const v = computeVerdict(running, idx, ds, has);
+      const v = computeVerdict(running, running, idx, ds, has);
       assert.ok(v.headline.length > 0, JSON.stringify(v));
       assert.ok(v.detail.length > 0, JSON.stringify(v));
     }
@@ -214,9 +230,12 @@ suite("health panel rendering", () => {
     assert.ok(html.includes("not reported by this binary"));
   });
 
-  test("a dead daemon is stated, not implied by the numbers being old", () => {
+  test("being unable to query is stated, not implied by the numbers being old", () => {
+    // STOPPED is both: no daemon and no answers. The banner has to say the
+    // numbers came off disk rather than leaving the reader to infer it.
     const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, STOPPED);
-    assert.ok(html.includes("Not running"));
+    assert.ok(html.includes("Not answering"));
+    assert.ok(html.includes("read from the graph on disk"));
     assert.ok(html.includes("startDaemon"));
   });
 
@@ -261,6 +280,51 @@ suite("health panel rendering", () => {
     const checked = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, FULL);
     assert.ok(checked.includes("Commit hook"));
     assert.ok(checked.includes("so commits do not refresh"));
+  });
+
+  test("the log row points at the reader on this page, not at the raw file", () => {
+    // Opening the file in an editor was both redundant, since the Daemon log
+    // section reads it with filters and a rotated-file picker, and broken: the
+    // logs live in .travsr, not .travsr/logs.
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, FULL);
+    assert.ok(html.includes("showLog()"), "the button scrolls to the log section");
+    assert.ok(html.includes('id="daemonLogSection"'), "and that section is anchored");
+    assert.ok(!html.includes("openLog"), "no message asks the extension to open a file");
+  });
+
+  test("the daemon section states the daemon and the queries separately", () => {
+    // FULL is the real shape of the reported bug: daemon down, queries fine.
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, FULL);
+    assert.ok(html.includes("not running"), "the daemon's own word");
+    assert.ok(html.includes("answering from the graph on disk"), "queries are separate");
+    assert.ok(html.includes("commits and saves will not refresh"), "and the consequence is named");
+    assert.ok(!html.includes(">running</b>"), "it must not claim the daemon is up");
+  });
+
+  test("a language the CLI calls active is still flagged when a warning names it", () => {
+    // `lang list` reports java as installed and enabled while `travsr status`
+    // warns it resolved nothing. The table used to show a tick beside a card
+    // saying the opposite.
+    const html = buildStatsHtml(STATS, [], [WARN], 500, undefined, 0, FRESH, FULL);
+    assert.ok(html.includes("see the warning below"), "the row points at the card");
+    assert.ok(!html.includes("<td>resolved</td>"), "no invented symbol count");
+  });
+
+  test("the semantic tile counts languages, it does not invent a symbol total", () => {
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, FULL);
+    assert.ok(html.includes("1 of 3"), "a count of languages");
+    assert.ok(!html.includes("0 symbols"), "never a fabricated total");
+  });
+
+  test("a language offers the fix its own status line names", () => {
+    // Go is partial with no analyzer installed, so the CLI says the fix is
+    // `travsr lang install go`. Offering a semantic re-index there runs the
+    // wrong command and changes nothing.
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, FULL);
+    assert.ok(html.includes("Install analyzer"), "the install fix is offered");
+    assert.ok(html.includes("Re-run semantic"), "and the re-index fix where that is the fix");
+    assert.ok(html.includes("fixLang(this, 2)"), "each row posts its own index");
+    assert.ok(!html.includes("fixLang(this, 'go')"), "never the language name itself");
   });
 
   test("no section signals its state by colour alone", () => {

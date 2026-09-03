@@ -763,9 +763,13 @@ export async function gatherHealth(
   log: LogEntry[],
   dbSize: string,
   logFiles: { files: LogFileInfo[]; onDisk: number },
-  activeRepoName: string
+  activeRepoName: string,
+  diags: Diagnostic[] = []
 ): Promise<HealthData> {
-  const daemonRunning = client.isConnected();
+  // Whether the extension can query, which is not the same question as whether
+  // the daemon is up: the extension's own `travsr mcp --stdio` child opens the
+  // database directly and keeps answering with no daemon anywhere.
+  const mcpConnected = client.isConnected();
 
   // Read from the log, because it is the one source that still answers after
   // the process has gone, which is exactly when this page gets opened.
@@ -797,8 +801,9 @@ export async function gatherHealth(
     }
   };
 
-  const [versionOut, embedOut, langOut, healthRaw, reposRaw] = await Promise.all([
+  const [versionOut, daemonOut, embedOut, langOut, healthRaw, reposRaw] = await Promise.all([
     settle(spawnLangCommand(binary, ["--version"], root ?? process.cwd()), ""),
+    settle(spawnLangCommand(binary, ["daemon", "status"], root ?? process.cwd(), 8_000), ""),
     settle(spawnLangCommand(binary, ["embed", "list", "--json"], root ?? process.cwd()), ""),
     settle(spawnLangCommand(binary, ["lang", "list", "--json"], root ?? process.cwd(), 60_000), ""),
     settle(client.callTool("get_graph_health"), ""),
@@ -806,6 +811,13 @@ export async function gatherHealth(
   ]);
 
   const binaryVersion = (/(\d+\.\d+\.\d+[^\s]*)/.exec(versionOut) ?? [])[1] ?? "";
+
+  // The daemon's own answer, which is the same one `travsr daemon status`
+  // gives in a terminal. "starting" counts as up: the control socket is not
+  // ready yet but the process is alive and will start watching.
+  const daemonLine = (/^daemon:\s*(.+)$/m.exec(daemonOut) ?? [])[1]?.trim() ?? "";
+  const daemonRunning = /^running|^starting/.test(daemonLine);
+  const daemonDetail = daemonLine;
 
   // Sidecars. `embed list --json` reports every model in the catalog; the panel
   // only needs whether the active one is on disk.
@@ -840,12 +852,35 @@ export async function gatherHealth(
     try {
       const parsed = JSON.parse(langOut) as LangInfo[];
       const inRepo = parsed.filter((l) => l.status !== "unsupported");
-      languages = inRepo.slice(0, 6).map((l) => ({
-        language: l.language,
-        analysis: l.status === "active" ? "full" : "structural only",
-        full: l.status === "active",
-        symbols: l.status === "active" ? "resolved" : "0 symbols",
-      }));
+      languages = inRepo.slice(0, 8).map((l) => {
+        const full = l.status === "active";
+        // Cross-referenced against the warnings on this same page. `lang list`
+        // can call a language active while `travsr status` warns that it ran
+        // and resolved nothing; both are true, and the row has to say so
+        // rather than showing a bare tick beside a contradicting card.
+        const flagged = diags.some((d) =>
+          new RegExp(`\\b${l.language.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(
+            `${d.title} ${d.hint}`
+          )
+        );
+        // `lang install <language>` and a semantic re-index are different
+        // fixes, and offering the wrong one changes nothing. A language that is
+        // partial with no analyzer on disk needs the install, which is what the
+        // CLI's own status line says; one whose analyzer is installed but
+        // resolved nothing needs the re-index.
+        const fix: LanguageRow["fix"] = !full && !l.installed ? "install" : !full || flagged ? "semantic" : "none";
+        return {
+          language: l.language,
+          analysis: full ? "full" : "structural only",
+          full,
+          // The CLI's own sentence. `lang list` reports what is installed and
+          // enabled and never counts symbols, so anything numeric here would
+          // be invented.
+          statusLine: l.statusLine || (full ? "installed and enabled" : l.status),
+          flagged,
+          fix,
+        };
+      });
       if (languages.length === 0) languages = null;
     } catch {
       languages = null;
@@ -917,6 +952,8 @@ export async function gatherHealth(
   const newest = logFiles.files[0];
   return {
     daemonRunning,
+    daemonDetail,
+    mcpConnected,
     daemonPid,
     daemonStopped,
     lastEditor,
@@ -1271,7 +1308,7 @@ type PanelMessage =
   | { command: "compact" }
   | { command: "pruneLogs" }
   | { command: "registerMcp" }
-  | { command: "openLog" }
+  | { command: "fixLang"; index: number }
   | { command: "runFix"; index: number }
   | { command: "copyFix"; index: number }
   | { command: "refresh" };
@@ -1518,7 +1555,7 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
     // log has changed.
     const health = reuse
       ? lastHealth
-      : await gatherHealth(client, bin, root, log, stats.dbSize, logFiles, path.basename(root ?? ""));
+      : await gatherHealth(client, bin, root, log, stats.dbSize, logFiles, path.basename(root ?? ""), diags);
     lastStats = stats;
     lastDiags = diags;
     lastIndex = index;
@@ -1580,18 +1617,15 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
       await refresh();
       return;
     }
-    if (msg.command === "openLog") {
-      const root = repoRoot();
-      const name = lastHealth.logFileName;
-      if (root === undefined || name === "") return;
-      try {
-        const doc = await vscode.workspace.openTextDocument(
-          path.join(root, ".travsr", "logs", name)
-        );
-        await vscode.window.showTextDocument(doc, { preview: true });
-      } catch {
-        void vscode.window.showWarningMessage(`Travsr: cannot open ${name}`);
-      }
+    if (msg.command === "fixLang") {
+      // An index into the languages this render produced, so the webview never
+      // chooses the language name that reaches the command line.
+      const lang = lastHealth.languages?.[msg.index];
+      if (lang === undefined || lang.fix === "none") return;
+      runTravsrCommand(
+        lang.fix === "install" ? ["lang", "install", lang.language] : ["init", "--semantic", "--force"],
+        repoRoot()
+      );
       return;
     }
     if (msg.command === "runFix" || msg.command === "copyFix") {

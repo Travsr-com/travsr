@@ -837,7 +837,24 @@ export interface LanguageRow {
   /** The CLI's own word for it, rendered as given. */
   analysis: string;
   full: boolean;
-  symbols: string;
+  /** `lang list` reports what is installed and enabled; it does not count
+   *  symbols. This is the CLI's own status line, not a count, because inventing
+   *  a number here is how the table came to say "resolved" for a language that
+   *  a diagnostic on the same page said had resolved nothing. */
+  statusLine: string;
+  /** True when a diagnostic on this page names this language. Without it the
+   *  table and the diagnostic card contradict each other: `lang list` reports a
+   *  language as installed and active while `travsr status` warns that it ran
+   *  and produced no symbols. Both are true, and the row has to show it. */
+  flagged: boolean;
+  /** Which fix this row offers, or none.
+   *
+   *  These are different commands and offering the wrong one wastes the user's
+   *  time: a language that is partial because no analyzer is installed needs
+   *  `lang install <language>`, which is what the CLI's own status line says,
+   *  while one whose analyzer is installed but resolved nothing needs a
+   *  semantic re-index. */
+  fix: "install" | "semantic" | "none";
 }
 
 /** Everything the page needs beyond the metric tiles and the log.
@@ -847,7 +864,20 @@ export interface LanguageRow {
  *  section whose data is missing says so rather than rendering a confident
  *  empty state. */
 export interface HealthData {
+  /** Whether the background daemon is up, as `travsr daemon status` reports it.
+   *
+   *  This is NOT the same question as "can the extension query the graph". The
+   *  extension spawns its own `travsr mcp --stdio` child, which opens the
+   *  database directly and keeps answering with no daemon anywhere. Reading the
+   *  MCP client's connection state as the daemon's state is what made this page
+   *  report "running" beside a terminal saying `daemon: not running`. */
   daemonRunning: boolean;
+  /** The daemon's own words, so a starting daemon and a daemon whose last start
+   *  failed do not both collapse to "not running". */
+  daemonDetail: string;
+  /** Whether the extension can query at all. Queries survive a stopped daemon;
+   *  what does not survive is anything refreshing the graph. */
+  mcpConnected: boolean;
   /** Parsed out of the daemon's own log, which is the only source that still
    *  works after the process has gone. */
   daemonPid: string;
@@ -867,6 +897,8 @@ export interface HealthData {
 
 export const EMPTY_HEALTH: HealthData = {
   daemonRunning: false,
+  daemonDetail: "",
+  mcpConnected: false,
   daemonPid: "",
   daemonStopped: "",
   lastEditor: "",
@@ -901,18 +933,23 @@ export interface VerdictView {
  *  outranks analyzer warnings because a stale graph makes every other number on
  *  the page describe a commit the user is no longer on. */
 export function computeVerdict(
+  mcpConnected: boolean,
   daemonRunning: boolean,
   index: IndexHealth,
   diags: Diagnostic[],
   hasGraph: boolean
 ): VerdictView {
-  if (!daemonRunning) {
+  // Being unable to query at all is the worst state, and it is a different
+  // state from the background daemon being stopped: the extension's own
+  // `travsr mcp --stdio` child answers from the database with no daemon
+  // anywhere, so a stopped daemon costs freshness, not answers.
+  if (!mcpConnected) {
     return {
       verdict: "offline",
-      headline: "Not running",
+      headline: "Not answering",
       detail: hasGraph
-        ? "The daemon is not answering, so the numbers below are read from the graph on disk rather than from a live index."
-        : "The daemon is not answering, and there is no graph on disk yet for this repository.",
+        ? "Travsr could not be reached, so the numbers below are read from the graph on disk rather than from a live index."
+        : "Travsr could not be reached, and there is no graph on disk yet for this repository.",
       action: { label: "Start daemon", message: "startDaemon" },
     };
   }
@@ -934,6 +971,18 @@ export function computeVerdict(
       headline: "Stale",
       detail: `The graph describes ${index.indexedCommit || "an earlier commit"}. ${behind}`,
       action: { label: "Reindex", message: "reindex" },
+    };
+  }
+  // Queries work, but nothing is watching the repository. Commits and saves
+  // will not refresh the graph, so this is a real degradation even though every
+  // number on the page is currently correct.
+  if (!daemonRunning) {
+    return {
+      verdict: "degraded",
+      headline: "Not watching",
+      detail:
+        "Queries are answered from the graph on disk, but the daemon is not running, so commits and saves will not refresh it.",
+      action: { label: "Start daemon", message: "startDaemon" },
     };
   }
   const errs = diags.filter((d) => d.severity === "error").length;
@@ -1062,7 +1111,7 @@ export function buildStatsHtml(
 ): string {
   const daemonRunning = health.daemonRunning;
   const hasGraph = stats.nodes !== "—" && stats.nodes !== "0";
-  const verdict = computeVerdict(daemonRunning, index, diags, hasGraph);
+  const verdict = computeVerdict(health.mcpConnected, daemonRunning, index, diags, hasGraph);
 
   /** A metric tile. `state` colours the value and adds a word beside it, so a
    *  tile is never amber without saying why. */
@@ -1213,13 +1262,42 @@ export function buildStatsHtml(
     "Daemon",
     daemonRunning ? statusChip("ok", "running") : statusChip("bad", "not running"),
     daemonRunning ? act("Restart", "restartDaemon") : act("Start", "startDaemon", "primary"),
-    (daemonRunning
-      ? row("Process", health.daemonPid ? `pid ${health.daemonPid}` : "running")
-      : row("Process", health.daemonStopped ? `stopped at ${health.daemonStopped}` : "not running", "bad")) +
+    // The daemon's own sentence, verbatim. "starting", "not responding" and
+    // "last start failed" are all distinct answers and none of them should be
+    // flattened into a bare running/not-running by this panel.
+    row(
+      "Status",
+      health.daemonDetail || (daemonRunning ? "running" : "not running"),
+      daemonRunning ? "ok" : "bad"
+    ) +
+      // Stated separately because the two are genuinely independent: the
+      // extension queries its own `travsr mcp --stdio` child, which answers
+      // from the database whether or not a daemon is up.
+      row(
+        "Queries",
+        health.mcpConnected ? "answering from the graph on disk" : "not answering",
+        health.mcpConnected ? "ok" : "bad"
+      ) +
+      (!daemonRunning && health.mcpConnected
+        ? row("Watching", "no, commits and saves will not refresh the graph", "warn")
+        : "") +
+      (health.daemonPid && daemonRunning ? row("Process", `pid ${health.daemonPid}`) : "") +
+      (!daemonRunning && health.daemonStopped
+        ? row("Last stopped", health.daemonStopped)
+        : "") +
       (health.lastEditor ? row("Last editor", health.lastEditor) : "") +
       (health.binaryVersion ? row("Version", health.binaryVersion) : "") +
+      // The button scrolls to the Daemon log section on this page rather than
+      // opening the file in an editor. That section reads the same file with
+      // severity filters, a rotated-file picker and an auto-refresh, so opening
+      // the raw file would be a second, worse way to read it.
       (health.logFileName
-        ? row("Log file", `${health.logFileName}  ${health.logFileSize}`, undefined, act("Open", "openLog"))
+        ? row(
+            "Log file",
+            `${health.logFileName}  ${health.logFileSize}`,
+            undefined,
+            `<button class="btn mini ghost" onclick="showLog()">View log</button>`
+          )
         : "")
   );
 
@@ -1316,15 +1394,27 @@ export function buildStatsHtml(
     act("Detect", "detectLangs"),
     health.languages === null
       ? unavailable("Could not read the language list.")
-      : `<table class="ltbl"><thead><tr><th>Language</th><th>Analysis</th><th>Symbols</th><th class="ra">Action</th></tr></thead><tbody>` +
+      : `<table class="ltbl"><thead><tr><th>Language</th><th>Analysis</th><th>Reported</th><th class="ra">Action</th></tr></thead><tbody>` +
         health.languages
-          .map(
-            (l) =>
+          .map((l, i) => {
+            // A language the CLI calls active can still be the subject of a
+            // warning on this same page. Showing the tick alone there is the
+            // table contradicting the card below it.
+            const tone = !l.full || l.flagged ? "warn" : "ok";
+            const icon = tone === "ok" ? OK_ICON : WARN_ICON;
+            const button =
+              l.fix === "install"
+                ? `<button class="btn mini primary" onclick="fixLang(this, ${i})">Install analyzer</button>`
+                : l.fix === "semantic"
+                  ? `<button class="btn mini primary" onclick="fixLang(this, ${i})">Re-run semantic</button>`
+                  : "-";
+            return (
               `<tr><td>${esc(l.language)}</td>` +
-              `<td class="${l.full ? "ok" : "warn"}">${l.full ? OK_ICON : WARN_ICON}${esc(l.analysis)}</td>` +
-              `<td>${esc(l.symbols)}</td>` +
-              `<td class="ra">${l.full ? "-" : act("Re-run semantic", "reindexSemantic", "primary")}</td></tr>`
-          )
+              `<td class="${tone}">${icon}${esc(l.analysis)}</td>` +
+              `<td>${esc(l.flagged ? "see the warning below" : l.statusLine)}</td>` +
+              `<td class="ra">${button}</td></tr>`
+            );
+          })
           .join("") +
         `</tbody></table>`
   );
@@ -1419,9 +1509,13 @@ export function buildStatsHtml(
   const semanticTile = (() => {
     const langs = health.languages;
     if (langs === null || langs.length === 0) return "";
-    const partial = langs.filter((l) => !l.full);
-    return partial.length > 0
-      ? card("Semantic", partial[0].symbols.startsWith("0") ? "0 symbols" : "partial", "warn", partial[0].language)
+    // A count, not a symbol total. `lang list` does not report symbol counts,
+    // and the tile used to print "0 symbols" for one partial language while
+    // five others were fully analysed, which read as though nothing resolved.
+    const bad = langs.filter((l) => !l.full || l.flagged);
+    const good = langs.length - bad.length;
+    return bad.length > 0
+      ? card("Semantic", `${good} of ${langs.length}`, "warn", bad.map((l) => l.language).join(", "))
       : card("Semantic", "full", undefined, `${langs.length} languages`);
   })();
 
@@ -1464,7 +1558,7 @@ ${activityRows}
 </tbody></table>
 </section>
 
-<section class="col-log">
+<section class="col-log" id="daemonLogSection">
 <h2>Daemon log</h2>
 <div class="log-bar">
   <input id="logSearch" type="search" placeholder="Filter lines\u2026" oninput="filterLog()"
@@ -1522,6 +1616,18 @@ function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({com
 function verdictAction(btn, msg){ setLoading(btn,true,btn.textContent); vscode.postMessage({command: msg}); }
 function panelAction(btn, msg){ setLoading(btn,true,btn.textContent); vscode.postMessage({command: msg}); }
 function removeRepoRow(btn, n){ setLoading(btn,true,'Remove'); vscode.postMessage({command:'remove', name:n}); }
+
+// Scroll to the log reader on this page. Deliberately not a message to the
+// extension: nothing needs to be spawned or opened, so a round trip would only
+// add latency and a way to fail.
+function showLog(){
+  var s = document.getElementById('daemonLogSection');
+  if (!s) return;
+  s.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  var input = document.getElementById('logSearch');
+  if (input) input.focus({ preventScroll: true });
+}
+function fixLang(btn, i){ setLoading(btn,true,btn.textContent); vscode.postMessage({command:'fixLang', index:i}); }
 function runFix(btn, i){ setLoading(btn,true,'Run'); vscode.postMessage({command:'runFix', index:i}); }
 function copyFix(btn, i){ vscode.postMessage({command:'copyFix', index:i}); }
 
