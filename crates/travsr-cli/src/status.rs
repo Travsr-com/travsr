@@ -89,12 +89,16 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                 //     edit, so it is genuinely stale until a refresh.
                 //   - active with references still pending: name how many are
                 //     unknown until commit.
-                //   - active and fully resolved: the overlay is queryable at
-                //     HEAD, so "stale, re-run init" would be wrong advice.
-                // The counts are repo-wide (phase_b_dirty is a single flag), so
-                // a mix of an editor-resolved file and a headless generic-language
-                // edit can read "active" on the strength of the resolved file;
-                // the commit-gated path still repairs the rest.
+                //   - active with nothing pending: the overlay resolved every
+                //     reference it detected, so "stale, re-run init" would be
+                //     wrong advice.
+                // The counts are repo-wide and phase_b_dirty is a single flag,
+                // so this last case cannot prove every dropped edge came back:
+                // an editor-resolved file and a headless generic-language edit
+                // (which leaves no rows at all) both feed one flag, and the
+                // resolved rows may belong only to the first. So it reports the
+                // recovery it can see without claiming a full refresh, which the
+                // commit-gated path is what actually delivers.
                 let live_active = payload.live_refs_resolved > 0 || payload.live_refs_pending > 0;
                 if !live_active {
                     "stale (run travsr init --semantic to refresh)".to_string()
@@ -104,7 +108,8 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                         payload.live_refs_pending
                     )
                 } else {
-                    "up to date (uncommitted edits resolved)".to_string()
+                    "uncommitted edits resolved where detected; commit for a full refresh"
+                        .to_string()
                 }
             } else {
                 // #712: the marker now advances even when a language crashed, so
@@ -590,14 +595,19 @@ mod tests {
     }
 
     #[test]
-    fn phase_b_reports_fresh_when_the_live_overlay_recovered_the_edit() {
-        // The live lane resolved every reference in the edited region, so the
-        // dirty marker must not read as "stale, re-run init": the graph is
-        // queryable at HEAD via the overlay.
+    fn phase_b_reports_recovery_without_claiming_a_full_refresh() {
+        // The live lane resolved its references with nothing pending, so the
+        // dirty marker must not read as "stale, re-run init". But the counts are
+        // repo-wide, so this cannot prove a separate headless edit (which leaves
+        // no rows) also came back: the message reports the recovery it can see
+        // and names the commit as the full refresh, never a bare "up to date".
         let mut p = payload("abc", "abc", true);
         p.live_refs_resolved = 12;
         p.live_refs_pending = 0;
-        assert_eq!(phase_b_state(&p), "up to date (uncommitted edits resolved)");
+        assert_eq!(
+            phase_b_state(&p),
+            "uncommitted edits resolved where detected; commit for a full refresh"
+        );
     }
 
     #[test]

@@ -310,6 +310,8 @@ fn index_paths_parallel(
                                 new_hash: new_hex,
                                 nodes: vec![],
                                 edges: vec![],
+                                // Unchanged file: no nodes to stamp.
+                                source: None,
                             },
                             ffi_markers: vec![],
                             workspace_dep_markers: vec![],
@@ -358,12 +360,19 @@ fn index_paths_parallel(
                     let mut edges = out.edges;
                     edges.extend(import_edges);
 
+                    // RFC-027 #813: carry the source so the write path can stamp
+                    // each definition's body hash from the same content these
+                    // nodes were parsed from. Unreadable/binary reads as None,
+                    // leaving the hashes NULL (preservation simply forgone).
+                    let source = std::fs::read_to_string(abs_path).ok();
+
                     let _ = tx.send(Ok(ParseResult {
                         file_graph: FileGraph {
                             vname_path,
                             new_hash: new_hex,
                             nodes: out.nodes,
                             edges,
+                            source,
                         },
                         ffi_markers: out.ffi_markers,
                         workspace_dep_markers: out.workspace_dep_markers,

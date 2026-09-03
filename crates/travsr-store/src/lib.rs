@@ -23,10 +23,14 @@ use sha2::{Digest, Sha256};
 /// tell a definition the edit left untouched (its committed edges stay valid and
 /// are preserved) from one whose body changed (its edges are re-resolved).
 ///
-/// `spans` are `(node_id, start_line, end_line)` with 1-based line numbers; a
-/// node whose span falls outside the file (a stale span) is omitted, which makes
-/// the caller treat its body as changed and re-resolve — the fail-safe
-/// direction. Line-start offsets are computed once, so this is O(file + nodes).
+/// `spans` are `(node_id, start_line, end_line)` with 1-based line numbers. A
+/// node is omitted (its body treated as changed, so the caller re-resolves — the
+/// fail-safe direction) when either its span falls outside the file (a stale
+/// span) or its `end_line` is unknown. The `end_line` guard matters: without a
+/// known end we could only hash the definition's first line, and an edit to any
+/// later line of a multi-line body would then hash identical and be wrongly
+/// preserved with its now-stale edges. Line-start offsets are computed once, so
+/// this is O(file + nodes).
 fn body_hashes_for_spans(
     content: &str,
     spans: impl IntoIterator<Item = (i64, u32, Option<u32>)>,
@@ -46,11 +50,10 @@ fn body_hashes_for_spans(
         if start == 0 || start > total_lines {
             continue;
         }
-        let end = end
-            .map(|e| e as usize)
-            .unwrap_or(start)
-            .max(start)
-            .min(total_lines);
+        // No known end line: hashing only the first line would miss edits to the
+        // rest of a multi-line body. Skip, so the caller re-resolves.
+        let Some(end) = end else { continue };
+        let end = (end as usize).max(start).min(total_lines);
         let begin = line_starts[start - 1];
         // `end` is 1-based inclusive: take bytes up to the start of line end + 1
         // (or EOF for the final line), so the definition's full text is hashed.
@@ -936,6 +939,15 @@ pub struct FileGraph {
     pub new_hash: String,
     pub nodes: Vec<travsr_core::Node>,
     pub edges: Vec<travsr_core::Edge>,
+    /// RFC-027 #813: the file's current source text, so the write path can stamp
+    /// each definition's `body_hash` from the same content it is deriving edges
+    /// from. That co-write is what makes the hash a sound preservation witness:
+    /// a later save preserves a definition only when its body is byte-identical
+    /// to what these edges were built from. `None` (e.g. an unchanged file with
+    /// no nodes, or a caller that does not supply it) leaves the hashes NULL,
+    /// which forgoes preservation for those definitions until their next
+    /// re-resolution — the fail-safe direction, never a wrong preservation.
+    pub source: Option<String>,
 }
 
 /// Aggregate counts returned by [`SqliteStore::write_file_graphs_batch`].
@@ -1169,8 +1181,8 @@ impl SqliteStore {
                 .reconcile_provenance_indexes_if_needed()
                 .context("reconciling RFC-027 provenance indexes (issue B)")?;
             store
-                .backfill_body_hashes_if_needed()
-                .context("backfilling RFC-027 #813 node body hashes")?;
+                .ensure_body_hash_column()
+                .context("adding RFC-027 #813 node body_hash column")?;
             store
                 .ensure_edge_sites_col_column()
                 .context("adding RFC-027 #813 P2 edge_sites col column")?;
@@ -2036,6 +2048,18 @@ impl SqliteStore {
             let mut counts = BatchWriteCounts::default();
 
             for file in batch {
+                // RFC-027 #813: body hash per definition, from this file's own
+                // source, stamped alongside the edges the same parse produced.
+                // Empty when the caller supplied no source (hashes stay NULL).
+                let body_hashes: HashMap<i64, String> = match &file.source {
+                    Some(text) => body_hashes_for_spans(
+                        text,
+                        file.nodes
+                            .iter()
+                            .filter_map(|n| n.line.map(|l| (node_id_to_i64(n.id), l, n.end_line))),
+                    ),
+                    None => HashMap::new(),
+                };
                 if staging {
                     // ── staging path (bulk init only) ─────────────────────────
                     // No delete pass — the DB is empty on a fresh init.
@@ -2045,8 +2069,8 @@ impl SqliteStore {
                     for node in &file.nodes {
                         tx.execute(
                             "INSERT INTO nodes_stage(id,corpus,root,path,language,\
-                             signature,kind,package,line,end_line,is_noise,test_role) \
-                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                             signature,kind,package,line,end_line,is_noise,test_role,body_hash) \
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                             params![
                                 node_id_to_i64(node.id),
                                 node.vname.corpus,
@@ -2060,6 +2084,7 @@ impl SqliteStore {
                                 node.end_line.map(|l| l as i64),
                                 travsr_core::noise::is_structural_noise(node),
                                 node.test_role.as_i64(),
+                                body_hashes.get(&node_id_to_i64(node.id)).map(String::as_str),
                             ],
                         )
                         .context("staging: inserting node")?;
@@ -2146,14 +2171,15 @@ impl SqliteStore {
                     for node in &file.nodes {
                         let id_i64 = node_id_to_i64(node.id);
                         tx.execute(
-                            "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line,is_noise,test_role) \
-                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
+                            "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line,is_noise,test_role,body_hash) \
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) \
                              ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                                package = excluded.package, \
                                line = COALESCE(excluded.line, nodes.line), \
                                end_line = COALESCE(excluded.end_line, nodes.end_line), \
                                is_noise = excluded.is_noise, \
-                               test_role = excluded.test_role",
+                               test_role = excluded.test_role, \
+                               body_hash = COALESCE(excluded.body_hash, nodes.body_hash)",
                             params![
                                 id_i64,
                                 node.vname.corpus,
@@ -2167,6 +2193,7 @@ impl SqliteStore {
                                 node.end_line.map(|l| l as i64),
                                 travsr_core::noise::is_structural_noise(node),
                                 node.test_role.as_i64(),
+                                body_hashes.get(&id_i64).map(String::as_str),
                             ],
                         )
                         .context("inserting node in batch")?;
@@ -6727,7 +6754,7 @@ impl SqliteStore {
                    id INTEGER, corpus TEXT, root TEXT, path TEXT, \
                    language TEXT, signature TEXT, kind TEXT, \
                    package TEXT, line INTEGER, end_line INTEGER, \
-                   is_noise INTEGER, test_role INTEGER \
+                   is_noise INTEGER, test_role INTEGER, body_hash TEXT \
                  ); \
                  CREATE INDEX IF NOT EXISTS nodes_stage_id ON nodes_stage(id); \
                  CREATE TEMP TABLE IF NOT EXISTS edges_stage( \
@@ -6773,9 +6800,9 @@ impl SqliteStore {
 
             let nodes_written = tx
                 .execute(
-                    "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line,is_noise,test_role) \
+                    "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line,is_noise,test_role,body_hash) \
                        SELECT id,corpus,root,path,language,signature,kind,package, \
-                              MAX(line),MAX(end_line),MAX(is_noise),MAX(test_role) \
+                              MAX(line),MAX(end_line),MAX(is_noise),MAX(test_role),MAX(body_hash) \
                        FROM nodes_stage GROUP BY id \
                        ON CONFLICT(id) DO UPDATE SET \
                          kind     = excluded.kind, \
@@ -6783,7 +6810,8 @@ impl SqliteStore {
                          line     = COALESCE(excluded.line,     nodes.line), \
                          end_line = COALESCE(excluded.end_line, nodes.end_line), \
                          is_noise = excluded.is_noise, \
-                         test_role = excluded.test_role",
+                         test_role = excluded.test_role, \
+                         body_hash = COALESCE(excluded.body_hash, nodes.body_hash)",
                     [],
                 )
                 .context("inserting nodes from staging")?;
@@ -6936,6 +6964,14 @@ impl SqliteStore {
     /// migrations were deliberately collapsed to keep the max at v23). The column
     /// is nullable, so existing rows read as "unknown body" and are never
     /// preserved until a reparse stamps them, which is the fail-safe direction.
+    ///
+    /// The column is populated only at write time, by the paths that also derive
+    /// the edges from the same source ([`Self::write_file_graphs_batch`] and its
+    /// staging flush, and [`Self::reindex_replace`]). There is deliberately no
+    /// disk-reading backfill: hashing the current working tree at open() could
+    /// stamp a definition whose committed edges were built from different content
+    /// (an edit made while the daemon was down leaves no trace to detect), which
+    /// is exactly the stale preservation this hash exists to prevent.
     fn ensure_body_hash_column(&mut self) -> AnyResult<()> {
         if !self.column_exists("nodes", "body_hash")? {
             self.conn
@@ -6964,106 +7000,6 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// RFC-027 #813: populate `nodes.body_hash` for definitions written without
-    /// it (the bulk-init and commit-batch write paths do not compute it), so the
-    /// first save after `travsr init` can already preserve the file's unchanged
-    /// definitions instead of falling back to the whole-file purge.
-    ///
-    /// Cheap gate: returns immediately once no line-bearing node is missing a
-    /// hash, which is the steady state after one pass (and `reindex_replace`
-    /// keeps new nodes stamped, so the gate does not re-trip). When it does run,
-    /// it reads each file with unstamped definitions once from disk, under the
-    /// repo root derived from the database location, and skips any file it cannot
-    /// read — leaving those hashes `NULL`, which only forgoes the optimisation.
-    fn backfill_body_hashes_if_needed(&mut self) -> AnyResult<()> {
-        self.ensure_body_hash_column()?;
-        let any_missing: bool = self
-            .conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM nodes \
-                 WHERE body_hash IS NULL AND line IS NOT NULL)",
-                [],
-                |r| r.get(0),
-            )
-            .context("checking for nodes missing a body hash")?;
-        if !any_missing {
-            return Ok(());
-        }
-        let Some(repo_root) = self.body_hash_repo_root() else {
-            return Ok(());
-        };
-
-        // Files that still hold an unstamped, line-bearing definition.
-        let files: Vec<(String, String)> = {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT DISTINCT corpus, path FROM nodes \
-                     WHERE body_hash IS NULL AND line IS NOT NULL",
-                )
-                .context("preparing file list for body-hash backfill")?;
-            let rows: Vec<(String, String)> = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-                .context("executing file list for body-hash backfill")?
-                .collect::<rusqlite::Result<_>>()
-                .context("collecting file list for body-hash backfill")?;
-            rows
-        };
-
-        for (corpus, path) in files {
-            let abs = repo_root.join(&path);
-            let Ok(content) = std::fs::read_to_string(&abs) else {
-                continue; // unreadable/binary: leave NULL, forgoing the optimisation
-            };
-            // (id, start_line, end_line) for this file's line-bearing nodes.
-            let spans: Vec<(i64, u32, Option<u32>)> = {
-                let mut stmt = self
-                    .conn
-                    .prepare(
-                        "SELECT id, line, end_line FROM nodes \
-                         WHERE corpus=?1 AND path=?2 AND line IS NOT NULL",
-                    )
-                    .context("preparing span load for body-hash backfill")?;
-                let rows: Vec<(i64, u32, Option<u32>)> = stmt
-                    .query_map(params![corpus, path], |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, i64>(1)? as u32,
-                            r.get::<_, Option<i64>>(2)?.map(|e| e as u32),
-                        ))
-                    })
-                    .context("executing span load for body-hash backfill")?
-                    .collect::<rusqlite::Result<_>>()
-                    .context("collecting spans for body-hash backfill")?;
-                rows
-            };
-            let hashes = body_hashes_for_spans(&content, spans);
-            let tx = self
-                .conn
-                .transaction()
-                .context("starting body-hash backfill transaction")?;
-            {
-                let mut upd = tx
-                    .prepare("UPDATE nodes SET body_hash=?1 WHERE id=?2")
-                    .context("preparing body-hash backfill update")?;
-                for (id, hash) in hashes {
-                    upd.execute(params![hash, id])
-                        .context("updating a node's body hash")?;
-                }
-            }
-            tx.commit().context("committing body-hash backfill")?;
-        }
-        Ok(())
-    }
-
-    /// The repo root the body-hash backfill resolves node paths against. The
-    /// database lives at `<repo>/.travsr/graph.db`, so the root is two parents
-    /// up. `None` for an in-memory store (its tests drive `reindex_replace`
-    /// directly with `content`, bypassing this backfill).
-    fn body_hash_repo_root(&self) -> Option<std::path::PathBuf> {
-        let db = self.db_path.as_ref()?;
-        Some(db.parent()?.parent()?.to_path_buf())
-    }
 
     /// Idempotent FTS backfill called once after migrations at `open()` /
     /// `open_in_memory()`.  Cheap gate: if `COUNT(nodes) == COUNT(nodes_fts_map)`
@@ -13194,6 +13130,7 @@ mod tests {
                 new_hash: "deadbeef".to_string(),
                 nodes: vec![n.clone()],
                 edges: vec![],
+                source: None,
             })
             .collect();
         bulk_store.write_file_graphs_batch(&batch, true).unwrap();
@@ -13242,12 +13179,14 @@ mod tests {
                 new_hash: "aaa".into(),
                 nodes: vec![node_a.clone()],
                 edges: vec![edge.clone()],
+                source: None,
             },
             FileGraph {
                 vname_path: "src/b.rs".into(),
                 new_hash: "bbb".into(),
                 nodes: vec![node_b.clone()],
                 edges: vec![],
+                source: None,
             },
         ];
         store.write_file_graphs_batch(&batch, true).unwrap();
@@ -13308,12 +13247,14 @@ mod tests {
                 new_hash: "aaa".into(),
                 nodes: vec![node.clone()],
                 edges: vec![edge.clone()],
+                source: None,
             },
             FileGraph {
                 vname_path: "src/lib.rs".into(),
                 new_hash: "aaa".into(),
                 nodes: vec![node_dup],
                 edges: vec![edge],
+                source: None,
             },
         ];
         store.write_file_graphs_batch(&batch, true).unwrap();
@@ -13341,6 +13282,7 @@ mod tests {
             new_hash: "aaa".into(),
             nodes: vec![node.clone()],
             edges: vec![],
+            source: None,
         }];
         store.write_file_graphs_batch(&batch, true).unwrap();
         store.flush_staging_to_production().unwrap();
@@ -13359,6 +13301,65 @@ mod tests {
             store.node_count().unwrap(),
             1,
             "re-init must not duplicate nodes"
+        );
+    }
+
+    #[test]
+    fn write_path_stamps_body_hash_from_source() {
+        // RFC-027 #813: the bulk write path stamps body_hash from the file's own
+        // source, co-written with the edges the same parse produced, so it is a
+        // sound preservation witness. A caller that supplies no source leaves the
+        // hash NULL — preservation forgone for that definition, never wrong.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.begin_bulk_fts_tracking().unwrap();
+        store.begin_staging_tables().unwrap();
+
+        let src = "fn foo() {\n    bar();\n}\n";
+        let stamped = Node::new(VName::new("c", "", "src/lib.rs", "rust", "fn:foo"), "function")
+            .with_line(1)
+            .with_end_line(3);
+        let unstamped = Node::new(VName::new("c", "", "src/nul.rs", "rust", "fn:baz"), "function")
+            .with_line(1)
+            .with_end_line(3);
+        let batch = vec![
+            FileGraph {
+                vname_path: "src/lib.rs".into(),
+                new_hash: "aaa".into(),
+                nodes: vec![stamped.clone()],
+                edges: vec![],
+                source: Some(src.to_string()),
+            },
+            FileGraph {
+                vname_path: "src/nul.rs".into(),
+                new_hash: "bbb".into(),
+                nodes: vec![unstamped.clone()],
+                edges: vec![],
+                source: None,
+            },
+        ];
+        store.write_file_graphs_batch(&batch, true).unwrap();
+        store.flush_staging_to_production().unwrap();
+
+        let body_hash = |id: i64| -> Option<String> {
+            store
+                .conn
+                .query_row("SELECT body_hash FROM nodes WHERE id=?1", params![id], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        let id = node_id_to_i64(stamped.id);
+        let expect = body_hashes_for_spans(src, [(id, 1u32, Some(3u32))]);
+        assert_eq!(
+            body_hash(id).as_deref(),
+            expect.get(&id).map(String::as_str),
+            "source-bearing file must stamp the hash of its definition's body"
+        );
+        assert!(body_hash(id).is_some(), "the write path must stamp from source");
+        assert_eq!(
+            body_hash(node_id_to_i64(unstamped.id)),
+            None,
+            "a file with no source must leave body_hash NULL (preservation forgone)"
         );
     }
 
@@ -13393,6 +13394,7 @@ mod tests {
                 new_hash: "hash".into(),
                 nodes: vec![n.clone()],
                 edges: vec![],
+                source: None,
             })
             .collect();
         store.write_file_graphs_batch(&batch, true).unwrap();
@@ -13447,6 +13449,7 @@ mod tests {
             new_hash: "deadbeef".to_string(),
             nodes: vec![node.clone()],
             edges: vec![],
+            source: None,
         }];
         bulk_store.write_file_graphs_batch(&batch, true).unwrap();
         bulk_store.rebuild_fts_from_map().unwrap();

@@ -183,6 +183,7 @@ fn bulk_init_path_populates_fts_words_and_is_noise() {
         new_hash: "h1".to_string(),
         nodes: vec![n.clone()],
         edges: vec![],
+        source: None,
     }];
     store.write_file_graphs_batch(&batch, true).unwrap();
     store.flush_staging_to_production().unwrap();

@@ -250,17 +250,26 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
             // cases rather than a blanket "degraded, run init":
             //   - no overlay ran (no resolution rows): the edges are genuinely
             //     missing, so the stale note stands.
-            //   - the overlay resolved the edited region with nothing pending:
-            //     results are current, so no degraded note (fall through to the
-            //     per-language completeness check).
             //   - some references are still pending: name that a few call edges
             //     may be missing until commit, without the heavy "run init".
+            //   - nothing pending, but some resolved: the overlay recovered the
+            //     edits it detected. The counts are repo-wide and phase_b_dirty
+            //     is a single flag, so this cannot prove every dropped edge came
+            //     back (a headless generic-language edit leaves no rows to count,
+            //     yet feeds the same flag as an editor-resolved file). So it
+            //     still warns lightly that a few edges may be missing until the
+            //     commit, rather than falling through to "results current".
             let resolved = store.resolved_ref_count().unwrap_or(0);
             let pending = store.pending_ref_count().unwrap_or(0);
             if resolved == 0 && pending == 0 {
                 Some(STALE.to_string())
             } else if pending == 0 {
-                phase_b_unanalyzed_note(store)
+                Some(
+                    "[note: a background re-index dropped some call edges; \
+                     uncommitted edits were re-resolved where detected, but a few \
+                     edges may still be missing until the next commit.]"
+                        .to_string(),
+                )
             } else {
                 Some(format!(
                     "[note: {pending} reference(s) in uncommitted edits are not \
@@ -10309,6 +10318,7 @@ mod snippet_tests {
                         edges: vec![],
                         vname_path: path,
                         new_hash: "deadbeef".to_string(),
+                        source: None,
                     }],
                     false,
                 )
@@ -11745,8 +11755,12 @@ mod snippet_tests {
 
     #[test]
     fn phase_b_note_not_degraded_when_the_live_overlay_resolved_the_edit() {
-        // dirty, but the overlay resolved the edited region with nothing
-        // pending: results are current, so no "degraded, run init" note.
+        // dirty, and the overlay resolved its references with nothing pending.
+        // This drops the heavy "degraded, run init" note, but not all caution:
+        // the counts are repo-wide, so a resolved file cannot prove a *separate*
+        // headless edit (which leaves no rows) also came back. So the note is a
+        // light "a few edges may be missing until the next commit", never the
+        // false "results are current".
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store.set_meta("last_commit", "abc").unwrap();
         store.set_meta("phase_b_commit", "abc").unwrap();
@@ -11771,10 +11785,14 @@ mod snippet_tests {
                 }],
             )
             .unwrap();
-        let note = phase_b_degraded_note(&store);
+        let note = phase_b_degraded_note(&store).expect("a light caution must remain");
         assert!(
-            note.as_deref().map_or(true, |s| !s.contains("degraded")),
-            "a fully-resolved overlay must not read as degraded, got: {note:?}"
+            !note.contains("degraded") && !note.contains("run `travsr init`"),
+            "a resolved overlay must drop the heavy degraded/run-init note, got: {note}"
+        );
+        assert!(
+            note.contains("until the next commit"),
+            "the light caution must still name the commit as the full refresh, got: {note}"
         );
     }
 
