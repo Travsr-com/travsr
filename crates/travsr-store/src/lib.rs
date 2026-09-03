@@ -7000,7 +7000,6 @@ impl SqliteStore {
         Ok(())
     }
 
-
     /// Idempotent FTS backfill called once after migrations at `open()` /
     /// `open_in_memory()`.  Cheap gate: if `COUNT(nodes) == COUNT(nodes_fts_map)`
     /// the index is up to date and we return immediately.  On first open after
@@ -13315,12 +13314,18 @@ mod tests {
         store.begin_staging_tables().unwrap();
 
         let src = "fn foo() {\n    bar();\n}\n";
-        let stamped = Node::new(VName::new("c", "", "src/lib.rs", "rust", "fn:foo"), "function")
-            .with_line(1)
-            .with_end_line(3);
-        let unstamped = Node::new(VName::new("c", "", "src/nul.rs", "rust", "fn:baz"), "function")
-            .with_line(1)
-            .with_end_line(3);
+        let stamped = Node::new(
+            VName::new("c", "", "src/lib.rs", "rust", "fn:foo"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(3);
+        let unstamped = Node::new(
+            VName::new("c", "", "src/nul.rs", "rust", "fn:baz"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(3);
         let batch = vec![
             FileGraph {
                 vname_path: "src/lib.rs".into(),
@@ -13343,9 +13348,11 @@ mod tests {
         let body_hash = |id: i64| -> Option<String> {
             store
                 .conn
-                .query_row("SELECT body_hash FROM nodes WHERE id=?1", params![id], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT body_hash FROM nodes WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
                 .unwrap()
         };
         let id = node_id_to_i64(stamped.id);
@@ -13355,7 +13362,10 @@ mod tests {
             expect.get(&id).map(String::as_str),
             "source-bearing file must stamp the hash of its definition's body"
         );
-        assert!(body_hash(id).is_some(), "the write path must stamp from source");
+        assert!(
+            body_hash(id).is_some(),
+            "the write path must stamp from source"
+        );
         assert_eq!(
             body_hash(node_id_to_i64(unstamped.id)),
             None,

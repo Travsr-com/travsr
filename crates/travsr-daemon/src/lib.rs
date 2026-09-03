@@ -4026,12 +4026,7 @@ fn live_resolution_targets(
         }
         let content = std::fs::read_to_string(abs_path).unwrap_or_default();
         let lines: Vec<&str> = content.lines().collect();
-        return live_resolve::merge_changed_occurrence_targets(
-            store,
-            &lines,
-            Vec::new(),
-            stashed,
-        );
+        return live_resolve::merge_changed_occurrence_targets(store, &lines, Vec::new(), stashed);
     };
     // The file text pins each target's exact column (RFC-027 #813 P1/P2). Read
     // and split into lines once here, then share the slice: the native builder
