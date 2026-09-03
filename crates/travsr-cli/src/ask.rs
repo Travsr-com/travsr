@@ -5,7 +5,7 @@
 //! store is opened directly (read-only fast path).
 
 use anyhow::Context as _;
-use tabled::{Table, Tabled};
+use tabled::{settings::Style, Table, Tabled};
 use travsr_mcp::query::{self, AskPayload};
 
 use crate::daemon_client;
@@ -19,16 +19,27 @@ pub enum OutputFormat {
     Json,
 }
 
+/// One rendered result line. `Kind` is deliberately absent (#824): every
+/// signature is already tagged with its kind (`fn:`, `method:`, `field:`,
+/// `use:`, `var:`, `struct:`, ...), so a Kind column only repeated it. What a
+/// human needs is the symbol, where it lives, and how strong the match is.
 #[derive(Tabled)]
 struct Row {
-    #[tabled(rename = "Kind")]
-    kind: String,
     #[tabled(rename = "Signature")]
     signature: String,
     #[tabled(rename = "Path")]
     path: String,
     #[tabled(rename = "Score")]
     score: String,
+}
+
+/// Render results as a borderless, space-aligned table (#824). The default
+/// `tabled` style drew a `+---+` rule between every row and boxed each cell in
+/// `|` bars, which roughly tripled the stdout an agent piping `ask` receives
+/// for output no human reads. Columns still align; only the frame is dropped.
+/// The machine surface is `--format json`, so this affects the human view only.
+fn render_rows(rows: Vec<Row>) -> String {
+    Table::new(rows).with(Style::blank()).to_string()
 }
 
 /// The match-source lanes the grouped human table renders, in backend
@@ -43,7 +54,6 @@ const SECTION_TAGS: [&str; 5] = ["exact", "semantic", "docs", "tests", "relevant
 
 fn to_row(r: &query::AskRow) -> Row {
     Row {
-        kind: r.kind.clone(),
         signature: r.signature.clone(),
         path: match r.line {
             Some(l) => format!("{}:{}", r.path, l),
@@ -405,11 +415,11 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
                 _ => "── relevant, graph-adjacent context ──",
             };
             println!("{header}");
-            println!("{}", Table::new(rows));
+            println!("{}", render_rows(rows));
         }
     } else {
         let rows: Vec<Row> = payload.rows.iter().map(to_row).collect();
-        println!("{}", Table::new(rows));
+        println!("{}", render_rows(rows));
         print_docs(&payload.docs);
     }
     let embed_note = if payload.embed_used {
