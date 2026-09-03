@@ -341,6 +341,20 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             }
             println!("\n{}", pal.dim("or `travsr ask --examples` for more"));
         }
+        // #826: when no embedding backend is configured, `ask` runs without
+        // semantic search, so this abstention may be a setup gap rather than a
+        // genuine absence. `init` prints this tip, but a disappointed user is
+        // reading here, not there, so name the fix where it is actually seen.
+        if travsr_plugin_host::active_backend_id().is_none() {
+            let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
+            println!(
+                "\n{}",
+                pal.dim(
+                    "note: semantic search is not set up, so this ran without it; \
+                     run `travsr embed init` to enable natural-language matching"
+                )
+            );
+        }
         // #376 §4.3: doc hits may appear below the abstain message, but never
         // convert it into a match — `payload.matched` stays false and no
         // confidence, coverage or tier label is derived from them. This is the
