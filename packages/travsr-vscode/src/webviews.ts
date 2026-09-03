@@ -399,11 +399,22 @@ function setLoading(btn, loading, label) {
   btn.innerHTML = loading ? '<span class="spinner">⟳</span> …' : label;
   if (loading) btn.dataset.label = label;
 }
+// A button whose work ends by replacing this whole document stays disabled
+// until that happens. The unlockButtons message fires the instant the
+// extension receives it, before any of the work, which is right for actions
+// that leave the document standing and wrong for a redraw: it re-enabled
+// Refresh while a render that can take seconds was still running, so the
+// button could be pressed again and again.
+function setSticky(btn, label) {
+  setLoading(btn, true, label);
+  btn.dataset.sticky = '1';
+}
 window.addEventListener('message', function(ev) {
   const d = ev.data;
   if (!d) return;
   if (d.command === 'unlockButtons') {
     document.querySelectorAll('button.btn').forEach(function(b) {
+      if (b.dataset.sticky) return;
       b.disabled = false;
       if (b.dataset.label) { b.innerHTML = b.dataset.label; delete b.dataset.label; }
     });
@@ -1566,6 +1577,12 @@ export function buildStatsHtml(
   </div>
   <div class="phead-a">
     <span class="checked" id="checkedAt" data-at="${Date.now()}">checked just now</span>
+    <label class="sel">Auto
+      <select id="logAuto" onchange="onLogAutoChange()"
+              title="Refresh the whole page on a timer. Every tick is a full redraw, so the log filter, the severity chip, the toggles and the scroll position are reset each time. Off by default.">
+        ${autoOptions}
+      </select>
+    </label>
     <button class="btn" id="refreshBtn" onclick="doRefresh(this)">Refresh</button>
   </div>
 </div>
@@ -1629,12 +1646,6 @@ ${activityRows}
       <option value="1440">24h</option>
     </select>
   </label>
-  <label class="sel">Auto
-    <select id="logAuto" onchange="onLogAutoChange()"
-            title="Re-read the log on a timer. Only the lines are replaced, so the filter, the severity chip and the scroll position are kept; the metric cards and the health banner move on Refresh.">
-      ${autoOptions}
-    </select>
-  </label>
   <label class="tog"><input type="checkbox" id="logUtc" onchange="filterLog()"> UTC</label>
   <label class="tog"><input type="checkbox" id="logJson" onchange="filterLog()"> JSON</label>
 </div>
@@ -1646,7 +1657,7 @@ ${logRows}
 </div>`;
 
   const script = `
-function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({command:'refresh'}); }
+function doRefresh(btn){ setSticky(btn,'Refresh'); vscode.postMessage({command:'refresh'}); }
 
 // How long ago this document was built, ticking so the reader can tell whether
 // what they are looking at is seconds or an hour old. Without it the header

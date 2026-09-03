@@ -29,7 +29,6 @@ import {
   LOG_MAX_LINES,
   LOG_MAX_FILES_LISTED,
   LOG_AUTO_SECONDS,
-  buildLogRowsHtml,
   UNKNOWN_INDEX,
   formatLogSize,
   EMPTY_HEALTH,
@@ -1508,18 +1507,12 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
       stopAuto();
       return;
     }
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (root === undefined) return;
-    const listed = daemonLogFileList(root);
-    const selected =
-      logFile !== undefined && listed.files.some((f) => f.name === logFile)
-        ? logFile
-        : (listed.files[0]?.name ?? "");
-    if (selected === "") return;
-    void entry.panel.webview.postMessage({
-      command: "setLogRows",
-      rows: buildLogRowsHtml(readDaemonLogFile(root, selected, logLines)),
-    });
+    // A full redraw, which is what the control now offers. It costs the panel
+    // state a redraw always costs (#767): the log filter, the severity chip,
+    // the toggles, the scroll position and any expanded row. That is stated in
+    // the control's own tooltip rather than left to be discovered, and the
+    // default is still Off.
+    void entry.refresh();
   };
 
   const render = async (): Promise<string> => {

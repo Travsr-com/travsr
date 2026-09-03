@@ -403,6 +403,31 @@ suite("health panel rendering", () => {
     assert.ok((html.match(/removeRepoRow\(/g) ?? []).length <= 8, "rows are capped");
   });
 
+  test("Refresh stays disabled until the redraw replaces the document", () => {
+    // unlockButtons fires the instant the extension receives a message, before
+    // any of the work. That is right for actions that leave the document
+    // standing, and wrong for a redraw: it re-enabled Refresh while a render
+    // that can take seconds was still running, so it could be pressed again
+    // and again.
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, RUNNING);
+    assert.ok(html.includes("setSticky(btn,'Refresh')"), "Refresh marks itself sticky");
+    assert.ok(html.includes("if (b.dataset.sticky) return;"), "and unlockButtons skips it");
+  });
+
+  test("auto refresh is a page control, not a log control", () => {
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, RUNNING);
+    // Anchored on the heading, not the words: "Daemon log" also appears in a
+    // CSS comment near the top of the document.
+    const header = html.slice(0, html.indexOf("<h2>Daemon log</h2>"));
+    assert.ok(header.includes('id="logAuto"'), "the Auto select sits in the page header");
+    assert.ok(
+      header.indexOf('id="logAuto"') > header.indexOf('id="checkedAt"'),
+      "beside the checked-at counter and Refresh"
+    );
+    // And it says what a tick costs, rather than leaving it to be discovered.
+    assert.ok(html.includes("full redraw"), "the tooltip states the cost");
+  });
+
   test("no section signals its state by colour alone", () => {
     const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, STALE, FULL);
     // Each chip tone carries a word beside it.
