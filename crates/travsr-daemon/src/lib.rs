@@ -4047,6 +4047,14 @@ fn live_resolution_targets(
     // this file at its last save, enumerated as extra editor targets. Empty for
     // a request with no fresh save (or from a test with no editor plane).
     stashed: &[travsr_core::ChangedOccurrence],
+    // RFC-027 #813 (finding 2): when `Some`, the changed-definition set of the
+    // save this request follows. Native targets for preserved definitions are a
+    // no-op for the committed graph (`put_edge_live` only touches `live` rows)
+    // and, unscoped, would crowd the enumerated occurrences out of the editor's
+    // per-save budget on a large file, so they are dropped here the same way the
+    // save-path lexical lane drops them. `None` keeps the whole-file behavior (a
+    // request with no fresh scoped save, a dependent, or a test).
+    scope: Option<&std::collections::HashSet<travsr_core::NodeId>>,
 ) -> Vec<travsr_ipc::message::LiveResolutionTarget> {
     let Some((vname_path, refs)) = extract_live_unresolved(store, corpus, repo_root, abs_path)
     else {
@@ -4068,10 +4076,23 @@ fn live_resolution_targets(
     let lines: Vec<&str> = content.lines().collect();
     let mut targets = match refs {
         LiveRefSet::Native {
-            unresolved,
-            inheritance,
+            mut unresolved,
+            mut inheritance,
             locally_bound,
         } => {
+            // RFC-027 #813 (finding 2): scope the native targets to the changed
+            // region, mirroring `live_resolve_file`. A reference whose enclosing
+            // definition was preserved needs no editor round trip.
+            if let Some(scope) = scope {
+                unresolved.retain(|c| scope.contains(&c.src));
+                inheritance.retain(|r| {
+                    store
+                        .enclosing_definition_at(corpus, &vname_path, r.line)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|id| scope.contains(&id))
+                });
+            }
             let mut targets =
                 live_resolve::targets_needing_editor(store, &lines, &unresolved, &locally_bound);
             targets.extend(live_resolve::inheritance_targets_needing_editor(
@@ -4153,7 +4174,9 @@ fn dependent_resolution_targets(
                     .stashed_changed_occurrences(&dep)
             })
             .unwrap_or_default();
-        let targets = live_resolution_targets(store, corpus, repo_root, &dep_abs, &stashed);
+        // Dependents were not reindexed by this save, so there is no fresh
+        // changed-def scope for them; resolve their whole file (no scope).
+        let targets = live_resolution_targets(store, corpus, repo_root, &dep_abs, &stashed, None);
         // A dependent with nothing for the editor to do (its references all
         // settle lexically, or it holds none) is not worth sending.
         if !targets.is_empty() {
@@ -5462,6 +5485,44 @@ mod tests {
         assert!(
             EmbedTickGuard::try_acquire().is_some(),
             "the flag must release even when the tick body panics"
+        );
+    }
+
+    /// RFC-027 #813 (finding 2): the editor-plane stash carries the save's
+    /// changed-definition scope alongside its occurrences, so the request path
+    /// can scope its native targets. `serve_stash` returns both and restarts the
+    /// TTL; a whole-file re-derive (scope `None`) clears any prior scoped entry so
+    /// a later request cannot scope against a stale set.
+    #[test]
+    fn stash_carries_the_changed_def_scope_and_a_whole_file_save_clears_it() {
+        use travsr_core::NodeId;
+        let mut plane = EditorPlane::default();
+        let occ = vec![travsr_core::ChangedOccurrence {
+            src: NodeId(1),
+            line: 7,
+            col: Some(4),
+            kind: "ref/call".to_string(),
+            name: "run".to_string(),
+        }];
+        let scope: std::collections::HashSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
+        plane.stash_changed_occurrences("a.rs".to_string(), occ.clone(), Some(scope.clone()));
+
+        // Serving returns the occurrences and the scope together.
+        let served = plane
+            .serve_stash("a.rs")
+            .expect("a fresh scoped stash is servable");
+        assert_eq!(served.0, occ, "the stashed occurrences are served");
+        assert_eq!(
+            served.1, scope,
+            "the changed-def scope is served for native scoping"
+        );
+
+        // A whole-file re-derive (scope None) drops the entry, so a request that
+        // arrives after it cannot scope its native targets against a stale set.
+        plane.stash_changed_occurrences("a.rs".to_string(), Vec::new(), None);
+        assert!(
+            plane.serve_stash("a.rs").is_none(),
+            "a whole-file re-derive must clear the prior scoped stash"
         );
     }
 
@@ -9552,7 +9613,7 @@ mod tests {
         let db_path = tmp.path().join(".travsr/graph.db");
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
         let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
-        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller, &[]);
+        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller, &[], None);
 
         let start = targets
             .iter()
@@ -9604,7 +9665,7 @@ mod tests {
         let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
         // Java is on LIVE_LANE_SHIPPED (measured 3,0,0 → 1.0000, §11.3), so the
         // gate admits it with no reading and no force flag needed.
-        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller, &[]);
+        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller, &[], None);
 
         let by_name = |name: &str| {
             targets
@@ -12475,17 +12536,25 @@ fn handle_watch_event(
                             live_resolve_file(&mut s, &corpus, repo_root, &abs, None);
                         }
                     }
-                    // RFC-027 #813 P2: stash this save's changed-def committed
-                    // occurrences so the editor target request that follows can
-                    // enumerate them. Release the store lock first, then take the
-                    // plane lock, keeping the store->plane order the serve path
-                    // also uses.
+                    // RFC-027 #813 P2 / finding 2: stash this save's changed
+                    // region so the editor target request that follows can both
+                    // enumerate its committed occurrences and scope its native
+                    // targets to the changed definitions. Release the store lock
+                    // first, then take the plane lock, keeping the store->plane
+                    // order the serve path also uses. One saved file per Upsert.
                     drop(s);
                     {
                         let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
-                        for (file, occ) in changed_occ {
-                            plane.stash_changed_occurrences(file, occ);
-                        }
+                        let occ = changed_occ
+                            .into_iter()
+                            .find(|(f, _)| *f == saved_vname)
+                            .map(|(_, o)| o)
+                            .unwrap_or_default();
+                        let scope_owned = changed_defs
+                            .into_iter()
+                            .find(|(f, _)| f == &saved_vname)
+                            .map(|(_, set)| set);
+                        plane.stash_changed_occurrences(saved_vname, occ, scope_owned);
                     }
                     enqueue_dirty_callers(callers, repo_root, index_tx)
                 }
@@ -12569,6 +12638,14 @@ pub struct EditorPlane {
 #[derive(Debug, Clone)]
 pub struct StashedOccurrences {
     pub occurrences: Vec<travsr_core::ChangedOccurrence>,
+    /// RFC-027 #813 (finding 2): the changed-definition set of the save that
+    /// produced this stash, so the request path scopes its native editor
+    /// targets to the changed region the same way the save-path lexical lane
+    /// does. A stash exists only for a scoped pure-body edit, so its presence
+    /// means "scope to this set" (empty means every definition was preserved,
+    /// so no native target is owed). A whole-file re-derive stashes nothing and
+    /// the request path stays whole-file.
+    pub changed_defs: std::collections::HashSet<travsr_core::NodeId>,
     /// When this stash stops being servable (see [`STASHED_OCCURRENCE_TTL`]).
     pub expires_at: std::time::Instant,
 }
@@ -12587,19 +12664,25 @@ const STASHED_OCCURRENCE_TTL: std::time::Duration = std::time::Duration::from_se
 const MAX_OCCURRENCES_PER_STASHED_FILE: usize = 500;
 
 impl EditorPlane {
-    /// RFC-027 #813 P2: stash a file's changed-def committed occurrences after a
-    /// save, bounded per file and in the number of files retained. An empty set
-    /// clears any prior stash for the file rather than leaving a stale one.
+    /// RFC-027 #813 P2 / finding 2: stash a scoped save's changed region after a
+    /// save, bounded per file and in the number of files retained. `scope` is the
+    /// save's changed-definition set: `Some` for a pure-body edit where the store
+    /// preserved definitions (the request path then scopes native targets to it),
+    /// `None` for a whole-file re-derive, which stashes nothing and clears any
+    /// prior entry so a later request cannot scope against a stale set.
     fn stash_changed_occurrences(
         &mut self,
         path: String,
         mut occ: Vec<travsr_core::ChangedOccurrence>,
+        scope: Option<std::collections::HashSet<travsr_core::NodeId>>,
     ) {
-        occ.truncate(MAX_OCCURRENCES_PER_STASHED_FILE);
-        if occ.is_empty() {
+        let Some(changed_defs) = scope else {
+            // Whole-file re-derive: no scope to stash, and any prior scoped entry
+            // is now stale, so drop it.
             self.changed_occurrences.remove(&path);
             return;
-        }
+        };
+        occ.truncate(MAX_OCCURRENCES_PER_STASHED_FILE);
         let now = std::time::Instant::now();
         self.changed_occurrences.retain(|_, e| e.expires_at > now);
         if self.changed_occurrences.len() >= MAX_STASHED_OCCURRENCE_FILES
@@ -12618,6 +12701,7 @@ impl EditorPlane {
             path,
             StashedOccurrences {
                 occurrences: occ,
+                changed_defs,
                 expires_at: now + STASHED_OCCURRENCE_TTL,
             },
         );
@@ -12632,21 +12716,29 @@ impl EditorPlane {
         }
     }
 
-    /// RFC-027 #813 P2: serve a target request or report *and* restart the TTL
+    /// RFC-027 #813 P2 / finding 2: serve a target request or report the stashed
+    /// occurrences *and* the changed-definition scope, *and* restart the TTL
     /// clock, because a resolution drain begins at the request, not at the save.
     /// A large edited function's targets (or a cold rust-analyzer / jdtls) can
     /// take several seconds to answer in batches; keying the 30 s window on the
     /// save time would reject every late batch as stale (`retain_current_targets`
     /// re-reads the stash and would find it gone). Refreshing on each serve keeps
     /// the stash alive as long as answers keep arriving inside one TTL of each
-    /// other. Read-only otherwise, so an expired stash still returns empty.
-    fn serve_changed_occurrences(&mut self, path: &str) -> Vec<travsr_core::ChangedOccurrence> {
+    /// other. `None` when no fresh stash exists, so the request stays whole-file.
+    #[allow(clippy::type_complexity)]
+    fn serve_stash(
+        &mut self,
+        path: &str,
+    ) -> Option<(
+        Vec<travsr_core::ChangedOccurrence>,
+        std::collections::HashSet<travsr_core::NodeId>,
+    )> {
         match self.changed_occurrences.get_mut(path) {
             Some(e) if e.expires_at > std::time::Instant::now() => {
                 e.expires_at = std::time::Instant::now() + STASHED_OCCURRENCE_TTL;
-                e.occurrences.clone()
+                Some((e.occurrences.clone(), e.changed_defs.clone()))
             }
-            _ => Vec::new(),
+            _ => None,
         }
     }
 }
@@ -12824,15 +12916,28 @@ fn handle_control_message(
             let s = store.lock().unwrap_or_else(|e| e.into_inner());
             let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
             let abs_path = repo_root.join(&file);
-            // RFC-027 #813 P2: enumerate this file's changed-def occurrences
-            // stashed at its last save (empty when none is fresh), and restart
-            // the TTL from this request so the resolution drain it kicks off has
-            // the full window even when the provider answers slowly.
-            let stashed = lsp_sessions
+            // RFC-027 #813 P2 / finding 2: serve this file's stashed changed
+            // region (its committed occurrences to enumerate, and its changed-def
+            // set to scope native targets), restarting the TTL from this request
+            // so the resolution drain it kicks off has the full window even when
+            // the provider answers slowly. `None` when no fresh scoped save, which
+            // keeps the whole-file behavior.
+            let (stashed, scope) = match lsp_sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .serve_changed_occurrences(&file);
-            let own = live_resolution_targets(&s, &corpus, repo_root, &abs_path, &stashed);
+                .serve_stash(&file)
+            {
+                Some((occ, defs)) => (occ, Some(defs)),
+                None => (Vec::new(), None),
+            };
+            let own = live_resolution_targets(
+                &s,
+                &corpus,
+                repo_root,
+                &abs_path,
+                &stashed,
+                scope.as_ref(),
+            );
             // RFC-027 section 8.7.5: also re-resolve the files whose edges this
             // save can restore, so a rename in one file heals its dependents
             // without each being saved in turn.
@@ -12887,17 +12992,28 @@ fn handle_control_message(
             // editor buffer, and `enclosing_definition_at` then reads spans from
             // the newer parse. Re-detecting against the file as it stands now
             // closes that window with the daemon's own evidence.
-            // RFC-027 #813 P2: validate against the same enumerated set the
-            // request served, so a resolution for a changed-def occurrence is
-            // recognized as current rather than rejected as stale. Refresh the
-            // TTL again here so a long, multi-batch drain keeps the stash alive as
-            // long as reports keep arriving within one TTL of each other.
-            let stashed = lsp_sessions
+            // RFC-027 #813 P2 / finding 2: validate against the same target set
+            // the request served (same stashed occurrences AND same changed-def
+            // scope), so a resolution for a changed-def occurrence is recognized
+            // as current rather than rejected as stale. Refresh the TTL again here
+            // so a long, multi-batch drain keeps the stash alive as long as
+            // reports keep arriving within one TTL of each other.
+            let (stashed, scope) = match lsp_sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .serve_changed_occurrences(&file);
-            let current =
-                live_resolution_targets(&s, &corpus, repo_root, &repo_root.join(&file), &stashed);
+                .serve_stash(&file)
+            {
+                Some((occ, defs)) => (occ, Some(defs)),
+                None => (Vec::new(), None),
+            };
+            let current = live_resolution_targets(
+                &s,
+                &corpus,
+                repo_root,
+                &repo_root.join(&file),
+                &stashed,
+                scope.as_ref(),
+            );
             let accepted = live_resolve::retain_current_targets(&resolutions, &current);
             let stale = resolutions.len() - accepted.len();
             let outcome = live_resolve::apply_live_resolutions(&mut s, &corpus, &file, &accepted);
