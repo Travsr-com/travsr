@@ -53,23 +53,35 @@ import {
 } from "./daemonIpc";
 
 /**
- * Cap on provider queries for one save, across the saved file **and** every
- * dependent the interface-edit closure pulls in (RFC-027 section 8.7.5).
+ * Provider-query budgets for one save, **split** so the saved file and the
+ * interface-edit dependent closure cannot starve each other.
  *
- * Each is an IPC round trip into another extension host. The daemon keeps the
- * set surgical (only references its lexical lane could not settle), so a
- * hand-written file is far below this; the cap only bounds a pathological
- * generated file or a rename in a hot utility whose closure is large. It bounds
- * the *total*, not each file, so one save can never fan out into an unbounded
- * storm of queries (§10.1). Truncation degrades recall, which the commit-gated
- * path repairs.
+ * Each query is an IPC round trip into another extension host. A single shared
+ * cap meant a large edited function lost recall to a big closure sharing the
+ * same counter, and vice versa; that is the gap this split closes. The own-file
+ * budget is generous because a body edit's cost is proportional to that one file
+ * the developer just saved, and for the generic-detector languages (Go, Java,
+ * ...) with no lexical floor the editor lane is the *only* recovery path, so
+ * every reference in the edited function is a target. The closure budget stays
+ * tight because a rename in a hot utility is the real fan-out risk (§10.1).
  *
- * RFC-027 #813 P2: stays at 200 even though the daemon now also enumerates the
- * changed definitions' committed occurrences. That enumeration is scoped to the
- * edited region (one function's references), so it comfortably fits under this
- * cap alongside the native lane's targets rather than needing a larger budget.
+ * Both are still bounded, so no save fans out into an unbounded storm, and
+ * truncation beyond a budget degrades recall, which the commit-gated path
+ * repairs. Resolution runs off the render path (the save handler does not await
+ * it), and the own file is drained in batches with a yield between them
+ * ([`REPORT_BATCH_SIZE`]), so a large function neither bursts the language
+ * server nor loses everything already resolved if the buffer moves mid-drain.
  */
-const MAX_QUERIES_PER_SAVE = 200;
+const OWN_FILE_QUERY_BUDGET = 500;
+const CLOSURE_QUERY_BUDGET = 200;
+
+/**
+ * Report resolutions in batches of this size instead of once at the end, so a
+ * long drain lands progressively and a mid-flight buffer change keeps the
+ * batches already reported (each report is additive on the daemon). A function
+ * with fewer references than this reports exactly once, unchanged from before.
+ */
+const REPORT_BATCH_SIZE = 100;
 
 /**
  * Languages the daemon's live lane detects references for. A cheap pre-filter
@@ -201,16 +213,19 @@ export async function publishLiveResolutions(
   // would no longer describe this file.
   if (doc.version !== version) return 0;
 
-  const budget: Budget = { remaining: MAX_QUERIES_PER_SAVE };
   let total = 0;
 
-  // The saved file, resolved against its live buffer.
-  total += await resolveAndReport(repoRoot, doc, file, own, version, budget);
+  // The saved file, resolved against its live buffer, on its own budget so a
+  // large edited function is never starved by the closure below.
+  const ownBudget: Budget = { remaining: OWN_FILE_QUERY_BUDGET };
+  total += await resolveAndReport(repoRoot, doc, file, own, version, ownBudget);
 
-  // Each dependent, resolved against its own file (RFC-027 section 8.7.5).
+  // Each dependent, resolved against its own file (RFC-027 section 8.7.5), on a
+  // separate, tighter budget that bounds the rename fan-out.
+  const closureBudget: Budget = { remaining: CLOSURE_QUERY_BUDGET };
   for (const dep of dependents) {
-    if (budget.remaining <= 0) break;
-    total += await resolveDependent(repoRoot, dep, budget);
+    if (closureBudget.remaining <= 0) break;
+    total += await resolveDependent(repoRoot, dep, closureBudget);
   }
 
   return total;
@@ -249,10 +264,16 @@ async function resolveDependent(
 }
 
 /**
- * Resolve `targets` against `doc` under the shared `budget` and report the
- * answers for `file`. Returns the number reported. Drops the whole batch if the
- * buffer moves mid-flight (RFC-027 section 11) — answers against old text no
- * longer describe the file.
+ * Resolve `targets` against `doc` under `budget` and report the answers for
+ * `file`. Returns the number reported.
+ *
+ * Reports in batches of [`REPORT_BATCH_SIZE`] rather than once at the end, so a
+ * long drain lands progressively and a mid-flight buffer change keeps whatever
+ * was already reported instead of dropping everything (RFC-027 section 11): each
+ * report is additive on the daemon, and every batch was resolved and sent while
+ * the buffer still matched `version`. A yield between batches keeps a large
+ * function from bursting the language server or monopolising the event loop.
+ * A partially-filled final batch is dropped, unreported, if the buffer moved.
  */
 async function resolveAndReport(
   repoRoot: string,
@@ -263,18 +284,29 @@ async function resolveAndReport(
   budget: Budget
 ): Promise<number> {
   if (targets.length === 0) return 0;
-  const resolutions: LiveResolutionItem[] = [];
+  let total = 0;
+  let batch: LiveResolutionItem[] = [];
+  const flush = async (): Promise<void> => {
+    if (batch.length === 0 || doc.version !== version) return;
+    await reportLiveResolution(repoRoot, file, batch);
+    total += batch.length;
+    batch = [];
+  };
   for (const target of targets) {
     if (budget.remaining <= 0) break;
-    if (doc.version !== version) return 0;
+    if (doc.version !== version) break;
     const item = await resolveTarget(repoRoot, doc, target, version);
     budget.remaining -= 1;
-    if (item) resolutions.push(item);
+    if (item) batch.push(item);
+    if (batch.length >= REPORT_BATCH_SIZE) {
+      await flush();
+      // Resolution is off the render path; yield so the next batch of provider
+      // queries does not arrive as one burst.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
   }
-  if (resolutions.length === 0) return 0;
-  if (doc.version !== version) return 0;
-  await reportLiveResolution(repoRoot, file, resolutions);
-  return resolutions.length;
+  await flush();
+  return total;
 }
 
 /**
