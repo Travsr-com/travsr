@@ -2179,7 +2179,7 @@ impl SqliteStore {
                                end_line = COALESCE(excluded.end_line, nodes.end_line), \
                                is_noise = excluded.is_noise, \
                                test_role = excluded.test_role, \
-                               body_hash = COALESCE(excluded.body_hash, nodes.body_hash)",
+                               body_hash = excluded.body_hash",
                             params![
                                 id_i64,
                                 node.vname.corpus,
@@ -2542,7 +2542,7 @@ impl SqliteStore {
             // still correct and re-deriving them is pure waste. Any doubt keeps
             // the set empty and the code below purges the whole file, exactly as
             // before this change.
-            let preserved: std::collections::HashSet<i64> = match content {
+            let mut preserved: std::collections::HashSet<i64> = match content {
                 Some(text) if old_ids == new_ids => {
                     // Body hashes stored for this file's definitions at their last
                     // (re)resolution, and the hashes the current text produces.
@@ -2576,6 +2576,39 @@ impl SqliteStore {
                 }
                 _ => std::collections::HashSet::new(),
             };
+
+            // RFC-027 #813 (finding 1): a byte-identical body proves the
+            // definition's own text is unchanged, NOT that the *types* its
+            // references resolve through are. NodeIds are name-based
+            // (`fn:{name}`, `method:{Type}.{name}`, `field:{Owner}.{f}`), so an
+            // edit to a parameter/return/field type, or a `type` alias RHS,
+            // leaves `old_ids == new_ids` intact and changes only the edited
+            // definition's hash, yet every same-file definition whose committed
+            // receiver-typed method/field edge went through that type now points
+            // at the wrong `dst`. Demote from `preserved` any definition that
+            // references a changed definition in this file, using this parse's
+            // edge set. Depth one is sound: a reference reached only *through* a
+            // byte-identical definition cannot shift, because that intermediary's
+            // own signature is unchanged, so it still returns the same type.
+            if !preserved.is_empty() {
+                let changed_in_file: std::collections::HashSet<i64> = new_ids
+                    .iter()
+                    .filter(|id| !preserved.contains(id))
+                    .copied()
+                    .collect();
+                let demoted: Vec<i64> = edges
+                    .iter()
+                    .filter_map(|e| {
+                        let src = node_id_to_i64(e.src);
+                        (preserved.contains(&src)
+                            && changed_in_file.contains(&node_id_to_i64(e.dst)))
+                        .then_some(src)
+                    })
+                    .collect();
+                for id in demoted {
+                    preserved.remove(&id);
+                }
+            }
 
             // RFC-027 #813 P2: current and committed start line of every
             // definition, so both a preserved definition's occurrences (below)
@@ -2809,7 +2842,21 @@ impl SqliteStore {
                         // live position, so a stale estimate is fail-closed.
                         let new_line = match (col, content_lines.as_deref()) {
                             (Some(c), Some(lines)) => {
-                                let end = new_ends.get(&src).copied().unwrap_or(estimate);
+                                // A definition with no known `end_line` still needs
+                                // an upper bound the search can move *down* to; an
+                                // insert (the common edit) pushes occurrences below
+                                // the start-delta estimate, and clamping the span
+                                // end to the estimate would only ever let the search
+                                // move up and so always abstain (issue #816 defect
+                                // 1). Fall back to the end of the buffer: the true
+                                // span end is unknown, so the file end is the safe
+                                // superset, and a mis-snap can still only land on
+                                // another occurrence of the same name at the same
+                                // column, which resolves the same callee.
+                                let end = new_ends
+                                    .get(&src)
+                                    .copied()
+                                    .unwrap_or(lines.len() as i64);
                                 snap_changed_occurrence_line(
                                     lines, &name, c as usize, estimate, start, end,
                                 )? as i64
@@ -3030,6 +3077,7 @@ impl SqliteStore {
                 callers,
                 changed_defs,
                 changed_occurrences,
+                preserved_any: !preserved.is_empty(),
             })
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -6811,7 +6859,7 @@ impl SqliteStore {
                          end_line = COALESCE(excluded.end_line, nodes.end_line), \
                          is_noise = excluded.is_noise, \
                          test_role = excluded.test_role, \
-                         body_hash = COALESCE(excluded.body_hash, nodes.body_hash)",
+                         body_hash = excluded.body_hash",
                     [],
                 )
                 .context("inserting nodes from staging")?;
@@ -11172,6 +11220,87 @@ mod tests {
             edge_provenance(&store, a.id, y.id).as_deref(),
             Some("tree-sitter"),
             "an added symbol must disable preservation for the whole file"
+        );
+    }
+
+    /// RFC-027 #813 (finding 1): a byte-identical body does not prove the types
+    /// its references resolve through are unchanged. A caller `h` whose body is
+    /// untouched but which references a definition `make` whose return type
+    /// changed (`-> A` to `-> B`) must NOT keep its committed `h -> A.run` edge:
+    /// truth is now `B.run`. The NodeId set is unchanged (names are stable), so
+    /// only the depth-one caller demotion catches it. An unrelated preserved
+    /// definition that references nothing changed still keeps its committed edge.
+    #[test]
+    fn reindex_replace_demotes_a_caller_of_a_type_changed_definition() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "a.rs", "rust", sig),
+                "function",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        // make: 1-3 (returns A), h: 5-7 (calls make(), then make().run()),
+        // g: 9-11 (unrelated, calls free()), and the two committed targets.
+        let make = mk("fn:make", 1, 3);
+        let h = mk("fn:h", 5, 7);
+        let g = mk("fn:g", 9, 11);
+        let run = mk("method:A.run", 13, 14);
+        let free = mk("fn:free", 16, 17);
+        let nodes = vec![
+            make.clone(),
+            h.clone(),
+            g.clone(),
+            run.clone(),
+            free.clone(),
+        ];
+        // This parse's tree-sitter edges: h calls make (the receiver source) and
+        // g calls free. The receiver-typed h -> A.run is committed below.
+        let ts_edges = vec![
+            Edge::new(h.id, make.id, EdgeKind::RefCall),
+            Edge::new(g.id, free.id, EdgeKind::RefCall),
+        ];
+        let content_v1 = "fn make() -> A {\n  A\n}\n\nfn h() {\n  make().run();\n}\n\nfn g() {\n  free();\n}\n\nfn run() {\n}\n\nfn free() {\n}\n";
+        store
+            .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h1", Some(content_v1))
+            .unwrap();
+        // Commit ratification: the receiver-typed and the free-call edges become
+        // committed truth.
+        store
+            .put_edge_lsif(&Edge::new(h.id, run.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(g.id, free.id, EdgeKind::RefCall))
+            .unwrap();
+        assert_eq!(
+            edge_provenance(&store, h.id, run.id).as_deref(),
+            Some("lsif")
+        );
+        assert_eq!(
+            edge_provenance(&store, g.id, free.id).as_deref(),
+            Some("lsif")
+        );
+
+        // v2: change only make's return type A -> B. h's and g's bodies are
+        // byte-identical; the NodeId set is unchanged.
+        let content_v2 = "fn make() -> B {\n  B\n}\n\nfn h() {\n  make().run();\n}\n\nfn g() {\n  free();\n}\n\nfn run() {\n}\n\nfn free() {\n}\n";
+        store
+            .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h2", Some(content_v2))
+            .unwrap();
+
+        // h references the changed `make`, so it is demoted from preserved and
+        // its stale committed edge is purged, to be re-resolved by the live lane.
+        assert_eq!(
+            edge_provenance(&store, h.id, run.id),
+            None,
+            "a caller of a type-changed definition must not keep its stale edge"
+        );
+        // g references only unchanged definitions, so it stays preserved.
+        assert_eq!(
+            edge_provenance(&store, g.id, free.id).as_deref(),
+            Some("lsif"),
+            "an unrelated preserved definition keeps its committed edge"
         );
     }
 

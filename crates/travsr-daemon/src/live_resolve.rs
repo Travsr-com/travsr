@@ -767,21 +767,26 @@ fn word_boundary_col_utf16(line: &str, name: &str) -> Option<u32> {
 }
 
 fn drop_same_position_collisions(targets: Vec<LiveResolutionTarget>) -> Vec<LiveResolutionTarget> {
-    let mut counts: std::collections::HashMap<(u32, &str, &str), usize> =
+    // `ref_col` is part of the key: two occurrences of one name on one line
+    // (`a.save(); b.save()`) each carry a distinct column now, so they are
+    // distinct positions and both are kept. Two with the same column, or both
+    // with no column (`None`), are a genuine collision the editor could not
+    // disambiguate and still collapse, exactly as before.
+    let mut counts: std::collections::HashMap<(u32, Option<u32>, &str, &str), usize> =
         std::collections::HashMap::new();
     for t in &targets {
         *counts
-            .entry((t.ref_line, t.name.as_str(), t.edge_kind.as_str()))
+            .entry((t.ref_line, t.ref_col, t.name.as_str(), t.edge_kind.as_str()))
             .or_default() += 1;
     }
-    let unique: std::collections::HashSet<(u32, String, String)> = counts
+    let unique: std::collections::HashSet<(u32, Option<u32>, String, String)> = counts
         .into_iter()
         .filter(|(_, n)| *n == 1)
-        .map(|((line, name, kind), _)| (line, name.to_string(), kind.to_string()))
+        .map(|((line, col, name, kind), _)| (line, col, name.to_string(), kind.to_string()))
         .collect();
     targets
         .into_iter()
-        .filter(|t| unique.contains(&(t.ref_line, t.name.clone(), t.edge_kind.clone())))
+        .filter(|t| unique.contains(&(t.ref_line, t.ref_col, t.name.clone(), t.edge_kind.clone())))
         .collect()
 }
 
@@ -850,8 +855,14 @@ pub fn merge_changed_occurrence_targets(
             })
         })
         .collect();
-    let mut out = native;
-    out.extend(drop_same_position_collisions(enumerated));
+    // Enumerated occurrences first: the editor drains this list in order up to
+    // its per-save budget, and the P2 enumeration is the whole point of the pass
+    // (references tree-sitter never detected). A native target that lands inside
+    // a preserved definition is a no-op for the graph (`put_edge_live` only
+    // touches `live` rows, never the preserved committed edge), so it must never
+    // crowd the enumerated set out of the budget on a large file.
+    let mut out = drop_same_position_collisions(enumerated);
+    out.extend(native);
     out
 }
 

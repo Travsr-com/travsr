@@ -3955,12 +3955,23 @@ fn record_generic_pendings(
     }
 }
 
-fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, abs_path: &Path) {
+fn live_resolve_file(
+    store: &mut SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+    // RFC-027 #813 (finding 2): when `Some`, the changed-definition set this save
+    // must re-resolve. References whose enclosing definition is preserved
+    // (byte-identical, committed edges intact) are dropped, so the lexical lane
+    // neither re-records them as `pending` nor rewrites their committed state.
+    // `None` re-resolves the whole file (a whole-file re-derive, or a dependent).
+    scope: Option<&std::collections::HashSet<travsr_core::NodeId>>,
+) {
     let Some((vname_path, refs)) = extract_live_unresolved(store, corpus, repo_root, abs_path)
     else {
         return;
     };
-    let (unresolved, inheritance, locally_bound) = match refs {
+    let (mut unresolved, mut inheritance, locally_bound) = match refs {
         LiveRefSet::Native {
             unresolved,
             inheritance,
@@ -3975,10 +3986,31 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
         // rows describing the pre-edit text, which `reindex_replace` leaves
         // alone.
         LiveRefSet::Generic(detected) => {
+            // Generic-detector languages have no native Phase B, so a preserved
+            // definition of theirs carries no committed edges to make its
+            // references falsely `pending`; every detected reference is genuinely
+            // pending until the editor answers it. So the generic pending record
+            // is left unscoped (the editor still resolves the whole file).
             record_generic_pendings(store, corpus, &vname_path, &detected);
             return;
         }
     };
+    // RFC-027 #813 (finding 2): drop references inside preserved definitions.
+    // A preserved definition's committed (scip/lsif) edges already resolve its
+    // references, so re-resolving them here would only overwrite that committed
+    // state with a fresh `pending`/`resolved` live row and inflate the freshness
+    // count. `call.src` is the enclosing definition; an inheritance clause's is
+    // resolved from its line the same way the resolver does below.
+    if let Some(scope) = scope {
+        unresolved.retain(|c| scope.contains(&c.src));
+        inheritance.retain(|r| {
+            store
+                .enclosing_definition_at(corpus, &vname_path, r.line)
+                .ok()
+                .flatten()
+                .is_some_and(|id| scope.contains(&id))
+        });
+    }
     let outcome = live_resolve::resolve_unambiguous_lexical(
         store,
         corpus,
@@ -4831,6 +4863,13 @@ pub fn reconcile_tracked_tree(
 /// path to stash.
 type ChangedOccurrencesByFile = Vec<(String, Vec<travsr_core::ChangedOccurrence>)>;
 
+/// RFC-027 #813 (finding 2): per-file changed-definition set (the nodes whose
+/// committed edges `reindex_replace` did NOT preserve), keyed by repo-relative
+/// path, so the save-path live lane re-resolves only the changed region and does
+/// not re-record a preserved definition's already-committed references as
+/// `pending`. Empty for a whole-file re-derive, where every node is "changed".
+type ChangedDefsByFile = Vec<(String, std::collections::HashSet<travsr_core::NodeId>)>;
+
 /// Re-index a set of changed files into `store`, also surfacing each file's
 /// changed-definition committed occurrences (RFC-027 #813 P2) for the live
 /// overlay to enumerate as editor targets.
@@ -4848,7 +4887,11 @@ pub fn reindex_files_reporting(
     paths: &[PathBuf],
     repo_root: &Path,
     store: &mut SqliteStore,
-) -> anyhow::Result<(travsr_core::DirtySet, ChangedOccurrencesByFile)> {
+) -> anyhow::Result<(
+    travsr_core::DirtySet,
+    ChangedOccurrencesByFile,
+    ChangedDefsByFile,
+)> {
     // Keep `repo_root` current. This path runs on every commit and on every
     // watcher batch, and it already knows the root, so stamping here closes the
     // window where a moved checkout keeps a stale value until someone runs an
@@ -4917,6 +4960,9 @@ pub fn reindex_files_reporting(
     // RFC-027 #813 P2: per-file changed-definition committed occurrences, for the
     // save path to stash and the live lane to enumerate as editor targets.
     let mut changed_occ_all: ChangedOccurrencesByFile = Vec::new();
+    // RFC-027 #813 (finding 2): per-file changed-definition set, for the save
+    // path to scope its lexical re-resolution to the changed region.
+    let mut changed_defs_all: ChangedDefsByFile = Vec::new();
     // Paths this batch rewrote, for the end-of-batch orphan sweep below.
     let mut written_paths: Vec<String> = Vec::new();
 
@@ -5039,6 +5085,17 @@ pub fn reindex_files_reporting(
                 }
                 if !report.changed_occurrences.is_empty() {
                     changed_occ_all.push((vname_path.clone(), report.changed_occurrences));
+                }
+                // RFC-027 #813 (finding 2): the changed region this save must
+                // re-resolve. Recorded only when preservation actually happened
+                // (a smaller set than the whole file); an empty `changed_defs`
+                // means every definition was preserved, so nothing needs
+                // re-resolving and the save path skips the lexical lane for it.
+                if report.preserved_any {
+                    changed_defs_all.push((
+                        vname_path.clone(),
+                        report.changed_defs.iter().copied().collect(),
+                    ));
                 }
                 any_changed = true;
                 written_paths.push(vname_path.clone());
@@ -5190,7 +5247,7 @@ pub fn reindex_files_reporting(
         }
     }
 
-    Ok((callers_all, changed_occ_all))
+    Ok((callers_all, changed_occ_all, changed_defs_all))
 }
 
 /// Phase A reindex of `paths`, returning only the Tier-0 dirty-caller set. The
@@ -5201,7 +5258,7 @@ pub fn reindex_files(
     repo_root: &Path,
     store: &mut SqliteStore,
 ) -> anyhow::Result<travsr_core::DirtySet> {
-    reindex_files_reporting(paths, repo_root, store).map(|(callers, _)| callers)
+    reindex_files_reporting(paths, repo_root, store).map(|(callers, _, _)| callers)
 }
 
 /// Run the LSIF semantic pass if `tsconfig.json` is present at the repo root,
@@ -8439,7 +8496,7 @@ mod tests {
             std::fs::write(&caller, text).unwrap();
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
             reindex_files(std::slice::from_ref(&caller), tmp.path(), &mut store).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller, None);
         }
 
         // The ambiguous call must never have produced a claim at all: an
@@ -8581,7 +8638,7 @@ mod tests {
             std::fs::write(&main, text).unwrap();
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
             reindex_files(std::slice::from_ref(&main), tmp.path(), &mut store).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &main);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &main, None);
         }
 
         // Commit and let Phase B run for real, so the meter has ratified
@@ -8764,7 +8821,7 @@ mod tests {
         {
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
             reindex_files(std::slice::from_ref(&main), tmp.path(), &mut store).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &main);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &main, None);
         }
 
         let after = travsr_store::SqliteStore::open(&db_path)
@@ -9017,7 +9074,7 @@ mod tests {
         // Overlay.
         {
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &order);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &order, None);
         }
         let live_rows = travsr_store::SqliteStore::open(&db_path)
             .unwrap()
@@ -9075,7 +9132,7 @@ mod tests {
         let before = graph_fingerprint(&db_path);
         {
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &order);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &order, None);
         }
         assert_eq!(
             graph_fingerprint(&db_path),
@@ -9221,7 +9278,7 @@ mod tests {
         std::fs::write(&order, text).unwrap();
         let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
         reindex_files(std::slice::from_ref(&order), tmp.path(), &mut store).unwrap();
-        live_resolve_file(&mut store, corpus, tmp.path(), &order);
+        live_resolve_file(&mut store, corpus, tmp.path(), &order, None);
         order
     }
 
@@ -9610,7 +9667,7 @@ mod tests {
         // (§8.3) and the pending row is the honest record the editor upgrades.
         {
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller, None);
         }
 
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -9674,7 +9731,7 @@ mod tests {
         };
         {
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller, None);
         }
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
         assert_eq!(
@@ -9729,7 +9786,7 @@ mod tests {
         };
         {
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller, None);
         }
 
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -12378,7 +12435,7 @@ fn handle_watch_event(
         WatchEvent::Upsert(path) => {
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             match reindex_files_reporting(std::slice::from_ref(&path), repo_root, &mut s) {
-                Ok((callers, changed_occ)) => {
+                Ok((callers, changed_occ, changed_defs)) => {
                     // RFC-027 sections 6 and 7.3a: refresh this file's live
                     // overlay, and on an interface edit the overlay of the files
                     // that reference it.
@@ -12393,11 +12450,29 @@ fn handle_watch_event(
                     // `reindex_replace`, so re-resolving them is what stops a
                     // rename from silently dropping every inbound live edge.
                     let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
-                    live_resolve_file(&mut s, &corpus, repo_root, &path);
+                    // RFC-027 #813 (finding 2): on a scoped pure-body edit the
+                    // store preserved every unchanged definition's committed
+                    // edges, so the lexical lane must re-resolve only the changed
+                    // region, otherwise it re-records a preserved definition's
+                    // already-committed references as `pending` and the freshness
+                    // count over-reports. `None` (no entry) means a whole-file
+                    // re-derive, which resolves the file wholesale as before.
+                    let saved_vname = path
+                        .strip_prefix(repo_root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let scope = changed_defs
+                        .iter()
+                        .find(|(f, _)| *f == saved_vname)
+                        .map(|(_, set)| set);
+                    live_resolve_file(&mut s, &corpus, repo_root, &path, scope);
+                    // Dependents were not reindexed by this event, so their whole
+                    // file is re-resolved (no scope) exactly as before.
                     for dependent in callers.iter().take(LIVE_CLOSURE_FILE_CAP) {
                         let abs = repo_root.join(dependent);
                         if abs != path && abs.is_file() {
-                            live_resolve_file(&mut s, &corpus, repo_root, &abs);
+                            live_resolve_file(&mut s, &corpus, repo_root, &abs, None);
                         }
                     }
                     // RFC-027 #813 P2: stash this save's changed-def committed
@@ -12553,6 +12628,24 @@ impl EditorPlane {
     fn stashed_changed_occurrences(&self, path: &str) -> Vec<travsr_core::ChangedOccurrence> {
         match self.changed_occurrences.get(path) {
             Some(e) if e.expires_at > std::time::Instant::now() => e.occurrences.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// RFC-027 #813 P2: serve a target request or report *and* restart the TTL
+    /// clock, because a resolution drain begins at the request, not at the save.
+    /// A large edited function's targets (or a cold rust-analyzer / jdtls) can
+    /// take several seconds to answer in batches; keying the 30 s window on the
+    /// save time would reject every late batch as stale (`retain_current_targets`
+    /// re-reads the stash and would find it gone). Refreshing on each serve keeps
+    /// the stash alive as long as answers keep arriving inside one TTL of each
+    /// other. Read-only otherwise, so an expired stash still returns empty.
+    fn serve_changed_occurrences(&mut self, path: &str) -> Vec<travsr_core::ChangedOccurrence> {
+        match self.changed_occurrences.get_mut(path) {
+            Some(e) if e.expires_at > std::time::Instant::now() => {
+                e.expires_at = std::time::Instant::now() + STASHED_OCCURRENCE_TTL;
+                e.occurrences.clone()
+            }
             _ => Vec::new(),
         }
     }
@@ -12732,11 +12825,13 @@ fn handle_control_message(
             let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
             let abs_path = repo_root.join(&file);
             // RFC-027 #813 P2: enumerate this file's changed-def occurrences
-            // stashed at its last save (empty when none is fresh).
+            // stashed at its last save (empty when none is fresh), and restart
+            // the TTL from this request so the resolution drain it kicks off has
+            // the full window even when the provider answers slowly.
             let stashed = lsp_sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .stashed_changed_occurrences(&file);
+                .serve_changed_occurrences(&file);
             let own = live_resolution_targets(&s, &corpus, repo_root, &abs_path, &stashed);
             // RFC-027 section 8.7.5: also re-resolve the files whose edges this
             // save can restore, so a rename in one file heals its dependents
@@ -12794,11 +12889,13 @@ fn handle_control_message(
             // closes that window with the daemon's own evidence.
             // RFC-027 #813 P2: validate against the same enumerated set the
             // request served, so a resolution for a changed-def occurrence is
-            // recognized as current rather than rejected as stale.
+            // recognized as current rather than rejected as stale. Refresh the
+            // TTL again here so a long, multi-batch drain keeps the stash alive as
+            // long as reports keep arriving within one TTL of each other.
             let stashed = lsp_sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .stashed_changed_occurrences(&file);
+                .serve_changed_occurrences(&file);
             let current =
                 live_resolution_targets(&s, &corpus, repo_root, &repo_root.join(&file), &stashed);
             let accepted = live_resolve::retain_current_targets(&resolutions, &current);

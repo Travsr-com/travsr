@@ -1584,12 +1584,20 @@ pub struct ReplaceReport {
     /// Paths of files that had inbound edges to the removed symbols.
     pub callers: DirtySet,
     /// RFC-027 #813: the definitions in the reparsed file this edit actually
-    /// changed, so the live lane re-resolves exactly these and leaves the rest.
-    /// It is every node this parse produced whose committed edges were NOT
-    /// preserved: the edited definitions on a pure body edit, or the whole file
-    /// when the edit added or removed a symbol (or no `content` was supplied, so
-    /// nothing could be proven unchanged). Empty means every definition was
-    /// preserved, so there is no changed region to re-resolve.
+    /// changed. It is every node this parse produced whose committed edges were
+    /// NOT preserved: the edited definitions on a pure body edit, or the whole
+    /// file when the edit added or removed a symbol (or no `content` was
+    /// supplied, so nothing could be proven unchanged). Empty means every
+    /// definition was preserved, so there is no changed region to re-resolve.
+    ///
+    /// The save-path lexical lane (`live_resolve_file`) scopes to exactly these,
+    /// so a preserved definition's already-committed references are not
+    /// re-recorded as `pending` and the freshness count stays honest. The
+    /// request-path editor targets (`live_resolution_targets`) are not yet scoped
+    /// to this set: they still span the file, which costs extra provider round
+    /// trips on preserved definitions but never a wrong edge, because a native
+    /// target inside a preserved definition is a no-op for the committed graph
+    /// (`put_edge_live` only touches `live` rows).
     #[serde(default)]
     pub changed_defs: Vec<NodeId>,
     /// RFC-027 #813 P2: the committed occurrence rows the reparse is about to
@@ -1605,6 +1613,13 @@ pub struct ReplaceReport {
     /// was supplied.
     #[serde(default)]
     pub changed_occurrences: Vec<ChangedOccurrence>,
+    /// RFC-027 #813 (finding 2): whether at least one definition was preserved,
+    /// i.e. this was a scoped pure-body edit and `changed_defs` is a proper
+    /// subset of the file. When false the whole file was re-derived and
+    /// `changed_defs` names every node, so the save path resolves the file
+    /// wholesale exactly as before and there is nothing to scope.
+    #[serde(default)]
+    pub preserved_any: bool,
 }
 
 /// RFC-027 #813 P2: one committed occurrence of a changed definition, captured
