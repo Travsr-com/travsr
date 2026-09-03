@@ -548,11 +548,10 @@ fn lexical_edge_kind(call: &UnresolvedCall) -> EdgeKind {
 /// extractor could be taught to carry UTF-16 offsets.
 pub fn targets_needing_editor(
     store: &SqliteStore,
-    content: &str,
+    lines: &[&str],
     unresolved: &[UnresolvedCall],
     locally_bound: &std::collections::HashSet<String>,
 ) -> Vec<LiveResolutionTarget> {
-    let lines: Vec<&str> = content.lines().collect();
     let targets: Vec<LiveResolutionTarget> = unresolved
         .iter()
         .filter_map(|call| {
@@ -714,10 +713,10 @@ pub fn generic_targets_needing_editor(
 /// counts UTF-16 code units, and JS `\b` (no `u` flag) is ASCII, so a
 /// daemon-pinned column and the editor's own fallback search agree byte for byte.
 /// A name the daemon cannot pin as a whole word on its line is left `None`, and
-/// the editor falls back to its own search, which abstains the same way. `content`
-/// is the current file text; a target whose line is out of range is left as is.
-pub fn fill_target_columns(content: &str, targets: &mut [LiveResolutionTarget]) {
-    let lines: Vec<&str> = content.lines().collect();
+/// the editor falls back to its own search, which abstains the same way. `lines`
+/// is the current file text split by line; a target whose line is out of range
+/// is left as is.
+pub fn fill_target_columns(lines: &[&str], targets: &mut [LiveResolutionTarget]) {
     for t in targets.iter_mut() {
         // A target the extractor already pinned to its exact occurrence column
         // keeps it; the name search is only the fallback for the rest.
@@ -805,14 +804,13 @@ fn drop_same_position_collisions(targets: Vec<LiveResolutionTarget>) -> Vec<Live
 /// finally deduped within the enumerated set the same way the native lane is.
 pub fn merge_changed_occurrence_targets(
     store: &SqliteStore,
-    content: &str,
+    lines: &[&str],
     native: Vec<LiveResolutionTarget>,
     stashed: &[travsr_core::ChangedOccurrence],
 ) -> Vec<LiveResolutionTarget> {
     if stashed.is_empty() {
         return native;
     }
-    let lines: Vec<&str> = content.lines().collect();
     let src_ids: Vec<travsr_core::NodeId> = {
         let mut v: Vec<travsr_core::NodeId> = stashed.iter().map(|o| o.src).collect();
         v.sort_unstable_by_key(|id| id.0);
@@ -1079,7 +1077,8 @@ mod tests {
                 provider: "definition".to_string(),
             },
         ];
-        fill_target_columns(content, &mut targets);
+        let lines: Vec<&str> = content.lines().collect();
+        fill_target_columns(&lines, &mut targets);
         // "    self.save(x);" - `save` starts at column 9 (0-based), after the
         // word boundary at the dot, not inside `self`.
         assert_eq!(targets[0].ref_col, Some(9));
@@ -1134,7 +1133,8 @@ mod tests {
             provider: "definition".to_string(),
         }];
 
-        let out = merge_changed_occurrence_targets(&store, content, native, &stashed);
+        let lines: Vec<&str> = content.lines().collect();
+        let out = merge_changed_occurrence_targets(&store, &lines, native, &stashed);
 
         // The native target is kept; the enumerated `bar` is added at its UTF-16
         // column; the out-of-span and native-owned occurrences are dropped.
@@ -2017,7 +2017,7 @@ mod tests {
         let mut ambiguous = call(src, "fn:save", 19);
         ambiguous.is_method_call = true;
 
-        let targets = targets_needing_editor(&store, "", &[resolvable, ambiguous], &no_locals());
+        let targets = targets_needing_editor(&store, &[], &[resolvable, ambiguous], &no_locals());
         assert_eq!(
             targets.len(),
             1,
@@ -2037,7 +2037,7 @@ mod tests {
         let store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
         let src = node_id("src/order.ts", "fn:placeOrder");
         let field = call(src, "field:count", 20);
-        let targets = targets_needing_editor(&store, "", &[field], &no_locals());
+        let targets = targets_needing_editor(&store, &[], &[field], &no_locals());
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].edge_kind, "ref/field");
         assert_eq!(targets[0].name, "count");
@@ -2056,7 +2056,8 @@ mod tests {
         let mut c = call(src, "fn:save", 1);
         c.is_method_call = true;
         c.caller_col = Some(14); // byte column of the second `save`
-        let targets = targets_needing_editor(&store, content, &[c], &no_locals());
+        let lines: Vec<&str> = content.lines().collect();
+        let targets = targets_needing_editor(&store, &lines, &[c], &no_locals());
         assert_eq!(targets.len(), 1);
         assert_eq!(
             targets[0].ref_col,
@@ -2073,7 +2074,7 @@ mod tests {
         let store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
         let src = node_id("src/order.ts", "fn:placeOrder");
         let bare = call(src, "fn:nowhere", 21);
-        assert!(targets_needing_editor(&store, "", &[bare], &no_locals()).is_empty());
+        assert!(targets_needing_editor(&store, &[], &[bare], &no_locals()).is_empty());
     }
 
     /// RFC-027 section 12: the editor lane records what it claimed, so the

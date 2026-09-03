@@ -2907,10 +2907,10 @@ impl SqliteStore {
 
             // Write new nodes + FTS within this transaction.
             // put_node_fts accepts &Connection; Transaction derefs to Connection.
-            let mut new_ids = std::collections::HashSet::<i64>::new();
+            // `new_ids` (this parse's NodeId set) is already computed above for the
+            // pure-body-edit test; reuse it for the removed-symbol diff below.
             for node in nodes {
                 let id_i64 = node_id_to_i64(node.id);
-                new_ids.insert(id_i64);
                 // RFC-027 #813: stamp the body hash so the next save can tell
                 // whether this definition was left untouched. `NULL` when no
                 // `content` was supplied (the pre-#813 behaviour) or the node has

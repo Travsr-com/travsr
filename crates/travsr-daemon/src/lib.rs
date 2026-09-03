@@ -21,7 +21,7 @@ use ignore::WalkBuilder;
 use travsr_analysis::skeleton::{embed_texts_for_file, EmbedRichness};
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
-    hash_file, ingest_lsif, link_imports, link_imports_go, link_imports_python_fs,
+    hash_bytes, ingest_lsif, link_imports, link_imports_go, link_imports_python_fs,
     link_imports_rust, run_lsif_emitter, FfiMarker,
 };
 use travsr_plugin_host::PluginIndexer;
@@ -294,15 +294,17 @@ fn index_paths_parallel(
                         .to_string_lossy()
                         .replace('\\', "/");
 
-                    // Hash-delta skip — same as reindex_files.
-                    let new_hash = match hash_file(abs_path) {
-                        Ok(h) => h,
+                    // Read once; the bytes feed the hash-delta skip below and, for
+                    // a changed file, the source handed to the write path so the
+                    // body hash is stamped from the same content (RFC-027 #813).
+                    let bytes = match std::fs::read(abs_path) {
+                        Ok(b) => b,
                         Err(e) => {
-                            tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %e, "hash failed, skipping");
+                            tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %e, "read failed, skipping");
                             continue;
                         }
                     };
-                    let new_hex = hex_encode(&new_hash);
+                    let new_hex = hex_encode(&hash_bytes(&bytes));
                     if stored.get(&vname_path).map(String::as_str) == Some(&new_hex) {
                         let _ = tx.send(Ok(ParseResult {
                             file_graph: FileGraph {
@@ -362,9 +364,10 @@ fn index_paths_parallel(
 
                     // RFC-027 #813: carry the source so the write path can stamp
                     // each definition's body hash from the same content these
-                    // nodes were parsed from. Unreadable/binary reads as None,
-                    // leaving the hashes NULL (preservation simply forgone).
-                    let source = std::fs::read_to_string(abs_path).ok();
+                    // nodes were parsed from, reusing the bytes read above.
+                    // Non-UTF-8 reads as None, leaving the hashes NULL
+                    // (preservation simply forgone).
+                    let source = String::from_utf8(bytes).ok();
 
                     let _ = tx.send(Ok(ParseResult {
                         file_graph: FileGraph {
@@ -4022,17 +4025,20 @@ fn live_resolution_targets(
             return Vec::new();
         }
         let content = std::fs::read_to_string(abs_path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().collect();
         return live_resolve::merge_changed_occurrence_targets(
             store,
-            &content,
+            &lines,
             Vec::new(),
             stashed,
         );
     };
     // The file text pins each target's exact column (RFC-027 #813 P1/P2). Read
-    // once and share it: the native builder uses the extractor's occurrence
-    // column, and `fill_target_columns` fills the rest by name search.
+    // and split into lines once here, then share the slice: the native builder
+    // uses the extractor's occurrence column, `fill_target_columns` fills the
+    // rest by name search, and the merge maps stashed occurrences by line.
     let content = std::fs::read_to_string(abs_path).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
     let mut targets = match refs {
         LiveRefSet::Native {
             unresolved,
@@ -4040,7 +4046,7 @@ fn live_resolution_targets(
             locally_bound,
         } => {
             let mut targets =
-                live_resolve::targets_needing_editor(store, &content, &unresolved, &locally_bound);
+                live_resolve::targets_needing_editor(store, &lines, &unresolved, &locally_bound);
             targets.extend(live_resolve::inheritance_targets_needing_editor(
                 store,
                 corpus,
@@ -4058,10 +4064,10 @@ fn live_resolution_targets(
     // RFC-027 #813 P1: pin each remaining target's column against the file text
     // (the ones the extractor left without an exact occurrence column) so the
     // editor resolves at the exact position instead of searching the line.
-    live_resolve::fill_target_columns(&content, &mut targets);
+    live_resolve::fill_target_columns(&lines, &mut targets);
     // RFC-027 #813 P2: enumerate the changed definitions' committed occurrences
     // as editor targets, deduped against the native lane above.
-    live_resolve::merge_changed_occurrence_targets(store, &content, targets, stashed)
+    live_resolve::merge_changed_occurrence_targets(store, &lines, targets, stashed)
 }
 
 /// RFC-027 section 8.7.5: the interface-edit closure, as editor targets.
@@ -4937,13 +4943,12 @@ pub fn reindex_files_reporting(
             .replace('\\', "/");
 
         // §2 GC keystone: detect deletion before touching the graph.
-        let new_hash = match hash_file(abs_path) {
-            Ok(h) => h,
-            Err(ref err)
-                if err
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-            {
+        // Read the file once; the same bytes feed both the hash and the content
+        // handed to reindex_replace below (RFC-027 #813), so a changed file is
+        // read a single time on this path instead of once per use.
+        let bytes = match std::fs::read(abs_path) {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 // File was deleted — both-direction delete + clear file hash row.
                 match store.delete_file(&corpus, &vname_path) {
                     Ok(callers) => {
@@ -4963,11 +4968,11 @@ pub fn reindex_files_reporting(
                 continue;
             }
             Err(err) => {
-                tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %err, "hash failed, skipping");
+                tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %err, "read failed, skipping");
                 continue;
             }
         };
-        let new_hex = hex_encode(&new_hash);
+        let new_hex = hex_encode(&hash_bytes(&bytes));
 
         let old_hex = store.get_file_hash(&vname_path)?;
         if old_hex.as_deref() == Some(&new_hex) {
@@ -5013,10 +5018,11 @@ pub fn reindex_files_reporting(
         //
         // RFC-027 #813: hand the current text to the store so a pure body edit
         // preserves the committed edges of every definition it left untouched
-        // instead of purging and re-deriving the whole file. `None` for a file
-        // that is not valid UTF-8 (the store then falls back to the whole-file
-        // purge), which a source file the parser accepted will not be.
-        let content = std::fs::read_to_string(abs_path).ok();
+        // instead of purging and re-deriving the whole file. Reuses the bytes
+        // read above; `None` for a file that is not valid UTF-8 (the store then
+        // falls back to the whole-file purge), which a source file the parser
+        // accepted will not be.
+        let content = String::from_utf8(bytes).ok();
         match store.reindex_replace(
             &corpus,
             &vname_path,
