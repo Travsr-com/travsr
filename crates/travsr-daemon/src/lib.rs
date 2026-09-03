@@ -534,6 +534,34 @@ const KNOWN_SOURCE_DIRS: &[&str] = &[
     "content",
 ];
 
+/// Resolve the `.git` directory for `repo_root`.
+///
+/// For a standard repo this is `<repo_root>/.git`. For a **linked worktree**
+/// `.git` is a gitlink file containing `gitdir: <path>`, so the actual git
+/// state directory lives elsewhere. `git rev-parse --git-dir` returns the
+/// correct directory in both cases. Falls back to `<repo_root>/.git` when
+/// git is unavailable.
+fn resolve_git_dir(repo_root: &Path) -> PathBuf {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--git-dir"])
+        .output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    // rev-parse may return a relative path (e.g. ".git");
+                    // join with repo_root so the result is always absolute.
+                    return repo_root.join(trimmed);
+                }
+            }
+        }
+    }
+    repo_root.join(".git")
+}
+
 /// Heuristic: a single directory holding ≥ 1 000 source-language files AND
 /// ≥ 15 % of the total discovered source files is flagged as a "large dep dir",
 /// unless the directory name is in `KNOWN_SOURCE_DIRS`.
@@ -1424,7 +1452,13 @@ pub fn init_repo_with_progress(
 
     // L13: warn if a rebase is in progress — init during rebase risks indexing
     // conflict-marker noise into graph.db; the user should finish rebasing first.
-    if repo_root.join(".git").join("REBASE_HEAD").exists() {
+    // We check for `rebase-merge/` (interactive) or `rebase-apply/` (am backend);
+    // these directories exist only while a rebase is running. REBASE_HEAD is not
+    // used because git leaves it behind after a completed or aborted rebase (#798).
+    // `git rev-parse --git-dir` resolves correctly for linked worktrees where .git
+    // is a gitlink file, not a directory.
+    let git_dir = resolve_git_dir(repo_root);
+    if git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir() {
         eprintln!(
             "warning: a git rebase is in progress, consider finishing or aborting it \
              before running `travsr init` to avoid indexing conflict markers"

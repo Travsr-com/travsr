@@ -296,3 +296,57 @@ fn hook_run_from_hook_reindexes_after_merge_commit() {
          (--first-parent semantics; before={count_before}, after={count_after})"
     );
 }
+
+/// #798 regression: a stale REBASE_HEAD left behind after a completed rebase
+/// must NOT trigger the "a git rebase is in progress" warning.
+#[test]
+fn init_no_rebase_warning_with_stale_rebase_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+
+    // Create a source file and initial commit so travsr has something to index.
+    std::fs::write(tmp.path().join("a.ts"), "export function a() {}").unwrap();
+    git(tmp.path(), &["add", "a.ts"]);
+    git(tmp.path(), &["commit", "-q", "-m", "initial"]);
+
+    // Simulate a stale REBASE_HEAD (left over from a finished rebase).
+    std::fs::write(
+        tmp.path().join(".git/REBASE_HEAD"),
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",
+    )
+    .unwrap();
+
+    // Ensure `rebase-merge/` does NOT exist (no rebase in progress).
+    assert!(!tmp.path().join(".git/rebase-merge").is_dir());
+    assert!(!tmp.path().join(".git/rebase-apply").is_dir());
+
+    let assert = travsr_init(tmp.path()).success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        !stderr.contains("rebase is in progress"),
+        "stale REBASE_HEAD must not trigger a rebase warning, but stderr was:\n{stderr}"
+    );
+}
+
+/// #798 regression: when `rebase-merge/` exists (a genuine interactive rebase
+/// in progress), `travsr init` must warn the user.
+#[test]
+fn init_warns_during_active_rebase() {
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+
+    // Create a source file and initial commit so travsr has something to index.
+    std::fs::write(tmp.path().join("a.ts"), "export function a() {}").unwrap();
+    git(tmp.path(), &["add", "a.ts"]);
+    git(tmp.path(), &["commit", "-q", "-m", "initial"]);
+
+    // Simulate an in-progress interactive rebase by creating the state directory.
+    std::fs::create_dir_all(tmp.path().join(".git/rebase-merge")).unwrap();
+
+    let assert = travsr_init(tmp.path()).success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("rebase is in progress"),
+        "rebase-merge/ directory must trigger a rebase warning, but stderr was:\n{stderr}"
+    );
+}
