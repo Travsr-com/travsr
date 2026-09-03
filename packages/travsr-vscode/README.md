@@ -47,7 +47,7 @@ For full cross-file analysis in languages beyond TypeScript, JavaScript, Python 
 | `Travsr: Open Context Explorer` | Graph-ranked context for a natural-language query |
 | `Travsr: Ask Symbol` | Look a symbol up by name across the graph |
 | `Travsr: Languages` | Language analyzer status, prerequisites, and installs |
-| `Travsr: Graph Stats` | Index health, daemon status, and the daemon log |
+| `Travsr: Health` | Index health, daemon status, analysis state, and the daemon log |
 | `Travsr: Select Repository` | Choose which open repo actions target |
 | `Travsr: Registered Repos` | Every repo in the global registry |
 | `Travsr: Re-index Now` | Re-index the active repository |

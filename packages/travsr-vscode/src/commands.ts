@@ -30,6 +30,9 @@ import {
   LOG_MAX_FILES_LISTED,
   LOG_AUTO_SECONDS,
   buildLogRowsHtml,
+  UNKNOWN_INDEX,
+  formatLogSize,
+  EMPTY_HEALTH,
   LANG_CONTRACT_FIELDS,
   LANG_CONTRACT_VERSION,
   type RepoRow,
@@ -39,6 +42,16 @@ import {
   type LangContractSkew,
 } from "./webviews";
 import type { Diagnostic, LogEntry, LogFileInfo } from "./webviews";
+import type { IndexHealth } from "./webviews";
+import type {
+  HealthData,
+  SidecarRow,
+  AgentRow,
+  IntegrityView,
+  LanguageRow,
+} from "./webviews";
+import { resolveAgentTargets } from "./mcpRegister";
+import { runTravsrCommand, parseTravsrInvocation } from "./terminal";
 
 // ── Pure helpers (unit-testable) ────────────────────────────────────────────
 
@@ -701,6 +714,225 @@ function shortTarget(target: string): string {
 }
 
 /** Build the stats dashboard view from `get_graph_stats` + local graph.db. */
+/** Parse the `get_index_status` envelope. Anything unparseable is reported as
+ *  unavailable rather than as a healthy default. */
+export function parseIndexHealth(raw: string): IndexHealth {
+  const body = stripEnvelope(raw).trim();
+  if (body === "") return UNKNOWN_INDEX;
+  try {
+    const p = JSON.parse(body) as {
+      indexed_commit?: unknown;
+      head_commit?: unknown;
+      staleness?: { behind_by?: unknown; is_stale?: unknown; working_tree_dirty?: unknown };
+      phase_a?: { state?: unknown };
+    };
+    const s = p.staleness ?? {};
+    const str = (v: unknown): string => (typeof v === "string" ? v : "");
+    const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
+    const bool = (v: unknown): boolean | null => (typeof v === "boolean" ? v : null);
+    return {
+      isStale: bool(s.is_stale),
+      behindBy: num(s.behind_by),
+      indexedCommit: str(p.indexed_commit),
+      headCommit: str(p.head_commit),
+      phaseA: str(p.phase_a?.state),
+      workingTreeDirty: bool(s.working_tree_dirty),
+      available: true,
+    };
+  } catch {
+    return UNKNOWN_INDEX;
+  }
+}
+
+/** Gather everything the Health page's sections need.
+ *
+ *  Each source is independent and every one of them can fail on its own: the
+ *  daemon can be down while the CLI still answers, a binary can be too old for
+ *  a tool, a config file can be missing. So each lands in its own field and a
+ *  failure becomes `null`, which the page renders as "could not read this"
+ *  rather than as a clean bill of health. Nothing here throws.
+ *
+ *  The spawns run together rather than in sequence: `lang list` alone takes
+ *  about 17 seconds on Windows because it sweeps PATH per catalog language, and
+ *  serialising four of those would make opening the panel feel broken.
+ */
+export async function gatherHealth(
+  client: McpClient,
+  binary: string,
+  root: string | undefined,
+  log: LogEntry[],
+  dbSize: string,
+  logFiles: { files: LogFileInfo[]; onDisk: number },
+  activeRepoName: string
+): Promise<HealthData> {
+  const daemonRunning = client.isConnected();
+
+  // Read from the log, because it is the one source that still answers after
+  // the process has gone, which is exactly when this page gets opened.
+  const findEvent = (re: RegExp): string => {
+    for (const e of log) {
+      const m = re.exec(e.message ?? "");
+      if (m) return m[1] ?? "";
+    }
+    return "";
+  };
+  const daemonPid = findEvent(/\bpid[= ](\d+)/);
+  const daemonStopped = (() => {
+    const stop = log.find((e) => /daemon stopped|shutting down/i.test(e.message ?? ""));
+    return stop?.time ?? "";
+  })();
+  const lastEditor = (() => {
+    const ed = log.find((e) => /editor (attached|detached)/i.test(e.message ?? ""));
+    if (ed === undefined) return "";
+    const sess = /session=([\w-]+)/.exec(ed.message ?? "");
+    const verb = /detached/i.test(ed.message ?? "") ? "detached" : "attached";
+    return `${sess ? sess[1] : "editor"} ${verb} ${ed.time ?? ""}`.trim();
+  })();
+
+  const settle = async <T>(p: Promise<T>, fallback: T): Promise<T> => {
+    try {
+      return await p;
+    } catch {
+      return fallback;
+    }
+  };
+
+  const [versionOut, embedOut, langOut, healthRaw, reposRaw] = await Promise.all([
+    settle(spawnLangCommand(binary, ["--version"], root ?? process.cwd()), ""),
+    settle(spawnLangCommand(binary, ["embed", "list", "--json"], root ?? process.cwd()), ""),
+    settle(spawnLangCommand(binary, ["lang", "list", "--json"], root ?? process.cwd(), 60_000), ""),
+    settle(client.callTool("get_graph_health"), ""),
+    settle(client.callTool("repos_list"), ""),
+  ]);
+
+  const binaryVersion = (/(\d+\.\d+\.\d+[^\s]*)/.exec(versionOut) ?? [])[1] ?? "";
+
+  // Sidecars. `embed list --json` reports every model in the catalog; the panel
+  // only needs whether the active one is on disk.
+  let sidecars: SidecarRow[] | null = null;
+  if (embedOut.trim() !== "") {
+    try {
+      const models = JSON.parse(embedOut) as Array<{ installed?: boolean; active?: boolean; id?: string }>;
+      const active = models.find((m) => m.active === true);
+      const anyInstalled = models.some((m) => m.installed === true);
+      const embedOk = active?.installed === true;
+      sidecars = [
+        {
+          name: "embed",
+          state: embedOk
+            ? `${active?.id ?? "model"}, ready`
+            : anyInstalled
+              ? "installed but not active"
+              : "not installed, semantic search off",
+          ok: embedOk,
+          action: embedOk ? "restartEmbed" : "installEmbed",
+        },
+      ];
+    } catch {
+      sidecars = null;
+    }
+  }
+
+  // Languages. Reuses the same JSON the Languages panel reads, so the two
+  // surfaces cannot disagree about a language.
+  let languages: LanguageRow[] | null = null;
+  if (langOut.trim() !== "") {
+    try {
+      const parsed = JSON.parse(langOut) as LangInfo[];
+      const inRepo = parsed.filter((l) => l.status !== "unsupported");
+      languages = inRepo.slice(0, 6).map((l) => ({
+        language: l.language,
+        analysis: l.status === "active" ? "full" : "structural only",
+        full: l.status === "active",
+        symbols: l.status === "active" ? "resolved" : "0 symbols",
+      }));
+      if (languages.length === 0) languages = null;
+    } catch {
+      languages = null;
+    }
+  }
+
+  // Integrity, from the daemon's own report.
+  let integrity: IntegrityView | null = null;
+  const healthBody = stripEnvelope(healthRaw).trim();
+  if (healthBody !== "") {
+    try {
+      const h = JSON.parse(healthBody) as {
+        healthy?: boolean;
+        ghost_paths?: { count?: number; sample?: string[] };
+        lexical_index_parity?: { ok?: boolean };
+      };
+      integrity = {
+        healthy: typeof h.healthy === "boolean" ? h.healthy : null,
+        ghostCount: typeof h.ghost_paths?.count === "number" ? h.ghost_paths.count : null,
+        ghostSample: Array.isArray(h.ghost_paths?.sample) ? h.ghost_paths.sample.slice(0, 3) : [],
+        lexicalOk: typeof h.lexical_index_parity?.ok === "boolean" ? h.lexical_index_parity.ok : null,
+        dbSize,
+        logSize: formatLogSize(logFiles.files.reduce((a, f) => a + f.size, 0)),
+        logFiles: logFiles.files.length,
+      };
+    } catch {
+      integrity = null;
+    }
+  }
+
+  const repos = reposRaw.trim() === "" ? null : parseReposList(reposRaw);
+
+  // Agents. A missing config file and a config with no travsr entry are
+  // different answers, so they are reported differently.
+  let agents: AgentRow[] | null = null;
+  try {
+    agents = resolveAgentTargets(root).map((t) => {
+      if (!fs.existsSync(t.configPath)) {
+        return { name: t.name, registered: false, detail: "config file not found" };
+      }
+      try {
+        const txt = fs.readFileSync(t.configPath, "utf8");
+        const registered = /"travsr"\s*:/.test(txt);
+        return {
+          name: t.name,
+          registered,
+          detail: registered ? "registered" : "not registered",
+        };
+      } catch {
+        return { name: t.name, registered: false, detail: "config not readable" };
+      }
+    });
+  } catch {
+    agents = null;
+  }
+
+  // The hook is a file, so this answers whether commits actually refresh the
+  // graph rather than whether the feature exists.
+  let commitHook: boolean | null = null;
+  if (root !== undefined) {
+    try {
+      const hook = path.join(root, ".git", "hooks", "post-commit");
+      commitHook = fs.existsSync(hook) && /travsr/.test(fs.readFileSync(hook, "utf8"));
+    } catch {
+      commitHook = null;
+    }
+  }
+
+  const newest = logFiles.files[0];
+  return {
+    daemonRunning,
+    daemonPid,
+    daemonStopped,
+    lastEditor,
+    binaryVersion,
+    logFileName: newest?.name ?? "",
+    logFileSize: newest ? formatLogSize(newest.size) : "",
+    commitHook,
+    sidecars,
+    agents,
+    repos,
+    activeRepo: activeRepoName,
+    languages,
+    integrity,
+  };
+}
+
 export function buildStatsView(raw: string): StatsView {
   const lines = stripEnvelope(raw).split("\n");
   const field = (key: string): string => {
@@ -1027,6 +1259,21 @@ type PanelMessage =
   | { command: "setLogLines"; lines: number }
   | { command: "setLogFile"; file: string }
   | { command: "setLogAuto"; seconds: number }
+  | { command: "startDaemon" }
+  | { command: "restartDaemon" }
+  | { command: "reindex" }
+  | { command: "fullRebuild" }
+  | { command: "reindexSemantic" }
+  | { command: "installHook" }
+  | { command: "installEmbed" }
+  | { command: "restartEmbed" }
+  | { command: "runFsck" }
+  | { command: "compact" }
+  | { command: "pruneLogs" }
+  | { command: "registerMcp" }
+  | { command: "openLog" }
+  | { command: "runFix"; index: number }
+  | { command: "copyFix"; index: number }
   | { command: "refresh" };
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
@@ -1173,6 +1420,8 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
   // doing the work.
   let lastStats: StatsView | undefined;
   let lastDiags: Diagnostic[] = [];
+  let lastIndex: IndexHealth = UNKNOWN_INDEX;
+  let lastHealth: HealthData = EMPTY_HEALTH;
   let logOnly = false;
   // How many lines the reader is asked for. The panel's Lines control raises
   // this when the user picks a window wider than what is already loaded, which
@@ -1258,18 +1507,117 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
     const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
     // readDiagnostics spawns `travsr status`.
     const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
+    // Drift, straight from the daemon. An older binary does not serve this tool
+    // and the client answers "" for an unknown tool, which parseIndexHealth
+    // reports as unavailable rather than as fresh.
+    const index = reuse
+      ? lastIndex
+      : parseIndexHealth(await client.callTool("get_index_status"));
+    // The sections. Skipped on a log-only refresh, which is what changing Lines
+    // or File does: those spawns are the expensive half and nothing above the
+    // log has changed.
+    const health = reuse
+      ? lastHealth
+      : await gatherHealth(client, bin, root, log, stats.dbSize, logFiles, path.basename(root ?? ""));
     lastStats = stats;
     lastDiags = diags;
+    lastIndex = index;
+    lastHealth = health;
     // A panel that was closed and reopened renders the stored interval as
     // selected, so the timer has to come back with it: otherwise the control
     // claims to be polling while nothing is.
     if (logAuto > 0 && autoTimer === undefined) {
       autoTimer = setInterval(autoTick, logAuto * 1000);
     }
-    return buildStatsHtml(stats, log, diags, logLines, { ...logFiles, selected }, logAuto);
+    return buildStatsHtml(
+      stats, log, diags, logLines, { ...logFiles, selected }, logAuto, index, health,
+      path.basename(root ?? ""), root ?? ""
+    );
   };
 
   const handle = async (msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
+    const repoRoot = (): string | undefined => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+    // Commands that run in the shared terminal. Each argv is a literal here,
+    // never assembled from anything the webview sent, so a panel that rendered
+    // hostile text still cannot choose what runs.
+    const TERMINAL_ACTIONS: Partial<Record<PanelMessage["command"], string[]>> = {
+      startDaemon: ["daemon", "start"],
+      restartDaemon: ["daemon", "restart"],
+      fullRebuild: ["init", "--force"],
+      reindexSemantic: ["init", "--semantic", "--force"],
+      installHook: ["init", "--force"],
+      installEmbed: ["embed", "init"],
+      restartEmbed: ["embed", "init", "--reinstall"],
+      runFsck: ["fsck"],
+      compact: ["fsck", "--fix"],
+      pruneLogs: ["repos", "--prune"],
+    };
+    const argv = TERMINAL_ACTIONS[msg.command];
+    if (argv !== undefined) {
+      // The destructive ones say what they will do before doing it. Reindexing
+      // is not destructive; rebuilding and repairing both discard state.
+      const DESTRUCTIVE: Partial<Record<string, string>> = {
+        fullRebuild: "Rebuild the graph from scratch? The current index is discarded and rebuilt.",
+        compact: "Repair the index? Entries pointing at files that no longer exist are removed.",
+        pruneLogs: "Prune stale repositories from the registry?",
+      };
+      const warning = DESTRUCTIVE[msg.command];
+      if (warning !== undefined) {
+        const go = await vscode.window.showWarningMessage(warning, { modal: true }, "Run");
+        if (go !== "Run") return;
+      }
+      runTravsrCommand(argv, repoRoot());
+      return;
+    }
+    if (msg.command === "reindex") {
+      await vscode.commands.executeCommand("travsr.reindexNow");
+      await refresh();
+      return;
+    }
+    if (msg.command === "registerMcp") {
+      await vscode.commands.executeCommand("travsr.registerMcpServer");
+      await refresh();
+      return;
+    }
+    if (msg.command === "openLog") {
+      const root = repoRoot();
+      const name = lastHealth.logFileName;
+      if (root === undefined || name === "") return;
+      try {
+        const doc = await vscode.workspace.openTextDocument(
+          path.join(root, ".travsr", "logs", name)
+        );
+        await vscode.window.showTextDocument(doc, { preview: true });
+      } catch {
+        void vscode.window.showWarningMessage(`Travsr: cannot open ${name}`);
+      }
+      return;
+    }
+    if (msg.command === "runFix" || msg.command === "copyFix") {
+      // The webview sends an index, not a command. The text is looked up here,
+      // in the diagnostics this render produced, so a log line cannot inject a
+      // command by being rendered into the page.
+      const cmd = lastDiags[msg.index]?.command;
+      if (cmd === undefined) return;
+      if (msg.command === "copyFix") {
+        await vscode.env.clipboard.writeText(cmd);
+        void vscode.window.showInformationMessage(`Travsr: copied \`${cmd}\``);
+        return;
+      }
+      const args = parseTravsrInvocation(cmd);
+      if (args === null) {
+        // Not a plain `travsr ...` call. Copy it rather than handing anything
+        // with shell syntax in it to a shell.
+        await vscode.env.clipboard.writeText(cmd);
+        void vscode.window.showWarningMessage(
+          "Travsr: that fix is not a plain travsr command, so it was copied instead of run."
+        );
+        return;
+      }
+      runTravsrCommand(args, repoRoot());
+      return;
+    }
     if (msg.command === "openFile") {
       // The log writes absolute paths in some places and repo-relative in
       // others, so both resolve against the repo root. The result must stay
@@ -1343,7 +1691,7 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
   };
 
   return vscode.commands.registerCommand("travsr.showGraphStats", () =>
-    openManagedPanel("travsrStats", "Travsr: Graph Stats", render, handle)
+    openManagedPanel("travsrStats", "Travsr: Health", render, handle)
   );
 }
 

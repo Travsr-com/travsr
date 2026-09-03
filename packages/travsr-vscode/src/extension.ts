@@ -235,7 +235,7 @@ export function activate(context: vscode.ExtensionContext): void {
         | "close";
       type ActionItem = vscode.QuickPickItem & { id: ItemId };
       const items: vscode.QuickPickItem[] = [
-        { label: "$(graph) Graph stats",              id: "graphStats" } as ActionItem,
+        { label: "$(pulse) Health",                    id: "graphStats" } as ActionItem,
         { label: "$(repo) Registered repos",          id: "repos"      } as ActionItem,
         { label: "$(extensions) Languages",           id: "languages"  } as ActionItem,
         { label: "$(sync) Re-index now",              id: "reindex"    } as ActionItem,

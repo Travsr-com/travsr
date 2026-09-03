@@ -1,7 +1,7 @@
 /**
  * VSCODE-247 — interactive management webviews.
  *
- * Pure HTML builders for the Synonyms editor, Repos manager, Graph Stats
+ * Pure HTML builders for the Synonyms editor, Repos manager, Health
  * dashboard, and Languages panel. Each builder returns a complete document via
  * `webviewShell`, styled with the canonical travsr-designer tokens and a strict
  * CSP. The builders are framework-free (no React) and pure so they can be
@@ -236,6 +236,67 @@ export function webviewShell(title: string, body: string, script: string): strin
   .banner.idle { background: var(--bg-elev); border-color: var(--border); color: var(--fg-muted); }
   /* #755: contract-skew notice. Block, not flex: it carries prose plus a row of
      actions, so the parts must stack rather than share a baseline. */
+  .banner.verdict { align-items: center; gap: 10px; }
+  .banner.verdict strong { flex-shrink: 0; }
+  .banner.verdict span { flex-grow: 1; min-width: 0; }
+  .banner.verdict .vact { flex-shrink: 0; margin-left: auto; }
+  .banner.warn2 { background: var(--gold-deep, var(--orange-deep)); border-color: var(--gold);
+    color: var(--gold); }
+  .card.warn .v { color: var(--gold); }
+  .card.bad .v { color: var(--error); }
+  .card .n { margin-top: 2px; font-size: 10px; color: var(--gold); }
+  .phead { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 12px; }
+  .phead h2 { margin: 0; }
+  .phead .sub { margin: 2px 0 0; font-size: 11px; }
+  .phead-a { margin-left: auto; display: flex; align-items: center; gap: 9px; }
+  .checked { font-size: 11px; color: var(--fg-muted); }
+  .hcols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    align-items: start; margin-top: 12px; }
+  .hcol { display: flex; flex-direction: column; gap: 10px; }
+  .hsec { border: 1px solid var(--border); border-radius: 6px;
+    overflow: hidden; background: var(--bg-elev); }
+  .hsec > summary { list-style: none; cursor: pointer; min-height: 30px; padding: 0 10px 0 6px;
+    display: flex; align-items: center; gap: 7px; background: var(--bg);
+    border-bottom: 1px solid var(--border); }
+  .hsec > summary::-webkit-details-marker { display: none; }
+  .hsec > summary .nm { font-size: 11px; font-weight: 600; color: var(--fg); }
+  .hsec .chev { width: 13px; height: 13px; flex-shrink: 0; color: var(--fg-muted);
+    transition: transform .12s ease; }
+  .hsec[open] > summary .chev { transform: rotate(90deg); }
+  .hsec .sacts { margin-left: 8px; display: flex; gap: 5px; }
+  .chip { margin-left: auto; display: inline-flex; align-items: center; gap: 4px;
+    font-size: 10px; white-space: nowrap; }
+  .chip.ok { color: var(--green); }
+  .chip.warn { color: var(--gold); }
+  .chip.bad { color: var(--error); }
+  .chip.mute { color: var(--fg-muted); }
+  .ci { width: 12px; height: 12px; flex-shrink: 0; }
+  .hrows { padding: 6px 10px 8px; }
+  .hrow { display: flex; align-items: center; gap: 9px; min-height: 22px; font-size: 12px; }
+  .hrow.muted { color: var(--fg-muted); font-size: 11px; padding: 2px 0; }
+  .hrow.mono-only { font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+    font-size: 10px; color: var(--fg-muted); padding-left: 118px; min-height: 17px; }
+  .hrow > span:first-child { width: 110px; flex-shrink: 0; color: var(--fg-muted); }
+  .hrow b { font-weight: 400; color: var(--fg); display: inline-flex; align-items: center;
+    gap: 5px; flex-grow: 1; min-width: 0;
+    font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 11px; }
+  .hrow b.ok { color: var(--green); }
+  .hrow b.warn { color: var(--gold); }
+  .hrow b.bad { color: var(--error); }
+  .hrow .ra { width: auto; margin-left: auto; flex-shrink: 0; }
+  table.ltbl { width: 100%; border-collapse: collapse; }
+  table.ltbl th { text-align: left; font-size: 9px; letter-spacing: .05em;
+    text-transform: uppercase; color: var(--fg-muted); font-weight: 600; padding: 0 6px 4px 0; }
+  table.ltbl td { font-size: 11px; color: var(--fg); padding: 3px 6px 3px 0;
+    border-top: 1px solid var(--border); }
+  table.ltbl td.ok { color: var(--green); }
+  table.ltbl td.warn { color: var(--gold); }
+  table.ltbl td .ci { vertical-align: -2px; margin-right: 4px; }
+  table.ltbl .ra { text-align: right; padding-right: 0; }
+  .btn.mini { padding: 2px 8px; font-size: 11px; }
+  .btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--fg-muted); }
+  .diag-a { display: flex; align-items: center; gap: 7px; }
+  .diag-a .diag-cmd { flex-grow: 1; }
   .banner.warn { display: block; background: var(--orange-deep); border-color: var(--orange);
     color: var(--fg); }
   .banner.warn b { color: var(--orange); }
@@ -711,6 +772,192 @@ export interface StatsView {
   lastIndexed: string;
 }
 
+/** What the daemon reports about drift between the index and the checkout.
+ *
+ *  Read from `get_index_status` rather than re-derived from the Git extension's
+ *  HEAD: `is_stale` is deliberately tri-state and already handles short-SHA
+ *  comparison and linked worktrees (#636), and duplicating that here would give
+ *  the panel a second opinion that can disagree with `travsr status`. */
+export interface IndexHealth {
+  /** null means the daemon could not decide, which is not the same as fresh. */
+  isStale: boolean | null;
+  behindBy: number | null;
+  indexedCommit: string;
+  headCommit: string;
+  phaseA: string;
+  workingTreeDirty: boolean | null;
+  /** False when the reply was empty, which is what an older binary that does
+   *  not serve `get_index_status` looks like. The panel says so rather than
+   *  rendering the gaps as answers. */
+  available: boolean;
+}
+
+export const UNKNOWN_INDEX: IndexHealth = {
+  isStale: null,
+  behindBy: null,
+  indexedCommit: "",
+  headCommit: "",
+  phaseA: "",
+  workingTreeDirty: null,
+  available: false,
+};
+
+/** One sidecar row. `state` is rendered verbatim, never re-derived from the
+ *  other fields, so the panel and `travsr embed list` cannot disagree. */
+export interface SidecarRow {
+  name: string;
+  state: string;
+  ok: boolean;
+  /** The action this row offers, absent when there is nothing to do. */
+  action?: "installEmbed" | "restartEmbed";
+}
+
+/** One agent config the extension knows how to write. */
+export interface AgentRow {
+  name: string;
+  registered: boolean;
+  /** Why it is not registered: a missing config file reads differently from a
+   *  config that exists and simply has no travsr entry. */
+  detail: string;
+}
+
+export interface IntegrityView {
+  /** null when the daemon could not be asked, which is not the same as clean. */
+  healthy: boolean | null;
+  ghostCount: number | null;
+  ghostSample: string[];
+  lexicalOk: boolean | null;
+  dbSize: string;
+  logSize: string;
+  logFiles: number;
+}
+
+export interface LanguageRow {
+  language: string;
+  /** The CLI's own word for it, rendered as given. */
+  analysis: string;
+  full: boolean;
+  symbols: string;
+}
+
+/** Everything the page needs beyond the metric tiles and the log.
+ *
+ *  Each field is independently optional, because each comes from a different
+ *  place and any one of them can be unavailable while the rest are fine. A
+ *  section whose data is missing says so rather than rendering a confident
+ *  empty state. */
+export interface HealthData {
+  daemonRunning: boolean;
+  /** Parsed out of the daemon's own log, which is the only source that still
+   *  works after the process has gone. */
+  daemonPid: string;
+  daemonStopped: string;
+  lastEditor: string;
+  binaryVersion: string;
+  logFileName: string;
+  logFileSize: string;
+  commitHook: boolean | null;
+  sidecars: SidecarRow[] | null;
+  agents: AgentRow[] | null;
+  repos: RepoRow[] | null;
+  activeRepo: string;
+  languages: LanguageRow[] | null;
+  integrity: IntegrityView | null;
+}
+
+export const EMPTY_HEALTH: HealthData = {
+  daemonRunning: false,
+  daemonPid: "",
+  daemonStopped: "",
+  lastEditor: "",
+  binaryVersion: "",
+  logFileName: "",
+  logFileSize: "",
+  commitHook: null,
+  sidecars: null,
+  agents: null,
+  repos: null,
+  activeRepo: "",
+  languages: null,
+  integrity: null,
+};
+
+export type Verdict = "offline" | "stale" | "degraded" | "healthy" | "unindexed";
+
+export interface VerdictView {
+  verdict: Verdict;
+  /** One word, so the state never rides on the banner colour alone. */
+  headline: string;
+  detail: string;
+  /** The action that resolves this state, or undefined when there is nothing
+   *  to offer (healthy, or a state whose fix is not a single command). */
+  action?: { label: string; message: "startDaemon" | "reindex" | "initRepo" };
+}
+
+/** Decide what the page says at the top.
+ *
+ *  Order matters and is not arbitrary. A stopped daemon outranks staleness
+ *  because nothing below the banner is live in that state, and staleness
+ *  outranks analyzer warnings because a stale graph makes every other number on
+ *  the page describe a commit the user is no longer on. */
+export function computeVerdict(
+  daemonRunning: boolean,
+  index: IndexHealth,
+  diags: Diagnostic[],
+  hasGraph: boolean
+): VerdictView {
+  if (!daemonRunning) {
+    return {
+      verdict: "offline",
+      headline: "Not running",
+      detail: hasGraph
+        ? "The daemon is not answering, so the numbers below are read from the graph on disk rather than from a live index."
+        : "The daemon is not answering, and there is no graph on disk yet for this repository.",
+      action: { label: "Start daemon", message: "startDaemon" },
+    };
+  }
+  if (!hasGraph) {
+    return {
+      verdict: "unindexed",
+      headline: "No graph yet",
+      detail: "This repository has not been indexed, so there is nothing for the editor or an agent to traverse.",
+      action: { label: "Index this repo", message: "initRepo" },
+    };
+  }
+  if (index.isStale === true) {
+    const behind =
+      index.behindBy !== null && index.behindBy > 0
+        ? `Your checkout is ${index.behindBy} commit${index.behindBy > 1 ? "s" : ""} ahead of it.`
+        : "Your checkout is on a different commit.";
+    return {
+      verdict: "stale",
+      headline: "Stale",
+      detail: `The graph describes ${index.indexedCommit || "an earlier commit"}. ${behind}`,
+      action: { label: "Reindex", message: "reindex" },
+    };
+  }
+  const errs = diags.filter((d) => d.severity === "error").length;
+  if (diags.length > 0) {
+    const warns = diags.length - errs;
+    const parts = [
+      errs > 0 ? `${errs} error${errs > 1 ? "s" : ""}` : "",
+      warns > 0 ? `${warns} warning${warns > 1 ? "s" : ""}` : "",
+    ].filter(Boolean);
+    return {
+      verdict: "degraded",
+      headline: "Degraded",
+      detail: `The graph is fresh, but ${parts.join(" and ")} affect what it can answer.`,
+    };
+  }
+  return {
+    verdict: "healthy",
+    headline: "Healthy",
+    detail: index.available
+      ? `Graph fresh at commit ${index.indexedCommit || "HEAD"}, with no analyzer or index problems reported.`
+      : "No analyzer or index problems reported.",
+  };
+}
+
 /** Severity ranks, the same semantics `travsr daemon logs --level` uses: warn
  *  means warn and above, not warn alone. */
 const LOG_RANK: Record<string, number> = { TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4 };
@@ -773,7 +1020,7 @@ export function buildLogRowsHtml(log: LogEntry[]): string {
     .join("\n");
 }
 
-/** Graph stats dashboard: metric cards, recent activity, and the log tail. */
+/** Health dashboard: metric cards, recent activity, and the log tail. */
 export function buildStatsHtml(
   stats: StatsView,
   log: LogEntry[] = [],
@@ -801,10 +1048,29 @@ export function buildStatsHtml(
    *  back set the way the user left it after a full redraw. The timer itself
    *  lives in the extension, not in this document, because a redraw replaces
    *  this document. */
-  autoSeconds: number = 0
+  autoSeconds: number = 0,
+  /** Drift as the daemon reports it. Defaults to unavailable so every existing
+   *  caller, and every test that predates this, still renders. */
+  index: IndexHealth = UNKNOWN_INDEX,
+  /** Everything the sections need. Defaults to empty, which renders each
+   *  section as "could not read this" rather than as a clean bill of health. */
+  health: HealthData = EMPTY_HEALTH,
+  /** Shown in the header, so a multi-repo user can see which repository the
+   *  page is describing without reading the paths in the rows. */
+  repoName: string = "",
+  repoPath: string = ""
 ): string {
-  const card = (k: string, v: string): string =>
-    `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
+  const daemonRunning = health.daemonRunning;
+  const hasGraph = stats.nodes !== "—" && stats.nodes !== "0";
+  const verdict = computeVerdict(daemonRunning, index, diags, hasGraph);
+
+  /** A metric tile. `state` colours the value and adds a word beside it, so a
+   *  tile is never amber without saying why. */
+  const card = (k: string, v: string, state?: "warn" | "bad", note?: string): string =>
+    `<div class="card${state ? ` ${state}` : ""}"><div class="k">${esc(k)}</div>` +
+    `<div class="v">${esc(v)}</div>` +
+    (note ? `<div class="n">${esc(note)}</div>` : "") +
+    `</div>`;
 
   // The feed is lifecycle, not traffic. `query.served` fires on every query and
   // would bury a Phase B failure under a hundred cache hits, so only events with
@@ -865,33 +1131,258 @@ export function buildStatsHtml(
   // Health reads before anything else, because "is something wrong" is the
   // question the panel is opened with. All clear is its own state, not an empty
   // list: nothing found and nothing checked look identical otherwise.
-  const errs = diags.filter((d) => d.severity === "error").length;
-  const warns = diags.length - errs;
-  const health = diags.length
-    ? `<div class="banner bad">
-<strong>${errs ? `${errs} error${errs > 1 ? "s" : ""}` : ""}${errs && warns ? " &middot; " : ""}${warns ? `${warns} warning${warns > 1 ? "s" : ""}` : ""}</strong>
-<span>affecting what the graph can answer</span></div>`
-    : log.length
-      ? `<div class="banner good"><strong>All clear</strong><span>no analyzer or index problems reported</span></div>`
-      : `<div class="banner idle"><strong>Daemon not running</strong>
-<span>start it to keep the graph fresh: <span class="mono">travsr daemon start</span></span></div>`;
+  const VERDICT_CLASS: Record<Verdict, string> = {
+    offline: "bad",
+    stale: "warn2",
+    degraded: "warn2",
+    unindexed: "idle",
+    healthy: "good",
+  };
+  const verdictBanner =
+    `<div class="banner ${VERDICT_CLASS[verdict.verdict]} verdict">` +
+    `<strong>${esc(verdict.headline)}</strong>` +
+    `<span>${esc(verdict.detail)}</span>` +
+    (verdict.action
+      ? `<button class="btn primary vact" onclick="verdictAction(this, '${verdict.action.message}')">${esc(
+          verdict.action.label
+        )}</button>`
+      : "") +
+    `</div>`;
 
   const diagCards = diags.length
     ? `<div class="diags">` +
       diags
-        .map(
-          (d) =>
+        .map((d) => {
+          // The heading is a claim and the body is the explanation. They used to
+          // be the same sentence twice over, because `title` is `hint` with the
+          // trailing "run `cmd`" clause cut off, and the card rendered both: the
+          // heading read as a sentence truncated mid-thought and the body
+          // repeated it in full. Show the body only when it says something the
+          // heading did not.
+          const extra = d.hint.startsWith(d.title) ? d.hint.slice(d.title.length).trim() : d.hint;
+          const body = extra !== "" && extra !== d.title ? extra.replace(/^[-,;.\s]+/, "") : "";
+          return (
             `<div class="diag ${d.severity}">` +
             `<div class="diag-t">${d.severity === "error" ? "&#10007;" : "&#9888;"} ${esc(d.title)}</div>` +
-            `<div class="diag-h">${esc(d.hint)}</div>` +
+            (body ? `<div class="diag-h">${esc(body)}</div>` : "") +
             (d.command
-              ? `<div class="diag-a"><code class="diag-cmd">${esc(d.command)}</code></div>`
+              ? `<div class="diag-a"><code class="diag-cmd">${esc(d.command)}</code>` +
+                `<button class="btn mini" onclick="runFix(this, ${diags.indexOf(d)})">Run</button>` +
+                `<button class="btn mini ghost" onclick="copyFix(this, ${diags.indexOf(d)})">Copy</button>` +
+                `</div>`
               : "") +
             `</div>`
-        )
+          );
+        })
         .join("\n") +
       `</div>`
     : "";
+
+  // ── Sections ──────────────────────────────────────────────────────────────
+  // Each is a real <details>, so collapsing survives without any script, and a
+  // section whose data could not be read says so rather than rendering an
+  // empty state that reads as "nothing wrong here".
+
+  const OK_ICON = `<svg class="ci" viewBox="0 0 16 16" fill="none"><path d="M3 8.4 6.4 11.8 13 5.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  const WARN_ICON = `<svg class="ci" viewBox="0 0 16 16" fill="none"><path d="M8 2.6 14.4 13H1.6L8 2.6Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 6.5v3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="8" cy="11.3" r=".8" fill="currentColor"/></svg>`;
+  const BAD_ICON = `<svg class="ci" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.8" stroke="currentColor" stroke-width="1.3"/><path d="M4.4 11.6 11.6 4.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`;
+  const CHEV = `<svg class="chev" viewBox="0 0 16 16" fill="none"><path d="M6 3.5 10.5 8 6 12.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+  /** A status chip. The word is not optional: colour alone never carries it. */
+  const statusChip = (tone: "ok" | "warn" | "bad" | "mute", word: string): string =>
+    `<span class="chip ${tone}">${tone === "ok" ? OK_ICON : tone === "bad" ? BAD_ICON : tone === "warn" ? WARN_ICON : ""}${esc(word)}</span>`;
+
+  const act = (label: string, message: string, tone: "primary" | "ghost" = "ghost"): string =>
+    `<button class="btn mini ${tone === "primary" ? "primary" : "ghost"}" onclick="panelAction(this, '${message}')">${esc(label)}</button>`;
+
+  const row = (k: string, v: string, tone?: "ok" | "warn" | "bad", trailing = ""): string =>
+    `<div class="hrow"><span>${esc(k)}</span>` +
+    `<b class="${tone ?? ""}">${tone === "ok" ? OK_ICON : tone === "warn" ? WARN_ICON : tone === "bad" ? BAD_ICON : ""}${esc(v)}</b>` +
+    (trailing ? `<span class="ra">${trailing}</span>` : "") +
+    `</div>`;
+
+  const section = (title: string, chipHtml: string, actions: string, inner: string): string =>
+    `<details class="hsec" open><summary>${CHEV}<span class="nm">${esc(title)}</span>` +
+    `${chipHtml}${actions ? `<span class="sacts">${actions}</span>` : ""}</summary>` +
+    `<div class="hrows">${inner}</div></details>`;
+
+  const unavailable = (why: string): string => `<div class="hrow muted">${esc(why)}</div>`;
+
+  // Daemon
+  const daemonSec = section(
+    "Daemon",
+    daemonRunning ? statusChip("ok", "running") : statusChip("bad", "not running"),
+    daemonRunning ? act("Restart", "restartDaemon") : act("Start", "startDaemon", "primary"),
+    (daemonRunning
+      ? row("Process", health.daemonPid ? `pid ${health.daemonPid}` : "running")
+      : row("Process", health.daemonStopped ? `stopped at ${health.daemonStopped}` : "not running", "bad")) +
+      (health.lastEditor ? row("Last editor", health.lastEditor) : "") +
+      (health.binaryVersion ? row("Version", health.binaryVersion) : "") +
+      (health.logFileName
+        ? row("Log file", `${health.logFileName}  ${health.logFileSize}`, undefined, act("Open", "openLog"))
+        : "")
+  );
+
+  // Index freshness
+  const indexInner = index.available
+    ? row("Indexed commit", index.indexedCommit || "unknown") +
+      row(
+        "Checkout HEAD",
+        index.headCommit
+          ? index.behindBy !== null && index.behindBy > 0
+            ? `${index.headCommit}, ${index.behindBy} commit${index.behindBy > 1 ? "s" : ""} ahead`
+            : index.headCommit
+          : "unknown",
+        index.isStale === true ? "warn" : undefined
+      ) +
+      (index.workingTreeDirty === true ? row("Working tree", "modified files not yet indexed") : "") +
+      (index.phaseA ? row("Phase A", `${index.phaseA}, ${stats.nodes} nodes`) : "") +
+      (health.commitHook === null
+        ? ""
+        : health.commitHook
+          ? row("Commit hook", "installed", "ok")
+          : row("Commit hook", "not installed, so commits do not refresh", "warn", act("Install", "installHook", "primary")))
+    : unavailable("Index status is not reported by this binary.");
+
+  const indexSec = section(
+    "Index freshness",
+    index.isStale === true ? statusChip("warn", "stale") : index.available ? statusChip("ok", "fresh") : statusChip("mute", "unknown"),
+    act("Reindex", "reindex", "primary") + act("Full rebuild", "fullRebuild"),
+    indexInner
+  );
+
+  // Sidecars
+  const sidecarSec = section(
+    "Sidecars",
+    health.sidecars === null
+      ? statusChip("mute", "unknown")
+      : health.sidecars.every((s) => s.ok)
+        ? statusChip("ok", `${health.sidecars.length} ready`)
+        : statusChip("warn", `${health.sidecars.filter((s) => !s.ok).length} missing`),
+    "",
+    health.sidecars === null
+      ? unavailable("Could not read the sidecar list.")
+      : health.sidecars
+          .map((s) =>
+            row(
+              s.name,
+              s.state,
+              s.ok ? "ok" : "warn",
+              s.action ? act(s.action === "installEmbed" ? "Install" : "Restart", s.action, s.ok ? "ghost" : "primary") : ""
+            )
+          )
+          .join("")
+  );
+
+  // Storage and integrity
+  const integ = health.integrity;
+  const integSec = section(
+    "Storage and integrity",
+    integ === null
+      ? statusChip("mute", "not checked")
+      : integ.ghostCount && integ.ghostCount > 0
+        ? statusChip("warn", `${integ.ghostCount} ghost path${integ.ghostCount > 1 ? "s" : ""}`)
+        : statusChip("ok", "consistent"),
+    act("Run fsck", "runFsck") + act("Compact", "compact"),
+    integ === null
+      ? unavailable("Could not read the integrity report.")
+      : row("graph.db", integ.dbSize) +
+        row("Logs", `${integ.logSize}, ${integ.logFiles} file${integ.logFiles === 1 ? "" : "s"}`, undefined, act("Prune", "pruneLogs")) +
+        row(
+          "Ghost paths",
+          integ.ghostCount === null
+            ? "unknown"
+            : integ.ghostCount === 0
+              ? "none, every node points at a real file"
+              : `${integ.ghostCount} entries point at files that no longer exist`,
+          integ.ghostCount ? "warn" : "ok"
+        ) +
+        integ.ghostSample.slice(0, 2).map((p) => `<div class="hrow mono-only">${esc(p)}</div>`).join("") +
+        row(
+          "Text index",
+          integ.lexicalOk === null ? "unknown" : integ.lexicalOk ? "consistent with the node table" : "out of step with the node table",
+          integ.lexicalOk === false ? "warn" : "ok"
+        )
+  );
+
+  // Languages
+  const langSec = section(
+    "Languages",
+    health.languages === null
+      ? statusChip("mute", "unknown")
+      : health.languages.some((l) => !l.full)
+        ? statusChip("warn", `${health.languages.filter((l) => !l.full).length} partial`)
+        : statusChip("ok", `${health.languages.length} full`),
+    act("Detect", "detectLangs"),
+    health.languages === null
+      ? unavailable("Could not read the language list.")
+      : `<table class="ltbl"><thead><tr><th>Language</th><th>Analysis</th><th>Symbols</th><th class="ra">Action</th></tr></thead><tbody>` +
+        health.languages
+          .map(
+            (l) =>
+              `<tr><td>${esc(l.language)}</td>` +
+              `<td class="${l.full ? "ok" : "warn"}">${l.full ? OK_ICON : WARN_ICON}${esc(l.analysis)}</td>` +
+              `<td>${esc(l.symbols)}</td>` +
+              `<td class="ra">${l.full ? "-" : act("Re-run semantic", "reindexSemantic", "primary")}</td></tr>`
+          )
+          .join("") +
+        `</tbody></table>`
+  );
+
+  // Agent connections
+  const agentSec = section(
+    "Agent connections",
+    health.agents === null
+      ? statusChip("mute", "unknown")
+      : statusChip(
+          health.agents.every((a) => a.registered) ? "ok" : "warn",
+          `${health.agents.filter((a) => a.registered).length} of ${health.agents.length}`
+        ),
+    act("Register all", "registerMcp", "primary"),
+    health.agents === null
+      ? unavailable("Could not read the agent configs.")
+      : health.agents
+          .map((a) =>
+            row(
+              a.name,
+              a.detail,
+              a.registered ? "ok" : "warn",
+              a.registered ? "" : act("Register", "registerMcp", "primary")
+            )
+          )
+          .join("")
+  );
+
+  // Repositories
+  const repoSec = section(
+    "Repositories",
+    health.repos === null ? statusChip("mute", "unknown") : statusChip("mute", `${health.repos.length} registered`),
+    health.repos && health.repos.some((r) => !r.exists)
+      ? act(`Prune stale (${health.repos.filter((r) => !r.exists).length})`, "prune", "primary")
+      : "",
+    health.repos === null
+      ? unavailable("Could not read the repository registry.")
+      : health.repos
+          .map((r) =>
+            row(
+              r.name,
+              r.exists
+                ? r.name === health.activeRepo
+                  ? "active"
+                  : "ok"
+                : "database missing",
+              r.exists ? "ok" : "warn",
+              r.exists ? "" : `<button class="btn mini ghost" onclick="removeRepoRow(this, '${esc(r.name)}')">Remove</button>`
+            )
+          )
+          .join("")
+  );
+
+  const sections =
+    `<div class="hcols">` +
+    `<div class="hcol">${daemonSec}${indexSec}${sidecarSec}${integSec}</div>` +
+    `<div class="hcol">${langSec}${diagCards}${agentSec}${repoSec}</div>` +
+    `</div>`;
 
   // The File control. One file at a time is the whole point: the panel used to
   // read across rotations, which made "the last 500 lines" a stream with no way
@@ -925,22 +1416,44 @@ export function buildStatsHtml(
   }`
       : "";
 
+  const semanticTile = (() => {
+    const langs = health.languages;
+    if (langs === null || langs.length === 0) return "";
+    const partial = langs.filter((l) => !l.full);
+    return partial.length > 0
+      ? card("Semantic", partial[0].symbols.startsWith("0") ? "0 symbols" : "partial", "warn", partial[0].language)
+      : card("Semantic", "full", undefined, `${langs.length} languages`);
+  })();
+
   const body = `
-<h2>Graph stats</h2>
-<p class="sub">Live metrics for the indexed graph.</p>
+<div class="phead">
+  <div>
+    <h2>${esc(repoName || "Health")}</h2>
+    <p class="sub mono">${esc(repoPath)}</p>
+  </div>
+  <div class="phead-a">
+    <span class="checked">checked just now</span>
+    <button class="btn" id="refreshBtn" onclick="doRefresh(this)">Refresh</button>
+  </div>
+</div>
+
+${verdictBanner}
+
 <div class="cards">
-  ${card("Nodes", stats.nodes)}
+  ${card("Nodes", stats.nodes, undefined, "on disk")}
   ${card("Edges", stats.edges)}
   ${card("Schema", stats.schemaVersion)}
   ${card("DB size", stats.dbSize)}
-  ${card("Last indexed", stats.lastIndexed)}
-</div>
-<div class="toolbar" style="margin-top:16px">
-  <button class="btn" id="refreshBtn" onclick="doRefresh(this)">Refresh</button>
+  ${card(
+    "Last indexed",
+    stats.lastIndexed,
+    index.isStale === true ? "warn" : undefined,
+    index.isStale === true ? "stale" : undefined
+  )}
+  ${semanticTile}
 </div>
 
-${health}
-${diagCards}
+${sections}
 
 <div class="split">
 <section class="col-activity">
@@ -1001,6 +1514,16 @@ ${logRows}
 
   const script = `
 function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({command:'refresh'}); }
+
+// The verdict's action and the per-diagnostic fixes. Only an index reaches the
+// extension, never the command text: the extension holds the diagnostics it
+// rendered and looks the command up, so nothing a log file said can be sent to
+// a shell by round-tripping through this document.
+function verdictAction(btn, msg){ setLoading(btn,true,btn.textContent); vscode.postMessage({command: msg}); }
+function panelAction(btn, msg){ setLoading(btn,true,btn.textContent); vscode.postMessage({command: msg}); }
+function removeRepoRow(btn, n){ setLoading(btn,true,'Remove'); vscode.postMessage({command:'remove', name:n}); }
+function runFix(btn, i){ setLoading(btn,true,'Run'); vscode.postMessage({command:'runFix', index:i}); }
+function copyFix(btn, i){ vscode.postMessage({command:'copyFix', index:i}); }
 
 var minRank = 0;
 function setLevel(id, btn) {

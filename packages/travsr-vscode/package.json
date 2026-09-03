@@ -121,7 +121,7 @@
       },
       {
         "command": "travsr.showGraphStats",
-        "title": "Travsr: Graph Stats",
+        "title": "Travsr: Health",
         "icon": "$(graph)"
       },
       {
