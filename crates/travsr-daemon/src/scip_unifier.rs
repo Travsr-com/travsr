@@ -463,6 +463,58 @@ mod tests {
     }
 
     #[test]
+    fn swift_extension_def_unifies_not_orphaned() {
+        // #825 Part B / #822: a Swift `extension X { … }` block is signed
+        // `extension:X` by Phase A; the swift emitter emits a separate native def
+        // for the block whose kind folds to `class`. Before the candidate widening
+        // that def matched no signature and survived as an orphan duplicate,
+        // stealing the extension members' reference edges — the mechanism behind
+        // #822's class-plus-extension abstention. It must now unify onto the
+        // `extension:X` node and count as unified, not missed.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // Phase A extension node (as swift.rs emits it: `extension:X`, kind
+        // "extension").
+        let ext_ts = Node::new(
+            VName::new(
+                "c",
+                "main",
+                "Ad.swift",
+                "swift",
+                "extension:InterscrollerAdHandler",
+            ),
+            "extension",
+        )
+        .with_line(10)
+        .with_end_line(20);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&ext_ts), &[], "scip")
+            .unwrap();
+
+        // Native swift def for the extension block (scheme-prefixed signature,
+        // kind "extension").
+        let ext_def = Node::new(
+            VName::new(
+                "c",
+                "main",
+                "Ad.swift",
+                "swift",
+                "swift::InterscrollerAdHandler",
+            ),
+            "extension",
+        )
+        .with_line(10);
+
+        let nodes = vec![ext_def.clone()];
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", &nodes, &mut refs);
+
+        assert_eq!(out.attempted, 1, "the extension def is a real attempt");
+        assert_eq!(out.unified, 1, "and it now unifies onto extension:X");
+        assert_eq!(out.alias_map.get(&ext_def.id), Some(&ext_ts.id));
+        assert!(out.misses.is_empty(), "no orphan, so no miss");
+    }
+
+    #[test]
     fn a_fully_unified_pass_reports_no_misses() {
         // The list must be empty when nothing misses, so status prints no stray
         // rows.

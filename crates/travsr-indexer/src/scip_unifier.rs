@@ -317,6 +317,16 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
             // N4d: Swift `actor` is now a distinct Phase A prefix and a valid
             // SCIP `#`-type unification target.
             "actor",
+            // #825 Part B: Swift/Dart `extension X` blocks are signed `extension:X`
+            // by Phase A (swift.rs, dart.rs), but the emitters emit a separate
+            // `extension`-kind def for the block, folded to `class` by
+            // `native_name_kind`. Without `extension:` in the candidate set that
+            // def matched nothing and survived as an orphan duplicate that stole
+            // the extension members' reference edges (the root of #822's
+            // class-plus-extension abstention). Line-proximity still routes the
+            // real `class X` def to its own `class:X` node, so a genuine class is
+            // never mis-unified onto an extension.
+            "extension",
         ]
         .iter()
         .map(|p| format!("{p}:{name}"))
@@ -515,6 +525,25 @@ mod tests {
         let p = scip_name_kind("objc . local/objc 0.0.0 Speakable/").unwrap();
         assert_eq!(p, parsed(None, "Speakable", "class"));
         assert!(candidate_signatures(&p).contains(&"protocol:Speakable".to_string()));
+    }
+
+    #[test]
+    fn swift_extension_def_unifies_onto_the_extension_node() {
+        // #825 Part B / #822: a Swift (or Dart) `extension X` block is signed
+        // `extension:X` by Phase A, and its native def parses as a `class`-kind
+        // name. `candidate_signatures` must offer `extension:X` so that def
+        // unifies onto the extension node instead of surviving as an orphan
+        // duplicate that steals the extension members' reference edges.
+        let p = native_name_kind("swift::InterscrollerAdHandler", "extension").unwrap();
+        assert_eq!(p, parsed(None, "InterscrollerAdHandler", "class"));
+        assert!(
+            candidate_signatures(&p).contains(&"extension:InterscrollerAdHandler".to_string()),
+            "an extension-kind def must offer the extension: candidate"
+        );
+        // The real `class X` def still offers `class:X`, so line-proximity keeps
+        // the two apart — the fix adds a candidate, it does not remove one.
+        let c = native_name_kind("swift::InterscrollerAdHandler", "class").unwrap();
+        assert!(candidate_signatures(&c).contains(&"class:InterscrollerAdHandler".to_string()));
     }
 
     #[test]
@@ -866,7 +895,8 @@ mod tests {
                 "type:Server",
                 "protocol:Server",
                 "namespace:Server",
-                "actor:Server"
+                "actor:Server",
+                "extension:Server"
             ]
         );
     }
