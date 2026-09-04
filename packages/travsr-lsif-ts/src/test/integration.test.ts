@@ -10,6 +10,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 
 const FIXTURE_TSCONFIG = path.join(__dirname, '../../fixtures/tsconfig.json');
 const EMITTER_BIN = path.join(__dirname, '../index.js');
@@ -196,6 +198,62 @@ test('a local variable gets no travsr_vname at all (issue #755)', () => {
       !sig.endsWith(':localEcho'),
       `local declarator must carry no vname; got ${sig}`
     );
+  }
+});
+
+// ── issue #833: --root override for a synthesized tsconfig outside the repo ──
+//
+// CommonJS / plain-JS repos ship no tsconfig, so the Rust side synthesizes one
+// in a temp dir with `files: [<abs js paths>]` and passes `--root <repo>`. The
+// emitted VName paths and the SEC-003 root must then be the repo, not the temp
+// dir, or every JS edge would point at a node id that was never written.
+
+test('--root makes VName paths repo-relative for a synthesized out-of-repo tsconfig (#833)', () => {
+  // realpath the temp dirs: on macOS os.tmpdir() is a symlink (/var → /private/var)
+  // and TS's getSourceFiles() returns the resolved path, which must match the
+  // canonical repo root the daemon passes in production.
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-jsrepo-')));
+  const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-jscfg-')));
+  try {
+    fs.writeFileSync(path.join(repo, 'math.js'), 'function add(a, b) { return a + b; }\nmodule.exports = { add };\n');
+    fs.writeFileSync(
+      path.join(repo, 'main.js'),
+      "const { add } = require('./math');\nfunction run() { return add(1, 2); }\nmodule.exports = { run };\n"
+    );
+
+    const synthTsconfig = path.join(scratch, 'tsconfig.json');
+    fs.writeFileSync(
+      synthTsconfig,
+      JSON.stringify({
+        compilerOptions: { allowJs: true, checkJs: false, noEmit: true, module: 'commonjs', moduleResolution: 'node' },
+        files: [path.join(repo, 'math.js'), path.join(repo, 'main.js')],
+      })
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [EMITTER_BIN, '--project', synthTsconfig, '--root', repo],
+      { encoding: 'utf-8' }
+    );
+    assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+
+    const vnames = parseVertices(result.stdout)
+      .map((v) => v['travsr_vname'] as { path?: string; signature?: string } | undefined)
+      .filter((vn): vn is { path: string; signature: string } => vn !== undefined && typeof vn.path === 'string');
+
+    // Paths are repo-relative — never absolute and never carrying the scratch dir.
+    for (const vn of vnames) {
+      assert.ok(!path.isAbsolute(vn.path), `expected repo-relative path, got absolute: ${vn.path}`);
+      assert.ok(!vn.path.includes('..'), `path escaped the repo root: ${vn.path}`);
+      assert.ok(!vn.path.includes(path.basename(scratch)), `path leaked the scratch dir: ${vn.path}`);
+    }
+
+    const sigs = vnames.map((vn) => `${vn.path}#${vn.signature}`);
+    assert.ok(sigs.includes('math.js#fn:add'), `expected math.js#fn:add in ${JSON.stringify(sigs)}`);
+    assert.ok(sigs.includes('main.js#fn:run'), `expected main.js#fn:run in ${JSON.stringify(sigs)}`);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(scratch, { recursive: true, force: true });
   }
 });
 

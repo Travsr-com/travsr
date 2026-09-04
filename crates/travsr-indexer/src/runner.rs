@@ -5,7 +5,7 @@
 //! `run_scip_python`     — scip-python SCIP indexer for Python (legacy / deprecated).
 
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -253,11 +253,29 @@ fn resolve_lsif_emitter() -> (String, Vec<String>) {
 /// - Non-zero exit code (first 5 lines of stderr included)
 /// - Timeout exceeded
 pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
+    run_lsif_emitter_impl(tsconfig, None)
+}
+
+/// Like [`run_lsif_emitter`], but computes emitted VName paths and the SEC-003
+/// containment root against `root` rather than the tsconfig's own directory.
+///
+/// Used when `tsconfig` is a synthesized ephemeral file living outside the repo
+/// (see [`synthesize_js_tsconfig`]) so that JavaScript sources without a project
+/// tsconfig still get semantic edges (#833). The emitter's repo-relative paths
+/// must match the tree-sitter node ids, which the Rust side computes relative to
+/// the repo root, so `root` must be that repo root.
+pub fn run_lsif_emitter_with_root(tsconfig: &Path, root: &Path) -> anyhow::Result<String> {
+    run_lsif_emitter_impl(tsconfig, Some(root))
+}
+
+fn run_lsif_emitter_impl(tsconfig: &Path, root: Option<&Path>) -> anyhow::Result<String> {
     let (program, prefix_args) = resolve_lsif_emitter();
-    let child = std::process::Command::new(&program)
-        .args(&prefix_args)
-        .arg("--project")
-        .arg(tsconfig)
+    let mut command = std::process::Command::new(&program);
+    command.args(&prefix_args).arg("--project").arg(tsconfig);
+    if let Some(root) = root {
+        command.arg("--root").arg(root);
+    }
+    let child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -278,6 +296,68 @@ pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&stdout_bytes).into_owned())
+}
+
+/// File extensions treated as JavaScript for the synthesized-tsconfig pass.
+/// TypeScript (`ts`/`tsx`/`mts`/`cts`) is already covered by a project tsconfig
+/// when one exists, so only these are swept into the JS fallback.
+pub const JS_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs"];
+
+/// Write an ephemeral `tsconfig.json` into a fresh temp dir that makes the
+/// TypeScript compiler resolve `js_files` with `allowJs`, so CommonJS / plain-JS
+/// repos get real cross-file semantic edges even when they ship no project
+/// tsconfig (or one that omits `allowJs`) — issue #833.
+///
+/// `js_files` MUST be absolute paths that live under the repo root the caller
+/// later passes to [`run_lsif_emitter_with_root`]; the emitter's SEC-003
+/// containment check rejects anything resolving outside it. The paths go into
+/// the config's `files[]` (not an `include` glob) so the compiler processes
+/// exactly the set Phase A indexed — no directory walk, and no ranges emitted
+/// for files that have no tree-sitter node (which would orphan edges).
+///
+/// Returns the owning [`tempfile::TempDir`] (keep it alive until the emitter has
+/// run) together with the written tsconfig path, or `Ok(None)` when `js_files`
+/// is empty.
+pub fn synthesize_js_tsconfig(
+    js_files: &[PathBuf],
+) -> anyhow::Result<Option<(tempfile::TempDir, PathBuf)>> {
+    if js_files.is_empty() {
+        return Ok(None);
+    }
+
+    let dir = tempfile::Builder::new()
+        .prefix("travsr-js-tsconfig-")
+        .tempdir()
+        .context("creating synthetic tsconfig dir")?;
+
+    let files: Vec<String> = js_files
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+
+    // `module`/`moduleResolution` = commonjs/node is the lenient resolver that
+    // handles `require()` (the reported CommonJS case) and still resolves ESM
+    // import paths well enough for indexing. checkJs/noEmit keep it a pure
+    // resolution pass — we never type-check or write output.
+    let config = serde_json::json!({
+        "compilerOptions": {
+            "allowJs": true,
+            "checkJs": false,
+            "noEmit": true,
+            "module": "commonjs",
+            "moduleResolution": "node",
+            "target": "es2020",
+            "resolveJsonModule": true,
+            "skipLibCheck": true,
+        },
+        "files": files,
+    });
+
+    let path = dir.path().join("tsconfig.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&config)?)
+        .with_context(|| format!("writing synthetic tsconfig {}", path.display()))?;
+
+    Ok(Some((dir, path)))
 }
 
 // ── scip-python ───────────────────────────────────────────────────────────────
@@ -1221,5 +1301,43 @@ mod tests {
             .expect("must return within watchdog window");
         let dump = result.expect("must succeed").expect("must be Some");
         assert_eq!(dump.len(), 131072);
+    }
+
+    // ── synthesize_js_tsconfig (#833) ───────────────────────────────────────
+
+    #[test]
+    fn synthesize_js_tsconfig_returns_none_for_no_js_files() {
+        let out = synthesize_js_tsconfig(&[]).expect("must not error");
+        assert!(out.is_none(), "empty input must synthesize nothing");
+    }
+
+    #[test]
+    fn synthesize_js_tsconfig_enables_allow_js_and_lists_the_files() {
+        let files = vec![
+            PathBuf::from("/repo/math.js"),
+            PathBuf::from("/repo/main.js"),
+        ];
+        let (dir, path) = synthesize_js_tsconfig(&files)
+            .expect("must not error")
+            .expect("must synthesize a config");
+
+        // The config lives inside the temp dir, not the repo.
+        assert!(
+            path.starts_with(dir.path()),
+            "tsconfig must live in the temp dir"
+        );
+        assert_eq!(path.file_name().unwrap(), "tsconfig.json");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // allowJs is the whole point — without it tsc ignores .js sources.
+        assert_eq!(json["compilerOptions"]["allowJs"], serde_json::json!(true));
+        assert_eq!(json["compilerOptions"]["noEmit"], serde_json::json!(true));
+        // Exactly the files we asked for, in order, so the compiler processes
+        // only what Phase A indexed (no directory walk, no orphan-edge risk).
+        assert_eq!(
+            json["files"],
+            serde_json::json!(["/repo/math.js", "/repo/main.js"])
+        );
     }
 }

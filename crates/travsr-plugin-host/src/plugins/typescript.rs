@@ -97,6 +97,47 @@ impl Plugin for TypeScriptPlugin {
             }
         }
 
+        // #833: `.js`/`.jsx`/`.mjs`/`.cjs` are classified as TypeScript, so they
+        // reach this plugin, but the project tsconfig above (if any) only covers
+        // them with `allowJs` — which plain-JS / CommonJS repos never set, and
+        // most have no tsconfig at all. Run a second pass over a synthesized
+        // allowJs tsconfig covering exactly this repo's JS files. A no-op when
+        // there are no JS files; idempotent where a real allowJs tsconfig
+        // already covered them (the dedup below drops the overlap).
+        if let Some(rel_files) = req.files.as_ref() {
+            let js_abs: Vec<std::path::PathBuf> = rel_files
+                .iter()
+                .filter(|r| {
+                    std::path::Path::new(r.as_str())
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| travsr_indexer::JS_EXTENSIONS.contains(&e))
+                })
+                .map(|r| req.root.join(r))
+                .collect();
+            match travsr_indexer::synthesize_js_tsconfig(&js_abs) {
+                Ok(Some((_scratch, synth_tsconfig))) => {
+                    match travsr_indexer::run_lsif_emitter_with_root(&synth_tsconfig, &req.root) {
+                        Ok(dump) => match travsr_indexer::ingest_lsif(&dump, &req.corpus) {
+                            Ok(lsif_out) => {
+                                tracing::debug!(
+                                    nodes = lsif_out.nodes.len(),
+                                    edges = lsif_out.edges.len(),
+                                    "js synthesized-tsconfig lsif enrichment merged"
+                                );
+                                nodes.extend(lsif_out.nodes);
+                                edges.extend(lsif_out.edges);
+                            }
+                            Err(e) => tracing::warn!("js lsif ingest: {e}"),
+                        },
+                        Err(e) => tracing::debug!("js lsif emitter not available: {e}"),
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("js synthetic tsconfig: {e}"),
+            }
+        }
+
         // Dedup merged output
         nodes.sort_unstable_by_key(|n| n.id);
         nodes.dedup_by_key(|n| n.id);
