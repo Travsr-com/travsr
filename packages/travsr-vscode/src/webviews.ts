@@ -1006,7 +1006,11 @@ export function computeVerdict(
     return {
       verdict: "degraded",
       headline: "Degraded",
-      detail: `The graph is fresh, but ${parts.join(" and ")} affect what it can answer.`,
+      // The verb agrees with the subject: one warning affects, two warnings
+      // affect, and an error plus a warning also affect.
+      detail: `The graph is fresh, but ${parts.join(" and ")} ${
+        diags.length === 1 ? "affects" : "affect"
+      } what it can answer.`,
     };
   }
   return {
@@ -1505,7 +1509,13 @@ export function buildStatsHtml(
                   r.exists ? "ok" : "warn",
                   r.exists
                     ? ""
-                    : `<button class="btn mini ghost" onclick="removeRepoRow(this, '${esc(r.name)}')">Remove</button>`
+                    : // The name travels in a data attribute, not inside a JS
+                      // string literal in the onclick. `esc` escapes for HTML,
+                      // and the parser decodes the entity before the JS is
+                      // parsed, so a name containing a quote would have broken
+                      // out of the literal. Registry names are basename-derived
+                      // so this was unlikely rather than safe.
+                      `<button class="btn mini ghost" data-name="${esc(r.name)}" onclick="removeRepoRow(this)">Remove</button>`
                 )
               )
               .join("") +
@@ -1694,7 +1704,10 @@ tickChecked();
 // a shell by round-tripping through this document.
 function verdictAction(btn, msg){ setLoading(btn,true,btn.textContent); vscode.postMessage({command: msg}); }
 function panelAction(btn, msg){ setLoading(btn,true,btn.textContent); vscode.postMessage({command: msg}); }
-function removeRepoRow(btn, n){ setLoading(btn,true,'Remove'); vscode.postMessage({command:'remove', name:n}); }
+function removeRepoRow(btn){
+  setLoading(btn,true,'Remove');
+  vscode.postMessage({command:'remove', name: btn.dataset.name || ''});
+}
 
 // Scroll to the log reader on this page. Deliberately not a message to the
 // extension: nothing needs to be spawned or opened, so a round trip would only

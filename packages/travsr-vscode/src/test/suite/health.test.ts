@@ -354,7 +354,16 @@ suite("health panel rendering", () => {
     // lived only in the Repos panel, so clicking them did nothing at all. This
     // pins the set of messages this page can emit against the set the
     // controller implements, so a new button cannot ship dead.
-    const html = buildStatsHtml(STATS, [], [WARN], 500, undefined, 0, STALE, FULL);
+    // Rendered across the states that emit different actions, not just one.
+    // The first version of this test rendered only a graph-present state, where
+    // the verdict emits `reindex`, so `initRepo` never appeared in the HTML it
+    // inspected and a dead primary action on the first-run page went unnoticed.
+    const EMPTY_STATS: StatsView = { ...STATS, nodes: "0", edges: "0" };
+    const html =
+      buildStatsHtml(STATS, [], [WARN], 500, undefined, 0, STALE, FULL) +
+      buildStatsHtml(EMPTY_STATS, [], [], 500, undefined, 0, UNKNOWN_INDEX, RUNNING) +
+      buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, RUNNING) +
+      buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, STOPPED);
     const HANDLED = new Set([
       "refresh", "startDaemon", "restartDaemon", "reindex", "fullRebuild",
       "reindexSemantic", "installHook", "installEmbed", "restartEmbed",
@@ -370,6 +379,16 @@ suite("health panel rendering", () => {
     for (const p of posted) {
       assert.ok(HANDLED.has(p), `${p} is posted by the page but not handled`);
     }
+    // The unindexed state's primary action has to be among them, since that is
+    // the one this check previously never saw.
+    assert.ok(posted.has("initRepo"), "the unindexed verdict's action was rendered");
+  });
+
+  test("the unindexed verdict offers an action that indexes", () => {
+    const EMPTY_STATS: StatsView = { ...STATS, nodes: "0", edges: "0" };
+    const html = buildStatsHtml(EMPTY_STATS, [], [], 500, undefined, 0, UNKNOWN_INDEX, RUNNING);
+    assert.ok(html.includes("No graph yet"), "the verdict is the unindexed one");
+    assert.ok(html.includes("verdictAction(this, 'initRepo')"), "and it posts initRepo");
   });
 
   test("the logs row offers no action, because pruning them is the daemon's job", () => {
@@ -401,6 +420,20 @@ suite("health panel rendering", () => {
     assert.ok(html.includes("and 62 more"), "the rest are counted, not listed");
     assert.ok(html.includes("Prune stale (68)"), "and the bulk fix is offered");
     assert.ok((html.match(/removeRepoRow\(/g) ?? []).length <= 8, "rows are capped");
+  });
+
+  test("a repo name reaches the handler as data, not as a JS string literal", () => {
+    // esc() escapes for HTML, and the parser decodes the entity before the JS
+    // in an onclick is parsed, so a name carrying a quote would have broken out
+    // of the literal it was interpolated into.
+    const awkward: HealthData = {
+      ...FULL,
+      repos: [{ name: "it's-gone", path: "c:/t", exists: false }],
+    };
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, awkward);
+    assert.ok(html.includes('data-name="it&#39;s-gone"'), "the name is an attribute");
+    assert.ok(html.includes("removeRepoRow(this)"), "and the handler reads it from the element");
+    assert.ok(!/removeRepoRow\(this, '/.test(html), "never interpolated into the call");
   });
 
   test("Refresh stays disabled until the redraw replaces the document", () => {

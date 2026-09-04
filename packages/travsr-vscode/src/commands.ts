@@ -1575,7 +1575,12 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
       restartDaemon: ["daemon", "restart"],
       fullRebuild: ["init", "--force"],
       reindexSemantic: ["init", "--semantic", "--force"],
-      installHook: ["init", "--force"],
+      // Plain `init`, not `--force`. It is incremental, skips when the graph is
+      // already up to date, and installs the hook as part of setup, which is
+      // all this row is asking for. `--force` is the same argv `fullRebuild`
+      // uses behind a modal, so sharing it here meant "Install" beside a
+      // missing commit hook silently discarded and rebuilt the whole index.
+      installHook: ["init"],
       installEmbed: ["embed", "init"],
       restartEmbed: ["embed", "init", "--reinstall"],
       runFsck: ["fsck"],
@@ -1603,6 +1608,36 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
     }
     if (msg.command === "reindex") {
       await vscode.commands.executeCommand("travsr.reindexNow");
+      await refresh();
+      return;
+    }
+    if (msg.command === "initRepo") {
+      // The unindexed verdict's primary action. Without this branch it fell
+      // through to the trailing refresh and re-rendered the same empty page,
+      // so the one button offered on a never-indexed repo did nothing.
+      //
+      // Runs under cancellable progress rather than in the terminal, matching
+      // the Languages panel: init on a large repo is long, and the panel has to
+      // redraw when it finishes so the page stops saying there is no graph.
+      const repo = repoRoot();
+      if (repo === undefined) {
+        void vscode.window.showWarningMessage("Travsr: open a folder to index it.");
+        return;
+      }
+      const binary =
+        vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
+      const { cancelled, code } = await spawnManagedInstall(
+        binary,
+        ["init"],
+        repo,
+        "Travsr: indexing this repository…"
+      );
+      if (cancelled) return;
+      if (code !== 0) {
+        void vscode.window.showErrorMessage(
+          `Travsr: indexing failed (exit ${code ?? "unknown"}). See the daemon log.`
+        );
+      }
       await refresh();
       return;
     }
