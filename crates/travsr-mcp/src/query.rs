@@ -248,6 +248,12 @@ pub struct StatusPayload {
     /// Old daemons omit the field (serde default None).
     #[serde(default)]
     pub dart_deps_unresolved: Option<String>,
+    /// #825: the actual SCIP definitions behind the `scip_unification_misses`
+    /// warning, one per line (`lang\tkind\tsymbol\tpath:line`), capped. Lets
+    /// `travsr status` name the unreconciled symbols instead of only counting
+    /// them. Empty/None = no misses. Old daemons omit it (serde default None).
+    #[serde(default)]
+    pub scip_unification_miss_list: Option<String>,
 }
 
 // ── status ────────────────────────────────────────────────────────────────────
@@ -271,6 +277,7 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
         rerank: crate::rerank::rerank_status().to_string(),
         phase_b_dirty: store.get_meta("phase_b_dirty")?.as_deref() == Some("1"),
         dart_deps_unresolved: store.get_meta("dart_deps_unresolved")?,
+        scip_unification_miss_list: store.get_meta("scip_unification_miss_list")?,
     })
 }
 

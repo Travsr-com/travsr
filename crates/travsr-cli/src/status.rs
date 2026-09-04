@@ -148,6 +148,49 @@ fn warned_langs(payload: &StatusPayload, kind: &str) -> Vec<String> {
         .collect()
 }
 
+/// #825: print the unreconciled SCIP definitions behind the E6 miss warning.
+///
+/// The miss set is deterministic, so the actionable information is *which*
+/// definitions miss (which language/construct is failing), not a bare count.
+/// Each stored row is `lang\tkind\tsymbol\tpath:line`; a malformed row is
+/// skipped rather than crashing status. Display is capped so a large repo does
+/// not flood the terminal — the warning's `missed/attempted` rate carries the
+/// true total.
+fn print_unification_misses(payload: &StatusPayload) {
+    for line in unification_miss_lines(payload.scip_unification_miss_list.as_deref()) {
+        eprintln!("{line}");
+    }
+}
+
+/// Pure renderer for [`print_unification_misses`], split out so it is testable
+/// without capturing stderr. Each stored row is `lang\tkind\tsymbol\tpath:line`;
+/// a malformed row is passed through verbatim rather than dropped. Display is
+/// capped at `SHOW`, with a trailing "… and N more" when the list is longer.
+fn unification_miss_lines(list: Option<&str>) -> Vec<String> {
+    const SHOW: usize = 20;
+    let Some(list) = list.filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let rows: Vec<&str> = list.lines().collect();
+    let mut out: Vec<String> = rows
+        .iter()
+        .take(SHOW)
+        .map(|row| {
+            let mut cols = row.split('\t');
+            match (cols.next(), cols.next(), cols.next(), cols.next()) {
+                (Some(lang), Some(kind), Some(symbol), Some(loc)) => {
+                    format!("  {lang} {kind} {symbol}  {loc}")
+                }
+                _ => format!("  {row}"),
+            }
+        })
+        .collect();
+    if rows.len() > SHOW {
+        out.push(format!("  … and {} more", rows.len() - SHOW));
+    }
+    out
+}
+
 /// #645 WS-B: the caller's live short HEAD, read at `cwd` (before the worktree
 /// redirect in `find_git_root`, so a linked worktree reports its own commit,
 /// not the main worktree's). `None` when git is unavailable or the dir is not a
@@ -377,9 +420,18 @@ pub fn run() -> anyhow::Result<()> {
                     // E6: SCIP definitions that did not unify onto their Phase A
                     // tree-sitter node — their references attribute to an orphaned
                     // duplicate node instead. `rate` is missed/attempted.
-                    ["scip_unification_misses", rate] => eprintln!(
-                        "warning: {rate} semantic definitions did not match their parsed symbol, some references may resolve to a duplicate. Re-run `travsr init --semantic` if it persists."
-                    ),
+                    //
+                    // #825: the miss set is deterministic (same sources + emitter
+                    // output => the identical misses every run), so the old
+                    // "Re-run `travsr init --semantic` if it persists" advice was a
+                    // no-op that could never move the count. Name the symbols
+                    // instead — that is what a dev can act on.
+                    ["scip_unification_misses", rate] => {
+                        eprintln!(
+                            "warning: {rate} semantic definitions did not match their parsed symbol, so some references may resolve to a duplicate. This is deterministic (re-running the index will not change it); the unreconciled definitions are listed below."
+                        );
+                        print_unification_misses(&payload);
+                    }
                     _ => {}
                 }
             }
@@ -544,6 +596,7 @@ mod tests {
             rerank: String::new(),
             phase_b_dirty: dirty,
             dart_deps_unresolved: None,
+            scip_unification_miss_list: None,
         }
     }
 
@@ -617,6 +670,38 @@ mod tests {
         let mut p = payload("abc", "abc", false);
         p.phase_b_warnings = Some("needs_approval:java".into());
         assert_eq!(phase_b_state(&p), "partial (not run: java)");
+    }
+
+    #[test]
+    fn unification_misses_render_named_rows() {
+        // #825: the diagnostic names each unreconciled def (lang, kind, symbol,
+        // path:line) instead of only counting them.
+        let list = "swift\tclass\tAdHandler\tAd.swift:12\nruby\tfunction\tApp.missing\tapp.rb:99";
+        let lines = unification_miss_lines(Some(list));
+        assert_eq!(
+            lines,
+            vec![
+                "  swift class AdHandler  Ad.swift:12".to_string(),
+                "  ruby function App.missing  app.rb:99".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unification_misses_cap_display_and_count_the_rest() {
+        let list = (0..25)
+            .map(|i| format!("go\tfunction\tf{i}\tx.go:{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = unification_miss_lines(Some(&list));
+        assert_eq!(lines.len(), 21, "20 rows + one overflow line");
+        assert_eq!(lines.last().unwrap(), "  … and 5 more");
+    }
+
+    #[test]
+    fn unification_misses_empty_or_absent_render_nothing() {
+        assert!(unification_miss_lines(None).is_empty());
+        assert!(unification_miss_lines(Some("")).is_empty());
     }
 
     #[test]
