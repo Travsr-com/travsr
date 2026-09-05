@@ -1618,17 +1618,18 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // Analysis for this language ran to completion and this symbol has
         // neither occurrence rows nor ref/call edges: a genuine zero.
         //
-        // The caveat lists both recall limits, not just one. It used to name only
-        // the name-collision case, so #864's repro — a uniquely-named constant
-        // used once inside a Rust format capture (`"{CONST} default rules"`),
-        // which the provider walks as a string literal — hit a reader for whom
-        // the one stated caveat plainly did not apply, and the zero read as
-        // fact. Kept to two lines on purpose: this is the CLEAN answer, and a
-        // paragraph of hedging here would teach a reader to discount every zero,
+        // The caveat names the one recall limit that still exists. #864's repro
+        // was a uniquely-named constant used once inside a Rust format capture
+        // (`"{CONST} default rules"`), which no provider recorded, so the single
+        // stated caveat did not apply and the zero read as fact. That gap is now
+        // closed in the extractor rather than described here (travsr-analysis
+        // recovers inline captures), so naming it would state a limit the index
+        // no longer has. Kept short on purpose: this is the CLEAN answer, and a
+        // paragraph of hedging would teach a reader to discount every zero,
         // which is the same signal loss the gate above exists to prevent.
         return format!(
-            "{header}\n0 reference(s). No uses recorded. Uses inside macros or format \
-             strings, and bare calls to an ambiguous name, are not indexed: use \
+            "{header}\n0 reference(s). No uses recorded. Bare calls to a name defined \
+             in more than one place are left unindexed to avoid mis-targeting; use \
              `find_pattern` to be sure."
         );
     }
@@ -13485,7 +13486,7 @@ mod snippet_tests {
     }
 
     #[test]
-    fn find_references_definitive_zero_names_the_real_recall_limits() {
+    fn find_references_definitive_zero_names_only_surviving_recall_limits() {
         // #864's repro: a uniquely-named constant used once, inside a Rust
         // inline format capture the provider walks as a string literal. The old
         // caveat offered only the name-collision reason, which did not apply,
@@ -13494,12 +13495,13 @@ mod snippet_tests {
 
         let out = find_references(&store, "unused", None);
         assert!(
-            out.contains("format strings"),
-            "the caveat must admit the unwalked-construct miss: {out}"
+            out.contains("defined in more than one place"),
+            "the caveat must keep the name-collision limit: {out}"
         );
         assert!(
-            out.contains("ambiguous name"),
-            "and must keep the name-collision one: {out}"
+            !out.contains("format"),
+            "inline format captures are recovered by the extractor now, so the \
+             caveat must not claim they are unindexed: {out}"
         );
     }
 
