@@ -37,6 +37,22 @@ import * as path from "path";
 const CONNECT_TIMEOUT_MS = 250;
 
 /**
+ * Idle budget for a request that expects a computed answer back, not just an
+ * accepted write (RFC-027 #813 P1).
+ *
+ * `net.Socket.setTimeout` is an idle timer, so it fires after this long with no
+ * bytes moving, not as a total deadline. `request-live-resolution-targets` is
+ * synchronous on the daemon and scales with file size (measured about 370ms on
+ * a 6700-line file, idle), so the fire-and-forget CONNECT_TIMEOUT_MS of 250ms
+ * cut it off before the first byte and the live-resolution lane silently
+ * returned no targets on exactly the large files whose gap is widest. This is
+ * generous enough for a big file yet still bounds a hung daemon; the request is
+ * off the render path (it runs on save, awaited by the live lane), so a longer
+ * wait costs no interactivity.
+ */
+const REQUEST_TIMEOUT_MS = 2000;
+
+/**
  * How long the daemon should believe this window's report.
  *
  * Long enough that an editor sitting idle with an unchanged view is not
@@ -217,7 +233,14 @@ export interface LiveResolutionItem {
 export interface LiveResolutionTargetItem {
   /** 1-based line of the reference in the dirty file. */
   ref_line: number;
-  /** The referenced name — the editor finds its column on `ref_line`. */
+  /**
+   * 0-based column the daemon pinned against the file text (RFC-027 #813 P1).
+   * Present, the editor resolves at exactly this position and skips its own
+   * `name` search; absent (an older daemon, or a name the daemon could not
+   * pin), it falls back to searching `ref_line` for `name`.
+   */
+  ref_col?: number;
+  /** The referenced name, used to find its column on `ref_line` when `ref_col` is absent. */
   name: string;
   /** Edge kind to carry back on the resolved `LiveResolutionItem`. */
   edge_kind: string;
@@ -325,7 +348,9 @@ function requestLine(socketPath: string, line: string): Promise<unknown> {
     };
 
     const sock = net.connect(socketPath);
-    sock.setTimeout(CONNECT_TIMEOUT_MS);
+    // A request waits for a computed answer, so it uses the larger request
+    // budget rather than the fire-and-forget connect budget (RFC-027 #813 P1).
+    sock.setTimeout(REQUEST_TIMEOUT_MS);
     sock.on("connect", () => sock.write(line));
     sock.on("data", (d: Buffer) => {
       buf += d.toString("utf8");
