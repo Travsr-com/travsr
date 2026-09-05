@@ -108,12 +108,19 @@ pub fn run(symbol: &str, path: Option<String>, format: OutputFormat) -> anyhow::
     // confident `path:line` list on a drifted worktree is never taken at face
     // value. cwd-local classifier, identical wording to `travsr status` and the
     // MCP tools (`travsr_mcp::head_index_mismatch_note`).
-    if let Some(head) = head.as_deref() {
-        let stored = store
-            .get_meta("last_commit")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+    //
+    // Skipped when this is a linked worktree served by another checkout:
+    // `warn_if_call_graph_degraded` above already named both roots definitively,
+    // and this note would follow it with a guess ("expected in a linked
+    // worktree; otherwise ... wait for the daemon to reconcile") whose advice is
+    // wrong in exactly that case.
+    let stored = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let cross_checkout = crate::repo::served_by_other_checkout(&db_path).is_some();
+    if let Some(head) = head.as_deref().filter(|_| !cross_checkout) {
         if let Some(note) = travsr_mcp::head_index_mismatch_note(head, &stored) {
             eprintln!("{note}");
         }

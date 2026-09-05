@@ -117,6 +117,112 @@ fn main_worktree_root(worktree_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Whether two resolved repo roots name the **same directory**.
+///
+/// Deliberately not `a == b`. The two sides reach this comparison by different
+/// routes and are not spelled alike even when they are one directory: the
+/// caller's own root is walked up from `cwd` and is therefore native, while a
+/// served root is derived from `git rev-parse --git-common-dir`, which on
+/// Windows renders forward slashes (`C:/repo/.git`) where the native path uses
+/// backslashes (`C:\repo\.git`). Windows and the default macOS filesystem are
+/// also case-insensitive, so `C:\Repo` and `c:\repo` are the same directory; a
+/// path may arrive as an 8.3 short name or as a UNC share
+/// (`\\server\share\repo`); and on macOS `/tmp` is a symlink to `/private/tmp`.
+/// A raw string compare reports "different tree" for every one of those.
+///
+/// `canonicalize` is the operating system's own answer to "which directory is
+/// this": a verbatim `\\?\`-prefixed path on Windows (long-path, case- and
+/// short-name-resolved, UNC included) and a fully resolved absolute path
+/// elsewhere. Only used for the comparison, never for display, so the user
+/// still sees the paths they typed.
+///
+/// A path that cannot be canonicalized (it does not exist, or is unreadable)
+/// counts as the **same** directory. The one caller uses this to decide whether
+/// to tell a user their answer came from another checkout, and that claim must
+/// never rest on a path this process could not resolve.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => true,
+    }
+}
+
+/// `Some(worktree_root)` when `cwd` stands in a **linked worktree** whose read
+/// queries are answered out of `served_root`, a different checkout. That is the
+/// `PreferLocalElseMain` redirect at the top of this file, seen from the far
+/// end: the answer is correct about the main worktree and wrong about the tree
+/// the user is editing.
+///
+/// `None` for a standard repo, for a linked worktree that has its own
+/// `.travsr/` (no redirect happened), and whenever the two roots cannot be told
+/// apart.
+///
+/// Gated on `.git` being a gitlink *file*, which is true only inside a linked
+/// worktree. That keeps the signal scoped to the redirect it describes: an
+/// explicit `--db <other repo>` or a registry-resolved root also serves a
+/// different directory, but by the user's own instruction, and must not be
+/// narrated as a worktree mix-up.
+fn worktree_served_elsewhere(cwd: &Path, served_root: &Path) -> Option<PathBuf> {
+    let own = find_git_root_for_write(cwd).ok()?;
+    if !own.join(".git").is_file() {
+        return None;
+    }
+    (!same_directory(&own, served_root)).then_some(own)
+}
+
+/// State plainly that this answer describes another checkout.
+///
+/// The condition this replaces was reported as index staleness ("semantic
+/// analysis has not caught up with the current commit"), which describes a race
+/// inside one tree and is repaired by waiting or re-indexing. Neither helps
+/// here: the served index is a faithful description of a *different* checkout,
+/// and no amount of re-indexing it will make it describe this worktree. Naming
+/// both roots is the whole point, so a reader can see which tree the
+/// `path:line` they are about to trust belongs to.
+fn cross_checkout_note(here: &Path, served: &Path, served_commit: Option<&str>) -> String {
+    let commit = match served_commit.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => format!(" (indexed at commit {c})"),
+        None => String::new(),
+    };
+    format!(
+        "[note: you are standing in the linked worktree {}, but travsr is \
+         answering from the index at {}{}, which is a different checkout. Any \
+         path, line number or symbol it reports describes that tree, not this \
+         one. This is not index staleness: re-indexing that checkout will never \
+         make it describe this worktree. Run `travsr init` here to give this \
+         worktree its own index.]",
+        here.display(),
+        served.display(),
+        commit
+    )
+}
+
+/// Production entry: `Some(worktree_root)` when the index at `db_path`
+/// (`<root>/.travsr/graph.db`) belongs to a checkout other than the linked
+/// worktree this process is standing in.
+///
+/// Filesystem only, so a caller can classify before deciding whether it is
+/// worth opening a store. Reading the cwd is the only reason this is separate
+/// from [`worktree_served_elsewhere`], which stays unit-testable without
+/// mutating the process's working directory.
+pub fn served_by_other_checkout(db_path: &Path) -> Option<PathBuf> {
+    // `<root>/.travsr/graph.db` -> `<root>`.
+    let served = db_path.parent()?.parent()?;
+    let cwd = std::env::current_dir().ok()?;
+    worktree_served_elsewhere(&cwd, served)
+}
+
+/// The note for [`served_by_other_checkout`], or `None` when the answer really
+/// does describe the tree the caller is standing in.
+///
+/// `served_commit` is the index's `last_commit` when the caller already has a
+/// store open, otherwise `None`; this resolver deliberately does not open one.
+pub fn cross_checkout_note_for_db(db_path: &Path, served_commit: Option<&str>) -> Option<String> {
+    let served = db_path.parent()?.parent()?;
+    let here = served_by_other_checkout(db_path)?;
+    Some(cross_checkout_note(&here, served, served_commit))
+}
+
 /// Find the deepest registered repo root that is an ancestor of (or equal to)
 /// `start`. Registry values are `<root>/.travsr/graph.db` paths.
 fn registered_ancestor(start: &Path) -> Option<PathBuf> {
@@ -281,6 +387,111 @@ mod tests {
             write_sub.canonicalize().unwrap(),
             wt.canonicalize().unwrap()
         );
+    }
+
+    /// `same_directory` must answer about directories, not spellings: a path
+    /// that walks through `sub/..` is the same directory as its parent, and two
+    /// genuinely distinct directories are not. The `..` case is the portable
+    /// stand-in for the platform spellings this guards against on Windows
+    /// (forward slashes out of `git rev-parse`, case differences, 8.3 short
+    /// names, UNC shares), which cannot be constructed on a POSIX test runner.
+    #[test]
+    fn same_directory_compares_directories_not_strings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(same_directory(tmp.path(), &sub.join("..")));
+
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert!(!same_directory(&sub, &other));
+    }
+
+    /// Fail-safe: an unresolvable path counts as the same directory, so a
+    /// cross-checkout claim is never made on the strength of a path this
+    /// process could not resolve.
+    #[test]
+    fn same_directory_treats_unresolvable_paths_as_same() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(same_directory(
+            tmp.path(),
+            &tmp.path().join("does-not-exist")
+        ));
+    }
+
+    /// The core acceptance, built without invoking git: a linked worktree's
+    /// `.git` is a *file* holding `gitdir: <path>`, and that shape alone is what
+    /// distinguishes the redirect from a normal repo. Constructing it by hand
+    /// keeps the classification independent of a git binary and of the
+    /// platform's worktree bookkeeping.
+    #[test]
+    fn hand_built_gitlink_served_by_another_root_is_cross_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        // The pointer file git writes into a linked worktree. Its payload is a
+        // platform-native absolute path, so it is built from the real `main`
+        // path rather than a hand-spelled string.
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()),
+        )
+        .unwrap();
+
+        let here = worktree_served_elsewhere(&wt, &main).expect("must flag the redirect");
+        assert!(
+            same_directory(&here, &wt),
+            "must report the worktree it is standing in"
+        );
+
+        let note = cross_checkout_note(&here, &main, Some("abc1234"));
+        assert!(note.contains(&wt.display().to_string()), "got: {note}");
+        assert!(note.contains(&main.display().to_string()), "got: {note}");
+        assert!(note.contains("abc1234"), "got: {note}");
+        assert!(
+            note.contains("not index staleness"),
+            "the note must not be mistaken for the staleness warning it replaces: {note}"
+        );
+    }
+
+    /// A linked worktree answered from its own root is not a cross-checkout
+    /// answer, even though `.git` is still a gitlink file. Guards the
+    /// `PreferLocalElseMain` case where the worktree was `travsr init`-ed in
+    /// place (issue #586) against a spurious note.
+    #[test]
+    fn gitlink_served_by_its_own_root_is_not_cross_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /nonexistent/.git/worktrees/wt\n").unwrap();
+        assert!(worktree_served_elsewhere(&wt, &wt).is_none());
+    }
+
+    /// A standard repo (`.git` is a directory) never produces the note, even
+    /// when it is served from somewhere else entirely (an explicit `--db`, or a
+    /// registry-resolved root). Those are the user's own instruction, not the
+    /// worktree redirect this note describes.
+    #[test]
+    fn standard_repo_is_never_reported_as_cross_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        assert!(worktree_served_elsewhere(&repo, &elsewhere).is_none());
+    }
+
+    /// The commit clause is omitted entirely when the index's commit is
+    /// unknown or blank, rather than rendered as an empty parenthetical.
+    #[test]
+    fn cross_checkout_note_omits_an_unknown_commit() {
+        let here = Path::new("/here");
+        let served = Path::new("/there");
+        assert!(!cross_checkout_note(here, served, None).contains("indexed at commit"));
+        assert!(!cross_checkout_note(here, served, Some("  ")).contains("indexed at commit"));
     }
 
     /// Once a worktree has its own index (a write command created

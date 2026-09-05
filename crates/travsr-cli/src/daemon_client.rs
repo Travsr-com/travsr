@@ -226,11 +226,52 @@ pub fn open_read_store(db_path: &Path) -> anyhow::Result<SqliteStore> {
 /// reads, so the cost does not justify threading a store through every caller.
 ///
 /// Silent on any error: a freshness note is not worth failing a query over.
+///
+/// A linked worktree served by another checkout's index takes precedence and
+/// replaces the freshness note. Both say "the answer you are reading may not be
+/// about your tree", but only one is true at a time and they call for opposite
+/// responses: the freshness note tells the user to wait or re-index, which is
+/// exactly the advice that cannot work when the served index is a faithful
+/// description of a *different* checkout. Saying "has not caught up with the
+/// current commit" there is the misleading half, so it is not said.
 pub fn warn_if_call_graph_degraded(db_path: &Path) {
+    if warn_if_cross_checkout(db_path) {
+        return;
+    }
     if let Ok(store) = open_read_store(db_path) {
         if let Some(note) = travsr_mcp::phase_b_degraded_note(&store) {
             eprintln!("warning: {note}");
         }
+    }
+}
+
+/// Warn on stderr when this command is answering out of a **different
+/// checkout's** index: the caller stands in a linked worktree whose reads are
+/// redirected to the main worktree (`repo::find_git_root`). Returns whether the
+/// note was emitted.
+///
+/// Separate from [`warn_if_call_graph_degraded`] because the two conditions are
+/// unrelated. That one is about how complete the call graph is, so commands
+/// riding only Phase A edges skip it; this one is about which tree the answer
+/// describes, which is wrong for `deps`, `pattern` and `status` just as much as
+/// for `callers`. A complete answer about the wrong tree is still wrong.
+///
+/// Classifies from the filesystem first and opens the store only once the note
+/// is certain, purely to name the commit the served index describes, so the
+/// ordinary case costs no store open at all.
+pub fn warn_if_cross_checkout(db_path: &Path) -> bool {
+    if crate::repo::served_by_other_checkout(db_path).is_none() {
+        return false;
+    }
+    let commit = open_read_store(db_path)
+        .ok()
+        .and_then(|s| s.get_meta("last_commit").ok().flatten());
+    match crate::repo::cross_checkout_note_for_db(db_path, commit.as_deref()) {
+        Some(note) => {
+            eprintln!("warning: {note}");
+            true
+        }
+        None => false,
     }
 }
 

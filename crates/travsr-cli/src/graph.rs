@@ -99,7 +99,13 @@ pub fn run(
     // complete whether or not Phase B has run. Warning there told the user their
     // complete answer might be missing something, which is both wrong and the
     // fastest way to teach someone to ignore the warning that matters.
-    if !matches!(direction, Direction::Deps) {
+    //
+    // The cross-checkout note is not subject to that split: it says which tree
+    // the answer describes, and a complete `deps` answer about the wrong
+    // checkout is still the wrong answer.
+    if matches!(direction, Direction::Deps) {
+        daemon_client::warn_if_cross_checkout(&db_path);
+    } else {
         daemon_client::warn_if_call_graph_degraded(&db_path);
     }
 
