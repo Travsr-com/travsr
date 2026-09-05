@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
- * Guard for #576 / #497: the release build matrix and the three installer
- * target maps must agree on the exact set of published Rust target triples.
+ * Guard for #576 / #497 / #664: the release build matrix, the three installer
+ * target maps and the host triple table must agree on the exact set of
+ * published Rust target triples.
  *
  * The comparable field in release.yml is `artifact:`, not `target:`. The
  * Linux entries build against musl (`target: x86_64-unknown-linux-musl`) but
@@ -10,11 +11,16 @@
  * (installer.ts, ensure-binary.js) only ever request the artifact name. Comparing
  * against `target:` would fail on a clean tree.
  *
- * This checks set equality of triples across the four sources, not pairing
+ * This checks set equality of triples across the five sources, not pairing
  * correctness (platform/arch -> triple). Mis-pairing is covered separately
  * by packages/travsr-vscode/src/test/suite/installer.test.ts. install.sh is
  * POSIX-only, so it is compared against the release build matrix's non-Windows
  * subset rather than the full artifact set.
+ *
+ * The fifth source is `current_target()` in travsr-plugin-host's
+ * phase_b/platform.rs, which reads the host's (OS, ARCH) and is the only such
+ * table left in the workspace. #664 filed it under crates/travsr-cli, where it
+ * used to live; that copy now delegates (install.rs:88).
  *
  * Known limitation: comment stripping is a naive line-based `//`/`#` strip
  * within the located region. A `//` or `#` inside a string literal would be
@@ -35,6 +41,10 @@ const RELEASE_YML = join(REPO_ROOT, ".github/workflows/release.yml");
 const INSTALLER_TS = join(REPO_ROOT, "packages/travsr-vscode/src/installer.ts");
 const INSTALL_JS = join(REPO_ROOT, "packages/travsr-npm/scripts/ensure-binary.js");
 const INSTALL_SH = join(REPO_ROOT, "install.sh");
+// #664 named crates/travsr-cli/src/install.rs. That copy is gone: its
+// current_target() now delegates to this one (install.rs:88), which is the only
+// (OS, ARCH) -> triple table left in the workspace.
+const PLATFORM_RS = join(REPO_ROOT, "crates/travsr-plugin-host/src/phase_b/platform.rs");
 
 /** Relative path for error messages, so they read the same regardless of cwd. */
 function rel(absPath) {
@@ -48,6 +58,67 @@ function readFileOrFail(absPath) {
     process.exit(1);
   }
   return readFileSync(absPath, "utf8");
+}
+
+/**
+ * Extracts the triples returned by `current_target()` in platform.rs, the table
+ * that answers "which target triple is this host?" for `travsr lang install`
+ * and `travsr embed install`.
+ *
+ * Region: from the `pub fn current_target` signature to the first line that is
+ * exactly `}` at column 0, which is the function's own closing brace in
+ * rustfmt-formatted source (`cargo fmt --all -- --check` gates that in CI).
+ * Bounding it matters rather than scanning the file: `WRAPPER_RELEASE_TARGETS`
+ * sits eight lines below and holds the same five strings for a different
+ * question (which travsr-lang release shipped a wrapper), and it is checked
+ * against the live release inventory by the CLI's `wrapper_release_drift`
+ * test, not against this repo's build matrix.
+ *
+ * Anchored on `Some("<triple>")` so the `_ => None` fallthrough contributes
+ * nothing. // O(n) in file line count
+ */
+function extractHostTargets(text) {
+  const lines = text.split("\n");
+  const startIdx = lines.findIndex((l) => /^pub fn current_target\b/.test(l));
+  if (startIdx === -1) {
+    console.error(
+      `ERROR: could not locate "pub fn current_target" in ${rel(PLATFORM_RS)} (parser needs updating)`
+    );
+    process.exit(1);
+  }
+  let endIdx = -1;
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    if (lines[i] === "}") {
+      endIdx = i;
+      break;
+    }
+  }
+  if (endIdx === -1) {
+    console.error(
+      `ERROR: could not locate the closing "}" for current_target in ${rel(PLATFORM_RS)} (parser needs updating)`
+    );
+    process.exit(1);
+  }
+
+  const region = lines
+    .slice(startIdx, endIdx + 1)
+    .map((l) => l.replace(/\/\/.*$/, ""))
+    .join("\n");
+
+  const values = [];
+  const valueRe = /Some\("([^"]+)"\)/g;
+  let m;
+  while ((m = valueRe.exec(region)) !== null) {
+    values.push(m[1]);
+  }
+
+  if (values.length === 0) {
+    console.error(
+      `ERROR: located current_target in ${rel(PLATFORM_RS)} but extracted zero triples (parser needs updating)`
+    );
+    process.exit(1);
+  }
+  return values;
 }
 
 /**
@@ -251,11 +322,13 @@ const V = new Set(vscodeTargets);
 const N = new Set(npmTargets);
 const S = new Set(installShTargets);
 const P = new Set([...R].filter((t) => !/windows/.test(t)));
+const H = new Set(extractHostTargets(readFileOrFail(PLATFORM_RS)));
 
 console.log(`OK: ${rel(RELEASE_YML)} ships ${R.size} artifact(s)`);
 console.log(`OK: ${rel(INSTALLER_TS)} TARGET_MAP claims ${V.size} target(s)`);
 console.log(`OK: ${rel(INSTALL_JS)} TARGETS claims ${N.size} target(s)`);
 console.log(`OK: install.sh TARGET_MAP claims ${S.size} POSIX target(s)`);
+console.log(`OK: ${rel(PLATFORM_RS)} current_target() knows ${H.size} host triple(s)`);
 
 const setDiff = (a, b) => [...a].filter((x) => !b.has(x));
 
@@ -275,6 +348,8 @@ const shellWindows = installShText
   .filter(({ line }) => !line.trim().startsWith("#") && /-windows-/i.test(line));
 const shellExtra = setDiff(S, P);
 const shellMissing = setDiff(P, S);
+const hostExtra = setDiff(H, R);
+const hostMissing = setDiff(R, H);
 
 let failed = false;
 
@@ -327,17 +402,34 @@ for (const v of shellMissing) {
       `       but ${rel(INSTALL_SH)} TARGET_MAP cannot consume it.`
   );
 }
+for (const v of hostExtra) {
+  failed = true;
+  console.error(
+    `ERROR: ${rel(PLATFORM_RS)} current_target() returns '${v}',\n` +
+      `       but ${rel(RELEASE_YML)} build matrix ships no such artifact, so every\n` +
+      `       'travsr lang install' and 'travsr embed install' on that host 404s.`
+  );
+}
+for (const v of hostMissing) {
+  failed = true;
+  console.error(
+    `ERROR: ${rel(RELEASE_YML)} ships '${v}',\n` +
+      `       but ${rel(PLATFORM_RS)} current_target() cannot name that host, so travsr\n` +
+      `       fails with 'Unsupported platform' on a platform it publishes a binary for.`
+  );
+}
 
 if (failed) {
   console.error(
-    "\nFix: these four must agree on the published platform set:\n" +
+    "\nFix: these five must agree on the published platform set:\n" +
       `  - ${rel(RELEASE_YML)} (build matrix, artifact:)\n` +
       `  - ${rel(INSTALLER_TS)} (TARGET_MAP)\n` +
       `  - ${rel(INSTALL_JS)} (TARGETS)\n` +
-      `  - install.sh (TARGET_MAP block, POSIX targets only, no windows)`
+      `  - install.sh (TARGET_MAP block, POSIX targets only, no windows)\n` +
+      `  - ${rel(PLATFORM_RS)} (current_target)`
   );
   process.exit(1);
 }
 
-console.log(`OK: all four target maps agree (${R.size} published targets, ${P.size} POSIX for install.sh)`);
+console.log(`OK: all five target maps agree (${R.size} published targets, ${P.size} POSIX for install.sh)`);
 process.exit(0);
