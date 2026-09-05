@@ -22,12 +22,35 @@ use crate::sandbox::StdioCfg;
 use std::io;
 use std::path::PathBuf;
 
-fn profile_name(repo_root: &std::path::Path) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    repo_root.hash(&mut h);
-    format!("travsr-{:016x}", h.finish())
+use crate::sandbox::cleanup::{profile_name, CleanupPlan, CleanupReport};
+
+/// #575: runs a deregistration cleanup plan. Every step is best-effort: a
+/// profile or path that resists cleanup is recorded and the rest proceeds, so
+/// deregistration never fails on ACL residue.
+pub(super) fn execute_cleanup(plan: &CleanupPlan) -> CleanupReport {
+    let mut report = CleanupReport::default();
+    for profile in &plan.profiles {
+        let sid = match ffi::derive_appcontainer_sid(profile) {
+            Ok(sid) => sid,
+            Err(e) => {
+                report.failures.push(format!("{profile}: {e}"));
+                continue;
+            }
+        };
+        for path in &plan.paths {
+            match ffi::revoke_path_access(path, sid.as_psid()) {
+                Ok(true) => report.revoked_paths += 1,
+                Ok(false) => {}
+                Err(e) => report.failures.push(format!("{}: {e}", path.display())),
+            }
+        }
+        match ffi::delete_appcontainer_profile(profile) {
+            Ok(true) => report.deleted_profiles += 1,
+            Ok(false) => {}
+            Err(e) => report.failures.push(format!("{profile}: {e}")),
+        }
+    }
+    report
 }
 
 fn to_mode(cfg: StdioCfg) -> ffi::StdioMode {

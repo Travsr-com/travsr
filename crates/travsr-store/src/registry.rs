@@ -59,8 +59,10 @@ pub fn display_name(key: &str) -> String {
 /// Outcome of [`unregister_resolving`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum UnregisterResult {
-    /// The entry was found and removed.
-    Removed,
+    /// The entry was found and removed. Carries the registry key that was
+    /// removed, which is the repo root the sandbox derived its grants from
+    /// (#575).
+    Removed(String),
     /// No entry matched by key, cleaned key, or basename.
     NotFound,
     /// A basename matched more than one entry; the caller must disambiguate
@@ -230,7 +232,7 @@ pub fn unregister_resolving(name: &str) -> anyhow::Result<UnregisterResult> {
     // 1. Exact key.
     if repos.remove(name).is_some() {
         write_registry_atomic(&reg_path, &repos)?;
-        return Ok(UnregisterResult::Removed);
+        return Ok(UnregisterResult::Removed(name.to_string()));
     }
 
     // 2. Cleaned (verbatim-stripped) key — what the list actually printed.
@@ -243,7 +245,7 @@ pub fn unregister_resolving(name: &str) -> anyhow::Result<UnregisterResult> {
     if clean_matches.len() == 1 {
         repos.remove(&clean_matches[0]);
         write_registry_atomic(&reg_path, &repos)?;
-        return Ok(UnregisterResult::Removed);
+        return Ok(UnregisterResult::Removed(clean_matches[0].clone()));
     }
 
     // 3. Display basename — unambiguous only.
@@ -257,7 +259,7 @@ pub fn unregister_resolving(name: &str) -> anyhow::Result<UnregisterResult> {
         1 => {
             repos.remove(&base_matches[0]);
             write_registry_atomic(&reg_path, &repos)?;
-            Ok(UnregisterResult::Removed)
+            Ok(UnregisterResult::Removed(base_matches[0].clone()))
         }
         _ => Ok(UnregisterResult::Ambiguous(
             base_matches
@@ -540,7 +542,7 @@ mod tests {
             // Removal by basename (what the list now shows) resolves to the key.
             assert_eq!(
                 unregister_resolving("travsr").unwrap(),
-                UnregisterResult::Removed
+                UnregisterResult::Removed(r"D:\com.travsr\travsr".to_string())
             );
             assert!(all_repos().unwrap().is_empty());
 
@@ -548,7 +550,7 @@ mod tests {
             register(r"D:\com.travsr\travsr", &home.join("t/graph.db")).unwrap();
             assert_eq!(
                 unregister_resolving(r"D:\com.travsr\travsr").unwrap(),
-                UnregisterResult::Removed
+                UnregisterResult::Removed(r"D:\com.travsr\travsr".to_string())
             );
 
             // Unknown name → NotFound (no registry mutation).
