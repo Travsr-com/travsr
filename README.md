@@ -489,6 +489,15 @@ design docs) alongside code by default, so a query can surface the
 *rationale* behind code, not just the code itself. Turn it off with
 `travsr config set docs.enabled false`.
 
+What a doc match sends to the model is the citation `path § Heading Trail:lines`,
+never the prose body, and every Markdown file in the repo is in scope except
+the quality exclusions (changelogs, licences, generated output). Two
+consequences worth knowing before leaving it on: a file path or a heading such
+as `## Failover for customer-db-prod` is readable text that now leaves the
+machine by default, and both are written by whoever authored the file, which
+may be a vendored dependency's README or a branch you are reviewing, so the
+model should treat them as data rather than as instructions.
+
 ### Edge kinds
 
 | Kind | Meaning |

@@ -884,9 +884,15 @@ pub(crate) const DOC_RERANK_FLOOR: f32 = 0.05;
 ///
 /// The query is normalized through [`doc_lane_query`] first — see that
 /// function for why that is load-bearing rather than cosmetic.
+///
+/// "No filter" means no *relevance* filter: `filter` is still applied, by
+/// [`retain_scope_allowed`], because the doc-space KNN is a retrieval entry
+/// point that no edge traversal covers, so this is where the docs lane's
+/// access scope is enforced (#525).
 pub(crate) fn doc_lane_candidates(
     store: &SqliteStore,
     query: &str,
+    filter: &dyn EdgeFilter,
     doc_knn: Option<DocKnnFn<'_>>,
 ) -> Vec<(NodeId, f32)> {
     if !docs_enabled(store) {
@@ -898,6 +904,35 @@ pub(crate) fn doc_lane_candidates(
     let k = doc_rerank_overfetch() as u32;
     let mut hits = knn(&doc_lane_query(query), k);
     hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    retain_scope_allowed(store, filter, hits)
+}
+
+/// Drop the candidates `filter` denies, at admission rather than after
+/// rendering: a denied node must not reach the reranker, the results cap or
+/// the budget carve, since surviving any of those makes its existence
+/// observable in what a permitted caller gets back (`travsr_retrieval::rbac`).
+///
+/// The corpus of each candidate is resolved in one batched lookup, and only
+/// for a filter whose verdict can depend on it (#413), so the local
+/// `OpenFilter` path costs exactly what it did before. A candidate missing
+/// from the store resolves to `None`, which every filter denies.
+fn retain_scope_allowed(
+    store: &SqliteStore,
+    filter: &dyn EdgeFilter,
+    mut hits: Vec<(NodeId, f32)>,
+) -> Vec<(NodeId, f32)> {
+    let corpora: HashMap<NodeId, String> = if filter.needs_corpus() {
+        let ids: Vec<NodeId> = hits.iter().map(|&(id, _)| id).collect();
+        store
+            .get_nodes(&ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| (n.id, n.vname.corpus))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    hits.retain(|&(id, _)| filter.allow(id, id, corpora.get(&id).map(String::as_str)));
     hits
 }
 
@@ -6457,7 +6492,13 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = DocsConfigEnv::new();
         let hook: DocKnnFn<'_> = &|_q, _k| vec![(NodeId(1), 0.9)];
-        assert!(!doc_lane_candidates(&env.store, "query", Some(hook)).is_empty());
+        assert!(!doc_lane_candidates(
+            &env.store,
+            "query",
+            &travsr_retrieval::OpenFilter,
+            Some(hook)
+        )
+        .is_empty());
     }
 
     /// docs.enabled=false must return no doc results regardless of what the
@@ -6471,7 +6512,13 @@ mod tests {
         let env = DocsConfigEnv::new();
         env.set_repo("docs.enabled", "false");
         let hook: DocKnnFn<'_> = &|_q, _k| vec![(NodeId(1), 0.9)];
-        assert!(doc_lane_candidates(&env.store, "query", Some(hook)).is_empty());
+        assert!(doc_lane_candidates(
+            &env.store,
+            "query",
+            &travsr_retrieval::OpenFilter,
+            Some(hook)
+        )
+        .is_empty());
     }
 
     #[test]
@@ -6481,7 +6528,10 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = DocsConfigEnv::new();
         std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
-        assert!(doc_lane_candidates(&env.store, "query", None).is_empty());
+        assert!(
+            doc_lane_candidates(&env.store, "query", &travsr_retrieval::OpenFilter, None)
+                .is_empty()
+        );
         std::env::remove_var("TRAVSR_DOCS_ENABLED");
     }
 
@@ -6505,7 +6555,12 @@ mod tests {
                 (NodeId(4), 0.70),
             ]
         };
-        let hits = doc_lane_candidates(&env.store, "query", Some(hook));
+        let hits = doc_lane_candidates(
+            &env.store,
+            "query",
+            &travsr_retrieval::OpenFilter,
+            Some(hook),
+        );
         assert_eq!(
             hits,
             vec![
@@ -6620,6 +6675,65 @@ mod tests {
     /// The content-token normalization is actually applied at the KNN
     /// boundary, not merely available as a helper — captures the text the
     /// hook receives.
+    fn doc_chunk_in_corpus(corpus: &str, path: &str, sig: &str) -> CoreNode {
+        CoreNode::new(
+            travsr_core::VName::new(corpus, "", path, "markdown", sig),
+            "doc-chunk",
+        )
+        .with_line(1)
+        .with_end_line(9)
+    }
+
+    /// #525 item 2: a candidate the caller's scope denies must not survive the
+    /// pool, so no later stage (rerank, render, budget carve) can observe it.
+    #[test]
+    fn doc_lane_candidates_drops_candidates_the_filter_denies() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut env = DocsConfigEnv::new();
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
+
+        let allowed = doc_chunk_in_corpus("public", "docs/public.md", "doc:setup");
+        let denied = doc_chunk_in_corpus("internal", "docs/internal.md", "doc:oncall");
+        env.store.put_node(&allowed).expect("put allowed");
+        env.store.put_node(&denied).expect("put denied");
+        let (allowed_id, denied_id) = (allowed.id, denied.id);
+
+        let hook: DocKnnFn<'_> = &|_q, _k| vec![(denied_id, 0.99), (allowed_id, 0.42)];
+        let hits = doc_lane_candidates(
+            &env.store,
+            "query",
+            &travsr_retrieval::RbacFilter::new(["public"]),
+            Some(hook),
+        );
+
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+        assert_eq!(hits, vec![(allowed_id, 0.42)]);
+    }
+
+    /// A candidate the store cannot resolve has an unknown corpus, which every
+    /// filter must treat as a denial (`EdgeFilter::allow`'s fail-closed rule).
+    #[test]
+    fn doc_lane_candidates_denies_a_candidate_missing_from_the_store() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = DocsConfigEnv::new();
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
+
+        let hook: DocKnnFn<'_> = &|_q, _k| vec![(NodeId(7), 0.9)];
+        let hits = doc_lane_candidates(
+            &env.store,
+            "query",
+            &travsr_retrieval::RbacFilter::new(["public"]),
+            Some(hook),
+        );
+
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+        assert!(hits.is_empty());
+    }
+
     #[test]
     fn doc_lane_candidates_sends_the_content_token_query_to_knn() {
         let _guard = DOCS_ENV_LOCK
@@ -6634,7 +6748,7 @@ mod tests {
             vec![]
         };
         let raw = "how does the knapsack enforce the token budget?";
-        let _ = doc_lane_candidates(&env.store, raw, Some(hook));
+        let _ = doc_lane_candidates(&env.store, raw, &travsr_retrieval::OpenFilter, Some(hook));
 
         let sent = seen.lock().unwrap().clone();
         assert_eq!(

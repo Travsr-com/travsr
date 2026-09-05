@@ -314,8 +314,14 @@ const DOC_LINE_MAX_BYTES: usize = 512;
 /// envelope unforgeable. Slugification is what prevents an anchor from carrying
 /// such a run; a crafted *path* still could, which is a pre-existing property of
 /// every row `ask` already prints in its Path column, not something docs add.
-fn docs_section(store: &SqliteStore, query: &str, token_budget: usize) -> (Vec<String>, usize) {
-    let (entries, doc_tokens) = crate::tools::build_docs_section(store, query, token_budget);
+fn docs_section(
+    store: &SqliteStore,
+    query: &str,
+    token_budget: usize,
+    filter: &dyn EdgeFilter,
+) -> (Vec<String>, usize) {
+    let (entries, doc_tokens) =
+        crate::tools::build_docs_section(store, query, token_budget, filter);
     let lines = entries
         .into_iter()
         .map(|(_, _, line)| {
@@ -432,7 +438,7 @@ pub fn ask_query_with_filter(
     //
     // Docs are computed independently of `Confidence` and never feed it: they
     // cannot convert an abstention into a confident answer (§4.3).
-    let (docs, doc_tokens) = docs_section(store, query, DEFAULT_TOKEN_BUDGET);
+    let (docs, doc_tokens) = docs_section(store, query, DEFAULT_TOKEN_BUDGET, filter);
 
     // UX-022: a docs section can only appear when docs are enabled AND the
     // doc-space KNN hook is armed. The cold path arms the code embed hook but

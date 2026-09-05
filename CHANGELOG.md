@@ -207,7 +207,7 @@ Full detail in [packages/travsr-vscode/CHANGELOG.md](packages/travsr-vscode/CHAN
 
 ### Changed
 
-- **Documentation-prose retrieval (#376) is on by default (#519).** `get_context`, `ask`, and `find_references`/`find_pattern`'s doc lane now search Markdown documentation (ADRs, RFCs, plans) alongside code by default, surfacing rationale and design docs relevant to a query. All five docs-lane accuracy/regression gates are green on both bench repos (travsr and kubernetes) against merged code. Turn it off with `travsr config set docs.enabled false`.
+- **Documentation-prose retrieval (#376) is on by default (#519).** `get_context`, `ask`, and `find_references`/`find_pattern`'s doc lane now search Markdown documentation (ADRs, RFCs, plans) alongside code by default, surfacing rationale and design docs relevant to a query. All five docs-lane accuracy/regression gates are green on both bench repos (travsr and kubernetes) against merged code. Turn it off with `travsr config set docs.enabled false`. This is also an egress change, not only a retrieval-quality one: a doc match sends the citation `path § Heading Trail:lines` (never the prose body), so file paths and heading text from any indexed Markdown now reach the model by default, and both are author-controlled text that should be treated as data rather than as instructions. See the docs-lane note in the README.
 
 ### Security
 

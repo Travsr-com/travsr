@@ -4945,12 +4945,13 @@ pub(crate) fn build_docs_section(
     store: &SqliteStore,
     query: &str,
     token_budget: usize,
+    filter: &dyn EdgeFilter,
 ) -> (Vec<(crate::seed::MatchSource, f32, String)>, usize) {
     let doc_knn = store.embed_doc_knn_fn();
     let doc_knn_ref = doc_knn
         .as_ref()
         .map(|f| f as &dyn Fn(&str, u32) -> Vec<(NodeId, f32)>);
-    let candidates = crate::seed::doc_lane_candidates(store, query, doc_knn_ref);
+    let candidates = crate::seed::doc_lane_candidates(store, query, filter, doc_knn_ref);
     if candidates.is_empty() {
         return (vec![], 0);
     }
@@ -5330,7 +5331,7 @@ fn get_context_body(
     // below and the normal-flow render further down can use it. `doc_tokens`
     // is already clamped to `docs.budget_pct` of `token_budget` (§4.3), so
     // subtracting it from the code lane's knapsack budget is always safe.
-    let (docs_entries, doc_tokens) = build_docs_section(store, query, token_budget);
+    let (docs_entries, doc_tokens) = build_docs_section(store, query, token_budget, filter);
 
     // #515: every return from this function must be sanitized, not just the
     // grounded ones. `sanitize_for_mcp` is mitigation M1 against T11 (prose
@@ -14424,7 +14425,12 @@ mod snippet_tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("TRAVSR_DOCS_ENABLED");
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
-        let (entries, tokens) = build_docs_section(&store, "how are floors calibrated", 4000);
+        let (entries, tokens) = build_docs_section(
+            &store,
+            "how are floors calibrated",
+            4000,
+            &travsr_retrieval::OpenFilter,
+        );
         assert!(entries.is_empty());
         assert_eq!(tokens, 0);
     }
@@ -14452,8 +14458,12 @@ mod snippet_tests {
             std::sync::Arc::new(move |_q, _k| Ok(vec![(id1, 0.71)]));
         store.set_embed_doc_knn_hook(hook);
 
-        let (entries, tokens) =
-            build_docs_section(&store, "how are semantic floors calibrated", 4000);
+        let (entries, tokens) = build_docs_section(
+            &store,
+            "how are semantic floors calibrated",
+            4000,
+            &travsr_retrieval::OpenFilter,
+        );
 
         std::env::remove_var("TRAVSR_DOCS_ENABLED");
 
@@ -14487,8 +14497,12 @@ mod snippet_tests {
             std::sync::Arc::new(move |_q, _k| Ok(vec![(id1, 0.71)]));
         store.set_embed_doc_knn_hook(hook);
 
-        let (entries, tokens) =
-            build_docs_section(&store, "how are semantic floors calibrated", 4000);
+        let (entries, tokens) = build_docs_section(
+            &store,
+            "how are semantic floors calibrated",
+            4000,
+            &travsr_retrieval::OpenFilter,
+        );
         assert_eq!(entries.len(), 1);
         let (ms, _score, line) = &entries[0];
         assert_eq!(*ms, crate::seed::MatchSource::Docs);
@@ -14513,6 +14527,62 @@ mod snippet_tests {
         std::env::remove_var("TRAVSR_DOCS_ENABLED");
         std::env::remove_var("TRAVSR_DOC_FLOOR");
         std::env::remove_var("TRAVSR_DOCS_MAX_RESULTS");
+    }
+
+    /// #525 item 2: the docs lane must obey the caller's scope. A doc chunk in
+    /// a corpus the filter denies must contribute neither its path nor its
+    /// heading trail to the rendered section, even when it outranks every
+    /// permitted hit.
+    #[test]
+    fn build_docs_section_never_renders_a_denied_corpus() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
+        std::env::set_var("TRAVSR_DOC_FLOOR", "0.42");
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let in_corpus = |corpus: &str, path: &str, sig: &str| {
+            travsr_core::Node::new(
+                travsr_core::VName::new(corpus, "", path, "markdown", sig),
+                "doc-chunk",
+            )
+            .with_line(1)
+            .with_end_line(9)
+        };
+        let allowed = in_corpus("public", "docs/setup.md", "doc:install-steps");
+        let denied = in_corpus("internal", "docs/internal/oncall.md", "doc:paging-secrets");
+        store.put_node(&allowed).unwrap();
+        store.put_node(&denied).unwrap();
+        let (allowed_id, denied_id) = (allowed.id, denied.id);
+
+        let hook: travsr_store::EmbedKnnHook =
+            std::sync::Arc::new(move |_q, _k| Ok(vec![(denied_id, 0.99), (allowed_id, 0.71)]));
+        store.set_embed_doc_knn_hook(hook);
+
+        let (entries, _tokens) = build_docs_section(
+            &store,
+            "how does paging work",
+            4000,
+            &travsr_retrieval::RbacFilter::new(["public"]),
+        );
+
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+        std::env::remove_var("TRAVSR_DOC_FLOOR");
+
+        let rendered = entries
+            .iter()
+            .map(|(_, _, line)| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !rendered.contains("oncall") && !rendered.contains("Paging Secrets"),
+            "a denied corpus must not reach the docs section: {rendered}"
+        );
+        assert!(
+            rendered.contains("docs/setup.md"),
+            "the permitted hit must still render: {rendered}"
+        );
     }
 
     /// #520: with no threshold set (the shipped default), reranking must
@@ -14586,7 +14656,8 @@ mod snippet_tests {
             std::sync::Arc::new(move |_q, _k| Ok(vec![(id1, 0.9)]));
         store.set_embed_doc_knn_hook(hook);
 
-        let (entries, tokens) = build_docs_section(&store, "query", 4000);
+        let (entries, tokens) =
+            build_docs_section(&store, "query", 4000, &travsr_retrieval::OpenFilter);
         assert!(entries.is_empty());
         assert_eq!(tokens, 0);
 
@@ -14625,7 +14696,8 @@ mod snippet_tests {
         store.set_embed_doc_knn_hook(hook);
 
         // A budget large enough that the §4.3 carve would happily admit it.
-        let (entries, _tokens) = build_docs_section(&store, "query", 200_000);
+        let (entries, _tokens) =
+            build_docs_section(&store, "query", 200_000, &travsr_retrieval::OpenFilter);
         assert_eq!(entries.len(), 1);
         assert!(
             entries[0].2.len() <= DOC_ENTRY_MAX_BYTES + 4,
@@ -14673,7 +14745,8 @@ mod snippet_tests {
             std::sync::Arc::new(move |_q, _k| Ok(vec![(id1, 0.9)]));
         store.set_embed_doc_knn_hook(hook);
 
-        let (entries, _t) = build_docs_section(&store, "query", 4000);
+        let (entries, _t) =
+            build_docs_section(&store, "query", 4000, &travsr_retrieval::OpenFilter);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, crate::seed::MatchSource::Docs);
         let header = match_source_header(crate::seed::MatchSource::Docs);
