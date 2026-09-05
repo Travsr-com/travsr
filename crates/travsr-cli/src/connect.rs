@@ -1152,6 +1152,11 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                 } else if skipped_guidance && !opts.remove {
                     say!("  (agent guidance not written; pass --rules to include it)");
                 }
+                // Whether this tool's MCP server file ended the run carrying our
+                // entry, which is the only state `approval_hint` below is true
+                // advice for. Stays false under `--dry-run`, which `continue`s
+                // before `execute` ever runs.
+                let mut wired = false;
                 for planned in kept {
                     let disp = rel(repo_root, &planned.path)
                         .unwrap_or_else(|| planned.path.display().to_string());
@@ -1203,6 +1208,11 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                                 }
                                 other => say!("  {} {disp}", label(other)),
                             }
+                            if matches!(planned.content, Content::JsonServer { .. })
+                                && server_in_place(&outcome)
+                            {
+                                wired = true;
+                            }
                             if planned.gitignore {
                                 if let Some(r) = rel(repo_root, &planned.path) {
                                     if opts.remove {
@@ -1236,11 +1246,15 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                         say!("{note}");
                     }
                     // #829: naming the still-pending approval where a bare `ok`
-                    // otherwise reads as done. Not gated on the write outcome:
-                    // approval is still needed whether the file was just written
-                    // or already present and committed.
-                    if let Some(hint) = tool.approval_hint() {
-                        say!("{hint}");
+                    // otherwise reads as done. Only once the server file is in
+                    // place, which covers both outcomes the PR wants (`wrote`
+                    // and `ok`). After a skip, a per-file error or a `--dry-run`
+                    // there is nothing to approve and the hint would send the
+                    // user at the wrong fix.
+                    if wired {
+                        if let Some(hint) = tool.approval_hint() {
+                            say!("{hint}");
+                        }
                     }
                 }
             }
@@ -1307,6 +1321,19 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether a server config file ended the run actually carrying our entry: the
+/// `wrote` and `ok` pair, and nothing else.
+///
+/// #829: `approval_hint` names a step the user takes *after* travsr wired the
+/// server, so it is only true advice for these two outcomes. `Skipped` (existing
+/// file is not strict JSON, top level is not a JSON object, or the file is
+/// tracked and `--commit` was not passed) and a per-file `Err` leave nothing to
+/// approve; `Removed` and `Absent` only arise on a remove run, which suppresses
+/// the hint anyway.
+fn server_in_place(o: &Outcome) -> bool {
+    matches!(o, Outcome::Written | Outcome::Unchanged)
 }
 
 fn label(o: &Outcome) -> &'static str {
@@ -1864,6 +1891,28 @@ mod tests {
         );
         // The hint is Claude Code specific; a rules-only tool must not carry it.
         assert!(Tool::Codex.approval_hint().is_none());
+    }
+
+    /// #829 review: the hint is advice about a file that exists. Every outcome
+    /// that leaves the server config without our entry must not carry it, or
+    /// `skipped .mcp.json: not strict JSON (left untouched)` is followed by
+    /// "restart Claude Code and accept the trust prompt", which is the wrong fix.
+    #[test]
+    fn the_approval_hint_follows_only_a_server_that_landed() {
+        assert!(server_in_place(&Outcome::Written), "wrote");
+        assert!(server_in_place(&Outcome::Unchanged), "ok");
+        for left_unwired in [
+            Outcome::Skipped("existing file is not strict JSON (left untouched)".into()),
+            Outcome::Skipped("top level is not a JSON object".into()),
+            Outcome::Removed,
+            Outcome::Absent,
+        ] {
+            assert!(
+                !server_in_place(&left_unwired),
+                "nothing to approve after `{}`",
+                label(&left_unwired)
+            );
+        }
     }
 
     #[test]
