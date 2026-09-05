@@ -18,8 +18,8 @@
 //! Two emit lanes, both fail-closed (section 8.1):
 //!
 //! - [`resolve_unambiguous_lexical`] (section 7.3a) needs no language server.
-//!   A name with exactly one definition in the graph has only one thing it can
-//!   mean, so resolving it is a lookup, not a guess.
+//!   A name with exactly one definition in its own language has only one thing
+//!   it can mean, so resolving it is a lookup, not a guess.
 //! - [`apply_live_resolutions`] (section 7.3b) consumes positions an editor's
 //!   language provider resolved. The editor answers "what does this position
 //!   point at"; this module maps both ends to nodes itself, so identity stays
@@ -217,7 +217,7 @@ fn resolve_one(store: &SqliteStore, corpus: &str, file: &str, r: &LiveResolution
     if !names_match(store, dst, &r.name) {
         return None;
     }
-    edge_if_sound(store, src, dst, edge)
+    edge_if_sound(store, src, dst, edge, CrossLanguage::Allowed)
 }
 
 /// True when `dst`'s signature plausibly names `name`.
@@ -359,6 +359,10 @@ const MAX_CLOSURE_FILES: usize = 64;
 /// size one is emitted. `alt_callee_sig` is tried when the primary misses (the
 /// #709 PascalCase class-vs-function ambiguity), under the same exactly-one
 /// rule, never to widen the net.
+///
+/// Repo-wide uniqueness spans every indexed language, and a bare identifier
+/// does not, so the winner must also be in the caller's own language
+/// ([`CrossLanguage::Refused`], issue #815).
 ///
 /// `locally_bound` is section 7.3's **step 1**, and step 3a needs both halves:
 /// `|candidates| == 1` **and** local-clean. It holds the names this file binds
@@ -509,7 +513,7 @@ fn lexical_one(
     let dst = candidate_signatures(call)
         .into_iter()
         .find_map(|sig| unique_definition(store, &sig, edge))?;
-    edge_if_sound(store, call.src, dst, edge)
+    edge_if_sound(store, call.src, dst, edge, CrossLanguage::Refused)
 }
 
 /// The edge kind a native call-site record resolves to. The extractor encodes a
@@ -881,7 +885,13 @@ fn inheritance_edge(
         return None;
     }
     let dst = unique_base_definition(store, base_name)?;
-    edge_if_sound(store, src, dst, EdgeKind::IsImplementation)
+    edge_if_sound(
+        store,
+        src,
+        dst,
+        EdgeKind::IsImplementation,
+        CrossLanguage::Refused,
+    )
 }
 
 /// The single class / interface / trait / … named `base_name` repo-wide, or
@@ -973,6 +983,27 @@ fn unique_definition(store: &SqliteStore, signature: &str, edge: EdgeKind) -> Op
     }
 }
 
+/// Whether the calling lane's evidence is strong enough to point a reference at
+/// a definition in another language (issue #815).
+///
+/// It is for the editor lane: a language provider resolved a concrete position,
+/// and a C++ translation unit calling a function declared in a `.h` the
+/// extension map classifies as C is a real `cpp -> c` call edge.
+///
+/// It is not for the lexical floor, whose entire warrant is "this name has
+/// exactly one definition repo-wide". That quantifier ranges over every indexed
+/// language while a bare identifier means something only in its own, so a name
+/// that is a *builtin* in the caller's language (never a repo symbol there) can
+/// leave a same-named foreign definition as the sole candidate. Genuine calls
+/// between the floor's languages cross an FFI boundary, which is
+/// [`EdgeKind::FFICall`] from the index-time resolver and out of this lane's
+/// scope entirely ([`live_edge_kind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrossLanguage {
+    Allowed,
+    Refused,
+}
+
 /// Shared soundness gate for both lanes.
 ///
 /// Section 8.2 fencing rule: live edges are intra-corpus only, so they can
@@ -984,13 +1015,27 @@ fn unique_definition(store: &SqliteStore, signature: &str, edge: EdgeKind) -> Op
 /// `kind` is the edge kind to emit (RFC-027 live edge-kind scope): the lane is
 /// no longer call-only, so the caller names it. The target-kind gate lives in
 /// [`target_kinds`], applied before this by whichever lane found `dst`.
-fn edge_if_sound(store: &SqliteStore, src: NodeId, dst: NodeId, kind: EdgeKind) -> Option<Edge> {
+///
+/// `cross_language` is named per lane rather than defaulted so a future lane
+/// has to state what its evidence is worth; see [`CrossLanguage`].
+fn edge_if_sound(
+    store: &SqliteStore,
+    src: NodeId,
+    dst: NodeId,
+    kind: EdgeKind,
+    cross_language: CrossLanguage,
+) -> Option<Edge> {
     if src == dst {
         return None;
     }
     let src_node = store.get_node(src).ok().flatten()?;
     let dst_node = store.get_node(dst).ok().flatten()?;
     if src_node.vname.corpus != dst_node.vname.corpus {
+        return None;
+    }
+    if cross_language == CrossLanguage::Refused
+        && src_node.vname.language != dst_node.vname.language
+    {
         return None;
     }
     Some(Edge::new(src, dst, kind))
@@ -1186,14 +1231,21 @@ mod tests {
         std::collections::HashSet::new()
     }
 
+    fn put_definition(
+        store: &mut SqliteStore,
+        language: &str,
+        (path, sig, kind, line, end_line): (&str, &str, &str, u32, u32),
+    ) {
+        let mut node = Node::new(VName::new(CORPUS, "", path, language, sig), kind);
+        node.line = Some(line);
+        node.end_line = Some(end_line);
+        store.put_node(&node).expect("put_node");
+    }
+
     fn store_with(nodes: &[(&str, &str, &str, u32, u32)]) -> SqliteStore {
         let mut store = SqliteStore::open_in_memory().expect("in-memory store");
-        for (path, sig, kind, line, end_line) in nodes {
-            let vname = VName::new(CORPUS, "", *path, "typescript", *sig);
-            let mut node = Node::new(vname, *kind);
-            node.line = Some(*line);
-            node.end_line = Some(*end_line);
-            store.put_node(&node).expect("put_node");
+        for n in nodes {
+            put_definition(&mut store, "typescript", *n);
         }
         store
     }
@@ -1588,6 +1640,137 @@ mod tests {
             .is_empty());
     }
 
+    /// Issue #815: a name that is a builtin in the caller's language is not a
+    /// repo symbol there, so a same-named definition in another language is the
+    /// lexical floor's only candidate and passes its exactly-one gate. Python's
+    /// `set(...)` resolving to a Rust `fn set` is a wrong un-ratified edge, the
+    /// failure class section 8.1 forbids, so the floor must abstain.
+    #[test]
+    fn a_builtin_call_does_not_resolve_across_a_language_boundary() {
+        let mut store = SqliteStore::open_in_memory().expect("in-memory store");
+        put_definition(
+            &mut store,
+            "python",
+            ("selftest.py", "method:Checks.names", "method", 260, 280),
+        );
+        put_definition(&mut store, "rust", ("src/lib.rs", "fn:set", "fn", 490, 495));
+        let src = VName::new(CORPUS, "", "selftest.py", "python", "method:Checks.names").id();
+
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "selftest.py",
+            &[call(src, "fn:set", 270)],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            }
+        );
+        assert!(
+            store
+                .iter_edges_from(src)
+                .expect("iter_edges_from")
+                .is_empty(),
+            "a Python builtin call must not resolve to a Rust definition"
+        );
+    }
+
+    /// The #815 guard must not disable the floor: the same shape with the unique
+    /// definition in the caller's own language still resolves.
+    #[test]
+    fn a_same_language_unique_definition_still_resolves() {
+        let mut store = SqliteStore::open_in_memory().expect("in-memory store");
+        put_definition(
+            &mut store,
+            "python",
+            ("selftest.py", "method:Checks.names", "method", 260, 280),
+        );
+        put_definition(
+            &mut store,
+            "python",
+            ("helpers.py", "fn:set", "function", 12, 18),
+        );
+        let src = VName::new(CORPUS, "", "selftest.py", "python", "method:Checks.names").id();
+
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "selftest.py",
+            &[call(src, "fn:set", 270)],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            }
+        );
+        assert_eq!(
+            provenance_of(
+                &store,
+                src,
+                VName::new(CORPUS, "", "helpers.py", "python", "fn:set").id(),
+            )
+            .as_deref(),
+            Some("live")
+        );
+    }
+
+    /// The #815 guard belongs to the lexical floor alone. The editor lane's
+    /// evidence is a language provider's answer for a concrete position, which
+    /// does cross a language boundary: `Language::from_extension` classifies a
+    /// plain `.h` as C, so a C++ translation unit calling a function declared in
+    /// a shared header is a genuine `cpp -> c` call edge that clangd resolves.
+    #[test]
+    fn an_editor_resolved_cross_language_target_still_emits() {
+        let mut store = SqliteStore::open_in_memory().expect("in-memory store");
+        put_definition(
+            &mut store,
+            "cpp",
+            ("src/engine.cpp", "fn:run", "function", 10, 30),
+        );
+        put_definition(
+            &mut store,
+            "c",
+            ("include/codec.h", "fn:codec_init", "function", 15, 20),
+        );
+        let src = VName::new(CORPUS, "", "src/engine.cpp", "cpp", "fn:run").id();
+
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/engine.cpp",
+            &[resolution(18, "codec_init", "include/codec.h", 17)],
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            }
+        );
+        assert_eq!(
+            provenance_of(
+                &store,
+                src,
+                VName::new(CORPUS, "", "include/codec.h", "c", "fn:codec_init").id(),
+            )
+            .as_deref(),
+            Some("live"),
+            "an editor-witnessed C header call must survive the language gate"
+        );
+    }
+
     /// A symbol referencing itself carries no traversal value and would surface
     /// as a spurious self-loop in `get_callers`.
     #[test]
@@ -1647,12 +1830,8 @@ mod tests {
 
     fn rust_store_with(nodes: &[(&str, &str, &str, u32, u32)]) -> SqliteStore {
         let mut store = SqliteStore::open_in_memory().expect("in-memory store");
-        for (path, sig, kind, line, end_line) in nodes {
-            let vname = VName::new(CORPUS, "", *path, "rust", *sig);
-            let mut node = Node::new(vname, *kind);
-            node.line = Some(*line);
-            node.end_line = Some(*end_line);
-            store.put_node(&node).expect("put_node");
+        for n in nodes {
+            put_definition(&mut store, "rust", *n);
         }
         store
     }
