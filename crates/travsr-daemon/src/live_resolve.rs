@@ -805,8 +805,8 @@ fn drop_same_position_collisions(targets: Vec<LiveResolutionTarget>) -> Vec<Live
 /// changed, so an occurrence whose remapped line drifted outside it is no longer
 /// trusted), given the editor's UTF-16 column from its stored byte column (or
 /// left for the editor's name search when it has none), dropped when a native
-/// target already covers its `(line, name, kind)` (the native lane owns it), and
-/// finally deduped within the enumerated set the same way the native lane is.
+/// target already covers its position (see the split below), and finally deduped
+/// within the enumerated set the same way the native lane is.
 pub fn merge_changed_occurrence_targets(
     store: &SqliteStore,
     lines: &[&str],
@@ -823,10 +823,30 @@ pub fn merge_changed_occurrence_targets(
         v
     };
     let spans = store.current_spans(&src_ids).unwrap_or_default();
-    let native_positions: std::collections::HashSet<(u32, String, String)> = native
-        .iter()
-        .map(|t| (t.ref_line, t.name.clone(), t.edge_kind.clone()))
-        .collect();
+    // What the native lane already owns. Keyed WITH the column: a native target
+    // pins the first whole-word match on its line, so a stashed occurrence of
+    // the same name at another column (`a.save(); b.save()`) is a distinct
+    // position and survives, which is what the column plumbing exists for. When
+    // either side has no column there is nothing to tell the two apart, so the
+    // native target owns the whole line for that name and kind, as before.
+    let mut native_at_col: std::collections::HashSet<(u32, u32, String, String)> =
+        std::collections::HashSet::new();
+    let mut native_uncolumned: std::collections::HashSet<(u32, String, String)> =
+        std::collections::HashSet::new();
+    let mut native_lines: std::collections::HashSet<(u32, String, String)> =
+        std::collections::HashSet::new();
+    for t in &native {
+        let line_key = (t.ref_line, t.name.clone(), t.edge_kind.clone());
+        match t.ref_col {
+            Some(c) => {
+                native_at_col.insert((t.ref_line, c, t.name.clone(), t.edge_kind.clone()));
+            }
+            None => {
+                native_uncolumned.insert(line_key.clone());
+            }
+        }
+        native_lines.insert(line_key);
+    }
     let enumerated: Vec<LiveResolutionTarget> = stashed
         .iter()
         .filter_map(|occ| {
@@ -836,15 +856,28 @@ pub fn merge_changed_occurrence_targets(
             if occ.line < start || end.is_some_and(|e| occ.line > e) {
                 return None;
             }
-            // The native lane already owns this position; do not double-count it.
-            if native_positions.contains(&(occ.line, occ.name.clone(), occ.kind.clone())) {
-                return None;
-            }
             let ref_col = occ.col.and_then(|bc| {
                 lines
                     .get((occ.line - 1) as usize)
                     .map(|l| byte_to_utf16_col(l, bc))
             });
+            // The native lane already owns this position; do not double-count it.
+            let line_key = (occ.line, occ.name.clone(), occ.kind.clone());
+            let owned = match ref_col {
+                Some(c) => {
+                    native_uncolumned.contains(&line_key)
+                        || native_at_col.contains(&(
+                            occ.line,
+                            c,
+                            occ.name.clone(),
+                            occ.kind.clone(),
+                        ))
+                }
+                None => native_lines.contains(&line_key),
+            };
+            if owned {
+                return None;
+            }
             Some(LiveResolutionTarget {
                 ref_line: occ.line,
                 ref_col,
@@ -1164,6 +1197,85 @@ mod tests {
             "byte col 8 must convert to UTF-16 col 7 across the accented prefix"
         );
         assert_eq!(bar.edge_kind, "ref/call");
+    }
+
+    /// The native lane pins the FIRST whole-word occurrence on a line, so on
+    /// `a.save(); b.save();` it owns one of the two positions. The second is a
+    /// distinct position that only the enumerated set carries, and dropping it
+    /// as "already owned" would waste the column plumbing this lane exists for.
+    #[test]
+    fn a_second_occurrence_on_a_native_lines_own_column_is_kept() {
+        use travsr_core::ChangedOccurrence;
+        let store = store_with(&[("a.ts", "fn:caller", "function", 1, 3)]);
+        let src = node_id("a.ts", "fn:caller");
+        // `  a.save(); b.save();` - `save` at byte/UTF-16 cols 4 and 13.
+        let content = "fn caller() {\n  a.save(); b.save();\n}\n";
+        let stashed = vec![
+            ChangedOccurrence {
+                src,
+                line: 2,
+                col: Some(4),
+                kind: "ref/call".into(),
+                name: "save".into(),
+            },
+            ChangedOccurrence {
+                src,
+                line: 2,
+                col: Some(13),
+                kind: "ref/call".into(),
+                name: "save".into(),
+            },
+        ];
+        // The native lane found only the first one.
+        let native = vec![LiveResolutionTarget {
+            ref_line: 2,
+            ref_col: Some(4),
+            name: "save".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        }];
+
+        let lines: Vec<&str> = content.lines().collect();
+        let out = merge_changed_occurrence_targets(&store, &lines, native, &stashed);
+
+        assert_eq!(out.len(), 2, "the native target plus the second occurrence");
+        let cols: std::collections::HashSet<Option<u32>> = out.iter().map(|t| t.ref_col).collect();
+        assert_eq!(
+            cols,
+            [Some(4), Some(13)].into_iter().collect(),
+            "both distinct columns survive; only the col-4 duplicate is dropped"
+        );
+    }
+
+    /// A native target the daemon could not place on its line owns the whole
+    /// line for that name and kind, so an enumerated occurrence there is still a
+    /// duplicate of it and is dropped, exactly as before the column split.
+    #[test]
+    fn a_native_target_without_a_column_still_owns_its_line() {
+        use travsr_core::ChangedOccurrence;
+        let store = store_with(&[("a.ts", "fn:caller", "function", 1, 3)]);
+        let src = node_id("a.ts", "fn:caller");
+        let content = "fn caller() {\n  a.save();\n}\n";
+        let stashed = vec![ChangedOccurrence {
+            src,
+            line: 2,
+            col: Some(4),
+            kind: "ref/call".into(),
+            name: "save".into(),
+        }];
+        let native = vec![LiveResolutionTarget {
+            ref_line: 2,
+            ref_col: None,
+            name: "save".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        }];
+
+        let lines: Vec<&str> = content.lines().collect();
+        let out = merge_changed_occurrence_targets(&store, &lines, native, &stashed);
+
+        assert_eq!(out.len(), 1, "the column-less native target owns the line");
+        assert_eq!(out[0].ref_col, None);
     }
 
     #[test]

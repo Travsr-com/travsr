@@ -5526,6 +5526,45 @@ mod tests {
         );
     }
 
+    /// The per-file cap is applied after ordering by position, so a function
+    /// with more occurrences than the cap keeps the top of its changed region
+    /// every time rather than whatever order the capture query happened to
+    /// return.
+    #[test]
+    fn stash_caps_occurrences_in_position_order() {
+        use travsr_core::NodeId;
+        let mut plane = EditorPlane::default();
+        // Descending lines, so raw-order truncation would keep the highest ones.
+        let occ: Vec<travsr_core::ChangedOccurrence> = (0..MAX_OCCURRENCES_PER_STASHED_FILE + 10)
+            .map(|i| travsr_core::ChangedOccurrence {
+                src: NodeId(1),
+                line: (MAX_OCCURRENCES_PER_STASHED_FILE + 10 - i) as u32,
+                col: Some(4),
+                kind: "ref/call".to_string(),
+                name: "run".to_string(),
+            })
+            .collect();
+        plane.stash_changed_occurrences(
+            "a.rs".to_string(),
+            occ,
+            Some(std::collections::HashSet::new()),
+        );
+
+        let (served, _) = plane
+            .serve_stash("a.rs")
+            .expect("a fresh stash is servable");
+        assert_eq!(served.len(), MAX_OCCURRENCES_PER_STASHED_FILE);
+        assert_eq!(
+            served[0].line, 1,
+            "the retained set starts at the first line"
+        );
+        assert_eq!(
+            served.last().expect("non-empty").line,
+            MAX_OCCURRENCES_PER_STASHED_FILE as u32,
+            "the cap keeps the lowest lines, contiguously"
+        );
+    }
+
     #[test]
     fn remap_resolved_sites_redirects_and_drops_self_loops() {
         // #299 F2: a resolved site whose dst unification redirected must be
@@ -12682,6 +12721,10 @@ impl EditorPlane {
             self.changed_occurrences.remove(&path);
             return;
         };
+        // Order by position before capping, so which occurrences survive on a
+        // function with more than the cap is deterministic (the top of the
+        // changed region) rather than whatever order the capture query returned.
+        occ.sort_unstable_by_key(|o| (o.line, o.col, o.src.0));
         occ.truncate(MAX_OCCURRENCES_PER_STASHED_FILE);
         let now = std::time::Instant::now();
         self.changed_occurrences.retain(|_, e| e.expires_at > now);

@@ -95,6 +95,17 @@ fn occurrence_at_col(line: &str, name: &str, col: usize) -> bool {
     before_ok && after_ok
 }
 
+/// How far [`snap_changed_occurrence_line`] will fan out from its start-delta
+/// estimate before abstaining.
+///
+/// The estimate is off by the net lines the edit inserted or deleted above the
+/// occurrence, so this caps the line shift a single save can chase. Well past
+/// any hand edit, and it keeps the cost of an occurrence that cannot be
+/// re-anchored at this cap instead of the definition's span, which is the whole
+/// buffer when the definition has no known `end_line`. Beyond it the occurrence
+/// abstains and heals at the next commit.
+const MAX_SNAP_RADIUS: i64 = 512;
+
 /// The current line of a changed definition's committed occurrence, or `None`
 /// to abstain (issue #816 defect 1).
 ///
@@ -118,8 +129,10 @@ fn occurrence_at_col(line: &str, name: &str, col: usize) -> bool {
 ///
 /// The search fans OUT from the estimate and returns the first hit, so its cost
 /// is the shift distance (near zero for a typical one-line edit), not the
-/// definition's length: a huge definition with many occurrences never turns into
-/// an occurrence-times-span scan on the save path.
+/// definition's length, and it stops at [`MAX_SNAP_RADIUS`], so an occurrence
+/// that ends up abstaining costs that cap rather than the whole span: a huge
+/// definition with many occurrences never turns into an occurrence-times-span
+/// scan on the save path.
 fn snap_changed_occurrence_line(
     lines: &[&str],
     name: &str,
@@ -140,9 +153,13 @@ fn snap_changed_occurrence_line(
     // Radius 0 first, then each ring outward. A tie at the same distance prefers
     // the line after the estimate (a larger line number): an insert, the common
     // edit, pushes occurrences down, so the true line is at or after the
-    // estimate. Bounded by how far either end of the span is from the estimate,
-    // so the loop always terminates.
-    let max_radius = (estimate - lo).abs().max((hi - estimate).abs());
+    // estimate. Bounded by how far either end of the span is from the estimate
+    // AND by MAX_SNAP_RADIUS, so the loop always terminates and a miss costs the
+    // cap rather than the span.
+    let max_radius = (estimate - lo)
+        .abs()
+        .max((hi - estimate).abs())
+        .min(MAX_SNAP_RADIUS);
     for r in 0..=max_radius {
         if hit(estimate + r) {
             return Some((estimate + r) as u32);
@@ -200,6 +217,30 @@ const ENCLOSING_DEFINITION_KINDS: &[&str] = &[
     "extension",
     "namespace",
     "init",
+];
+
+/// Node kinds whose whole span is type-level declaration text, so an edit
+/// anywhere inside one can re-point how *other* definitions in the file resolve
+/// (RFC-027 #813 preservation gate).
+///
+/// There is no type-reference `EdgeKind`, so a definition that resolves
+/// *through* one of these has no edge to it and the edge-based demotion in
+/// `reindex_replace` cannot see the dependency. A change to one therefore
+/// invalidates the file's whole preserved set.
+///
+/// Container kinds (`class`, `impl`, `module`, `namespace`, `object`) are
+/// deliberately absent: their span covers their members' bodies, so any
+/// method-body edit would change them and preservation would never fire. Their
+/// members are separate nodes whose own hashes carry the signal instead.
+const TYPE_LEVEL_KINDS: &[&str] = &[
+    "type",
+    "typedef",
+    "interface",
+    "struct",
+    "enum",
+    "union",
+    "trait",
+    "protocol",
 ];
 
 /// Type alias for the RFC-018 Step 4 semantic-ANN callback injected by the daemon.
@@ -2581,30 +2622,52 @@ impl SqliteStore {
             // definition's own text is unchanged, NOT that the *types* its
             // references resolve through are. NodeIds are name-based
             // (`fn:{name}`, `method:{Type}.{name}`, `field:{Owner}.{f}`), so an
-            // edit to a parameter/return/field type, or a `type` alias RHS,
-            // leaves `old_ids == new_ids` intact and changes only the edited
+            // edit to a parameter, return, or field type leaves
+            // `old_ids == new_ids` intact and changes only the edited
             // definition's hash, yet every same-file definition whose committed
             // receiver-typed method/field edge went through that type now points
-            // at the wrong `dst`. Demote from `preserved` any definition that
-            // references a changed definition in this file, using this parse's
-            // edge set. Depth one is sound: a reference reached only *through* a
-            // byte-identical definition cannot shift, because that intermediary's
-            // own signature is unchanged, so it still returns the same type.
-            if !preserved.is_empty() {
-                let changed_in_file: std::collections::HashSet<i64> = new_ids
-                    .iter()
-                    .filter(|id| !preserved.contains(id))
-                    .copied()
-                    .collect();
+            // at the wrong `dst`.
+            //
+            // Two rules, because a type dependency is only sometimes an edge:
+            //
+            // 1. A change to a TYPE_LEVEL_KINDS definition invalidates the whole
+            //    file. There is no type-reference `EdgeKind` (see `EdgeKind`), so
+            //    a `type A = Foo` -> `type A = Bar` edit produces no edge into
+            //    `type:A` for rule 2 to follow, and every definition resolving
+            //    through `A` would keep a stale committed `dst`.
+            // 2. Otherwise demote any preserved definition that references a
+            //    changed definition in this parse's edge set. Iterated to a
+            //    fixpoint, so demoting B also demotes a preserved A that
+            //    references B; each round removes at least one id from a finite
+            //    set, so it terminates.
+            //
+            // Residual, accepted: a container's own declaration (a `class`'s
+            // `extends` clause) is not covered, because a container's span holds
+            // its members' bodies and treating it as changed would disable
+            // preservation on every method-body edit.
+            if !preserved.is_empty()
+                && nodes.iter().any(|n| {
+                    TYPE_LEVEL_KINDS.contains(&n.kind.as_str())
+                        && !preserved.contains(&node_id_to_i64(n.id))
+                })
+            {
+                preserved.clear();
+            }
+            while !preserved.is_empty() {
                 let demoted: Vec<i64> = edges
                     .iter()
                     .filter_map(|e| {
                         let src = node_id_to_i64(e.src);
+                        let dst = node_id_to_i64(e.dst);
                         (preserved.contains(&src)
-                            && changed_in_file.contains(&node_id_to_i64(e.dst)))
+                            && new_ids.contains(&dst)
+                            && !preserved.contains(&dst))
                         .then_some(src)
                     })
                     .collect();
+                if demoted.is_empty() {
+                    break;
+                }
                 for id in demoted {
                     preserved.remove(&id);
                 }
@@ -2766,19 +2829,6 @@ impl SqliteStore {
                     rows
                 };
 
-            // #299 F7: purge OWNED occurrence rows only — an occurrence's `src` is
-            // the enclosing node in the *same* file, so `src ∈ this file` selects
-            // exactly the sites that live in this file and will be re-derived by
-            // the next Phase B pass. Inbound sites (references from other files to
-            // this file's symbols) are preserved, mirroring the owned-edge rule so
-            // a blank-line/body edit stays lossless. (A blanket FK cascade would
-            // wrongly nuke those inbound sites when the node is deleted+reinserted.)
-            //
-            // The whole owned set is deleted, preserved definitions included,
-            // because a preserved definition may have drifted lines; its sites are
-            // then re-inserted below on their current lines (RFC-027 #813 P2), so
-            // the row a preserved definition keeps carries the same line the next
-            // commit would write, never a stale duplicate.
             // RFC-027 #813 P2: capture the CHANGED definitions' committed
             // occurrences before the purge, so the live lane can enumerate them
             // as editor-resolution targets and reach references the tree-sitter
@@ -2842,17 +2892,9 @@ impl SqliteStore {
                         // live position, so a stale estimate is fail-closed.
                         let new_line = match (col, content_lines.as_deref()) {
                             (Some(c), Some(lines)) => {
-                                // A definition with no known `end_line` still needs
-                                // an upper bound the search can move *down* to; an
-                                // insert (the common edit) pushes occurrences below
-                                // the start-delta estimate, and clamping the span
-                                // end to the estimate would only ever let the search
-                                // move up and so always abstain (issue #816 defect
-                                // 1). Fall back to the end of the buffer: the true
-                                // span end is unknown, so the file end is the safe
-                                // superset, and a mis-snap can still only land on
-                                // another occurrence of the same name at the same
-                                // column, which resolves the same callee.
+                                // An unknown span end falls back to the buffer end,
+                                // so the search can still move down to an insert;
+                                // MAX_SNAP_RADIUS keeps that bound cheap.
                                 let end = new_ends
                                     .get(&src)
                                     .copied()
@@ -2878,6 +2920,19 @@ impl SqliteStore {
                 rows
             };
 
+            // #299 F7: purge OWNED occurrence rows only — an occurrence's `src` is
+            // the enclosing node in the *same* file, so `src ∈ this file` selects
+            // exactly the sites that live in this file and will be re-derived by
+            // the next Phase B pass. Inbound sites (references from other files to
+            // this file's symbols) are preserved, mirroring the owned-edge rule so
+            // a blank-line/body edit stays lossless. (A blanket FK cascade would
+            // wrongly nuke those inbound sites when the node is deleted+reinserted.)
+            //
+            // The whole owned set is deleted, preserved definitions included,
+            // because a preserved definition may have drifted lines; its sites are
+            // then re-inserted below on their current lines (RFC-027 #813 P2), so
+            // the row a preserved definition keeps carries the same line the next
+            // commit would write, never a stale duplicate.
             tx.execute(
                 "DELETE FROM edge_sites \
                  WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
@@ -11301,6 +11356,150 @@ mod tests {
             edge_provenance(&store, g.id, free.id).as_deref(),
             Some("lsif"),
             "an unrelated preserved definition keeps its committed edge"
+        );
+    }
+
+    /// A `type A = Foo` -> `type A = Bar` edit re-points every definition that
+    /// resolves through `A`, but there is no type-reference `EdgeKind`, so no
+    /// edge into `type:A` exists for the caller demotion to follow. A change to
+    /// a TYPE_LEVEL_KINDS definition must therefore invalidate the whole file's
+    /// preserved set, or `caller` keeps a committed edge to `Foo.go` when truth
+    /// is now `Bar.go`.
+    #[test]
+    fn reindex_replace_invalidates_the_file_when_a_type_alias_changes() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, kind: &str, line: u32, end: u32| {
+            travsr_core::Node::new(travsr_core::VName::new("c", "", "a.rs", "rust", sig), kind)
+                .with_line(line)
+                .with_end_line(end)
+        };
+        let alias = mk("type:A", "type", 1, 1);
+        let caller = mk("fn:caller", "function", 3, 5);
+        let go = mk("method:Foo.go", "method", 7, 8);
+        let nodes = vec![alias.clone(), caller.clone(), go.clone()];
+        // Tree-sitter emits nothing into `type:A`: the alias is used as a
+        // parameter type, which is not an edge kind.
+        let ts_edges: Vec<Edge> = Vec::new();
+        let v1 = "type A = Foo;\n\nfn caller(a: A) {\n  a.go();\n}\n\nfn go() {\n}\n";
+        store
+            .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h1", Some(v1))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(caller.id, go.id, EdgeKind::RefCall))
+            .unwrap();
+        assert_eq!(
+            edge_provenance(&store, caller.id, go.id).as_deref(),
+            Some("lsif")
+        );
+
+        // Only the alias RHS changes. `caller` is byte-identical and the NodeId
+        // set is unchanged, so nothing but the type-level rule catches this.
+        let v2 = "type A = Bar;\n\nfn caller(a: A) {\n  a.go();\n}\n\nfn go() {\n}\n";
+        store
+            .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h2", Some(v2))
+            .unwrap();
+
+        assert_eq!(
+            edge_provenance(&store, caller.id, go.id),
+            None,
+            "a type-level change must purge the file's committed edges, not preserve them"
+        );
+    }
+
+    /// The demotion iterates to a fixpoint: demoting `b` (it references the
+    /// changed `c`) must then demote `a`, which references `b`. A single pass
+    /// over a snapshot of the changed set leaves `a` preserved with a stale edge.
+    #[test]
+    fn reindex_replace_demotion_reaches_a_transitive_caller() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "a.rs", "rust", sig),
+                "function",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        // c: 1-3 (edited), b: 5-7 (calls c), a: 9-11 (calls b), d: 13-15
+        // (unrelated, calls free), free: 17-18, x: 20-21 (the committed target).
+        let c = mk("fn:c", 1, 3);
+        let b = mk("fn:b", 5, 7);
+        let a = mk("fn:a", 9, 11);
+        let d = mk("fn:d", 13, 15);
+        let free = mk("fn:free", 17, 18);
+        let x = mk("method:X.run", 20, 21);
+        let nodes = vec![
+            c.clone(),
+            b.clone(),
+            a.clone(),
+            d.clone(),
+            free.clone(),
+            x.clone(),
+        ];
+        let ts_edges = vec![
+            Edge::new(b.id, c.id, EdgeKind::RefCall),
+            Edge::new(a.id, b.id, EdgeKind::RefCall),
+            Edge::new(d.id, free.id, EdgeKind::RefCall),
+        ];
+        let body = |c_body: &str| {
+            format!(
+                "fn c() {{\n  {c_body}\n}}\n\nfn b() {{\n  c().run();\n}}\n\nfn a() {{\n  b().run();\n}}\n\nfn d() {{\n  free();\n}}\n\nfn free() {{\n}}\n\nfn run() {{\n}}\n"
+            )
+        };
+        store
+            .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h1", Some(&body("A")))
+            .unwrap();
+        for src in [b.id, a.id] {
+            store
+                .put_edge_lsif(&Edge::new(src, x.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        store
+            .put_edge_lsif(&Edge::new(d.id, free.id, EdgeKind::RefCall))
+            .unwrap();
+
+        // Only c's body changes.
+        store
+            .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h2", Some(&body("B")))
+            .unwrap();
+
+        assert_eq!(
+            edge_provenance(&store, b.id, x.id),
+            None,
+            "the direct caller of the changed definition is demoted"
+        );
+        assert_eq!(
+            edge_provenance(&store, a.id, x.id),
+            None,
+            "the transitive caller must be demoted too, not left with a stale edge"
+        );
+        assert_eq!(
+            edge_provenance(&store, d.id, free.id).as_deref(),
+            Some("lsif"),
+            "a definition off the changed chain keeps its committed edge"
+        );
+    }
+
+    /// The re-anchoring search stops at [`MAX_SNAP_RADIUS`], so an occurrence
+    /// that cannot be found costs the cap rather than the definition's span,
+    /// which is the whole buffer when the definition has no known `end_line`.
+    #[test]
+    fn snap_changed_occurrence_line_is_bounded_by_the_max_radius() {
+        let mut lines: Vec<&str> = vec!["  other();"; 2000];
+        let hit = "  foo();";
+        // Within the cap: found. Estimate 100, true line 600 (radius 500).
+        lines[599] = hit;
+        assert_eq!(
+            snap_changed_occurrence_line(&lines, "foo", 2, 100, 1, lines.len() as i64),
+            Some(600)
+        );
+        // Beyond the cap: abstains and heals at commit rather than scanning the
+        // rest of the buffer.
+        lines[599] = "  other();";
+        lines[1499] = hit;
+        assert_eq!(
+            snap_changed_occurrence_line(&lines, "foo", 2, 100, 1, lines.len() as i64),
+            None
         );
     }
 
