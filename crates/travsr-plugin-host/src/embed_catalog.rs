@@ -10,11 +10,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-// `Command` (unqualified) is only referenced from the Unix/macOS process-control
-// paths (`kill`, `sysctl`, `vm_stat`); the cross-platform spawn sites use the
-// fully-qualified `std::process::Command`. Gate the import to Unix so a Windows
-// build does not warn about it being unused.
-#[cfg(unix)]
+// `Command` (unqualified) is only referenced from the macOS `sysctl` and
+// `vm_stat` probes; every cross-platform spawn site uses the fully-qualified
+// `std::process::Command`.
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
