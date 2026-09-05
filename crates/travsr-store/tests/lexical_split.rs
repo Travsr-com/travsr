@@ -283,7 +283,7 @@ fn symbol_frequency_counts_sqlite_on_sqlitestore_fixture() {
 fn symbol_frequency_none_for_short_token() {
     let store = open();
     // < 3 bytes never enters the word vocab (ident::segments drops it), and with
-    // no node named "ab" the #778 exact-leaf-name fallback is 0, so the token is
+    // no node carrying an "ab" segment the #778 fallback count is 0, so the token is
     // still unmeasurable -> None (stays generic / abstains).
     assert_eq!(store.symbol_frequency("ab").unwrap(), None);
 }
@@ -291,7 +291,7 @@ fn symbol_frequency_none_for_short_token() {
 #[test]
 fn symbol_frequency_short_token_grounds_on_exact_symbol() {
     // #778: a 2-char symbol (`UI`) is absent from the word vocab (min segment
-    // len 3), but it is a real, unique symbol in this repo. The exact-leaf-name
+    // len 3), but it is a real, unique symbol in this repo. The segment-count
     // fallback measures it as rare (Some(1)) rather than returning None and
     // letting the seed path fabricate `freq = n_total` and abstain on the exact
     // rank-0 match.
@@ -300,8 +300,8 @@ fn symbol_frequency_short_token_grounds_on_exact_symbol() {
         .put_node(&node("app/ui.rb", "class:UI", "class"))
         .unwrap();
     assert_eq!(store.symbol_frequency("UI").unwrap(), Some(1));
-    // A qualified leaf named exactly the token counts too (`method:Foo.ui` ->
-    // leaf `ui`), case-insensitively.
+    // A qualified member carrying the token as its own segment counts too
+    // (`method:Foo.ui`), case-insensitively.
     store
         .put_node(&node("app/foo.rb", "method:Foo.ui", "method"))
         .unwrap();
@@ -318,9 +318,9 @@ fn symbol_frequency_short_token_counts_qualified_members_as_generic() {
     // member (`method:WidgetN.id`), so a corpus of hundreds of `.id` members plus
     // one `class:Id` counted as 1 -> `freq <= rare_anchor_max` -> the strongest
     // trust signal in the system, purely because `id` is 2 chars. The
-    // exact-leaf-name count instead counts every `*.id` member (leaf `id`), so a
-    // common member name reads as generic, exactly as the 3-char segment vocab
-    // would count the identical `.key` corpus.
+    // segment count instead counts every `*.id` member, so a common member name
+    // reads as generic, exactly as the 3-char segment vocab would count the
+    // identical `.key` corpus.
     let mut store = open();
     for i in 0..40 {
         store
@@ -341,16 +341,16 @@ fn symbol_frequency_short_token_counts_qualified_members_as_generic() {
 
 #[test]
 fn symbol_frequency_short_token_saturates_at_cap() {
-    // #778 PR #791 review follow-up: when a short leaf name is common enough to
-    // hit LEAF_NAME_COUNT_CAP (4096), the LIMIT truncates the scan. The truncated
-    // count must NOT be reported verbatim: 4096 still reads as "specific" through
+    // #778 PR #791 review follow-up: when a short segment is common enough to hit
+    // SEGMENT_MATCH_COUNT_CAP (4096), the scan stops early and truncates the
+    // count. It must NOT be reported verbatim: 4096 still reads as "specific" through
     // idf_weight (which does not saturate near it), which would let a name borne
     // by tens of thousands of nodes clear the anchor-emit cut. The count is
     // instead saturated to the corpus size so IDF floors to generic.
     let mut store = open();
-    // 4096 nodes named exactly `xy` at their leaf -> the leaf-count scan hits the
-    // LIMIT. One extra non-matching node makes the corpus 4097, so a saturated
-    // result is distinguishable from the truncated 4096.
+    // 4096 nodes carrying an `xy` segment -> the count hits the cap. One extra
+    // non-matching node makes the corpus 4097, so a saturated result is
+    // distinguishable from the truncated 4096.
     for i in 0..4096 {
         store
             .put_node(&node(
@@ -364,7 +364,7 @@ fn symbol_frequency_short_token_saturates_at_cap() {
         .put_node(&node("app/other.rb", "class:Other", "class"))
         .unwrap();
     // Saturated to the corpus size (4097), not the truncated cap (4096): proves
-    // the LIMIT value is not reported as-is.
+    // the cap value is not reported as-is.
     assert_eq!(store.symbol_frequency("xy").unwrap(), Some(4097));
 }
 
@@ -375,4 +375,59 @@ fn symbol_frequency_none_for_absent_token() {
         .put_node(&node("src/a.rs", "fn:hello", "function"))
         .unwrap();
     assert_eq!(store.symbol_frequency("zzzznotpresent").unwrap(), None);
+}
+
+#[test]
+fn symbol_frequency_short_token_counts_compound_members_like_vocab_does() {
+    // #800: two identically shaped corpora that must measure the same way. The
+    // short token is not the leaf of `method:WidgetN.user_id` (the leaf is
+    // `user_id`), so a leaf-equality fallback saw 1 node while the 3-char
+    // segment vocab counted all 41 `.user_key` members for `key`. Both tokens
+    // are segments of the member name and both admit every one of those nodes
+    // to `anchor_pool` via `contains_token`, so grounding must not flip on
+    // token length.
+    let mut store = open();
+    for i in 0..40 {
+        store
+            .put_node(&node(
+                &format!("app/w_{i}.rb"),
+                &format!("method:Widget{i}.user_id"),
+                "method",
+            ))
+            .unwrap();
+        store
+            .put_node(&node(
+                &format!("app/v_{i}.rb"),
+                &format!("method:Gadget{i}.user_key"),
+                "method",
+            ))
+            .unwrap();
+    }
+    store
+        .put_node(&node("app/id.rb", "class:Id", "class"))
+        .unwrap();
+    store
+        .put_node(&node("app/key.rb", "class:Key", "class"))
+        .unwrap();
+
+    assert_eq!(store.symbol_frequency("key").unwrap(), Some(41));
+    assert_eq!(store.symbol_frequency("id").unwrap(), Some(41));
+}
+
+#[test]
+fn symbol_frequency_short_token_counts_segments_not_substrings() {
+    // #800: the boundary is the segmenter's, not punctuation's, so a short
+    // token inside a camelCase member counts like one inside a snake_case
+    // member, while `identifier` (one segment) is not a match at all.
+    let mut store = open();
+    store
+        .put_node(&node("app/a.rb", "method:Widget.parseId", "method"))
+        .unwrap();
+    store
+        .put_node(&node("app/b.rb", "method:Widget.parse_id", "method"))
+        .unwrap();
+    store
+        .put_node(&node("app/c.rb", "method:Widget.identifier", "method"))
+        .unwrap();
+    assert_eq!(store.symbol_frequency("id").unwrap(), Some(2));
 }
