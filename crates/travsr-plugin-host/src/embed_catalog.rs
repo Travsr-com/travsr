@@ -642,32 +642,18 @@ fn sidecar_supports_cancel(bin_path: &Path) -> bool {
 }
 
 /// True if a process with `pid` is currently alive (no signal sent).
-#[cfg(unix)]
+///
+/// Only a positive `Dead` reading stops the shutdown path. A platform with no
+/// probe reports `Unknown`, which must wait the grace window and run the kill
+/// fallback rather than assume the sidecar left (#500, #759).
 fn pid_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-/// #500: real liveness probe (OpenProcess + GetExitCodeProcess, no signal).
-/// The previous hardcoded `false` made `!pid_alive(pid)` in the grace poll
-/// true on its first iteration, so `terminate_inflight_reindex` logged
-/// "drained gracefully" immediately and returned — skipping both the grace
-/// wait and the `kill_pid` fallback (which the same `false` also made dead
-/// code). The sidecar was never terminated on Windows.
-#[cfg(target_os = "windows")]
-fn pid_alive(pid: u32) -> bool {
-    crate::sandbox::windows::pid_alive(pid)
+    pid_liveness(pid) != Liveness::Dead
 }
 
-/// Conservative stub for platforms with neither probe: report alive, so
-/// shutdown waits the full grace window and always runs the kill fallback.
-#[cfg(not(any(unix, target_os = "windows")))]
-fn pid_alive(_pid: u32) -> bool {
-    true
+/// True once the cancelled sidecar is gone: either its spawn surface cleared
+/// `REINDEX_CHILD_PID` through `ReindexPidGuard`, or the process itself exited.
+fn reindex_has_drained(pid: u32) -> bool {
+    REINDEX_CHILD_PID.load(Ordering::SeqCst) == 0 || !pid_alive(pid)
 }
 
 /// Gracefully cancel an in-flight reindex sidecar, else best-effort terminate it.
@@ -693,11 +679,9 @@ pub fn terminate_inflight_reindex() {
         if let Err(e) = std::fs::write(path, b"") {
             tracing::warn!(err = %e, "embed: failed to write cancel sentinel, will hard-kill");
         } else {
-            // Grace poll: wait for the sidecar (any spawn surface clears
-            // REINDEX_CHILD_PID via ReindexPidGuard on exit) to drain and exit.
             let deadline = std::time::Instant::now() + Duration::from_secs(CANCEL_GRACE_SECS);
             while std::time::Instant::now() < deadline {
-                if REINDEX_CHILD_PID.load(Ordering::SeqCst) == 0 || !pid_alive(pid) {
+                if reindex_has_drained(pid) {
                     tracing::info!(pid, "embed: reindex drained gracefully after cancel");
                     let _ = std::fs::remove_file(path);
                     return;
@@ -2147,6 +2131,46 @@ mod tests {
         assert_eq!(REINDEX_CHILD_PID.load(Ordering::SeqCst), 12345);
         drop(guard);
         assert_eq!(REINDEX_CHILD_PID.load(Ordering::SeqCst), 0);
+    }
+
+    /// #759 regression: the Unix arm shelled out to `kill -0`, whose non-zero
+    /// exit folds `EPERM` (alive, not signallable by this uid) into `ESRCH`
+    /// (gone). A sidecar under another uid read as dead, so the shutdown grace
+    /// poll logged "drained gracefully" on its first iteration and returned
+    /// before the `kill_pid` fallback, orphaning it.
+    ///
+    /// PID 1 is always alive and, outside a root-run suite, never signallable,
+    /// which is the canonical `EPERM` case. Skips as root, where `kill`
+    /// returns `Ok` and the assertion would pass without reaching that arm.
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_reads_an_unsignallable_live_process_as_alive() {
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        assert!(
+            pid_alive(1),
+            "PID 1 is alive; EPERM must not be read as dead"
+        );
+    }
+
+    /// The call site the bug actually cost: with the sidecar still registered
+    /// and its process alive, the grace poll must keep waiting rather than
+    /// report a drain that did not happen.
+    #[cfg(unix)]
+    #[test]
+    fn an_unsignallable_sidecar_is_not_reported_as_drained() {
+        let _serial = REINDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        REINDEX_CHILD_PID.store(1, Ordering::SeqCst);
+        let drained = reindex_has_drained(1);
+        REINDEX_CHILD_PID.store(0, Ordering::SeqCst);
+        assert!(
+            !drained,
+            "a live sidecar this uid cannot signal has not drained"
+        );
     }
 
     /// #500 regression: pid_alive must report real liveness on every platform.
