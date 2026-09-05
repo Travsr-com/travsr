@@ -11,6 +11,33 @@ struct Row {
     exists: String,
 }
 
+/// #575: deregistration is the one explicit, user-initiated "this repo is done"
+/// event, so it is where the Windows sandbox's persistent AppContainer grants
+/// (inheritable ACEs on the repo tree and the toolchain caches, plus the
+/// profile itself) are revoked. A no-op on every other platform, and never
+/// fatal: the repo is already out of the registry by this point.
+fn report_sandbox_cleanup(removed_keys: &[String]) {
+    let remaining: Vec<String> = registry::all_repos()
+        .map(|repos| repos.into_keys().collect())
+        .unwrap_or_default();
+    for key in removed_keys {
+        let report = travsr_plugin_host::sandbox::cleanup::purge_repo_sandbox_grants(
+            key.as_str(),
+            &remaining,
+        );
+        if report.is_empty() {
+            continue;
+        }
+        println!(
+            "  revoked sandbox grants on {} path(s), removed {} AppContainer profile(s)",
+            report.revoked_paths, report.deleted_profiles
+        );
+        for failure in &report.failures {
+            println!("  could not clean up {failure}");
+        }
+    }
+}
+
 /// `travsr repos [--prune] [--remove NAME] [--json]`.
 ///
 /// Default lists registered repos as a table. `--remove` drops one entry,
@@ -21,7 +48,10 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
         // UX-018: the list shows the basename as Name, so `--remove` accepts the
         // basename (or a full path) rather than only the raw registry key.
         match registry::unregister_resolving(name)? {
-            registry::UnregisterResult::Removed => println!("removed repo '{name}'"),
+            registry::UnregisterResult::Removed(key) => {
+                println!("removed repo '{name}'");
+                report_sandbox_cleanup(&[key]);
+            }
             registry::UnregisterResult::NotFound => {
                 println!("no repo named '{name}' in the registry")
             }
@@ -47,6 +77,7 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
             for name in &removed {
                 println!("  - {name}");
             }
+            report_sandbox_cleanup(&removed);
         }
         return Ok(());
     }

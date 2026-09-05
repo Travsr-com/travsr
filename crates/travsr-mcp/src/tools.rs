@@ -3849,7 +3849,7 @@ pub fn repos_prune() -> String {
 pub fn repos_remove(name: &str) -> String {
     use travsr_store::registry::UnregisterResult;
     match travsr_store::registry::unregister_resolving(name) {
-        Ok(UnregisterResult::Removed) => "ok".to_string(),
+        Ok(UnregisterResult::Removed(_)) => "ok".to_string(),
         Ok(UnregisterResult::NotFound) => "not found".to_string(),
         Ok(UnregisterResult::Ambiguous(paths)) => format!("ambiguous: {}", paths.join(", ")),
         Err(e) => {

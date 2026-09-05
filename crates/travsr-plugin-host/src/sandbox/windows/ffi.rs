@@ -10,16 +10,17 @@ use std::path::Path;
 
 use windows_sys::Win32::Foundation::STILL_ACTIVE;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
-    HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, WAIT_FAILED,
+    CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+    ERROR_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT, HLOCAL,
+    INVALID_HANDLE_VALUE, WAIT_FAILED,
 };
 use windows_sys::Win32::Security::Authorization::{
-    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-    GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
-    TRUSTEE_W,
+    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, ACCESS_MODE, EXPLICIT_ACCESS_W,
+    GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
+    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
     CreateWellKnownSid, EqualSid, FreeSid, GetAce, WinCapabilityInternetClientSid,
@@ -258,17 +259,18 @@ pub(super) fn ensure_appcontainer_profile(profile_name: &str) -> io::Result<()> 
 /// ACE type byte for `ACCESS_ALLOWED_ACE` (Win32 `ACCESS_ALLOWED_ACE_TYPE`).
 const ACE_TYPE_ACCESS_ALLOWED: u8 = 0;
 
-/// #505: true when `dacl` already carries an inheritable allow ACE for `sid`
-/// whose mask covers `access_mask`.
+/// True when any `ACCESS_ALLOWED_ACE` in `dacl` satisfies `matches`.
 ///
 /// # Safety
 /// `dacl` must be null or a valid, readable `ACL` (as returned by
-/// `GetNamedSecurityInfoW`); `sid` must be a valid SID.
-unsafe fn dacl_has_inheritable_allow_ace(dacl: *const ACL, sid: PSID, access_mask: u32) -> bool {
+/// `GetNamedSecurityInfoW`).
+unsafe fn any_allow_ace(
+    dacl: *const ACL,
+    matches: impl Fn(*const ACCESS_ALLOWED_ACE) -> bool,
+) -> bool {
     if dacl.is_null() {
         return false;
     }
-    const INHERIT_BOTH: u8 = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u8;
     for i in 0..u32::from((*dacl).AceCount) {
         let mut ace_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         if GetAce(dacl, i, &mut ace_ptr) == 0 {
@@ -278,19 +280,42 @@ unsafe fn dacl_has_inheritable_allow_ace(dacl: *const ACL, sid: PSID, access_mas
         if (*header).AceType != ACE_TYPE_ACCESS_ALLOWED {
             continue;
         }
-        if (*header).AceFlags & INHERIT_BOTH != INHERIT_BOTH {
-            continue;
-        }
-        let ace = ace_ptr as *const ACCESS_ALLOWED_ACE;
-        if (*ace).Mask & access_mask != access_mask {
-            continue;
-        }
-        let ace_sid = std::ptr::addr_of!((*ace).SidStart) as PSID;
-        if EqualSid(ace_sid, sid) != 0 {
+        if matches(ace_ptr as *const ACCESS_ALLOWED_ACE) {
             return true;
         }
     }
     false
+}
+
+/// # Safety
+/// `ace` must be a valid `ACCESS_ALLOWED_ACE` and `sid` a valid SID.
+unsafe fn ace_is_for_sid(ace: *const ACCESS_ALLOWED_ACE, sid: PSID) -> bool {
+    EqualSid(std::ptr::addr_of!((*ace).SidStart) as PSID, sid) != 0
+}
+
+/// #505: true when `dacl` already carries an inheritable allow ACE for `sid`
+/// whose mask covers `access_mask`.
+///
+/// # Safety
+/// `dacl` must be null or a valid, readable `ACL` (as returned by
+/// `GetNamedSecurityInfoW`); `sid` must be a valid SID.
+unsafe fn dacl_has_inheritable_allow_ace(dacl: *const ACL, sid: PSID, access_mask: u32) -> bool {
+    const INHERIT_BOTH: u8 = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u8;
+    any_allow_ace(dacl, |ace| unsafe {
+        (*ace).Header.AceFlags & INHERIT_BOTH == INHERIT_BOTH
+            && (*ace).Mask & access_mask == access_mask
+            && ace_is_for_sid(ace, sid)
+    })
+}
+
+/// #575: true when `dacl` carries any allow ACE for `sid`, whatever its mask or
+/// inheritance flags.
+///
+/// # Safety
+/// `dacl` must be null or a valid, readable `ACL` (as returned by
+/// `GetNamedSecurityInfoW`); `sid` must be a valid SID.
+unsafe fn dacl_has_any_allow_ace(dacl: *const ACL, sid: PSID) -> bool {
+    any_allow_ace(dacl, |ace| unsafe { ace_is_for_sid(ace, sid) })
 }
 
 /// Adds an allow ACE for `sid` with `access_mask` to the DACL of `path`.
@@ -302,7 +327,8 @@ unsafe fn dacl_has_inheritable_allow_ace(dacl: *const ACL, sid: PSID, access_mas
 /// read instead of re-churning the tree on every sidecar spawn (minutes on a
 /// monorepo, permanent MFT/USN write traffic, EDR alarms). Exactly one ACE
 /// per (repo, SID, mask) persists on the tree; it is intentionally left in
-/// place across spawns — see the issue for the uninstall-cleanup discussion.
+/// place across spawns and removed by `revoke_path_access` when the repo is
+/// deregistered (#575).
 pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io::Result<()> {
     grant_path_access_impl(path, sid, access_mask, SUB_CONTAINERS_AND_OBJECTS_INHERIT)
 }
@@ -320,15 +346,21 @@ pub(super) fn grant_path_access_this_only(
     grant_path_access_impl(path, sid, access_mask, 0)
 }
 
-fn grant_path_access_impl(
-    path: &Path,
-    sid: PSID,
-    access_mask: u32,
-    inheritance: u32,
-) -> io::Result<()> {
-    let path_wide = path_to_wide(path);
+/// Frees a `LocalAlloc`ed block (a security descriptor or an ACL) on drop.
+struct LocalGuard(HLOCAL);
 
-    let mut old_dacl = std::ptr::null_mut();
+impl Drop for LocalGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { LocalFree(self.0) };
+        }
+    }
+}
+
+/// Reads the DACL of `path_wide`. The pointer borrows from the security
+/// descriptor the returned guard owns, so the guard must outlive it.
+fn read_dacl(path_wide: &[u16]) -> io::Result<(*mut ACL, LocalGuard)> {
+    let mut dacl = std::ptr::null_mut();
     let mut sd = std::ptr::null_mut();
     let err = unsafe {
         GetNamedSecurityInfoW(
@@ -337,7 +369,7 @@ fn grant_path_access_impl(
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut old_dacl,
+            &mut dacl,
             std::ptr::null_mut(),
             &mut sd,
         )
@@ -345,29 +377,18 @@ fn grant_path_access_impl(
     if err != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(err as i32));
     }
-    struct SdGuard(HLOCAL);
-    impl Drop for SdGuard {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { LocalFree(self.0) };
-            }
-        }
-    }
-    let _sd_guard = SdGuard(sd);
+    Ok((dacl, LocalGuard(sd)))
+}
 
-    // #505: grant already present → skip the subtree rewrite entirely. Only
-    // meaningful for the inheriting case (dacl_has_inheritable_allow_ace only
-    // matches (OI)(CI) aces); the this-only grant always re-applies, which is
-    // idempotent and cheap on the short ancestor chains it's used for.
-    if inheritance == SUB_CONTAINERS_AND_OBJECTS_INHERIT
-        && unsafe { dacl_has_inheritable_allow_ace(old_dacl, sid, access_mask) }
-    {
-        return Ok(());
-    }
-
-    let ea = EXPLICIT_ACCESS_W {
+fn ace_entry(
+    sid: PSID,
+    access_mask: u32,
+    mode: ACCESS_MODE,
+    inheritance: u32,
+) -> EXPLICIT_ACCESS_W {
+    EXPLICIT_ACCESS_W {
         grfAccessPermissions: access_mask,
-        grfAccessMode: GRANT_ACCESS,
+        grfAccessMode: mode,
         grfInheritance: inheritance,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
@@ -376,22 +397,21 @@ fn grant_path_access_impl(
             TrusteeType: TRUSTEE_IS_UNKNOWN,
             ptstrName: sid as *mut u16,
         },
-    };
+    }
+}
 
+/// Merges `ea` into `old_dacl` and writes the result back to `path_wide`.
+fn apply_dacl_entry(
+    path_wide: &[u16],
+    old_dacl: *mut ACL,
+    ea: &EXPLICIT_ACCESS_W,
+) -> io::Result<()> {
     let mut new_dacl = std::ptr::null_mut();
-    let err = unsafe { SetEntriesInAclW(1, &ea, old_dacl, &mut new_dacl) };
+    let err = unsafe { SetEntriesInAclW(1, ea, old_dacl, &mut new_dacl) };
     if err != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(err as i32));
     }
-    struct AclGuard(HLOCAL);
-    impl Drop for AclGuard {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { LocalFree(self.0) };
-            }
-        }
-    }
-    let _acl_guard = AclGuard(new_dacl as HLOCAL);
+    let _acl_guard = LocalGuard(new_dacl as HLOCAL);
 
     let err = unsafe {
         SetNamedSecurityInfoW(
@@ -408,6 +428,79 @@ fn grant_path_access_impl(
         return Err(io::Error::from_raw_os_error(err as i32));
     }
     Ok(())
+}
+
+fn grant_path_access_impl(
+    path: &Path,
+    sid: PSID,
+    access_mask: u32,
+    inheritance: u32,
+) -> io::Result<()> {
+    let path_wide = path_to_wide(path);
+    let (old_dacl, _sd_guard) = read_dacl(&path_wide)?;
+
+    // #505: grant already present → skip the subtree rewrite entirely. Only
+    // meaningful for the inheriting case (dacl_has_inheritable_allow_ace only
+    // matches (OI)(CI) aces); the this-only grant always re-applies, which is
+    // idempotent and cheap on the short ancestor chains it's used for.
+    if inheritance == SUB_CONTAINERS_AND_OBJECTS_INHERIT
+        && unsafe { dacl_has_inheritable_allow_ace(old_dacl, sid, access_mask) }
+    {
+        return Ok(());
+    }
+
+    let ea = ace_entry(sid, access_mask, GRANT_ACCESS, inheritance);
+    apply_dacl_entry(&path_wide, old_dacl, &ea)
+}
+
+fn is_missing_object(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(code)
+        if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PATH_NOT_FOUND as i32)
+}
+
+/// #575: removes every allow ACE for `sid` from the DACL of `path`, whatever
+/// its mask or inheritance flags, and reports whether anything was removed.
+///
+/// Idempotent, so deregistration never fails on residue that is already gone:
+/// a path that no longer exists and a DACL carrying no ACE for `sid` both
+/// return `Ok(false)` without touching the object. The pre-check also keeps the
+/// inheritance propagation walk (the cost #505 removed) off every path that was
+/// never granted.
+pub(super) fn revoke_path_access(path: &Path, sid: PSID) -> io::Result<bool> {
+    let path_wide = path_to_wide(path);
+    let (old_dacl, _sd_guard) = match read_dacl(&path_wide) {
+        Ok(dacl) => dacl,
+        Err(e) if is_missing_object(&e) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if !unsafe { dacl_has_any_allow_ace(old_dacl, sid) } {
+        return Ok(false);
+    }
+
+    // REVOKE_ACCESS drops every entry for the trustee, so the mask and
+    // inheritance an ACE was granted with do not have to be reproduced here.
+    let ea = ace_entry(sid, 0, REVOKE_ACCESS, 0);
+    apply_dacl_entry(&path_wide, old_dacl, &ea)?;
+    Ok(true)
+}
+
+/// #575: deletes the AppContainer profile and its on-disk profile directory,
+/// reporting whether one existed. An absent profile is not an error.
+pub(super) fn delete_appcontainer_profile(profile_name: &str) -> io::Result<bool> {
+    const HRESULT_WIN32: u32 = 0x8007_0000;
+    let wide = to_wide(profile_name);
+    let hr = unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
+    if hr == 0 {
+        return Ok(true);
+    }
+    let err = hr as u32;
+    if err == (HRESULT_WIN32 | ERROR_NOT_FOUND) || err == (HRESULT_WIN32 | ERROR_FILE_NOT_FOUND) {
+        return Ok(false);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        format!("DeleteAppContainerProfile failed: HRESULT {hr:#010x}"),
+    ))
 }
 
 /// Grants FILE_TRAVERSE (0x0020) — "pass through," not "list contents" — on
