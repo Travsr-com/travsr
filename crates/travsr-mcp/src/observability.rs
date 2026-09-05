@@ -361,10 +361,17 @@ fn decode_phase_b_warnings(
                     rest.to_string(),
                     (
                         "failed",
+                        // #843: the outcome records only the language, so no
+                        // cause can be asserted from it. Name the candidates
+                        // and the command that prints the analyzer's own
+                        // stderr, which the host logs at warn.
                         format!(
                             "semantic analyzer for '{rest}' ran but found no symbols despite \
-                             '{rest}' sources being present, re-run \
-                             `travsr init --semantic --force` after fixing the project setup"
+                             '{rest}' sources being present, and did not crash; the build's \
+                             semantic output may be off, nothing may have been recompiled, or \
+                             the repo may have no in-corpus '{rest}' references. Re-run \
+                             `RUST_LOG=travsr_plugin_host=warn travsr init --semantic --force` \
+                             to see the analyzer's own diagnostics"
                         ),
                     ),
                 );
@@ -2376,6 +2383,25 @@ mod tests {
         );
         // The repo forbids em-dashes, so the CLI's dash is a comma here.
         assert!(!detail.contains('\u{2014}'), "em-dash: {detail}");
+    }
+
+    /// #843: an agent reading this detail acted on the asserted cause, telling
+    /// the user to fix a build that was not broken. The outcome carries no
+    /// evidence of why the analyzer returned nothing, so the detail must stay
+    /// with what was observed and name the command that produces the evidence.
+    #[test]
+    fn zero_nodes_detail_names_candidates_instead_of_asserting_a_cause() {
+        let decoded = decode_phase_b_warnings("zero_nodes:go", "");
+        let (state, detail) = decoded.get("go").expect("go must decode");
+        assert_eq!(*state, "failed", "a zero-node run is still terminal");
+        assert!(
+            !detail.contains("after fixing the project setup"),
+            "must not assert an unverified cause: {detail}"
+        );
+        assert!(
+            detail.contains("RUST_LOG=travsr_plugin_host=warn"),
+            "must name how to see the analyzer's own output: {detail}"
+        );
     }
 
     /// #636 round-5 review: pinning one string's wording was not enough. The

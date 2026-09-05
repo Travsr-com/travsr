@@ -471,13 +471,14 @@ impl Transport for Sidecar {
                 // A clean handshake + invoke that nonetheless yields zero nodes is
                 // the exact shape of a silent analyzer failure (e.g. libclang
                 // denied a sandbox read → every TU fails to parse → empty index).
-                // Echo the sidecar's own stderr at debug so the cause is
-                // recoverable rather than surfacing only as a generic zero-node
-                // warning with a misdirecting remedy.
+                // #843: this stderr is the only evidence of why, and nothing
+                // downstream carries it, so it warns like the handshake-failure
+                // and crash echoes rather than sitting below the daemon log's
+                // default level.
                 if resp.nodes.is_empty() {
                     let tail = self.stderr_ring.tail();
                     if !tail.is_empty() {
-                        tracing::debug!(
+                        tracing::warn!(
                             lang = %self.language,
                             stderr = %tail,
                             "Phase B: sidecar returned zero nodes; sidecar stderr follows"
