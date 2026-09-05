@@ -11,22 +11,26 @@ use travsr_plugin_protocol::{HandshakeResponse, PROTOCOL_VERSION};
 
 /// Maps canonical language name → expected fuzz target filename under fuzz/fuzz_targets/.
 /// ADR-017 Rule 4: in-process grammars MUST have a fuzz target.
+///
+/// The runtime check below only logs. `.github/scripts/check-fuzz-targets.mjs`
+/// is the enforcing one: it fails CI when an entry here has no target source,
+/// or when a target exists but the nightly fuzz matrix does not run it.
 const FUZZ_TARGETS: &[(&str, &str)] = &[
     ("typescript", "fuzz_treesitter_indexer.rs"),
     ("rust", "fuzz_treesitter_indexer.rs"), // shared indexer target covers Rust
     ("python", "fuzz_pyright_lsif_parser.rs"),
     ("go", "fuzz_go_parser.rs"),
-    ("java", "fuzz_java_parser.rs"), // TODO: create this fuzz target
-    ("kotlin", "fuzz_kotlin_parser.rs"), // TODO: create this fuzz target
-    ("ruby", "fuzz_ruby_parser.rs"), // TODO: create this fuzz target
-    ("csharp", "fuzz_csharp_parser.rs"), // TODO: create this fuzz target
-    ("php", "fuzz_php_parser.rs"),   // TODO: create this fuzz target
-    ("scala", "fuzz_scala_parser.rs"), // TODO: create this fuzz target
-    ("cpp", "fuzz_cpp_parser.rs"),   // TODO: create this fuzz target
-    ("c", "fuzz_c_parser.rs"),       // TODO: create this fuzz target
+    ("java", "fuzz_java_parser.rs"),
+    ("kotlin", "fuzz_kotlin_parser.rs"),
+    ("ruby", "fuzz_ruby_parser.rs"),
+    ("csharp", "fuzz_csharp_parser.rs"),
+    ("php", "fuzz_php_parser.rs"),
+    ("scala", "fuzz_scala_parser.rs"),
+    ("cpp", "fuzz_cpp_parser.rs"),
+    ("c", "fuzz_c_parser.rs"),
     ("swift", "fuzz_swift_parser.rs"),
     ("dart", "fuzz_dart_parser.rs"),
-    ("objectivec", "fuzz_objc_parser.rs"), // TODO(#345): create this fuzz target
+    ("objectivec", "fuzz_objc_parser.rs"),
 ];
 
 /// Emitted at most once per process, like [`SANDBOX_PROBED`] below.
