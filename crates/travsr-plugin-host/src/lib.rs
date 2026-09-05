@@ -58,7 +58,7 @@ pub use transport::{InProcess, PluginHealth, Sidecar, Transport};
 /// `#![forbid(unsafe_code)]`).
 ///
 /// Delegates to [`sandbox::windows::pid_alive`], the same probe
-/// `embed_catalog::pid_alive` already uses for the daemon shutdown grace
+/// `embed_catalog::pid_liveness` uses for the daemon shutdown grace
 /// poll; `unsafe` stays confined to `sandbox/windows/ffi.rs` per ADR-017
 /// Amendment A2 Invariant 1, this is a safe wrapper only.
 ///

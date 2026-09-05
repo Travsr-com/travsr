@@ -1224,8 +1224,9 @@ pub(super) fn terminate_process(handle: HANDLE) -> io::Result<()> {
 /// non-child processes and across integrity levels) and checks
 /// `GetExitCodeProcess` for `STILL_ACTIVE`. Returns `false` when the PID
 /// cannot be opened (already exited and reaped) or an exit code is recorded.
-/// Sends no signal. `pub(crate)`: `embed_catalog::pid_alive` delegates here so
-/// the daemon-shutdown grace poll can observe the sidecar, keeping all unsafe
+/// Sends no signal. `pub(crate)`: `crate::windows_pid_is_alive` wraps this, and
+/// `embed_catalog::pid_liveness` reaches it through that wrapper so the
+/// daemon-shutdown grace poll can observe the sidecar, keeping all unsafe
 /// confined to this file.
 pub(crate) fn pid_alive(pid: u32) -> bool {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
