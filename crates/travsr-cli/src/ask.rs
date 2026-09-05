@@ -39,8 +39,18 @@ struct Row {
 /// `|` bars, which roughly tripled the stdout an agent piping `ask` receives
 /// for output no human reads. Columns still align; only the frame is dropped.
 /// The machine surface is `--format json`, so this affects the human view only.
+///
+/// `Style::blank()` pads the last column, so every line would otherwise end in
+/// a space: invisible in a terminal, but still a byte per row in the stdout
+/// this change exists to shrink, and whitespace noise the moment anyone diffs
+/// captured output. Trim it back off.
 fn render_rows(rows: Vec<Row>) -> String {
-    Table::new(rows).with(Style::blank()).to_string()
+    let table = Table::new(rows).with(Style::blank()).to_string();
+    table
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The match-source lanes the grouped human table renders, in backend
@@ -1832,6 +1842,14 @@ mod render_tests {
         assert!(out.is_ascii(), "non-ASCII in table:\n{out}");
         // `path:line` stays one unbroken, clickable token.
         assert!(out.contains("crates/travsr-cli/src/ask.rs:1"));
+
+        // No line ends in whitespace: `Style::blank()` pads the last column and
+        // would otherwise leave a trailing space on every row. A stray `\r` is
+        // stripped first so this cannot fail on a CRLF checkout.
+        for line in out.lines() {
+            let line = line.trim_end_matches('\r');
+            assert_eq!(line, line.trim_end(), "trailing whitespace: {line:?}");
+        }
     }
 
     /// The kind is folded away only when the signature already spells it.
