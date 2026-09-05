@@ -236,7 +236,7 @@ pub fn run() -> anyhow::Result<()> {
     // already knows, and its "wait for the daemon to reconcile" advice cannot
     // work when the served index describes a tree that is not this one.
     let stored = payload.last_commit.as_deref().unwrap_or("");
-    if let Some(note) = crate::repo::cross_checkout_note_for_db(&db_path, Some(stored)) {
+    if let Some(note) = crate::repo::cross_checkout_note_for_db(&cwd, &db_path, Some(stored)) {
         eprintln!("warning: {note}");
     } else if let Some(head) = head.as_deref() {
         if let Some(note) = travsr_mcp::head_index_mismatch_note(head, stored) {

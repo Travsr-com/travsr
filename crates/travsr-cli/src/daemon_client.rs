@@ -227,17 +227,32 @@ pub fn open_read_store(db_path: &Path) -> anyhow::Result<SqliteStore> {
 ///
 /// Silent on any error: a freshness note is not worth failing a query over.
 ///
-/// A linked worktree served by another checkout's index takes precedence and
-/// replaces the freshness note. Both say "the answer you are reading may not be
-/// about your tree", but only one is true at a time and they call for opposite
-/// responses: the freshness note tells the user to wait or re-index, which is
-/// exactly the advice that cannot work when the served index is a faithful
-/// description of a *different* checkout. Saying "has not caught up with the
-/// current commit" there is the misleading half, so it is not said.
-pub fn warn_if_call_graph_degraded(db_path: &Path) {
-    if warn_if_cross_checkout(db_path) {
-        return;
+/// A linked worktree served by another checkout's index takes precedence: its
+/// note names both trees and states plainly that waiting or re-indexing will
+/// never make the served index describe this worktree, which is exactly the
+/// advice the freshness note ("has not caught up with the current commit") gives
+/// and gets wrong here. The one true half of the freshness note — that empty
+/// results from a degraded index are not authoritative — is folded into the
+/// cross-checkout note instead (see `repo::cross_checkout_note`), so it is not
+/// lost, and the misleading "it will catch up to your tree" framing is not said.
+///
+/// Returns whether the cross-checkout note was emitted, so a caller can suppress
+/// its own hedged drift note keyed to the note that was actually printed rather
+/// than to a fresh recomputation of the same predicate.
+pub fn warn_if_call_graph_degraded(db_path: &Path) -> bool {
+    let cross = warn_if_cross_checkout(db_path);
+    if !cross {
+        warn_if_phase_b_degraded(db_path);
     }
+    cross
+}
+
+/// The Phase B completeness half of [`warn_if_call_graph_degraded`], on its own.
+/// Split out so a caller that has already decided the cross-checkout question
+/// (`graph`, which emits the cross-checkout note for every direction but the
+/// completeness note only for the call-edge directions) can reach it without
+/// re-running the cross-checkout classification.
+pub(crate) fn warn_if_phase_b_degraded(db_path: &Path) {
     if let Ok(store) = open_read_store(db_path) {
         if let Some(note) = travsr_mcp::phase_b_degraded_note(&store) {
             eprintln!("warning: {note}");
@@ -257,22 +272,35 @@ pub fn warn_if_call_graph_degraded(db_path: &Path) {
 /// for `callers`. A complete answer about the wrong tree is still wrong.
 ///
 /// Classifies from the filesystem first and opens the store only once the note
-/// is certain, purely to name the commit the served index describes, so the
-/// ordinary case costs no store open at all.
+/// is certain, so the ordinary case costs no store open at all. When it does
+/// open, it reads both the commit to name and whether the served index is
+/// Phase B degraded from the *same* handle, so the degraded caveat costs no
+/// second open.
 pub fn warn_if_cross_checkout(db_path: &Path) -> bool {
-    if crate::repo::served_by_other_checkout(db_path).is_none() {
+    if crate::repo::worktree_note_suppressed() {
         return false;
     }
-    let commit = open_read_store(db_path)
-        .ok()
-        .and_then(|s| s.get_meta("last_commit").ok().flatten());
-    match crate::repo::cross_checkout_note_for_db(db_path, commit.as_deref()) {
-        Some(note) => {
-            eprintln!("warning: {note}");
-            true
-        }
-        None => false,
-    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    let Some(here) = crate::repo::served_by_other_checkout(&cwd, db_path) else {
+        return false;
+    };
+    let Some(served) = db_path.parent().and_then(Path::parent) else {
+        return false;
+    };
+    let (commit, degraded) = match open_read_store(db_path) {
+        Ok(s) => (
+            s.get_meta("last_commit").ok().flatten(),
+            travsr_mcp::phase_b_degraded_note(&s).is_some(),
+        ),
+        Err(_) => (None, false),
+    };
+    eprintln!(
+        "warning: {}",
+        crate::repo::cross_checkout_note(&here, served, commit.as_deref(), degraded)
+    );
+    true
 }
 
 #[cfg(test)]

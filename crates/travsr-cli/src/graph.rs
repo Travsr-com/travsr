@@ -102,11 +102,14 @@ pub fn run(
     //
     // The cross-checkout note is not subject to that split: it says which tree
     // the answer describes, and a complete `deps` answer about the wrong
-    // checkout is still the wrong answer.
-    if matches!(direction, Direction::Deps) {
-        daemon_client::warn_if_cross_checkout(&db_path);
-    } else {
-        daemon_client::warn_if_call_graph_degraded(&db_path);
+    // checkout is still the wrong answer. Emitting it explicitly here, rather
+    // than relying on `warn_if_call_graph_degraded` to delegate to it, keeps the
+    // "every direction gets the cross-checkout note" rule visible at the call
+    // site that owns the split — a refactor of that delegation cannot silently
+    // drop it from `callers` / `blast-radius`.
+    let cross = daemon_client::warn_if_cross_checkout(&db_path);
+    if !cross && !matches!(direction, Direction::Deps) {
+        daemon_client::warn_if_phase_b_degraded(&db_path);
     }
 
     // Daemon route first (#318 O1), direct read-only open as fallback.
