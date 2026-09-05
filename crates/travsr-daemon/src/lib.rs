@@ -2184,6 +2184,107 @@ fn lsif_covered_keys(
         .collect()
 }
 
+/// #836: the direct base classes of each `class:{name}` node, indexed by the
+/// file that declares the subclass, so [`resolve_unresolved_calls`] can retry an
+/// inherited method against the classes a subclass actually declares.
+///
+/// Phase B derives a base's node id from the *subclass's* own path
+/// (`phase_b_python.rs` / `phase_b_typescript.rs`), so an `IsImplementation`
+/// edge is only ever evidence about two classes declared in the same file. A
+/// base imported from another module resolves to no node and is dropped here,
+/// which is also what keeps a same-named class in an unrelated file from
+/// lending its bases to this one.
+#[derive(Default)]
+struct ClassHierarchy {
+    bases_by_path:
+        std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
+}
+
+impl ClassHierarchy {
+    /// Deepest inheritance chain walked. Python's own C3 linearization is
+    /// unbounded, but a chain this long is far past any real class tree and the
+    /// cap keeps a corrupted index from costing an unbounded walk.
+    const MAX_DEPTH: usize = 8;
+
+    fn build(store: &SqliteStore, pb_edges: &[travsr_core::Edge]) -> Self {
+        let inheritance: Vec<&travsr_core::Edge> = pb_edges
+            .iter()
+            .filter(|e| e.kind == travsr_core::EdgeKind::IsImplementation)
+            .collect();
+        if inheritance.is_empty() {
+            return Self::default();
+        }
+        let endpoints: Vec<travsr_core::NodeId> = {
+            let mut v: Vec<travsr_core::NodeId> =
+                inheritance.iter().flat_map(|e| [e.src, e.dst]).collect();
+            v.sort_unstable_by_key(|id| id.0);
+            v.dedup();
+            v
+        };
+        let classes: std::collections::HashMap<travsr_core::NodeId, (String, String)> = store
+            .get_nodes(&endpoints)
+            .unwrap_or_else(|e| {
+                tracing::warn!("resolve_unresolved_calls: class hierarchy lookup failed: {e}");
+                Vec::new()
+            })
+            .into_iter()
+            .filter_map(|n| {
+                let name = n.vname.signature.strip_prefix("class:")?.to_string();
+                Some((n.id, (n.vname.path, name)))
+            })
+            .collect();
+
+        let mut bases_by_path: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Vec<String>>,
+        > = std::collections::HashMap::new();
+        for e in inheritance {
+            let (Some((path, subclass)), Some((_, base))) =
+                (classes.get(&e.src), classes.get(&e.dst))
+            else {
+                continue;
+            };
+            bases_by_path
+                .entry(path.clone())
+                .or_default()
+                .entry(subclass.clone())
+                .or_default()
+                .push(base.clone());
+        }
+        Self { bases_by_path }
+    }
+
+    /// The base classes of `class` as declared in `path`, nearest first.
+    ///
+    /// Breadth-first over declaration order: identical to Python's C3
+    /// linearization for single inheritance, and for multiple inheritance it
+    /// still visits a nearer base before a farther one.
+    fn ancestors(&self, path: &str, class: &str) -> Vec<String> {
+        let Some(bases) = self.bases_by_path.get(path) else {
+            return Vec::new();
+        };
+        let mut ordered: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::from([class]);
+        let mut frontier: Vec<&str> = vec![class];
+        for _ in 0..Self::MAX_DEPTH {
+            let mut next: Vec<&str> = Vec::new();
+            for subclass in &frontier {
+                for base in bases.get(*subclass).into_iter().flatten() {
+                    if seen.insert(base.as_str()) {
+                        ordered.push(base.clone());
+                        next.push(base.as_str());
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        ordered
+    }
+}
+
 /// Write the result of one Phase B (SCIP) pass into `store`, returning a
 /// [`PhaseBReport`].
 ///
@@ -2441,6 +2542,56 @@ fn resolve_unresolved_calls(
         .map(|n| (n.id, n.vname.language))
         .collect();
 
+    // #836: inherited-method resolution. `self.method()` recovers its receiver
+    // as the enclosing class, so a method defined on a base class has no
+    // `method:{T}.{leaf}` node and the exact tier above misses it. Retry it
+    // against the classes `T` declares as bases, which the extractor already
+    // recorded as `IsImplementation` edges. This is a second exact-signature
+    // tier, not a relaxation of the branch-(3) guard below: only a base named
+    // by a recorded inheritance edge is tried, and only its exact
+    // `method:{Base}.{leaf}` node may resolve the call.
+    let hierarchy = ClassHierarchy::build(store, pb_edges);
+    let mut mro_chains: std::collections::HashMap<(&str, &str), Vec<String>> =
+        std::collections::HashMap::new();
+    let mut inherited_sigs: Vec<String> = Vec::new();
+    for u in unresolved {
+        if !u.is_method_call {
+            continue;
+        }
+        let Some(t) = u.recv_type.as_deref() else {
+            continue;
+        };
+        let leaf = leaf_of(&u.callee_sig);
+        if !known_graph_types.contains(t)
+            || by_recv_sig.contains_key(format!("method:{t}.{leaf}").as_str())
+        {
+            continue;
+        }
+        let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
+        let chain = mro_chains
+            .entry((caller_path, t))
+            .or_insert_with(|| hierarchy.ancestors(caller_path, t));
+        inherited_sigs.extend(chain.iter().map(|base| format!("method:{base}.{leaf}")));
+    }
+    inherited_sigs.sort_unstable();
+    inherited_sigs.dedup();
+    let inherited_candidates = store
+        .nodes_by_signatures(&inherited_sigs)
+        .unwrap_or_else(|e| {
+            tracing::warn!("resolve_unresolved_calls: inherited method lookup failed: {e}");
+            Vec::new()
+        });
+    let mut by_inherited_sig: std::collections::HashMap<
+        &str,
+        Vec<(travsr_core::NodeId, &str, &str)>,
+    > = std::collections::HashMap::new();
+    for (id, sig, path, lang) in &inherited_candidates {
+        by_inherited_sig
+            .entry(sig.as_str())
+            .or_default()
+            .push((*id, path.as_str(), lang.as_str()));
+    }
+
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
     let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
     for u in unresolved {
@@ -2546,7 +2697,30 @@ fn resolve_unresolved_calls(
                         // hit may resolve a receiver-recovered method call.
                         // Genuine sites remain covered by the E7 LSIF/scip
                         // path.
-                        None => continue,
+                        //
+                        // #836: one case is decidable without guessing. If `T`
+                        // declares a base class (an `IsImplementation` edge the
+                        // extractor recorded from `class T(Base)`) and that base
+                        // defines this method exactly, the call is an inherited
+                        // call and its target is named by the graph, not by leaf
+                        // uniqueness. An external receiver has no such edge, so
+                        // the `Command.stdin` collision above still falls
+                        // through to `continue`.
+                        None => {
+                            let caller_path =
+                                caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
+                            let leaf = leaf_of(&u.callee_sig);
+                            match mro_chains
+                                .get(&(caller_path, t.as_str()))
+                                .into_iter()
+                                .flatten()
+                                .find_map(|base| {
+                                    by_inherited_sig.get(format!("method:{base}.{leaf}").as_str())
+                                }) {
+                                Some(m) => m.clone(),
+                                None => continue,
+                            }
+                        }
                     }
                 }
                 // #604: receiver type not recovered — no evidence of a call
@@ -6075,6 +6249,165 @@ mod tests {
         assert!(
             edges.is_empty(),
             "class receiver without the method must not resolve by unique-leaf guess (#606): {edges:?}"
+        );
+        assert!(sites.is_empty());
+    }
+
+    /// Build a Python `class:{name}` node in `path` and put it in `store`.
+    fn py_class(store: &mut SqliteStore, path: &str, name: &str) -> travsr_core::Node {
+        use travsr_core::{Node, VName};
+        let n = Node::new(
+            VName::new("", "", path, "python", format!("class:{name}")),
+            "class",
+        );
+        store.put_node(&n).unwrap();
+        n
+    }
+
+    /// Build a Python `method:{class}.{name}` node in `path` and put it in `store`.
+    fn py_method(
+        store: &mut SqliteStore,
+        path: &str,
+        class: &str,
+        name: &str,
+    ) -> travsr_core::Node {
+        use travsr_core::{Node, VName};
+        let n = Node::new(
+            VName::new("", "", path, "python", format!("method:{class}.{name}")),
+            "method",
+        );
+        store.put_node(&n).unwrap();
+        n
+    }
+
+    #[test]
+    fn e4_inherited_method_resolves_through_is_implementation_836() {
+        // #836: `psf/requests` shape. `Session.send` calls
+        // `self.resolve_redirects()`, defined on the base `SessionRedirectMixin`.
+        // `method:Session.resolve_redirects` does not exist, so the exact
+        // `by_recv_sig` tier misses; the `IsImplementation` edge Phase B emitted
+        // for `class Session(SessionRedirectMixin)` names the base, and the base
+        // does define the method exactly.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let path = "requests/sessions.py";
+
+        let caller = py_method(&mut store, path, "Session", "send");
+        let session = py_class(&mut store, path, "Session");
+        let mixin = py_class(&mut store, path, "SessionRedirectMixin");
+        let callee = py_method(
+            &mut store,
+            path,
+            "SessionRedirectMixin",
+            "resolve_redirects",
+        );
+
+        let pb_edges = vec![travsr_core::Edge::new(
+            session.id,
+            mixin.id,
+            travsr_core::EdgeKind::IsImplementation,
+        )];
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:resolve_redirects".to_string(),
+            alt_callee_sig: None,
+            hint_crate: None,
+            caller_line: 804,
+            is_method_call: true,
+            recv_type: Some("Session".to_string()),
+        }];
+
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(edges.len(), 1, "inherited method must resolve: {edges:?}");
+        assert_eq!(edges[0].dst, callee.id);
+        assert_eq!(sites, vec![(caller.id, callee.id, 804)]);
+    }
+
+    #[test]
+    fn e4_inherited_method_walks_multi_level_mro_836() {
+        // #836: the method lives two levels up (`Leaf` -> `Mid` -> `Root`), so
+        // the retry must follow the inheritance chain transitively, not just the
+        // direct base.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let path = "pkg/models.py";
+
+        let caller = py_method(&mut store, path, "Leaf", "run");
+        let leaf = py_class(&mut store, path, "Leaf");
+        let mid = py_class(&mut store, path, "Mid");
+        let root = py_class(&mut store, path, "Root");
+        let callee = py_method(&mut store, path, "Root", "save");
+
+        let pb_edges = vec![
+            travsr_core::Edge::new(leaf.id, mid.id, travsr_core::EdgeKind::IsImplementation),
+            travsr_core::Edge::new(mid.id, root.id, travsr_core::EdgeKind::IsImplementation),
+        ];
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:save".to_string(),
+            alt_callee_sig: None,
+            hint_crate: None,
+            caller_line: 12,
+            is_method_call: true,
+            recv_type: Some("Leaf".to_string()),
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(edges.len(), 1, "grandparent method must resolve: {edges:?}");
+        assert_eq!(edges[0].dst, callee.id);
+    }
+
+    #[test]
+    fn e4_inherited_method_requires_a_same_file_inheritance_edge_836() {
+        // #836 fail-closed guard: an unrelated file declares its own `Session`
+        // that DOES inherit `Base`, and `Base.helper` exists. The caller's own
+        // `Session` has no base at all, so the same-named class elsewhere must
+        // not lend it a method table (#529/#604/#606: a same-named in-graph type
+        // is never evidence of the target).
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = py_method(&mut store, "app/one.py", "Session", "run");
+        py_class(&mut store, "app/one.py", "Session");
+
+        let other_session = py_class(&mut store, "app/two.py", "Session");
+        let base = py_class(&mut store, "app/two.py", "Base");
+        py_method(&mut store, "app/two.py", "Base", "helper");
+
+        let pb_edges = vec![travsr_core::Edge::new(
+            other_session.id,
+            base.id,
+            travsr_core::EdgeKind::IsImplementation,
+        )];
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:helper".to_string(),
+            alt_callee_sig: None,
+            hint_crate: None,
+            caller_line: 7,
+            is_method_call: true,
+            recv_type: Some("Session".to_string()),
+        }];
+
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "another file's same-named class must not supply a base (#836): {edges:?}"
         );
         assert!(sites.is_empty());
     }
