@@ -128,6 +128,32 @@ fn head_at(cwd: &std::path::Path) -> Option<String> {
     crate::git_bounded::git_stdout_bounded(Some(cwd), ["rev-parse", "--short", "HEAD"])
 }
 
+/// The `zero_nodes:<lang>` lines, in print order.
+///
+/// #712: the analyzer ran over this language's sources and returned nothing at
+/// all. Not a crash, and not a missing analyzer either: `resolver.rs` skips a
+/// language up front when its underlying tool is absent, so anything that
+/// reaches here had both the wrapper and the tool.
+fn zero_nodes_warning_lines(lang: &str) -> Vec<String> {
+    let mut out = vec![format!(
+        "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. It completed without crashing and its analyzer is installed, so reinstalling will not help. Causes vary: the analyzer's semantic output may not be enabled for this project's build, nothing may have been recompiled, the build may have written where the analyzer did not look, or the repo may genuinely have no in-corpus '{lang}' references. Re-run `RUST_LOG=travsr_plugin_host=warn travsr init --semantic --force` to see the analyzer's own diagnostics"
+    )];
+    if let Some(entry) = travsr_plugin_host::phase_b::catalog::lookup(lang) {
+        let prereq = entry.effective_prerequisites();
+        if !prereq.is_empty() && prereq != "none" {
+            out.push(format!("  needs: {prereq}"));
+        }
+    }
+    // #724 Finding 4: the most common cause of a zero-node Java run on macOS is
+    // scip-java's javac shim crashing under the stock bash 3.2.
+    if lang == "java" {
+        if let Some(hint) = crate::progress::macos_java_bash_hint() {
+            out.push(format!("  {hint}"));
+        }
+    }
+    out
+}
+
 pub fn run() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     // `head_at` and `find_git_root` are independent, bounded git queries on the
@@ -246,16 +272,6 @@ pub fn run() -> anyhow::Result<()> {
                     ["needs_consent", lang] => eprintln!(
                         "warning: full '{lang}' analysis needs your permission to run; run `travsr lang allow-unsandboxed {lang}`"
                     ),
-                    // #712: analyzer ran but produced no nodes over the repo's
-                    // source files of this language — a silent zero-node result,
-                    // not a crash. Point at the tool and a rebuild.
-                    // UX-3: the analyzer is installed and active (the zero-node
-                    // warning only fires for a language that ran), so telling the
-                    // user to reinstall misdirects — reinstalling changes nothing.
-                    // The real causes are the sidecar failing to parse/resolve this
-                    // repo's sources (e.g. a sandbox-denied read, a missing SDK, or
-                    // no buildable project). Point at the sidecar's own diagnostics,
-                    // which the host now forwards on stderr.
                     // #724: definitions arrived, occurrences did not, so no call
                     // edge can come from this language. The analyzer reported
                     // success, which is what makes it worth saying out loud.
@@ -265,26 +281,8 @@ pub fn run() -> anyhow::Result<()> {
                         );
                     }
                     ["zero_nodes", lang] => {
-                        eprintln!(
-                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help, it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
-                        );
-                        // Name the concrete thing to check rather than leaving
-                        // "a missing SDK or an unbuildable project" as the only
-                        // clue — the catalog already knows what this language's
-                        // analyzer needs from the project.
-                        if let Some(entry) = travsr_plugin_host::phase_b::catalog::lookup(lang) {
-                            let prereq = entry.effective_prerequisites();
-                            if !prereq.is_empty() && prereq != "none" {
-                                eprintln!("  needs: {prereq}");
-                            }
-                        }
-                        // #724 Finding 4: the most common cause of a zero-node
-                        // Java run on macOS is scip-java's javac shim crashing
-                        // under the stock bash 3.2. Surface the actionable fix.
-                        if *lang == "java" {
-                            if let Some(hint) = crate::progress::macos_java_bash_hint() {
-                                eprintln!("  {hint}");
-                            }
+                        for line in zero_nodes_warning_lines(lang) {
+                            eprintln!("{line}");
                         }
                     }
                     // #449: languages present in the repo whose Phase B sidecar
@@ -529,6 +527,66 @@ mod tests {
         let mut p = payload("abc", "abc", false);
         p.phase_b_warnings = Some("zero_nodes:go".into());
         assert_eq!(phase_b_state(&p), "complete");
+    }
+
+    /// #843: a clean run that returns nothing has many causes, and the host
+    /// cannot tell them apart from the outcome alone. Asserting one of them
+    /// sent users to fix a build that was already fine.
+    #[test]
+    fn zero_nodes_warning_does_not_assert_a_cause_it_cannot_know() {
+        let text = zero_nodes_warning_lines("go").join("\n");
+        for asserted in [
+            "unbuildable project",
+            "missing SDK",
+            "Fix the project setup",
+            "could not read or build",
+        ] {
+            assert!(
+                !text.contains(asserted),
+                "must not assert {asserted:?}, got: {text}"
+            );
+        }
+        assert!(
+            text.contains("ran but found no symbols"),
+            "must still state what was observed: {text}"
+        );
+    }
+
+    /// #843: with no evidence in the outcome the message's job is to name the
+    /// candidates and the one command that produces the analyzer's own output.
+    #[test]
+    fn zero_nodes_warning_offers_candidates_and_a_way_to_see_the_evidence() {
+        let text = zero_nodes_warning_lines("go").join("\n");
+        assert!(
+            text.contains("RUST_LOG=travsr_plugin_host=warn travsr init --semantic --force"),
+            "must name the command that surfaces the analyzer's stderr: {text}"
+        );
+        assert!(
+            text.matches(" may ").count() >= 3,
+            "must offer several candidate causes, not one: {text}"
+        );
+    }
+
+    /// The catalog prerequisite is the one concrete, per-language fact the host
+    /// does have, so softening the message must not drop it.
+    #[test]
+    fn zero_nodes_warning_keeps_the_catalog_prerequisite() {
+        let lang = ["java", "scala", "kotlin", "csharp", "go"]
+            .into_iter()
+            .find(|l| {
+                travsr_plugin_host::phase_b::catalog::lookup(l)
+                    .map(|e| {
+                        let p = e.effective_prerequisites();
+                        !p.is_empty() && p != "none"
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("at least one catalog language declares a prerequisite");
+        let lines = zero_nodes_warning_lines(lang);
+        assert!(
+            lines.iter().any(|l| l.starts_with("  needs: ")),
+            "prerequisite line missing for {lang}: {lines:?}"
+        );
     }
 
     #[test]
