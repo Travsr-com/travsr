@@ -401,6 +401,14 @@ jobs:
       - name: verify release matrix and installer target maps agree (#576)
         run: node .github/scripts/check-target-maps.mjs
 
+  fuzz-targets:
+    name: fuzz targets run nightly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: verify every in-process grammar is fuzzed in CI (ADR-017 Rule 4.3)
+        run: node .github/scripts/check-fuzz-targets.mjs
+
   install-sh-lint:
     name: "install.sh (shellcheck)"
     runs-on: ubuntu-latest
