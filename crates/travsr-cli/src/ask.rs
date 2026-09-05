@@ -341,20 +341,6 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             }
             println!("\n{}", pal.dim("or `travsr ask --examples` for more"));
         }
-        // #826: when no embedding backend is configured, `ask` runs without
-        // semantic search, so this abstention may be a setup gap rather than a
-        // genuine absence. `init` prints this tip, but a disappointed user is
-        // reading here, not there, so name the fix where it is actually seen.
-        if travsr_plugin_host::active_backend_id().is_none() {
-            let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
-            println!(
-                "\n{}",
-                pal.dim(
-                    "note: semantic search is not set up, so this ran without it; \
-                     run `travsr embed init` to enable natural-language matching"
-                )
-            );
-        }
         // #376 §4.3: doc hits may appear below the abstain message, but never
         // convert it into a match — `payload.matched` stays false and no
         // confidence, coverage or tier label is derived from them. This is the
@@ -364,6 +350,15 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             println!();
             print_docs(&payload.docs);
         }
+        // #826: an abstention may be a setup gap rather than a genuine absence,
+        // so say which one. `degraded_note` is the per-query signal the matched
+        // path already prints (and `--format json` already carries): it names
+        // `travsr embed init` only when semantic search really did not run for
+        // THIS query in THIS repo, and says "warming up" / "in progress" /
+        // "degraded" in the states where that command is the wrong advice.
+        if !payload.degraded_note.is_empty() {
+            println!("\n{}", payload.degraded_note);
+        }
         return Ok(());
     }
     if payload.no_results {
@@ -371,6 +366,10 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         if !payload.docs.is_empty() {
             println!();
             print_docs(&payload.docs);
+        }
+        // #826: same reasoning as the abstain branch above.
+        if !payload.degraded_note.is_empty() {
+            println!("\n{}", payload.degraded_note);
         }
         return Ok(());
     }
