@@ -276,7 +276,11 @@ fn strip_backticks(s: &str) -> &str {
 ///              prefixes, so `actor:` (a SCIP `#`-type target) is added here;
 ///              `extension:` is deliberately omitted — an extension is not a
 ///              SCIP definition target and must not steal the extended type's
-///              unification.)
+///              unification. #825: a def whose own *node kind* is `extension`
+///              gets `extension:<name>` from `unify_all`'s last-resort rung
+///              instead, tried only after every candidate below has failed
+///              corpus-wide, so the block can adopt its own Phase A node
+///              without ever displacing the type it extends.)
 ///   terms:     `field:C.n` (owner-qualified field, #757), `var:` `const:`
 ///              `static:` (unqualified package/global terms)
 pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
@@ -317,16 +321,6 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
             // N4d: Swift `actor` is now a distinct Phase A prefix and a valid
             // SCIP `#`-type unification target.
             "actor",
-            // #825 Part B: Swift/Dart `extension X` blocks are signed `extension:X`
-            // by Phase A (swift.rs, dart.rs), but the emitters emit a separate
-            // `extension`-kind def for the block, folded to `class` by
-            // `native_name_kind`. Without `extension:` in the candidate set that
-            // def matched nothing and survived as an orphan duplicate that stole
-            // the extension members' reference edges (the root of #822's
-            // class-plus-extension abstention). Line-proximity still routes the
-            // real `class X` def to its own `class:X` node, so a genuine class is
-            // never mis-unified onto an extension.
-            "extension",
         ]
         .iter()
         .map(|p| format!("{p}:{name}"))
@@ -528,22 +522,22 @@ mod tests {
     }
 
     #[test]
-    fn swift_extension_def_unifies_onto_the_extension_node() {
-        // #825 Part B / #822: a Swift (or Dart) `extension X` block is signed
-        // `extension:X` by Phase A, and its native def parses as a `class`-kind
-        // name. `candidate_signatures` must offer `extension:X` so that def
-        // unifies onto the extension node instead of surviving as an orphan
-        // duplicate that steals the extension members' reference edges.
+    fn extension_kind_def_offers_no_extension_candidate() {
+        // #825 Part B: a Swift `extension X { … }` block's native def parses as
+        // a `class`-kind name for `X` — the *extended type*. It must offer only
+        // the type candidates: the extension def and the `class X` def share one
+        // SCIP symbol (and, since a VName carries no kind, one NodeId), and both
+        // the alias map and `symbol_aliases` are last-write-wins, so offering
+        // `extension:X` here would move every reference to `X` off the class and
+        // onto whichever extension block resolved last. The block's own
+        // `extension:X` node is reached by `unify_all`'s last-resort rung, after
+        // the type has had every chance to claim the symbol.
         let p = native_name_kind("swift::InterscrollerAdHandler", "extension").unwrap();
         assert_eq!(p, parsed(None, "InterscrollerAdHandler", "class"));
         assert!(
-            candidate_signatures(&p).contains(&"extension:InterscrollerAdHandler".to_string()),
-            "an extension-kind def must offer the extension: candidate"
+            !candidate_signatures(&p).contains(&"extension:InterscrollerAdHandler".to_string()),
+            "extension: must not be a general class-kind candidate"
         );
-        // The real `class X` def still offers `class:X`, so line-proximity keeps
-        // the two apart — the fix adds a candidate, it does not remove one.
-        let c = native_name_kind("swift::InterscrollerAdHandler", "class").unwrap();
-        assert!(candidate_signatures(&c).contains(&"class:InterscrollerAdHandler".to_string()));
     }
 
     #[test]
@@ -895,8 +889,7 @@ mod tests {
                 "type:Server",
                 "protocol:Server",
                 "namespace:Server",
-                "actor:Server",
-                "extension:Server"
+                "actor:Server"
             ]
         );
     }

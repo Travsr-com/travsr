@@ -148,25 +148,18 @@ fn warned_langs(payload: &StatusPayload, kind: &str) -> Vec<String> {
         .collect()
 }
 
-/// #825: print the unreconciled SCIP definitions behind the E6 miss warning.
+/// #825: render the unreconciled SCIP definitions behind the E6 miss warning.
 ///
 /// The miss set is deterministic, so the actionable information is *which*
 /// definitions miss (which language/construct is failing), not a bare count.
-/// Each stored row is `lang\tkind\tsymbol\tpath:line`; a malformed row is
-/// skipped rather than crashing status. Display is capped so a large repo does
-/// not flood the terminal — the warning's `missed/attempted` rate carries the
-/// true total.
-fn print_unification_misses(payload: &StatusPayload) {
-    for line in unification_miss_lines(payload.scip_unification_miss_list.as_deref()) {
-        eprintln!("{line}");
-    }
-}
-
-/// Pure renderer for [`print_unification_misses`], split out so it is testable
-/// without capturing stderr. Each stored row is `lang\tkind\tsymbol\tpath:line`;
-/// a malformed row is passed through verbatim rather than dropped. Display is
-/// capped at `SHOW`, with a trailing "… and N more" when the list is longer.
-fn unification_miss_lines(list: Option<&str>) -> Vec<String> {
+/// Each stored row is `lang\tkind\tsymbol\tpath:line`; a malformed row is passed
+/// through verbatim rather than dropped. Pure (no stderr) so it is unit-testable.
+///
+/// Display is capped at `SHOW`. `missed` is the true total from the warning's
+/// `missed/attempted` rate, which is larger than `list` whenever the daemon hit
+/// its own storage cap (`MAX_MISS_ROWS`) — the overflow line must count from it,
+/// not from the stored rows, or the tail contradicts the warning above it.
+fn unification_miss_lines(list: Option<&str>, missed: Option<usize>) -> Vec<String> {
     const SHOW: usize = 20;
     let Some(list) = list.filter(|s| !s.is_empty()) else {
         return Vec::new();
@@ -185,8 +178,11 @@ fn unification_miss_lines(list: Option<&str>) -> Vec<String> {
             }
         })
         .collect();
-    if rows.len() > SHOW {
-        out.push(format!("  … and {} more", rows.len() - SHOW));
+    // `max(rows.len())` keeps the tail honest if the rate and the list ever
+    // disagree the other way (daemon/CLI skew): never under-report the rest.
+    let total = missed.unwrap_or(0).max(rows.len());
+    if total > out.len() {
+        out.push(format!("  … and {} more", total - out.len()));
     }
     out
 }
@@ -426,11 +422,31 @@ pub fn run() -> anyhow::Result<()> {
                     // "Re-run `travsr init --semantic` if it persists" advice was a
                     // no-op that could never move the count. Name the symbols
                     // instead — that is what a dev can act on.
+                    //
+                    // The list itself can legitimately be absent: an index whose
+                    // last Phase B run predates #825 has the warning key but not
+                    // the list key, as does an old daemon serving a new CLI. Only
+                    // then does re-running do something — it writes the list — so
+                    // say that instead of promising rows that never print.
                     ["scip_unification_misses", rate] => {
-                        eprintln!(
-                            "warning: {rate} semantic definitions did not match their parsed symbol, so some references may resolve to a duplicate. This is deterministic (re-running the index will not change it); the unreconciled definitions are listed below."
+                        let missed = rate
+                            .split_once('/')
+                            .and_then(|(m, _)| m.parse::<usize>().ok());
+                        let rows = unification_miss_lines(
+                            payload.scip_unification_miss_list.as_deref(),
+                            missed,
                         );
-                        print_unification_misses(&payload);
+                        let tail = if rows.is_empty() {
+                            "run `travsr init --semantic` once to record which definitions they are"
+                        } else {
+                            "the unreconciled definitions are listed below"
+                        };
+                        eprintln!(
+                            "warning: {rate} semantic definitions did not match their parsed symbol, so some references may resolve to a duplicate. This is deterministic (re-running the index will not change the count); {tail}."
+                        );
+                        for row in rows {
+                            eprintln!("{row}");
+                        }
                     }
                     _ => {}
                 }
@@ -677,7 +693,7 @@ mod tests {
         // #825: the diagnostic names each unreconciled def (lang, kind, symbol,
         // path:line) instead of only counting them.
         let list = "swift\tclass\tAdHandler\tAd.swift:12\nruby\tfunction\tApp.missing\tapp.rb:99";
-        let lines = unification_miss_lines(Some(list));
+        let lines = unification_miss_lines(Some(list), Some(2));
         assert_eq!(
             lines,
             vec![
@@ -693,15 +709,33 @@ mod tests {
             .map(|i| format!("go\tfunction\tf{i}\tx.go:{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let lines = unification_miss_lines(Some(&list));
+        let lines = unification_miss_lines(Some(&list), Some(25));
         assert_eq!(lines.len(), 21, "20 rows + one overflow line");
         assert_eq!(lines.last().unwrap(), "  … and 5 more");
     }
 
     #[test]
+    fn unification_misses_overflow_counts_from_the_true_total() {
+        // #825 review: `write_phase_b_results` caps the STORED list at 100 rows
+        // while display caps at 20, so for the issue's 152/2632 case counting the
+        // remainder from the stored rows printed "… and 80 more" directly under a
+        // warning that said 152. The overflow must count from the rate.
+        let list = (0..100)
+            .map(|i| format!("swift\tclass\tT{i}\tA.swift:{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = unification_miss_lines(Some(&list), Some(152));
+        assert_eq!(lines.len(), 21);
+        assert_eq!(lines.last().unwrap(), "  … and 132 more");
+        // An unparseable rate must never under-report: fall back to the rows.
+        let lines = unification_miss_lines(Some(&list), None);
+        assert_eq!(lines.last().unwrap(), "  … and 80 more");
+    }
+
+    #[test]
     fn unification_misses_empty_or_absent_render_nothing() {
-        assert!(unification_miss_lines(None).is_empty());
-        assert!(unification_miss_lines(Some("")).is_empty());
+        assert!(unification_miss_lines(None, Some(152)).is_empty());
+        assert!(unification_miss_lines(Some(""), Some(152)).is_empty());
     }
 
     #[test]
