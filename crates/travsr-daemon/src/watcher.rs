@@ -817,6 +817,11 @@ mod tests {
     ///
     /// That is the common case for the repo shape this issue was reported on:
     /// a Rust repo whose `target/` does not exist until the first build.
+    ///
+    /// Written as two batches. The first one cannot avoid racing the unwatch, so
+    /// its count says more about the machine than about the code; the second one
+    /// runs after the unwatch has had time to apply, and is what the assertion
+    /// rests on.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_skip_dir_created_after_spawn_is_dropped_too() {
@@ -834,21 +839,41 @@ mod tests {
         let base = settled(|| handle.raw_events(), Duration::from_secs(10));
         assert!(base > 0, "control: a watched dir must move the counter");
 
-        // What `cargo build` does on a fresh clone.
+        // What `cargo build` does on a fresh clone. This first batch RACES the
+        // unwatch by construction: the Create event has to be delivered and
+        // processed before any later write stops being reported, so some number
+        // always gets through, and that number is whatever the box was fast
+        // enough to deliver in the meantime. It is therefore measured, not
+        // asserted on. A bound here reads as an assertion about the machine: it
+        // was 219 on a 2 core CI runner against under 40 on a developer laptop.
         std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
         for i in 0..400 {
             std::fs::write(root.join(format!("target/debug/deps/x{i}.rlib")), "junk").unwrap();
         }
-        let from_target = settled(|| handle.raw_events(), Duration::from_secs(15)) - base;
+        let after_race = settled(|| handle.raw_events(), Duration::from_secs(20));
+        // The producer going quiet does not prove the consumer has caught up,
+        // and it is the consumer that calls `unwatch`. Give it room.
+        std::thread::sleep(Duration::from_secs(1));
+        let before_second = handle.raw_events();
 
-        // Not zero: creating the directory is itself an event on the watched
-        // parent, and a few files can land before the unwatch is processed. The
-        // bar is that it stops, not that it never starts.
+        // The assertion, and the reason for the second batch: by now the unwatch
+        // has certainly been applied, so these 400 writes are not racing
+        // anything. Either the tree is unwatched and they are silent, or it was
+        // re-watched and they arrive in full. That is a property of the code
+        // rather than of the scheduler, so it holds on any machine.
+        for i in 400..800 {
+            std::fs::write(root.join(format!("target/debug/deps/x{i}.rlib")), "junk").unwrap();
+        }
+        let from_second = settled(|| handle.raw_events(), Duration::from_secs(20)) - before_second;
+
         assert!(
-            from_target < 120,
-            "target/ created after spawn produced {from_target} raw events: the \
-             startup unwatch is a snapshot and notify re-watched the new tree, so \
-             `cargo clean && cargo build` reproduces #801 (#801 review)"
+            from_second < 40,
+            "400 writes into a target/ created after spawn produced {from_second} \
+             raw events once the unwatch had had time to apply ({} during the \
+             race itself): the startup unwatch is a snapshot and notify \
+             re-watched the new tree, so `cargo clean && cargo build` reproduces \
+             #801 (#801 review)",
+            after_race - base
         );
     }
 
@@ -976,13 +1001,23 @@ mod tests {
             }
         });
 
+        // Edit only after `start_time` is unambiguously in the past. The
+        // staleness guard compares the file's mtime against it, and a filesystem
+        // with coarse mtime granularity can stamp a write made microseconds
+        // after `spawn` as predating it, at which point the edit is dropped and
+        // the control arm below fails for a reason that has nothing to do with
+        // what this test is about. The other watch tests never see it because
+        // they assert on `raw_events`, which is counted before that guard.
+        std::thread::sleep(Duration::from_millis(1_100));
         std::fs::write(&file, "export const x = 2;").unwrap();
 
         // Control arm: the edit must reach the indexer at all, or the assertion
-        // below passes on a watcher that delivers nothing.
+        // below passes on a watcher that delivers nothing. Budgeted generously
+        // because it crosses a 500 ms debounce and a 500 ms flush tick before it
+        // can arrive, and a loaded 2 core CI box stretches both.
         wait_until(
             || reindexes.load(Ordering::Relaxed) > 0,
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         );
         assert!(
             reindexes.load(Ordering::Relaxed) > 0,
@@ -994,8 +1029,15 @@ mod tests {
         // which coalesce into one reindex when they share a debounce window and
         // into two when they do not, so the absolute count is not the thing to
         // assert on. The growth after everything has drained is.
-        std::thread::sleep(Duration::from_secs(2));
-        let after_edit = reindexes.load(Ordering::Relaxed);
+        //
+        // `settled` rather than a fixed sleep: on a slow box the second of those
+        // two events can land after any wall clock deadline this test picks, and
+        // it would be counted as growth. It cannot mask the failure, because a
+        // running cycle ticks about once a second and the window below is six.
+        let after_edit = settled(
+            || reindexes.load(Ordering::Relaxed),
+            Duration::from_secs(15),
+        );
 
         // Nothing is touched in this window. The cycle ticks about once a second
         // when it is running, so anything above zero here is the file
