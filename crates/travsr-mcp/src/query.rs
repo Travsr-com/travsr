@@ -242,6 +242,20 @@ pub struct StatusPayload {
     /// (serde default false), which reads as the pre-#583 behaviour.
     #[serde(default)]
     pub phase_b_dirty: bool,
+    /// References the live overlay resolved mid-edit (`ref_resolution_state`
+    /// state='resolved'). With `phase_b_dirty` set, a non-zero count is positive
+    /// evidence the editor/lexical lane recovered the edited region, so the
+    /// semantic surface is not degraded despite the reindex. Old daemons omit the
+    /// field (serde default 0).
+    #[serde(default)]
+    pub live_refs_resolved: u64,
+    /// References the live overlay recorded as still unresolved
+    /// (`ref_resolution_state` state='pending'): the honest count of edges that
+    /// are unknown until the next commit. Zero (with `live_refs_resolved` > 0)
+    /// means the live lane settled everything it detected. Old daemons omit the
+    /// field (serde default 0).
+    #[serde(default)]
+    pub live_refs_pending: u64,
     /// WS-2: comma-separated Dart package directories that were indexed without
     /// resolved dependencies (no `.dart_tool/package_config.json`), so their
     /// cross-package references are incomplete. Empty = resolved or no Dart.
@@ -257,6 +271,11 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
     // L11: detect FTS/nodes skew — indicates a partial write or a bad migration.
     // fts_count is the number of rows in nodes_fts (virtual FTS table).
     let fts_count = store.fts_node_count().unwrap_or(nodes);
+    // Live-overlay tallies, so a phase_b_dirty edit the editor lane already
+    // recovered reads as live-fresh rather than a blanket "stale". A read error
+    // degrades to zero, which keeps the conservative signal.
+    let resolved_refs = store.resolved_ref_count().unwrap_or(0);
+    let pending_refs = store.pending_ref_count().unwrap_or(0);
     Ok(StatusPayload {
         nodes,
         fts_nodes: fts_count,
@@ -270,6 +289,8 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
         rust_lsif_degraded: store.get_meta("rust_lsif_degraded")?,
         rerank: crate::rerank::rerank_status().to_string(),
         phase_b_dirty: store.get_meta("phase_b_dirty")?.as_deref() == Some("1"),
+        live_refs_resolved: resolved_refs,
+        live_refs_pending: pending_refs,
         dart_deps_unresolved: store.get_meta("dart_deps_unresolved")?,
     })
 }

@@ -188,10 +188,25 @@ fn resolve_one(store: &SqliteStore, corpus: &str, file: &str, r: &LiveResolution
     // gate: a target of the wrong kind, or a position in no matching span (a
     // node_modules file, a generated stub, an unindexed file), maps to nothing
     // and abstains (§8.1).
-    let dst = store
+    let dst = match store
         .enclosing_node_at(corpus, &r.target_path, r.target_line, target_kinds(edge))
         .ok()
-        .flatten()?;
+        .flatten()
+    {
+        Some(dst) => dst,
+        // Issue #816 defect 2 backstop: a provider that reports the item's full
+        // range (rust-analyzer's `targetRange`) or a bare `Location` puts the
+        // definition line on a leading doc comment, attribute, or decorator,
+        // above the node's declaration, so exact span containment misses. Map
+        // such a position to the definition it heads. Language-server-agnostic:
+        // it needs no `targetSelectionRange`, so a server that supplies only a
+        // range still resolves. The name gate below still guards precision, so a
+        // wrong header match abstains.
+        None => store
+            .node_starting_at_or_below(corpus, &r.target_path, r.target_line, target_kinds(edge))
+            .ok()
+            .flatten()?,
+    };
     // Does the node the editor landed on actually carry the name it said it was
     // resolving? Nothing above checks this: the gates are edge kind, target node
     // kind, span containment and corpus equality, none of which notice a
@@ -533,6 +548,7 @@ fn lexical_edge_kind(call: &UnresolvedCall) -> EdgeKind {
 /// extractor could be taught to carry UTF-16 offsets.
 pub fn targets_needing_editor(
     store: &SqliteStore,
+    lines: &[&str],
     unresolved: &[UnresolvedCall],
     locally_bound: &std::collections::HashSet<String>,
 ) -> Vec<LiveResolutionTarget> {
@@ -553,8 +569,21 @@ pub fn targets_needing_editor(
             if call.caller_line == 0 {
                 return None;
             }
+            // RFC-027 #813 P2: prefer the extractor's exact occurrence column,
+            // converted from a byte offset to the editor's UTF-16 column. It
+            // points at the precise identifier the extractor captured, so it is
+            // right even when the name repeats on the line, where the
+            // `fill_target_columns` name search would pick the first match and
+            // could resolve the wrong occurrence. `None` leaves it for the name
+            // search fallback.
+            let ref_col = call.caller_col.and_then(|bc| {
+                lines
+                    .get((call.caller_line - 1) as usize)
+                    .map(|line| byte_to_utf16_col(line, bc))
+            });
             Some(LiveResolutionTarget {
                 ref_line: call.caller_line,
+                ref_col,
                 name: travsr_core::ident::leaf_of(&call.callee_sig).to_string(),
                 edge_kind: lexical_edge_kind(call).as_str().to_string(),
                 // Calls and fields are both answered by the definition provider;
@@ -594,6 +623,7 @@ pub fn inheritance_targets_needing_editor(
             }
             Some(LiveResolutionTarget {
                 ref_line: r.line,
+                ref_col: None,
                 name: r.base_name.clone(),
                 edge_kind: EdgeKind::IsImplementation.as_str().to_string(),
                 provider: "definition".to_string(),
@@ -632,6 +662,7 @@ pub fn generic_targets_needing_editor(
         }
         out.push(LiveResolutionTarget {
             ref_line: line,
+            ref_col: None,
             name: name.to_string(),
             edge_kind: kind.as_str().to_string(),
             // All three kinds resolve to where the target is *defined*, which is
@@ -674,23 +705,198 @@ pub fn generic_targets_needing_editor(
 /// the real column through the protocol would recover this recall — the
 /// detectors have it at capture time — but it is a protocol change, and until
 /// then abstaining is the only fail-closed option.
+/// RFC-027 #813 P1: pin each target's 0-based column against the file text, so
+/// the editor resolves at the exact position instead of searching the line for
+/// `name`.
+///
+/// Mirrors the extension's `\bname\b` search and its column unit: `vscode.Position`
+/// counts UTF-16 code units, and JS `\b` (no `u` flag) is ASCII, so a
+/// daemon-pinned column and the editor's own fallback search agree byte for byte.
+/// A name the daemon cannot pin as a whole word on its line is left `None`, and
+/// the editor falls back to its own search, which abstains the same way. `lines`
+/// is the current file text split by line; a target whose line is out of range
+/// is left as is.
+pub fn fill_target_columns(lines: &[&str], targets: &mut [LiveResolutionTarget]) {
+    for t in targets.iter_mut() {
+        // A target the extractor already pinned to its exact occurrence column
+        // keeps it; the name search is only the fallback for the rest.
+        if t.ref_col.is_some() || t.ref_line == 0 {
+            continue;
+        }
+        if let Some(line) = lines.get((t.ref_line - 1) as usize) {
+            t.ref_col = word_boundary_col_utf16(line, &t.name);
+        }
+    }
+}
+
+/// Convert a 0-based byte offset within `line` to the 0-based UTF-16 column the
+/// editor's `vscode.Position` expects (RFC-027 #813 P2). Equal for ASCII, which
+/// identifiers are; a byte offset landing inside a multibyte char is clamped
+/// back to the previous char boundary, and one past the end clamps to the line
+/// length, so the result is always a valid column.
+fn byte_to_utf16_col(line: &str, byte_col: u32) -> u32 {
+    let mut b = (byte_col as usize).min(line.len());
+    while b > 0 && !line.is_char_boundary(b) {
+        b -= 1;
+    }
+    line[..b].encode_utf16().count() as u32
+}
+
+/// The 0-based UTF-16 column of the first whole-word (`\bname\b`, ASCII word
+/// boundary) occurrence of `name` in `line`, or `None`.
+fn word_boundary_col_utf16(line: &str, name: &str) -> Option<u32> {
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let nb = name.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0usize;
+    while i + nb.len() <= bytes.len() {
+        if &bytes[i..i + nb.len()] == nb && line.is_char_boundary(i) {
+            let before_ok = i == 0 || !is_word(bytes[i - 1]);
+            let after = i + nb.len();
+            let after_ok = after >= bytes.len() || !is_word(bytes[after]);
+            if before_ok && after_ok {
+                return Some(line[..i].encode_utf16().count() as u32);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 fn drop_same_position_collisions(targets: Vec<LiveResolutionTarget>) -> Vec<LiveResolutionTarget> {
-    let mut counts: std::collections::HashMap<(u32, &str, &str), usize> =
+    // `ref_col` is part of the key: two occurrences of one name on one line
+    // (`a.save(); b.save()`) each carry a distinct column now, so they are
+    // distinct positions and both are kept. Two with the same column, or both
+    // with no column (`None`), are a genuine collision the editor could not
+    // disambiguate and still collapse, exactly as before.
+    let mut counts: std::collections::HashMap<(u32, Option<u32>, &str, &str), usize> =
         std::collections::HashMap::new();
     for t in &targets {
         *counts
-            .entry((t.ref_line, t.name.as_str(), t.edge_kind.as_str()))
+            .entry((t.ref_line, t.ref_col, t.name.as_str(), t.edge_kind.as_str()))
             .or_default() += 1;
     }
-    let unique: std::collections::HashSet<(u32, String, String)> = counts
+    let unique: std::collections::HashSet<(u32, Option<u32>, String, String)> = counts
         .into_iter()
         .filter(|(_, n)| *n == 1)
-        .map(|((line, name, kind), _)| (line, name.to_string(), kind.to_string()))
+        .map(|((line, col, name, kind), _)| (line, col, name.to_string(), kind.to_string()))
         .collect();
     targets
         .into_iter()
-        .filter(|t| unique.contains(&(t.ref_line, t.name.clone(), t.edge_kind.clone())))
+        .filter(|t| unique.contains(&(t.ref_line, t.ref_col, t.name.clone(), t.edge_kind.clone())))
         .collect()
+}
+
+/// RFC-027 #813 P2: merge a saved file's changed-definition committed
+/// occurrences into its native/generic editor targets.
+///
+/// These reach references the tree-sitter live extractor never detects (macro,
+/// desugared, trait-dispatched) that the committed SCIP occurrence set did
+/// capture, resolved at their exact stored column. Precision is safe by
+/// construction: the editor resolves the CURRENT buffer position and the daemon
+/// maps the result to a SCIP-owned node (section 8.2 fencing), so a stale
+/// position is fail-closed (it resolves current code or nothing), never a
+/// fabricated target.
+///
+/// Each occurrence is bounded to its changed definition's CURRENT span (the body
+/// changed, so an occurrence whose remapped line drifted outside it is no longer
+/// trusted), given the editor's UTF-16 column from its stored byte column (or
+/// left for the editor's name search when it has none), dropped when a native
+/// target already covers its position (see the split below), and finally deduped
+/// within the enumerated set the same way the native lane is.
+pub fn merge_changed_occurrence_targets(
+    store: &SqliteStore,
+    lines: &[&str],
+    native: Vec<LiveResolutionTarget>,
+    stashed: &[travsr_core::ChangedOccurrence],
+) -> Vec<LiveResolutionTarget> {
+    if stashed.is_empty() {
+        return native;
+    }
+    let src_ids: Vec<travsr_core::NodeId> = {
+        let mut v: Vec<travsr_core::NodeId> = stashed.iter().map(|o| o.src).collect();
+        v.sort_unstable_by_key(|id| id.0);
+        v.dedup();
+        v
+    };
+    let spans = store.current_spans(&src_ids).unwrap_or_default();
+    // What the native lane already owns. Keyed WITH the column: a native target
+    // pins the first whole-word match on its line, so a stashed occurrence of
+    // the same name at another column (`a.save(); b.save()`) is a distinct
+    // position and survives, which is what the column plumbing exists for. When
+    // either side has no column there is nothing to tell the two apart, so the
+    // native target owns the whole line for that name and kind, as before.
+    let mut native_at_col: std::collections::HashSet<(u32, u32, String, String)> =
+        std::collections::HashSet::new();
+    let mut native_uncolumned: std::collections::HashSet<(u32, String, String)> =
+        std::collections::HashSet::new();
+    let mut native_lines: std::collections::HashSet<(u32, String, String)> =
+        std::collections::HashSet::new();
+    for t in &native {
+        let line_key = (t.ref_line, t.name.clone(), t.edge_kind.clone());
+        match t.ref_col {
+            Some(c) => {
+                native_at_col.insert((t.ref_line, c, t.name.clone(), t.edge_kind.clone()));
+            }
+            None => {
+                native_uncolumned.insert(line_key.clone());
+            }
+        }
+        native_lines.insert(line_key);
+    }
+    let enumerated: Vec<LiveResolutionTarget> = stashed
+        .iter()
+        .filter_map(|occ| {
+            // Bound to the definition's current span; drop an occurrence that
+            // drifted outside it (an unknown end is a start-only lower bound).
+            let &(start, end) = spans.get(&occ.src)?;
+            if occ.line < start || end.is_some_and(|e| occ.line > e) {
+                return None;
+            }
+            let ref_col = occ.col.and_then(|bc| {
+                lines
+                    .get((occ.line - 1) as usize)
+                    .map(|l| byte_to_utf16_col(l, bc))
+            });
+            // The native lane already owns this position; do not double-count it.
+            let line_key = (occ.line, occ.name.clone(), occ.kind.clone());
+            let owned = match ref_col {
+                Some(c) => {
+                    native_uncolumned.contains(&line_key)
+                        || native_at_col.contains(&(
+                            occ.line,
+                            c,
+                            occ.name.clone(),
+                            occ.kind.clone(),
+                        ))
+                }
+                None => native_lines.contains(&line_key),
+            };
+            if owned {
+                return None;
+            }
+            Some(LiveResolutionTarget {
+                ref_line: occ.line,
+                ref_col,
+                name: occ.name.clone(),
+                // Calls and fields are both answered by the definition provider.
+                edge_kind: occ.kind.clone(),
+                provider: "definition".to_string(),
+            })
+        })
+        .collect();
+    // Enumerated occurrences first: the editor drains this list in order up to
+    // its per-save budget, and the P2 enumeration is the whole point of the pass
+    // (references tree-sitter never detected). A native target that lands inside
+    // a preserved definition is a no-op for the graph (`put_edge_live` only
+    // touches `live` rows, never the preserved committed edge), so it must never
+    // crowd the enumerated set out of the budget on a large file.
+    let mut out = drop_same_position_collisions(enumerated);
+    out.extend(native);
+    out
 }
 
 /// The unique `IsImplementation` edge from `src` (the implementing class) to the
@@ -894,6 +1100,197 @@ mod tests {
 
     const CORPUS: &str = "testrepo";
 
+    #[test]
+    fn fill_target_columns_pins_word_boundary_positions() {
+        let content = "fn a() {\n    self.save(x);\n    let save = 1;\n}\n";
+        let mut targets = vec![
+            LiveResolutionTarget {
+                ref_line: 2,
+                ref_col: None,
+                name: "save".to_string(),
+                edge_kind: "ref/call".to_string(),
+                provider: "definition".to_string(),
+            },
+            // A name that is not present on its line stays None; the editor
+            // falls back to its own search, which abstains the same way.
+            LiveResolutionTarget {
+                ref_line: 2,
+                ref_col: None,
+                name: "missing".to_string(),
+                edge_kind: "ref/call".to_string(),
+                provider: "definition".to_string(),
+            },
+        ];
+        let lines: Vec<&str> = content.lines().collect();
+        fill_target_columns(&lines, &mut targets);
+        // "    self.save(x);" - `save` starts at column 9 (0-based), after the
+        // word boundary at the dot, not inside `self`.
+        assert_eq!(targets[0].ref_col, Some(9));
+        assert_eq!(targets[1].ref_col, None);
+    }
+
+    #[test]
+    fn merge_changed_occurrence_targets_enumerates_bounds_and_dedups() {
+        use travsr_core::ChangedOccurrence;
+        // A caller def spanning lines 5-9. Its committed occurrences are what the
+        // live lane enumerates as editor targets after a body edit.
+        let store = store_with(&[("a.ts", "fn:caller", "function", 5, 9)]);
+        let src = node_id("a.ts", "fn:caller");
+        // Line 6 has a non-ASCII prefix, so the stored byte column and the
+        // editor's UTF-16 column genuinely differ: `bar` is at byte col 8 but
+        // UTF-16 col 7 (the accented `é` is two bytes, one UTF-16 unit). A wrong
+        // conversion here is a wrong editor position.
+        // Lines 5-9 are the function body; line 6 carries the accented call.
+        let content = "\n\n\n\nfn caller() {\n  café.bar();\n  qux();\n}\n\n";
+        let stashed = vec![
+            // In-span, with a column: enumerated at the exact UTF-16 position.
+            ChangedOccurrence {
+                src,
+                line: 6,
+                col: Some(8),
+                kind: "ref/call".into(),
+                name: "bar".into(),
+            },
+            // Out of the def's current span (line 20 > end 9): dropped.
+            ChangedOccurrence {
+                src,
+                line: 20,
+                col: Some(2),
+                kind: "ref/call".into(),
+                name: "gone".into(),
+            },
+            // In-span but a position the native lane already owns: dropped so it
+            // is not double-counted (native target retained below).
+            ChangedOccurrence {
+                src,
+                line: 7,
+                col: Some(2),
+                kind: "ref/call".into(),
+                name: "qux".into(),
+            },
+        ];
+        let native = vec![LiveResolutionTarget {
+            ref_line: 7,
+            ref_col: Some(2),
+            name: "qux".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        }];
+
+        let lines: Vec<&str> = content.lines().collect();
+        let out = merge_changed_occurrence_targets(&store, &lines, native, &stashed);
+
+        // The native target is kept; the enumerated `bar` is added at its UTF-16
+        // column; the out-of-span and native-owned occurrences are dropped.
+        assert_eq!(out.len(), 2, "native target plus one enumerated occurrence");
+        assert!(out
+            .iter()
+            .any(|t| t.name == "qux" && t.ref_line == 7 && t.provider == "definition"));
+        let bar = out
+            .iter()
+            .find(|t| t.name == "bar")
+            .expect("bar occurrence enumerated");
+        assert_eq!(bar.ref_line, 6);
+        assert_eq!(
+            bar.ref_col,
+            Some(7),
+            "byte col 8 must convert to UTF-16 col 7 across the accented prefix"
+        );
+        assert_eq!(bar.edge_kind, "ref/call");
+    }
+
+    /// The native lane pins the FIRST whole-word occurrence on a line, so on
+    /// `a.save(); b.save();` it owns one of the two positions. The second is a
+    /// distinct position that only the enumerated set carries, and dropping it
+    /// as "already owned" would waste the column plumbing this lane exists for.
+    #[test]
+    fn a_second_occurrence_on_a_native_lines_own_column_is_kept() {
+        use travsr_core::ChangedOccurrence;
+        let store = store_with(&[("a.ts", "fn:caller", "function", 1, 3)]);
+        let src = node_id("a.ts", "fn:caller");
+        // `  a.save(); b.save();` - `save` at byte/UTF-16 cols 4 and 13.
+        let content = "fn caller() {\n  a.save(); b.save();\n}\n";
+        let stashed = vec![
+            ChangedOccurrence {
+                src,
+                line: 2,
+                col: Some(4),
+                kind: "ref/call".into(),
+                name: "save".into(),
+            },
+            ChangedOccurrence {
+                src,
+                line: 2,
+                col: Some(13),
+                kind: "ref/call".into(),
+                name: "save".into(),
+            },
+        ];
+        // The native lane found only the first one.
+        let native = vec![LiveResolutionTarget {
+            ref_line: 2,
+            ref_col: Some(4),
+            name: "save".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        }];
+
+        let lines: Vec<&str> = content.lines().collect();
+        let out = merge_changed_occurrence_targets(&store, &lines, native, &stashed);
+
+        assert_eq!(out.len(), 2, "the native target plus the second occurrence");
+        let cols: std::collections::HashSet<Option<u32>> = out.iter().map(|t| t.ref_col).collect();
+        assert_eq!(
+            cols,
+            [Some(4), Some(13)].into_iter().collect(),
+            "both distinct columns survive; only the col-4 duplicate is dropped"
+        );
+    }
+
+    /// A native target the daemon could not place on its line owns the whole
+    /// line for that name and kind, so an enumerated occurrence there is still a
+    /// duplicate of it and is dropped, exactly as before the column split.
+    #[test]
+    fn a_native_target_without_a_column_still_owns_its_line() {
+        use travsr_core::ChangedOccurrence;
+        let store = store_with(&[("a.ts", "fn:caller", "function", 1, 3)]);
+        let src = node_id("a.ts", "fn:caller");
+        let content = "fn caller() {\n  a.save();\n}\n";
+        let stashed = vec![ChangedOccurrence {
+            src,
+            line: 2,
+            col: Some(4),
+            kind: "ref/call".into(),
+            name: "save".into(),
+        }];
+        let native = vec![LiveResolutionTarget {
+            ref_line: 2,
+            ref_col: None,
+            name: "save".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        }];
+
+        let lines: Vec<&str> = content.lines().collect();
+        let out = merge_changed_occurrence_targets(&store, &lines, native, &stashed);
+
+        assert_eq!(out.len(), 1, "the column-less native target owns the line");
+        assert_eq!(out[0].ref_col, None);
+    }
+
+    #[test]
+    fn word_boundary_col_is_utf16_and_whole_word_only() {
+        // `saved` must not match the target `save` (no trailing boundary).
+        assert_eq!(
+            word_boundary_col_utf16("let saved = save()", "save"),
+            Some(12)
+        );
+        // A multibyte prefix: `é` is one UTF-16 code unit, so `x` is at col 2.
+        assert_eq!(word_boundary_col_utf16("é x", "x"), Some(2));
+        // Substring inside a larger identifier never matches.
+        assert_eq!(word_boundary_col_utf16("reservation", "server"), None);
+    }
+
     /// Most tests exercise the uniqueness gate, not the section 7.3 step-1
     /// local-scope gate, so they declare no local bindings. The tests that do
     /// exercise it build their own set.
@@ -1040,6 +1437,70 @@ mod tests {
             "src/order.ts",
             &[resolution(2, "save", "src/user.ts", 17)],
         );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            }
+        );
+    }
+
+    /// Issue #816 defect 2 backstop: a provider that reports the item's full
+    /// range (or a bare `Location`) puts the definition line on a leading doc
+    /// comment or attribute, above the node's declaration. The daemon maps such
+    /// a position to the definition it heads and emits, so a server that does not
+    /// supply `targetSelectionRange` still resolves.
+    #[test]
+    fn a_definition_line_just_above_the_node_maps_to_the_node() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        // The provider reports line 13, a doc comment / attribute two lines above
+        // User.save's declaration at 15, which is inside no node span.
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "save", "src/user.ts", 13)],
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            }
+        );
+        assert_eq!(
+            provenance_of(
+                &store,
+                node_id("src/order.ts", "fn:placeOrder"),
+                node_id("src/user.ts", "method:User.save"),
+            )
+            .as_deref(),
+            Some("live"),
+            "a header position above the node must still resolve to the definition",
+        );
+    }
+
+    /// The backstop is name-gated: a header position above a node whose name does
+    /// not match the reported reference abstains rather than attaching.
+    #[test]
+    fn a_header_position_above_a_mismatched_node_still_abstains() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        // Line 13 heads User.save, but the reference names `load`, not `save`.
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "load", "src/user.ts", 13)],
+        );
+
         assert_eq!(
             out,
             LiveOutcome {
@@ -1611,6 +2072,7 @@ mod tests {
     fn a_resolution_the_current_parse_no_longer_asks_for_is_dropped() {
         let targets = vec![LiveResolutionTarget {
             ref_line: 18,
+            ref_col: None,
             name: "save".to_string(),
             edge_kind: "ref/call".to_string(),
             provider: "definition".to_string(),
@@ -1678,7 +2140,7 @@ mod tests {
         let mut ambiguous = call(src, "fn:save", 19);
         ambiguous.is_method_call = true;
 
-        let targets = targets_needing_editor(&store, &[resolvable, ambiguous], &no_locals());
+        let targets = targets_needing_editor(&store, &[], &[resolvable, ambiguous], &no_locals());
         assert_eq!(
             targets.len(),
             1,
@@ -1698,11 +2160,33 @@ mod tests {
         let store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
         let src = node_id("src/order.ts", "fn:placeOrder");
         let field = call(src, "field:count", 20);
-        let targets = targets_needing_editor(&store, &[field], &no_locals());
+        let targets = targets_needing_editor(&store, &[], &[field], &no_locals());
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].edge_kind, "ref/field");
         assert_eq!(targets[0].name, "count");
         assert_eq!(targets[0].provider, "definition");
+    }
+
+    /// RFC-027 #813 P2: the extractor's exact occurrence column wins over the
+    /// name search when the name repeats on the line. The name search finds the
+    /// first `save`, which is the wrong occurrence and would resolve the wrong
+    /// call; the captured column points at the one the extractor actually meant.
+    #[test]
+    fn the_extractor_column_beats_the_name_search_when_a_name_repeats() {
+        let store = store_with(&[("src/a.ts", "fn:f", "function", 1, 3)]);
+        let src = node_id("src/a.ts", "fn:f");
+        let content = "  a.save(); b.save()\n";
+        let mut c = call(src, "fn:save", 1);
+        c.is_method_call = true;
+        c.caller_col = Some(14); // byte column of the second `save`
+        let lines: Vec<&str> = content.lines().collect();
+        let targets = targets_needing_editor(&store, &lines, &[c], &no_locals());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].ref_col,
+            Some(14),
+            "the exact occurrence column must win over the first name match"
+        );
     }
 
     /// A bare free-function call the lexical lane could not resolve has no unique
@@ -1713,7 +2197,7 @@ mod tests {
         let store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
         let src = node_id("src/order.ts", "fn:placeOrder");
         let bare = call(src, "fn:nowhere", 21);
-        assert!(targets_needing_editor(&store, &[bare], &no_locals()).is_empty());
+        assert!(targets_needing_editor(&store, &[], &[bare], &no_locals()).is_empty());
     }
 
     /// RFC-027 section 12: the editor lane records what it claimed, so the

@@ -717,6 +717,16 @@ pub struct ScipRef {
     /// edge-emitting behavior with no regression.
     #[serde(default = "default_true")]
     pub is_call: bool,
+    /// 0-based UTF-8 BYTE column of the reference occurrence on `caller_line`
+    /// (RFC-027 #813 P2). Recorded on the `edge_sites` row so the live overlay
+    /// resolves the reference at its exact editor position instead of searching
+    /// the line for the name. Each source (SCIP sidecar, rust-analyzer LSIF,
+    /// Dart emitter) converts its own occurrence unit to a byte offset before
+    /// building this; the daemon converts byte to the editor's UTF-16 column at
+    /// use. `None` when the source cannot give a reliable position, in which case
+    /// the daemon falls back to its word-boundary search (no regression).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_col: Option<u32>,
 }
 
 /// serde default for [`ScipRef::is_call`] / [`LsifPositionalRef::is_call`].
@@ -748,6 +758,14 @@ pub struct LsifPositionalRef {
     /// record a `find_references` occurrence without creating a call edge (#650).
     #[serde(default = "default_true")]
     pub is_call: bool,
+    /// 0-based UTF-8 BYTE column of the reference occurrence on `caller_line`
+    /// (RFC-027 #813 P2). LSIF/LSP ranges are UTF-16 code units, so the indexer
+    /// converts the range's start character to a byte offset against the caller
+    /// line before setting this. Carried through to the resolved [`ScipRef`] and
+    /// recorded on the `edge_sites` row. `None` for a dump built before this
+    /// shipped, in which case the daemon name-searches the line (no regression).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_col: Option<u32>,
 }
 
 /// A single reference occurrence returned by `find_references` (issue #299):
@@ -1126,6 +1144,16 @@ pub struct UnresolvedCall {
     /// skips `edge_sites` emission for zero lines.
     #[serde(default)]
     pub caller_line: u32,
+    /// 0-based byte column of the callee-name occurrence on `caller_line`
+    /// (RFC-027 #813 P2). It is the start column of the exact identifier node the
+    /// extractor captured, so it points at the reference the editor resolves,
+    /// which is strictly better than a name search when the name repeats on the
+    /// line. Byte offset, in the file's own encoding; the daemon converts it to
+    /// the editor's UTF-16 column against the current line. `None` for an emitter
+    /// that predates this field, in which case the daemon falls back to its
+    /// word-boundary search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_col: Option<u32>,
     /// True when this call came from a method-call receiver (`recv.method()`)
     /// whose type is not known syntactically. A method call can never resolve
     /// to a bare free function — the daemon resolver requires a qualified
@@ -1555,6 +1583,71 @@ pub struct ReplaceReport {
     pub removed_count: usize,
     /// Paths of files that had inbound edges to the removed symbols.
     pub callers: DirtySet,
+    /// RFC-027 #813: the definitions in the reparsed file this edit actually
+    /// changed. It is every node this parse produced whose committed edges were
+    /// NOT preserved: the edited definitions on a pure body edit, or the whole
+    /// file when the edit added or removed a symbol (or no `content` was
+    /// supplied, so nothing could be proven unchanged). Empty means every
+    /// definition was preserved, so there is no changed region to re-resolve.
+    ///
+    /// Both lanes scope to exactly these. The save-path lexical lane
+    /// (`live_resolve_file`) filters to them so a preserved definition's
+    /// already-committed references are not re-recorded as `pending` and the
+    /// freshness count stays honest. The request-path editor targets
+    /// (`live_resolution_targets`) filter to them too, via the set stashed on the
+    /// `EditorPlane` at save, so a preserved definition emits no native provider
+    /// round trip. A whole-file re-derive stashes nothing, so the request path
+    /// stays whole-file; a dependent file (not reparsed by this save) is also
+    /// resolved whole-file.
+    #[serde(default)]
+    pub changed_defs: Vec<NodeId>,
+    /// RFC-027 #813 P2: the committed occurrence rows the reparse is about to
+    /// purge for the changed definitions, captured before the purge (see
+    /// [`ChangedOccurrence`]). The live lane enumerates
+    /// these as editor-resolution targets so it reaches references the
+    /// tree-sitter live extractor never detects (macro, desugared,
+    /// trait-dispatched) but the committed SCIP occurrence set did capture, and
+    /// resolves each at its exact stored column. The `dst` is deliberately NOT
+    /// carried: it is the stale committed target, and the editor must re-resolve
+    /// the CURRENT buffer position (RFC-027 section 8.2 fencing), so only the
+    /// position is trustworthy. Empty on a pure preserve or when no `content`
+    /// was supplied.
+    #[serde(default)]
+    pub changed_occurrences: Vec<ChangedOccurrence>,
+    /// RFC-027 #813 (finding 2): whether at least one definition was preserved,
+    /// i.e. this was a scoped pure-body edit and `changed_defs` is a proper
+    /// subset of the file. When false the whole file was re-derived and
+    /// `changed_defs` names every node, so the save path resolves the file
+    /// wholesale exactly as before and there is nothing to scope.
+    #[serde(default)]
+    pub preserved_any: bool,
+}
+
+/// RFC-027 #813 P2: one committed occurrence of a changed definition, captured
+/// by `reindex_replace` before it purges the file's owned sites, for the live
+/// lane to re-resolve at the editor. Carries only the position and kind, never
+/// the stale committed `dst` (see [`ReplaceReport::changed_occurrences`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChangedOccurrence {
+    /// The changed source definition this occurrence lived in (its enclosing
+    /// node), so the daemon can bound the occurrence to that def's current span.
+    pub src: NodeId,
+    /// 1-based line of the occurrence, already remapped to the current buffer by
+    /// the changed definition's block delta when captured.
+    pub line: u32,
+    /// 0-based UTF-8 byte column of the occurrence, or `None` when the committed
+    /// row carried no column (the daemon then name-searches the line).
+    pub col: Option<u32>,
+    /// The occurrence's edge kind (`ref/call` or `ref/field`), so the served
+    /// editor target requests the matching resolution.
+    pub kind: String,
+    /// Leaf name of the reference identifier at this occurrence (the committed
+    /// callee's signature leaf), so the editor can name-search the line when no
+    /// column is stored and label the target. Never a node identity: the editor
+    /// resolves the CURRENT buffer position and the daemon maps the result to a
+    /// SCIP-owned node (RFC-027 section 8.2 fencing), so the stale committed
+    /// target is deliberately not carried, only this name hint.
+    pub name: String,
 }
 
 /// Summary returned by `reconcile` / `travsr fsck`.
@@ -2192,6 +2285,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 42,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         };
@@ -2211,6 +2305,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 42,
+            caller_col: None,
             is_method_call: true,
             recv_type: None,
         };

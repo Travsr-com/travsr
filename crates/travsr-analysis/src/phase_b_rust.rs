@@ -354,6 +354,7 @@ fn extract_file_call_edges(
 
             // 1-based call-site line (issue #299). tree-sitter rows are 0-based.
             let occ_line = cap.node.start_position().row.saturating_add(1) as u32;
+            let occ_col = cap.node.start_position().column as u32;
 
             let Some((caller_fn, caller_impl)) = find_enclosing_fn(cap.node, source.as_slice())
             else {
@@ -405,6 +406,7 @@ fn extract_file_call_edges(
                         alt_callee_sig: None,
                         hint_crate: None,
                         caller_line: occ_line,
+                        caller_col: Some(occ_col),
                         is_method_call: true,
                         recv_type,
                     });
@@ -433,6 +435,7 @@ fn extract_file_call_edges(
                                     alt_callee_sig: None,
                                     hint_crate: None,
                                     caller_line: occ_line,
+                                    caller_col: Some(occ_col),
                                     is_method_call: false,
                                     recv_type: None,
                                 });
@@ -447,6 +450,7 @@ fn extract_file_call_edges(
                                     alt_callee_sig: None,
                                     hint_crate: Some(qual.clone()),
                                     caller_line: occ_line,
+                                    caller_col: Some(occ_col),
                                     is_method_call: false,
                                     recv_type: None,
                                 });
@@ -461,6 +465,7 @@ fn extract_file_call_edges(
                                     alt_callee_sig: None,
                                     hint_crate: None,
                                     caller_line: occ_line,
+                                    caller_col: Some(occ_col),
                                     is_method_call: false,
                                     recv_type: None,
                                 });
@@ -478,6 +483,7 @@ fn extract_file_call_edges(
                         alt_callee_sig: None,
                         hint_crate: None,
                         caller_line: occ_line,
+                        caller_col: Some(occ_col),
                         is_method_call: false,
                         recv_type: None,
                     });
@@ -524,6 +530,7 @@ fn extract_file_call_edges(
                         alt_callee_sig: None,
                         hint_crate: None,
                         caller_line: occ_line,
+                        caller_col: Some(occ_col),
                         is_method_call: false,
                         recv_type,
                     });
@@ -581,6 +588,7 @@ fn extract_macro_calls(
                 continue;
             }
             let occ_line = name_node.start_position().row.saturating_add(1) as u32;
+            let occ_col = name_node.start_position().column as u32;
             let Some((caller_fn, caller_impl)) = find_enclosing_fn(name_node, source) else {
                 continue;
             };
@@ -621,6 +629,7 @@ fn extract_macro_calls(
                 alt_callee_sig: None,
                 hint_crate: None,
                 caller_line: occ_line,
+                caller_col: Some(occ_col),
                 is_method_call,
                 // Macro-token recovery has no receiver AST node to inspect
                 // (it scans the raw token stream, not a parsed expression) —
@@ -1395,6 +1404,18 @@ fn run(z: &Zoo) {
             .get("fn:greet")
             .expect("bare call recovered from macro");
         assert_eq!(greet.caller_line, 5);
+
+        // RFC-027 #813 P2: the captured byte column points at the callee
+        // identifier itself, so the editor resolves the exact occurrence.
+        let src_str = std::str::from_utf8(source).unwrap();
+        let col_points_at = |u: &UnresolvedCall, leaf: &str| {
+            let line = src_str.lines().nth((u.caller_line - 1) as usize).unwrap();
+            let col = u.caller_col.expect("occurrence column captured") as usize;
+            line[col..].starts_with(leaf)
+        };
+        assert!(col_points_at(describe, "describe"));
+        assert!(col_points_at(speak, "speak"));
+        assert!(col_points_at(greet, "greet"));
 
         // No guessed callee ids: every recovered call is attributed to `run`.
         let run_id = VName::new("c", "", "main.rs", "rust", "fn:run").id();
