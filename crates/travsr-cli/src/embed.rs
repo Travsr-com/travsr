@@ -2005,6 +2005,15 @@ fn model_files_installed(b: &EmbedBackend) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `id` can only ever name a file directly inside the index
+/// directory. A `model_id` comes from `embed.db` rather than from the
+/// catalog, and `gc` passes it to `remove_file`, so one that resolves to a
+/// parent or an absolute path would delete outside `.travsr/`.
+fn names_a_file_in_this_dir(id: &str) -> bool {
+    let mut parts = Path::new(id).components();
+    matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none()
+}
+
 /// The HNSW index files (code + docs space) that exist on disk for a set of
 /// models, keyed off `db_path`'s directory the same way `cmd_status` locates
 /// the active model's own index (`{model}.hnsw.usearch`, `embed.rs:~1533`).
@@ -2012,6 +2021,7 @@ fn reclaimable_hnsw_paths(db_path: &Path, models: &[(String, u64, u64)]) -> Vec<
     let dir = db_path.parent().unwrap_or(db_path);
     models
         .iter()
+        .filter(|(id, _, _)| names_a_file_in_this_dir(id))
         .flat_map(|(id, _, _)| {
             [
                 dir.join(format!("{id}.hnsw.usearch")),
@@ -2864,5 +2874,50 @@ mod embed_ux_tests {
         assert_eq!(pct_display(0, 0), 100.0); // empty tier => nothing to do
         assert_eq!(pct_display(50, 100), 50.0); // normal case
         assert_eq!(pct_display(0, 100), 0.0);
+    }
+}
+
+/// #525 item 3: `gc` turns `node_embeddings.model_id` into a filename it then
+/// deletes. That column is whatever was written to `embed.db`, so the id has
+/// to be treated as untrusted input rather than as a name.
+#[cfg(test)]
+mod gc_path_tests {
+    use super::*;
+
+    /// `db_path`'s directory with one index file per given id, plus a file
+    /// one level above it that no id may ever reach.
+    fn index_dir_with(ids: &[&str]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".travsr");
+        std::fs::create_dir_all(&dir).unwrap();
+        for id in ids {
+            std::fs::write(dir.join(format!("{id}.hnsw.usearch")), b"idx").unwrap();
+        }
+        let outside = root.path().join("outside.hnsw.usearch");
+        std::fs::write(&outside, b"not ours").unwrap();
+        (root, dir.join("embed.db"), outside)
+    }
+
+    fn models(ids: &[&str]) -> Vec<(String, u64, u64)> {
+        ids.iter().map(|id| ((*id).to_string(), 1, 1)).collect()
+    }
+
+    #[test]
+    fn a_model_id_that_escapes_the_index_dir_reclaims_nothing() {
+        let (_root, db_path, outside) = index_dir_with(&[]);
+        let paths = reclaimable_hnsw_paths(&db_path, &models(&["../outside"]));
+        assert!(
+            paths.is_empty(),
+            "an id naming a path outside the index dir must not become a deletion target: {paths:?}"
+        );
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn an_ordinary_model_id_still_reclaims_its_index_files() {
+        let (_root, db_path, _outside) = index_dir_with(&["bge-small-en-v1.5"]);
+        let paths = reclaimable_hnsw_paths(&db_path, &models(&["bge-small-en-v1.5"]));
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("bge-small-en-v1.5.hnsw.usearch"));
     }
 }
