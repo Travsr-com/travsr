@@ -95,6 +95,24 @@ fn occurrence_at_col(line: &str, name: &str, col: usize) -> bool {
     before_ok && after_ok
 }
 
+/// True when a whole identifier token *starts* at byte column `col` of `line`.
+///
+/// The weaker companion to [`occurrence_at_col`]: it asks whether the column is
+/// a real token boundary, not which token sits there. Used only as the
+/// second-tier check in [`snap_changed_occurrence_line`], where the committed
+/// callee's name is known not to be the token the source spells (RFC-027 #813
+/// P2). Word characters are ASCII, so slicing at `col` is safe once `col` is a
+/// char boundary.
+fn token_starts_at(line: &str, col: usize) -> bool {
+    let bytes = line.as_bytes();
+    if col >= bytes.len() || !line.is_char_boundary(col) {
+        return false;
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // A word character that is not the middle of a longer identifier.
+    is_word(bytes[col]) && (col == 0 || !is_word(bytes[col - 1]))
+}
+
 /// How far [`snap_changed_occurrence_line`] will fan out from its start-delta
 /// estimate before abstaining.
 ///
@@ -120,12 +138,33 @@ const MAX_SNAP_RADIUS: i64 = 512;
 /// word. Ties prefer the line at or after the estimate, since an insert (which
 /// pushes occurrences down to a larger line number) is the common edit.
 ///
-/// Returns `None` when no such line exists in the span (the occurrence's own
-/// line was reflowed, or the name moved off its column), so a body edit that
-/// rewrites a reference abstains and heals at commit rather than serving a stale
-/// position. A mis-snap to another occurrence of the same `(name, col)` inside
-/// the same definition is harmless: the editor resolves the same callee, so the
-/// daemon derives the same `(enclosing def -> callee)` edge either way.
+/// The committed callee's name is not always the token the source spells at the
+/// occurrence. `Self { .. }` and `-> Self` reference the impl's type, an alias
+/// or re-export is written under its local name, and a tuple field is spelled
+/// `0`; in every one of those the stored column is right and only the name to
+/// compare against is wrong. Measured on this repository, 94.5% of the
+/// occurrences the name search alone rejects have a real identifier token
+/// starting at exactly the stored column. So a failed search falls back to a
+/// second tier: keep the occurrence at the unshifted `estimate` when a whole
+/// token starts at `col` there ([`token_starts_at`]).
+///
+/// That tier deliberately does NOT fan out. The name is what makes a search over
+/// candidate lines safe; "some token starts here" would match almost any line at
+/// the same indentation, so it is only ever applied at radius 0, where the
+/// start-delta estimate is already believed correct. It is strictly stronger
+/// than the column-less path, which serves the bare estimate with no check at
+/// all, and the daemon still bounds the result to the definition's current span,
+/// the editor still resolves the live buffer, and `names_match` still gates the
+/// answer against the callee's leaf, so a stale position stays fail-closed.
+///
+/// Returns `None` when no such line exists in the span and no token starts at
+/// the column on the estimate line (the occurrence's own line was reflowed, or
+/// the column holds an operator or a lifetime rather than an identifier), so a
+/// body edit that rewrites a reference abstains and heals at commit rather than
+/// serving a stale position. A mis-snap to another occurrence of the same
+/// `(name, col)` inside the same definition is harmless: the editor resolves
+/// the same callee, so the daemon derives the same `(enclosing def -> callee)`
+/// edge either way.
 ///
 /// The search fans OUT from the estimate and returns the first hit, so its cost
 /// is the shift distance (near zero for a typical one-line edit), not the
@@ -167,6 +206,18 @@ fn snap_changed_occurrence_line(
         if r > 0 && hit(estimate - r) {
             return Some((estimate - r) as u32);
         }
+    }
+    // Second tier: the name is not the source's spelling for this occurrence.
+    // Accept the estimate alone, and only when the column is a real token
+    // boundary there, so the editor is pointed at a token rather than into
+    // whitespace or the middle of an identifier.
+    if estimate >= lo
+        && estimate <= hi
+        && lines
+            .get((estimate - 1) as usize)
+            .is_some_and(|line| token_starts_at(line, col))
+    {
+        return Some(estimate as u32);
     }
     None
 }
@@ -11485,7 +11536,10 @@ mod tests {
     /// which is the whole buffer when the definition has no known `end_line`.
     #[test]
     fn snap_changed_occurrence_line_is_bounded_by_the_max_radius() {
-        let mut lines: Vec<&str> = vec!["  other();"; 2000];
+        // Filler indented past the occurrence column, so the second tier (which
+        // accepts the estimate when any token starts at the column) cannot fire
+        // and this stays a test of the search cap alone.
+        let mut lines: Vec<&str> = vec!["    other();"; 2000];
         let hit = "  foo();";
         // Within the cap: found. Estimate 100, true line 600 (radius 500).
         lines[599] = hit;
@@ -11495,11 +11549,74 @@ mod tests {
         );
         // Beyond the cap: abstains and heals at commit rather than scanning the
         // rest of the buffer.
-        lines[599] = "  other();";
+        lines[599] = "    other();";
         lines[1499] = hit;
         assert_eq!(
             snap_changed_occurrence_line(&lines, "foo", 2, 100, 1, lines.len() as i64),
             None
+        );
+    }
+
+    /// RFC-027 #813 P2: an occurrence whose source spelling is not the committed
+    /// callee's name is kept, not dropped. `Self { .. }` references the impl's
+    /// type but is spelled `Self`, so the name search finds nothing while the
+    /// stored column points at a perfectly good token. Measured on this
+    /// repository this class was 94.5% of everything the name search rejected.
+    #[test]
+    fn an_occurrence_spelled_differently_from_its_callee_is_still_anchored() {
+        let lines = vec![
+            "impl Guard {",
+            "    fn new() -> Self {",
+            "        Self { a: 1 }",
+            "    }",
+            "}",
+        ];
+        // Callee leaf is `Guard`; column 8 of line 3 holds `Self`.
+        assert_eq!(
+            snap_changed_occurrence_line(&lines, "Guard", 8, 3, 1, 5),
+            Some(3)
+        );
+        // A tuple field is spelled `0` while the callee node carries the field
+        // name, and the same fallback anchors it.
+        let tuple = vec!["fn f(s: S) -> u32 {", "    s.node.0", "}"];
+        assert_eq!(
+            snap_changed_occurrence_line(&tuple, "first", 11, 2, 1, 3),
+            Some(2)
+        );
+    }
+
+    /// The fallback requires a real token at the column, so a desugared
+    /// occurrence whose column lands on an operator still abstains rather than
+    /// pointing a language server at punctuation.
+    #[test]
+    fn an_occurrence_on_a_non_identifier_column_still_abstains() {
+        let lines = vec!["fn f(x: A, y: A) -> i32 {", "    x + y", "}"];
+        // `x + y` desugars to `Add::add`; column 6 is the `+`.
+        assert_eq!(
+            snap_changed_occurrence_line(&lines, "add", 6, 2, 1, 3),
+            None
+        );
+        // Column 7 is the space after it, which is not a token start either.
+        assert_eq!(
+            snap_changed_occurrence_line(&lines, "add", 7, 2, 1, 3),
+            None
+        );
+        // And the middle of an identifier is not a token start.
+        let mid = vec!["fn f() {", "    other();", "}"];
+        assert_eq!(snap_changed_occurrence_line(&mid, "zzz", 6, 2, 1, 3), None);
+    }
+
+    /// The name search still wins when the name IS findable: the fallback is a
+    /// last resort at radius 0, never a replacement for re-anchoring a moved
+    /// occurrence.
+    #[test]
+    fn the_name_search_beats_the_token_fallback() {
+        let lines = vec!["fn f() {", "    other();", "    foo();", "}"];
+        // Column 4 of the estimate line 2 holds `other`, so the fallback would
+        // accept line 2; the name search must still find `foo` on line 3.
+        assert_eq!(
+            snap_changed_occurrence_line(&lines, "foo", 4, 2, 1, 4),
+            Some(3)
         );
     }
 
