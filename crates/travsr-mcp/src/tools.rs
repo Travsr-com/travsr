@@ -1509,6 +1509,36 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                  use `find_pattern` for a textual search."
             );
         }
+        // The target's own file being analysed is necessary but not sufficient.
+        // A reference lives in whatever file *uses* the symbol, so a repo-wide
+        // "no uses anywhere" claim needs every file that could hold one to have
+        // been analysed, not just the one the definition sits in. #551 rejected
+        // the language-wide ratio as a proxy for "was THIS file analysed", and
+        // that still holds; this is the other question, and for that question
+        // the ratio is exactly the right evidence. Anything short of complete
+        // coverage makes a statement about the analysed subset, dressed up as a
+        // statement about the repo.
+        //
+        // Concretely: a symbol whose only use the provider never recorded (a
+        // use inside a construct it does not walk, or in a file it timed out on)
+        // reads as a confident zero today even though its own file is covered.
+        // An agent acts on that zero, so it must degrade like the cases above.
+        //
+        // A coverage read that fails, or a language with no files at all, is
+        // treated as incomplete: this may only ever soften a claim.
+        let (files_with_occ, files_total) =
+            store.language_occurrence_coverage(lang).unwrap_or((0, 0));
+        if files_total == 0 || files_with_occ < files_total {
+            let coverage_pct = (100 * files_with_occ).checked_div(files_total).unwrap_or(0) as u32;
+            return format!(
+                "{header}\n0 recorded reference(s), not a definitive zero. \
+                 Semantic analysis has not covered every '{lang}' file in this \
+                 repo ({files_with_occ} of {files_total} carry occurrence data, \
+                 {coverage_pct}%), so a use recorded nowhere is not the same as \
+                 a use that does not exist. Run `travsr status` to check Phase \
+                 B, or use `find_pattern` for a textual search."
+            );
+        }
         // Coverage is effectively complete for this language and this symbol has
         // neither occurrence rows nor ref/call edges: a genuine zero. (If the
         // same name is also defined elsewhere, bare calls to it are left
@@ -13243,6 +13273,59 @@ mod snippet_tests {
         assert!(
             !out.contains("not a definitive zero"),
             "should not soften when the file was analysed: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_when_language_coverage_is_partial() {
+        // A use lives in whatever file calls the symbol, so a repo-wide zero
+        // needs every file that could hold one to have been analysed. Here the
+        // target's own file carries occurrence rows, so the #450 gate passes,
+        // but another file of the same language has none: a use sitting in that
+        // file would be unrecorded, and "has no recorded uses" would assert
+        // absence the index cannot support.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "src/covered.rs", "rust", "fn:caller"),
+            "function",
+        );
+        let callee = Node::new(
+            VName::new("", "", "src/covered.rs", "rust", "fn:callee"),
+            "function",
+        );
+        // Same analysed file as the occurrence pair, but nothing points at it.
+        let unused = Node::new(
+            VName::new("", "", "src/covered.rs", "rust", "const:UNUSED"),
+            "constant",
+        )
+        .with_line(20);
+        // A second file of the same language that analysis never reached.
+        let unanalysed = Node::new(
+            VName::new("", "", "src/unanalysed.rs", "rust", "fn:elsewhere"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&unused).unwrap();
+        store.put_node(&unanalysed).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 5)])
+            .unwrap();
+
+        let out = find_references(&store, "UNUSED", None);
+        assert!(
+            out.contains("not a definitive zero"),
+            "partial language coverage must soften the claim: {out}"
+        );
+        assert!(
+            out.contains("1 of 2"),
+            "should report the coverage it is degrading on: {out}"
+        );
+        assert!(
+            !out.contains("has no recorded uses"),
+            "must not assert absence: {out}"
         );
     }
 
