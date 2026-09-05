@@ -487,7 +487,12 @@ build/
 **/testdata/
 ";
 
-/// Number of default rules in [`DEFAULT_TRAVSRIGNORE`] (for the summary line).
+/// Number of default rules in [`DEFAULT_TRAVSRIGNORE`].
+///
+/// Diagnostic only: the sole consumer is the `tracing::info!` that `init_repo`
+/// emits after scaffolding. The user-facing init summary deliberately prints no
+/// count (it points at the file instead), so do not read this as something a
+/// user sees.
 ///
 /// Pinned to the string above by `travsrignore_scaffold_matches_its_rule_count`.
 const DEFAULT_TRAVSRIGNORE_RULE_COUNT: usize = 8;
