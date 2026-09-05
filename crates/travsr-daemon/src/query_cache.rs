@@ -1,7 +1,8 @@
 //! In-daemon LRU result cache for read-only CLI queries (#318 O2).
 //!
 //! Keyed by `(tool, args, last_commit, phase_b_commit, data_version,
-//! embed_data_version)`. The git commit hook advances `last_commit` and the
+//! embed_data_version, embed_generation)`. The git commit hook advances
+//! `last_commit` and the
 //! background Phase B pass advances `phase_b_commit` (#318 O3); `data_version`
 //! is SQLite's `PRAGMA data_version` as seen by the daemon's read connection,
 //! which increments on *any* write to `graph.db` from another connection —
@@ -13,6 +14,14 @@
 //! `None` both while no embed.db exists and for tools that never read
 //! embed.db (`graph`, `status`), so the embed sidecar's batched writes cannot
 //! thrash entries that don't depend on them.
+//!
+//! `embed_generation` covers the half of `ask` that no pragma can see (#510).
+//! The KNN seeds come from the embed sidecar's *in-memory* HNSW index, and a
+//! respawn or model switch replaces that index without writing embed.db, so
+//! every other component of the key is unchanged across a swap that changes
+//! the answer. It is `travsr_plugin_host::embed_serving_generation()`, which
+//! the host advances each time a sidecar takes over the KNN hooks.
+//!
 //! Together, any graph or embed mutation changes the key. That makes
 //! invalidation structural: stale entries simply stop matching and age out via
 //! LRU eviction — there is no explicit `invalidate()` to forget to call on a
@@ -33,6 +42,15 @@ pub struct DataVersions {
     /// embed-dependent tools once the sidecar has created it. The two states
     /// must not collide, so this stays an `Option` rather than a sentinel.
     pub embed: Option<u64>,
+    /// #510: `travsr_plugin_host::embed_serving_generation()`, which advances
+    /// every time a sidecar starts serving the daemon's KNN hooks. `ask` seeds
+    /// come from that sidecar's *in-memory* HNSW index, which a respawn or a
+    /// model switch replaces without any embed.db write, so `embed` alone
+    /// cannot see the change. `None` for tools that never reach the sidecar,
+    /// on the same footing as `embed`; `Some(0)` means no sidecar has served in
+    /// this process, which is what distinguishes an unconfigured repo from a
+    /// live one.
+    pub embed_generation: Option<u64>,
 }
 
 /// Cache key: the query identity plus the markers that bound graph freshness —
@@ -51,6 +69,7 @@ struct CacheKey {
     phase_b_commit: String,
     data_version: u64,
     embed_data_version: Option<u64>,
+    embed_generation: Option<u64>,
 }
 
 /// Byte budget across all cached values (issue #736 B1).
@@ -105,6 +124,7 @@ impl QueryCache {
             phase_b_commit: phase_b_commit.to_string(),
             data_version: versions.graph,
             embed_data_version: versions.embed,
+            embed_generation: versions.embed_generation,
         }
     }
 
@@ -207,9 +227,41 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Graph-only data versions (no embed.db), the common case in these tests.
+    /// Graph-only data versions (no embed.db, no sidecar), the common case in
+    /// these tests.
     fn dv(graph: u64) -> DataVersions {
-        DataVersions { graph, embed: None }
+        DataVersions {
+            graph,
+            embed: None,
+            embed_generation: None,
+        }
+    }
+
+    /// #510: a sidecar respawn swaps the served HNSW index in place inside the
+    /// `Arc` the KNN hooks hold, so the seeds behind an `ask` answer change
+    /// with no embed.db write to move `embed` and no graph write to move the
+    /// rest of the key. Only the serving generation can see it, and without it
+    /// the pre-swap answer is served until something unrelated evicts it.
+    #[test]
+    fn a_sidecar_restart_invalidates_warm_ask_entries() {
+        let mut c = QueryCache::new(8);
+        let args = json!({"query": "isPrime"});
+        let served_by = |generation: u64| DataVersions {
+            graph: 1,
+            embed: Some(7),
+            embed_generation: Some(generation),
+        };
+        c.put("ask", &args, "c1", "p1", served_by(1), json!("old index"));
+        assert!(
+            c.get("ask", &args, "c1", "p1", served_by(2)).is_none(),
+            "a respawned sidecar serves a different HNSW index, so a warm entry \
+             built from the old one must not hit"
+        );
+        assert_eq!(
+            c.get("ask", &args, "c1", "p1", served_by(1)),
+            Some(json!("old index")),
+            "the same generation must still hit, or every ask recomputes"
+        );
     }
 
     #[test]
@@ -289,6 +341,7 @@ mod tests {
         let embedded = |embed: u64| DataVersions {
             graph: 1,
             embed: Some(embed),
+            embed_generation: Some(1),
         };
         c.put(
             "ask",
