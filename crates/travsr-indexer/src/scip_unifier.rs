@@ -395,6 +395,22 @@ pub fn native_name_kind<'a>(signature: &'a str, node_kind: &str) -> Option<ScipN
         signature
     };
 
+    // #825: the body must be a symbol name, not a path. A URI scheme (`file:`
+    // in `file:///abs/x.dart`) and a Windows drive letter (`C:` in
+    // `C:\src\x.rs`) are both all-alphabetic, so the single-colon strip above
+    // cannot tell them from a kind prefix and eats them, and the `.` split
+    // below then reads the file extension as the symbol: `file:///C:/src/x.dart`
+    // became container `///C:/src/x`, name `dart`. That is a corrupted value in
+    // the `travsr status` miss list (#825 Part A prints it verbatim) and, worse,
+    // a bogus `class:dart` candidate that could unify a def onto an unrelated
+    // node. A path carries no usable leaf name, which is already this function's
+    // documented `None` condition. The real emitter shapes always keep a `::`
+    // separator before the dotted name and take the branch above, so they are
+    // unaffected.
+    if body.contains(['/', '\\']) {
+        return None;
+    }
+
     // Split `Container.name` on the last `.`; a bare name has no container.
     let (container, name) = match body.rsplit_once('.') {
         Some((c, n)) if !c.is_empty() && !n.is_empty() => (Some(c), n),
@@ -578,6 +594,35 @@ mod tests {
         assert_eq!(
             native_name_kind("swift::Animal", "class"),
             Some(parsed(None, "Animal", "class"))
+        );
+    }
+
+    #[test]
+    fn native_name_kind_path_shaped_signature_is_none() {
+        // #825: a URI scheme (`file:`) and a Windows drive letter (`C:`) are both
+        // all-alphabetic, so the single-colon kind-prefix strip could not tell
+        // them from `fn:` / `class:` and ate them, after which the `.` split read
+        // the file extension as the symbol name. `file:///C:/src/x.dart` came out
+        // as container `///C:/src/x`, name `dart` — a corrupted row in the
+        // `travsr status` miss list, and a bogus `class:dart` candidate that
+        // could unify a def onto an unrelated node. A path has no usable leaf
+        // name, so the answer is None.
+        for sym in [
+            "file:///C:/src/x.dart",
+            "file:///abs/x.dart",
+            "C:\\src\\x.rs",
+            "package:pkg/animal.dart",
+        ] {
+            assert_eq!(native_name_kind(sym, "class"), None, "sym={sym}");
+        }
+        // The real emitter shapes keep their `::` separator and are unaffected,
+        // Windows drive letter included.
+        let p = native_name_kind("file:///C:/src/x.dart::Animal.describe", "function").unwrap();
+        assert_eq!(p, parsed(Some("Animal"), "describe", "function"));
+        // And an ordinary Phase-A-style prefix still strips.
+        assert_eq!(
+            native_name_kind("class:Foo", "class"),
+            Some(parsed(None, "Foo", "class"))
         );
     }
 
