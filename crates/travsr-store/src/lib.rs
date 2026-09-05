@@ -11791,12 +11791,9 @@ mod tests {
         for iter in 0..200u32 {
             let mut store = SqliteStore::open_in_memory().unwrap();
             let mk = |sig: &str, kind: &str, line: u32, end: u32| {
-                travsr_core::Node::new(
-                    travsr_core::VName::new("c", "", "a.rs", "rust", sig),
-                    kind,
-                )
-                .with_line(line)
-                .with_end_line(end)
+                travsr_core::Node::new(travsr_core::VName::new("c", "", "a.rs", "rust", sig), kind)
+                    .with_line(line)
+                    .with_end_line(end)
             };
             // make: 1-3 (shared callee), h0..h3: 4-15 (each calls make().run()),
             // ctrl: 16-18 (off-chain, calls free), then the committed targets.
@@ -11816,7 +11813,11 @@ mod tests {
             let body = |ret: &str, param: &str, edited: &[bool; 4]| {
                 let mut s = format!("fn make({param}) -> {ret} {{\n  d()\n}}\n");
                 for (i, e) in edited.iter().enumerate() {
-                    let call = if *e { "make().run(); log()" } else { "make().run()" };
+                    let call = if *e {
+                        "make().run(); log()"
+                    } else {
+                        "make().run()"
+                    };
                     s.push_str(&format!("fn h{i}() {{\n  {call};\n}}\n"));
                 }
                 s.push_str("fn ctrl() {\n  free();\n}\n");
