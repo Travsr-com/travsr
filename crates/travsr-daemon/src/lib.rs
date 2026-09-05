@@ -11000,6 +11000,7 @@ mod tests {
                 query_cache::DataVersions {
                     graph: s.data_version().unwrap(),
                     embed: s.embed_data_version().unwrap(),
+                    embed_generation: Some(travsr_plugin_host::embed_serving_generation()),
                 },
             )
         };
@@ -11039,6 +11040,17 @@ mod tests {
             serde_json::json!(false),
             "deleted node must not resurface"
         );
+    }
+
+    /// #510: the embed components of the cache key are gated on this predicate.
+    /// Widening it would let the sidecar's batched reindex writes and its
+    /// respawns invalidate entries whose answers cannot depend on either.
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn only_ask_is_keyed_on_embed_state() {
+        assert!(reads_embeddings("ask"));
+        assert!(!reads_embeddings("graph"));
+        assert!(!reads_embeddings("status"));
     }
 }
 
@@ -12254,6 +12266,18 @@ fn live_editor_sessions(
     live
 }
 
+/// Whether a query tool's answer depends on embedding state, and so whether its
+/// cache entries must be keyed on it.
+///
+/// Only `ask` reaches the embeddings, through the sidecar's KNN seeds and the
+/// RFC-019 cosine oracle. Keying `graph`/`status` entries on embed state would
+/// let the embed sidecar's batched reindex writes thrash entries that cannot
+/// change because of them.
+#[cfg(any(unix, windows))]
+fn reads_embeddings(tool: &str) -> bool {
+    tool == "ask"
+}
+
 /// Returns `(response, should_shutdown)`.
 ///
 /// Called from the Unix domain-socket accept loop and the Windows Named Pipe
@@ -12746,16 +12770,23 @@ fn handle_control_message(
             // no store) rather than collapsing to a sentinel value: a sentinel
             // could collide across two consecutive errors bracketing a
             // mutation and serve one stale hit.
-            // Only `ask` reads embed.db (KNN + RFC-019 cosine oracle) — keying
-            // graph/status entries on embed state would let the embed
-            // sidecar's batched reindex writes thrash unrelated cache entries.
-            let embed_version = if tool == "ask" {
+            // #510: embed.db is only half of what an `ask` answer depends on.
+            // The KNN seeds come from the sidecar's in-memory HNSW index, which
+            // a respawn or model switch replaces with no embed.db write, so the
+            // host's serving generation goes in the key beside the pragma.
+            let embed_version = if reads_embeddings(&tool) {
                 s.embed_data_version()
             } else {
                 Ok(None)
             };
+            let embed_generation =
+                reads_embeddings(&tool).then(travsr_plugin_host::embed_serving_generation);
             let versions = match (s.data_version(), embed_version) {
-                (Ok(graph), Ok(embed)) => Some(query_cache::DataVersions { graph, embed }),
+                (Ok(graph), Ok(embed)) => Some(query_cache::DataVersions {
+                    graph,
+                    embed,
+                    embed_generation,
+                }),
                 (graph, embed) => {
                     let err = graph
                         .err()

@@ -37,7 +37,7 @@ pub use embed_catalog::{
     ModelUsage, MAX_EMBED_WORKERS,
 };
 pub use embed_sidecar::{EmbedCapabilities, EmbedError, EmbedSidecar};
-pub use embed_supervisor::{EmbedQueryHook, EmbedSupervisor};
+pub use embed_supervisor::{embed_serving_generation, EmbedQueryHook, EmbedSupervisor};
 pub use governance::{Capacity, EmbedGovernance, EmbedOverrides, Priority};
 pub use indexer::{PhaseBInputs, PhaseBLiveness, PhaseBOutcome, PluginIndexer};
 pub use phase_b::{
