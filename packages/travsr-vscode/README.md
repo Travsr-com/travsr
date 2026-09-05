@@ -12,7 +12,7 @@ Travsr replaces vector RAG with a deterministic graph. Every function call, impo
 - **Callers and dependencies**: all call sites for any function across the repo, and the imports of any file, in the sidebar tree
 - **Context Explorer**: graph-ranked context for a natural-language query, grouped by whether a result matched exactly, semantically, or through the graph
 - **Code lens and hover**: inline "N callers" counts on definitions, a dependency list on imports, and a high-blast warning before you edit a high-impact file
-- **Languages panel**: which languages have full cross-file analysis on this machine and in this repository, what each one still needs, and a one-click install for the ones that are missing
+- **Languages, inside Health**: which analyzers are installed on this machine, which are turned on for this repository, what each one still needs, and one click to install, enable for this repository, or disable
 - **Stats panel**: index and daemon health, plus a searchable daemon log with severity filters, a per-day file picker, and optional auto-refresh
 - **Multi-repo**: pick the active repository once when several are open; installs and re-indexes go where you meant them to
 - **MCP integration**: registers the local Travsr MCP server with Claude Desktop, Cursor and Continue, so the same graph answers your agent's questions
@@ -23,7 +23,7 @@ Travsr replaces vector RAG with a deterministic graph. Every function call, impo
 
 - VS Code 1.85 or later
 - The `travsr` binary. The extension resolves it from `travsr.binaryPath`, then `~/.travsr/bin`, then PATH, and offers to download a verified release build if none of those work.
-- travsr v1.0.0 or later is recommended. An older binary does not report everything the Languages panel needs; the panel detects that and says so, rather than rendering the gaps as answers.
+- travsr v1.0.0 or later is recommended. An older binary does not report everything the Health panel's Languages section needs; the panel detects that and says so, rather than rendering the gaps as answers.
 
 ## Getting Started
 
@@ -33,7 +33,7 @@ Travsr replaces vector RAG with a deterministic graph. Every function call, impo
 4. Open the **Travsr** panel in the Activity Bar to see your live call graph
 5. Use `Travsr: Show Callers` or `Travsr: Show Blast Radius` from the command palette
 
-For full cross-file analysis in languages beyond TypeScript, JavaScript, Python and Rust, open `Travsr: Languages` and install the analyzer for the ones you use. The panel names any tool the analyzer needs first (a JDK, Node.js, and so on) and what is already available on this machine.
+For full cross-file analysis in languages beyond TypeScript, JavaScript, Python and Rust, open `Travsr: Health` and use the Languages section. It shows, per language, whether the analyzer is installed on this machine and whether it is turned on for this repository, names any tool the analyzer needs first (a JDK, Node.js, and so on), and offers the one action that applies: install, enable for this repository, or disable.
 
 ## Commands
 
@@ -46,7 +46,6 @@ For full cross-file analysis in languages beyond TypeScript, JavaScript, Python 
 | `Travsr: Show Execution Path` | Lowest-cost path between two symbols, with nearby context |
 | `Travsr: Open Context Explorer` | Graph-ranked context for a natural-language query |
 | `Travsr: Ask Symbol` | Look a symbol up by name across the graph |
-| `Travsr: Languages` | Language analyzer status, prerequisites, and installs |
 | `Travsr: Health` | Index health, daemon status, analysis state, and the daemon log |
 | `Travsr: Select Repository` | Choose which open repo actions target |
 | `Travsr: Registered Repos` | Every repo in the global registry |

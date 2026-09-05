@@ -226,7 +226,6 @@ export function activate(context: vscode.ExtensionContext): void {
       type ItemId =
         | "graphStats"
         | "repos"
-        | "languages"
         | "reindex"
         | "restart"
         | "settings"
@@ -237,7 +236,6 @@ export function activate(context: vscode.ExtensionContext): void {
       const items: vscode.QuickPickItem[] = [
         { label: "$(pulse) Health",                    id: "graphStats" } as ActionItem,
         { label: "$(repo) Registered repos",          id: "repos"      } as ActionItem,
-        { label: "$(extensions) Languages",           id: "languages"  } as ActionItem,
         { label: "$(sync) Re-index now",              id: "reindex"    } as ActionItem,
         { label: "", kind: vscode.QuickPickItemKind.Separator },
         { label: "$(refresh) Restart daemon",         id: "restart"  } as ActionItem,
@@ -258,9 +256,6 @@ export function activate(context: vscode.ExtensionContext): void {
           break;
         case "repos":
           await vscode.commands.executeCommand("travsr.showRepos");
-          break;
-        case "languages":
-          await vscode.commands.executeCommand("travsr.showLanguages");
           break;
         case "reindex":
           await vscode.commands.executeCommand("travsr.reindexNow");
@@ -459,7 +454,8 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // CLI↔UI parity commands (VSCODE-247): askSymbol, manageSynonyms,
-  // showDependencies, showExecutionPath, showRepos, showGraphStats, showLanguages.
+  // showDependencies, showExecutionPath, showRepos, showGraphStats (Health,
+  // which also carries the languages table).
   registerParityCommands(proxy, context, binary, () => {
     codeLensProvider.clearCache();
     hoverProvider.clearCache();
@@ -606,7 +602,7 @@ async function checkBinaryAndPrompt(
       // re-learn a fact about a binary the user chose themselves, is the wrong
       // trade. The steps below probe because each of them runs at most once (they
       // persist the path they picked, so the next activation lands here), and the
-      // Languages panel re-checks the shape from the payload it already fetches,
+      // Health page re-checks the shape from the payload it already fetches,
       // which covers this branch at no extra cost.
       return; // valid, nothing to do
     } catch (e) {

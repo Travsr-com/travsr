@@ -59,9 +59,22 @@ const FULL: HealthData = {
   ],
   activeRepo: "menuservice",
   languages: [
-    { language: "Java", analysis: "structural only", full: false, statusLine: "partial", flagged: true, fix: "semantic" },
-    { language: "XML", analysis: "full", full: true, statusLine: "installed and enabled", flagged: false, fix: "none" },
-    { language: "Go", analysis: "structural only", full: false, statusLine: "partial (run: travsr lang install go for full analysis)", flagged: false, fix: "install" },
+    {
+      language: "Java", analysis: "full", full: true, statusLine: "installed and enabled", flagged: true,
+      installed: true, repoState: "enabled", availableHere: true, osName: "", prerequisites: "JDK + Gradle",
+      builtin: false, inRepo: true, fix: "semantic", canDisable: true,
+    },
+    {
+      language: "XML", analysis: "full", full: true, statusLine: "installed and enabled", flagged: false,
+      installed: true, repoState: "always_on", availableHere: true, osName: "", prerequisites: "",
+      builtin: true, inRepo: true, fix: "none", canDisable: false,
+    },
+    {
+      language: "Go", analysis: "structural only", full: false,
+      statusLine: "partial (run: travsr lang install go for full analysis)", flagged: false,
+      installed: false, repoState: "not_enabled", availableHere: true, osName: "", prerequisites: "Go toolchain",
+      builtin: false, inRepo: true, fix: "install", canDisable: false,
+    },
   ],
   integrity: {
     healthy: false,
@@ -349,6 +362,57 @@ suite("health panel rendering", () => {
     assert.ok(!html.includes("fixLang(this, 'go')"), "never the language name itself");
   });
 
+  test("the Languages table keeps 'installed on this machine' apart from 'on for this repo'", () => {
+    // kotlin is the case the merged table exists for: the analyzer is on the
+    // machine, so an install changes nothing; what is missing is the per-repo
+    // switch. The old table offered Install there.
+    const rows: HealthData["languages"] = [
+      {
+        language: "kotlin", analysis: "structural only", full: false, statusLine: "partial", flagged: false,
+        installed: true, repoState: "not_enabled", availableHere: true, osName: "", prerequisites: "JDK, Maven or Gradle",
+        builtin: false, inRepo: true, fix: "enable", canDisable: false,
+      },
+      {
+        language: "go", analysis: "structural only", full: false, statusLine: "partial", flagged: false,
+        installed: false, repoState: "not_enabled", availableHere: true, osName: "", prerequisites: "Go toolchain",
+        builtin: false, inRepo: true, fix: "install", canDisable: false,
+      },
+      {
+        language: "java", analysis: "full", full: true, statusLine: "active", flagged: false,
+        installed: true, repoState: "enabled", availableHere: true, osName: "", prerequisites: "JDK + Gradle",
+        builtin: false, inRepo: true, fix: "none", canDisable: true,
+      },
+      {
+        language: "ruby", analysis: "structural only", full: false, statusLine: "not available on windows", flagged: false,
+        installed: false, repoState: "not_enabled", availableHere: false, osName: "Windows", prerequisites: "Ruby, Bundler",
+        builtin: false, inRepo: true, fix: "none", canDisable: false,
+      },
+    ];
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, { ...FULL, languages: rows });
+    assert.ok(html.includes("<th>Global installed</th>") && html.includes("<th>This repo</th>"), "two columns, two facts");
+    assert.ok(html.includes("Enable for this repo") && html.includes("fixLang(this, 0)"), "installed but off here offers the enable, not an install");
+    assert.ok(html.includes("Install analyzer") && html.includes("fixLang(this, 1)"), "not installed offers the install");
+    assert.ok(html.includes("disableLang(this, 2)"), "an enabled non-builtin can be turned off");
+    assert.ok(html.includes("not available on Windows"), "an unavailable language says so");
+    assert.ok(!html.includes("fixLang(this, 3)"), "and is never offered an install that would dead-end");
+    assert.ok(html.includes("JDK, Maven or Gradle"), "prerequisites travel with the row");
+    // The Semantic tile counts only languages that can run here: ruby is a fact
+    // about the platform, not a partial analysis.
+    assert.ok(html.includes("1 of 3"), `tile counts the three that can run here; got ${/Semantic[\s\S]{0,200}/.exec(html)?.[0]}`);
+  });
+
+  test("a stale binary's language rows are withheld and the banner names it", () => {
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, {
+      ...FULL,
+      languages: null,
+      languagesSkew: { missingFields: ["status", "repoState"], binary: "C:/old/travsr.exe" },
+    });
+    assert.ok(html.includes("older than this extension expects"), "the banner appears in the section");
+    assert.ok(html.includes("C:/old/travsr.exe"), "it names the binary");
+    assert.ok(html.includes("downloadBinary(") && html.includes("openBinarySetting("), "and offers both remedies");
+    assert.ok(!html.includes("Could not read the language list."), "a skew is a finding, not a read failure");
+  });
+
   test("every button on the page posts a message the panel handles", () => {
     // The Remove and Prune stale buttons were rendered here but their handlers
     // lived only in the Repos panel, so clicking them did nothing at all. This
@@ -367,9 +431,9 @@ suite("health panel rendering", () => {
     const HANDLED = new Set([
       "refresh", "startDaemon", "restartDaemon", "reindex", "fullRebuild",
       "reindexSemantic", "installHook", "installEmbed", "restartEmbed",
-      "runFsck", "compact", "registerMcp", "prune", "remove", "fixLang",
+      "runFsck", "compact", "registerMcp", "prune", "remove", "fixLang", "disableLang",
       "runFix", "copyFix", "openFile", "setLogLines", "setLogFile", "setLogAuto",
-      "initRepo", "detectLangs",
+      "initRepo", "detectLangs", "downloadBinary", "openBinarySetting",
     ]);
     const posted = new Set<string>();
     for (const m of html.matchAll(/command:\s*'([a-zA-Z]+)'/g)) posted.add(m[1]);

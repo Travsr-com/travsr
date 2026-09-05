@@ -1,8 +1,8 @@
 /**
  * VSCODE-247 — interactive management webviews.
  *
- * Pure HTML builders for the Synonyms editor, Repos manager, Health
- * dashboard, and Languages panel. Each builder returns a complete document via
+ * Pure HTML builders for the Synonyms editor, Repos manager and Health
+ * dashboard (which carries the languages table). Each builder returns a complete document via
  * `webviewShell`, styled with the canonical travsr-designer tokens and a strict
  * CSP. The builders are framework-free (no React) and pure so they can be
  * unit-tested without a real webview.
@@ -292,7 +292,9 @@ export function webviewShell(title: string, body: string, script: string): strin
   table.ltbl td.ok { color: var(--green); }
   table.ltbl td.warn { color: var(--gold); }
   table.ltbl td .ci { vertical-align: -2px; margin-right: 4px; }
-  table.ltbl .ra { text-align: right; padding-right: 0; }
+  table.ltbl .ra { text-align: right; padding-right: 0; white-space: nowrap; }
+  table.ltbl td.mute { color: var(--fg-subtle); }
+  table.ltbl .lprereq { font-size: 10px; color: var(--fg-subtle); line-height: 1.3; }
   .btn.mini { padding: 2px 8px; font-size: 11px; }
   .btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--fg-muted); }
   .diag-a { display: flex; align-items: center; gap: 7px; }
@@ -843,6 +845,15 @@ export interface IntegrityView {
   logFiles: number;
 }
 
+/** One row of the Health page's Languages table.
+ *
+ *  Two facts the CLI reports are kept apart on purpose, because they answer
+ *  different questions and used to be collapsed into one column: whether the
+ *  analyzer is installed on this machine (`installed`, the global fact) and
+ *  whether full analysis is turned on for the repository this page describes
+ *  (`repoState`, the per-repo corpus trust gate). A language can be installed
+ *  everywhere and still be off here, and the remedy for that is not an
+ *  install. */
 export interface LanguageRow {
   language: string;
   /** The CLI's own word for it, rendered as given. */
@@ -858,14 +869,39 @@ export interface LanguageRow {
    *  language as installed and active while `travsr status` warns that it ran
    *  and produced no symbols. Both are true, and the row has to show it. */
   flagged: boolean;
-  /** Which fix this row offers, or none.
-   *
-   *  These are different commands and offering the wrong one wastes the user's
-   *  time: a language that is partial because no analyzer is installed needs
-   *  `lang install <language>`, which is what the CLI's own status line says,
-   *  while one whose analyzer is installed but resolved nothing needs a
-   *  semantic re-index. */
-  fix: "install" | "semantic" | "none";
+  /** Analyzer present on this machine (the CLI's `installed`). Global: it says
+   *  nothing about whether this repo may use it. */
+  installed: boolean;
+  /** Per-repo enablement, the CLI's `repoState` tag rendered as sent. `unknown`
+   *  is the extension's own word for a tag it did not recognise (#755): never a
+   *  value that looks like a real answer. */
+  repoState: "always_on" | "enabled" | "needs_analyzer" | "not_enabled" | "no_repo" | "unknown";
+  /** Whether full analysis can run on this OS at all. False means no build
+   *  exists here, so no install is ever offered for the row. */
+  availableHere: boolean;
+  /** The OS word for the unavailable case ("Windows"), else "". */
+  osName: string;
+  /** What the project needs for full analysis ("JDK + Gradle"). "" when the
+   *  analyzer needs nothing; "unknown" when the CLI did not report it. */
+  prerequisites: string;
+  builtin: boolean;
+  /** The graph found files of this language in the repo. False rows are not
+   *  rendered: there is nothing here for the analyzer to read, so nothing to
+   *  install or enable. True when the graph could not say. */
+  inRepo: boolean;
+  /** Which fix this row offers, or none. These are different commands and
+   *  offering the wrong one wastes the user's time:
+   *  - `install`: no analyzer on this machine, run `lang install <language>`,
+   *    which also turns it on for this repo;
+   *  - `enable`: installed globally but off for this repo, turn it on in config
+   *    without downloading anything;
+   *  - `permission`: installed, but its build tools cannot run isolated on this
+   *    OS and need the user's one-time consent;
+   *  - `semantic`: enabled, but a warning on this page says it resolved
+   *    nothing, so re-run the semantic pass. */
+  fix: "install" | "enable" | "permission" | "semantic" | "none";
+  /** Full analysis is on and this is not a builtin, so it can be turned off. */
+  canDisable: boolean;
 }
 
 /** Everything the page needs beyond the metric tiles and the log.
@@ -903,6 +939,10 @@ export interface HealthData {
   repos: RepoRow[] | null;
   activeRepo: string;
   languages: LanguageRow[] | null;
+  /** #755: set when the resolved binary's `lang list --json` predates the fields
+   *  the Languages section reads. The rows are withheld (`languages` is null) and
+   *  the section says which binary is behind instead of guessing at cells. */
+  languagesSkew?: LangContractSkew;
   integrity: IntegrityView | null;
 }
 
@@ -1415,40 +1455,115 @@ export function buildStatsHtml(
         )
   );
 
-  // Languages
+  // Languages. This is the one place the extension reports per-language state
+  // (the separate Languages panel was folded in here): what is installed on
+  // this machine, what is turned on for this repo, and the one action that
+  // moves a row forward.
+  // Only languages the repo contains and this OS can run count towards the
+  // chip: a missing analyzer for a language the repo has no files in is not a
+  // problem with this repo.
+  const langHere = (health.languages ?? []).filter((l) => l.availableHere && l.inRepo);
+  const langPartial = langHere.filter((l) => !l.full || l.flagged).length;
   const langSec = section(
     "Languages",
     health.languages === null
       ? statusChip("mute", "unknown")
-      : health.languages.some((l) => !l.full)
-        ? statusChip("warn", `${health.languages.filter((l) => !l.full).length} partial`)
-        : statusChip("ok", `${health.languages.length} full`),
+      : langPartial > 0
+        ? statusChip("warn", `${langPartial} partial`)
+        : statusChip("ok", `${langHere.length} full`),
     act("Detect", "detectLangs"),
-    health.languages === null
+    health.languagesSkew !== undefined
+      ? skewBanner(health.languagesSkew)
+      : health.languages === null
       ? unavailable("Could not read the language list.")
-      : `<table class="ltbl"><thead><tr><th>Language</th><th>Analysis</th><th>Reported</th><th class="ra">Action</th></tr></thead><tbody>` +
-        health.languages
-          .map((l, i) => {
+      : (() => {
+        const thead = `<thead><tr><th>Language</th><th>Analysis</th><th>Global installed</th><th>This repo</th><th class="ra">Action</th></tr></thead>`;
+        // The index is into `health.languages`, which is what the extension
+        // looks a click up in, so it must survive the split below.
+        const renderRow = (l: LanguageRow, i: number): string => {
             // A language the CLI calls active can still be the subject of a
             // warning on this same page. Showing the tick alone there is the
             // table contradicting the card below it.
-            const tone = !l.full || l.flagged ? "warn" : "ok";
-            const icon = tone === "ok" ? OK_ICON : WARN_ICON;
-            const button =
+            const tone = !l.availableHere ? "mute" : !l.full || l.flagged ? "warn" : "ok";
+            const icon = tone === "ok" ? OK_ICON : tone === "warn" ? WARN_ICON : "";
+            const analysisText = !l.availableHere
+              ? `not available on ${l.osName || "this platform"}`
+              : l.flagged
+                ? `${l.analysis}, see the warning below`
+                : l.analysis;
+            // Global: is the analyzer on this machine at all. Unavailable rows
+            // have no honest answer, so the cell stays empty rather than "no".
+            const globalCell = !l.availableHere
+              ? `<td class="mute">-</td>`
+              : l.installed
+                ? `<td class="ok">${OK_ICON}installed</td>`
+                : `<td class="warn">${WARN_ICON}not installed</td>`;
+            // This repo: the CLI's tag, rendered, never re-derived (#755).
+            const repoText =
+              {
+                always_on: "always on",
+                enabled: "enabled",
+                needs_analyzer: "no analyzer",
+                not_enabled: "not enabled",
+                no_repo: "n/a",
+                unknown: "unknown",
+              }[l.repoState] ?? "unknown";
+            const repoTone =
+              !l.availableHere || l.repoState === "no_repo"
+                ? "mute"
+                : l.repoState === "always_on" || l.repoState === "enabled"
+                  ? "ok"
+                  : "warn";
+            const repoTip =
+              {
+                always_on: "Built in, on for every repository",
+                enabled: "Full analysis is on for this repository",
+                needs_analyzer: `Authorized for this repository, but the analyzer is not installed on this machine, so only structural analysis runs until it is.`,
+                not_enabled: `Installed on this machine but off for this repository. Enable it here, or run travsr lang install ${l.language} in this repository.`,
+                no_repo: "Open a repository to see per-repository state",
+                unknown: `travsr did not report per-repository state for ${l.language}. Update travsr, or set travsr.binaryPath to a current binary.`,
+              }[l.repoState] ?? "";
+            const repoCell = !l.availableHere
+              ? `<td class="mute">-</td>`
+              : `<td class="${repoTone}" title="${esc(repoTip)}">${repoTone === "ok" ? OK_ICON : repoTone === "warn" ? WARN_ICON : ""}${esc(repoText)}</td>`;
+            const primary =
               l.fix === "install"
-                ? `<button class="btn mini primary" onclick="fixLang(this, ${i})">Install analyzer</button>`
-                : l.fix === "semantic"
-                  ? `<button class="btn mini primary" onclick="fixLang(this, ${i})">Re-run semantic</button>`
-                  : "-";
+                ? `<button class="btn mini primary" onclick="fixLang(this, ${i})" title="Downloads the analyzer and turns full analysis on for this repository">Install analyzer</button>`
+                : l.fix === "enable"
+                  ? `<button class="btn mini primary" onclick="fixLang(this, ${i})" title="Turns full analysis on for this repository; nothing is downloaded">Enable for this repo</button>`
+                  : l.fix === "permission"
+                    ? `<button class="btn mini primary" onclick="fixLang(this, ${i})" title="Full analysis for ${esc(l.language)} needs your one-time permission to run on ${esc(l.osName || "this OS")}; it uses your project's own build tools">Allow &amp; enable</button>`
+                    : l.fix === "semantic"
+                      ? `<button class="btn mini primary" onclick="fixLang(this, ${i})">Re-run semantic</button>`
+                      : "";
+            const disable = l.canDisable
+              ? `<button class="btn mini" onclick="disableLang(this, ${i})" title="Turn full analysis off for ${esc(l.language)}">Disable</button>`
+              : "";
+            const actions = primary || disable ? `${primary}${primary && disable ? " " : ""}${disable}` : "-";
+            const prereq =
+              l.prerequisites !== ""
+                ? `<div class="lprereq" title="${esc(l.prerequisites === "unknown" ? `travsr did not report prerequisites for ${l.language}.` : "What this project needs for full analysis")}">${esc(l.prerequisites)}</div>`
+                : "";
             return (
-              `<tr><td>${esc(l.language)}</td>` +
-              `<td class="${tone}">${icon}${esc(l.analysis)}</td>` +
-              `<td>${esc(l.flagged ? "see the warning below" : l.statusLine)}</td>` +
-              `<td class="ra">${button}</td></tr>`
+              `<tr><td>${esc(l.language)}${prereq}</td>` +
+              `<td class="${tone}">${icon}${esc(analysisText)}</td>` +
+              globalCell +
+              repoCell +
+              `<td class="ra">${actions}</td></tr>`
             );
-          })
-          .join("") +
-        `</tbody></table>`
+          };
+        // Only languages the repo contains. The catalog knows sixteen; a repo
+        // with three of them gets three rows, and a language it has no files
+        // in is not listed at all. The index passed to the buttons is still
+        // the position in `health.languages`, which is what a click is looked
+        // up in, so the filter must not renumber.
+        const here = health.languages
+          .map((l, i) => (l.inRepo ? renderRow(l, i) : ""))
+          .join("");
+        return here
+          ? `<table class="ltbl">${thead}<tbody>${here}</tbody></table>`
+          : unavailable("The graph found no supported languages in this repository yet.");
+      })()
   );
 
   // Agent connections
@@ -1567,7 +1682,11 @@ export function buildStatsHtml(
       : "";
 
   const semanticTile = (() => {
-    const langs = health.languages;
+    // Only languages the repo contains and this OS can run: a row that says
+    // "not available on Windows" is a fact about the platform, and one the
+    // repo has no files in is a fact about the catalog, neither a partial
+    // analysis of this repo.
+    const langs = health.languages?.filter((l) => l.availableHere && l.inRepo) ?? null;
     if (langs === null || langs.length === 0) return "";
     // A count, not a symbol total. `lang list` does not report symbol counts,
     // and the tile used to print "0 symbols" for one partial language while
@@ -1720,6 +1839,10 @@ function showLog(){
   if (input) input.focus({ preventScroll: true });
 }
 function fixLang(btn, i){ setLoading(btn,true,btn.textContent); vscode.postMessage({command:'fixLang', index:i}); }
+function disableLang(btn, i){ setLoading(btn,true,btn.textContent); vscode.postMessage({command:'disableLang', index:i}); }
+// #755: the skew banner's two remedies, the same actions the palette exposes.
+function downloadBinary(btn){ setLoading(btn,true,btn.textContent); vscode.postMessage({command:'downloadBinary'}); }
+function openBinarySetting(){ vscode.postMessage({command:'openBinarySetting'}); }
 function runFix(btn, i){ setLoading(btn,true,'Run'); vscode.postMessage({command:'runFix', index:i}); }
 function copyFix(btn, i){ vscode.postMessage({command:'copyFix', index:i}); }
 
@@ -1945,12 +2068,6 @@ export function formatLogSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** A per-language node count from the graph. */
-export interface LangCount {
-  language: string;
-  count: number;
-}
-
 /** An available language tool from `travsr lang list --json`. */
 export interface LangInfo {
   language: string;
@@ -2003,11 +2120,12 @@ export interface LangInfo {
   contract?: number;
 }
 
-/** #755: what `buildLanguagesHtml` reads out of every row and cannot re-derive.
- *  A binary whose `lang list --json` omits any of these predates this panel's
- *  contract, and rendering its rows produces silently wrong cells (a `status`
- *  that falls back to "partial", a `repoState` that interpolates the literal
- *  string "undefined"). Exported so the parser and the panel agree on one list.
+/** #755: what the Health page's Languages section reads out of every row and
+ *  cannot re-derive. A binary whose `lang list --json` omits any of these
+ *  predates this extension's contract, and rendering its rows produces silently
+ *  wrong cells (a `status` that falls back to "partial", a `repoState` that
+ *  interpolates the literal string "undefined"). Exported so the parser and the
+ *  renderer agree on one list.
  *
  *  Deliberately NOT every field on `LangInfo`. `needsApproval` and
  *  `elevatedHosts` are still declared (and still emitted) so an older CLI's JSON
@@ -2059,7 +2177,7 @@ function skewBanner(skew: LangContractSkew): string {
   return `<div class="banner warn" role="alert">
   <b>The <code>travsr</code> this window resolved is older than this extension expects.</b>
   <p style="margin:6px 0 0">${reported} ${fields}
-  Rather than show cells it would have to guess at, the available-tools list is held back.</p>
+  Rather than show cells it would have to guess at, the language rows are held back.</p>
   ${which}
   <p style="margin:8px 0 0">
     <button class="btn primary" onclick="downloadBinary(this)">Download a current binary</button>
@@ -2068,235 +2186,3 @@ function skewBanner(skew: LangContractSkew): string {
 </div>`;
 }
 
-/** Languages panel: indexed section + available section with install actions.
- *
- *  `skew` (#755) is set when the resolved binary's `lang list --json` predates the
- *  fields this panel reads. The available-tools rows are then withheld and replaced
- *  by an actionable banner: rendering them would produce a table that silently
- *  disagrees with `travsr lang list`, which is the whole failure this guards. */
-export function buildLanguagesHtml(
-  indexed: LangCount[],
-  available: LangInfo[],
-  targetRepo?: string,
-  skew?: LangContractSkew
-): string {
-  // ── Indexed section ──────────────────────────────────────────────────────────
-  const indexedRows = indexed.length
-    ? indexed
-        .map(
-          (l) =>
-            `<tr><td><span class="lang-dot"></span><span class="mono">${esc(l.language)}</span></td>
-<td style="text-align:right;color:var(--fg-muted)">${l.count.toLocaleString()}</td></tr>`
-        )
-        .join("\n")
-    : `<tr><td colspan="2" class="empty" style="font-style:normal">No language metadata yet.&nbsp; <button class="btn primary" id="initBtn" onclick="initRepo(this)">Initialize this repo</button></td></tr>`;
-  const indexedNote = indexed.length
-    ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural analysis; includes test &amp; fixture files.</p>`
-    : "";
-
-  // ── Available section ────────────────────────────────────────────────────────
-  const detectedLangs = new Set(indexed.map((l) => l.language));
-
-  // #755: skew short-circuits the rows entirely. Even with the per-cell guards
-  // below, a table of "unknown / unknown / unknown" rows is a worse answer than
-  // one sentence naming the wrong binary — the guards exist so a single odd row
-  // degrades gracefully, not so a whole skewed payload gets rendered.
-  const availRows = skew
-    ? ""
-    : available
-    .map((l) => {
-      // #755: every row here is `JSON.parse` of another process's stdout, so at
-      // runtime any field can be absent no matter what `LangInfo` declares. Read
-      // presence through an untyped view so the guards below are real branches
-      // and not comparisons the compiler proves impossible and prunes.
-      const sent = l as unknown as Record<string, unknown>;
-      const detected = detectedLangs.has(l.language);
-      // Render the CLI's computed status — never re-derive it here, so the panel
-      // can never disagree with `travsr lang list`.
-      const isActive = l.status === "active";
-      // No build for this OS: full analysis can never run here, so the panel must
-      // never offer an install. `status` and `availableOnThisPlatform` come from
-      // one CLI predicate and always agree; check both defensively.
-      const unavailableHere =
-        l.status === "unsupported" || !l.availableOnThisPlatform;
-      const osName =
-        ({ windows: "Windows", macos: "macOS", linux: "Linux" } as Record<string, string>)[
-          l.unavailableTarget ?? ""
-        ] ?? "this platform";
-      // The CLI's needs_consent line names the exact command (`allow-unsandboxed`),
-      // which is fine in a terminal but is internal wording for a panel with a
-      // button. Use plain prose here instead of echoing that line.
-      const permissionTip =
-        `Full analysis for ${l.language} needs your one-time permission to run on ` +
-        `${osName}. It uses your project's own build tools, the same as if you ran ` +
-        `the build yourself. Click to allow and enable it.`;
-
-      // Analysis column: one word per status, its plain (jargon-free) line as the
-      // tooltip — except needs_consent, whose CLI line names an internal command.
-      // #755: a status the CLI did not send (an older binary, or a tag added by a
-      // newer one) must read as unknown. The old `?? ["stale","partial"]` fallback
-      // asserted "partial" — a specific, checkable claim about the language — on the
-      // strength of a missing field, which is how every row came out "partial".
-      const badge = (
-        {
-          active: ["ok", "active"],
-          partial: ["stale", "partial"],
-          needs_approval: ["dim", "needs approval"],
-          needs_consent: ["dim", "needs permission"],
-          unsupported: ["dim", "not available here"],
-        } as Record<string, [string, string]>
-      )[l.status] ?? ["dim", "unknown"];
-      const badgeTip =
-        l.status === "needs_consent"
-          ? permissionTip
-          : typeof sent["statusLine"] === "string"
-            ? l.statusLine
-            : `travsr did not report a status for ${l.language}. Update travsr, or set travsr.binaryPath to a current binary.`;
-      const analysisBadges = `<span class="badge ${badge[0]}" title="${esc(badgeTip)}">${badge[1]}</span>`;
-
-      // Raw action HTML (used directly when detected or active; wrapped otherwise).
-      let rawAction: string;
-      if (unavailableHere) {
-        // Honest dead-end: no install offered, structure still works. Tooltip is
-        // the CLI's own plain line ("...not available on windows").
-        rawAction = `<span class="badge dim" title="${esc(badgeTip)}">Not available on ${esc(osName)}</span>`;
-      } else if (isActive && !l.builtin) {
-        rawAction = `<button class="btn danger" onclick="removeLang(this,'${esc(l.language)}')">Disable</button>`;
-      } else if (isActive) {
-        // A built-in analyzer that is live (e.g. python): nothing to install or turn off.
-        rawAction = `<span class="badge ok" title="${esc(badgeTip)}">on</span>`;
-      } else if (l.status === "needs_consent") {
-        // Installed, but needs the user's one-time permission to run on this OS.
-        // One click records it and re-indexes — no docs trip, no command to type.
-        rawAction = `<button class="btn primary" title="${esc(permissionTip)}" onclick="grantPermission(this,'${esc(l.language)}')">Allow &amp; enable</button>`;
-      } else {
-        // partial → installable here. Elevated languages (java, kotlin, scala,
-        // csharp) land here too now that elevated access is auto-granted for local
-        // use (ADR-017 amendment): they show a plain Install, no consent form.
-        // Languages that need an external build tool (scala, php) also land here:
-        // the Prerequisites column already names the tool, so this is a plain
-        // Install, not a redirect to a docs site.
-        rawAction = `<button class="btn primary" onclick="installLang(this,'${esc(l.language)}')">Install</button>`;
-      }
-
-      // Gate: undetected + inactive non-builtins get a disclosure instead of a direct
-      // button. Builtins, active languages, and platform-unavailable ones show their
-      // cell directly — the last so "Not available on <OS>" is never buried.
-      const actionCell =
-        !unavailableHere && !detected && !isActive && !l.builtin
-          ? `<details class="not-here"><summary>Not in this repo</summary><div class="not-here-body">${rawAction}</div></details>`
-          : rawAction;
-
-      // This repo: is full analysis actually turned on for the target repo (the
-      // corpus trust gate), independent of whether the tool is installed. This is
-      // the fact that keeps "active on this machine" from being read as "on here".
-      // #755: these are object lookups on a CLI-supplied enum tag. An absent or
-      // unrecognised tag used to interpolate the literal string "undefined" into
-      // the cell, so every row read "undefined" against a stale binary. Fall back
-      // to a placeholder that says the value is unknown and names the remedy —
-      // never to a value that looks like a real answer.
-      const repoText =
-        {
-          always_on: "always on",
-          enabled: "enabled",
-          needs_analyzer: "no analyzer",
-          not_enabled: "not enabled",
-          no_repo: "n/a",
-        }[l.repoState] ?? "unknown";
-      const repoCls =
-        l.repoState === "enabled" || l.repoState === "always_on"
-          ? "ok"
-          : l.repoState === "not_enabled" || l.repoState === "needs_analyzer"
-            ? "stale"
-            : "dim";
-      const repoTip =
-        {
-          always_on: "Built in, always on for every repo",
-          enabled: "Full analysis is on for this repo",
-          needs_analyzer: `Authorized for this repo, but its analyzer isn't installed yet, only structural analysis runs until it is. Install it: travsr lang install ${l.language}`,
-          not_enabled: `Full analysis is off for this repo. Enable it: travsr lang install ${l.language} (run in this repo)`,
-          no_repo: "Open a repo to see per-repo status",
-        }[l.repoState] ??
-        `travsr did not report per-repo state for ${l.language}. Update travsr, or set travsr.binaryPath to a current binary.`;
-      const repoBadge = `<span class="badge ${repoCls}" title="${esc(repoTip)}">${repoText}</span>`;
-
-      // #755: an absent `prerequisites` is not the same fact as an analyzer with no
-      // external dependency, and "—" claims the latter. Say the value is unknown.
-      const prereqText =
-        sent["prerequisites"] === undefined || sent["prerequisites"] === null
-          ? `<span style="color:var(--fg-subtle)" title="travsr did not report prerequisites for ${esc(l.language)}.">unknown</span>`
-          : l.prerequisites && l.prerequisites !== "none"
-            ? `<span style="color:var(--fg-subtle)">${esc(l.prerequisites)}</span>`
-            : `<span style="color:var(--fg-subtle)">-</span>`;
-
-      return `<tr>
-<td><span class="mono">${esc(l.language)}</span></td>
-<td>${analysisBadges}</td>
-<td>${repoBadge}</td>
-<td>${prereqText}</td>
-<td>${actionCell}</td></tr>`;
-    })
-    .join("\n");
-
-  // When several repos are open the panel names the one install/detect will
-  // target and offers a one-click change, so the destination is never a guess.
-  const sub = targetRepo
-    ? `<p class="sub">Target repo: <b>${esc(targetRepo)}</b>; install &amp; detect run here. <a href="#" onclick="pickRepo();return false" style="color:var(--green)">change</a></p>`
-    : `<p class="sub">Indexed languages in this repo and available semantic analysis tools.</p>`;
-
-  // #755: with a skewed payload the empty-table placeholder would read as "no
-  // tools available", which is a claim about the machine rather than about the
-  // binary. Say what actually happened.
-  const availEmpty = skew
-    ? '<tr><td colspan="5" class="empty">Held back; the resolved travsr is older than this panel expects (see above).</td></tr>'
-    : '<tr><td colspan="5" class="empty">No analysis tools available yet. Use Reload above to check again.</td></tr>';
-
-  const body = `
-<h2>Languages</h2>
-${sub}
-${skew ? skewBanner(skew) : ""}
-<div class="toolbar">
-  <button class="btn" id="detectBtn" onclick="detectLangs(this)">Detect &amp; install</button>
-  <button class="btn" id="refreshBtn" onclick="doRefresh(this)" title="Refresh indexed counts (fast)">Refresh</button>
-  <button class="btn" id="reloadBtn" onclick="reloadAvail(this)" title="Refresh the list of available analysis tools">Reload available tools</button>
-</div>
-<section>
-  <h3>Indexed in this repo</h3>
-  <table><thead><tr><th>Language</th><th style="text-align:right">Nodes</th></tr></thead>
-  <tbody>${indexedRows}</tbody></table>
-  ${indexedNote}
-</section>
-<section>
-  <h3>Available tools</h3>
-  <table><thead><tr><th>Language</th><th>Semantic</th><th>This repo</th><th>Prerequisites</th><th>Action</th></tr></thead>
-  <tbody>${availRows || availEmpty}</tbody></table>
-</section>`;
-
-  const script = `
-function pickRepo() {
-  vscode.postMessage({command:'pickRepo'});
-}
-function installLang(btn, lang) {
-  setLoading(btn, true, 'Install');
-  vscode.postMessage({command:'installLang', language:lang});
-}
-function removeLang(btn, lang) {
-  setLoading(btn, true, 'Disable');
-  vscode.postMessage({command:'removeLang', language:lang});
-}
-function grantPermission(btn, lang) {
-  setLoading(btn, true, 'Allow &amp; enable');
-  vscode.postMessage({command:'enableWithPermission', language:lang});
-}
-function detectLangs(btn) {
-  setLoading(btn, true, 'Detect &amp; install');
-  vscode.postMessage({command:'detectLangs'});
-}
-function doRefresh(btn) { setLoading(btn, true, 'Refresh'); vscode.postMessage({command:'refresh'}); }
-function reloadAvail(btn) { setLoading(btn, true, 'Reload available tools'); vscode.postMessage({command:'reloadAvailable'}); }
-function initRepo(btn) { setLoading(btn, true, btn.innerText || 'Initialize this repo'); vscode.postMessage({command:'initRepo'}); }
-function downloadBinary(btn) { setLoading(btn, true, 'Download a current binary'); vscode.postMessage({command:'downloadBinary'}); }
-function openBinarySetting() { vscode.postMessage({command:'openBinarySetting'}); }`;
-
-  return webviewShell("Travsr Languages", body, script);
-}
