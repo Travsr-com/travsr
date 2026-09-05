@@ -168,6 +168,17 @@ suite("verdict", () => {
     assert.strictEqual(v.action?.message, "initRepo");
   });
 
+  test("no graph outranks a stopped daemon: the first command is init, which starts the daemon", () => {
+    // A fresh checkout with nothing answering used to offer Start daemon,
+    // which starts a daemon with nothing to serve and leaves `init` still to
+    // do. `travsr init` is the first command in any repository.
+    const v = computeVerdict(false, false, UNKNOWN_INDEX, [], false);
+    assert.strictEqual(v.verdict, "unindexed");
+    assert.strictEqual(v.headline, "No graph yet");
+    assert.strictEqual(v.action?.message, "initRepo");
+    assert.ok(/starts the daemon/.test(v.detail), v.detail);
+  });
+
   test("staleness outranks analyzer warnings, and names both commits", () => {
     const v = computeVerdict(true, true, STALE, [WARN], true);
     assert.strictEqual(v.verdict, "stale");

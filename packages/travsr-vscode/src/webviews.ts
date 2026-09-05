@@ -993,6 +993,20 @@ export function computeVerdict(
   diags: Diagnostic[],
   hasGraph: boolean
 ): VerdictView {
+  // No graph at all comes first, whatever the daemon is doing: `travsr init`
+  // is the first command in any repository, and it starts the daemon itself.
+  // Offering "Start daemon" here sent people to a daemon with nothing to
+  // serve, and the next thing they had to do was still `init`.
+  if (!hasGraph) {
+    return {
+      verdict: "unindexed",
+      headline: "No graph yet",
+      detail: mcpConnected
+        ? "This repository has not been indexed, so there is nothing for the editor or an agent to traverse."
+        : "This repository has not been indexed yet, so there is nothing for Travsr to answer from. Indexing it also starts the daemon.",
+      action: { label: "Index this repo", message: "initRepo" },
+    };
+  }
   // Being unable to query at all is the worst state, and it is a different
   // state from the background daemon being stopped: the extension's own
   // `travsr mcp --stdio` child answers from the database with no daemon
@@ -1001,18 +1015,8 @@ export function computeVerdict(
     return {
       verdict: "offline",
       headline: "Not answering",
-      detail: hasGraph
-        ? "Travsr could not be reached, so the numbers below are read from the graph on disk rather than from a live index."
-        : "Travsr could not be reached, and there is no graph on disk yet for this repository.",
+      detail: "Travsr could not be reached, so the numbers below are read from the graph on disk rather than from a live index.",
       action: { label: "Start daemon", message: "startDaemon" },
-    };
-  }
-  if (!hasGraph) {
-    return {
-      verdict: "unindexed",
-      headline: "No graph yet",
-      detail: "This repository has not been indexed, so there is nothing for the editor or an agent to traverse.",
-      action: { label: "Index this repo", message: "initRepo" },
     };
   }
   if (index.isStale === true) {
