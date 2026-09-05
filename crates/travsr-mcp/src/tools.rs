@@ -3798,28 +3798,37 @@ pub fn synonym_list(store: &SqliteStore) -> String {
 // fed to an LLM. The registry is global (independent of the open store), so these
 // are valid on the stdio server regardless of which repo it was started for.
 
-/// List registry entries as TSV: `name\tdb_path\t{0|1}` (1 = graph.db exists).
+/// List registry entries as TSV: `name\tdb_path\t{0|1}\tstatus`, where the
+/// boolean says whether graph.db is on disk and `status` (#454) is one of
+/// `indexed` / `index_missing` / `not_indexed` / `unknown`. The boolean column
+/// keeps its position so an older VS Code extension build still parses the rows.
 /// Empty string when the registry is empty.
 pub fn repos_list() -> String {
-    let repos = match travsr_store::registry::all_repos() {
+    let repos = match travsr_store::registry::all_entries() {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("repos_list error: {e}");
             return String::new();
         }
     };
-    let mut rows: Vec<(String, std::path::PathBuf)> = repos.into_iter().collect();
+    let mut rows: Vec<(String, travsr_store::registry::RepoEntry)> = repos.into_iter().collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     rows.iter()
-        .map(|(name, db_path)| {
-            let exists = if db_path.exists() { "1" } else { "0" };
+        .map(|(name, entry)| {
+            let status = entry.index_status();
+            let exists = if status == travsr_store::registry::IndexStatus::Indexed {
+                "1"
+            } else {
+                "0"
+            };
             // UX-018: emit the basename as the display Name and the verbatim-
             // stripped full path, matching the CLI `repos` table. `repos_remove`
             // resolves either back to the registry key.
             let display = travsr_store::registry::display_name(name);
-            let path = travsr_store::registry::strip_verbatim_prefix(&db_path.to_string_lossy())
-                .into_owned();
-            format!("{display}\t{path}\t{exists}")
+            let path =
+                travsr_store::registry::strip_verbatim_prefix(&entry.db_path.to_string_lossy())
+                    .into_owned();
+            format!("{display}\t{path}\t{exists}\t{}", status.as_str())
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -8847,11 +8856,62 @@ mod tests {
         assert!(!list.is_empty(), "defaults must be re-seeded after reset");
     }
 
-    // Note: repos_list/repos_prune/repos_remove operate on the *real* global
-    // registry (~/.travsr), so they are intentionally NOT unit-tested here — a
-    // test calling repos_prune() would mutate the developer's HOME. The
-    // underlying registry::{prune,unregister,all_repos} are covered by
-    // travsr-store/src/registry.rs tests under a temp-HOME lock.
+    // Note: repos_prune/repos_remove operate on the *real* global registry
+    // (~/.travsr), so they are intentionally NOT unit-tested here: a test
+    // calling repos_prune() would mutate the developer's HOME. The underlying
+    // registry::{prune,unregister,all_repos} are covered by
+    // travsr-store/src/registry.rs tests under a temp-HOME lock. repos_list only
+    // reads, so it is exercised below against a temp HOME.
+
+    #[test]
+    fn repos_list_reports_the_index_status_of_every_state() {
+        // HOME is process-global; this is the crate's lock for mutating it.
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let present = home.path().join("present/.travsr/graph.db");
+        std::fs::create_dir_all(present.parent().unwrap()).unwrap();
+        std::fs::write(&present, b"x").unwrap();
+        std::fs::create_dir_all(home.path().join(".travsr")).unwrap();
+        std::fs::write(
+            home.path().join(".travsr/registry.json"),
+            serde_json::json!({
+                "repos": {
+                    "/repos/present": { "db_path": present, "indexed_at": 1_700_000_000u64 },
+                    "/repos/never": { "db_path": home.path().join("never/graph.db") },
+                    "/repos/deleted": {
+                        "db_path": home.path().join("deleted/graph.db"),
+                        "indexed_at": 1_700_000_000u64
+                    },
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let listing = repos_list();
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let status = |name: &str| -> String {
+            let row = listing
+                .lines()
+                .find(|l| l.starts_with(&format!("{name}\t")))
+                .unwrap_or_else(|| panic!("row {name} missing from: {listing}"));
+            let cols: Vec<&str> = row.split('\t').collect();
+            assert_eq!(cols.len(), 4, "row must carry name, path, exists, status");
+            format!("{}|{}", cols[2], cols[3])
+        };
+        assert_eq!(status("present"), "1|indexed");
+        assert_eq!(status("never"), "0|not_indexed");
+        assert_eq!(status("deleted"), "0|index_missing");
+    }
 
     // ── transitive dependencies unit test ────────────────────────────────────
 

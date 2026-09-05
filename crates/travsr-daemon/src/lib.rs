@@ -1982,6 +1982,14 @@ pub fn init_repo_with_progress(
     // for minutes on large repos and produces Compact-richness text that would
     // be regenerated immediately anyway.
 
+    // #454: only now, on the success path, has an index actually been built.
+    // `register` above ran before a single file was indexed.
+    if std::env::var("TRAVSR_DISABLE_REGISTRY").as_deref() != Ok("1") {
+        if let Err(e) = travsr_store::registry::mark_indexed(&repo_root.to_string_lossy()) {
+            tracing::warn!("registry index stamp failed (non-fatal): {e}");
+        }
+    }
+
     let total_edges = edges_before + edges_written;
     Ok(InitStats {
         files_indexed: batch_counts.files_written,
@@ -7824,6 +7832,35 @@ mod tests {
 
         std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
         std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn init_repo_records_the_completed_index_in_the_registry() {
+        // #454: registration happens before a single file is indexed, so only a
+        // stamp written on the success path can tell a deleted index apart from
+        // one that was never built.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
+
+        let home_tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home_tmp.path());
+        let _ = init_repo(tmp.path()).unwrap();
+        let entries = travsr_store::registry::all_entries().unwrap();
+        std::env::remove_var("HOME");
+
+        let (_, entry) = entries.iter().next().expect("repo must be registered");
+        assert_eq!(
+            entry.index_status(),
+            travsr_store::registry::IndexStatus::Indexed
+        );
+        std::fs::remove_file(&entry.db_path).unwrap();
+        assert_eq!(
+            entry.index_status(),
+            travsr_store::registry::IndexStatus::IndexMissing,
+            "a deleted graph.db must not read as 'never indexed'"
+        );
     }
 
     #[test]

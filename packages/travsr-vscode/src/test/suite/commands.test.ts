@@ -106,6 +106,14 @@ suite("VSCODE-247: parseReposList", () => {
     assert.deepStrictEqual(parseReposList("<travsr-data></travsr-data>"), []);
     assert.deepStrictEqual(parseReposList(""), []);
   });
+  test("#454: carries the status column, and leaves it unset without one", () => {
+    const raw =
+      "never\t/a/graph.db\t0\tnot_indexed\ndeleted\t/b/graph.db\t0\tindex_missing\nold\t/c/graph.db\t0";
+    const rows = parseReposList(raw);
+    assert.strictEqual(rows[0].status, "not_indexed");
+    assert.strictEqual(rows[1].status, "index_missing");
+    assert.strictEqual(rows[2].status, undefined);
+  });
 });
 
 suite("VSCODE-247: buildStatsView", () => {
