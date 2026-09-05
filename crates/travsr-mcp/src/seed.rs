@@ -792,7 +792,7 @@ pub(crate) type DocKnnFn<'a> = &'a dyn Fn(&str, u32) -> Vec<(NodeId, f32)>;
 //
 // `doc_lane_candidates` fetches a larger, unfiltered pool; the caller
 // (`tools::build_docs_section`) reranks it and falls back to `doc_floor`-style
-// cosine filtering when the reranker is unavailable/disabled/over-budget —
+// cosine filtering when the reranker is unavailable/disabled/breaker-open —
 // same fail-open contract as the code lane's `crate::rerank::rerank`.
 
 /// Candidate pool size for doc-lane reranking — the doc-corpus analogue of

@@ -4853,7 +4853,7 @@ fn humanize_doc_anchor(sig: &str) -> String {
 /// but a store lookup failure or a node deleted between KNN and this call
 /// must degrade gracefully, not silently drop a real hit), or
 /// `crate::rerank::rerank` itself returns `None` (model absent, disabled,
-/// panicked, or over the circuit-breaker budget — same fail-open contract
+/// panicked, or skipped because the circuit breaker is open — same fail-open contract
 /// the code lane already relies on).
 fn rerank_doc_candidates(
     store: &SqliteStore,

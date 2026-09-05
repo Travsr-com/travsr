@@ -33,24 +33,31 @@ pub(crate) fn rerank_topk() -> usize {
         .unwrap_or(30)
 }
 
-/// Circuit-breaker budget. Mirrors `knn_budget_ms` (tools.rs): measured
-/// *after* the call completes and the result discarded if over budget, rather
-/// than a preemptive timeout — a CPU-bound forward pass can't be safely
-/// aborted mid-flight without unsafe thread termination, and this is the same
-/// tradeoff the existing KNN breaker already makes.
+/// Per-call latency budget. A CPU-bound forward pass can't be safely aborted
+/// mid-flight without unsafe thread termination, so this is necessarily
+/// measured *after* the call completes — which means it can never make the
+/// call that exceeded it any cheaper. It therefore drives [`Breaker`], which
+/// skips inference on *subsequent* calls, and never invalidates the scores of
+/// the call it measured.
 ///
-/// Default 1200 — this is a backstop, not the primary defense against repo
-/// size. The primary defense is `travsr-rerank::MAX_CANDIDATE_CHARS`, which
-/// bounds each candidate's tokenizer input so real cost stays roughly
-/// repo-agnostic (RFC-021 Phase 3 E2E, 2026-07-18): before that fix, K=30 on
-/// kubernetes/kubernetes measured 2.5-9s (vs ~353ms on travsr's own compact
-/// Rust fns) because 40-line Go snippets routinely blew past the tokenizer's
-/// truncation ceiling, and `PaddingStrategy::BatchLongest` then padded every
-/// candidate in a batch up to the longest one. After the input-size fix,
-/// the same K=30 on k8s measured 700-950ms — much closer to travsr's own
-/// number, but a real repo/hardware can still occasionally exceed 600ms
-/// (measured: 7/27 queries), so 1200 keeps headroom over the current
-/// post-fix worst case without going back to tolerating unbounded cost.
+/// Read as a UX policy, not a hardware calibration: "a single interactive
+/// rerank may take up to this long". That reading is what makes one number
+/// portable across an M-series laptop, an OCI A1 core and a Windows CI box —
+/// the alternative (a number predicting how fast the model runs) is wrong on
+/// every machine but the one it was measured on. A slow machine trips the
+/// breaker and stops paying the cost; a fast one never trips it.
+///
+/// Default 1200, unchanged since RFC-021 Phase 3 E2E (2026-07-18), and still a
+/// backstop rather than the primary defense against repo size. The primary
+/// defense is `travsr-rerank::MAX_CANDIDATE_CHARS`, which bounds each
+/// candidate's tokenizer input so real cost stays roughly repo-agnostic:
+/// before that fix, K=30 on kubernetes/kubernetes measured 2.5-9s (vs ~353ms
+/// on travsr's own compact Rust fns) because 40-line Go snippets routinely
+/// blew past the tokenizer's truncation ceiling, and
+/// `PaddingStrategy::BatchLongest` then padded every candidate in a batch up
+/// to the longest one. After the input-size fix, the same K=30 on k8s measured
+/// 700-950ms, and both candidate pools are hard-capped (30 code lane, 20 doc
+/// lane), so per-call cost no longer scales with the repo.
 fn rerank_budget_ms() -> u128 {
     std::env::var("TRAVSR_RERANK_BUDGET_MS")
         .ok()
@@ -58,6 +65,95 @@ fn rerank_budget_ms() -> u128 {
         .filter(|&x: &u128| x > 0)
         .unwrap_or(1200)
 }
+
+/// Consecutive over-budget calls that open [`Breaker`]. More than one, because
+/// a single slow call is almost always contention from unrelated work on the
+/// developer's machine (a build, a test run) rather than a statement about the
+/// hardware — measured on this repo: rerank costs 91-671ms per call on an idle
+/// 8-core M3 and 1505-3319ms with the CPU saturated by concurrent builds.
+/// Reacting to one sample would disable the reranker every time the user
+/// compiles something.
+const BREAKER_TRIP_STREAK: u32 = 3;
+
+/// While the breaker is open, one call in this many is let through as a probe,
+/// so a machine that was merely busy gets the reranker back without restarting
+/// the daemon. Deliberately counted in calls rather than wall-clock time: no
+/// clock source to disagree about across platforms, and it costs at most one
+/// slow query per interval.
+const BREAKER_PROBE_INTERVAL: u32 = 16;
+
+/// A real circuit breaker for the reranker: it opens after
+/// [`BREAKER_TRIP_STREAK`] consecutive over-budget calls and then *skips*
+/// inference, which is the only point at which skipping saves anything.
+///
+/// It deliberately does NOT judge the scores of a call that already ran. The
+/// cross-encoder is deterministic (`travsr-rerank`: same input, identical
+/// output), so how long a call took carries no information about whether its
+/// scores are good — discarding them spent the latency and threw away the
+/// ranking, which is strictly worse than either running or not running.
+///
+/// Owns its counters rather than reading process-global statics so the
+/// decision logic is unit-testable without the `OnceLock` pinning caveat that
+/// applies to [`RERANKER`].
+struct Breaker {
+    /// Consecutive completed calls that exceeded the budget. Any in-budget
+    /// call resets it, closing the breaker.
+    over_budget_streak: std::sync::atomic::AtomicU32,
+    /// Calls skipped since the last probe; drives [`BREAKER_PROBE_INTERVAL`].
+    skipped_since_probe: std::sync::atomic::AtomicU32,
+}
+
+impl Breaker {
+    const fn new() -> Self {
+        Self {
+            over_budget_streak: std::sync::atomic::AtomicU32::new(0),
+            skipped_since_probe: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// `true` when this call should skip inference entirely and fail open to
+    /// the lexical gate. Lets one call in [`BREAKER_PROBE_INTERVAL`] through
+    /// while open so the breaker can close again on its own.
+    fn should_skip(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.over_budget_streak.load(Relaxed) < BREAKER_TRIP_STREAK {
+            return false;
+        }
+        if self.skipped_since_probe.fetch_add(1, Relaxed) + 1 >= BREAKER_PROBE_INTERVAL {
+            self.skipped_since_probe.store(0, Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Record a completed call. Logs only on the open/close transitions, so a
+    /// sustained slow machine warns once rather than once per query.
+    fn record(&self, over_budget: bool, elapsed_ms: u128, budget_ms: u128) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if over_budget {
+            if self.over_budget_streak.fetch_add(1, Relaxed) + 1 == BREAKER_TRIP_STREAK {
+                tracing::warn!(
+                    elapsed_ms,
+                    threshold_ms = budget_ms,
+                    streak = BREAKER_TRIP_STREAK,
+                    "rerank is consistently over budget on this machine, skipping inference \
+                     on further queries and falling back to the lexical gate; it is retried \
+                     periodically"
+                );
+            }
+            return;
+        }
+        if self.over_budget_streak.swap(0, Relaxed) >= BREAKER_TRIP_STREAK {
+            self.skipped_since_probe.store(0, Relaxed);
+            tracing::info!(elapsed_ms, "rerank back within budget, resuming");
+        }
+    }
+}
+
+/// Process-wide breaker. Shared by both call sites (code lane in `seed.rs`,
+/// doc lane in `tools.rs`) on purpose: what it measures is this machine's
+/// capacity to run the model interactively, not a property of either lane.
+static BREAKER: Breaker = Breaker::new();
 
 /// The canonical per-user install location for the reranker model, mirroring
 /// the embed backends' `~/.travsr/models/<id>` layout (see `embed.rs`). P5 ships
@@ -416,14 +512,23 @@ pub(crate) fn warm_background() {
 }
 
 /// Score `candidates` against `query`. Returns `None` — "no opinion" — when
-/// the reranker is absent, disabled, panicked, errored, or ran over budget;
-/// the caller must leave ordering/confidence untouched in that case. Never
-/// panics itself. `Some(scores)` is always the same length as `candidates`,
-/// aligned by index.
+/// the reranker is absent, disabled, panicked, errored, or skipped because the
+/// circuit breaker is open; the caller must leave ordering/confidence untouched
+/// in that case. Never panics itself. `Some(scores)` is always the same length
+/// as `candidates`, aligned by index.
+///
+/// Scores that were actually computed are always returned. An over-budget call
+/// feeds [`BREAKER`] so the *next* queries can skip the cost, but its own
+/// output is kept: the model is deterministic, so elapsed time says nothing
+/// about score quality, and discarding it paid the full latency and then
+/// silently reinstated the confident-salad bug RFC-021 exists to cut.
 pub(crate) fn rerank(query: &str, candidates: &[&str]) -> Option<Vec<f32>> {
     let reranker = reranker()?;
     if candidates.is_empty() {
         return Some(Vec::new());
+    }
+    if BREAKER.should_skip() {
+        return None;
     }
 
     let start = Instant::now();
@@ -443,14 +548,7 @@ pub(crate) fn rerank(query: &str, candidates: &[&str]) -> Option<Vec<f32>> {
     };
 
     let budget = rerank_budget_ms();
-    if elapsed_ms > budget {
-        tracing::warn!(
-            elapsed_ms,
-            threshold_ms = budget,
-            "rerank exceeded circuit-breaker threshold, discarding scores, falling back to lexical gate"
-        );
-        return None;
-    }
+    BREAKER.record(elapsed_ms > budget, elapsed_ms, budget);
     Some(scores)
 }
 
@@ -473,6 +571,62 @@ mod tests {
     fn rerank_budget_default_is_1200ms() {
         std::env::remove_var("TRAVSR_RERANK_BUDGET_MS");
         assert_eq!(rerank_budget_ms(), 1200);
+    }
+
+    #[test]
+    fn breaker_stays_closed_for_isolated_slow_calls() {
+        // A single slow call is contention from unrelated work, not a verdict
+        // on the machine: the reranker must keep running.
+        let breaker = Breaker::new();
+        for _ in 0..10 {
+            assert!(!breaker.should_skip());
+            breaker.record(true, 5_000, 1_200);
+            assert!(!breaker.should_skip());
+            breaker.record(false, 300, 1_200);
+        }
+    }
+
+    #[test]
+    fn breaker_opens_only_after_a_streak_then_skips_inference() {
+        let breaker = Breaker::new();
+        for _ in 0..BREAKER_TRIP_STREAK - 1 {
+            assert!(!breaker.should_skip(), "must not open before the streak");
+            breaker.record(true, 5_000, 1_200);
+        }
+        assert!(!breaker.should_skip());
+        breaker.record(true, 5_000, 1_200);
+        // Open: the cost is now skipped rather than paid and discarded.
+        assert!(breaker.should_skip());
+    }
+
+    #[test]
+    fn open_breaker_probes_and_closes_once_calls_are_back_in_budget() {
+        let breaker = Breaker::new();
+        for _ in 0..BREAKER_TRIP_STREAK {
+            breaker.record(true, 5_000, 1_200);
+        }
+        // Skips until the probe interval elapses, then lets exactly one through.
+        for _ in 0..BREAKER_PROBE_INTERVAL - 1 {
+            assert!(breaker.should_skip());
+        }
+        assert!(!breaker.should_skip(), "one call in N must probe");
+        // The probe came back in budget, so the breaker closes.
+        breaker.record(false, 300, 1_200);
+        assert!(!breaker.should_skip());
+    }
+
+    #[test]
+    fn open_breaker_stays_open_while_probes_are_still_over_budget() {
+        let breaker = Breaker::new();
+        for _ in 0..BREAKER_TRIP_STREAK {
+            breaker.record(true, 5_000, 1_200);
+        }
+        for _ in 0..BREAKER_PROBE_INTERVAL - 1 {
+            assert!(breaker.should_skip());
+        }
+        assert!(!breaker.should_skip());
+        breaker.record(true, 5_000, 1_200);
+        assert!(breaker.should_skip(), "a slow probe must not close it");
     }
 
     #[test]
