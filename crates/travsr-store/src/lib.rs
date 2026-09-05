@@ -2687,7 +2687,12 @@ impl SqliteStore {
             //    `type:A` for rule 2 to follow, and every definition resolving
             //    through `A` would keep a stale committed `dst`.
             // 2. Otherwise demote any preserved definition that references a
-            //    changed definition in this parse's edge set. Iterated to a
+            //    changed definition. The reference relationships are the file's
+            //    COMMITTED owned edges still in the store (the resolved
+            //    `RefCall`/reference edges Phase A tree-sitter never emits — it
+            //    emits only `DefinesBinding`/`Depends`/`ResolvesTo`, so this
+            //    parse's `edges` alone would demote nothing in production),
+            //    unioned with this parse's structural edges. Iterated to a
             //    fixpoint, so demoting B also demotes a preserved A that
             //    references B; each round removes at least one id from a finite
             //    set, so it terminates.
@@ -2704,23 +2709,54 @@ impl SqliteStore {
             {
                 preserved.clear();
             }
-            while !preserved.is_empty() {
-                let demoted: Vec<i64> = edges
-                    .iter()
-                    .filter_map(|e| {
-                        let src = node_id_to_i64(e.src);
-                        let dst = node_id_to_i64(e.dst);
-                        (preserved.contains(&src)
-                            && new_ids.contains(&dst)
-                            && !preserved.contains(&dst))
-                        .then_some(src)
-                    })
+            if !preserved.is_empty() {
+                // The file's committed owned edges (src ∈ this file), loaded once
+                // before the owned-edge purge below. These carry the resolved
+                // reference edges that make a caller depend on a changed callee's
+                // type; unioned with this parse's structural edges for the
+                // fixpoint. Over-demotion (a body change that does not move the
+                // callee's resolved type) only costs a re-resolve, never a wrong
+                // edge.
+                let committed_ref_pairs: Vec<(i64, i64)> = {
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT src, dst FROM edges \
+                             WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                        )
+                        .context("preparing committed owned edge load for demotion")?;
+                    let rows: Vec<(i64, i64)> = stmt
+                        .query_map(params![corpus, path], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                        })
+                        .context("executing committed owned edge load")?
+                        .collect::<rusqlite::Result<_>>()
+                        .context("collecting committed owned edges")?;
+                    rows
+                };
+                let ref_pairs: Vec<(i64, i64)> = committed_ref_pairs
+                    .into_iter()
+                    .chain(
+                        edges
+                            .iter()
+                            .map(|e| (node_id_to_i64(e.src), node_id_to_i64(e.dst))),
+                    )
                     .collect();
-                if demoted.is_empty() {
-                    break;
-                }
-                for id in demoted {
-                    preserved.remove(&id);
+                loop {
+                    let demoted: Vec<i64> = ref_pairs
+                        .iter()
+                        .filter_map(|(src, dst)| {
+                            (preserved.contains(src)
+                                && new_ids.contains(dst)
+                                && !preserved.contains(dst))
+                            .then_some(*src)
+                        })
+                        .collect();
+                    if demoted.is_empty() {
+                        break;
+                    }
+                    for id in demoted {
+                        preserved.remove(&id);
+                    }
                 }
             }
 
@@ -3171,7 +3207,8 @@ impl SqliteStore {
             // RFC-027 #813: the definitions this edit changed are every node the
             // parse produced whose committed edges were not preserved. On a pure
             // body edit that is just the edited definitions; otherwise it is the
-            // whole file. The live lane re-resolves exactly these.
+            // whole file. This is the changed region both live lanes scope to
+            // (see `ReplaceReport::changed_defs`).
             let changed_defs: Vec<NodeId> = nodes
                 .iter()
                 .filter(|n| !preserved.contains(&node_id_to_i64(n.id)))
@@ -11361,24 +11398,27 @@ mod tests {
             run.clone(),
             free.clone(),
         ];
-        // This parse's tree-sitter edges: h calls make (the receiver source) and
-        // g calls free. The receiver-typed h -> A.run is committed below.
-        let ts_edges = vec![
-            Edge::new(h.id, make.id, EdgeKind::RefCall),
-            Edge::new(g.id, free.id, EdgeKind::RefCall),
-        ];
+        // Phase A tree-sitter emits only structural edges (DefinesBinding /
+        // Depends / ResolvesTo), never RefCall, so the fresh parse carries no
+        // h -> make edge. The demotion must therefore read the committed
+        // reference edges, which Phase B ratifies below (put_edge_lsif), not
+        // this parse's edges.
+        let ts_edges: Vec<Edge> = Vec::new();
         let content_v1 = "fn make() -> A {\n  A\n}\n\nfn h() {\n  make().run();\n}\n\nfn g() {\n  free();\n}\n\nfn run() {\n}\n\nfn free() {\n}\n";
         store
             .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h1", Some(content_v1))
             .unwrap();
-        // Commit ratification: the receiver-typed and the free-call edges become
-        // committed truth.
-        store
-            .put_edge_lsif(&Edge::new(h.id, run.id, EdgeKind::RefCall))
-            .unwrap();
-        store
-            .put_edge_lsif(&Edge::new(g.id, free.id, EdgeKind::RefCall))
-            .unwrap();
+        // Commit ratification: the resolved reference edges become committed
+        // truth. h calls make (the receiver source) and make().run() (the
+        // receiver-typed edge that goes stale when make's return type changes);
+        // g calls free.
+        for edge in [
+            Edge::new(h.id, make.id, EdgeKind::RefCall),
+            Edge::new(h.id, run.id, EdgeKind::RefCall),
+            Edge::new(g.id, free.id, EdgeKind::RefCall),
+        ] {
+            store.put_edge_lsif(&edge).unwrap();
+        }
         assert_eq!(
             edge_provenance(&store, h.id, run.id).as_deref(),
             Some("lsif")
@@ -11487,11 +11527,10 @@ mod tests {
             free.clone(),
             x.clone(),
         ];
-        let ts_edges = vec![
-            Edge::new(b.id, c.id, EdgeKind::RefCall),
-            Edge::new(a.id, b.id, EdgeKind::RefCall),
-            Edge::new(d.id, free.id, EdgeKind::RefCall),
-        ];
+        // The fresh parse carries no RefCall (Phase A never emits it); the call
+        // chain and the committed targets are ratified through the committed
+        // reference edges below, the way Phase B supplies them in production.
+        let ts_edges: Vec<Edge> = Vec::new();
         let body = |c_body: &str| {
             format!(
                 "fn c() {{\n  {c_body}\n}}\n\nfn b() {{\n  c().run();\n}}\n\nfn a() {{\n  b().run();\n}}\n\nfn d() {{\n  free();\n}}\n\nfn free() {{\n}}\n\nfn run() {{\n}}\n"
@@ -11500,14 +11539,17 @@ mod tests {
         store
             .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h1", Some(&body("A")))
             .unwrap();
-        for src in [b.id, a.id] {
-            store
-                .put_edge_lsif(&Edge::new(src, x.id, EdgeKind::RefCall))
-                .unwrap();
+        // Commit ratification: the call chain (b -> c, a -> b) and each caller's
+        // committed target (b/a -> X.run), plus d's off-chain call.
+        for edge in [
+            Edge::new(b.id, c.id, EdgeKind::RefCall),
+            Edge::new(a.id, b.id, EdgeKind::RefCall),
+            Edge::new(b.id, x.id, EdgeKind::RefCall),
+            Edge::new(a.id, x.id, EdgeKind::RefCall),
+            Edge::new(d.id, free.id, EdgeKind::RefCall),
+        ] {
+            store.put_edge_lsif(&edge).unwrap();
         }
-        store
-            .put_edge_lsif(&Edge::new(d.id, free.id, EdgeKind::RefCall))
-            .unwrap();
 
         // Only c's body changes.
         store
@@ -11726,6 +11768,136 @@ mod tests {
                     edited[i]
                 );
             }
+        }
+    }
+
+    /// Property (finding 1): a preserved caller never keeps a committed edge
+    /// that resolved through a definition whose signature changed. Fuzzes
+    /// whether the shared callee's return type or a parameter type is mutated
+    /// and which callers are body-edited, and asserts every caller of the
+    /// mutated callee is demoted (its committed receiver-typed edge purged)
+    /// while an off-chain caller keeps its edge. The reference relationships
+    /// come from the committed edges, never this parse's (Phase A emits no
+    /// RefCall), so this is the production shape.
+    #[test]
+    fn reindex_replace_demotion_never_keeps_a_stale_typed_edge() {
+        // Deterministic LCG so a failure reproduces from the seed in the message.
+        let mut state: u64 = 0xD1B54A32D192ED03;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as u32
+        };
+
+        for iter in 0..200u32 {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            let mk = |sig: &str, kind: &str, line: u32, end: u32| {
+                travsr_core::Node::new(
+                    travsr_core::VName::new("c", "", "a.rs", "rust", sig),
+                    kind,
+                )
+                .with_line(line)
+                .with_end_line(end)
+            };
+            // make: 1-3 (shared callee), h0..h3: 4-15 (each calls make().run()),
+            // ctrl: 16-18 (off-chain, calls free), then the committed targets.
+            let make = mk("fn:make", "function", 1, 3);
+            let hs: Vec<_> = (0..4)
+                .map(|i| mk(&format!("fn:h{i}"), "function", 4 + i * 3, 6 + i * 3))
+                .collect();
+            let ctrl = mk("fn:ctrl", "function", 16, 18);
+            let xrun = mk("method:X.run", "method", 19, 19);
+            let free = mk("fn:free", "function", 20, 20);
+            let mut nodes = vec![make.clone()];
+            nodes.extend(hs.iter().cloned());
+            nodes.push(ctrl.clone());
+            nodes.push(xrun.clone());
+            nodes.push(free.clone());
+
+            let body = |ret: &str, param: &str, edited: &[bool; 4]| {
+                let mut s = format!("fn make({param}) -> {ret} {{\n  d()\n}}\n");
+                for (i, e) in edited.iter().enumerate() {
+                    let call = if *e { "make().run(); log()" } else { "make().run()" };
+                    s.push_str(&format!("fn h{i}() {{\n  {call};\n}}\n"));
+                }
+                s.push_str("fn ctrl() {\n  free();\n}\n");
+                s.push_str("fn run() {}\n");
+                s.push_str("fn free() {}\n");
+                s
+            };
+
+            let no_edit = [false; 4];
+            // The fresh parse carries no RefCall (Phase A emits only structural
+            // edges), so the demotion input is the committed edges alone.
+            let ts_edges: Vec<Edge> = Vec::new();
+            store
+                .reindex_replace(
+                    "c",
+                    "a.rs",
+                    &nodes,
+                    &ts_edges,
+                    "h1",
+                    Some(&body("A", "", &no_edit)),
+                )
+                .unwrap();
+            // Ratify the committed reference edges Phase B would supply: each
+            // caller calls make (the receiver source) and make().run() (the
+            // stale-able receiver-typed edge); ctrl calls free.
+            for h in &hs {
+                store
+                    .put_edge_lsif(&Edge::new(h.id, make.id, EdgeKind::RefCall))
+                    .unwrap();
+                store
+                    .put_edge_lsif(&Edge::new(h.id, xrun.id, EdgeKind::RefCall))
+                    .unwrap();
+            }
+            store
+                .put_edge_lsif(&Edge::new(ctrl.id, free.id, EdgeKind::RefCall))
+                .unwrap();
+
+            // Random edit: mutate make's signature (return type, parameter type,
+            // or neither) and independently body-edit each caller.
+            let sig_kind = next() % 3; // 0 = none, 1 = return type, 2 = param type
+            let (ret, param) = match sig_kind {
+                1 => ("B", ""),
+                2 => ("A", "x: i32"),
+                _ => ("A", ""),
+            };
+            let make_mutated = sig_kind != 0;
+            let mut edited = [false; 4];
+            for e in edited.iter_mut() {
+                *e = next() % 2 == 0;
+            }
+
+            store
+                .reindex_replace(
+                    "c",
+                    "a.rs",
+                    &nodes,
+                    &ts_edges,
+                    "h2",
+                    Some(&body(ret, param, &edited)),
+                )
+                .unwrap();
+
+            for (i, h) in hs.iter().enumerate() {
+                // A caller keeps its committed edge iff its own body is unchanged
+                // AND the callee it resolves through is unchanged.
+                let preserved = !make_mutated && !edited[i];
+                let expected = if preserved { Some("lsif") } else { None };
+                assert_eq!(
+                    edge_provenance(&store, h.id, xrun.id).as_deref(),
+                    expected,
+                    "iter {iter}: h{i} make_mutated={make_mutated} edited={}: \
+                     a caller of a signature-changed callee kept a stale edge",
+                    edited[i]
+                );
+            }
+            // The off-chain caller is never demoted.
+            assert_eq!(
+                edge_provenance(&store, ctrl.id, free.id).as_deref(),
+                Some("lsif"),
+                "iter {iter}: an off-chain caller must keep its committed edge"
+            );
         }
     }
 

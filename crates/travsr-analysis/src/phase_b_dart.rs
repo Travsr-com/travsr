@@ -453,7 +453,7 @@ fn parse_emitter_output(
                         // back to the encoding-agnostic window; anything that does
                         // not resolve stays unset for the daemon to name-search.
                         caller_col: r["col"].as_i64().and_then(|c| {
-                            let l = doc_lines.get(line as usize - 1)?;
+                            let l = doc_lines.get((line as usize).checked_sub(1)?)?;
                             if col_is_utf16 {
                                 utf16_col_to_byte(l, c)
                             } else {
