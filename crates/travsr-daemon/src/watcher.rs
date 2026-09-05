@@ -18,7 +18,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use notify::event::{ModifyKind, RenameMode};
+use notify::event::{AccessKind, ModifyKind, RenameMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
@@ -276,6 +276,37 @@ pub fn spawn(
                 }
                 match raw_rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(event) => {
+                        // #801: a READ is not a change, and on inotify it is
+                        // reported as one. `notify` subscribes to `IN_OPEN`
+                        // (8.2.0 `inotify.rs:427`), so every file the daemon
+                        // opens comes back to it as an event, and the two reads
+                        // it does on the hot path close a cycle:
+                        //
+                        //   read .gitignore -> Access(Open) -> is_ignore_file ->
+                        //   build_ignore_matcher reads every .gitignore -> ...
+                        //
+                        //   edit a file -> Upsert -> reindex_files reads it ->
+                        //   Access(Open) -> newer than daemon start, so the
+                        //   staleness guard passes it -> Upsert -> ...
+                        //
+                        // The first spins at ~150k events/sec from a single
+                        // `cat .gitignore` by any process; the second reindexes
+                        // every edited file once per debounce interval until the
+                        // daemon restarts. Neither is reachable on fsevent,
+                        // windows or kqueue: none of them emit `Access` at all,
+                        // which is why this reproduces only on Linux.
+                        //
+                        // Placed above the matcher rebuild because that rebuild
+                        // runs before any per-path filtering, so nothing below
+                        // can break the cycle. `Access(Close(Write))` is kept: it
+                        // is a genuine write signal.
+                        if matches!(
+                            event.kind,
+                            EventKind::Access(AccessKind::Open(_) | AccessKind::Read)
+                        ) {
+                            continue;
+                        }
+
                         // #403: a change to any .gitignore/.travsrignore
                         // invalidates the cached matcher — rebuild it so newly
                         // ignored paths stop being indexed without a daemon
@@ -900,6 +931,142 @@ mod tests {
             }
         }
         last
+    }
+
+    /// #801: indexing a file must not schedule indexing it again.
+    ///
+    /// The second cycle with the same cause as
+    /// `reading_an_ignore_file_does_not_feed_the_watcher`, and the one that
+    /// keeps running after every ordinary edit. `handle_watch_event` reindexes
+    /// on `Upsert`, `reindex_files` reads the file, inotify reports that read as
+    /// `Access(Open)`, the staleness guard passes it because the file really is
+    /// newer than daemon start and stays that way, and `Access(_)` falls into
+    /// the `_` arm of the kind match, which means `Upsert`. One edit, then a
+    /// reindex every `DEBOUNCE_MS` until the daemon restarts, once per file
+    /// edited in the session.
+    ///
+    /// Observed over a fixed window rather than with `settled`, deliberately.
+    /// The broken behaviour ticks about once a second (the flush thread runs
+    /// every `DEBOUNCE_MS` and each re-entry sets a fresh `DEBOUNCE_MS`
+    /// deadline), so three quiet 50 ms samples land in the gap between two ticks
+    /// and `settled` would report a stopped counter on code that has not
+    /// stopped. Only a window several ticks wide separates "indexed once" from
+    /// "indexing forever".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reindexing_a_file_does_not_schedule_itself_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let file = root.join("app.ts");
+        std::fs::write(&file, "export const x = 1;").unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<WatchEvent>(1024);
+        let handle = spawn(root, tx, Instant::now()).expect("watcher spawns");
+
+        // Stand in for `handle_watch_event`: the only part that matters here is
+        // that indexing READS the file, which is what closes the cycle.
+        let reindexes = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&reindexes);
+        std::thread::spawn(move || {
+            while let Some(ev) = rx.blocking_recv() {
+                if let WatchEvent::Upsert(path) = ev {
+                    let _ = std::fs::read_to_string(&path);
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+
+        std::fs::write(&file, "export const x = 2;").unwrap();
+
+        // Control arm: the edit must reach the indexer at all, or the assertion
+        // below passes on a watcher that delivers nothing.
+        wait_until(
+            || reindexes.load(Ordering::Relaxed) > 0,
+            Duration::from_secs(5),
+        );
+        assert!(
+            reindexes.load(Ordering::Relaxed) > 0,
+            "one edit must produce one reindex, or this test proves nothing"
+        );
+
+        // Let the edit's own events drain before taking the baseline. A single
+        // write arrives as `Modify(Data)` and again as `Access(Close(Write))`,
+        // which coalesce into one reindex when they share a debounce window and
+        // into two when they do not, so the absolute count is not the thing to
+        // assert on. The growth after everything has drained is.
+        std::thread::sleep(Duration::from_secs(2));
+        let after_edit = reindexes.load(Ordering::Relaxed);
+
+        // Nothing is touched in this window. The cycle ticks about once a second
+        // when it is running, so anything above zero here is the file
+        // rescheduling itself, and it is load independent: a slower machine
+        // changes the rate, not the fact that it never stops.
+        std::thread::sleep(Duration::from_secs(6));
+        let growth = reindexes.load(Ordering::Relaxed) - after_edit;
+        assert_eq!(
+            growth, 0,
+            "{growth} further reindexes with nothing touched: indexing the file \
+             reads it, and the read comes back as another Upsert, so every edited \
+             file is reindexed once per debounce interval until the daemon \
+             restarts (#801)."
+        );
+
+        drop(handle);
+    }
+
+    /// #801: reading a watched file must not count as changing it.
+    ///
+    /// The failure this pins is a cycle, not a cost. `notify`'s inotify backend
+    /// subscribes to `IN_OPEN` (8.2.0 `inotify.rs:427`), so a read produces an
+    /// event; `build_ignore_matcher` reads every `.gitignore` in the repo; and
+    /// the rebuild is triggered by an event naming an ignore file. Read,
+    /// rebuild, read. One `cat .gitignore` by an unrelated process, with nothing
+    /// ever written, held the watcher at ~150k events/sec indefinitely.
+    ///
+    /// Asserting on `raw_events` rather than on reindexes for the same reason
+    /// the tests above do: the userspace filter discards these events either
+    /// way, so every downstream observation is identical whether the cycle is
+    /// running or not.
+    ///
+    /// Linux only, like the other watch tests here: fsevent, windows and kqueue
+    /// never construct an `Access` event, so there is nothing to observe there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reading_an_ignore_file_does_not_feed_the_watcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(root.join("app.ts"), "export const x = 1;").unwrap();
+
+        let (tx, _rx) = mpsc::channel::<WatchEvent>(1024);
+        let handle = spawn(root, tx, Instant::now()).expect("watcher spawns");
+
+        // Control arm, as above: a real write must move the counter, or the
+        // assertion below passes on a watcher that sees nothing at all.
+        std::fs::write(root.join("app.ts"), "export const x = 2;").unwrap();
+        wait_until(|| handle.raw_events() > 0, Duration::from_secs(5));
+        let after_write = settled(|| handle.raw_events(), Duration::from_secs(10));
+        assert!(
+            after_write > 0,
+            "a write inside the repo must produce raw events, or this test proves nothing"
+        );
+
+        // A separate process reads the file once and writes nothing, the way
+        // `git status`, ripgrep or an editor does.
+        let status = std::process::Command::new("cat")
+            .arg(root.join(".gitignore"))
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("cat runs");
+        assert!(status.success(), "cat .gitignore failed");
+
+        let from_read = settled(|| handle.raw_events(), Duration::from_secs(10)) - after_write;
+        assert!(
+            from_read < 100,
+            "one read of .gitignore produced {from_read} raw events: the read is \
+             being treated as a change, so rebuilding the matcher reads the file \
+             again and the watcher feeds itself (#801)."
+        );
     }
 
     #[test]
