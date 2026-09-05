@@ -1514,6 +1514,9 @@ pub(crate) fn extract_tar_gz(bytes: &[u8], dest: &std::path::Path) -> Result<()>
     );
     let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
+    // `set_mask` takes the bits to clear, and `unpack` already drops the
+    // setuid/setgid/sticky bits it is not asked to preserve.
+    archive.set_mask(0o777 & !EXTRACTED_MODE_MASK);
     for entry in archive.entries().context("reading tar entries")? {
         let mut entry = entry.context("reading a tar entry")?;
         let kind = entry.header().entry_type();
@@ -1547,6 +1550,27 @@ pub(crate) fn extract_tar_gz(bytes: &[u8], dest: &std::path::Path) -> Result<()>
     Ok(())
 }
 
+/// The only permission bits either extractor lets an archive set on what it
+/// unpacks: the owner's, plus read and execute for group and other. Everything
+/// else is dropped, so a release asset can ship an executable launcher (#835)
+/// but can neither hand out setuid/setgid nor leave a tool travsr later runs
+/// writable by another local user.
+const EXTRACTED_MODE_MASK: u32 = 0o755;
+
+#[cfg(unix)]
+fn apply_entry_mode(target: &std::path::Path, mode: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(mode) = mode else { return Ok(()) };
+    let permissions = std::fs::Permissions::from_mode(mode & EXTRACTED_MODE_MASK);
+    std::fs::set_permissions(target, permissions)
+        .with_context(|| format!("setting permissions on {}", target.display()))
+}
+
+#[cfg(not(unix))]
+fn apply_entry_mode(_target: &std::path::Path, _mode: Option<u32>) -> Result<()> {
+    Ok(())
+}
+
 /// Extract a zip archive into `dest`, in-process.
 pub(crate) fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
     anyhow::ensure!(
@@ -1574,10 +1598,15 @@ pub(crate) fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
+        // A previous extraction may have left the target read-only, which makes
+        // `File::create` fail rather than truncate. `tar::Entry::unpack` does the
+        // same before writing.
+        let _ = std::fs::remove_file(&target);
         let mut out = std::fs::File::create(&target)
             .with_context(|| format!("creating {}", target.display()))?;
         std::io::copy(&mut file, &mut out)
             .with_context(|| format!("writing {}", target.display()))?;
+        apply_entry_mode(&target, file.unix_mode())?;
     }
     Ok(())
 }
@@ -1754,9 +1783,13 @@ mod extraction_tests {
     /// writer, so a test that could only build well-formed names would never
     /// exercise the case the extractor exists to reject.
     fn tar_gz_with(name: &str, body: &[u8]) -> Vec<u8> {
+        tar_gz_with_mode(name, body, 0o644)
+    }
+
+    fn tar_gz_with_mode(name: &str, body: &[u8], mode: u32) -> Vec<u8> {
         let mut header = tar::Header::new_ustar();
         header.set_size(body.len() as u64);
-        header.set_mode(0o644);
+        header.set_mode(mode);
         header.set_entry_type(tar::EntryType::Regular);
         {
             let raw = header.as_old_mut();
@@ -1798,6 +1831,25 @@ mod extraction_tests {
             std::fs::read_to_string(dest.join("share/data.txt")).unwrap(),
             "hello"
         );
+    }
+
+    /// The tar path unpacks through `tar::Entry::unpack`, which applies the
+    /// header mode already. Pinned here because the zip path is now expected to
+    /// match it.
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_tar_entry_stays_executable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        extract_tar_gz(&tar_gz_with_mode("bin/tool", b"binary", 0o755), &dest).unwrap();
+        let mode = std::fs::metadata(dest.join("bin/tool"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     #[test]
@@ -1901,6 +1953,90 @@ mod extraction_tests {
 
         extract_zip(&bytes, &dest).unwrap();
         assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"binary");
+    }
+
+    /// Build a one-entry zip whose central directory records `mode` verbatim.
+    ///
+    /// `SimpleFileOptions::unix_permissions` masks the mode down to `0o777`, so
+    /// the setuid/setgid case is written straight into the central directory's
+    /// external-attributes field instead.
+    #[cfg(unix)]
+    fn zip_entry_with_mode(name: &str, body: &[u8], mode: u32) -> Vec<u8> {
+        const CENTRAL_HEADER_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+        const EXTERNAL_ATTRIBUTES_OFFSET: usize = 38;
+        const S_IFREG: u32 = 0o100_000;
+
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file::<_, ()>(
+            name,
+            zip::write::SimpleFileOptions::default().unix_permissions(mode & 0o777),
+        )
+        .unwrap();
+        std::io::Write::write_all(&mut w, body).unwrap();
+        let mut bytes = w.finish().unwrap().into_inner();
+
+        let header = bytes
+            .windows(CENTRAL_HEADER_SIGNATURE.len())
+            .position(|w| w == CENTRAL_HEADER_SIGNATURE)
+            .expect("central directory header");
+        let at = header + EXTERNAL_ATTRIBUTES_OFFSET;
+        bytes[at..at + 4].copy_from_slice(&((mode | S_IFREG) << 16).to_le_bytes());
+        bytes
+    }
+
+    #[cfg(unix)]
+    fn extract_and_read_mode(bytes: &[u8], entry: &str) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        extract_zip(bytes, &dest).unwrap();
+        std::fs::metadata(dest.join(entry))
+            .unwrap()
+            .permissions()
+            .mode()
+    }
+
+    /// #835: the KLS launcher ships 0755 inside `server.zip`; unpacked without
+    /// its mode the wrapper's `exec` gets EACCES and Phase B silently yields
+    /// zero symbols.
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_zip_entry_stays_executable() {
+        let bytes = zip_entry_with_mode("server/bin/kotlin-language-server", b"#!/bin/sh\n", 0o755);
+        let mode = extract_and_read_mode(&bytes, "server/bin/kotlin-language-server");
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setuid_and_setgid_bits_in_a_zip_entry_are_dropped() {
+        let bytes = zip_entry_with_mode("bin/tool", b"binary", 0o6755);
+        let mode = extract_and_read_mode(&bytes, "bin/tool");
+        assert_eq!(mode & 0o7000, 0, "no setuid, setgid or sticky bit");
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    /// Reinstalling over an earlier install must not trip over a read-only file
+    /// the earlier install created.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_zip_entry_extracts_twice() {
+        let bytes = zip_entry_with_mode("bin/tool", b"binary", 0o444);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        extract_zip(&bytes, &dest).unwrap();
+        extract_zip(&bytes, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"binary");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_and_world_write_bits_in_a_zip_entry_are_dropped() {
+        let bytes = zip_entry_with_mode("bin/tool", b"binary", 0o777);
+        assert_eq!(extract_and_read_mode(&bytes, "bin/tool") & 0o777, 0o755);
     }
 }
 
