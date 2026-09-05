@@ -276,7 +276,10 @@ export function webviewShell(title: string, body: string, script: string): strin
   .hrow.muted { color: var(--fg-muted); font-size: 11px; padding: 2px 0; }
   .hrow.mono-only { font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
     font-size: 10px; color: var(--fg-muted); padding-left: 118px; min-height: 17px; }
-  .hrow > span:first-child { width: 110px; flex-shrink: 0; color: var(--fg-muted); }
+  /* The key column is a floor, not a box: a repo name longer than 110px wraps
+     inside its own cell instead of painting over the value beside it. */
+  .hrow > span:first-child { flex: 0 0 auto; min-width: 110px; max-width: 45%; color: var(--fg-muted);
+    overflow-wrap: anywhere; word-break: break-word; line-height: 1.3; }
   .hrow b { font-weight: 400; color: var(--fg); display: inline-flex; align-items: center;
     gap: 5px; flex-grow: 1; min-width: 0;
     font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 11px; }
@@ -1300,7 +1303,7 @@ export function buildStatsHtml(
     `<button class="btn mini ${tone === "primary" ? "primary" : "ghost"}" onclick="panelAction(this, '${message}')">${esc(label)}</button>`;
 
   const row = (k: string, v: string, tone?: "ok" | "warn" | "bad", trailing = ""): string =>
-    `<div class="hrow"><span>${esc(k)}</span>` +
+    `<div class="hrow"><span title="${esc(k)}">${esc(k)}</span>` +
     `<b class="${tone ?? ""}">${tone === "ok" ? OK_ICON : tone === "warn" ? WARN_ICON : tone === "bad" ? BAD_ICON : ""}${esc(v)}</b>` +
     (trailing ? `<span class="ra">${trailing}</span>` : "") +
     `</div>`;
