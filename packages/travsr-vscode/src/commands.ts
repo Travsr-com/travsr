@@ -157,7 +157,9 @@ export function parseExecutionPath(raw: string): GraphData {
   return { nodes, edges };
 }
 
-/** Parse `repos_list` TSV output (`name\tdb_path\t{0|1}`) into rows. */
+/** Parse `repos_list` TSV output (`name\tdb_path\t{0|1}\tstatus`) into rows.
+ *  The status column arrived with #454; a binary that predates it sends three
+ *  columns and the row is left without a status rather than given a guessed one. */
 export function parseReposList(raw: string): RepoRow[] {
   const inner = stripEnvelope(raw);
   return inner
@@ -166,7 +168,9 @@ export function parseReposList(raw: string): RepoRow[] {
     .filter((l) => l.trim())
     .map((l) => {
       const parts = l.split("\t");
-      return { name: parts[0] ?? "", path: parts[1] ?? "", exists: parts[2] === "1" };
+      const row: RepoRow = { name: parts[0] ?? "", path: parts[1] ?? "", exists: parts[2] === "1" };
+      if (parts[3]) row.status = parts[3];
+      return row;
     });
 }
 

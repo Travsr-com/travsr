@@ -68,6 +68,77 @@ pub enum UnregisterResult {
     Ambiguous(Vec<String>),
 }
 
+/// A registry row: where this repo's `graph.db` lives, plus what the registry
+/// knows about the repo ever having been indexed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoEntry {
+    pub db_path: PathBuf,
+    index_history: IndexHistory,
+}
+
+/// What the registry records about a repo's indexing history (#454). The db file
+/// cannot answer this on its own: it is created by `SqliteStore::open` at the
+/// *start* of `init`, and deleting it takes any evidence stored inside it along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexHistory {
+    /// Row written before the registry tracked index completions, so whether the
+    /// repo was ever indexed is not knowable from the registry.
+    Untracked,
+    NeverIndexed,
+    IndexedAt(u64),
+}
+
+/// Index state of one registry entry, as reported by `travsr repos` and the MCP
+/// `repos_list` tool (#454).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexStatus {
+    /// The graph.db is on disk.
+    Indexed,
+    /// An index completed at some point and the graph.db has since gone.
+    IndexMissing,
+    /// Registered, with no index run ever completed for it.
+    NotIndexed,
+    /// The graph.db is gone and this entry predates index tracking, so the
+    /// registry cannot say which of the two cases above it is.
+    Unknown,
+}
+
+impl IndexStatus {
+    /// Machine-facing tag: the CLI `--json` `status` field and the MCP TSV.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Indexed => "indexed",
+            Self::IndexMissing => "index_missing",
+            Self::NotIndexed => "not_indexed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Text for the CLI table's `Exists` column, keeping its `yes` / `no (...)`
+    /// shape.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Indexed => "yes",
+            Self::IndexMissing => "no (index deleted)",
+            Self::NotIndexed => "no (never indexed)",
+            Self::Unknown => "no (unknown)",
+        }
+    }
+}
+
+impl RepoEntry {
+    pub fn index_status(&self) -> IndexStatus {
+        if self.db_path.exists() {
+            return IndexStatus::Indexed;
+        }
+        match self.index_history {
+            IndexHistory::IndexedAt(_) => IndexStatus::IndexMissing,
+            IndexHistory::NeverIndexed => IndexStatus::NotIndexed,
+            IndexHistory::Untracked => IndexStatus::Unknown,
+        }
+    }
+}
+
 /// SEC (#507, Windows): mirror the Unix owner-only restriction via `icacls`,
 /// following the daemon's graph.db pattern. `/inheritance:r` strips all
 /// inherited ACEs; `/grant:r` re-grants to the current user only —
@@ -128,6 +199,66 @@ fn restrict_to_owner_windows(path: &Path) {
 /// entry, and writes back atomically. Parent directory is created if needed.
 /// Non-fatal: callers should log and continue on error.
 pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
+    let (reg_path, _lock) = lock_registry()?;
+
+    // UX-018: normalize away the Windows `\\?\` verbatim prefix so the registry
+    // key and stored db path are clean, consistent paths (never a mix of a
+    // prefixed and a bare entry for the same repo).
+    let repo_name = strip_verbatim_prefix(repo_name).into_owned();
+    let db_path = PathBuf::from(strip_verbatim_prefix(&db_path.to_string_lossy()).into_owned());
+
+    let mut repos = read_registry(&reg_path).unwrap_or_default();
+    // #454: a re-`init` must not erase the record that this repo was indexed
+    // before, so the upsert below carries the existing row's history over.
+    let index_history = repos
+        .iter()
+        .find(|(k, _)| strip_verbatim_prefix(k).as_ref() == repo_name.as_str())
+        .map_or(IndexHistory::NeverIndexed, |(_, entry)| entry.index_history);
+    // UX-018: drop any pre-existing entry that only differs from the normalized
+    // key by the Windows `\\?\` verbatim prefix, then re-insert the clean one.
+    // Without this migration a repo first registered by an older build under its
+    // prefixed key would keep *both* the old prefixed key and the new clean key
+    // and show up twice in `repos`. Removing by normalized form and re-inserting
+    // collapses the pair to a single clean entry on the next `init`.
+    repos.retain(|k, _| strip_verbatim_prefix(k).as_ref() != repo_name.as_str());
+    repos.insert(
+        repo_name,
+        RepoEntry {
+            db_path,
+            index_history,
+        },
+    );
+    write_registry_atomic(&reg_path, &repos)?;
+
+    // Explicit unlock is not needed; the lock file drops at end of scope.
+    Ok(())
+}
+
+/// Record that an index run completed for `repo_name` (#454), so a later listing
+/// can tell an index that was deleted apart from one that was never built.
+///
+/// No-op when the repo is not registered. Non-fatal: callers should log and
+/// continue on error.
+pub fn mark_indexed(repo_name: &str) -> anyhow::Result<()> {
+    let (reg_path, _lock) = lock_registry()?;
+    let key = strip_verbatim_prefix(repo_name).into_owned();
+    let Some(mut repos) = read_registry(&reg_path) else {
+        return Ok(());
+    };
+    let Some(entry) = repos.get_mut(&key) else {
+        return Ok(());
+    };
+    entry.index_history = IndexHistory::IndexedAt(now_secs());
+    write_registry_atomic(&reg_path, &repos)
+}
+
+/// Create `~/.travsr` owner-only, take the exclusive `registry.lock`, and return
+/// the registry path together with the held lock.
+///
+/// M1: serializes concurrent registry writes. The atomic rename protects against
+/// crash-corruption but not against concurrent read-modify-write by two
+/// processes, so every writer goes through here.
+fn lock_registry() -> anyhow::Result<(PathBuf, std::fs::File)> {
     let reg_path = registry_path();
     let travsr_home = reg_path
         .parent()
@@ -153,9 +284,6 @@ pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
     #[cfg(windows)]
     restrict_to_owner_windows(travsr_home);
 
-    // M1: serialize concurrent `travsr init` registry writes with an exclusive
-    // flock on registry.lock. The atomic rename protects against crash-corruption
-    // but not against concurrent read-modify-write by two processes.
     let lock_path = travsr_home.join("registry.lock");
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
@@ -164,32 +292,29 @@ pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
         .open(&lock_path)
         .context("opening registry.lock")?;
     fs2::FileExt::lock_exclusive(&lock_file).context("acquiring registry.lock")?;
+    Ok((reg_path, lock_file))
+}
 
-    // UX-018: normalize away the Windows `\\?\` verbatim prefix so the registry
-    // key and stored db path are clean, consistent paths (never a mix of a
-    // prefixed and a bare entry for the same repo).
-    let repo_name = strip_verbatim_prefix(repo_name).into_owned();
-    let db_path = PathBuf::from(strip_verbatim_prefix(&db_path.to_string_lossy()).into_owned());
-
-    let mut repos = read_registry(&reg_path).unwrap_or_default();
-    // UX-018: drop any pre-existing entry that only differs from the normalized
-    // key by the Windows `\\?\` verbatim prefix, then re-insert the clean one.
-    // Without this migration a repo first registered by an older build under its
-    // prefixed key would keep *both* the old prefixed key and the new clean key
-    // and show up twice in `repos`. Removing by normalized form and re-inserting
-    // collapses the pair to a single clean entry on the next `init`.
-    repos.retain(|k, _| strip_verbatim_prefix(k).as_ref() != repo_name.as_str());
-    repos.insert(repo_name, db_path);
-    write_registry_atomic(&reg_path, &repos)?;
-
-    // Explicit unlock is not needed — lock_file drops at end of scope.
-    Ok(())
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Return all entries from the global registry.
 ///
 /// Returns an empty map if the file does not exist (not an error).
 pub fn all_repos() -> anyhow::Result<HashMap<String, PathBuf>> {
+    Ok(all_entries()?
+        .into_iter()
+        .map(|(name, entry)| (name, entry.db_path))
+        .collect())
+}
+
+/// Return all entries with their index history, which is what a repo listing
+/// needs to report an [`IndexStatus`] rather than a bare "the db file is there"
+/// boolean.
+pub fn all_entries() -> anyhow::Result<HashMap<String, RepoEntry>> {
     Ok(read_registry(&registry_path()).unwrap_or_default())
 }
 
@@ -285,10 +410,10 @@ pub fn prune() -> anyhow::Result<Vec<String>> {
     };
 
     let mut removed: Vec<String> = Vec::new();
-    let mut kept: HashMap<String, PathBuf> = HashMap::new();
-    for (name, db_path) in repos {
-        if db_path.exists() {
-            kept.insert(name, db_path);
+    let mut kept: HashMap<String, RepoEntry> = HashMap::new();
+    for (name, entry) in repos {
+        if entry.db_path.exists() {
+            kept.insert(name, entry);
         } else {
             removed.push(name);
         }
@@ -301,27 +426,53 @@ pub fn prune() -> anyhow::Result<Vec<String>> {
     Ok(removed)
 }
 
-fn read_registry(path: &Path) -> Option<HashMap<String, PathBuf>> {
+fn read_registry(path: &Path) -> Option<HashMap<String, RepoEntry>> {
     let raw = std::fs::read_to_string(path).ok()?;
     let map: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let repos = map.get("repos")?.as_object()?;
     Some(
         repos
             .iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), PathBuf::from(s))))
+            .filter_map(|(k, v)| parse_entry(v).map(|entry| (k.clone(), entry)))
             .collect(),
     )
 }
 
-fn write_registry_atomic(path: &Path, repos: &HashMap<String, PathBuf>) -> anyhow::Result<()> {
+/// A row is either the pre-#454 bare db-path string or `{ db_path, indexed_at? }`.
+/// The shape is the only record of whether the writer tracked index completions,
+/// so [`entry_to_json`] preserves it rather than upgrading rows in place.
+fn parse_entry(value: &serde_json::Value) -> Option<RepoEntry> {
+    if let Some(db_path) = value.as_str() {
+        return Some(RepoEntry {
+            db_path: PathBuf::from(db_path),
+            index_history: IndexHistory::Untracked,
+        });
+    }
+    let row = value.as_object()?;
+    Some(RepoEntry {
+        db_path: PathBuf::from(row.get("db_path")?.as_str()?),
+        index_history: match row.get("indexed_at").and_then(serde_json::Value::as_u64) {
+            Some(secs) => IndexHistory::IndexedAt(secs),
+            None => IndexHistory::NeverIndexed,
+        },
+    })
+}
+
+fn entry_to_json(entry: &RepoEntry) -> serde_json::Value {
+    let db_path = entry.db_path.to_string_lossy().into_owned();
+    match entry.index_history {
+        IndexHistory::Untracked => serde_json::Value::String(db_path),
+        IndexHistory::NeverIndexed => serde_json::json!({ "db_path": db_path }),
+        IndexHistory::IndexedAt(secs) => {
+            serde_json::json!({ "db_path": db_path, "indexed_at": secs })
+        }
+    }
+}
+
+fn write_registry_atomic(path: &Path, repos: &HashMap<String, RepoEntry>) -> anyhow::Result<()> {
     let json_repos: serde_json::Map<String, serde_json::Value> = repos
         .iter()
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                serde_json::Value::String(v.to_string_lossy().into_owned()),
-            )
-        })
+        .map(|(k, entry)| (k.clone(), entry_to_json(entry)))
         .collect();
     let serialized = serde_json::to_string_pretty(&serde_json::json!({ "repos": json_repos }))
         .context("serializing registry")?;
@@ -573,6 +724,131 @@ mod tests {
             }
             // Nothing removed on an ambiguous match.
             assert_eq!(all_repos().unwrap().len(), 2);
+        });
+    }
+
+    /// Write a registry in the pre-#454 shape: values are bare db-path strings.
+    fn write_legacy_registry(pairs: &[(&str, &Path)]) {
+        let reg = registry_path();
+        std::fs::create_dir_all(reg.parent().unwrap()).unwrap();
+        let repos: serde_json::Map<String, serde_json::Value> = pairs
+            .iter()
+            .map(|(k, p)| {
+                (
+                    (*k).to_string(),
+                    serde_json::Value::String(p.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        std::fs::write(
+            &reg,
+            serde_json::to_string_pretty(&serde_json::json!({ "repos": repos })).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn touch_db(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    #[test]
+    fn index_status_separates_never_indexed_present_and_deleted() {
+        with_temp_home(|home| {
+            let present = home.join("present/.travsr/graph.db");
+            touch_db(&present);
+            register("present", &present).unwrap();
+            mark_indexed("present").unwrap();
+
+            let never = home.join("never/.travsr/graph.db");
+            register("never", &never).unwrap();
+
+            let deleted = home.join("deleted/.travsr/graph.db");
+            touch_db(&deleted);
+            register("deleted", &deleted).unwrap();
+            mark_indexed("deleted").unwrap();
+            std::fs::remove_file(&deleted).unwrap();
+
+            let entries = all_entries().unwrap();
+            assert_eq!(
+                entries["present"].index_status(),
+                IndexStatus::Indexed,
+                "db on disk means the index is there"
+            );
+            assert_eq!(
+                entries["never"].index_status(),
+                IndexStatus::NotIndexed,
+                "registered but no index ever completed"
+            );
+            assert_eq!(
+                entries["deleted"].index_status(),
+                IndexStatus::IndexMissing,
+                "index completed, then the db was removed"
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_row_reports_unknown_only_when_its_db_is_gone() {
+        with_temp_home(|home| {
+            let present = home.join("present/.travsr/graph.db");
+            touch_db(&present);
+            write_legacy_registry(&[
+                ("present", &present),
+                ("gone", &home.join("gone/.travsr/graph.db")),
+            ]);
+
+            let entries = all_entries().unwrap();
+            assert_eq!(entries["present"].index_status(), IndexStatus::Indexed);
+            assert_eq!(
+                entries["gone"].index_status(),
+                IndexStatus::Unknown,
+                "a row predating index tracking must not claim 'never indexed'"
+            );
+        });
+    }
+
+    #[test]
+    fn register_preserves_a_recorded_index_across_reregistration() {
+        with_temp_home(|home| {
+            let db = home.join("proj/.travsr/graph.db");
+            register("proj", &db).unwrap();
+            mark_indexed("proj").unwrap();
+            register("proj", &db).unwrap();
+
+            assert_eq!(
+                all_entries().unwrap()["proj"].index_status(),
+                IndexStatus::IndexMissing,
+                "re-init must not erase the record that this repo was indexed"
+            );
+        });
+    }
+
+    #[test]
+    fn rewrites_do_not_invent_index_history_for_legacy_rows() {
+        with_temp_home(|home| {
+            let live = home.join("live/.travsr/graph.db");
+            touch_db(&live);
+            write_legacy_registry(&[
+                ("live", &live),
+                ("stale", &home.join("stale/.travsr/graph.db")),
+            ]);
+            prune().unwrap();
+
+            let raw = std::fs::read_to_string(registry_path()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(
+                parsed["repos"]["live"].is_string(),
+                "a pruning rewrite must leave an untracked row untracked, got: {raw}"
+            );
+        });
+    }
+
+    #[test]
+    fn mark_indexed_is_a_no_op_for_an_unregistered_repo() {
+        with_temp_home(|_| {
+            mark_indexed("never-registered").unwrap();
+            assert!(all_entries().unwrap().is_empty());
         });
     }
 }

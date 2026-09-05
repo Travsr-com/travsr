@@ -181,10 +181,16 @@ fn registry_key_for(fake_home: &Path, repo_dir: &Path) -> String {
     // canonicalized path still carries the prefix and would otherwise not match.
     let repo_dir_str = repo_dir.to_string_lossy();
     let repo_dir_norm = travsr_store::registry::strip_verbatim_prefix(&repo_dir_str);
+    // #454: a row is either the legacy bare db-path string or `{ db_path, ... }`.
+    let db_path = |v: &serde_json::Value| -> Option<String> {
+        v.as_str()
+            .or_else(|| v.get("db_path")?.as_str())
+            .map(str::to_owned)
+    };
     repos
         .iter()
         .find(|(_, v)| {
-            v.as_str()
+            db_path(v)
                 .map(|s| s.contains(repo_dir_norm.trim_end_matches('/')))
                 .unwrap_or(false)
         })
