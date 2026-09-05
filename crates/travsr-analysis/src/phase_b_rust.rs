@@ -672,6 +672,7 @@ fn extract_macro_calls(
                 None => VName::new(corpus, "", vname_path, "rust", format!("fn:{caller_fn}")).id(),
             };
             for (offset, name) in captures {
+                let (line, col) = capture_position(lit, offset, child.start_position());
                 out.push(UnresolvedCall {
                     src: caller_id,
                     // Only a const or static can be named here and also be a
@@ -680,7 +681,8 @@ fn extract_macro_calls(
                     callee_sig: format!("const:{name}"),
                     alt_callee_sig: Some(format!("static:{name}")),
                     hint_crate: None,
-                    caller_line: capture_line(lit, offset, child.start_position().row),
+                    caller_line: line,
+                    caller_col: Some(col),
                     is_method_call: false,
                     recv_type: None,
                 });
@@ -748,19 +750,26 @@ fn format_captures(lit: &str) -> Vec<(usize, &str)> {
     out
 }
 
-/// 1-based line of the capture at `offset` inside a literal beginning on
-/// 0-based `start_row`.
+/// 1-based line and 0-based byte column of the capture at `offset` inside a
+/// literal beginning at `start`.
 ///
-/// Not simply the literal's own line: a format string wrapped with `\` line
+/// Not simply the literal's own position: a format string wrapped with `\` line
 /// continuations is still a single `string_literal`, so a capture on its third
-/// line must report that line or `find_references` hands back a `path:line`
-/// that points at the wrong source.
-fn capture_line(lit: &str, offset: usize, start_row: usize) -> u32 {
-    let newlines = lit.as_bytes()[..offset]
-        .iter()
-        .filter(|&&c| c == b'\n')
-        .count();
-    start_row.saturating_add(newlines).saturating_add(1) as u32
+/// line must report that line, or `find_references` hands back a `path:line`
+/// pointing at the wrong source. The column is offset from the literal's own
+/// start only on the first line; after a newline it is measured from that
+/// newline, matching tree-sitter's byte-based `Point::column`.
+fn capture_position(lit: &str, offset: usize, start: tree_sitter::Point) -> (u32, u32) {
+    let prefix = &lit.as_bytes()[..offset];
+    let newlines = prefix.iter().filter(|&&c| c == b'\n').count();
+    let col = match prefix.iter().rposition(|&c| c == b'\n') {
+        Some(nl) => offset - nl - 1,
+        None => start.column + offset,
+    };
+    (
+        start.row.saturating_add(newlines).saturating_add(1) as u32,
+        col as u32,
+    )
 }
 
 /// Walk up from `node` to the nearest enclosing `function_item` node itself
@@ -1175,17 +1184,21 @@ mod tests {
     }
 
     #[test]
-    fn capture_line_follows_a_wrapped_literal() {
+    fn capture_position_follows_a_wrapped_literal() {
         // A `\`-continued format string is ONE string_literal, so a capture on
         // its later lines must not report the literal's opening line.
         let lit = "\"first \\\n     second {MAX_LEN} \\\n     third\"";
         let offset = lit.find("MAX_LEN").unwrap();
+        let at = |o: usize| capture_position(lit, o, tree_sitter::Point { row: 9, column: 4 });
+        assert_eq!(at(offset).0, 11, "0-based row 9 + 2 newlines + 1");
+        assert_eq!(at(1).0, 10, "a capture on the opening line");
+        // The column is offset from the literal's own start only before a
+        // newline; after one it is measured from that newline.
+        assert_eq!(at(1).1, 5, "literal start column 4, plus 1");
         assert_eq!(
-            capture_line(lit, offset, 9),
-            11,
-            "0-based row 9 + 2 newlines + 1"
+            at(offset).1,
+            (offset - lit[..offset].rfind('\n').unwrap() - 1) as u32
         );
-        assert_eq!(capture_line(lit, 1, 9), 10, "a capture on the opening line");
     }
 
     #[test]
