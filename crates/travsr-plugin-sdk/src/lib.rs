@@ -15,6 +15,8 @@ pub use travsr_plugin_protocol::{
 // Re-export core types so language crates only need travsr-plugin-sdk as a dep.
 pub use travsr_core::{Edge, Language, Node, NodeId, VName};
 
+mod protocol_compat;
+
 mod runner;
 pub use runner::run_plugin;
 
