@@ -590,6 +590,19 @@ impl Tool {
                  and create {}/.windsurf/rules/travsr.md with the Travsr guidance",
                 repo.display()
             ),
+            // Both destinations, because which one the user picks is what
+            // decides whether an approval is pending: a project `.mcp.json` is
+            // gated behind the one-time trust prompt `approval_hint` names
+            // (#829), a user-scoped entry is not. The generic arm below hands
+            // over JSON without saying where it goes, so it cannot carry either
+            // claim without asserting a scope the user has not chosen yet.
+            Tool::ClaudeCode => format!(
+                "  add to {}/.mcp.json (project scope, loads only after a one-time \
+                 approval: restart Claude Code and accept the trust prompt, or run \
+                 /mcp to enable the travsr server), or under `mcpServers` in \
+                 ~/.claude.json (user scope, no approval):\n{server}",
+                repo.display()
+            ),
             _ => format!("  MCP server config:\n{server}"),
         }
     }
@@ -1913,6 +1926,31 @@ mod tests {
                 label(&left_unwired)
             );
         }
+    }
+
+    /// #829 review follow-up: when Claude Code is known only from `~/.claude`,
+    /// the printed snippet is the whole of the guidance, and the generic arm
+    /// handed over JSON without saying where to put it. The two destinations
+    /// differ in exactly the thing #829 is about, so naming one without the
+    /// other would either hide the pending trust prompt or invent one that
+    /// never appears.
+    #[test]
+    fn the_claude_code_snippet_names_both_destinations_and_their_approval() {
+        let dir = tempdir().unwrap();
+        let snippet = Tool::ClaudeCode.snippet(dir.path(), &cmd());
+        assert!(snippet.contains(".mcp.json"), "project scope: {snippet}");
+        assert!(snippet.contains("~/.claude.json"), "user scope: {snippet}");
+        assert!(
+            snippet.contains("one-time approval") && snippet.contains("run /mcp"),
+            "project scope must name the pending approval: {snippet}"
+        );
+        assert!(
+            snippet.contains("no approval"),
+            "user scope must say it needs none: {snippet}"
+        );
+        // A tool whose snippet names no destination must not claim either.
+        let generic = Tool::Cursor.snippet(dir.path(), &cmd());
+        assert!(!generic.contains("approval"), "{generic}");
     }
 
     #[test]
