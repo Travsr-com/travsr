@@ -12271,7 +12271,7 @@ mod tests {
 
         // The rebuild's Phase B: the site now exists.
         store
-            .record_edge_sites(&[(caller.id, callee.id, 3)])
+            .record_edge_sites(&[(caller.id, callee.id, 3, None)])
             .unwrap();
         let edges_before = store.edge_count().unwrap();
 
@@ -12325,9 +12325,9 @@ mod tests {
                     ],
                 )
                 .unwrap();
-            sites.push((a.id, callee.id, 3));
-            sites.push((a.id, callee.id, 7));
-            sites.push((b.id, callee.id, 42));
+            sites.push((a.id, callee.id, 3, None));
+            sites.push((a.id, callee.id, 7, None));
+            sites.push((b.id, callee.id, 42, None));
             callers.push((a, b));
         }
         assert_eq!(raw_pending_count(&store), 18, "precondition");
@@ -12360,7 +12360,7 @@ mod tests {
             .unwrap();
         // The file is rewritten with the symbol gone: its id is retired.
         store
-            .reindex_replace("c", "src/a.ts", &[], &[], "h")
+            .reindex_replace("c", "src/a.ts", &[], &[], "h", None)
             .unwrap();
         assert!(
             store.get_node(old.id).unwrap().is_none(),
@@ -12428,11 +12428,14 @@ mod tests {
             .unwrap();
         // The rename: `src/d.ts` no longer defines `doomed`.
         store
-            .reindex_replace("c", "src/d.ts", &[], &[], "h")
+            .reindex_replace("c", "src/d.ts", &[], &[], "h", None)
             .unwrap();
         // Phase B's evidence.
         store
-            .record_edge_sites(&[(caller.id, callee.id, 3), (caller.id, callee.id, 5)])
+            .record_edge_sites(&[
+                (caller.id, callee.id, 3, None),
+                (caller.id, callee.id, 5, None),
+            ])
             .unwrap();
 
         let rows_before = raw_row_count(&store);
@@ -12512,7 +12515,7 @@ mod tests {
             .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 10, "callee")])
             .unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 11)])
+            .record_edge_sites(&[(caller.id, callee.id, 11, None)])
             .unwrap();
 
         let report = store.reconcile_ref_resolution_states().unwrap();
@@ -12534,7 +12537,9 @@ mod tests {
             .replace_ref_resolution_states("c", "src/a.ts", &[pending(a.id, 10, "callee")])
             .unwrap();
         // B resolved something on its own line 10, which has nothing to do with A.
-        store.record_edge_sites(&[(b.id, callee.id, 10)]).unwrap();
+        store
+            .record_edge_sites(&[(b.id, callee.id, 10, None)])
+            .unwrap();
 
         let report = store.reconcile_ref_resolution_states().unwrap();
 
@@ -12555,9 +12560,9 @@ mod tests {
             .unwrap();
         store
             .record_edge_sites(&[
-                (caller.id, callee.id, 9),
-                (caller.id, callee.id, 11),
-                (caller.id, callee.id, 12),
+                (caller.id, callee.id, 9, None),
+                (caller.id, callee.id, 11, None),
+                (caller.id, callee.id, 12, None),
             ])
             .unwrap();
 
@@ -12587,7 +12592,7 @@ mod tests {
             )
             .unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 5)])
+            .record_edge_sites(&[(caller.id, callee.id, 5, None)])
             .unwrap();
         let rows_before = raw_row_count(&store);
 
@@ -12628,10 +12633,10 @@ mod tests {
             .replace_ref_resolution_states("c", "src/d.ts", &[pending(doomed.id, 4, "a")])
             .unwrap();
         store
-            .reindex_replace("c", "src/d.ts", &[], &[], "h")
+            .reindex_replace("c", "src/d.ts", &[], &[], "h", None)
             .unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 3)])
+            .record_edge_sites(&[(caller.id, callee.id, 3, None)])
             .unwrap();
 
         let first = store.reconcile_ref_resolution_states().unwrap();
@@ -12676,10 +12681,10 @@ mod tests {
             .replace_ref_resolution_states("c", "src/d.ts", &[pending(doomed.id, 4, "a")])
             .unwrap();
         store
-            .reindex_replace("c", "src/d.ts", &[], &[], "h")
+            .reindex_replace("c", "src/d.ts", &[], &[], "h", None)
             .unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 3)])
+            .record_edge_sites(&[(caller.id, callee.id, 3, None)])
             .unwrap();
         assert_eq!(raw_pending_count(&store), 2, "precondition");
 
@@ -12746,7 +12751,7 @@ mod tests {
                 .unwrap();
             // Phase B resolves the even lines only.
             for line in (2..=LINES_PER_FILE).step_by(2) {
-                sites.push((caller.id, callee.id, line));
+                sites.push((caller.id, callee.id, line, None));
             }
         }
         let total = (FILES * LINES_PER_FILE) as i64;

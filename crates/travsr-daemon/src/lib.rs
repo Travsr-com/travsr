@@ -9571,7 +9571,7 @@ mod tests {
         let again = {
             let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
             reindex_files(std::slice::from_ref(&caller), tmp.path(), &mut store).unwrap();
-            live_resolve_file(&mut store, corpus, tmp.path(), &caller);
+            live_resolve_file(&mut store, corpus, tmp.path(), &caller, None);
             store
                 .enclosing_definition_at(corpus, "src/caller.ts", 9)
                 .unwrap()
@@ -9721,7 +9721,7 @@ mod tests {
     ) {
         let caller = tmp.path().join("src/caller.ts");
         let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
-        live_resolve_file(&mut store, corpus, tmp.path(), &caller);
+        live_resolve_file(&mut store, corpus, tmp.path(), &caller, None);
         assert!(
             raw_has_row(db_path, run, NOTIFY_LINE, "notify"),
             "precondition"
@@ -9857,7 +9857,7 @@ mod tests {
                 ))
                 .unwrap();
             store
-                .record_edge_sites(&[(caller.id, callee.id, 3)])
+                .record_edge_sites(&[(caller.id, callee.id, 3, None)])
                 .unwrap();
             let row = |line, name: &str| travsr_store::RefResolution {
                 src: caller.id,
