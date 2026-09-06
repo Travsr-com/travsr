@@ -343,6 +343,7 @@ mod tests {
             caller_line: line,
             callee_id: callee,
             is_call,
+            caller_col: None,
         }
     }
 
