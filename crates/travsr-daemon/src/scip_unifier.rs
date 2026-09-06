@@ -115,9 +115,7 @@ pub fn unify_all(
     // re-query without re-parsing the SCIP descriptor.
     // Carries the kind too: the cross-file rung below is restricted by it, and
     // re-deriving it would mean re-parsing the SCIP descriptor.
-    // Carries the node itself (for its id, path, line and own kind) and the
-    // parsed leaf name, both needed by the extension rung below.
-    let mut unmatched: Vec<(&travsr_core::Node, &str, Vec<String>, &str, &str)> = Vec::new();
+    let mut unmatched: Vec<(NodeId, &str, Vec<String>, &str)> = Vec::new();
     // #825: first-seen detail for each callable/type SCIP symbol that becomes an
     // attempt, so the residual misses (`attempted - unified`) can be named in
     // `travsr status`. Keyed by scip symbol to match the per-symbol counters.
@@ -245,7 +243,7 @@ pub fn unify_all(
             Ok(None) if dsl_contained => {
                 dropped.insert(node.id);
             }
-            Ok(None) => unmatched.push((node, scip_sym, candidates, parsed.kind, parsed.name)),
+            Ok(None) => unmatched.push((node.id, scip_sym, candidates, parsed.kind)),
             Err(e) => tracing::warn!(symbol = %scip_sym, "G1: DB lookup: {e:#}"),
         }
     }
@@ -255,12 +253,12 @@ pub fn unify_all(
     // C/C++ header/source). Alias it onto that node so it is dropped as a
     // duplicate and its edges/refs rewrite onto the real node, and credit its
     // symbol as unified so the miss-rate does not penalize the benign twin.
-    for (node, sym, candidates, kind, name) in unmatched {
+    for (node_id, sym, candidates, kind) in unmatched {
         // Rung 1: the symbol unified in another file, so this occurrence is
         // the benign twin.
         if let Some(&ts_id) = sym_to_ts.get(sym) {
             aliases.push((sym.to_string(), ts_id));
-            alias_map.insert(node.id, ts_id);
+            alias_map.insert(node_id, ts_id);
             // Only callable/type symbols feed the miss-rate; crediting a
             // `variable` twin would let `unified` exceed `attempted`.
             if attempted_syms.contains(sym) {
@@ -307,63 +305,15 @@ pub fn unify_all(
         match store.find_unique_ts_node_across_files(corpus, &candidates) {
             Ok(Some(ts_id)) => {
                 aliases.push((sym.to_string(), ts_id));
-                alias_map.insert(node.id, ts_id);
+                alias_map.insert(node_id, ts_id);
                 sym_to_ts.entry(sym).or_insert(ts_id);
                 if attempted_syms.contains(sym) {
                     unified_syms.insert(sym);
                 }
                 tracing::trace!(symbol = %sym, ?ts_id, "G1: unified across files");
-                continue;
             }
             Ok(None) => {}
             Err(e) => tracing::warn!(symbol = %sym, "G1: cross-file lookup: {e:#}"),
-        }
-
-        // Rung 3 (#825 Part B): the def's OWN node kind is `extension` — a
-        // Swift/Dart `extension X { … }` block. `candidate_signatures`
-        // deliberately never offers `extension:`, because such a def carries
-        // the *extended type's* symbol (`swift::X`) and, since a VName has no
-        // kind field, the extended type's `NodeId` as well; the alias map,
-        // `symbol_aliases` and the ref rewrite are all last-write-wins, so a
-        // general `extension:` candidate would move every reference to `X` off
-        // the type and onto whichever block resolved last.
-        //
-        // Reaching this rung means no type named `X` claimed the symbol in this
-        // file, in another file (rung 1) or anywhere in the corpus (rung 2), so
-        // the block extends a type this repo does not define (`extension
-        // UIView`) and its own Phase A node is the only correct home. Without
-        // this the def survived as an orphan duplicate that took the block
-        // members' reference edges with it — the bulk of #825's miss list.
-        // Tried last precisely so it can never displace the extended type.
-        //
-        // Language-agnostic: the gate is the Phase A node kind `extension`, not
-        // the language. Dart signs its (separately named) extensions `class:X`,
-        // so a Dart def matches in the main loop and never gets here.
-        if node.kind != "extension" {
-            continue;
-        }
-        let Some(line) = node.line else {
-            continue;
-        };
-        let ext = [format!("extension:{name}")];
-        match store.find_ts_node_for_unification(
-            corpus,
-            &node.vname.path,
-            &ext,
-            line as i64,
-            MAX_LINE_DELTA,
-        ) {
-            Ok(Some(ts_id)) => {
-                aliases.push((sym.to_string(), ts_id));
-                alias_map.insert(node.id, ts_id);
-                sym_to_ts.entry(sym).or_insert(ts_id);
-                if attempted_syms.contains(sym) {
-                    unified_syms.insert(sym);
-                }
-                tracing::trace!(symbol = %sym, ?ts_id, "G1: unified onto its extension block");
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(symbol = %sym, "G1: extension lookup: {e:#}"),
         }
     }
 
@@ -510,140 +460,6 @@ mod tests {
         assert_eq!(m.symbol, "App.missing");
         assert_eq!(m.path, "lib/app.rb");
         assert_eq!(m.line, 99);
-    }
-
-    #[test]
-    fn swift_extension_of_foreign_type_unifies_not_orphaned() {
-        // #825 Part B: `extension UIView { … }` — the extended type is defined
-        // outside this repo, so no `class:`/`struct:`/… node claims the symbol in
-        // this file, in another file, or corpus-wide. The block's own
-        // `extension:UIView` node is the only correct home; before rung 3 the def
-        // matched nothing and survived as an orphan duplicate that took the
-        // block members' reference edges with it. This is the bulk of #825's
-        // 152-row miss list.
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        // Phase A extension node (as swift.rs emits it: `extension:X`, kind
-        // "extension").
-        let ext_ts = Node::new(
-            VName::new("c", "main", "Ad.swift", "swift", "extension:UIView"),
-            "extension",
-        )
-        .with_line(10)
-        .with_end_line(20);
-        store
-            .write_phase_b_batch(std::slice::from_ref(&ext_ts), &[], "scip")
-            .unwrap();
-
-        // Native swift def for the extension block (scheme-prefixed signature,
-        // kind "extension").
-        let ext_def = Node::new(
-            VName::new("c", "main", "Ad.swift", "swift", "swift::UIView"),
-            "extension",
-        )
-        .with_line(10);
-
-        let nodes = vec![ext_def.clone()];
-        let mut refs = vec![ScipRef {
-            caller_path: "Ad.swift".into(),
-            caller_line: 12,
-            callee_id: ext_def.id,
-            is_call: false,
-        }];
-        let out = unify_all(&mut store, "c", &nodes, &mut refs);
-
-        assert_eq!(out.attempted, 1, "the extension def is a real attempt");
-        assert_eq!(out.unified, 1, "and it now unifies onto extension:UIView");
-        assert_eq!(out.alias_map.get(&ext_def.id), Some(&ext_ts.id));
-        assert_eq!(refs[0].callee_id, ext_ts.id, "the ref follows the alias");
-        assert!(out.misses.is_empty(), "no orphan, so no miss");
-    }
-
-    #[test]
-    fn class_plus_extension_pair_keeps_references_on_the_class() {
-        // #825 Part B review / #822: `class X { … }` at 11-40 and `extension X {
-        // … }` at 46-60 in one file. The swift emitter emits a def for each, both
-        // under `swift::X` — and a VName carries no kind, so in the same file the
-        // two defs are ONE NodeId, which every reference to `X` carries as its
-        // callee. `alias_map`, `symbol_aliases` and the final ref rewrite are all
-        // last-write-wins, so an `extension:X` candidate offered to the extension
-        // def would move every type reference off the class and onto the
-        // extension block. Rung 3 runs only after rungs 1 and 2 have failed, so
-        // the class always wins: the extension def collapses onto the class node
-        // (rung 1) exactly as it did before Part B.
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let class_ts = Node::new(
-            VName::new(
-                "c",
-                "main",
-                "Ad.swift",
-                "swift",
-                "class:InterscrollerAdHandler",
-            ),
-            "class",
-        )
-        .with_line(11)
-        .with_end_line(40);
-        let ext_ts = Node::new(
-            VName::new(
-                "c",
-                "main",
-                "Ad.swift",
-                "swift",
-                "extension:InterscrollerAdHandler",
-            ),
-            "extension",
-        )
-        .with_line(46)
-        .with_end_line(60);
-        store
-            .write_phase_b_batch(&[class_ts.clone(), ext_ts.clone()], &[], "scip")
-            .unwrap();
-
-        // Both emitter defs, in source order: same signature => same NodeId.
-        let class_def = Node::new(
-            VName::new(
-                "c",
-                "main",
-                "Ad.swift",
-                "swift",
-                "swift::InterscrollerAdHandler",
-            ),
-            "class",
-        )
-        .with_line(11);
-        let ext_def = Node::new(
-            VName::new(
-                "c",
-                "main",
-                "Ad.swift",
-                "swift",
-                "swift::InterscrollerAdHandler",
-            ),
-            "extension",
-        )
-        .with_line(46);
-        assert_eq!(
-            class_def.id, ext_def.id,
-            "a VName carries no kind, so the pair shares one NodeId"
-        );
-
-        let nodes = vec![class_def.clone(), ext_def.clone()];
-        let mut refs = vec![ScipRef {
-            caller_path: "Other.swift".into(),
-            caller_line: 3,
-            callee_id: class_def.id,
-            is_call: false,
-        }];
-        let out = unify_all(&mut store, "c", &nodes, &mut refs);
-
-        assert_eq!(
-            refs[0].callee_id, class_ts.id,
-            "a reference to the type must land on the class, not the extension"
-        );
-        assert_eq!(out.alias_map.get(&class_def.id), Some(&class_ts.id));
-        assert_eq!(out.attempted, 1, "one SCIP symbol, so one attempt");
-        assert_eq!(out.unified, 1, "and both defs resolve to the class node");
-        assert!(out.misses.is_empty(), "neither def is a miss");
     }
 
     #[test]

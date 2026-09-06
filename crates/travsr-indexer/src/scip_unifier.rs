@@ -276,11 +276,7 @@ fn strip_backticks(s: &str) -> &str {
 ///              prefixes, so `actor:` (a SCIP `#`-type target) is added here;
 ///              `extension:` is deliberately omitted — an extension is not a
 ///              SCIP definition target and must not steal the extended type's
-///              unification. #825: a def whose own *node kind* is `extension`
-///              gets `extension:<name>` from `unify_all`'s last-resort rung
-///              instead, tried only after every candidate below has failed
-///              corpus-wide, so the block can adopt its own Phase A node
-///              without ever displacing the type it extends.)
+///              unification.)
 ///   terms:     `field:C.n` (owner-qualified field, #757), `var:` `const:`
 ///              `static:` (unqualified package/global terms)
 pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
@@ -535,25 +531,6 @@ mod tests {
         let p = scip_name_kind("objc . local/objc 0.0.0 Speakable/").unwrap();
         assert_eq!(p, parsed(None, "Speakable", "class"));
         assert!(candidate_signatures(&p).contains(&"protocol:Speakable".to_string()));
-    }
-
-    #[test]
-    fn extension_kind_def_offers_no_extension_candidate() {
-        // #825 Part B: a Swift `extension X { … }` block's native def parses as
-        // a `class`-kind name for `X` — the *extended type*. It must offer only
-        // the type candidates: the extension def and the `class X` def share one
-        // SCIP symbol (and, since a VName carries no kind, one NodeId), and both
-        // the alias map and `symbol_aliases` are last-write-wins, so offering
-        // `extension:X` here would move every reference to `X` off the class and
-        // onto whichever extension block resolved last. The block's own
-        // `extension:X` node is reached by `unify_all`'s last-resort rung, after
-        // the type has had every chance to claim the symbol.
-        let p = native_name_kind("swift::InterscrollerAdHandler", "extension").unwrap();
-        assert_eq!(p, parsed(None, "InterscrollerAdHandler", "class"));
-        assert!(
-            !candidate_signatures(&p).contains(&"extension:InterscrollerAdHandler".to_string()),
-            "extension: must not be a general class-kind candidate"
-        );
     }
 
     #[test]
