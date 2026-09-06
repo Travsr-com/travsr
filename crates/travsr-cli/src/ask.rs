@@ -5,7 +5,7 @@
 //! store is opened directly (read-only fast path).
 
 use anyhow::Context as _;
-use tabled::{Table, Tabled};
+use tabled::{settings::Style, Table, Tabled};
 use travsr_mcp::query::{self, AskPayload};
 
 use crate::daemon_client;
@@ -19,16 +19,38 @@ pub enum OutputFormat {
     Json,
 }
 
+/// One rendered result line. There is no `Kind` column (#824): most signatures
+/// already carry their kind as a prefix (`fn:`, `method:`, `field:`, `var:`,
+/// ...), so the column just repeated it. The kind is folded into `signature`
+/// instead, and only for the rows that do not already show it — see
+/// [`signature_shows_kind`].
 #[derive(Tabled)]
 struct Row {
-    #[tabled(rename = "Kind")]
-    kind: String,
     #[tabled(rename = "Signature")]
     signature: String,
     #[tabled(rename = "Path")]
     path: String,
     #[tabled(rename = "Score")]
     score: String,
+}
+
+/// Render results as a borderless, space-aligned table (#824). The default
+/// `tabled` style drew a `+---+` rule between every row and boxed each cell in
+/// `|` bars, which roughly tripled the stdout an agent piping `ask` receives
+/// for output no human reads. Columns still align; only the frame is dropped.
+/// The machine surface is `--format json`, so this affects the human view only.
+///
+/// `Style::blank()` pads the last column, so every line would otherwise end in
+/// a space: invisible in a terminal, but still a byte per row in the stdout
+/// this change exists to shrink, and whitespace noise the moment anyone diffs
+/// captured output. Trim it back off.
+fn render_rows(rows: Vec<Row>) -> String {
+    let table = Table::new(rows).with(Style::blank()).to_string();
+    table
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The match-source lanes the grouped human table renders, in backend
@@ -41,10 +63,44 @@ struct Row {
 /// `payload.docs`, not from `rows`.
 const SECTION_TAGS: [&str; 5] = ["exact", "semantic", "docs", "tests", "relevant"];
 
+/// THE RULE: a signature already shows its kind only when the word before its
+/// first `:` is an abbreviation of the row's own kind — every letter of that
+/// word appearing in order inside the kind name.
+///
+/// That is language-agnostic because it compares the signature against the kind
+/// the indexer stamped on the same node rather than against a list of known
+/// prefixes: `fn:`/function, `var:`/variable, `pkg:`/package, `filemod:`/
+/// file-module and every other Phase A and Kotlin prefix pass, while the Phase B
+/// provider schemes that survive G1 unification — SCIP `scip:<path>:<symbol>`
+/// (Java/Go/C#/C/C++/Scala/PHP/Ruby/ObjC), the Swift emitter's `swift::Type.member`
+/// and the Dart emitter's `file:///abs/x.dart::Type.member` — do not, because
+/// `scip`/`swift`/`file` are not subsequences of `function`, `method`, `class`
+/// or any other kind. A bare path (a file node) and a Windows `C:\src\x.rs`
+/// have no kind-like prefix either, so they keep their kind too. #824's report
+/// came from an iOS/Swift run, which is exactly the set this protects.
+fn signature_shows_kind(signature: &str, kind: &str) -> bool {
+    let Some((prefix, _)) = signature.split_once(':') else {
+        return false;
+    };
+    if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let mut kind_chars = kind.chars();
+    prefix
+        .chars()
+        .all(|p| kind_chars.any(|k| k.eq_ignore_ascii_case(&p)))
+}
+
 fn to_row(r: &query::AskRow) -> Row {
     Row {
-        kind: r.kind.clone(),
-        signature: r.signature.clone(),
+        // Keep the signature verbatim — it is what a user copies into
+        // `travsr graph` / `travsr references` — and only prepend the kind when
+        // the signature does not already carry it.
+        signature: if r.kind.is_empty() || signature_shows_kind(&r.signature, &r.kind) {
+            r.signature.clone()
+        } else {
+            format!("{}: {}", r.kind, r.signature)
+        },
         path: match r.line {
             Some(l) => format!("{}:{}", r.path, l),
             None => r.path.clone(),
@@ -418,11 +474,11 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
                 _ => "── relevant, graph-adjacent context ──",
             };
             println!("{header}");
-            println!("{}", Table::new(rows));
+            println!("{}", render_rows(rows));
         }
     } else {
         let rows: Vec<Row> = payload.rows.iter().map(to_row).collect();
-        println!("{}", Table::new(rows));
+        println!("{}", render_rows(rows));
         print_docs(&payload.docs);
     }
     let embed_note = if payload.embed_used {
@@ -1752,5 +1808,105 @@ mod suggestion_tests {
         // All stop words or too short: nothing worth searching for.
         assert_eq!(distinctive_term("what is it for"), None);
         assert_eq!(distinctive_term(""), None);
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::{render_rows, to_row, Row};
+    use travsr_mcp::query::AskRow;
+
+    fn row(signature: &str) -> Row {
+        Row {
+            signature: signature.to_string(),
+            path: "crates/travsr-cli/src/ask.rs:1".to_string(),
+            score: "0.500".to_string(),
+        }
+    }
+
+    fn ask_row(kind: &str, signature: &str) -> AskRow {
+        AskRow {
+            kind: kind.to_string(),
+            signature: signature.to_string(),
+            path: "x".to_string(),
+            line: None,
+            score: 0.5,
+            match_source: None,
+        }
+    }
+
+    /// #824: pins the borderless render. The previous default came from a bare
+    /// `Table::new(rows)` with no style call, which is easy to reintroduce, and
+    /// the `+---+` rule per row was most of the stdout an agent piping `ask`
+    /// paid for. Lines are trimmed before comparison so column padding cannot
+    /// flip the assertions.
+    #[test]
+    fn render_rows_is_borderless_and_keeps_the_header() {
+        let out = render_rows(vec![row("fn:knapsack"), row("method:Animal.describe")]);
+        assert!(!out.contains("+--"), "row rule survived:\n{out}");
+        assert!(!out.contains('|'), "cell bars survived:\n{out}");
+
+        let header = out.lines().next().unwrap_or_default().trim();
+        assert!(header.starts_with("Signature"), "header lost: {header:?}");
+        assert!(header.contains("Path") && header.contains("Score"));
+        assert!(!out.contains("Kind"), "Kind column returned:\n{out}");
+
+        // ASCII only: a Windows terminal must render this unchanged.
+        assert!(out.is_ascii(), "non-ASCII in table:\n{out}");
+        // `path:line` stays one unbroken, clickable token.
+        assert!(out.contains("crates/travsr-cli/src/ask.rs:1"));
+
+        // No line ends in whitespace: `Style::blank()` pads the last column and
+        // would otherwise leave a trailing space on every row. A stray `\r` is
+        // stripped first so this cannot fail on a CRLF checkout.
+        for line in out.lines() {
+            let line = line.trim_end_matches('\r');
+            assert_eq!(line, line.trim_end(), "trailing whitespace: {line:?}");
+        }
+    }
+
+    /// The kind is folded away only when the signature already spells it.
+    /// Phase A (all 16 languages) and Kotlin prefix their signatures; the SCIP,
+    /// Swift and Dart Phase B conventions do not, and those rows would
+    /// otherwise lose their only kind information in the human view.
+    #[test]
+    fn kind_is_kept_for_signatures_that_do_not_carry_it() {
+        let cases = [
+            // Already kinded — the prefix abbreviates the kind.
+            ("function", "fn:knapsack", "fn:knapsack"),
+            ("method", "method:Animal.describe", "method:Animal.describe"),
+            ("variable", "var:LIMIT", "var:LIMIT"),
+            ("package", "pkg:serde@1.0", "pkg:serde@1.0"),
+            ("file-module", "filemod:knapsack", "filemod:knapsack"),
+            ("doc-chunk", "doc:rfc-010/design", "doc:rfc-010/design"),
+            // Provider schemes — not kinds, so the kind is prepended.
+            (
+                "method",
+                "scip:src/Foo.java:semanticdb maven . . Foo#bar().",
+                "method: scip:src/Foo.java:semanticdb maven . . Foo#bar().",
+            ),
+            (
+                "method",
+                "swift::Animal.describe",
+                "method: swift::Animal.describe",
+            ),
+            (
+                "method",
+                "file:///abs/x.dart::Animal.describe",
+                "method: file:///abs/x.dart::Animal.describe",
+            ),
+            // No prefix at all: a repo-relative path, and a Windows path whose
+            // drive letter must not be mistaken for a kind prefix.
+            (
+                "file",
+                "crates/travsr-cli/src/ask.rs",
+                "file: crates/travsr-cli/src/ask.rs",
+            ),
+            ("file", "C:\\src\\x.rs", "file: C:\\src\\x.rs"),
+        ];
+        for (kind, signature, want) in cases {
+            let got = to_row(&ask_row(kind, signature)).signature;
+            assert_eq!(got, want, "kind={kind} signature={signature}");
+        }
     }
 }
