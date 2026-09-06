@@ -48,7 +48,6 @@ import {
 import { ContextExplorerPanel, getSymbolAtCursor } from "./contextExplorer";
 import { registerMcpServerCommand } from "./mcpRegister";
 import { registerContextCodeAction } from "./contextCodeAction";
-import { runTravsrCommand } from "./terminal";
 
 export function activate(context: vscode.ExtensionContext): void {
   const channel = vscode.window.createOutputChannel("Travsr");
@@ -229,7 +228,6 @@ export function activate(context: vscode.ExtensionContext): void {
         | "repos"
         | "reindex"
         | "restart"
-        | "stop"
         | "settings"
         | "output"
         | "disable"
@@ -241,7 +239,6 @@ export function activate(context: vscode.ExtensionContext): void {
         { label: "$(sync) Re-index now",              id: "reindex"    } as ActionItem,
         { label: "", kind: vscode.QuickPickItemKind.Separator },
         { label: "$(refresh) Restart daemon",         id: "restart"  } as ActionItem,
-        { label: "$(debug-stop) Stop daemon",         id: "stop"     } as ActionItem,
         { label: "$(gear) Open settings",             id: "settings" } as ActionItem,
         { label: "$(output) Show output channel",     id: "output"   } as ActionItem,
         { label: "$(circle-slash) Disable extension", id: "disable"  } as ActionItem,
@@ -550,23 +547,6 @@ export function activate(context: vscode.ExtensionContext): void {
       void publishLiveResolutions(workspaceRoot, doc).catch(() => {
         // Never surfaced: see the note above.
       });
-    })
-  );
-
-  // Stop the daemon. Deliberately a command rather than a button on the Health
-  // page: that page is built around remedies, and a one-click path into the
-  // "Not watching" state does not belong among them. Reachable from the palette
-  // and the status bar menu, where the other lifecycle actions live.
-  context.subscriptions.push(
-    vscode.commands.registerCommand("travsr.stopDaemon", async () => {
-      const go = await vscode.window.showWarningMessage(
-        "Stop the Travsr daemon? Queries keep working from the graph on disk, but commits and saves will no longer refresh it.",
-        { modal: true },
-        "Stop"
-      );
-      if (go !== "Stop") return;
-      runTravsrCommand(["daemon", "stop"], workspaceRoot);
-      refreshOpenPanels();
     })
   );
 

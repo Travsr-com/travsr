@@ -444,7 +444,7 @@ suite("health panel rendering", () => {
       buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, RUNNING) +
       buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, STOPPED);
     const HANDLED = new Set([
-      "refresh", "startDaemon", "restartDaemon", "reindex", "fullRebuild",
+      "refresh", "startDaemon", "restartDaemon", "stopDaemon", "reindex", "fullRebuild",
       "installHook", "installEmbed", "reinstallEmbed", "changeEmbedModel",
       "runFsck", "compact", "registerMcp", "prune", "remove", "fixLang", "disableLang",
       "runFix", "copyFix", "openFile", "setLogLines", "setLogFile", "setLogAuto",

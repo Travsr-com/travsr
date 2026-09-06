@@ -1338,7 +1338,12 @@ export function buildStatsHtml(
   const daemonSec = section(
     "Daemon",
     daemonRunning ? statusChip("ok", "running") : statusChip("bad", "not running"),
-    daemonRunning ? act("Restart", "restartDaemon") : act("Start", "startDaemon", "primary"),
+    // Stop is offered only while it is running, and only here. It is the one
+    // action on this page that makes things worse rather than better, so it
+    // sits with the section that owns the daemon and confirms before running.
+    daemonRunning
+      ? act("Restart", "restartDaemon") + act("Stop", "stopDaemon")
+      : act("Start", "startDaemon", "primary"),
     // The daemon's own sentence, verbatim. "starting", "not responding" and
     // "last start failed" are all distinct answers and none of them should be
     // flattened into a bare running/not-running by this panel.

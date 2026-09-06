@@ -135,11 +135,6 @@
         "icon": "$(sync)"
       },
       {
-        "command": "travsr.stopDaemon",
-        "title": "Travsr: Stop Daemon",
-        "icon": "$(debug-stop)"
-      },
-      {
         "command": "travsr.openFileGraph",
         "title": "Travsr: Open File Graph",
         "icon": "$(type-hierarchy)"

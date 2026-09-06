@@ -1391,6 +1391,7 @@ type PanelMessage =
   | { command: "setLogAuto"; seconds: number }
   | { command: "startDaemon" }
   | { command: "restartDaemon" }
+  | { command: "stopDaemon" }
   | { command: "reindex" }
   | { command: "fullRebuild" }
   | { command: "installHook" }
@@ -1707,6 +1708,22 @@ export function registerShowGraphStats(
         if (go !== "Run") return;
       }
       runTravsrCommand(argv, repoRoot());
+      return;
+    }
+    if (msg.command === "stopDaemon") {
+      // The only action on this page that leaves things worse than it found
+      // them, so it asks first and names what stopping costs rather than
+      // relying on the word "stop" to carry it.
+      const go = await vscode.window.showWarningMessage(
+        "Stop the Travsr daemon? Queries keep working from the graph on disk, but commits and saves will no longer refresh it.",
+        { modal: true },
+        "Stop"
+      );
+      if (go !== "Stop") return;
+      runTravsrCommand(["daemon", "stop"], repoRoot());
+      // The daemon takes a moment to release its socket, and this page's whole
+      // point is reporting that state, so redraw once it has.
+      setTimeout(() => void refresh(), 1500);
       return;
     }
     if (msg.command === "changeEmbedModel") {
