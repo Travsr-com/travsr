@@ -3513,8 +3513,7 @@ fn maybe_spawn_embed(
         return;
     }
 
-    let phase2_total = total.saturating_sub(phase1_total);
-    let phase2_remaining = phase2_total.saturating_sub(embedded.saturating_sub(phase1_done));
+    let phase2_remaining = phase2_remaining(total, embedded, phase1_total, phase1_done);
 
     if phase2_remaining == 0 {
         phase2_spawned.store(true, Ordering::Relaxed);
@@ -3535,6 +3534,24 @@ fn maybe_spawn_embed(
     if travsr_plugin_host::spawn_background_reindex_phase2(&db_path) {
         phase2_spawned.store(true, Ordering::Relaxed);
     }
+}
+
+/// Phase 2 nodes still to embed, from one `embed_progress` reading.
+///
+/// `phase2_total = total - phase1_total` and `phase2_done = embedded -
+/// phase1_done`, both saturating because the four counts are read in separate
+/// statements and a node can change tier between them.
+///
+/// The arithmetic is only right when `embedded` is over the same embeddable
+/// set as `total` (#862). With an unfiltered `embedded`, every vector on an
+/// ineligible node inflated `phase2_done` by one, and once the inflation
+/// reached the genuine remainder the outer `saturating_sub` returned 0: the
+/// tick concluded Phase 2 was complete and never spawned it. The saturation
+/// stays; the store's count is what was wrong, and `embed_progress` now
+/// applies its predicate to `embedded` too.
+fn phase2_remaining(total: u64, embedded: u64, phase1_total: u64, phase1_done: u64) -> u64 {
+    let phase2_total = total.saturating_sub(phase1_total);
+    phase2_total.saturating_sub(embedded.saturating_sub(phase1_done))
 }
 
 /// Pending-tombstone count observed at the last invalidation-driven spawn.
@@ -11340,6 +11357,218 @@ mod tests {
         maybe_spawn_embed(tmp.path(), &store, &flag);
         // flag remains true — Phase 2 was not re-spawned
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // ── #862: Phase 2 must be computed from the eligible embedded count ───────
+
+    /// The arithmetic in isolation. Same graph, two readings of `embedded`: the
+    /// unfiltered one the store used to return, and the filtered one it returns
+    /// now. Ten Phase 2 nodes are genuinely pending in both.
+    #[test]
+    fn phase2_remaining_is_masked_by_an_inflated_embedded_count() {
+        // total 100, phase1 10/10 done, 80 of 90 Phase 2 nodes embedded.
+        assert_eq!(phase2_remaining(100, 90, 10, 10), 10);
+        // Twenty vectors on ineligible nodes, counted: the saturation swallows
+        // the ten real ones and the tick believes Phase 2 is complete.
+        assert_eq!(phase2_remaining(100, 110, 10, 10), 0);
+        // And with a smaller inflation it under-reports rather than zeroes.
+        assert_eq!(phase2_remaining(100, 95, 10, 10), 5);
+        // Nothing embedded yet, and the empty graph.
+        assert_eq!(phase2_remaining(100, 0, 10, 0), 90);
+        assert_eq!(phase2_remaining(0, 0, 0, 0), 0);
+    }
+
+    /// The #862 graph on disk: 100 eligible nodes (10 core at shell 5, all
+    /// embedded; 90 at shell 0, 80 embedded), 20 `field` nodes with no
+    /// `embed_text` that carry vectors anyway, a backend configured, Phase B
+    /// complete. Returns the repo, the store and the raw model-scoped vector
+    /// count in embed.db.
+    fn repo_with_inflated_embeddings() -> (tempfile::TempDir, travsr_store::SqliteStore, i64) {
+        const MODEL: &str = "test-model-862";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        travsr_plugin_host::write_repo_backend_id(tmp.path(), MODEL).unwrap();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        set_phase_b_complete(&mut store, "abc123");
+
+        let node = |kind: &str, sig: String| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/lib.ts", "typescript", sig),
+                kind,
+            )
+        };
+        let mut shells = Vec::new();
+        let mut rows: Vec<i64> = Vec::new();
+        for i in 0..10 {
+            let n = node("function", format!("fn:core{i}"));
+            store.put_node(&n).unwrap();
+            shells.push((n.id, 5));
+            rows.push(n.id.0 as i64);
+        }
+        for i in 0..90 {
+            let n = node("function", format!("fn:leaf{i}"));
+            store.put_node(&n).unwrap();
+            shells.push((n.id, 0));
+            if i < 80 {
+                rows.push(n.id.0 as i64);
+            }
+        }
+        for i in 0..20 {
+            let n = node("field", format!("field:T.f{i}"));
+            store.put_node(&n).unwrap();
+            rows.push(n.id.0 as i64);
+        }
+        store.write_shell_numbers(&shells).unwrap();
+
+        let embed_db = tmp.path().join(".travsr/embed.db");
+        let conn = rusqlite::Connection::open(&embed_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE node_embeddings (
+                 node_id   INTEGER NOT NULL,
+                 model_id  TEXT    NOT NULL,
+                 embedding BLOB    NOT NULL,
+                 text_hash TEXT,
+                 PRIMARY KEY (node_id, model_id)
+             ) WITHOUT ROWID;
+             CREATE INDEX idx_node_embeddings_model ON node_embeddings(model_id);",
+        )
+        .unwrap();
+        for id in &rows {
+            conn.execute(
+                "INSERT INTO node_embeddings (node_id, model_id, embedding) VALUES (?1, ?2, X'00')",
+                rusqlite::params![id, MODEL],
+            )
+            .unwrap();
+        }
+        let raw: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+                rusqlite::params![MODEL],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (tmp, store, raw)
+    }
+
+    /// The critical integration case. Before the fix the tick read `embedded =
+    /// 110`, computed `phase2_remaining = 0`, latched `phase2_spawned` and never
+    /// launched Phase 2 while ten nodes had no vector. Now it reads 90, computes
+    /// 10, and attempts the spawn. No sidecar is installed for the test model,
+    /// so the attempt fails and the flag stays false: a false flag after the
+    /// tick is what "Phase 2 was not suppressed" looks like here, and a true one
+    /// is exactly the suppression.
+    #[test]
+    fn embed_tick_does_not_suppress_phase2_because_of_ineligible_vectors() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, store, raw_vectors) = repo_with_inflated_embeddings();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        assert_eq!(
+            raw_vectors, 110,
+            "precondition: the unfiltered count is inflated"
+        );
+
+        // The threshold the tick derives from this k-core distribution.
+        let threshold =
+            travsr_plugin_host::derive_phase1_threshold_for_status(&db_path).unwrap_or(3);
+        assert_eq!(threshold, 5, "precondition: the 10 core nodes are Phase 1");
+        let progress = store.embed_progress("test-model-862", threshold).unwrap();
+        assert_eq!(
+            progress,
+            (100, 90, 10, 10),
+            "embedded is the eligible count, Phase 1 is complete"
+        );
+        let (total, embedded, p1_total, p1_done) = progress;
+        assert_eq!(phase2_remaining(total, embedded, p1_total, p1_done), 10);
+        assert_eq!(
+            phase2_remaining(total, raw_vectors as u64, p1_total, p1_done),
+            0,
+            "the unfiltered count would have concluded Phase 2 was complete"
+        );
+
+        let store = std::sync::Mutex::new(store);
+        let phase2_spawned = std::sync::atomic::AtomicBool::new(false);
+        maybe_spawn_embed(tmp.path(), &store, &phase2_spawned);
+        assert!(
+            !phase2_spawned.load(std::sync::atomic::Ordering::Relaxed),
+            "the tick must try to launch Phase 2 (and fail for want of a sidecar), \
+             not latch it as complete on the strength of ineligible vectors"
+        );
+
+        // Nothing about the graph or the vectors changed to get there.
+        let s = store.lock().unwrap();
+        assert_eq!(
+            s.embed_progress("test-model-862", threshold).unwrap(),
+            progress
+        );
+        let still: i64 = rusqlite::Connection::open(tmp.path().join(".travsr/embed.db"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM node_embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            still, 110,
+            "ineligible vectors are not deleted to fix the count"
+        );
+    }
+
+    /// The control for the test above: when Phase 2 genuinely is complete, the
+    /// tick still latches the flag, so the corrected count did not simply make
+    /// the tick spawn unconditionally.
+    #[test]
+    fn embed_tick_still_latches_phase2_when_every_eligible_node_is_embedded() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, store, _) = repo_with_inflated_embeddings();
+        // Embed the ten leaf nodes that were missing.
+        let missing: Vec<i64> = {
+            let conn = rusqlite::Connection::open(tmp.path().join(".travsr/graph.db")).unwrap();
+            let all: Vec<i64> = {
+                let mut st = conn
+                    .prepare("SELECT id FROM nodes WHERE kind = 'function'")
+                    .unwrap();
+                st.query_map([], |r| r.get(0))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect()
+            };
+            let edb = rusqlite::Connection::open(tmp.path().join(".travsr/embed.db")).unwrap();
+            all.into_iter()
+                .filter(|id| {
+                    !edb.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM node_embeddings WHERE node_id = ?1)",
+                        rusqlite::params![id],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(missing.len(), 10, "precondition");
+        {
+            let edb = rusqlite::Connection::open(tmp.path().join(".travsr/embed.db")).unwrap();
+            for id in &missing {
+                edb.execute(
+                    "INSERT INTO node_embeddings (node_id, model_id, embedding) VALUES (?1, 'test-model-862', X'00')",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+            }
+        }
+        let threshold = travsr_plugin_host::derive_phase1_threshold_for_status(
+            &tmp.path().join(".travsr/graph.db"),
+        )
+        .unwrap_or(3);
+        assert_eq!(
+            store.embed_progress("test-model-862", threshold).unwrap(),
+            (100, 100, 10, 10)
+        );
+
+        let store = std::sync::Mutex::new(store);
+        let phase2_spawned = std::sync::atomic::AtomicBool::new(false);
+        maybe_spawn_embed(tmp.path(), &store, &phase2_spawned);
+        assert!(
+            phase2_spawned.load(std::sync::atomic::Ordering::Relaxed),
+            "with every eligible node embedded, Phase 2 is complete and the flag latches"
+        );
     }
 
     #[test]

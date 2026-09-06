@@ -35,3 +35,5 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+# #862 tests seed and inspect `embed.db` directly, the way the sidecar writes it.
+rusqlite = { workspace = true }
