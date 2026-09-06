@@ -928,6 +928,85 @@ impl PluginIndexer {
                                         }
                                     }
                                 }
+
+                                // #833: `.js`/`.jsx`/`.mjs`/`.cjs` classify as
+                                // TypeScript, so they arrive in this work item. The
+                                // project tsconfig above (if any) only resolves them
+                                // when it sets `allowJs`, which plain-JS / CommonJS
+                                // repos never do — and most ship no tsconfig at all.
+                                // Run a second pass over a synthesized allowJs
+                                // tsconfig covering exactly this repo's JS files so
+                                // they get real cross-file semantic refs instead of
+                                // only tree-sitter heuristics. The pass is a no-op
+                                // when there are no JS files (pure-TS repos), and
+                                // its writes are idempotent where a real allowJs
+                                // tsconfig already covered them.
+                                //
+                                // `item.files` is None only on the legacy
+                                // "sidecar walks itself" protocol path; every
+                                // `init --semantic` supplies indexable_paths,
+                                // so the JS pass simply does not run there.
+                                if let Some(rel_files) = item.files.as_ref() {
+                                    let js_abs: Vec<std::path::PathBuf> = rel_files
+                                        .iter()
+                                        .filter(|r| {
+                                            std::path::Path::new(r.as_str())
+                                                .extension()
+                                                .and_then(|e| e.to_str())
+                                                .is_some_and(|e| {
+                                                    travsr_indexer::JS_EXTENSIONS.contains(&e)
+                                                })
+                                        })
+                                        .map(|r| repo_root.join(r))
+                                        .collect();
+                                    match travsr_indexer::synthesize_js_tsconfig(&js_abs) {
+                                        Ok(Some((_scratch, synth_tsconfig))) => {
+                                            match travsr_indexer::run_lsif_emitter_with_root(
+                                                &synth_tsconfig,
+                                                repo_root,
+                                            ) {
+                                                Ok(dump) => {
+                                                    match travsr_indexer::ingest_lsif_g2(
+                                                        &dump, corpus,
+                                                    ) {
+                                                        Ok(g2) => {
+                                                            tracing::debug!(
+                                                                refs = g2.refs.len(),
+                                                                "Phase B: js synthesized-tsconfig lsif refs merged"
+                                                            );
+                                                            refs.extend(g2.refs);
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!("js lsif ingest: {e}")
+                                                        }
+                                                    }
+                                                }
+                                                // Only a failure to *start* the
+                                                // emitter is "not available".
+                                                // One that ran and failed (a
+                                                // pre-`--root` emitter hits
+                                                // SEC-003 here) is a real fault
+                                                // and must be visible at
+                                                // default verbosity, stderr
+                                                // head included.
+                                                Err(e)
+                                                    if travsr_indexer::emitter_missing(&e) =>
+                                                {
+                                                    tracing::debug!(
+                                                        "js lsif emitter not available: {e}"
+                                                    )
+                                                }
+                                                Err(e) => tracing::warn!(
+                                                    "js lsif emitter failed: {e:#}"
+                                                ),
+                                            }
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => {
+                                            tracing::warn!("js synthetic tsconfig: {e}")
+                                        }
+                                    }
+                                }
                                 nodes.sort_unstable_by_key(|n| n.id);
                                 nodes.dedup_by_key(|n| n.id);
                                 edges.sort_unstable_by_key(|e| (e.src, e.dst));
