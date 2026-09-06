@@ -2856,6 +2856,75 @@ mod embed_ux_tests {
         assert_eq!(parse_cpu_choice("xyz", ""), None);
     }
 
+    /// #862: the raw counts `embed status` prints come from `query_embed_stats`.
+    /// A vector on an ineligible node (a `field` with no `embed_text`) must not
+    /// lift `embedded` above `total_symbols`, and the derived Phase 2 figures
+    /// must follow. Exercised here rather than only through the binary because
+    /// `cmd_status` gates the progress section on an installed backend, which
+    /// the integration test can fake on Unix only.
+    #[test]
+    fn query_embed_stats_counts_only_eligible_vectors() {
+        use travsr_store::Store as _;
+        const MODEL: &str = "bge-small-en-v1.5";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let node = |kind: &str, sig: String| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/lib.ts", "typescript", sig),
+                kind,
+            )
+        };
+        let mut vectors: Vec<i64> = Vec::new();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            for i in 0..10 {
+                let n = node("function", format!("fn:f{i}"));
+                store.put_node(&n).unwrap();
+                if i < 8 {
+                    vectors.push(n.id.0 as i64); // two functions still pending
+                }
+            }
+            for i in 0..3 {
+                let n = node("field", format!("field:T.f{i}"));
+                store.put_node(&n).unwrap();
+                vectors.push(n.id.0 as i64); // ineligible, yet embedded
+            }
+        }
+        let conn = rusqlite::Connection::open(tmp.path().join(".travsr/embed.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE node_embeddings (
+                 node_id INTEGER NOT NULL, model_id TEXT NOT NULL,
+                 embedding BLOB NOT NULL, text_hash TEXT,
+                 PRIMARY KEY (node_id, model_id)) WITHOUT ROWID;",
+        )
+        .unwrap();
+        for id in &vectors {
+            conn.execute(
+                "INSERT INTO node_embeddings (node_id, model_id, embedding) VALUES (?1, ?2, X'00')",
+                rusqlite::params![id, MODEL],
+            )
+            .unwrap();
+        }
+        let raw: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, 11, "precondition: the unfiltered count is inflated");
+
+        let EmbedStatsWithThreshold { stats, .. } = query_embed_stats(&db_path, MODEL).unwrap();
+        assert_eq!(stats.total_symbols, 10);
+        assert_eq!(stats.embedded, 8, "eight eligible vectors, not eleven rows");
+        assert!(stats.embedded <= stats.total_symbols);
+        // No k-core data: Phase 1 is empty and everything is Phase 2.
+        assert_eq!((stats.phase1_total, stats.phase1_done), (0, 0));
+        assert_eq!((stats.phase2_total, stats.phase2_done), (10, 8));
+        assert_eq!(
+            stats.phase2_total - stats.phase2_done,
+            2,
+            "the two functions without a vector are the pending work"
+        );
+    }
+
     /// F4: a lagging tier denominator can make `done > total`; the displayed
     /// percentage must never exceed 100%. Raw counts stay honest elsewhere.
     #[test]

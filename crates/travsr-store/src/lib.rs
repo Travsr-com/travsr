@@ -1913,6 +1913,11 @@ impl SqliteStore {
     /// phase1 = embeddable nodes with `shell_number >= threshold` (high-centrality core).
     /// Phase2 totals can be derived: `phase2_total = total_symbols - phase1_total`.
     ///
+    /// Every count is over embeddable nodes, `embedded` included (#862), so
+    /// `embedded <= total_symbols` and `phase1_done <= phase1_total` hold for
+    /// one model and one graph snapshot, and `total_symbols - embedded` is the
+    /// same pending set the sidecar computes for itself.
+    ///
     /// RFC-019: embedded counts are read from embed.db (sibling of graph.db) via
     /// ATTACH. Returns (total, 0, phase1_total, 0) when embed.db does not yet
     /// exist (first run before any reindex completes).
@@ -1924,9 +1929,19 @@ impl SqliteStore {
         // #391: must match travsr-embed sidecar's NODE_ELIGIBLE predicate exactly —
         // a node is embeddable if it's a normal symbol kind OR the daemon opted it
         // in via embed_text (admits data-format file nodes: yaml/toml/json/xml).
-        // If this drifts from the sidecar, `embedded` (which counts every row in
-        // node_embeddings) can exceed `total_symbols`, showing >100% progress and
-        // suppressing the auto-reindex trigger for pending file nodes.
+        //
+        // #862: all four counts apply this predicate, `embedded` included. A
+        // vector's presence is not evidence that its node is embeddable *now*:
+        // eligibility is a property of the node's current row, and it moves.
+        // `clear_all_embed_texts` on a model switch drops every `embed_text`
+        // and the regeneration at the new tier does not necessarily restore it,
+        // so a `field` node embedded while it had text becomes ineligible while
+        // its vector stays. Counting that vector made `embedded` exceed
+        // `total_symbols` (10,009 / 9,996 in the report) and, through the
+        // daemon's `phase2_remaining` arithmetic, masked exactly that many
+        // genuinely pending nodes. The vectors themselves are left alone: they
+        // are valid data for the sidecar's own use, they are simply not
+        // progress against the denominator they were being compared to.
         //
         // #376 W1: the trailing clause mirrors the sidecar's exclusion of
         // doc-chunks with no prose. Without it those nodes count as pending
@@ -1989,10 +2004,18 @@ impl SqliteStore {
                         .execute_batch(&format!("ATTACH DATABASE '{embed_path_str}' AS edb"))
                         .context("attaching embed.db")?;
                     let _guard = EdbGuard(&self.conn); // DETACH on any early return
+                                                       // #862: same join and predicate as `phase1_done` below, minus
+                                                       // the shell clause. The join also drops an orphan row whose
+                                                       // node is gone: embed.db is a separate file, so the schema's
+                                                       // `ON DELETE CASCADE` cannot reach across to it.
                     let embedded: i64 = self
                         .conn
                         .query_row(
-                            "SELECT COUNT(*) FROM edb.node_embeddings WHERE model_id = ?1",
+                            &format!(
+                                "SELECT COUNT(*) FROM edb.node_embeddings ne \
+                                 JOIN nodes n ON ne.node_id = n.id \
+                                 WHERE ne.model_id = ?1 AND {KIND_FILTER_N}"
+                            ),
                             rusqlite::params![model_id],
                             |r| r.get(0),
                         )
@@ -9930,6 +9953,463 @@ mod tests {
             total, 2,
             "embeddable = {{doc-chunk with prose, function}}, not the prose-less chunk"
         );
+    }
+
+    // ── #862: `embedded` is over embeddable nodes, like the other three ────────
+    //
+    // File-backed stores throughout, because `open_in_memory` has no sibling
+    // `embed.db` and `embed_progress` reads `embedded` from there. The embed.db
+    // is written with the sidecar's own DDL (`travsr-embed::freshness::
+    // ensure_schema`), rows and all, so what these tests count is what the
+    // daemon and `travsr embed status` count in the field.
+
+    const M: &str = "arctic-embed-m-v1.5";
+
+    fn node_kind(kind: &str, sig: &str) -> Node {
+        Node::new(
+            VName::new("test-corpus", "main", "src/foo.ts", "typescript", sig),
+            kind,
+        )
+    }
+
+    /// Create `<dir>/embed.db` as the sidecar does and insert one vector per
+    /// `(node_id, model_id)`. `node_id` is raw so a test can point a row at a
+    /// node that does not exist.
+    fn seed_embed_db(dir: &std::path::Path, rows: &[(i64, &str)]) -> std::path::PathBuf {
+        let path = dir.join("embed.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS node_embeddings (
+                 node_id   INTEGER NOT NULL,
+                 model_id  TEXT    NOT NULL,
+                 embedding BLOB    NOT NULL,
+                 text_hash TEXT,
+                 PRIMARY KEY (node_id, model_id)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS idx_node_embeddings_model
+                 ON node_embeddings(model_id);",
+        )
+        .unwrap();
+        for (node_id, model_id) in rows {
+            conn.execute(
+                "INSERT OR REPLACE INTO node_embeddings (node_id, model_id, embedding, text_hash) \
+                 VALUES (?1, ?2, X'00', 'h')",
+                params![node_id, model_id],
+            )
+            .unwrap();
+        }
+        path
+    }
+
+    fn raw_vector_count(embed_db: &std::path::Path, model_id: &str) -> i64 {
+        Connection::open(embed_db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+                params![model_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn ids(nodes: &[Node]) -> Vec<i64> {
+        nodes.iter().map(|n| node_id_to_i64(n.id)).collect()
+    }
+
+    /// `n` eligible function nodes, written to the store.
+    fn put_functions(store: &mut SqliteStore, n: usize) -> Vec<Node> {
+        (0..n)
+            .map(|i| {
+                let node = node_kind("function", &format!("fn:f{i}"));
+                store.put_node(&node).unwrap();
+                node
+            })
+            .collect()
+    }
+
+    /// The daemon's Phase 2 arithmetic (`crates/travsr-daemon`, `phase2_remaining`),
+    /// replicated so the store tests can state what the tick would conclude.
+    fn daemon_phase2_remaining(p: (u64, u64, u64, u64)) -> u64 {
+        let (total, embedded, p1_total, p1_done) = p;
+        total
+            .saturating_sub(p1_total)
+            .saturating_sub(embedded.saturating_sub(p1_done))
+    }
+
+    /// Positive 1: every eligible node has a vector, and nothing else does.
+    #[test]
+    fn embed_progress_is_complete_when_every_eligible_node_has_a_vector() {
+        let (mut store, dir) = file_backed_store();
+        let nodes = put_functions(&mut store, 12);
+        let rows: Vec<(i64, &str)> = ids(&nodes).into_iter().map(|id| (id, M)).collect();
+        seed_embed_db(dir.path(), &rows);
+
+        let p = store.embed_progress(M, 1000).unwrap();
+        assert_eq!(p, (12, 12, 0, 0));
+        assert_eq!(daemon_phase2_remaining(p), 0, "nothing left to embed");
+    }
+
+    /// Positive 2: 100 eligible, 75 embedded. The 25 missing vectors are the
+    /// pending work, and Phase 2 must see exactly them.
+    #[test]
+    fn embed_progress_reports_missing_eligible_vectors_as_pending() {
+        let (mut store, dir) = file_backed_store();
+        let nodes = put_functions(&mut store, 100);
+        let rows: Vec<(i64, &str)> = ids(&nodes[..75]).into_iter().map(|id| (id, M)).collect();
+        seed_embed_db(dir.path(), &rows);
+
+        let p = store.embed_progress(M, 1000).unwrap();
+        assert_eq!(p, (100, 75, 0, 0));
+        assert_eq!(daemon_phase2_remaining(p), 25);
+    }
+
+    /// Positive 3, the core #862 regression: one ineligible node with a vector
+    /// must not lift `embedded` above the eligible count.
+    #[test]
+    fn embed_progress_does_not_count_a_vector_on_an_ineligible_node() {
+        let (mut store, dir) = file_backed_store();
+        let eligible = put_functions(&mut store, 10);
+        let field = node_kind("field", "field:Foo.bar");
+        store.put_node(&field).unwrap();
+        let mut rows: Vec<(i64, &str)> = ids(&eligible).into_iter().map(|id| (id, M)).collect();
+        rows.push((node_id_to_i64(field.id), M));
+        let embed_db = seed_embed_db(dir.path(), &rows);
+        assert_eq!(
+            raw_vector_count(&embed_db, M),
+            11,
+            "precondition: the unfiltered count is the inflated 11"
+        );
+
+        let (total, embedded, _, _) = store.embed_progress(M, 1000).unwrap();
+        assert_eq!(total, 10);
+        assert_eq!(embedded, 10, "not 11: the field node is not embeddable");
+        assert!(embedded <= total);
+        assert_eq!(
+            raw_vector_count(&embed_db, M),
+            11,
+            "the ineligible node's vector is left in place, only not counted"
+        );
+    }
+
+    /// Positive 4: many ineligible vectors, none of them count.
+    #[test]
+    fn embed_progress_ignores_every_ineligible_vector() {
+        let (mut store, dir) = file_backed_store();
+        let eligible = put_functions(&mut store, 5);
+        let mut rows: Vec<(i64, &str)> = ids(&eligible).into_iter().map(|id| (id, M)).collect();
+        for i in 0..40 {
+            let n = node_kind("field", &format!("field:T.f{i}"));
+            store.put_node(&n).unwrap();
+            rows.push((node_id_to_i64(n.id), M));
+        }
+        let embed_db = seed_embed_db(dir.path(), &rows);
+        assert_eq!(raw_vector_count(&embed_db, M), 45, "precondition");
+
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (5, 5, 0, 0));
+    }
+
+    /// Positive 5: the realistic mixture. Only eligible nodes that have a vector
+    /// count towards `embedded`; only eligible nodes count towards `total`.
+    #[test]
+    fn embed_progress_counts_only_eligible_nodes_with_vectors_in_a_mixed_graph() {
+        let (mut store, dir) = file_backed_store();
+        let eligible_embedded = put_functions(&mut store, 30);
+        let eligible_pending: Vec<Node> = (0..20)
+            .map(|i| {
+                let n = node_kind("method", &format!("method:C.m{i}"));
+                store.put_node(&n).unwrap();
+                n
+            })
+            .collect();
+        let mut rows: Vec<(i64, &str)> = ids(&eligible_embedded)
+            .into_iter()
+            .map(|id| (id, M))
+            .collect();
+        for i in 0..7 {
+            let n = node_kind("variable", &format!("var:v{i}"));
+            store.put_node(&n).unwrap();
+            rows.push((node_id_to_i64(n.id), M)); // ineligible + embedded
+        }
+        for i in 0..9 {
+            let n = node_kind("import", &format!("import:./i{i}"));
+            store.put_node(&n).unwrap(); // ineligible + not embedded
+        }
+        seed_embed_db(dir.path(), &rows);
+
+        let p = store.embed_progress(M, 1000).unwrap();
+        assert_eq!(
+            p,
+            (50, 30, 0, 0),
+            "total = 30 embedded + 20 pending functions and methods; embedded = 30"
+        );
+        assert_eq!(daemon_phase2_remaining(p), eligible_pending.len() as u64);
+    }
+
+    /// Positive 6: vectors for another model are not this model's progress.
+    #[test]
+    fn embed_progress_is_scoped_to_the_requested_model() {
+        let (mut store, dir) = file_backed_store();
+        let nodes = put_functions(&mut store, 10);
+        let all = ids(&nodes);
+        let mut rows: Vec<(i64, &str)> = all[..4].iter().map(|&id| (id, M)).collect();
+        rows.extend(all.iter().map(|&id| (id, "bge-large-en-v1.5")));
+        seed_embed_db(dir.path(), &rows);
+
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (10, 4, 0, 0));
+        assert_eq!(
+            store.embed_progress("bge-large-en-v1.5", 1000).unwrap(),
+            (10, 10, 0, 0)
+        );
+        assert_eq!(
+            store.embed_progress("never-installed", 1000).unwrap(),
+            (10, 0, 0, 0)
+        );
+    }
+
+    /// Positive 7: eligible nodes, no vectors at all: everything is pending.
+    #[test]
+    fn embed_progress_reports_zero_embedded_when_nothing_is_embedded_yet() {
+        let (mut store, dir) = file_backed_store();
+        put_functions(&mut store, 8);
+        // embed.db exists (the sidecar created the schema) but holds no rows.
+        seed_embed_db(dir.path(), &[]);
+
+        let p = store.embed_progress(M, 1000).unwrap();
+        assert_eq!(p, (8, 0, 0, 0));
+        assert_eq!(daemon_phase2_remaining(p), 8);
+    }
+
+    /// Positive 8: an empty index, with and without an embed.db, and with an
+    /// embed.db that only holds rows for nodes that do not exist.
+    #[test]
+    fn embed_progress_on_an_empty_index_is_all_zero() {
+        let (store, dir) = file_backed_store();
+        assert_eq!(
+            store.embed_progress(M, 3).unwrap(),
+            (0, 0, 0, 0),
+            "no embed.db"
+        );
+
+        seed_embed_db(dir.path(), &[]);
+        assert_eq!(
+            store.embed_progress(M, 3).unwrap(),
+            (0, 0, 0, 0),
+            "empty embed.db"
+        );
+
+        seed_embed_db(dir.path(), &[(1, M), (2, M), (3, M)]);
+        assert_eq!(
+            store.embed_progress(M, 3).unwrap(),
+            (0, 0, 0, 0),
+            "vectors with no nodes are not progress on an empty graph"
+        );
+    }
+
+    /// Negative 9: an orphan row (its node was deleted; embed.db is a separate
+    /// file, so no cascade reaches it) does not count and is not deleted.
+    #[test]
+    fn embed_progress_excludes_an_orphan_vector_without_deleting_it() {
+        let (mut store, dir) = file_backed_store();
+        let nodes = put_functions(&mut store, 3);
+        let mut rows: Vec<(i64, &str)> = ids(&nodes).into_iter().map(|id| (id, M)).collect();
+        rows.push((987_654_321, M)); // no such node
+        let embed_db = seed_embed_db(dir.path(), &rows);
+
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (3, 3, 0, 0));
+        assert_eq!(
+            raw_vector_count(&embed_db, M),
+            4,
+            "the orphan is still there: progress reporting is read-only"
+        );
+
+        // The realistic route to an orphan: the node's file is deleted.
+        store.delete_nodes_for_path("src/foo.ts").unwrap();
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (0, 0, 0, 0));
+        assert_eq!(raw_vector_count(&embed_db, M), 4);
+    }
+
+    /// Negative 10: the exact #862 row. `kind = 'field'`, `embed_text IS NULL`,
+    /// vector present: excluded. The same kind *with* text is opted in by the
+    /// daemon and counts, which is what shows the predicate decides, not the kind.
+    #[test]
+    fn embed_progress_excludes_a_field_whose_embed_text_is_null_but_counts_one_with_text() {
+        let (mut store, dir) = file_backed_store();
+        let without_text = node_kind("field", "field:Config.timeout");
+        let with_text = node_kind("field", "field:Config.retries");
+        store.put_node(&without_text).unwrap();
+        store.put_node(&with_text).unwrap();
+        store
+            .write_embed_texts_batch(&[(with_text.id, "field retries: u32".to_string())])
+            .unwrap();
+        seed_embed_db(
+            dir.path(),
+            &[
+                (node_id_to_i64(without_text.id), M),
+                (node_id_to_i64(with_text.id), M),
+            ],
+        );
+
+        assert_eq!(
+            store.embed_progress(M, 1000).unwrap(),
+            (1, 1, 0, 0),
+            "one embeddable field (it has text), one vector that counts"
+        );
+
+        // The model-switch path that produced the report: every text is cleared
+        // and the regeneration never restores this one. The vector stays, the
+        // node is no longer embeddable, and the count must follow the node.
+        store.clear_all_embed_texts().unwrap();
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (0, 0, 0, 0));
+    }
+
+    /// Negative 11: every kind the predicate excludes, each with a vector, plus a
+    /// prose-less doc-chunk. One eligible node beside them so the counts are 1/1.
+    #[test]
+    fn embed_progress_excludes_each_ineligible_kind_even_with_a_vector() {
+        let (mut store, dir) = file_backed_store();
+        let ok = node_kind("function", "fn:ok");
+        store.put_node(&ok).unwrap();
+        let mut rows = vec![(node_id_to_i64(ok.id), M)];
+        for kind in [
+            "file",
+            "file-module",
+            "import",
+            "module",
+            "field",
+            "variable",
+        ] {
+            let n = node_kind(kind, &format!("{kind}:x"));
+            store.put_node(&n).unwrap();
+            rows.push((node_id_to_i64(n.id), M));
+        }
+        let chunk = doc_chunk("docs/a.md", "doc:intro"); // no prose
+        store.put_node(&chunk).unwrap();
+        rows.push((node_id_to_i64(chunk.id), M));
+        let embed_db = seed_embed_db(dir.path(), &rows);
+        assert_eq!(raw_vector_count(&embed_db, M), 8, "precondition");
+
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (1, 1, 0, 0));
+    }
+
+    /// Negative 12: one node, vectors for several models. Only the requested
+    /// model's row counts, and it counts once.
+    #[test]
+    fn embed_progress_counts_a_node_once_per_requested_model() {
+        let (mut store, dir) = file_backed_store();
+        let n = node_kind("function", "fn:one");
+        store.put_node(&n).unwrap();
+        let id = node_id_to_i64(n.id);
+        seed_embed_db(
+            dir.path(),
+            &[(id, M), (id, "bge-small-en-v1.5"), (id, "third")],
+        );
+
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (1, 1, 0, 0));
+        assert_eq!(store.embed_progress("third", 1000).unwrap(), (1, 1, 0, 0));
+        assert_eq!(store.embed_progress("fourth", 1000).unwrap(), (1, 0, 0, 0));
+    }
+
+    /// Negative 13: repeated calls are deterministic and change nothing, in
+    /// either database. The ATTACH/DETACH cycle must also survive being repeated.
+    #[test]
+    fn embed_progress_is_deterministic_and_read_only_across_repeated_calls() {
+        let (mut store, dir) = file_backed_store();
+        let eligible = put_functions(&mut store, 6);
+        let field = node_kind("field", "field:T.f");
+        store.put_node(&field).unwrap();
+        let mut rows: Vec<(i64, &str)> =
+            ids(&eligible[..4]).into_iter().map(|id| (id, M)).collect();
+        rows.push((node_id_to_i64(field.id), M));
+        rows.push((42, M)); // orphan
+        let embed_db = seed_embed_db(dir.path(), &rows);
+        let nodes_before = store.node_count().unwrap();
+        let vectors_before = raw_vector_count(&embed_db, M);
+
+        let first = store.embed_progress(M, 1000).unwrap();
+        assert_eq!(first, (6, 4, 0, 0));
+        for _ in 0..5 {
+            assert_eq!(store.embed_progress(M, 1000).unwrap(), first);
+        }
+        assert_eq!(store.node_count().unwrap(), nodes_before);
+        assert_eq!(raw_vector_count(&embed_db, M), vectors_before);
+    }
+
+    /// Negative 14: Phase 1 partially done, with ineligible vectors present.
+    /// `phase1_done` was already filtered; the fix must leave it alone and make
+    /// `embedded` agree with it, so the derived Phase 2 figure is the truth.
+    #[test]
+    fn embed_progress_with_partial_phase1_is_not_skewed_by_ineligible_vectors() {
+        let (mut store, dir) = file_backed_store();
+        let core = put_functions(&mut store, 20);
+        let rest: Vec<Node> = (0..80)
+            .map(|i| {
+                let n = node_kind("method", &format!("method:R.m{i}"));
+                store.put_node(&n).unwrap();
+                n
+            })
+            .collect();
+        let mut shells: Vec<(NodeId, u32)> = core.iter().map(|n| (n.id, 5)).collect();
+        shells.extend(rest.iter().map(|n| (n.id, 0)));
+        store.write_shell_numbers(&shells).unwrap();
+        // Half the core is embedded, none of the rest, plus five ineligible vectors.
+        let mut rows: Vec<(i64, &str)> = ids(&core[..10]).into_iter().map(|id| (id, M)).collect();
+        for i in 0..5 {
+            let n = node_kind("variable", &format!("var:v{i}"));
+            store.put_node(&n).unwrap();
+            rows.push((node_id_to_i64(n.id), M));
+        }
+        seed_embed_db(dir.path(), &rows);
+
+        let p = store.embed_progress(M, 5).unwrap();
+        assert_eq!(p, (100, 10, 20, 10));
+        let (total, embedded, p1_total, p1_done) = p;
+        assert!(p1_done < p1_total, "Phase 1 is genuinely incomplete");
+        assert!(p1_done <= p1_total);
+        assert!(embedded <= total);
+        assert_eq!(
+            daemon_phase2_remaining(p),
+            80,
+            "all 80 Phase 2 nodes are pending; with the unfiltered 15 this read 75"
+        );
+    }
+
+    /// The invariant the report states, over a graph that has every shape at
+    /// once: eligible embedded, eligible pending, ineligible embedded, ineligible
+    /// pending, an orphan vector, and another model's vectors.
+    #[test]
+    fn embed_progress_embedded_never_exceeds_total_symbols() {
+        let (mut store, dir) = file_backed_store();
+        let eligible = put_functions(&mut store, 9);
+        let mut rows: Vec<(i64, &str)> =
+            ids(&eligible[..6]).into_iter().map(|id| (id, M)).collect();
+        for kind in [
+            "field",
+            "variable",
+            "module",
+            "import",
+            "file",
+            "file-module",
+        ] {
+            for i in 0..3 {
+                let n = node_kind(kind, &format!("{kind}:{i}"));
+                store.put_node(&n).unwrap();
+                if i < 2 {
+                    rows.push((node_id_to_i64(n.id), M));
+                }
+            }
+        }
+        rows.push((7_777, M));
+        rows.extend(ids(&eligible).into_iter().map(|id| (id, "other-model")));
+        let embed_db = seed_embed_db(dir.path(), &rows);
+        assert!(
+            raw_vector_count(&embed_db, M) > 9,
+            "precondition: unfiltered, this model has more vectors than eligible nodes"
+        );
+
+        let (total, embedded, p1_total, p1_done) = store.embed_progress(M, 1000).unwrap();
+        assert_eq!((total, embedded), (9, 6));
+        assert!(embedded <= total);
+        assert!(p1_done <= p1_total);
     }
 
     /// #376 W2: the count the daemon's embed tick uses to notice that content
