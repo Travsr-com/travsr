@@ -4187,6 +4187,7 @@ dependencies = [
  "fs2",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tempfile",
  "tracing",
  "travsr-core",

@@ -80,7 +80,37 @@ fn phase_b_state(payload: &StatusPayload) -> String {
     match payload.phase_b_commit.as_deref() {
         Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => {
             if payload.phase_b_dirty {
-                "stale (run travsr init --semantic to refresh)".to_string()
+                // A mid-edit reindex dropped the changed region's committed
+                // edges. Whether that is a real degradation depends on the live
+                // overlay, in three cases:
+                //   - live lane inactive (no ref_resolution rows at all: a
+                //     headless daemon with no editor, or a generic-detector
+                //     language with no lexical floor): nothing recovered the
+                //     edit, so it is genuinely stale until a refresh.
+                //   - active with references still pending: name how many are
+                //     unknown until commit.
+                //   - active with nothing pending: the overlay resolved every
+                //     reference it detected, so "stale, re-run init" would be
+                //     wrong advice.
+                // The counts are repo-wide and phase_b_dirty is a single flag,
+                // so this last case cannot prove every dropped edge came back:
+                // an editor-resolved file and a headless generic-language edit
+                // (which leaves no rows at all) both feed one flag, and the
+                // resolved rows may belong only to the first. So it reports the
+                // recovery it can see without claiming a full refresh, which the
+                // commit-gated path is what actually delivers.
+                let live_active = payload.live_refs_resolved > 0 || payload.live_refs_pending > 0;
+                if !live_active {
+                    "stale (run travsr init --semantic to refresh)".to_string()
+                } else if payload.live_refs_pending > 0 {
+                    format!(
+                        "{} reference(s) in uncommitted edits not yet resolved",
+                        payload.live_refs_pending
+                    )
+                } else {
+                    "uncommitted edits resolved where detected; commit for a full refresh"
+                        .to_string()
+                }
             } else {
                 // #712: the marker now advances even when a language crashed, so
                 // the healthy languages are complete and queryable at HEAD. Name
@@ -543,6 +573,8 @@ mod tests {
             rust_lsif_degraded: None,
             rerank: String::new(),
             phase_b_dirty: dirty,
+            live_refs_resolved: 0,
+            live_refs_pending: 0,
             dart_deps_unresolved: None,
         }
     }
@@ -559,6 +591,48 @@ mod tests {
         assert_eq!(
             phase_b_state(&payload("abc", "abc", true)),
             "stale (run travsr init --semantic to refresh)"
+        );
+    }
+
+    #[test]
+    fn phase_b_reports_recovery_without_claiming_a_full_refresh() {
+        // The live lane resolved its references with nothing pending, so the
+        // dirty marker must not read as "stale, re-run init". But the counts are
+        // repo-wide, so this cannot prove a separate headless edit (which leaves
+        // no rows) also came back: the message reports the recovery it can see
+        // and names the commit as the full refresh, never a bare "up to date".
+        let mut p = payload("abc", "abc", true);
+        p.live_refs_resolved = 12;
+        p.live_refs_pending = 0;
+        assert_eq!(
+            phase_b_state(&p),
+            "uncommitted edits resolved where detected; commit for a full refresh"
+        );
+    }
+
+    #[test]
+    fn phase_b_names_pending_references_instead_of_a_blanket_stale() {
+        // Live lane active with some references still unresolved; report how many
+        // are unknown until commit rather than a flat "stale".
+        let mut p = payload("abc", "abc", true);
+        p.live_refs_resolved = 5;
+        p.live_refs_pending = 3;
+        assert_eq!(
+            phase_b_state(&p),
+            "3 reference(s) in uncommitted edits not yet resolved"
+        );
+    }
+
+    #[test]
+    fn phase_b_names_pending_even_when_nothing_resolved_yet() {
+        // The lane ran (rows exist) but settled nothing so far: still "active
+        // with pending", not the inactive "stale", so the count is honest.
+        let mut p = payload("abc", "abc", true);
+        p.live_refs_resolved = 0;
+        p.live_refs_pending = 4;
+        assert_eq!(
+            phase_b_state(&p),
+            "4 reference(s) in uncommitted edits not yet resolved"
         );
     }
 

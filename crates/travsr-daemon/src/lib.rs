@@ -21,7 +21,7 @@ use ignore::WalkBuilder;
 use travsr_analysis::skeleton::{embed_texts_for_file, EmbedRichness};
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
-    hash_file, ingest_lsif, link_imports, link_imports_go, link_imports_python_fs,
+    hash_bytes, ingest_lsif, link_imports, link_imports_go, link_imports_python_fs,
     link_imports_rust, run_lsif_emitter, FfiMarker,
 };
 use travsr_plugin_host::PluginIndexer;
@@ -294,15 +294,17 @@ fn index_paths_parallel(
                         .to_string_lossy()
                         .replace('\\', "/");
 
-                    // Hash-delta skip — same as reindex_files.
-                    let new_hash = match hash_file(abs_path) {
-                        Ok(h) => h,
+                    // Read once; the bytes feed the hash-delta skip below and, for
+                    // a changed file, the source handed to the write path so the
+                    // body hash is stamped from the same content (RFC-027 #813).
+                    let bytes = match std::fs::read(abs_path) {
+                        Ok(b) => b,
                         Err(e) => {
-                            tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %e, "hash failed, skipping");
+                            tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %e, "read failed, skipping");
                             continue;
                         }
                     };
-                    let new_hex = hex_encode(&new_hash);
+                    let new_hex = hex_encode(&hash_bytes(&bytes));
                     if stored.get(&vname_path).map(String::as_str) == Some(&new_hex) {
                         let _ = tx.send(Ok(ParseResult {
                             file_graph: FileGraph {
@@ -310,6 +312,8 @@ fn index_paths_parallel(
                                 new_hash: new_hex,
                                 nodes: vec![],
                                 edges: vec![],
+                                // Unchanged file: no nodes to stamp.
+                                source: None,
                             },
                             ffi_markers: vec![],
                             workspace_dep_markers: vec![],
@@ -358,12 +362,20 @@ fn index_paths_parallel(
                     let mut edges = out.edges;
                     edges.extend(import_edges);
 
+                    // RFC-027 #813: carry the source so the write path can stamp
+                    // each definition's body hash from the same content these
+                    // nodes were parsed from, reusing the bytes read above.
+                    // Non-UTF-8 reads as None, leaving the hashes NULL
+                    // (preservation simply forgone).
+                    let source = String::from_utf8(bytes).ok();
+
                     let _ = tx.send(Ok(ParseResult {
                         file_graph: FileGraph {
                             vname_path,
                             new_hash: new_hex,
                             nodes: out.nodes,
                             edges,
+                            source,
                         },
                         ffi_markers: out.ffi_markers,
                         workspace_dep_markers: out.workspace_dep_markers,
@@ -2227,10 +2239,7 @@ fn resolve_unresolved_calls(
     // to them, per callee — not per line, so a second real call sharing the
     // line with an LSIF-covered one is not also dropped (#I2).
     lsif_covered: &std::collections::HashSet<(String, u32, String)>,
-) -> (
-    Vec<travsr_core::Edge>,
-    Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
-) {
+) -> (Vec<travsr_core::Edge>, Vec<SiteRow>) {
     if unresolved.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -2453,7 +2462,7 @@ fn resolve_unresolved_calls(
         .collect();
 
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
-    let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
+    let mut sites: Vec<SiteRow> = Vec::new();
     for u in unresolved {
         // #757: field-access reference (`x.foo`). Handled ahead of the call
         // paths below because it is not a call: it resolves to the exact Phase A
@@ -2495,7 +2504,7 @@ fn resolve_unresolved_calls(
                     *dst,
                     travsr_core::EdgeKind::RefField,
                 ));
-                sites.push((u.src, *dst, u.caller_line));
+                sites.push((u.src, *dst, u.caller_line, u.caller_col));
             }
             continue;
         }
@@ -2697,14 +2706,14 @@ fn resolve_unresolved_calls(
                 // #299: record the call-site occurrence. `u.src` is the caller
                 // function node (same file as the call), so nodes.path[src] is the
                 // occurrence file — exactly what reference_sites returns.
-                sites.push((u.src, dst, u.caller_line));
+                sites.push((u.src, dst, u.caller_line, u.caller_col));
             }
         }
     }
 
     edges.sort_unstable_by_key(|e| (e.src.0, e.dst.0));
     edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst);
-    sites.sort_unstable_by_key(|(s, d, l)| (s.0, d.0, *l));
+    sites.sort_unstable_by_key(|(s, d, l, _)| (s.0, d.0, *l));
     sites.dedup();
     (edges, sites)
 }
@@ -3106,8 +3115,11 @@ fn write_phase_b_results(
     (report, alias_map, dropped)
 }
 
-/// A resolved occurrence row: `(src caller node, dst target node, 1-based line)`.
-type SiteRow = (travsr_core::NodeId, travsr_core::NodeId, u32);
+/// A resolved occurrence row: `(src caller node, dst target node, 1-based line,
+/// 0-based UTF-8 byte column of the reference on that line)`. RFC-027 #813 P2:
+/// `col` is `None` for a call the extractor emitted without a position, in which
+/// case the editor lane name-searches the line as before.
+type SiteRow = (travsr_core::NodeId, travsr_core::NodeId, u32, Option<u32>);
 
 /// #757: split resolved occurrence sites into call sites (`ref/call`) and
 /// field-access sites (`ref/field`) by matching each site's `(src, dst)` against
@@ -3130,7 +3142,7 @@ fn split_field_sites(
     }
     sites
         .into_iter()
-        .partition(|(s, d, _)| !field_pairs.contains(&(*s, *d)))
+        .partition(|(s, d, _, _)| !field_pairs.contains(&(*s, *d)))
 }
 
 /// #299 F2: remap `resolved_sites.dst` through the unification alias map and
@@ -3147,21 +3159,21 @@ fn split_field_sites(
 /// and dropped) are kept symmetric so no site records against a node the batch
 /// never wrote.
 fn remap_resolved_sites(
-    sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
+    sites: Vec<SiteRow>,
     alias_map: &std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId>,
     dropped: &std::collections::HashSet<travsr_core::NodeId>,
-) -> Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> {
+) -> Vec<SiteRow> {
     if alias_map.is_empty() && dropped.is_empty() {
         return sites;
     }
     sites
         .into_iter()
-        .filter_map(|(src, dst, line)| {
+        .filter_map(|(src, dst, line, col)| {
             if dropped.contains(&dst) {
                 return None;
             }
             let dst = alias_map.get(&dst).copied().unwrap_or(dst);
-            (src != dst).then_some((src, dst, line))
+            (src != dst).then_some((src, dst, line, col))
         })
         .collect()
 }
@@ -3953,12 +3965,23 @@ fn record_generic_pendings(
     }
 }
 
-fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, abs_path: &Path) {
+fn live_resolve_file(
+    store: &mut SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+    // RFC-027 #813 (finding 2): when `Some`, the changed-definition set this save
+    // must re-resolve. References whose enclosing definition is preserved
+    // (byte-identical, committed edges intact) are dropped, so the lexical lane
+    // neither re-records them as `pending` nor rewrites their committed state.
+    // `None` re-resolves the whole file (a whole-file re-derive, or a dependent).
+    scope: Option<&std::collections::HashSet<travsr_core::NodeId>>,
+) {
     let Some((vname_path, refs)) = extract_live_unresolved(store, corpus, repo_root, abs_path)
     else {
         return;
     };
-    let (unresolved, inheritance, locally_bound) = match refs {
+    let (mut unresolved, mut inheritance, locally_bound) = match refs {
         LiveRefSet::Native {
             unresolved,
             inheritance,
@@ -3973,10 +3996,31 @@ fn live_resolve_file(store: &mut SqliteStore, corpus: &str, repo_root: &Path, ab
         // rows describing the pre-edit text, which `reindex_replace` leaves
         // alone.
         LiveRefSet::Generic(detected) => {
+            // Generic-detector languages have no native Phase B, so a preserved
+            // definition of theirs carries no committed edges to make its
+            // references falsely `pending`; every detected reference is genuinely
+            // pending until the editor answers it. So the generic pending record
+            // is left unscoped (the editor still resolves the whole file).
             record_generic_pendings(store, corpus, &vname_path, &detected);
             return;
         }
     };
+    // RFC-027 #813 (finding 2): drop references inside preserved definitions.
+    // A preserved definition's committed (scip/lsif) edges already resolve its
+    // references, so re-resolving them here would only overwrite that committed
+    // state with a fresh `pending`/`resolved` live row and inflate the freshness
+    // count. `call.src` is the enclosing definition; an inheritance clause's is
+    // resolved from its line the same way the resolver does below.
+    if let Some(scope) = scope {
+        unresolved.retain(|c| scope.contains(&c.src));
+        inheritance.retain(|r| {
+            store
+                .enclosing_definition_at(corpus, &vname_path, r.line)
+                .ok()
+                .flatten()
+                .is_some_and(|id| scope.contains(&id))
+        });
+    }
     let outcome = live_resolve::resolve_unambiguous_lexical(
         store,
         corpus,
@@ -4009,19 +4053,58 @@ fn live_resolution_targets(
     corpus: &str,
     repo_root: &Path,
     abs_path: &Path,
+    // RFC-027 #813 P2: the changed-definition committed occurrences stashed for
+    // this file at its last save, enumerated as extra editor targets. Empty for
+    // a request with no fresh save (or from a test with no editor plane).
+    stashed: &[travsr_core::ChangedOccurrence],
+    // RFC-027 #813 (finding 2): when `Some`, the changed-definition set of the
+    // save this request follows. Native targets for preserved definitions are a
+    // no-op for the committed graph (`put_edge_live` only touches `live` rows)
+    // and, unscoped, would crowd the enumerated occurrences out of the editor's
+    // per-save budget on a large file, so they are dropped here the same way the
+    // save-path lexical lane drops them. `None` keeps the whole-file behavior (a
+    // request with no fresh scoped save, a dependent, or a test).
+    scope: Option<&std::collections::HashSet<travsr_core::NodeId>>,
 ) -> Vec<travsr_ipc::message::LiveResolutionTarget> {
     let Some((vname_path, refs)) = extract_live_unresolved(store, corpus, repo_root, abs_path)
     else {
-        return Vec::new();
+        // Even with no native/generic references, a stashed occurrence set can
+        // still hold editor targets, so fall through to the merge rather than
+        // returning early when there is something to enumerate.
+        if stashed.is_empty() {
+            return Vec::new();
+        }
+        let content = std::fs::read_to_string(abs_path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().collect();
+        return live_resolve::merge_changed_occurrence_targets(store, &lines, Vec::new(), stashed);
     };
-    match refs {
+    // The file text pins each target's exact column (RFC-027 #813 P1/P2). Read
+    // and split into lines once here, then share the slice: the native builder
+    // uses the extractor's occurrence column, `fill_target_columns` fills the
+    // rest by name search, and the merge maps stashed occurrences by line.
+    let content = std::fs::read_to_string(abs_path).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut targets = match refs {
         LiveRefSet::Native {
-            unresolved,
-            inheritance,
+            mut unresolved,
+            mut inheritance,
             locally_bound,
         } => {
+            // RFC-027 #813 (finding 2): scope the native targets to the changed
+            // region, mirroring `live_resolve_file`. A reference whose enclosing
+            // definition was preserved needs no editor round trip.
+            if let Some(scope) = scope {
+                unresolved.retain(|c| scope.contains(&c.src));
+                inheritance.retain(|r| {
+                    store
+                        .enclosing_definition_at(corpus, &vname_path, r.line)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|id| scope.contains(&id))
+                });
+            }
             let mut targets =
-                live_resolve::targets_needing_editor(store, &unresolved, &locally_bound);
+                live_resolve::targets_needing_editor(store, &lines, &unresolved, &locally_bound);
             targets.extend(live_resolve::inheritance_targets_needing_editor(
                 store,
                 corpus,
@@ -4035,7 +4118,14 @@ fn live_resolution_targets(
         // there is no lane to partition against and every detected reference is
         // an editor target.
         LiveRefSet::Generic(refs) => live_resolve::generic_targets_needing_editor(&refs),
-    }
+    };
+    // RFC-027 #813 P1: pin each remaining target's column against the file text
+    // (the ones the extractor left without an exact occurrence column) so the
+    // editor resolves at the exact position instead of searching the line.
+    live_resolve::fill_target_columns(&lines, &mut targets);
+    // RFC-027 #813 P2: enumerate the changed definitions' committed occurrences
+    // as editor targets, deduped against the native lane above.
+    live_resolve::merge_changed_occurrence_targets(store, &lines, targets, stashed)
 }
 
 /// RFC-027 section 8.7.5: the interface-edit closure, as editor targets.
@@ -4063,6 +4153,10 @@ fn dependent_resolution_targets(
     corpus: &str,
     repo_root: &Path,
     abs_path: &Path,
+    // RFC-027 #813 P2: the editor plane, so each dependent file's own stashed
+    // changed occurrences are enumerated alongside its native targets. `None`
+    // from a test with no plane.
+    sessions: Option<&std::sync::Mutex<EditorPlane>>,
 ) -> Vec<travsr_ipc::message::DependentTargets> {
     // Only a live-lane file the gate has not disabled can have dependents worth
     // restoring; a disabled or unsupported language costs nothing here.
@@ -4083,7 +4177,16 @@ fn dependent_resolution_targets(
     let mut out = Vec::new();
     for dep in dependents {
         let dep_abs = repo_root.join(&dep);
-        let targets = live_resolution_targets(store, corpus, repo_root, &dep_abs);
+        let stashed = sessions
+            .map(|s| {
+                s.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .stashed_changed_occurrences(&dep)
+            })
+            .unwrap_or_default();
+        // Dependents were not reindexed by this save, so there is no fresh
+        // changed-def scope for them; resolve their whole file (no scope).
+        let targets = live_resolution_targets(store, corpus, repo_root, &dep_abs, &stashed, None);
         // A dependent with nothing for the editor to do (its references all
         // settle lexically, or it holds none) is not worth sending.
         if !targets.is_empty() {
@@ -4837,18 +4940,40 @@ pub fn reconcile_tracked_tree(
     Ok((dirty, paths.len()))
 }
 
-/// Re-index a set of changed files into `store`.
+/// RFC-027 #813 P2: per-file changed-definition committed occurrences, keyed by
+/// repo-relative path, as [`reindex_files_reporting`] returns them for the save
+/// path to stash.
+type ChangedOccurrencesByFile = Vec<(String, Vec<travsr_core::ChangedOccurrence>)>;
+
+/// RFC-027 #813 (finding 2): per-file changed-definition set (the nodes whose
+/// committed edges `reindex_replace` did NOT preserve), keyed by repo-relative
+/// path, so the save-path live lane re-resolves only the changed region and does
+/// not re-record a preserved definition's already-committed references as
+/// `pending`. Empty for a whole-file re-derive, where every node is "changed".
+type ChangedDefsByFile = Vec<(String, std::collections::HashSet<travsr_core::NodeId>)>;
+
+/// Re-index a set of changed files into `store`, also surfacing each file's
+/// changed-definition committed occurrences (RFC-027 #813 P2) for the live
+/// overlay to enumerate as editor targets.
 ///
 /// For each file:
 /// - Compute its SHA-256 hash.
 /// - Skip if the stored hash matches (file unchanged).
 /// - Otherwise: delete its nodes/edges, re-parse, persist new records,
 ///   update the file hash, and record the HEAD commit SHA in `meta`.
-pub fn reindex_files(
+///
+/// Most callers want only the dirty-caller set and use the thin
+/// [`reindex_files`] wrapper; the save path uses this variant to stash the
+/// occurrences for the file the editor is about to request targets for.
+pub fn reindex_files_reporting(
     paths: &[PathBuf],
     repo_root: &Path,
     store: &mut SqliteStore,
-) -> anyhow::Result<travsr_core::DirtySet> {
+) -> anyhow::Result<(
+    travsr_core::DirtySet,
+    ChangedOccurrencesByFile,
+    ChangedDefsByFile,
+)> {
     // Keep `repo_root` current. This path runs on every commit and on every
     // watcher batch, and it already knows the root, so stamping here closes the
     // window where a moved checkout keeps a stale value until someone runs an
@@ -4914,6 +5039,12 @@ pub fn reindex_files(
     let mut any_changed = false;
     // Accumulate Tier-0 dirty callers across all files in this batch.
     let mut callers_all = travsr_core::DirtySet::default();
+    // RFC-027 #813 P2: per-file changed-definition committed occurrences, for the
+    // save path to stash and the live lane to enumerate as editor targets.
+    let mut changed_occ_all: ChangedOccurrencesByFile = Vec::new();
+    // RFC-027 #813 (finding 2): per-file changed-definition set, for the save
+    // path to scope its lexical re-resolution to the changed region.
+    let mut changed_defs_all: ChangedDefsByFile = Vec::new();
     // Paths this batch rewrote, for the end-of-batch orphan sweep below.
     let mut written_paths: Vec<String> = Vec::new();
 
@@ -4935,13 +5066,12 @@ pub fn reindex_files(
             .replace('\\', "/");
 
         // §2 GC keystone: detect deletion before touching the graph.
-        let new_hash = match hash_file(abs_path) {
-            Ok(h) => h,
-            Err(ref err)
-                if err
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-            {
+        // Read the file once; the same bytes feed both the hash and the content
+        // handed to reindex_replace below (RFC-027 #813), so a changed file is
+        // read a single time on this path instead of once per use.
+        let bytes = match std::fs::read(abs_path) {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 // File was deleted — both-direction delete + clear file hash row.
                 match store.delete_file(&corpus, &vname_path) {
                     Ok(callers) => {
@@ -4961,11 +5091,11 @@ pub fn reindex_files(
                 continue;
             }
             Err(err) => {
-                tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %err, "hash failed, skipping");
+                tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %err, "read failed, skipping");
                 continue;
             }
         };
-        let new_hex = hex_encode(&new_hash);
+        let new_hex = hex_encode(&hash_bytes(&bytes));
 
         let old_hex = store.get_file_hash(&vname_path)?;
         if old_hex.as_deref() == Some(&new_hex) {
@@ -5008,7 +5138,22 @@ pub fn reindex_files(
         // §2: owned-edge-only atomic replace — preserves inbound edges to surviving
         // symbols (blank-line/body edits lossless) and eagerly deletes orphans for
         // removed symbols. Hash upsert is inside the same transaction.
-        match store.reindex_replace(&corpus, &vname_path, &out.nodes, &all_edges, &new_hex) {
+        //
+        // RFC-027 #813: hand the current text to the store so a pure body edit
+        // preserves the committed edges of every definition it left untouched
+        // instead of purging and re-deriving the whole file. Reuses the bytes
+        // read above; `None` for a file that is not valid UTF-8 (the store then
+        // falls back to the whole-file purge), which a source file the parser
+        // accepted will not be.
+        let content = String::from_utf8(bytes).ok();
+        match store.reindex_replace(
+            &corpus,
+            &vname_path,
+            &out.nodes,
+            &all_edges,
+            &new_hex,
+            content.as_deref(),
+        ) {
             Ok(report) => {
                 if !report.callers.is_empty() {
                     tracing::debug!(
@@ -5019,6 +5164,20 @@ pub fn reindex_files(
                         report.callers.len()
                     );
                     callers_all.extend(report.callers);
+                }
+                if !report.changed_occurrences.is_empty() {
+                    changed_occ_all.push((vname_path.clone(), report.changed_occurrences));
+                }
+                // RFC-027 #813 (finding 2): the changed region this save must
+                // re-resolve. Recorded only when preservation actually happened
+                // (a smaller set than the whole file); an empty `changed_defs`
+                // means every definition was preserved, so nothing needs
+                // re-resolving and the save path skips the lexical lane for it.
+                if report.preserved_any {
+                    changed_defs_all.push((
+                        vname_path.clone(),
+                        report.changed_defs.iter().copied().collect(),
+                    ));
                 }
                 any_changed = true;
                 written_paths.push(vname_path.clone());
@@ -5170,7 +5329,18 @@ pub fn reindex_files(
         }
     }
 
-    Ok(callers_all)
+    Ok((callers_all, changed_occ_all, changed_defs_all))
+}
+
+/// Phase A reindex of `paths`, returning only the Tier-0 dirty-caller set. The
+/// thin wrapper over [`reindex_files_reporting`] for the callers (commit hook,
+/// bulk refresh, CLI, tests) that do not consume the changed-occurrence stash.
+pub fn reindex_files(
+    paths: &[PathBuf],
+    repo_root: &Path,
+    store: &mut SqliteStore,
+) -> anyhow::Result<travsr_core::DirtySet> {
+    reindex_files_reporting(paths, repo_root, store).map(|(callers, _, _)| callers)
 }
 
 /// Run the LSIF semantic pass if `tsconfig.json` is present at the repo root,
@@ -5377,6 +5547,83 @@ mod tests {
         );
     }
 
+    /// RFC-027 #813 (finding 2): the editor-plane stash carries the save's
+    /// changed-definition scope alongside its occurrences, so the request path
+    /// can scope its native targets. `serve_stash` returns both and restarts the
+    /// TTL; a whole-file re-derive (scope `None`) clears any prior scoped entry so
+    /// a later request cannot scope against a stale set.
+    #[test]
+    fn stash_carries_the_changed_def_scope_and_a_whole_file_save_clears_it() {
+        use travsr_core::NodeId;
+        let mut plane = EditorPlane::default();
+        let occ = vec![travsr_core::ChangedOccurrence {
+            src: NodeId(1),
+            line: 7,
+            col: Some(4),
+            kind: "ref/call".to_string(),
+            name: "run".to_string(),
+        }];
+        let scope: std::collections::HashSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
+        plane.stash_changed_occurrences("a.rs".to_string(), occ.clone(), Some(scope.clone()));
+
+        // Serving returns the occurrences and the scope together.
+        let served = plane
+            .serve_stash("a.rs")
+            .expect("a fresh scoped stash is servable");
+        assert_eq!(served.0, occ, "the stashed occurrences are served");
+        assert_eq!(
+            served.1, scope,
+            "the changed-def scope is served for native scoping"
+        );
+
+        // A whole-file re-derive (scope None) drops the entry, so a request that
+        // arrives after it cannot scope its native targets against a stale set.
+        plane.stash_changed_occurrences("a.rs".to_string(), Vec::new(), None);
+        assert!(
+            plane.serve_stash("a.rs").is_none(),
+            "a whole-file re-derive must clear the prior scoped stash"
+        );
+    }
+
+    /// The per-file cap is applied after ordering by position, so a function
+    /// with more occurrences than the cap keeps the top of its changed region
+    /// every time rather than whatever order the capture query happened to
+    /// return.
+    #[test]
+    fn stash_caps_occurrences_in_position_order() {
+        use travsr_core::NodeId;
+        let mut plane = EditorPlane::default();
+        // Descending lines, so raw-order truncation would keep the highest ones.
+        let occ: Vec<travsr_core::ChangedOccurrence> = (0..MAX_OCCURRENCES_PER_STASHED_FILE + 10)
+            .map(|i| travsr_core::ChangedOccurrence {
+                src: NodeId(1),
+                line: (MAX_OCCURRENCES_PER_STASHED_FILE + 10 - i) as u32,
+                col: Some(4),
+                kind: "ref/call".to_string(),
+                name: "run".to_string(),
+            })
+            .collect();
+        plane.stash_changed_occurrences(
+            "a.rs".to_string(),
+            occ,
+            Some(std::collections::HashSet::new()),
+        );
+
+        let (served, _) = plane
+            .serve_stash("a.rs")
+            .expect("a fresh stash is servable");
+        assert_eq!(served.len(), MAX_OCCURRENCES_PER_STASHED_FILE);
+        assert_eq!(
+            served[0].line, 1,
+            "the retained set starts at the first line"
+        );
+        assert_eq!(
+            served.last().expect("non-empty").line,
+            MAX_OCCURRENCES_PER_STASHED_FILE as u32,
+            "the cap keeps the lowest lines, contiguously"
+        );
+    }
+
     #[test]
     fn remap_resolved_sites_redirects_and_drops_self_loops() {
         // #299 F2: a resolved site whose dst unification redirected must be
@@ -5398,19 +5645,22 @@ mod tests {
         let dropped: std::collections::HashSet<NodeId> = [gone].into_iter().collect();
 
         let sites = vec![
-            (src, scip_dst, 10),  // dst remaps 2 → 3
-            (src, NodeId(9), 11), // dst not in alias — unchanged
-            (src, collapses, 12), // dst remaps 4 → 1 == src → dropped
-            (src, gone, 13),      // dst was dropped → discarded
+            (src, scip_dst, 10, None),  // dst remaps 2 → 3
+            (src, NodeId(9), 11, None), // dst not in alias — unchanged
+            (src, collapses, 12, None), // dst remaps 4 → 1 == src → dropped
+            (src, gone, 13, None),      // dst was dropped → discarded
         ];
         let out = remap_resolved_sites(sites, &alias, &dropped);
-        assert_eq!(out, vec![(src, ts_dst, 10), (src, NodeId(9), 11)]);
+        assert_eq!(
+            out,
+            vec![(src, ts_dst, 10, None), (src, NodeId(9), 11, None)]
+        );
     }
 
     #[test]
     fn remap_resolved_sites_empty_alias_is_identity() {
         use travsr_core::NodeId;
-        let sites = vec![(NodeId(1), NodeId(2), 5)];
+        let sites = vec![(NodeId(1), NodeId(2), 5, None)];
         let out = remap_resolved_sites(
             sites.clone(),
             &std::collections::HashMap::new(),
@@ -5633,6 +5883,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 42,
+            caller_col: None,
             is_method_call: true,
             recv_type: None,
         }];
@@ -5659,10 +5910,7 @@ mod tests {
     fn resolve_one_field_ref(
         store: &SqliteStore,
         recv_type: Option<&str>,
-    ) -> (
-        Vec<travsr_core::Edge>,
-        Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
-    ) {
+    ) -> (Vec<travsr_core::Edge>, Vec<SiteRow>) {
         use travsr_core::{Node, VName};
         let caller = Node::new(
             VName::new(
@@ -5680,6 +5928,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9,
+            caller_col: None,
             is_method_call: false,
             recv_type: recv_type.map(str::to_string),
         }];
@@ -5728,7 +5977,7 @@ mod tests {
             travsr_core::EdgeKind::RefField,
             "field read must be ref/field, never ref/call"
         );
-        assert_eq!(sites, vec![(caller.id, field.id, 9)]);
+        assert_eq!(sites, vec![(caller.id, field.id, 9, None)]);
     }
 
     #[test]
@@ -5824,6 +6073,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9,
+            caller_col: None,
             is_method_call: false,
             recv_type: Some("Config".to_string()),
         }];
@@ -5849,11 +6099,11 @@ mod tests {
             Edge::new(a, b, EdgeKind::RefCall),
             Edge::new(a, c, EdgeKind::RefField),
         ];
-        let sites = vec![(a, b, 10), (a, c, 20), (a, d, 30)];
+        let sites = vec![(a, b, 10, None), (a, c, 20, None), (a, d, 30, None)];
         let (calls, fields) = split_field_sites(&edges, sites);
         // b is a call target, c is a field; d has no field edge → treated as call.
-        assert_eq!(calls, vec![(a, b, 10), (a, d, 30)]);
-        assert_eq!(fields, vec![(a, c, 20)]);
+        assert_eq!(calls, vec![(a, b, 10, None), (a, d, 30, None)]);
+        assert_eq!(fields, vec![(a, c, 20, None)]);
     }
 
     #[test]
@@ -5897,6 +6147,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -5957,6 +6208,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 3,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -5975,7 +6227,7 @@ mod tests {
         );
         assert_eq!(edges[0].src, caller.id);
         assert_eq!(edges[0].dst, callee.id);
-        assert_eq!(sites, vec![(caller.id, callee.id, 3)]);
+        assert_eq!(sites, vec![(caller.id, callee.id, 3, None)]);
     }
 
     #[test]
@@ -6044,14 +6296,14 @@ mod tests {
         assert!(
             sites
                 .iter()
-                .any(|(s, d, _)| *s == index_node.id && *d == class_node.id),
+                .any(|(s, d, _, _)| *s == index_node.id && *d == class_node.id),
             "constructor call must record an occurrence site for find_references: {sites:?}"
         );
         // Method reference: `resp.render()` → method:HttpResponse.render.
         assert!(
             sites
                 .iter()
-                .any(|(s, d, _)| *s == index_node.id && *d == render_node.id),
+                .any(|(s, d, _, _)| *s == index_node.id && *d == render_node.id),
             "method call must record an occurrence site: {sites:?}"
         );
 
@@ -6088,6 +6340,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -6137,6 +6390,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 5,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -6154,7 +6408,7 @@ mod tests {
             "recv_type exact match should resolve: {edges:?}"
         );
         assert_eq!(edges[0].dst, callee.id);
-        assert_eq!(sites, vec![(caller.id, callee.id, 5)]);
+        assert_eq!(sites, vec![(caller.id, callee.id, 5, None)]);
     }
 
     #[test]
@@ -6191,6 +6445,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 12,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("HashSet".to_string()),
         }];
@@ -6263,6 +6518,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -6328,6 +6584,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9773,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Command".to_string()),
         }];
@@ -6389,6 +6646,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 3,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -6447,6 +6705,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 8,
+            caller_col: None,
             is_method_call: true,
             recv_type: None,
         }];
@@ -6508,6 +6767,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 12,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -6563,6 +6823,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 45,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -6614,6 +6875,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -6667,6 +6929,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 8,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -6729,6 +6992,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 4,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("SqliteStore".to_string()),
         }];
@@ -6805,6 +7069,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: line,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         };
@@ -6899,6 +7164,7 @@ mod tests {
                 alt_callee_sig: None,
                 hint_crate: None,
                 caller_line: 8,
+                caller_col: None,
                 is_method_call: true,
                 recv_type: Some("Session".to_string()),
             },
@@ -6908,6 +7174,7 @@ mod tests {
                 alt_callee_sig: None,
                 hint_crate: None,
                 caller_line: 8,
+                caller_col: None,
                 is_method_call: true,
                 recv_type: Some("Session".to_string()),
             },
@@ -6952,6 +7219,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 4,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -7012,6 +7280,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 4,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("App".to_string()),
         }];
@@ -7065,6 +7334,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 5,
+            caller_col: None,
             is_method_call: true,
             recv_type: None, // chain receiver — unrecoverable
         }];
@@ -7107,6 +7377,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 2,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         };
@@ -7271,6 +7542,7 @@ mod tests {
                 caller_line: *line,
                 callee_id,
                 is_call: true,
+                caller_col: None,
             });
         }
 
@@ -8231,7 +8503,7 @@ mod tests {
             store
                 .put_edge(&Edge::new(n.id, n.id, EdgeKind::RefCall))
                 .unwrap();
-            store.record_edge_sites(&[(n.id, n.id, 1)]).unwrap();
+            store.record_edge_sites(&[(n.id, n.id, 1, None)]).unwrap();
             n.id
         };
 
@@ -8383,7 +8655,7 @@ mod tests {
             std::fs::write(&caller, text).unwrap();
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
             reindex_files(std::slice::from_ref(&caller), tmp.path(), &mut store).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller, None);
         }
 
         // The ambiguous call must never have produced a claim at all: an
@@ -8525,7 +8797,7 @@ mod tests {
             std::fs::write(&main, text).unwrap();
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
             reindex_files(std::slice::from_ref(&main), tmp.path(), &mut store).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &main);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &main, None);
         }
 
         // Commit and let Phase B run for real, so the meter has ratified
@@ -8596,6 +8868,158 @@ mod tests {
         assert!(
             live_lane_enabled_for(&store, "rust"),
             "a Rust reading at or above the bar must keep the lane enabled"
+        );
+    }
+
+    /// RFC-027 #813 Mechanism A, end to end through the real save path: a body
+    /// edit to one function preserves every other function's committed call edge
+    /// (mid-edit recovery, the ~71% -> ~99% win), and the next commit restores
+    /// the full committed graph with no live overlay left (Invariant #4). The
+    /// headless daemon reaches this recovery with no language server at all.
+    #[test]
+    fn body_edit_preserves_committed_call_edges_and_commit_reconverges() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        const N: usize = 25;
+        // types.rs: two structs whose method names collide, so every `m{i}` is
+        // ambiguous by name — the lexical lane must abstain on it, and only a
+        // type-aware resolver (Phase B) or a preserved committed edge can carry
+        // the call. This is the ambiguous-callee case where the whole-file purge
+        // lost recall (RFC-027 §7.3a).
+        let mut types = String::from("pub struct A;\npub struct B;\n\nimpl A {\n");
+        for i in 0..N {
+            types.push_str(&format!("    pub fn m{i}(&self) -> i32 {{ {i} }}\n"));
+        }
+        types.push_str("}\n\nimpl B {\n");
+        for i in 0..N {
+            types.push_str(&format!("    pub fn m{i}(&self) -> i32 {{ {i} }}\n"));
+        }
+        types.push_str("}\n");
+        std::fs::write(tmp.path().join("src/types.rs"), types).unwrap();
+
+        // main.rs: N caller functions, each a type-resolved call `a.m{i}()` on an
+        // `A`. `edit0` rewrites only c0's body (signature and its call unchanged,
+        // so its NodeId is stable and the edit is a pure body edit).
+        let main = tmp.path().join("src/main.rs");
+        let build_main = |edit0: bool| {
+            let mut s = String::from("mod types;\nuse types::A;\n\n");
+            for i in 0..N {
+                if i == 0 && edit0 {
+                    s.push_str(
+                        "pub fn c0(a: &A) -> i32 {\n    let _changed = 1 + 1;\n    a.m0()\n}\n",
+                    );
+                } else {
+                    s.push_str(&format!("pub fn c{i}(a: &A) -> i32 {{\n    a.m{i}()\n}}\n"));
+                }
+            }
+            s
+        };
+        std::fs::write(&main, build_main(false)).unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .get_meta("corpus")
+            .unwrap()
+            .unwrap_or_default();
+
+        // Commit the initial tree and run Phase B so the cross-file calls are
+        // ratified into committed (scip) edges — the baseline the mid-edit save
+        // must preserve.
+        let commit = |msg: &str| {
+            std::process::Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-qm",
+                    msg,
+                ])
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            let sha = read_head_commit_sha(tmp.path()).expect("HEAD after commit");
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", &sha).unwrap();
+        };
+        let run_phase_b = || {
+            let store_mutex =
+                std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+            run_background_phase_b_inner(tmp.path(), &store_mutex);
+        };
+        commit("initial");
+        run_phase_b();
+
+        // Ratified baseline: main.rs's committed type-resolved call edges.
+        let baseline = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .owned_ratified_ref_call_edges(&corpus, "src/main.rs")
+            .unwrap();
+        assert!(
+            baseline >= 20,
+            "precondition: native Phase B must ratify the type-resolved calls; got {baseline}"
+        );
+
+        // Save a pure body edit to c0 only, then run the overlay — the mid-edit
+        // state. No language server is involved on this path.
+        std::fs::write(&main, build_main(true)).unwrap();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&main), tmp.path(), &mut store).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &main, None);
+        }
+
+        let after = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .owned_ratified_ref_call_edges(&corpus, "src/main.rs")
+            .unwrap();
+        // Only c0's ratified edge is dropped (c0's body changed, so it is
+        // re-resolved into the live overlay, which this count excludes); every
+        // other function's committed edge is preserved in place. The pre-#813
+        // whole-file purge dropped all `baseline` of them to zero.
+        assert_eq!(
+            after,
+            baseline - 1,
+            "exactly the edited function's committed edge should drop; got {after} of {baseline}"
+        );
+        let recovery = after as f64 / baseline as f64;
+        assert!(
+            recovery >= 0.95,
+            "mid-edit recovery {recovery:.3} is below the 0.95 acceptance bar \
+             (after {after} of baseline {baseline})"
+        );
+
+        // Commit and run Phase B for real: the committed graph must fully
+        // reconverge and carry no live overlay (Invariant #4).
+        commit("edit");
+        run_phase_b();
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let reconverged = store
+            .owned_ratified_ref_call_edges(&corpus, "src/main.rs")
+            .unwrap();
+        assert_eq!(
+            reconverged, baseline,
+            "commit must restore every committed edge (Invariant #4): {reconverged} vs {baseline}"
+        );
+        assert_eq!(
+            store.count_edges_with_provenance("live").unwrap(),
+            0,
+            "no live overlay may survive ratification (Invariant #4)"
         );
     }
 
@@ -8809,7 +9233,7 @@ mod tests {
         // Overlay.
         {
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &order);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &order, None);
         }
         let live_rows = travsr_store::SqliteStore::open(&db_path)
             .unwrap()
@@ -8867,7 +9291,7 @@ mod tests {
         let before = graph_fingerprint(&db_path);
         {
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &order);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &order, None);
         }
         assert_eq!(
             graph_fingerprint(&db_path),
@@ -9525,7 +9949,7 @@ mod tests {
         std::fs::write(&order, text).unwrap();
         let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
         reindex_files(std::slice::from_ref(&order), tmp.path(), &mut store).unwrap();
-        live_resolve_file(&mut store, corpus, tmp.path(), &order);
+        live_resolve_file(&mut store, corpus, tmp.path(), &order, None);
         order
     }
 
@@ -9799,7 +10223,7 @@ mod tests {
         let db_path = tmp.path().join(".travsr/graph.db");
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
         let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
-        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller);
+        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller, &[], None);
 
         let start = targets
             .iter()
@@ -9851,7 +10275,7 @@ mod tests {
         let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
         // Java is on LIVE_LANE_SHIPPED (measured 3,0,0 → 1.0000, §11.3), so the
         // gate admits it with no reading and no force flag needed.
-        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller);
+        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller, &[], None);
 
         let by_name = |name: &str| {
             targets
@@ -9914,13 +10338,13 @@ mod tests {
         // (§8.3) and the pending row is the honest record the editor upgrades.
         {
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller, None);
         }
 
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
         // A save of `session.go` (which defines `Helper`) must surface `run.go`
         // as a dependent carrying that reference as an editor target.
-        let dependents = dependent_resolution_targets(&store, &corpus, tmp.path(), &session);
+        let dependents = dependent_resolution_targets(&store, &corpus, tmp.path(), &session, None);
         let run = dependents
             .iter()
             .find(|d| d.file == "run.go")
@@ -9933,7 +10357,7 @@ mod tests {
 
         // A file that defines nothing any pending reference names has no
         // dependents — a body edit stays local (§6.1), no closure fan-out.
-        let none = dependent_resolution_targets(&store, &corpus, tmp.path(), &caller);
+        let none = dependent_resolution_targets(&store, &corpus, tmp.path(), &caller, None);
         assert!(
             none.iter().all(|d| d.file != "session.go"),
             "run.go defines nothing session.go is pending on, got {none:?}"
@@ -9978,7 +10402,7 @@ mod tests {
         };
         {
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller, None);
         }
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
         assert_eq!(
@@ -10033,7 +10457,7 @@ mod tests {
         };
         {
             let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-            live_resolve_file(&mut store, &corpus, tmp.path(), &caller);
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller, None);
         }
 
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -12089,11 +12513,20 @@ impl Daemon {
             let repo_worker = Arc::clone(&repo_root_arc);
             let index_tx_worker = index_tx.clone();
             let worker_stop_inner = Arc::clone(&worker_stop);
+            // RFC-027 #813 P2: the worker stashes each save's changed-def
+            // occurrences into the same plane the control loop serves from.
+            let lsp_sessions_worker = Arc::clone(&lsp_sessions);
             tokio::task::spawn_blocking(move || {
                 loop {
                     match index_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                         Ok(ev) => {
-                            handle_watch_event(ev, &repo_worker, &store_worker, &index_tx_worker);
+                            handle_watch_event(
+                                ev,
+                                &repo_worker,
+                                &store_worker,
+                                &index_tx_worker,
+                                &lsp_sessions_worker,
+                            );
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             if worker_stop_inner.load(std::sync::atomic::Ordering::Acquire) {
@@ -12668,14 +13101,17 @@ fn handle_watch_event(
     repo_root: &std::path::Path,
     store: &std::sync::Mutex<SqliteStore>,
     index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
+    // RFC-027 #813 P2: the editor plane, so a save can stash its changed-def
+    // committed occurrences for the target request that follows it.
+    lsp_sessions: &std::sync::Mutex<EditorPlane>,
 ) {
     use watcher::WatchEvent;
 
     match ev {
         WatchEvent::Upsert(path) => {
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-            match reindex_files(std::slice::from_ref(&path), repo_root, &mut s) {
-                Ok(callers) => {
+            match reindex_files_reporting(std::slice::from_ref(&path), repo_root, &mut s) {
+                Ok((callers, changed_occ, changed_defs)) => {
                     // RFC-027 sections 6 and 7.3a: refresh this file's live
                     // overlay, and on an interface edit the overlay of the files
                     // that reference it.
@@ -12690,12 +13126,50 @@ fn handle_watch_event(
                     // `reindex_replace`, so re-resolving them is what stops a
                     // rename from silently dropping every inbound live edge.
                     let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
-                    live_resolve_file(&mut s, &corpus, repo_root, &path);
+                    // RFC-027 #813 (finding 2): on a scoped pure-body edit the
+                    // store preserved every unchanged definition's committed
+                    // edges, so the lexical lane must re-resolve only the changed
+                    // region, otherwise it re-records a preserved definition's
+                    // already-committed references as `pending` and the freshness
+                    // count over-reports. `None` (no entry) means a whole-file
+                    // re-derive, which resolves the file wholesale as before.
+                    let saved_vname = path
+                        .strip_prefix(repo_root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let scope = changed_defs
+                        .iter()
+                        .find(|(f, _)| *f == saved_vname)
+                        .map(|(_, set)| set);
+                    live_resolve_file(&mut s, &corpus, repo_root, &path, scope);
+                    // Dependents were not reindexed by this event, so their whole
+                    // file is re-resolved (no scope) exactly as before.
                     for dependent in callers.iter().take(LIVE_CLOSURE_FILE_CAP) {
                         let abs = repo_root.join(dependent);
                         if abs != path && abs.is_file() {
-                            live_resolve_file(&mut s, &corpus, repo_root, &abs);
+                            live_resolve_file(&mut s, &corpus, repo_root, &abs, None);
                         }
+                    }
+                    // RFC-027 #813 P2 / finding 2: stash this save's changed
+                    // region so the editor target request that follows can both
+                    // enumerate its committed occurrences and scope its native
+                    // targets to the changed definitions. Release the store lock
+                    // first, then take the plane lock, keeping the store->plane
+                    // order the serve path also uses. One saved file per Upsert.
+                    drop(s);
+                    {
+                        let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+                        let occ = changed_occ
+                            .into_iter()
+                            .find(|(f, _)| *f == saved_vname)
+                            .map(|(_, o)| o)
+                            .unwrap_or_default();
+                        let scope_owned = changed_defs
+                            .into_iter()
+                            .find(|(f, _)| f == &saved_vname)
+                            .map(|(_, set)| set);
+                        plane.stash_changed_occurrences(saved_vname, occ, scope_owned);
                     }
                     enqueue_dirty_callers(callers, repo_root, index_tx)
                 }
@@ -12767,6 +13241,125 @@ pub struct EditorPlane {
     pub refused: std::collections::HashMap<String, usize>,
     /// Refusals whose root arrived after `MAX_REFUSED_ROOTS` was reached.
     pub refused_overflow: usize,
+    /// RFC-027 #813 P2: repo-relative file path -> the changed-definition
+    /// committed occurrences captured at that file's last save, for the live
+    /// lane to enumerate as editor targets while the mid-edit window is open.
+    /// Bounded in files retained and TTL-expired on read, like the sessions.
+    pub changed_occurrences: std::collections::HashMap<String, StashedOccurrences>,
+}
+
+/// RFC-027 #813 P2: one file's changed-definition committed occurrences, stashed
+/// at save so a target request that arrives moments later can enumerate them.
+#[derive(Debug, Clone)]
+pub struct StashedOccurrences {
+    pub occurrences: Vec<travsr_core::ChangedOccurrence>,
+    /// RFC-027 #813 (finding 2): the changed-definition set of the save that
+    /// produced this stash, so the request path scopes its native editor
+    /// targets to the changed region the same way the save-path lexical lane
+    /// does. A stash exists only for a scoped pure-body edit, so its presence
+    /// means "scope to this set" (empty means every definition was preserved,
+    /// so no native target is owed). A whole-file re-derive stashes nothing and
+    /// the request path stays whole-file.
+    pub changed_defs: std::collections::HashSet<travsr_core::NodeId>,
+    /// When this stash stops being servable (see [`STASHED_OCCURRENCE_TTL`]).
+    pub expires_at: std::time::Instant,
+}
+
+/// Files whose changed-occurrence enumeration is retained at once. A person
+/// edits a handful of files in a mid-edit window; past this the soonest-to-
+/// expire entry is evicted.
+const MAX_STASHED_OCCURRENCE_FILES: usize = 64;
+/// How long a saved file's changed-occurrence enumeration stays servable. A
+/// target request follows its save within a keystroke or two; past this the
+/// buffer has almost certainly moved on and the committed positions are stale.
+const STASHED_OCCURRENCE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Occurrences retained per file. One changed function's references fit well
+/// under this; a whole-file rewrite that blows past it is not the case this
+/// enumeration serves, so it is truncated rather than grown.
+const MAX_OCCURRENCES_PER_STASHED_FILE: usize = 500;
+
+impl EditorPlane {
+    /// RFC-027 #813 P2 / finding 2: stash a scoped save's changed region after a
+    /// save, bounded per file and in the number of files retained. `scope` is the
+    /// save's changed-definition set: `Some` for a pure-body edit where the store
+    /// preserved definitions (the request path then scopes native targets to it),
+    /// `None` for a whole-file re-derive, which stashes nothing and clears any
+    /// prior entry so a later request cannot scope against a stale set.
+    fn stash_changed_occurrences(
+        &mut self,
+        path: String,
+        mut occ: Vec<travsr_core::ChangedOccurrence>,
+        scope: Option<std::collections::HashSet<travsr_core::NodeId>>,
+    ) {
+        let Some(changed_defs) = scope else {
+            // Whole-file re-derive: no scope to stash, and any prior scoped entry
+            // is now stale, so drop it.
+            self.changed_occurrences.remove(&path);
+            return;
+        };
+        // Order by position before capping, so which occurrences survive on a
+        // function with more than the cap is deterministic (the top of the
+        // changed region) rather than whatever order the capture query returned.
+        occ.sort_unstable_by_key(|o| (o.line, o.col, o.src.0));
+        occ.truncate(MAX_OCCURRENCES_PER_STASHED_FILE);
+        let now = std::time::Instant::now();
+        self.changed_occurrences.retain(|_, e| e.expires_at > now);
+        if self.changed_occurrences.len() >= MAX_STASHED_OCCURRENCE_FILES
+            && !self.changed_occurrences.contains_key(&path)
+        {
+            if let Some(soonest) = self
+                .changed_occurrences
+                .iter()
+                .min_by_key(|(_, e)| e.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.changed_occurrences.remove(&soonest);
+            }
+        }
+        self.changed_occurrences.insert(
+            path,
+            StashedOccurrences {
+                occurrences: occ,
+                changed_defs,
+                expires_at: now + STASHED_OCCURRENCE_TTL,
+            },
+        );
+    }
+
+    /// RFC-027 #813 P2: the live changed-def occurrences stashed for `path`,
+    /// empty if none or expired (expiry evaluated on read, like the sessions).
+    fn stashed_changed_occurrences(&self, path: &str) -> Vec<travsr_core::ChangedOccurrence> {
+        match self.changed_occurrences.get(path) {
+            Some(e) if e.expires_at > std::time::Instant::now() => e.occurrences.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// RFC-027 #813 P2 / finding 2: serve a target request or report the stashed
+    /// occurrences *and* the changed-definition scope, *and* restart the TTL
+    /// clock, because a resolution drain begins at the request, not at the save.
+    /// A large edited function's targets (or a cold rust-analyzer / jdtls) can
+    /// take several seconds to answer in batches; keying the 30 s window on the
+    /// save time would reject every late batch as stale (`retain_current_targets`
+    /// re-reads the stash and would find it gone). Refreshing on each serve keeps
+    /// the stash alive as long as answers keep arriving inside one TTL of each
+    /// other. `None` when no fresh stash exists, so the request stays whole-file.
+    #[allow(clippy::type_complexity)]
+    fn serve_stash(
+        &mut self,
+        path: &str,
+    ) -> Option<(
+        Vec<travsr_core::ChangedOccurrence>,
+        std::collections::HashSet<travsr_core::NodeId>,
+    )> {
+        match self.changed_occurrences.get_mut(path) {
+            Some(e) if e.expires_at > std::time::Instant::now() => {
+                e.expires_at = std::time::Instant::now() + STASHED_OCCURRENCE_TTL;
+                Some((e.occurrences.clone(), e.changed_defs.clone()))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Distinct refused roots retained per daemon lifetime. Small because the
@@ -12942,11 +13535,33 @@ fn handle_control_message(
             let s = store.lock().unwrap_or_else(|e| e.into_inner());
             let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
             let abs_path = repo_root.join(&file);
-            let own = live_resolution_targets(&s, &corpus, repo_root, &abs_path);
+            // RFC-027 #813 P2 / finding 2: serve this file's stashed changed
+            // region (its committed occurrences to enumerate, and its changed-def
+            // set to scope native targets), restarting the TTL from this request
+            // so the resolution drain it kicks off has the full window even when
+            // the provider answers slowly. `None` when no fresh scoped save, which
+            // keeps the whole-file behavior.
+            let (stashed, scope) = match lsp_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .serve_stash(&file)
+            {
+                Some((occ, defs)) => (occ, Some(defs)),
+                None => (Vec::new(), None),
+            };
+            let own = live_resolution_targets(
+                &s,
+                &corpus,
+                repo_root,
+                &abs_path,
+                &stashed,
+                scope.as_ref(),
+            );
             // RFC-027 section 8.7.5: also re-resolve the files whose edges this
             // save can restore, so a rename in one file heals its dependents
             // without each being saved in turn.
-            let dependents = dependent_resolution_targets(&s, &corpus, repo_root, &abs_path);
+            let dependents =
+                dependent_resolution_targets(&s, &corpus, repo_root, &abs_path, Some(lsp_sessions));
             drop(s);
 
             tracing::debug!(
@@ -12996,7 +13611,28 @@ fn handle_control_message(
             // editor buffer, and `enclosing_definition_at` then reads spans from
             // the newer parse. Re-detecting against the file as it stands now
             // closes that window with the daemon's own evidence.
-            let current = live_resolution_targets(&s, &corpus, repo_root, &repo_root.join(&file));
+            // RFC-027 #813 P2 / finding 2: validate against the same target set
+            // the request served (same stashed occurrences AND same changed-def
+            // scope), so a resolution for a changed-def occurrence is recognized
+            // as current rather than rejected as stale. Refresh the TTL again here
+            // so a long, multi-batch drain keeps the stash alive as long as
+            // reports keep arriving within one TTL of each other.
+            let (stashed, scope) = match lsp_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .serve_stash(&file)
+            {
+                Some((occ, defs)) => (occ, Some(defs)),
+                None => (Vec::new(), None),
+            };
+            let current = live_resolution_targets(
+                &s,
+                &corpus,
+                repo_root,
+                &repo_root.join(&file),
+                &stashed,
+                scope.as_ref(),
+            );
             let accepted = live_resolve::retain_current_targets(&resolutions, &current);
             let stale = resolutions.len() - accepted.len();
             let outcome = live_resolve::apply_live_resolutions(&mut s, &corpus, &file, &accepted);
