@@ -1321,8 +1321,18 @@ export function buildStatsHtml(
   const act = (label: string, message: string, tone: "primary" | "ghost" = "ghost"): string =>
     `<button class="btn mini ${tone === "primary" ? "primary" : "ghost"}" onclick="panelAction(this, '${message}')">${esc(label)}</button>`;
 
-  const row = (k: string, v: string, tone?: "ok" | "warn" | "bad", trailing = ""): string =>
-    `<div class="hrow"><span title="${esc(k)}">${esc(k)}</span>` +
+  // `keyTitle` overrides the hover text on the label. It defaults to the label
+  // itself, which is what a truncated row needs; the repository rows pass the
+  // database path instead, because two checkouts can share a basename and the
+  // registry shows nothing else to tell them apart.
+  const row = (
+    k: string,
+    v: string,
+    tone?: "ok" | "warn" | "bad",
+    trailing = "",
+    keyTitle?: string
+  ): string =>
+    `<div class="hrow"><span title="${esc(keyTitle ?? k)}">${esc(k)}</span>` +
     `<b class="${tone ?? ""}">${tone === "ok" ? OK_ICON : tone === "warn" ? WARN_ICON : tone === "bad" ? BAD_ICON : ""}${esc(v)}</b>` +
     (trailing ? `<span class="ra">${trailing}</span>` : "") +
     `</div>`;
@@ -1632,25 +1642,41 @@ export function buildStatsHtml(
       : (() => {
           // Capped. A machine that has run the test suite accumulates one
           // registry entry per temp repo, so this reached seventy rows of
-          // `.tmpXXXXXX` and buried every real repository. The ones that still
-          // exist come first, since those are the ones worth acting on, and
+          // `.tmpXXXXXX` and buried every real repository.
+          //
+          // The repository this page describes sorts first whatever else is in
+          // the registry. Ranking on `exists` alone was not enough: temp repos
+          // whose database is still on disk rank the same as the open one, the
+          // registry arrives sorted by name, and `.tmp` sorts before most real
+          // names, so fifteen live temp entries pushed the active repository
+          // past the cap and the page never showed the row it is about. Live
+          // ones come next, since those are the ones worth acting on, and
           // Prune stale in the header clears the rest in one go.
           const REPO_ROWS = 8;
-          const sorted = [...health.repos].sort(
-            (a, b) => Number(b.exists) - Number(a.exists)
-          );
+          const rank = (r: RepoRow): number =>
+            r.name === health.activeRepo ? 0 : r.exists ? 1 : 2;
+          const sorted = [...health.repos].sort((a, b) => rank(a) - rank(b));
           const shown = sorted.slice(0, REPO_ROWS);
-          const hidden = sorted.length - shown.length;
+          const hidden = sorted.slice(REPO_ROWS);
+          const hiddenStale = hidden.filter((r) => !r.exists).length;
           return (
             shown
-              .map((r) =>
-                row(
+              .map((r) => {
+                const active = r.name === health.activeRepo;
+                return row(
                   r.name,
+                  // What was checked is whether the graph database is on disk,
+                  // nothing about the working tree. This said "ok", which reads
+                  // as a verdict on the repository and is more than the check
+                  // supports: a repo deleted months ago still says "ok" for as
+                  // long as its database survives in ~/.travsr.
                   r.exists
-                    ? r.name === health.activeRepo
+                    ? active
                       ? "active"
-                      : "ok"
-                    : "database missing",
+                      : "database present"
+                    : active
+                      ? "active, no database"
+                      : "database missing",
                   r.exists ? "ok" : "warn",
                   r.exists
                     ? ""
@@ -1660,14 +1686,22 @@ export function buildStatsHtml(
                       // parsed, so a name containing a quote would have broken
                       // out of the literal. Registry names are basename-derived
                       // so this was unlikely rather than safe.
-                      `<button class="btn mini ghost" data-name="${esc(r.name)}" onclick="removeRepoRow(this)">Remove</button>`
-                )
-              )
+                      `<button class="btn mini ghost" data-name="${esc(r.name)}" onclick="removeRepoRow(this)">Remove</button>`,
+                  r.path ? `Graph database: ${r.path}` : r.name
+                );
+              })
               .join("") +
-            (hidden > 0
-              ? `<div class="hrow muted">and ${hidden} more, ${
-                  sorted.filter((r) => !r.exists).length
-                } of which have no database</div>`
+            // The stale count belongs to the rows that were hidden. It was
+            // taken over the whole registry, so a registry that is mostly
+            // stale reported more missing databases than there are hidden
+            // rows ("and 7 more, 12 of which have no database"). When none of
+            // the hidden rows are stale there is nothing to qualify, and the
+            // clause was a double negative reading "0 of which have no
+            // database".
+            (hidden.length > 0
+              ? `<div class="hrow muted">and ${hidden.length} more${
+                  hiddenStale > 0 ? `, ${hiddenStale} with no database` : ""
+                }</div>`
               : "")
           );
         })()

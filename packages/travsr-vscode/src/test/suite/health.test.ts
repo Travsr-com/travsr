@@ -534,6 +534,97 @@ suite("health panel rendering", () => {
     assert.ok((html.match(/removeRepoRow\(/g) ?? []).length <= 8, "rows are capped");
   });
 
+  test("the open repository is listed however full the registry is", () => {
+    // Every temp repo here still has its database, so ranking on `exists`
+    // alone left them tied with the open one. The registry arrives sorted by
+    // name and ".tmp" sorts before "menuservice", so the row this whole page
+    // is about fell past the cap and the section showed nothing but junk.
+    const buried: HealthData = {
+      ...FULL,
+      repos: [
+        ...Array.from({ length: 14 }, (_, i) => ({
+          name: `.tmp${i}`,
+          path: `c:/t/${i}`,
+          exists: true,
+        })),
+        { name: "menuservice", path: "c:/r/menuservice", exists: true },
+      ],
+      activeRepo: "menuservice",
+    };
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, buried);
+    const repoSec = html.slice(html.indexOf(">Repositories</span>"));
+    assert.ok(repoSec.includes("menuservice"), "the open repo has a row");
+    assert.ok(repoSec.includes("active"), "and is marked as the one in view");
+    assert.ok(
+      repoSec.indexOf("menuservice") < repoSec.indexOf(".tmp0"),
+      "ahead of the temp repos, not merely present"
+    );
+    assert.ok(repoSec.includes("and 7 more"), "the rest are counted");
+  });
+
+  test("the hidden-row count describes the hidden rows", () => {
+    // The stale count was taken over the whole registry while the sentence it
+    // sits in describes only what was cut, so a mostly-stale registry claimed
+    // more missing databases than there were hidden rows.
+    const mostlyStale: HealthData = {
+      ...FULL,
+      repos: [
+        { name: "menuservice", path: "c:/r/menuservice", exists: true },
+        { name: "keeper", path: "c:/r/keeper", exists: true },
+        ...Array.from({ length: 12 }, (_, i) => ({
+          name: `.tmp${i}`,
+          path: `c:/t/${i}`,
+          exists: false,
+        })),
+      ],
+      activeRepo: "menuservice",
+    };
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, mostlyStale);
+    // 14 rows, 8 shown, so 6 hidden and every one of them stale.
+    assert.ok(html.includes("and 6 more, 6 with no database"), "counted over the hidden rows");
+    assert.ok(!html.includes("12 with no database"), "not over the whole registry");
+  });
+
+  test("nothing stale below the cap leaves the count unqualified", () => {
+    const allLive: HealthData = {
+      ...FULL,
+      repos: Array.from({ length: 15 }, (_, i) => ({
+        name: `repo${i}`,
+        path: `c:/r/${i}`,
+        exists: true,
+      })),
+      activeRepo: "repo0",
+    };
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, allLive);
+    assert.ok(html.includes("and 7 more"), "the rest are counted");
+    assert.ok(
+      !html.includes("0 with no database") && !html.includes("0 of which"),
+      "and a zero is not spelled out as a double negative"
+    );
+  });
+
+  test("a repo row says what was checked, and which checkout it means", () => {
+    // The check is whether the graph database is on disk. It said "ok", which
+    // reads as a verdict on the repository: a checkout deleted months ago
+    // still said "ok" while its database survived in ~/.travsr.
+    const three: HealthData = {
+      ...FULL,
+      repos: [
+        { name: "menuservice", path: "c:/r/menuservice", exists: true },
+        { name: "travsr", path: "c:/r/travsr", exists: true },
+        { name: "logrot-testrepo", path: "c:/r/logrot", exists: false },
+      ],
+      activeRepo: "menuservice",
+    };
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, three);
+    assert.ok(html.includes("database present"), "a live row says what was checked");
+    assert.ok(html.includes("database missing"), "and a stale row still does");
+    assert.ok(
+      html.includes('title="Graph database: c:/r/travsr"'),
+      "the path distinguishes two checkouts that share a basename"
+    );
+  });
+
   test("a repo name reaches the handler as data, not as a JS string literal", () => {
     // esc() escapes for HTML, and the parser decodes the entity before the JS
     // in an onclick is parsed, so a name carrying a quote would have broken out
