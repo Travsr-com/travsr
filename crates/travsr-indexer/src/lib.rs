@@ -31,7 +31,7 @@ use travsr_core::{EdgeKind, Language};
 // ParseOutput and FfiMarker are now owned by travsr-analysis.
 pub use ffi::{FfiMarker, FfiMarkerKind};
 pub use ffi_resolver::FfiConfig;
-pub use hash::hash_file;
+pub use hash::{hash_bytes, hash_file};
 pub use lsif::ingest as ingest_lsif;
 pub use lsif::{
     ingest_g2 as ingest_lsif_g2, ingest_g2_from_reader as ingest_lsif_g2_from_reader,
