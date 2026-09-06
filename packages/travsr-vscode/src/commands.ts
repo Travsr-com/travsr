@@ -936,7 +936,8 @@ export async function gatherHealth(
               ? "installed but not active"
               : "not installed, semantic search off",
           ok: embedOk,
-          action: embedOk ? "restartEmbed" : "installEmbed",
+          action: embedOk ? "reinstallEmbed" : "installEmbed",
+          backend: active?.id,
         },
       ];
     } catch {
@@ -1377,10 +1378,9 @@ type PanelMessage =
   | { command: "restartDaemon" }
   | { command: "reindex" }
   | { command: "fullRebuild" }
-  | { command: "reindexSemantic" }
   | { command: "installHook" }
   | { command: "installEmbed" }
-  | { command: "restartEmbed" }
+  | { command: "reinstallEmbed" }
   | { command: "runFsck" }
   | { command: "compact" }
   | { command: "registerMcp" }
@@ -1663,7 +1663,6 @@ export function registerShowGraphStats(
       startDaemon: ["daemon", "start"],
       restartDaemon: ["daemon", "restart"],
       fullRebuild: ["init", "--force"],
-      reindexSemantic: ["init", "--semantic", "--force"],
       // Plain `init`, not `--force`. It is incremental, skips when the graph is
       // already up to date, and installs the hook as part of setup, which is
       // all this row is asking for. `--force` is the same argv `fullRebuild`
@@ -1671,7 +1670,6 @@ export function registerShowGraphStats(
       // missing commit hook silently discarded and rebuilt the whole index.
       installHook: ["init"],
       installEmbed: ["embed", "init"],
-      restartEmbed: ["embed", "init", "--reinstall"],
       runFsck: ["fsck"],
       compact: ["fsck", "--fix"],
       // Without `--yes` this prompts per language. That is deliberate: it runs
@@ -1693,6 +1691,31 @@ export function registerShowGraphStats(
         if (go !== "Run") return;
       }
       runTravsrCommand(argv, repoRoot());
+      return;
+    }
+    if (msg.command === "reinstallEmbed") {
+      // Not a process restart. `embed init --reinstall` re-downloads the sidecar
+      // binary and the ONNX model, then re-embeds the repository, so the button
+      // says Reinstall and this says what that costs before it starts.
+      //
+      // The backend is named explicitly: without it the CLI opens its
+      // interactive model menu, and a panel button should not drop the user
+      // into a prompt in a terminal they did not ask for.
+      const backend = lastHealth.sidecars?.find((s) => s.name === "embed")?.backend;
+      const go = await vscode.window.showWarningMessage(
+        backend === undefined
+          ? "Reinstall the embedding sidecar? This re-downloads it and re-embeds the repository."
+          : `Reinstall the embedding sidecar (${backend})? This re-downloads the binary and its model, then re-embeds the repository.`,
+        { modal: true },
+        "Reinstall"
+      );
+      if (go !== "Reinstall") return;
+      runTravsrCommand(
+        backend === undefined
+          ? ["embed", "init", "--reinstall", "--yes"]
+          : ["embed", "init", "--reinstall", "--backend", backend],
+        repoRoot()
+      );
       return;
     }
     if (msg.command === "reindex") {

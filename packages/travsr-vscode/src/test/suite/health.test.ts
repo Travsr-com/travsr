@@ -46,7 +46,7 @@ const FULL: HealthData = {
   commitHook: false,
   sidecars: [
     { name: "embed", state: "not installed, semantic search off", ok: false, action: "installEmbed" },
-    { name: "rerank", state: "v0.4.1, ready", ok: true, action: "restartEmbed" },
+    { name: "rerank", state: "v0.4.1, ready", ok: true, action: "reinstallEmbed" },
   ],
   agents: [
     { name: "Claude Desktop", registered: true, detail: "registered" },
@@ -441,7 +441,7 @@ suite("health panel rendering", () => {
       buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, STOPPED);
     const HANDLED = new Set([
       "refresh", "startDaemon", "restartDaemon", "reindex", "fullRebuild",
-      "reindexSemantic", "installHook", "installEmbed", "restartEmbed",
+      "installHook", "installEmbed", "reinstallEmbed",
       "runFsck", "compact", "registerMcp", "prune", "remove", "fixLang", "disableLang",
       "runFix", "copyFix", "openFile", "setLogLines", "setLogFile", "setLogAuto",
       "initRepo", "detectLangs", "downloadBinary", "openBinarySetting",
@@ -457,6 +457,19 @@ suite("health panel rendering", () => {
     // The unindexed state's primary action has to be among them, since that is
     // the one this check previously never saw.
     assert.ok(posted.has("initRepo"), "the unindexed verdict's action was rendered");
+
+    // And the other direction, which is the half that was missing: a message
+    // the controller handles but nothing posts is dead weight, and listing it
+    // here actively hid it. `reindexSemantic` survived that way after the
+    // panel-wide semantic reindex became the per-language fixLang button.
+    //
+    // Messages the log controls own are exempt: they are posted from handlers
+    // this render does not inline, so their absence here says nothing.
+    const LOG_OWNED = new Set(["setLogLines", "setLogFile", "setLogAuto", "openFile"]);
+    for (const h of HANDLED) {
+      if (LOG_OWNED.has(h)) continue;
+      assert.ok(posted.has(h), `${h} is handled but no button posts it`);
+    }
   });
 
   test("the unindexed verdict offers an action that indexes", () => {

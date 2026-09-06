@@ -825,7 +825,10 @@ export interface SidecarRow {
   state: string;
   ok: boolean;
   /** The action this row offers, absent when there is nothing to do. */
-  action?: "installEmbed" | "restartEmbed";
+  action?: "installEmbed" | "reinstallEmbed";
+  /** The active backend id, so a reinstall can name it. Without it the CLI
+   *  opens its interactive model menu in a terminal the user did not ask for. */
+  backend?: string;
 }
 
 /** One agent config the extension knows how to write. */
@@ -1418,7 +1421,7 @@ export function buildStatsHtml(
               s.name,
               s.state,
               s.ok ? "ok" : "warn",
-              s.action ? act(s.action === "installEmbed" ? "Install" : "Restart", s.action, s.ok ? "ghost" : "primary") : ""
+              s.action ? act(s.action === "installEmbed" ? "Install" : "Reinstall", s.action, s.ok ? "ghost" : "primary") : ""
             )
           )
           .join("")
@@ -1549,7 +1552,7 @@ export function buildStatsHtml(
             const actions = primary || disable ? `${primary}${primary && disable ? " " : ""}${disable}` : "-";
             const prereq =
               l.prerequisites !== ""
-                ? `<div class="lprereq" title="${esc(l.prerequisites === "unknown" ? `travsr did not report prerequisites for ${l.language}.` : "What this project needs for full analysis")}">${esc(l.prerequisites)}</div>`
+                ? `<div class="lprereq" title="${esc(l.prerequisites === "unknown" ? `travsr did not report prerequisites for ${l.language}.` : "What this project needs for full analysis")}">needs: ${esc(l.prerequisites)}</div>`
                 : "";
             return (
               `<tr><td>${esc(l.language)}${prereq}</td>` +
