@@ -35,5 +35,7 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+# #811 tests inspect `ref_resolution_state` with the raw SQL the issue was
+# measured with, bypassing the store's readers (whose `JOIN nodes` hides orphans).
 # #862 tests seed and inspect `embed.db` directly, the way the sidecar writes it.
 rusqlite = { workspace = true }
