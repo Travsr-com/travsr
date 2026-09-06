@@ -35,3 +35,6 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+# #811 tests inspect `ref_resolution_state` with the raw SQL the issue was
+# measured with, bypassing the store's readers (whose `JOIN nodes` hides orphans).
+rusqlite = { workspace = true }

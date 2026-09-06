@@ -680,6 +680,55 @@ pub struct RefResolution {
     pub resolved_dst: Option<NodeId>,
 }
 
+/// #811: what one [`SqliteStore::reconcile_ref_resolution_states`] pass removed.
+///
+/// Two counters rather than one because they answer different questions: a
+/// large `cleared_resolved` after a full rebuild is the stale-marker backlog
+/// #811 is about, while `purged_orphans` tracks renames. Both zero means the
+/// table was already consistent with the graph, which is what a second run must
+/// always report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefReconcileReport {
+    /// `pending` rows deleted because `edge_sites` now holds a call site at the
+    /// same `(src, line)`.
+    pub cleared_resolved: usize,
+    /// Rows deleted because their `src` node no longer exists.
+    pub purged_orphans: usize,
+}
+
+impl RefReconcileReport {
+    /// Rows removed in total.
+    pub fn total(&self) -> usize {
+        self.cleared_resolved + self.purged_orphans
+    }
+}
+
+/// RFC-027 section 8.3: the `DELETE` behind
+/// [`SqliteStore::clear_resolved_pending_refs`], on any connection or open
+/// transaction, so the standalone method and the transactional
+/// [`SqliteStore::reconcile_ref_resolution_states`] share one statement.
+fn clear_resolved_pending_refs_on(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM ref_resolution_state \
+         WHERE state = 'pending' \
+           AND EXISTS (SELECT 1 FROM edge_sites s \
+                       WHERE s.src = ref_resolution_state.src \
+                         AND s.line = ref_resolution_state.ref_line)",
+        [],
+    )
+}
+
+/// RFC-027 section 9.2: the `DELETE` behind
+/// [`SqliteStore::purge_orphan_ref_resolution_states`]; see
+/// [`clear_resolved_pending_refs_on`] for why it is factored out.
+fn purge_orphan_ref_resolution_states_on(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM ref_resolution_state \
+         WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = ref_resolution_state.src)",
+        [],
+    )
+}
+
 /// RFC-027 section 12: how the live lane scored against Phase B.
 ///
 /// Deliberately three buckets, not two. `unverifiable` is the honest home for a
@@ -5506,16 +5555,7 @@ LIMIT ?4",
     ///
     /// Returns the number of rows cleared.
     pub fn clear_resolved_pending_refs(&mut self) -> Result<usize, StoreError> {
-        self.conn
-            .execute(
-                "DELETE FROM ref_resolution_state \
-                 WHERE state = 'pending' \
-                   AND EXISTS (SELECT 1 FROM edge_sites s \
-                               WHERE s.src = ref_resolution_state.src \
-                                 AND s.line = ref_resolution_state.ref_line)",
-                [],
-            )
-            .map_err(|e| StoreError::Database(e.to_string()))
+        clear_resolved_pending_refs_on(&self.conn).map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// RFC-027 section 9.2: drop reference rows whose `src` node is gone.
@@ -5535,13 +5575,57 @@ LIMIT ?4",
     ///
     /// Returns the number of rows purged.
     pub fn purge_orphan_ref_resolution_states(&mut self) -> Result<usize, StoreError> {
-        self.conn
-            .execute(
-                "DELETE FROM ref_resolution_state \
-                 WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = ref_resolution_state.src)",
-                [],
-            )
+        purge_orphan_ref_resolution_states_on(&self.conn)
             .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// #811: reconcile `ref_resolution_state` against the graph as it stands.
+    ///
+    /// The two hygiene deletes above, [`Self::clear_resolved_pending_refs`] and
+    /// [`Self::purge_orphan_ref_resolution_states`], used to run only from the
+    /// daemon's live-overlay ratification, so a `pending` row that a full CLI
+    /// Phase B rebuild (`travsr init --semantic --force`) had since resolved
+    /// survived it, and a daemon restarted on an already-current index never
+    /// reached ratification at all. `pending_ref_count` then over-reported
+    /// references the rebuilt graph resolves, which is the misleading abstention
+    /// the freshness note exists to prevent.
+    ///
+    /// This is the one entry point every Phase B completion path calls. It is
+    /// keyed purely on evidence in the store, so it is safe to run whenever the
+    /// graph is at rest and needs no knowledge of *which* Phase B produced it:
+    ///
+    /// - a `pending` row with a matching `edge_sites(src, line)` is resolved by
+    ///   definition and goes;
+    /// - a row whose `src` node no longer exists describes a reference that no
+    ///   longer exists and goes;
+    /// - everything else stays. A genuine unresolved reference has no site and a
+    ///   live node, and this must never touch it. Wiping the table would be the
+    ///   easy fix and the wrong one: the surviving rows are the honest record of
+    ///   what is still unresolved.
+    ///
+    /// Both deletes run in one transaction so a failure leaves the table exactly
+    /// as it was rather than half reconciled, and both are idempotent: a second
+    /// run over the same graph finds nothing to delete and returns zeros.
+    pub fn reconcile_ref_resolution_states(&mut self) -> Result<RefReconcileReport, StoreError> {
+        (|| -> AnyResult<RefReconcileReport> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("reconcile_ref_resolution_states: begin")?;
+            let cleared_resolved =
+                clear_resolved_pending_refs_on(&tx).context("clearing resolved pending refs")?;
+            let purged_orphans = purge_orphan_ref_resolution_states_on(&tx)
+                .context("purging orphan ref_resolution_state rows")?;
+            tx.commit()
+                .context("reconcile_ref_resolution_states: commit")?;
+            Ok(RefReconcileReport {
+                cleared_resolved,
+                purged_orphans,
+            })
+        })()
+        // `{:#}` keeps the SQLite cause behind the context, so a daemon log line
+        // says *why* the reconcile failed rather than only which step did.
+        .map_err(|e| StoreError::Database(format!("{e:#}")))
     }
 
     /// RFC-027 section 7.5: map a `(path, line)` position to the graph node
@@ -10164,6 +10248,588 @@ mod tests {
         );
         assert_eq!(store.purge_orphan_ref_resolution_states().unwrap(), 1);
         assert_eq!(store.pending_ref_count().unwrap(), 1);
+    }
+
+    // ── #811 reconcile_ref_resolution_states ─────────────────────────────────
+    //
+    // The store half of #811. Every test below inspects the table directly with
+    // the SQL the issue measured with, `SELECT COUNT(*) FROM ref_resolution_state
+    // WHERE state = 'pending'`, rather than through `pending_ref_count`, whose
+    // `JOIN nodes` would hide an orphan row and so pass over a table that still
+    // held it.
+
+    /// The issue's own measurement, verbatim.
+    fn raw_pending_count(store: &SqliteStore) -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM ref_resolution_state WHERE state = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn raw_row_count(store: &SqliteStore) -> i64 {
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM ref_resolution_state", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    fn raw_edge_sites_count(store: &SqliteStore) -> i64 {
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM edge_sites", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Whether a `(src, ref_line, name)` row is still present, in any state.
+    fn has_row(store: &SqliteStore, src: NodeId, line: u32, name: &str) -> bool {
+        store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ref_resolution_state \
+                 WHERE src = ?1 AND ref_line = ?2 AND name = ?3)",
+                params![node_id_to_i64(src), line as i64, name],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            != 0
+    }
+
+    fn resolved(src: NodeId, line: u32, name: &str, dst: NodeId) -> RefResolution {
+        RefResolution {
+            src,
+            ref_line: line,
+            ref_col: 0,
+            name: name.to_string(),
+            state: "resolved",
+            resolved_dst: Some(dst),
+        }
+    }
+
+    /// A caller and a callee in two files, with a `ref/call` edge between them
+    /// and nothing in `ref_resolution_state` yet.
+    fn caller_and_callee(store: &mut SqliteStore) -> (Node, Node) {
+        let caller = live_node("c", "src/a.ts", "fn:caller", "function", 1);
+        let callee = live_node("c", "src/b.ts", "fn:callee", "function", 1);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        (caller, callee)
+    }
+
+    /// Positive 1: a `pending` row whose `(src, line)` Phase B has since recorded
+    /// a call site for is resolved by definition and must go.
+    #[test]
+    fn reconcile_removes_a_pending_row_phase_b_resolved() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 3, "callee")])
+            .unwrap();
+        assert_eq!(raw_pending_count(&store), 1, "precondition");
+
+        // The rebuild's Phase B: the site now exists.
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 3)])
+            .unwrap();
+        let edges_before = store.edge_count().unwrap();
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(
+            report,
+            RefReconcileReport {
+                cleared_resolved: 1,
+                purged_orphans: 0,
+            }
+        );
+        assert_eq!(raw_pending_count(&store), 0);
+        assert!(!has_row(&store, caller.id, 3, "callee"));
+        assert_eq!(
+            raw_edge_sites_count(&store),
+            1,
+            "the evidence the reconcile keyed on must itself be untouched"
+        );
+        assert_eq!(
+            store.edge_count().unwrap(),
+            edges_before,
+            "reconciling the state table must not touch the graph"
+        );
+    }
+
+    /// Positive 2: the #811 shape is thousands of rows across many files. Every
+    /// one with a site goes, in one pass, whatever file or node it belongs to.
+    #[test]
+    fn reconcile_removes_every_resolved_pending_row_across_files() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let callee = live_node("c", "src/lib.ts", "fn:target", "function", 1);
+        store.put_node(&callee).unwrap();
+
+        let mut callers = Vec::new();
+        let mut sites = Vec::new();
+        for f in 0..6 {
+            let path = format!("src/f{f}.ts");
+            let a = live_node("c", &path, &format!("fn:a{f}"), "function", 1);
+            let b = live_node("c", &path, &format!("fn:b{f}"), "function", 40);
+            store.put_node(&a).unwrap();
+            store.put_node(&b).unwrap();
+            store
+                .replace_ref_resolution_states(
+                    "c",
+                    &path,
+                    &[
+                        pending(a.id, 3, "target"),
+                        pending(a.id, 7, "target"),
+                        pending(b.id, 42, "target"),
+                    ],
+                )
+                .unwrap();
+            sites.push((a.id, callee.id, 3));
+            sites.push((a.id, callee.id, 7));
+            sites.push((b.id, callee.id, 42));
+            callers.push((a, b));
+        }
+        assert_eq!(raw_pending_count(&store), 18, "precondition");
+        store.record_edge_sites(&sites).unwrap();
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report.cleared_resolved, 18);
+        assert_eq!(report.purged_orphans, 0);
+        assert_eq!(raw_pending_count(&store), 0);
+        assert_eq!(raw_row_count(&store), 0);
+        for (a, b) in &callers {
+            assert!(
+                store.iter_edges_from(a.id).is_ok() && store.iter_edges_from(b.id).is_ok(),
+                "graph reads must still work; the nodes are untouched"
+            );
+        }
+    }
+
+    /// Positive 3: a row whose `src` node no longer exists describes a reference
+    /// that no longer exists. `replace_ref_resolution_states` cannot reach it
+    /// (it resolves `src` through `nodes`), so the reconcile must.
+    #[test]
+    fn reconcile_purges_a_row_whose_source_node_is_gone() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let old = live_node("c", "src/a.ts", "fn:old", "function", 1);
+        store.put_node(&old).unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(old.id, 4, "x")])
+            .unwrap();
+        // The file is rewritten with the symbol gone: its id is retired.
+        store
+            .reindex_replace("c", "src/a.ts", &[], &[], "h")
+            .unwrap();
+        assert!(
+            store.get_node(old.id).unwrap().is_none(),
+            "precondition: the source node must be gone"
+        );
+        assert_eq!(
+            raw_pending_count(&store),
+            1,
+            "precondition: the row outlived it"
+        );
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(
+            report,
+            RefReconcileReport {
+                cleared_resolved: 0,
+                purged_orphans: 1,
+            }
+        );
+        assert_eq!(raw_pending_count(&store), 0);
+        assert_eq!(raw_row_count(&store), 0);
+    }
+
+    /// Positive 4: a realistic mixture. Only the rows the graph disproves go;
+    /// the honest abstentions and the unrelated valid rows all stay, and the
+    /// graph itself is untouched.
+    #[test]
+    fn reconcile_over_a_mixed_table_removes_only_what_the_graph_disproves() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        let other = live_node("c", "src/c.ts", "fn:other", "function", 1);
+        store.put_node(&other).unwrap();
+        // A symbol that will be renamed away, taking its id with it.
+        let doomed = live_node("c", "src/d.ts", "fn:doomed", "function", 1);
+        store.put_node(&doomed).unwrap();
+
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/a.ts",
+                &[
+                    // Resolved by the rebuild: a site lands on line 3.
+                    pending(caller.id, 3, "callee"),
+                    // Genuine abstention: nothing ever resolves line 9.
+                    pending(caller.id, 9, "nothing"),
+                    // Unrelated valid row: the live lane's own answer, which
+                    // `clear` never touches (it is keyed on `pending`).
+                    resolved(caller.id, 5, "callee", callee.id),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/c.ts", &[pending(other.id, 2, "ghost")])
+            .unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/d.ts",
+                &[
+                    pending(doomed.id, 4, "a"),
+                    resolved(doomed.id, 6, "b", callee.id),
+                ],
+            )
+            .unwrap();
+        // The rename: `src/d.ts` no longer defines `doomed`.
+        store
+            .reindex_replace("c", "src/d.ts", &[], &[], "h")
+            .unwrap();
+        // Phase B's evidence.
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 3), (caller.id, callee.id, 5)])
+            .unwrap();
+
+        let rows_before = raw_row_count(&store);
+        let pending_before = raw_pending_count(&store);
+        let sites_before = raw_edge_sites_count(&store);
+        let edges_before = store.edge_count().unwrap();
+        let nodes_before = store.node_count().unwrap();
+        assert_eq!((rows_before, pending_before), (6, 4), "precondition");
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(
+            report,
+            RefReconcileReport {
+                cleared_resolved: 1,
+                purged_orphans: 2,
+            },
+            "one resolved pending row, and both rows of the renamed symbol"
+        );
+        // Gone.
+        assert!(!has_row(&store, caller.id, 3, "callee"), "resolved pending");
+        assert!(!has_row(&store, doomed.id, 4, "a"), "orphan pending");
+        assert!(!has_row(&store, doomed.id, 6, "b"), "orphan resolved");
+        // Kept.
+        assert!(
+            has_row(&store, caller.id, 9, "nothing"),
+            "genuine abstention"
+        );
+        assert!(
+            has_row(&store, other.id, 2, "ghost"),
+            "genuine abstention, other file"
+        );
+        assert!(
+            has_row(&store, caller.id, 5, "callee"),
+            "valid resolved row"
+        );
+        assert_eq!(raw_pending_count(&store), 2);
+        assert_eq!(raw_row_count(&store), rows_before - 3);
+        // Before/after: the graph and its evidence are exactly as they were.
+        assert_eq!(raw_edge_sites_count(&store), sites_before);
+        assert_eq!(store.edge_count().unwrap(), edges_before);
+        assert_eq!(store.node_count().unwrap(), nodes_before);
+        // The two readers agree with the raw count once orphans are gone.
+        assert_eq!(store.pending_ref_count().unwrap(), 2);
+    }
+
+    /// Negative 9: a reference nothing resolved has no site and a live node. It
+    /// is the honest abstention RFC-027 exists to preserve, and must stay.
+    #[test]
+    fn reconcile_keeps_a_genuine_unresolved_reference() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, _callee) = caller_and_callee(&mut store);
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 3, "mystery")])
+            .unwrap();
+        assert_eq!(raw_edge_sites_count(&store), 0, "precondition: no evidence");
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report, RefReconcileReport::default());
+        assert_eq!(raw_pending_count(&store), 1);
+        assert!(has_row(&store, caller.id, 3, "mystery"));
+        assert_eq!(
+            store.pending_refs_in_file("c", "src/a.ts").unwrap(),
+            vec![("mystery".to_string(), 3)],
+            "the freshness note must still be able to report it"
+        );
+    }
+
+    /// Negative 10: a site on the neighbouring line is not evidence for this
+    /// one. `(src, line)` is the predicate, and an off-by-one must not match.
+    #[test]
+    fn reconcile_ignores_a_site_on_the_neighbouring_line() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 10, "callee")])
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 11)])
+            .unwrap();
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report, RefReconcileReport::default());
+        assert!(has_row(&store, caller.id, 10, "callee"));
+        assert_eq!(raw_pending_count(&store), 1);
+    }
+
+    /// Negative 11: the same line in a *different* enclosing definition is a
+    /// different call site. A row for `A` must not be cleared by `B`'s site.
+    #[test]
+    fn reconcile_ignores_a_matching_line_on_a_different_source() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (a, callee) = caller_and_callee(&mut store);
+        let b = live_node("c", "src/a.ts", "fn:b", "function", 30);
+        store.put_node(&b).unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(a.id, 10, "callee")])
+            .unwrap();
+        // B resolved something on its own line 10, which has nothing to do with A.
+        store.record_edge_sites(&[(b.id, callee.id, 10)]).unwrap();
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report, RefReconcileReport::default());
+        assert!(has_row(&store, a.id, 10, "callee"));
+        assert_eq!(raw_pending_count(&store), 1);
+    }
+
+    /// Negative 12: several sites on *other* lines of the same source are not
+    /// evidence either. Keyed on `src` alone this row would go (the finding-3
+    /// regression); keyed on `(src, line)` it stays.
+    #[test]
+    fn reconcile_ignores_sites_on_other_lines_of_the_same_source() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 10, "callee")])
+            .unwrap();
+        store
+            .record_edge_sites(&[
+                (caller.id, callee.id, 9),
+                (caller.id, callee.id, 11),
+                (caller.id, callee.id, 12),
+            ])
+            .unwrap();
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report, RefReconcileReport::default());
+        assert!(has_row(&store, caller.id, 10, "callee"));
+        assert_eq!(raw_pending_count(&store), 1);
+        assert_eq!(raw_edge_sites_count(&store), 3);
+    }
+
+    /// Negative 13: a table that is already consistent with the graph, holding
+    /// both a genuine abstention and a valid resolved row, is left exactly as it
+    /// is, and the pass reports that it did nothing.
+    #[test]
+    fn reconcile_on_a_consistent_table_changes_nothing() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/a.ts",
+                &[
+                    pending(caller.id, 3, "nothing"),
+                    resolved(caller.id, 5, "callee", callee.id),
+                ],
+            )
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 5)])
+            .unwrap();
+        let rows_before = raw_row_count(&store);
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report, RefReconcileReport::default());
+        assert_eq!(report.total(), 0);
+        assert_eq!(raw_row_count(&store), rows_before);
+        assert_eq!(raw_pending_count(&store), 1);
+
+        // And on a completely empty table.
+        let mut empty = SqliteStore::open_in_memory().unwrap();
+        assert_eq!(
+            empty.reconcile_ref_resolution_states().unwrap(),
+            RefReconcileReport::default()
+        );
+    }
+
+    /// Negative 15: idempotent. The first pass does the work; a second pass over
+    /// the same graph finds nothing, errors on nothing, and changes nothing.
+    #[test]
+    fn reconcile_is_idempotent() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        let doomed = live_node("c", "src/d.ts", "fn:doomed", "function", 1);
+        store.put_node(&doomed).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/a.ts",
+                &[
+                    pending(caller.id, 3, "callee"),
+                    pending(caller.id, 9, "nothing"),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/d.ts", &[pending(doomed.id, 4, "a")])
+            .unwrap();
+        store
+            .reindex_replace("c", "src/d.ts", &[], &[], "h")
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 3)])
+            .unwrap();
+
+        let first = store.reconcile_ref_resolution_states().unwrap();
+        assert_eq!(
+            first,
+            RefReconcileReport {
+                cleared_resolved: 1,
+                purged_orphans: 1,
+            }
+        );
+        let rows_after_first = raw_row_count(&store);
+        let pending_after_first = raw_pending_count(&store);
+        assert_eq!(pending_after_first, 1);
+
+        for _ in 0..3 {
+            let again = store.reconcile_ref_resolution_states().unwrap();
+            assert_eq!(
+                again,
+                RefReconcileReport::default(),
+                "a repeat must be a no-op"
+            );
+            assert_eq!(raw_row_count(&store), rows_after_first);
+            assert_eq!(raw_pending_count(&store), pending_after_first);
+        }
+        assert!(has_row(&store, caller.id, 9, "nothing"));
+    }
+
+    /// Negative 16: the two deletes are one transaction. Inject a failure into
+    /// the second (a trigger that aborts the orphan purge) and the first must be
+    /// rolled back with it: the table is either fully reconciled or untouched,
+    /// never half-way.
+    #[test]
+    fn a_failed_reconcile_leaves_the_table_untouched() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        let doomed = live_node("c", "src/d.ts", "fn:doomed", "function", 1);
+        store.put_node(&doomed).unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 3, "callee")])
+            .unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/d.ts", &[pending(doomed.id, 4, "a")])
+            .unwrap();
+        store
+            .reindex_replace("c", "src/d.ts", &[], &[], "h")
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 3)])
+            .unwrap();
+        assert_eq!(raw_pending_count(&store), 2, "precondition");
+
+        // The orphan purge is the second statement. Make it fail.
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER injected_failure BEFORE DELETE ON ref_resolution_state \
+                 WHEN NOT EXISTS (SELECT 1 FROM nodes WHERE id = OLD.src) \
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+
+        let err = store
+            .reconcile_ref_resolution_states()
+            .expect_err("the injected failure must surface");
+        assert!(
+            err.to_string().contains("injected"),
+            "the error must be the injected one, got: {err}"
+        );
+        assert_eq!(
+            raw_pending_count(&store),
+            2,
+            "the first delete (the resolved pending row) must have been rolled back"
+        );
+        assert!(has_row(&store, caller.id, 3, "callee"));
+        assert!(has_row(&store, doomed.id, 4, "a"));
+
+        // Remove the fault and the same pass completes in full.
+        store
+            .conn
+            .execute_batch("DROP TRIGGER injected_failure;")
+            .unwrap();
+        assert_eq!(
+            store.reconcile_ref_resolution_states().unwrap(),
+            RefReconcileReport {
+                cleared_resolved: 1,
+                purged_orphans: 1,
+            }
+        );
+        assert_eq!(raw_row_count(&store), 0);
+    }
+
+    /// Negative 17: a backlog the size #811 measured (thousands of rows) is
+    /// reconciled in one pass to exactly the right remainder.
+    #[test]
+    fn reconcile_handles_a_large_backlog() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let callee = live_node("c", "src/lib.ts", "fn:target", "function", 1);
+        store.put_node(&callee).unwrap();
+
+        const FILES: u32 = 40;
+        const LINES_PER_FILE: u32 = 100;
+        let mut sites = Vec::new();
+        for f in 0..FILES {
+            let path = format!("src/f{f}.ts");
+            let caller = live_node("c", &path, &format!("fn:caller{f}"), "function", 1);
+            store.put_node(&caller).unwrap();
+            let rows: Vec<RefResolution> = (1..=LINES_PER_FILE)
+                .map(|line| pending(caller.id, line, "target"))
+                .collect();
+            store
+                .replace_ref_resolution_states("c", &path, &rows)
+                .unwrap();
+            // Phase B resolves the even lines only.
+            for line in (2..=LINES_PER_FILE).step_by(2) {
+                sites.push((caller.id, callee.id, line));
+            }
+        }
+        let total = (FILES * LINES_PER_FILE) as i64;
+        assert_eq!(raw_pending_count(&store), total, "precondition");
+        store.record_edge_sites(&sites).unwrap();
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report.cleared_resolved as i64, total / 2);
+        assert_eq!(report.purged_orphans, 0);
+        assert_eq!(raw_pending_count(&store), total / 2);
+        assert_eq!(store.pending_ref_count().unwrap() as i64, total / 2);
+        assert_eq!(
+            store.reconcile_ref_resolution_states().unwrap(),
+            RefReconcileReport::default(),
+            "and the remainder is stable"
+        );
     }
 
     /// Finding 7: `_` is LIKE's single-character wildcard and identifiers are

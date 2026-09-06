@@ -1854,6 +1854,16 @@ pub fn init_repo_with_progress(
             if let Err(e) = store.reconcile_edge_languages() {
                 tracing::warn!("reconciling edge languages: {e:#}");
             }
+            // #811: the call sites are all recorded, so reconcile the
+            // reference-resolution table against them now, exactly as the
+            // daemon's ratification does. Without this a `pending` row the
+            // live lane wrote before this rebuild survived `--force` even
+            // though `edge_sites` now proves the reference resolved, and
+            // `pending_ref_count` kept reporting it. Not gated on which
+            // languages ran: the reconcile is keyed on the evidence in the
+            // store, so a crashed sidecar's files simply have no new sites and
+            // keep their rows.
+            reconcile_ref_resolution_states(&mut store);
             report
         };
         tracing::info!(
@@ -4405,20 +4415,69 @@ fn ratify_live_overlay(store: &mut SqliteStore, ratified: &[String]) {
         Err(e) => tracing::warn!("live overlay sweep failed: {e:#}"),
     }
     // A reference Phase B recorded a call site for is no longer pending, whoever
-    // resolved it.
-    if let Err(e) = store.clear_resolved_pending_refs() {
-        tracing::debug!("clearing resolved pending refs failed: {e:#}");
-    }
-    // Rows whose `src` node was renamed away are unreachable by every other
-    // delete path, so they would otherwise accumulate for the life of the repo.
-    match store.purge_orphan_ref_resolution_states() {
-        Ok(0) => {}
-        Ok(n) => tracing::debug!(
-            event = "live.pending.purged",
-            rows = n,
-            "purged reference rows whose enclosing symbol no longer exists"
+    // resolved it, and rows whose `src` node was renamed away are unreachable by
+    // every other delete path. Same reconcile every Phase B completion runs
+    // (#811); see `reconcile_ref_resolution_states`.
+    reconcile_ref_resolution_states(store);
+}
+
+/// #811: reconcile `ref_resolution_state` with the graph after Phase B lands.
+///
+/// The single call site shared by every path that completes a Phase B pass:
+/// the daemon's live-overlay ratification ([`ratify_live_overlay`]), the CLI's
+/// inline full rebuild (`travsr init --semantic`, in
+/// [`init_repo_with_progress`]), and daemon startup
+/// ([`reconcile_ref_resolution_states_on_startup`]). Before this, only the
+/// first of those ran the reconcile, so `pending` rows a full rebuild had
+/// resolved survived `travsr init --semantic --force` and a restart on a
+/// current index alike, and `pending_ref_count` over-reported references the
+/// rebuilt graph resolves.
+///
+/// The work itself lives in the store
+/// ([`SqliteStore::reconcile_ref_resolution_states`]): one transaction, keyed on
+/// evidence only (a matching `edge_sites` row, a missing `src` node), so it
+/// never deletes a genuine unresolved reference and a second run is a no-op.
+///
+/// Fail-open, like the rest of ratification: a reconcile that errors leaves
+/// stale-but-honest rows behind and never costs the graph anything, so it is
+/// logged and not propagated.
+fn reconcile_ref_resolution_states(store: &mut SqliteStore) {
+    match store.reconcile_ref_resolution_states() {
+        Ok(r) if r.total() == 0 => {}
+        Ok(r) => tracing::debug!(
+            event = "live.pending.reconciled",
+            cleared_resolved = r.cleared_resolved,
+            purged_orphans = r.purged_orphans,
+            "reconciled ref_resolution_state against the ratified graph"
         ),
-        Err(e) => tracing::debug!("purging orphan ref_resolution_state rows failed: {e:#}"),
+        Err(e) => tracing::debug!("reconciling ref_resolution_state failed: {e:#}"),
+    }
+}
+
+/// #811: the daemon-startup half of the reconcile.
+///
+/// A daemon restarted on an index that is already current never runs Phase B:
+/// `arm_phase_b_if_pending` only arms when `last_commit != phase_b_commit`, and
+/// `run_background_phase_b_inner` returns before ratification when they match.
+/// So whatever `pending` rows the previous daemon (or a CLI rebuild made before
+/// this fix) left behind would stay for the life of the index. Reconciling once
+/// at startup closes that gap without any graph work: it is two evidence-keyed
+/// `DELETE`s under a brief lock, never a rebuild, and on a clean table it
+/// deletes nothing.
+///
+/// Logged at `info` when it removed something, because a non-zero count here
+/// is exactly the backlog #811 reported and worth seeing in `travsr daemon logs`.
+fn reconcile_ref_resolution_states_on_startup(store: &std::sync::Mutex<SqliteStore>) {
+    let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+    match s.reconcile_ref_resolution_states() {
+        Ok(r) if r.total() == 0 => {}
+        Ok(r) => tracing::info!(
+            event = "live.pending.reconciled",
+            cleared_resolved = r.cleared_resolved,
+            purged_orphans = r.purged_orphans,
+            "startup: reconciled stale ref_resolution_state rows left by a previous session"
+        ),
+        Err(e) => tracing::warn!("startup ref_resolution_state reconcile failed: {e:#}"),
     }
 }
 
@@ -8903,6 +8962,518 @@ mod tests {
         );
     }
 
+    // ── #811: ref_resolution_state reconciled on every Phase B completion ──
+    //
+    // The daemon half of #811. The store tests prove the reconcile itself; these
+    // prove it runs from every path that completes a Phase B pass, on a real
+    // repository, and assert on the table with the SQL the issue measured with
+    // rather than through `pending_ref_count` (whose `JOIN nodes` hides orphans).
+
+    /// The issue's own measurement, verbatim, on the on-disk database.
+    fn raw_pending_count(db_path: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM ref_resolution_state WHERE state = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Whether a `(src, ref_line, name)` row is present, in any state.
+    fn raw_has_row(
+        db_path: &std::path::Path,
+        src: travsr_core::NodeId,
+        line: u32,
+        name: &str,
+    ) -> bool {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ref_resolution_state \
+                 WHERE src = ?1 AND ref_line = ?2 AND name = ?3)",
+                rusqlite::params![src.0 as i64, line as i64, name],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            != 0
+    }
+
+    /// Whether Phase B recorded a call site at `(src, line)`: the evidence the
+    /// reconcile keys on.
+    fn raw_edge_site_exists(
+        db_path: &std::path::Path,
+        src: travsr_core::NodeId,
+        line: u32,
+    ) -> bool {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM edge_sites WHERE src = ?1 AND line = ?2)",
+                rusqlite::params![src.0 as i64, line as i64],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            != 0
+    }
+
+    fn meta(db_path: &std::path::Path, key: &str) -> Option<String> {
+        travsr_store::SqliteStore::open(db_path)
+            .unwrap()
+            .get_meta(key)
+            .unwrap()
+    }
+
+    /// The part of the graph the reconcile is keyed on and must never change:
+    /// every node, every `ref/*` edge with its provenance, and every call site.
+    ///
+    /// Narrower than `graph_fingerprint` on purpose. Repeated `--force` passes
+    /// are not byte-stable on Phase A's speculative import `resolves-to` edges
+    /// (a pre-existing property of the purge-and-restage path, unrelated to
+    /// #811), and comparing those would make this test about that instead.
+    fn semantic_fingerprint(db_path: &std::path::Path) -> (Vec<String>, Vec<String>, i64) {
+        let store = travsr_store::SqliteStore::open(db_path).unwrap();
+        let mut refs: Vec<String> = store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, _, kind, _)| kind.starts_with("ref/"))
+            .map(|(s, d, k, p)| format!("{}|{}|{k}|{p}", s.0, d.0))
+            .collect();
+        refs.sort();
+        let sites: i64 = rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM edge_sites", [], |r| r.get(0))
+            .unwrap();
+        (store.node_fingerprint().unwrap(), refs, sites)
+    }
+
+    /// `travsr init --semantic [--force]`, exactly as `crates/travsr-cli/src/init.rs`
+    /// drives it. `init_repo` would defer Phase B to the daemon and never reach the
+    /// inline path under test.
+    fn init_semantic(root: &std::path::Path, force: bool) {
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        let r = init_repo_with_progress(root, None, true, force, &mut |_| {});
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+        r.expect("init_repo_with_progress(semantic = true)");
+    }
+
+    /// The original `caller.ts`. Line 4's `notify()` is the #811 shape: the two
+    /// lanes disagree about it by design. `notify` is a parameter of `run`, so
+    /// the precision-first live lane refuses the repo-wide lookup (section 7.3
+    /// step 1: a locally bound bare identifier is not a free reference) and
+    /// records `pending`; Phase B's recall-biased resolver has no such gate and,
+    /// finding exactly one `fn:notify` in the repo, records a call site at that
+    /// line. A pending row with a site beside it is exactly what the issue
+    /// sampled. Line 5's `frobnicate()` has no definition anywhere, so nothing
+    /// ever resolves it: the genuine abstention that must survive every pass.
+    const CALLER_TS: &str = "import { Billing } from \"./billing\";\n\
+                             export function run(bill: Billing, notify: () => void): void {\n\
+                             \x20 bill.charge();\n\
+                             \x20 notify();\n\
+                             \x20 frobnicate();\n\
+                             }\n";
+    const NOTIFY_LINE: u32 = 4;
+    const FROBNICATE_LINE: u32 = 5;
+
+    /// A committed TypeScript repo with the fixture above, fully indexed by
+    /// `travsr init --semantic`. Returns the root, the database, the corpus and
+    /// the id of `run`, the enclosing definition every row in the test hangs off.
+    fn repo_with_a_shadowed_call() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        String,
+        travsr_core::NodeId,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/billing.ts"),
+            "export class Billing {\n  charge(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/notify.ts"),
+            "export function notify(): void {}\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("src/caller.ts"), CALLER_TS).unwrap();
+        git_commit_all(tmp.path(), "seed");
+
+        init_semantic(tmp.path(), false);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
+        let run = store
+            .enclosing_definition_at(&corpus, "src/caller.ts", NOTIFY_LINE)
+            .unwrap()
+            .expect("`run` must enclose line 4");
+        assert_eq!(
+            meta(&db_path, "phase_b_commit"),
+            meta(&db_path, "last_commit"),
+            "precondition: init --semantic must leave Phase B current"
+        );
+        assert!(
+            raw_edge_site_exists(&db_path, run, NOTIFY_LINE),
+            "precondition: Phase B must record a call site for `notify()`, or there is \
+             nothing for the live lane's abstention to go stale against"
+        );
+        assert!(
+            !raw_edge_site_exists(&db_path, run, FROBNICATE_LINE),
+            "precondition: nothing may resolve `frobnicate`, or the negative case is vacuous"
+        );
+        (tmp, db_path, corpus, run)
+    }
+
+    /// Steps 2 and 3 of the #811 repro. The daemon is up: a save lands, Phase A
+    /// re-indexes the file (dropping its `edge_sites`) and the live lane records
+    /// what it saw, abstaining on `notify` and `frobnicate`. Then the edit is
+    /// reverted on disk with the daemon stopped, so nothing re-processes the
+    /// file. Returns the id of the function the edit added, whose rows are now
+    /// orphans.
+    fn edit_overlay_and_revert(
+        tmp: &tempfile::TempDir,
+        db_path: &std::path::Path,
+        corpus: &str,
+        run: travsr_core::NodeId,
+    ) -> travsr_core::NodeId {
+        let caller = tmp.path().join("src/caller.ts");
+        let mut edited = CALLER_TS.to_string();
+        edited.push_str("\nexport function again(bill: Billing): void {\n  bill.charge();\n}\n");
+        std::fs::write(&caller, &edited).unwrap();
+        let again = {
+            let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
+            reindex_files(std::slice::from_ref(&caller), tmp.path(), &mut store).unwrap();
+            live_resolve_file(&mut store, corpus, tmp.path(), &caller);
+            store
+                .enclosing_definition_at(corpus, "src/caller.ts", 9)
+                .unwrap()
+                .expect("`again` must enclose line 9 after the save")
+        };
+        assert!(
+            raw_has_row(db_path, run, NOTIFY_LINE, "notify"),
+            "precondition: the live lane must abstain on the locally bound call"
+        );
+        assert!(
+            raw_has_row(db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "precondition: the live lane must abstain on the undefined call"
+        );
+        assert!(
+            !raw_edge_site_exists(db_path, run, NOTIFY_LINE),
+            "precondition: the save dropped the file's call sites, so at this point \
+             the pending row is honest"
+        );
+
+        // The revert, with the daemon stopped.
+        std::fs::write(&caller, CALLER_TS).unwrap();
+        again
+    }
+
+    /// Positive 5, the #811 reproduction. After `travsr init --semantic --force`
+    /// the rebuilt graph resolves line 4 (a call site is recorded), so the live
+    /// lane's `pending` row for it is stale and must go; the row for line 5,
+    /// which nothing resolves, must stay; and the rows of the function the
+    /// revert removed are orphans and must go too. Before the fix the CLI path
+    /// never reconciled, so the stale row survived with the site beside it.
+    #[test]
+    fn a_full_semantic_rebuild_retires_the_pending_rows_it_resolved() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus, run) = repo_with_a_shadowed_call();
+        let again = edit_overlay_and_revert(&tmp, &db_path, &corpus, run);
+        let pending_before = raw_pending_count(&db_path);
+        assert!(pending_before >= 2, "precondition: got {pending_before}");
+
+        // Step 4: the full rebuild.
+        init_semantic(tmp.path(), true);
+
+        // The graph is right: Phase B current, no live overlay, `run` still
+        // there under the same id, `again` gone with the revert.
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            meta(&db_path, "phase_b_commit"),
+            meta(&db_path, "last_commit")
+        );
+        assert_ne!(meta(&db_path, "phase_b_dirty").as_deref(), Some("1"));
+        assert_eq!(store.count_edges_with_provenance("live").unwrap(), 0);
+        assert_eq!(
+            store
+                .enclosing_definition_at(&corpus, "src/caller.ts", NOTIFY_LINE)
+                .unwrap(),
+            Some(run),
+            "a full rebuild must reproduce `run` under the same id"
+        );
+        assert!(
+            store.get_node(again).unwrap().is_none(),
+            "the revert removed `again`"
+        );
+        assert!(
+            raw_edge_site_exists(&db_path, run, NOTIFY_LINE),
+            "the rebuilt graph resolves line 4: this is the site the pending row is stale against"
+        );
+
+        // The table agrees with the graph.
+        assert!(
+            !raw_has_row(&db_path, run, NOTIFY_LINE, "notify"),
+            "a pending row Phase B has recorded a call site for must not survive \
+             `init --semantic --force` (#811)"
+        );
+        assert!(
+            !raw_has_row(&db_path, again, 9, "charge"),
+            "rows of a definition the revert removed are orphans and must go"
+        );
+        assert!(
+            raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "the genuine unresolved reference must stay pending"
+        );
+        assert_eq!(
+            raw_pending_count(&db_path),
+            1,
+            "exactly the one honest abstention remains"
+        );
+        assert_eq!(
+            store.pending_ref_count().unwrap(),
+            1,
+            "the count the freshness note shows agrees with the raw table"
+        );
+    }
+
+    /// Positive 6: repeated full rebuilds are stable. A second and third
+    /// `--force` must not reintroduce stale rows, change the pending count, or
+    /// change the graph.
+    #[test]
+    fn repeated_full_rebuilds_keep_the_pending_count_stable() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus, run) = repo_with_a_shadowed_call();
+        edit_overlay_and_revert(&tmp, &db_path, &corpus, run);
+
+        init_semantic(tmp.path(), true);
+        let after_first = (raw_pending_count(&db_path), semantic_fingerprint(&db_path));
+        assert_eq!(
+            after_first.0, 1,
+            "precondition: the first rebuild reconciled"
+        );
+
+        for pass in 2..=3 {
+            init_semantic(tmp.path(), true);
+            assert_eq!(
+                raw_pending_count(&db_path),
+                after_first.0,
+                "rebuild {pass} changed the pending count"
+            );
+            assert!(
+                raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
+                "rebuild {pass} lost the genuine abstention"
+            );
+            assert!(
+                !raw_has_row(&db_path, run, NOTIFY_LINE, "notify"),
+                "rebuild {pass} reintroduced the stale row"
+            );
+            assert_eq!(
+                semantic_fingerprint(&db_path),
+                after_first.1,
+                "rebuild {pass} changed the nodes, the ref edges or the call sites"
+            );
+        }
+        // And the table is now a fixed point of the reconcile itself.
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.reconcile_ref_resolution_states().unwrap(),
+            travsr_store::RefReconcileReport::default()
+        );
+    }
+
+    /// The state a pre-fix session leaves behind, on a current index: pending
+    /// rows whose call sites Phase B has already recorded. The live lane runs
+    /// over the unchanged file, so its abstentions land beside the sites init's
+    /// Phase B wrote, and nothing is armed because `phase_b_commit` is at HEAD.
+    fn stale_rows_on_a_current_index(
+        tmp: &tempfile::TempDir,
+        db_path: &std::path::Path,
+        corpus: &str,
+        run: travsr_core::NodeId,
+    ) {
+        let caller = tmp.path().join("src/caller.ts");
+        let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
+        live_resolve_file(&mut store, corpus, tmp.path(), &caller);
+        assert!(
+            raw_has_row(db_path, run, NOTIFY_LINE, "notify"),
+            "precondition"
+        );
+        assert!(
+            raw_has_row(db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "precondition"
+        );
+        assert!(
+            raw_edge_site_exists(db_path, run, NOTIFY_LINE),
+            "precondition: the stale shape is a pending row with a site beside it"
+        );
+        assert_eq!(
+            meta(db_path, "phase_b_commit"),
+            meta(db_path, "last_commit"),
+            "precondition: the index is current, so no Phase B is due"
+        );
+    }
+
+    /// Positive 7: a daemon restarted on a current index has no Phase B to run
+    /// and so never reaches ratification. Its startup reconcile must retire the
+    /// stale rows anyway, without touching the graph or triggering a rebuild.
+    #[test]
+    fn a_daemon_restart_on_a_current_index_reconciles_without_a_rebuild() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus, run) = repo_with_a_shadowed_call();
+        stale_rows_on_a_current_index(&tmp, &db_path, &corpus, run);
+        let before = graph_fingerprint(&db_path);
+        let marker_before = meta(&db_path, "phase_b_commit");
+
+        // What the daemon does on startup, in order: open the store, reconcile,
+        // and let the scheduler decide whether Phase B is due.
+        let store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        reconcile_ref_resolution_states_on_startup(&store);
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        arm_phase_b_if_pending(&store, &sched);
+        assert!(
+            !sched.try_claim(),
+            "a current index must not arm a Phase B run: the reconcile is not a rebuild"
+        );
+        // Even if a tick did claim a run, the worker returns before any work.
+        assert_eq!(
+            run_background_phase_b_inner(tmp.path(), &store),
+            phase_b_sched::RunOutcome::Success
+        );
+        drop(store);
+
+        assert!(
+            !raw_has_row(&db_path, run, NOTIFY_LINE, "notify"),
+            "the stale row must not survive a daemon restart (#811)"
+        );
+        assert!(
+            raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "the genuine abstention must survive it"
+        );
+        assert_eq!(raw_pending_count(&db_path), 1);
+        assert_eq!(
+            graph_fingerprint(&db_path),
+            before,
+            "no graph work may happen"
+        );
+        assert_eq!(meta(&db_path, "phase_b_commit"), marker_before);
+    }
+
+    /// Positive 8: the path that always reconciled still does, through the
+    /// shared helper: a resolved pending row goes, a genuine one stays, and an
+    /// orphan is purged, exactly as before the refactor.
+    #[test]
+    fn daemon_ratification_still_reconciles_pending_rows() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus, run) = repo_with_a_shadowed_call();
+        stale_rows_on_a_current_index(&tmp, &db_path, &corpus, run);
+        // A row whose enclosing symbol no longer exists (a rename retired its id).
+        let ghost = travsr_core::NodeId(0xDEAD_BEEF);
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store
+                .upsert_ref_resolution_states(&[travsr_store::RefResolution {
+                    src: ghost,
+                    ref_line: 1,
+                    ref_col: 0,
+                    name: "gone".to_string(),
+                    state: "pending",
+                    resolved_dst: None,
+                }])
+                .unwrap();
+        }
+        assert_eq!(raw_pending_count(&db_path), 3, "precondition");
+
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            ratify_live_overlay(&mut store, &["typescript".to_string()]);
+        }
+
+        assert!(
+            !raw_has_row(&db_path, run, NOTIFY_LINE, "notify"),
+            "resolved pending"
+        );
+        assert!(!raw_has_row(&db_path, ghost, 1, "gone"), "orphan");
+        assert!(
+            raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "genuine"
+        );
+        assert_eq!(raw_pending_count(&db_path), 1);
+    }
+
+    /// Negative 14: the reconcile does not depend on Phase B work existing. With
+    /// `phase_b_commit` already at `last_commit` and nothing to rebuild, the
+    /// startup pass alone brings the table in line with the graph.
+    #[test]
+    fn startup_reconcile_needs_no_phase_b_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        let (caller, callee) = {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", "abc123").unwrap();
+            store.set_meta("phase_b_commit", "abc123").unwrap();
+            let caller = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/a.ts", "typescript", "fn:caller"),
+                "function",
+            );
+            let callee = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/b.ts", "typescript", "fn:callee"),
+                "function",
+            );
+            store.put_node(&caller).unwrap();
+            store.put_node(&callee).unwrap();
+            store
+                .put_edge(&travsr_core::Edge::new(
+                    caller.id,
+                    callee.id,
+                    travsr_core::EdgeKind::RefCall,
+                ))
+                .unwrap();
+            store
+                .record_edge_sites(&[(caller.id, callee.id, 3)])
+                .unwrap();
+            let row = |line, name: &str| travsr_store::RefResolution {
+                src: caller.id,
+                ref_line: line,
+                ref_col: 0,
+                name: name.to_string(),
+                state: "pending",
+                resolved_dst: None,
+            };
+            store
+                .upsert_ref_resolution_states(&[row(3, "callee"), row(7, "mystery")])
+                .unwrap();
+            (caller.id, callee.id)
+        };
+        assert_eq!(raw_pending_count(&db_path), 2, "precondition");
+        let edges_before = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .edge_count()
+            .unwrap();
+
+        let store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        // Nothing is due, so the scheduler stays idle...
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        arm_phase_b_if_pending(&store, &sched);
+        assert!(!sched.try_claim());
+        // ...and the startup reconcile is the only thing that runs.
+        reconcile_ref_resolution_states_on_startup(&store);
+        // Twice, to show the second pass is a no-op.
+        reconcile_ref_resolution_states_on_startup(&store);
+        drop(store);
+
+        assert!(!raw_has_row(&db_path, caller, 3, "callee"));
+        assert!(raw_has_row(&db_path, caller, 7, "mystery"));
+        assert_eq!(raw_pending_count(&db_path), 1);
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(store.edge_count().unwrap(), edges_before);
+        assert!(store.get_node(callee).unwrap().is_some());
+        assert_eq!(meta(&db_path, "phase_b_commit").as_deref(), Some("abc123"));
+    }
+
     /// `ratified_languages` maps analyzer names onto how nodes are labeled.
     #[test]
     fn ratified_languages_maps_javascript_and_the_lsif_pass_onto_typescript() {
@@ -11304,6 +11875,11 @@ impl Daemon {
         let store = Arc::new(Mutex::new(
             SqliteStore::open(&db_path).context("opening graph.db")?,
         ));
+        // #811: a restart on a current index never reaches Phase B
+        // ratification, so this is the only chance to retire `pending` rows a
+        // previous session (or a pre-fix CLI rebuild) left behind. Evidence-
+        // keyed deletes only; no graph work.
+        reconcile_ref_resolution_states_on_startup(&store);
         // R5 (#342): separate read-only connection so Query messages do not
         // hold the write mutex while the indexer worker needs it.
         let read_store = Arc::new(Mutex::new(
