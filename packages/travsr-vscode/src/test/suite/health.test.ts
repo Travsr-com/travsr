@@ -164,6 +164,31 @@ suite("verdict", () => {
     assert.ok(/read from the graph on disk/.test(v.detail));
   });
 
+  test("a stopped daemon outranks staleness, which is the case this panel was built for", () => {
+    // The combination with no test: queries answered by the extension's own
+    // `travsr mcp --stdio` child, daemon stopped, graph stale. Staleness was
+    // checked first, so it offered Reindex, which fixes freshness once and
+    // leaves nothing watching, and the next commit re-stales the graph. The
+    // existing "outranks everything else" test passed mcpConnected=false, so it
+    // hit the earlier `offline` branch and never reached this ordering.
+    const v = computeVerdict(true, false, STALE, [], true);
+    assert.strictEqual(v.verdict, "degraded");
+    assert.strictEqual(v.headline, "Not watching");
+    assert.strictEqual(v.action?.message, "startDaemon");
+    // And it says both things, rather than trading one omission for another.
+    assert.ok(/will not refresh/.test(v.detail), v.detail);
+    assert.ok(/catches it up/.test(v.detail), v.detail);
+    assert.ok(v.detail.includes(STALE.indexedCommit), "naming the commit it is stuck on");
+  });
+
+  test("a stale graph with the daemon running still says Stale", () => {
+    // The swap must not swallow the stale verdict where it is the only fault.
+    const v = computeVerdict(true, true, STALE, [], true);
+    assert.strictEqual(v.verdict, "stale");
+    assert.strictEqual(v.headline, "Stale");
+    assert.strictEqual(v.action?.message, "reindex");
+  });
+
   test("a stopped daemon is reported even while queries still answer", () => {
     // The regression this pins: the page read the MCP client's connection
     // state as the daemon's state. The extension spawns its own

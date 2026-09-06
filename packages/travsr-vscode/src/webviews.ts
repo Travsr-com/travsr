@@ -1057,6 +1057,31 @@ export function computeVerdict(
       action: { label: "Start daemon", message: "startDaemon" },
     };
   }
+  // Queries work, but nothing is watching the repository. Commits and saves
+  // will not refresh the graph, so this is a real degradation even though the
+  // numbers on the page may all be correct.
+  //
+  // This is checked before staleness, which is the order the comment above this
+  // function has always described and the order the code did not have. Stopped
+  // and stale together is the state this panel was built for, and ranking stale
+  // first offered Reindex, which fixes freshness once and leaves nothing
+  // watching, so the next commit re-stales the graph. Start daemon is the more
+  // complete remedy: the daemon reconciles HEAD drift on its first tick after
+  // startup (`reconcile_head_drift`, run immediately rather than after the
+  // first five-minute interval), so it catches the graph up and then keeps it
+  // up. `is_stale` is commit-identity only, which is exactly what that
+  // reconciliation keys on.
+  if (!daemonRunning) {
+    return {
+      verdict: "degraded",
+      headline: "Not watching",
+      detail:
+        index.isStale === true
+          ? `Queries are answered from the graph on disk, but the daemon is not running, so commits and saves will not refresh it. The graph describes ${index.indexedCommit || "an earlier commit"}; starting the daemon catches it up and keeps it up.`
+          : "Queries are answered from the graph on disk, but the daemon is not running, so commits and saves will not refresh it.",
+      action: { label: "Start daemon", message: "startDaemon" },
+    };
+  }
   if (index.isStale === true) {
     const behind =
       index.behindBy !== null && index.behindBy > 0
@@ -1067,18 +1092,6 @@ export function computeVerdict(
       headline: "Stale",
       detail: `The graph describes ${index.indexedCommit || "an earlier commit"}. ${behind}`,
       action: { label: "Reindex", message: "reindex" },
-    };
-  }
-  // Queries work, but nothing is watching the repository. Commits and saves
-  // will not refresh the graph, so this is a real degradation even though every
-  // number on the page is currently correct.
-  if (!daemonRunning) {
-    return {
-      verdict: "degraded",
-      headline: "Not watching",
-      detail:
-        "Queries are answered from the graph on disk, but the daemon is not running, so commits and saves will not refresh it.",
-      action: { label: "Start daemon", message: "startDaemon" },
     };
   }
   const errs = diags.filter((d) => d.severity === "error").length;
