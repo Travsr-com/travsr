@@ -373,20 +373,27 @@ pub fn synthesize_js_tsconfig(
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .collect();
 
-    // `node16` resolves `require()` (the reported CommonJS case) and honours
-    // the real `.mjs`/`.cjs` extension semantics this pass targets. It replaces
-    // `commonjs`/`node` (node10), which TypeScript has scheduled for removal in
-    // 6.0; measured on a CJS + ESM + JSX fixture the two emit byte-identical
-    // dumps, so this is future-proofing at no resolution cost. TS requires
-    // `module` and `moduleResolution` to agree here (TS5095). checkJs/noEmit
-    // keep it a pure resolution pass — we never type-check or write output.
+    // `bundler` resolution is the permissive resolver that handles both the
+    // CommonJS `require()` case #833 reports and extensionless relative ESM
+    // imports (`import { add } from './math'`) — the ordinary Vite / webpack /
+    // Next convention. It replaces `commonjs`/`node` (node10), which TypeScript
+    // removes in 6.0. `node16` was the first replacement tried, but under a
+    // `"type": "module"` package it treats an extensionless `.js` import as
+    // unresolved ESM and, with `checkJs` off, drops the cross-file reference
+    // with no diagnostic: measured over CJS + ESM fixtures node16 leaves CJS
+    // byte-identical but takes the ESM case from 2 reference edges to 0, the
+    // opposite of what this pass is for. `module: "preserve"` is the pairing
+    // `moduleResolution: "bundler"` requires and lets a file mix `import` and
+    // `require`. checkJs/noEmit keep it a pure resolution pass — we never
+    // type-check or write output. (integration.test.ts pins the ESM behaviour;
+    // a config-keys-only test cannot, since the keys are exactly what changed.)
     let config = serde_json::json!({
         "compilerOptions": {
             "allowJs": true,
             "checkJs": false,
             "noEmit": true,
-            "module": "node16",
-            "moduleResolution": "node16",
+            "module": "preserve",
+            "moduleResolution": "bundler",
             "target": "es2020",
             "resolveJsonModule": true,
             "skipLibCheck": true,
@@ -1393,15 +1400,18 @@ mod tests {
         // allowJs is the whole point — without it tsc ignores .js sources.
         assert_eq!(json["compilerOptions"]["allowJs"], serde_json::json!(true));
         assert_eq!(json["compilerOptions"]["noEmit"], serde_json::json!(true));
-        // node16, not the deprecated node10 resolver, and both keys must agree
-        // or tsc rejects the config outright (TS5095).
+        // bundler resolution, not the deprecated node10 resolver, paired with
+        // `module: "preserve"` (bundler requires an esnext/preserve module).
+        // This only guards that the Rust side writes the intended keys; the ESM
+        // extensionless-import behaviour those keys buy is pinned by the
+        // emitter's integration.test.ts, which a config-keys check cannot cover.
         assert_eq!(
             json["compilerOptions"]["module"],
-            serde_json::json!("node16")
+            serde_json::json!("preserve")
         );
         assert_eq!(
             json["compilerOptions"]["moduleResolution"],
-            serde_json::json!("node16")
+            serde_json::json!("bundler")
         );
         // Exactly the files we asked for, in order, so the compiler processes
         // only what Phase A indexed (no directory walk, no orphan-edge risk).

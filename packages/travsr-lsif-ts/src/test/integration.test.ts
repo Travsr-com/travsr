@@ -257,6 +257,80 @@ test('--root makes VName paths repo-relative for a synthesized out-of-repo tscon
   }
 });
 
+// ── issue #833 follow-up: extensionless ESM imports must resolve cross-file ──
+//
+// The synthesized JS tsconfig uses `moduleResolution: "bundler"` (see
+// synthesize_js_tsconfig in travsr-indexer). Under `node16`, a `.js` file in a
+// `"type": "module"` package is ESM, an extensionless relative import does not
+// resolve, and with `checkJs` off the cross-file reference is dropped with no
+// diagnostic — the ordinary Vite/webpack/Next shape silently loses its edges.
+// `bundler` resolves it. This pins the behaviour the config keys buy, which a
+// config-keys assertion cannot: assert a reference occurrence in main.js links
+// to the shared referenceResult for `add` defined in math.js.
+
+test('extensionless ESM import resolves cross-file under bundler resolution (#833)', () => {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-esmrepo-')));
+  const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-esmcfg-')));
+  try {
+    // `"type": "module"` makes the .js files ESM — the case node16 mishandles.
+    fs.writeFileSync(path.join(repo, 'package.json'), '{ "type": "module" }\n');
+    fs.writeFileSync(path.join(repo, 'math.js'), 'export function add(a, b) {\n  return a + b;\n}\n');
+    fs.writeFileSync(
+      path.join(repo, 'main.js'),
+      // extensionless relative import — no `.js` — the bundler convention.
+      "import { add } from './math';\nexport function run() {\n  return add(1, 2);\n}\n"
+    );
+
+    const synthTsconfig = path.join(scratch, 'tsconfig.json');
+    fs.writeFileSync(
+      synthTsconfig,
+      JSON.stringify({
+        // Mirror synthesize_js_tsconfig exactly.
+        compilerOptions: {
+          allowJs: true,
+          checkJs: false,
+          noEmit: true,
+          module: 'preserve',
+          moduleResolution: 'bundler',
+          target: 'es2020',
+          resolveJsonModule: true,
+          skipLibCheck: true,
+        },
+        files: [path.join(repo, 'math.js'), path.join(repo, 'main.js')],
+      })
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [EMITTER_BIN, '--project', synthTsconfig, '--root', repo],
+      { encoding: 'utf-8' }
+    );
+    assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+
+    // Locate the main.js document vertex; item/references edges carry the
+    // document they occur in, so a references item anchored in main.js is a
+    // reference site there — which exists only if `./math` resolved.
+    const mainDoc = parseVertices(result.stdout).find(
+      (v) => v['label'] === 'document' && typeof v['uri'] === 'string' && (v['uri'] as string).endsWith('/main.js')
+    );
+    assert.ok(mainDoc, 'no document vertex for main.js');
+
+    const refItemsInMain = parseEdges(result.stdout).filter(
+      (e) =>
+        e['label'] === 'item' &&
+        e['property'] === 'references' &&
+        e['document'] === mainDoc!['id']
+    );
+    assert.ok(
+      refItemsInMain.length > 0,
+      'no cross-file reference resolved from main.js — extensionless ESM import was dropped (node16 regression)'
+    );
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /** All travsr_vname signatures in the dump whose path ends with `fileSuffix`. */
