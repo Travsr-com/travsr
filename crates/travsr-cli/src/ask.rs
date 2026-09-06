@@ -350,6 +350,15 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             println!();
             print_docs(&payload.docs);
         }
+        // #826: an abstention may be a setup gap rather than a genuine absence,
+        // so say which one. `degraded_note` is the per-query signal the matched
+        // path already prints (and `--format json` already carries): it names
+        // `travsr embed init` only when semantic search really did not run for
+        // THIS query in THIS repo, and says "warming up" / "in progress" /
+        // "degraded" in the states where that command is the wrong advice.
+        if !payload.degraded_note.is_empty() {
+            println!("\n{}", payload.degraded_note);
+        }
         return Ok(());
     }
     if payload.no_results {
@@ -357,6 +366,10 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         if !payload.docs.is_empty() {
             println!();
             print_docs(&payload.docs);
+        }
+        // #826: same reasoning as the abstain branch above.
+        if !payload.degraded_note.is_empty() {
+            println!("\n{}", payload.degraded_note);
         }
         return Ok(());
     }
