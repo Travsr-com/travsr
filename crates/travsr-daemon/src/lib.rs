@@ -2929,6 +2929,9 @@ fn write_phase_b_results(
     // channel below so silent non-unification (orphaned SCIP twins) is visible.
     let mut scip_unify_attempted: usize = 0;
     let mut scip_unify_missed: usize = 0;
+    // #825: the actual unreconciled symbols behind the miss count, persisted so
+    // `travsr status` can name them instead of only reporting a rate.
+    let mut scip_unify_misses: Vec<crate::scip_unifier::UnifyMiss> = Vec::new();
     if pb_refs.is_empty() {
         // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
         // These are analyzer/SCIP-derived structural edges (E1: provenance 'scip').
@@ -2943,6 +2946,7 @@ fn write_phase_b_results(
         let unify = crate::scip_unifier::unify_all(store, corpus, &pb_nodes, &mut pb_refs_mut);
         scip_unify_attempted = unify.attempted;
         scip_unify_missed = unify.attempted.saturating_sub(unify.unified);
+        scip_unify_misses = unify.misses;
         alias_map = unify.alias_map;
         // #780: synthetic DSL meta-scope def nodes (RSpec blocks) with no twin.
         // Dropped outright — node, inbound refs, and edges — so they stop
@@ -3084,6 +3088,28 @@ fn write_phase_b_results(
         warnings.push(format!(
             "scip_unification_misses:{scip_unify_missed}/{scip_unify_attempted}"
         ));
+    }
+    // #825: persist the unreconciled symbols themselves so `travsr status` can
+    // name them (the miss set is deterministic, so "re-run init" never helps —
+    // seeing WHICH defs miss is what actually moves the work forward). Capped so
+    // a pathological repo cannot bloat the meta table; the count already carries
+    // the true total. One row per line: `lang\tkind\tsymbol\tpath:line`.
+    const MAX_MISS_ROWS: usize = 100;
+    if scip_unify_misses.is_empty() {
+        let _ = store.set_meta("scip_unification_miss_list", "");
+    } else {
+        let list = scip_unify_misses
+            .iter()
+            .take(MAX_MISS_ROWS)
+            .map(|m| {
+                format!(
+                    "{}\t{}\t{}\t{}:{}",
+                    m.language, m.kind, m.symbol, m.path, m.line
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = store.set_meta("scip_unification_miss_list", &list);
     }
     if !warnings.is_empty() {
         let _ = store.set_meta("phase_b_warnings", &warnings.join(","));
