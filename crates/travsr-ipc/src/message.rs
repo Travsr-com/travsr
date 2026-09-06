@@ -239,8 +239,17 @@ fn default_live_edge_kind() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LiveResolutionTarget {
     /// 1-based line of the reference in the dirty file. The editor searches this
-    /// line for `name` to recover the column the native extractor does not carry.
+    /// line for `name` to recover the column when `ref_col` is absent.
     pub ref_line: u32,
+    /// 0-based column of the reference, when the daemon could pin it against the
+    /// file text (RFC-027 #813 P1). Present, the editor resolves at exactly this
+    /// position and skips its own `name` search, which removes the miss class
+    /// where the target name is not literally on the line (e.g. a tuple-field
+    /// access like `s.node.0`). Absent (an older daemon, or a name the daemon
+    /// could not pin), the editor falls back to searching `ref_line` for `name`,
+    /// so the field is additive and safe to ignore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_col: Option<u32>,
     /// The referenced name, so the editor can pin the column and so the daemon
     /// can record an honest `pending` row if the editor's answer maps to nothing.
     pub name: String,
@@ -482,15 +491,29 @@ mod tests {
     fn a_resolution_target_serialises_to_the_shape_the_extension_reads() {
         let target = LiveResolutionTarget {
             ref_line: 19,
+            ref_col: Some(6),
             name: "save".to_string(),
             edge_kind: "ref/call".to_string(),
             provider: "definition".to_string(),
         };
         let v = serde_json::to_value(&target).expect("serialise");
         assert_eq!(v["ref_line"], 19);
+        assert_eq!(v["ref_col"], 6);
         assert_eq!(v["name"], "save");
         assert_eq!(v["edge_kind"], "ref/call");
         assert_eq!(v["provider"], "definition");
+
+        // `ref_col` is omitted (not null) when absent, so an older extension that
+        // never reads it sees exactly the pre-#813 shape.
+        let no_col = LiveResolutionTarget {
+            ref_col: None,
+            ..target
+        };
+        let v = serde_json::to_value(&no_col).expect("serialise");
+        assert!(
+            v.get("ref_col").is_none(),
+            "ref_col must be omitted when None"
+        );
     }
 
     // RFC-027 section 8.7.5: the target response carries the saved file's own
@@ -503,6 +526,7 @@ mod tests {
         let resp = LiveResolutionTargets {
             own: vec![LiveResolutionTarget {
                 ref_line: 12,
+                ref_col: None,
                 name: "run".to_string(),
                 edge_kind: "ref/call".to_string(),
                 provider: "definition".to_string(),
@@ -511,6 +535,7 @@ mod tests {
                 file: "src/main.go".to_string(),
                 targets: vec![LiveResolutionTarget {
                     ref_line: 4,
+                    ref_col: None,
                     name: "Start".to_string(),
                     edge_kind: "ref/call".to_string(),
                     provider: "definition".to_string(),

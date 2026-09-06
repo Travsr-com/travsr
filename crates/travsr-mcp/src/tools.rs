@@ -243,7 +243,41 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
     match (phase_b, last) {
         (None, Some(_)) => Some(PENDING.to_string()),
         (Some(pb), Some(lc)) if pb != lc => Some(PENDING.to_string()),
-        _ if dirty => Some(STALE.to_string()),
+        _ if dirty => {
+            // #583 set this flag on any mid-edit reindex, on the pre-live-lane
+            // premise that the dropped call edges are simply gone. The live
+            // overlay may have recovered them, so report the truth in three
+            // cases rather than a blanket "degraded, run init":
+            //   - no overlay ran (no resolution rows): the edges are genuinely
+            //     missing, so the stale note stands.
+            //   - some references are still pending: name that a few call edges
+            //     may be missing until commit, without the heavy "run init".
+            //   - nothing pending, but some resolved: the overlay recovered the
+            //     edits it detected. The counts are repo-wide and phase_b_dirty
+            //     is a single flag, so this cannot prove every dropped edge came
+            //     back (a headless generic-language edit leaves no rows to count,
+            //     yet feeds the same flag as an editor-resolved file). So it
+            //     still warns lightly that a few edges may be missing until the
+            //     commit, rather than falling through to "results current".
+            let resolved = store.resolved_ref_count().unwrap_or(0);
+            let pending = store.pending_ref_count().unwrap_or(0);
+            if resolved == 0 && pending == 0 {
+                Some(STALE.to_string())
+            } else if pending == 0 {
+                Some(
+                    "[note: a background re-index dropped some call edges; \
+                     uncommitted edits were re-resolved where detected, but a few \
+                     edges may still be missing until the next commit.]"
+                        .to_string(),
+                )
+            } else {
+                Some(format!(
+                    "[note: {pending} reference(s) in uncommitted edits are not \
+                     yet resolved, so a few call edges may be missing until the \
+                     next commit; other results are current.]"
+                ))
+            }
+        }
         // Current index, but not every language in it was analyzed.
         _ => phase_b_unanalyzed_note(store),
     }
@@ -7582,7 +7616,7 @@ mod tests {
         store.put_node(&callee).unwrap();
         store.put_node(&caller).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 12)])
+            .record_edge_sites(&[(caller.id, callee.id, 12, None)])
             .unwrap();
 
         let clean = find_references_raw(&store, "charge", None);
@@ -10284,6 +10318,7 @@ mod snippet_tests {
                         edges: vec![],
                         vname_path: path,
                         new_hash: "deadbeef".to_string(),
+                        source: None,
                     }],
                     false,
                 )
@@ -11719,6 +11754,84 @@ mod snippet_tests {
     }
 
     #[test]
+    fn phase_b_note_not_degraded_when_the_live_overlay_resolved_the_edit() {
+        // dirty, and the overlay resolved its references with nothing pending.
+        // This drops the heavy "degraded, run init" note, but not all caution:
+        // the counts are repo-wide, so a resolved file cannot prove a *separate*
+        // headless edit (which leaves no rows) also came back. So the note is a
+        // light "a few edges may be missing until the next commit", never the
+        // false "results are current".
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let n = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+            "function",
+        )
+        .with_line(1);
+        store.put_node(&n).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "a.rs",
+                &[travsr_store::RefResolution {
+                    src: n.id,
+                    ref_line: 2,
+                    ref_col: 0,
+                    name: "b".into(),
+                    state: "resolved",
+                    resolved_dst: None,
+                }],
+            )
+            .unwrap();
+        let note = phase_b_degraded_note(&store).expect("a light caution must remain");
+        assert!(
+            !note.contains("degraded") && !note.contains("run `travsr init`"),
+            "a resolved overlay must drop the heavy degraded/run-init note, got: {note}"
+        );
+        assert!(
+            note.contains("until the next commit"),
+            "the light caution must still name the commit as the full refresh, got: {note}"
+        );
+    }
+
+    #[test]
+    fn phase_b_note_names_pending_references_instead_of_run_init() {
+        // dirty with an unresolved reference: name the gap honestly, without the
+        // heavy "run travsr init".
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let n = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+            "function",
+        )
+        .with_line(1);
+        store.put_node(&n).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "a.rs",
+                &[travsr_store::RefResolution {
+                    src: n.id,
+                    ref_line: 2,
+                    ref_col: 0,
+                    name: "b".into(),
+                    state: "pending",
+                    resolved_dst: None,
+                }],
+            )
+            .unwrap();
+        let note = phase_b_degraded_note(&store).expect("a pending overlay must note the gap");
+        assert!(
+            note.contains("not yet resolved") && !note.contains("travsr init"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
     fn phase_b_note_none_when_dirty_flag_cleared() {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store.set_meta("last_commit", "abc").unwrap();
@@ -13151,7 +13264,10 @@ mod snippet_tests {
         store.put_node(&caller).unwrap();
         // Two distinct occurrence lines from the same caller must both appear.
         store
-            .record_edge_sites(&[(caller.id, callee.id, 9), (caller.id, callee.id, 10)])
+            .record_edge_sites(&[
+                (caller.id, callee.id, 9, None),
+                (caller.id, callee.id, 10, None),
+            ])
             .unwrap();
 
         let out = find_references(&store, "charge", None);
@@ -13188,7 +13304,7 @@ mod snippet_tests {
         store.put_node(&callee).unwrap();
         store.put_node(&orphan).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 11)])
+            .record_edge_sites(&[(caller.id, callee.id, 11, None)])
             .unwrap();
 
         let out = find_references(&store, "orphan", None);
@@ -13232,7 +13348,7 @@ mod snippet_tests {
         store.put_node(&callee).unwrap();
         store.put_node(&unused).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 5)])
+            .record_edge_sites(&[(caller.id, callee.id, 5, None)])
             .unwrap();
 
         let out = find_references(&store, "unused", None);
@@ -13402,7 +13518,9 @@ mod snippet_tests {
         );
         store.put_node(&def).unwrap();
         store.put_node(&caller).unwrap();
-        store.record_edge_sites(&[(caller.id, def.id, 42)]).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, def.id, 42, None)])
+            .unwrap();
 
         for hint in [
             "crates/travsr-retrieval",  // directory prefix
@@ -13482,7 +13600,7 @@ mod snippet_tests {
         store.put_node(&shared_d).unwrap();
         store.put_node(&caller).unwrap();
         store
-            .record_edge_sites(&[(caller.id, shared_c.id, 7)])
+            .record_edge_sites(&[(caller.id, shared_c.id, 7, None)])
             .unwrap();
 
         let out = find_references(&store, "ClassC.shared", None);
@@ -13545,7 +13663,7 @@ mod snippet_tests {
         store.put_node(&shared).unwrap();
         store.put_node(&caller).unwrap();
         store
-            .record_edge_sites(&[(caller.id, shared.id, 4)])
+            .record_edge_sites(&[(caller.id, shared.id, 4, None)])
             .unwrap();
 
         let out = find_references(&store, "ClassC.shared", None);
@@ -15181,7 +15299,7 @@ mod issue_755_tests {
         store.put_node(&dog).unwrap();
         store.put_node(&target).unwrap();
         store
-            .record_edge_sites(&[(cat.id, target.id, 4), (dog.id, target.id, 7)])
+            .record_edge_sites(&[(cat.id, target.id, 4, None), (dog.id, target.id, 7, None)])
             .unwrap();
         let got = find_references_structured(&store, "speak", None);
         assert_eq!(got.status, "resolved");

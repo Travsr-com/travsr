@@ -550,6 +550,27 @@ impl Tool {
         }
     }
 
+    /// A follow-up step a tool needs after its server file is written but before
+    /// the server actually loads. Distinct from `note`: `note` marks a rules-only
+    /// adapter whose MCP config lives in a global file travsr does not write,
+    /// whereas this is for a tool travsr *does* wire, that still gates the server
+    /// behind a user action.
+    ///
+    /// Claude Code will not load a project-scoped `.mcp.json` until it is approved
+    /// once (`enabledMcpjsonServers`). Writing the file reports `ok`, but the
+    /// travsr tools stay inert until that approval, so a bare `ok` reads as done
+    /// when it is not (#829).
+    fn approval_hint(&self) -> Option<&'static str> {
+        match self {
+            Tool::ClaudeCode => Some(
+                "  note: Claude Code loads a project .mcp.json only after a one-time \
+                 approval. If the travsr tools are not available, restart Claude Code \
+                 and accept the trust prompt, or run /mcp to enable the travsr server.",
+            ),
+            _ => None,
+        }
+    }
+
     /// Snippet printed when only a global marker is present.
     fn snippet(&self, repo: &Path, cmd: &McpCommand) -> String {
         let server = indent(&mcp_servers_json(cmd));
@@ -567,6 +588,19 @@ impl Tool {
             Tool::Windsurf => format!(
                 "  add to ~/.codeium/windsurf/mcp_config.json:\n{server}\n  \
                  and create {}/.windsurf/rules/travsr.md with the Travsr guidance",
+                repo.display()
+            ),
+            // Both destinations, because which one the user picks is what
+            // decides whether an approval is pending: a project `.mcp.json` is
+            // gated behind the one-time trust prompt `approval_hint` names
+            // (#829), a user-scoped entry is not. The generic arm below hands
+            // over JSON without saying where it goes, so it cannot carry either
+            // claim without asserting a scope the user has not chosen yet.
+            Tool::ClaudeCode => format!(
+                "  add to {}/.mcp.json (project scope, loads only after a one-time \
+                 approval: restart Claude Code and accept the trust prompt, or run \
+                 /mcp to enable the travsr server), or under `mcpServers` in \
+                 ~/.claude.json (user scope, no approval):\n{server}",
                 repo.display()
             ),
             _ => format!("  MCP server config:\n{server}"),
@@ -1131,6 +1165,11 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                 } else if skipped_guidance && !opts.remove {
                     say!("  (agent guidance not written; pass --rules to include it)");
                 }
+                // Whether this tool's MCP server file ended the run carrying our
+                // entry, which is the only state `approval_hint` below is true
+                // advice for. Stays false under `--dry-run`, which `continue`s
+                // before `execute` ever runs.
+                let mut wired = false;
                 for planned in kept {
                     let disp = rel(repo_root, &planned.path)
                         .unwrap_or_else(|| planned.path.display().to_string());
@@ -1182,6 +1221,11 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                                 }
                                 other => say!("  {} {disp}", label(other)),
                             }
+                            if matches!(planned.content, Content::JsonServer { .. })
+                                && server_in_place(&outcome)
+                            {
+                                wired = true;
+                            }
                             if planned.gitignore {
                                 if let Some(r) = rel(repo_root, &planned.path) {
                                     if opts.remove {
@@ -1213,6 +1257,17 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                 if !opts.remove {
                     if let Some(note) = tool.note(&cmd) {
                         say!("{note}");
+                    }
+                    // #829: naming the still-pending approval where a bare `ok`
+                    // otherwise reads as done. Only once the server file is in
+                    // place, which covers both outcomes the PR wants (`wrote`
+                    // and `ok`). After a skip, a per-file error or a `--dry-run`
+                    // there is nothing to approve and the hint would send the
+                    // user at the wrong fix.
+                    if wired {
+                        if let Some(hint) = tool.approval_hint() {
+                            say!("{hint}");
+                        }
                     }
                 }
             }
@@ -1279,6 +1334,19 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether a server config file ended the run actually carrying our entry: the
+/// `wrote` and `ok` pair, and nothing else.
+///
+/// #829: `approval_hint` names a step the user takes *after* travsr wired the
+/// server, so it is only true advice for these two outcomes. `Skipped` (existing
+/// file is not strict JSON, top level is not a JSON object, or the file is
+/// tracked and `--commit` was not passed) and a per-file `Err` leave nothing to
+/// approve; `Removed` and `Absent` only arise on a remove run, which suppresses
+/// the hint anyway.
+fn server_in_place(o: &Outcome) -> bool {
+    matches!(o, Outcome::Written | Outcome::Unchanged)
 }
 
 fn label(o: &Outcome) -> &'static str {
@@ -1820,6 +1888,69 @@ mod tests {
             rules_only.len() >= 3,
             "expected Antigravity, Codex and Windsurf to be rules-only, got {rules_only:?}"
         );
+    }
+
+    /// #829: writing `.mcp.json` reports `ok`, but Claude Code will not load a
+    /// project server until it is approved once. The report must name that step,
+    /// or the wiring looks done while it is inert.
+    #[test]
+    fn claude_code_names_the_one_time_approval_step() {
+        let hint = Tool::ClaudeCode
+            .approval_hint()
+            .expect("claude-code writes a project .mcp.json and needs an approval hint");
+        assert!(
+            hint.contains("approval") && hint.contains("/mcp"),
+            "hint should name the approval and how to grant it: {hint}"
+        );
+        // The hint is Claude Code specific; a rules-only tool must not carry it.
+        assert!(Tool::Codex.approval_hint().is_none());
+    }
+
+    /// #829 review: the hint is advice about a file that exists. Every outcome
+    /// that leaves the server config without our entry must not carry it, or
+    /// `skipped .mcp.json: not strict JSON (left untouched)` is followed by
+    /// "restart Claude Code and accept the trust prompt", which is the wrong fix.
+    #[test]
+    fn the_approval_hint_follows_only_a_server_that_landed() {
+        assert!(server_in_place(&Outcome::Written), "wrote");
+        assert!(server_in_place(&Outcome::Unchanged), "ok");
+        for left_unwired in [
+            Outcome::Skipped("existing file is not strict JSON (left untouched)".into()),
+            Outcome::Skipped("top level is not a JSON object".into()),
+            Outcome::Removed,
+            Outcome::Absent,
+        ] {
+            assert!(
+                !server_in_place(&left_unwired),
+                "nothing to approve after `{}`",
+                label(&left_unwired)
+            );
+        }
+    }
+
+    /// #829 review follow-up: when Claude Code is known only from `~/.claude`,
+    /// the printed snippet is the whole of the guidance, and the generic arm
+    /// handed over JSON without saying where to put it. The two destinations
+    /// differ in exactly the thing #829 is about, so naming one without the
+    /// other would either hide the pending trust prompt or invent one that
+    /// never appears.
+    #[test]
+    fn the_claude_code_snippet_names_both_destinations_and_their_approval() {
+        let dir = tempdir().unwrap();
+        let snippet = Tool::ClaudeCode.snippet(dir.path(), &cmd());
+        assert!(snippet.contains(".mcp.json"), "project scope: {snippet}");
+        assert!(snippet.contains("~/.claude.json"), "user scope: {snippet}");
+        assert!(
+            snippet.contains("one-time approval") && snippet.contains("run /mcp"),
+            "project scope must name the pending approval: {snippet}"
+        );
+        assert!(
+            snippet.contains("no approval"),
+            "user scope must say it needs none: {snippet}"
+        );
+        // A tool whose snippet names no destination must not claim either.
+        let generic = Tool::Cursor.snippet(dir.path(), &cmd());
+        assert!(!generic.contains("approval"), "{generic}");
     }
 
     #[test]
