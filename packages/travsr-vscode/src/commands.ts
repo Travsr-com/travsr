@@ -34,6 +34,7 @@ import {
   EMPTY_HEALTH,
   LANG_CONTRACT_FIELDS,
   LANG_CONTRACT_VERSION,
+  isTempRepo,
   type RepoRow,
   type StatsView,
   type LangInfo,
@@ -1375,6 +1376,7 @@ type PanelMessage =
   | { command: "reset" }
   | { command: "prune" }
   | { command: "remove"; name: string }
+  | { command: "removeTempRepos" }
   | { command: "installLang"; language: string }
   | { command: "removeLang"; language: string }
   | { command: "enableWithPermission"; language: string }
@@ -1850,8 +1852,55 @@ export function registerShowGraphStats(
       return;
     }
     if (msg.command === "remove") {
-      await client.callTool("repos_remove", { name: msg.name });
+      // `repos_remove` resolves a display basename only when it is
+      // unambiguous, and answers "ambiguous" or "not found" otherwise. That
+      // answer was thrown away, so a click that removed nothing looked exactly
+      // like one that worked: the row came back after the refresh with no
+      // explanation. Two checkouts of the same project register the same
+      // basename, which is the case that produces it.
+      const res = stripEnvelope(
+        await client.callTool("repos_remove", { name: msg.name })
+      ).trim();
       await refresh();
+      if (res.startsWith("ambiguous")) {
+        void vscode.window.showWarningMessage(
+          `Travsr: more than one registered repository is named ${msg.name}, so this entry was left alone. Remove it by path with travsr repos remove.`
+        );
+      } else if (res !== "ok") {
+        void vscode.window.showWarningMessage(
+          `Travsr: could not remove ${msg.name} from the registry (${res || "the registry did not answer"}).`
+        );
+      }
+      return;
+    }
+    if (msg.command === "removeTempRepos") {
+      // The names come from the render this page last produced, never from the
+      // webview, which posts no argument at all. Same rule as the diagnostics
+      // Run buttons: the panel names an action, the extension decides what it
+      // acts on.
+      const names = (lastHealth.repos ?? [])
+        .filter((r) => r.name !== lastHealth.activeRepo && isTempRepo(r.name))
+        .map((r) => r.name);
+      if (names.length === 0) return;
+      const go = await vscode.window.showWarningMessage(
+        `Remove ${names.length} registry entr${names.length === 1 ? "y" : "ies"} left by test runs? Only the registry is edited. Any graph databases under ~/.travsr stay on disk.`,
+        { modal: true },
+        "Remove"
+      );
+      if (go !== "Remove") return;
+      let removed = 0;
+      for (const name of names) {
+        const res = stripEnvelope(
+          await client.callTool("repos_remove", { name })
+        ).trim();
+        if (res === "ok") removed++;
+      }
+      await refresh();
+      void vscode.window.showInformationMessage(
+        removed === names.length
+          ? `Travsr: removed ${removed} test registry entr${removed === 1 ? "y" : "ies"}.`
+          : `Travsr: removed ${removed} of ${names.length} test registry entries. The rest could not be resolved by name; travsr repos remove takes a path.`
+      );
       return;
     }
     if (msg.command === "fixLang" || msg.command === "disableLang") {

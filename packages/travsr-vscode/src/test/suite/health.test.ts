@@ -60,6 +60,9 @@ const FULL: HealthData = {
   repos: [
     { name: "menuservice", path: "c:/r/menuservice", exists: true },
     { name: "logrot-testrepo", path: "c:/r/logrot", exists: false },
+    // Any machine that has run the suite carries these, so the default fixture
+    // carries one too.
+    { name: ".tmpA1b2c3", path: "c:/t/.tmpA1b2c3", exists: true },
   ],
   activeRepo: "menuservice",
   languages: [
@@ -446,7 +449,8 @@ suite("health panel rendering", () => {
     const HANDLED = new Set([
       "refresh", "startDaemon", "restartDaemon", "stopDaemon", "reindex", "fullRebuild",
       "installHook", "installEmbed", "reinstallEmbed", "changeEmbedModel",
-      "runFsck", "compact", "registerMcp", "prune", "remove", "fixLang", "disableLang",
+      "runFsck", "compact", "registerMcp", "prune", "remove", "removeTempRepos",
+      "fixLang", "disableLang",
       "runFix", "copyFix", "openFile", "setLogLines", "setLogFile", "setLogAuto",
       "initRepo", "detectLangs", "downloadBinary", "openBinarySetting",
     ]);
@@ -560,6 +564,90 @@ suite("health panel rendering", () => {
       "ahead of the temp repos, not merely present"
     );
     assert.ok(repoSec.includes("and 7 more"), "the rest are counted");
+  });
+
+  test("test leftovers are counted apart, not listed one by one", () => {
+    // Fifteen `.tmpXXXXXX` rows all saying the same thing was the whole
+    // section on a machine that had run the suite.
+    const cluttered: HealthData = {
+      ...FULL,
+      repos: [
+        ...Array.from({ length: 14 }, (_, i) => ({
+          name: `.tmp0${i}zXmr`.slice(0, 10),
+          path: `c:/t/${i}`,
+          exists: true,
+        })),
+        { name: "travsr", path: "c:/r/travsr", exists: true },
+      ],
+      activeRepo: "travsr",
+    };
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, cluttered);
+    const sec = html.slice(html.indexOf(">Repositories</span>"));
+    assert.ok(sec.includes("travsr"), "the real repo is listed");
+    assert.ok(!/\.tmp0\dzXmr/.test(sec.split("Recent activity")[0]), "the temp ones are not");
+    assert.ok(sec.includes("1 registered"), "the count is of repos you opened");
+    assert.ok(sec.includes("14 from tests"), "and the leftovers are counted separately");
+    assert.ok(
+      sec.includes("14 test repositories left by test runs, not listed"),
+      "said on the page, not silently dropped"
+    );
+    assert.ok(sec.includes("Remove test repos (14)"), "with the bulk fix beside it");
+  });
+
+  test("a repository named .tmp-something real is not mistaken for a leftover", () => {
+    // The pattern is tempfile's: `.tmp` and exactly six alphanumerics. A
+    // hidden project directory is not that, and hiding one would be worse
+    // than the clutter this removes.
+    const odd: HealthData = {
+      ...FULL,
+      repos: [
+        { name: ".tmpl", path: "c:/r/tmpl", exists: true },
+        { name: ".tmp-scratch", path: "c:/r/scratch", exists: true },
+        { name: ".tmpA1b2c3d4", path: "c:/r/long", exists: true },
+      ],
+      activeRepo: "",
+    };
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, odd);
+    const sec = html.slice(html.indexOf(">Repositories</span>"));
+    assert.ok(sec.includes(".tmpl"), "too short is a real name");
+    assert.ok(sec.includes(".tmp-scratch"), "a hyphen is not tempfile's alphabet");
+    assert.ok(sec.includes(".tmpA1b2c3d4"), "too long is a real name");
+    assert.ok(!sec.includes("from tests"), "so nothing is counted as a leftover");
+  });
+
+  test("the open repository is never treated as a leftover", () => {
+    // Indexing a temp directory to try travsr out is a real thing to do, and
+    // the page must still show the repo it is describing.
+    const inTemp: HealthData = {
+      ...FULL,
+      repos: [{ name: ".tmpA1b2c3", path: "c:/t/a", exists: true }],
+      activeRepo: ".tmpA1b2c3",
+    };
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, inTemp);
+    const sec = html.slice(html.indexOf(">Repositories</span>"));
+    assert.ok(sec.includes(".tmpA1b2c3"), "the row is there");
+    assert.ok(!sec.includes("Remove test repos"), "and there is nothing to bulk remove");
+  });
+
+  test("Remove is offered on every row except the one you have open", () => {
+    // It used to appear only where the database was already gone, so an entry
+    // for a repository you had finished with could not be dropped at all.
+    const mix: HealthData = {
+      ...FULL,
+      repos: [
+        { name: "menuservice", path: "c:/r/menuservice", exists: true },
+        { name: "old-project", path: "c:/r/old", exists: true },
+        { name: "logrot-testrepo", path: "c:/r/logrot", exists: false },
+      ],
+      activeRepo: "menuservice",
+    };
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, mix);
+    assert.ok(html.includes('data-name="old-project"'), "a live row can be removed");
+    assert.ok(html.includes('data-name="logrot-testrepo"'), "so can a stale one");
+    assert.ok(
+      !html.includes('data-name="menuservice"'),
+      "but not the repository this page describes"
+    );
   });
 
   test("the hidden-row count describes the hidden rows", () => {

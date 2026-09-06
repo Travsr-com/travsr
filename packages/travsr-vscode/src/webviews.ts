@@ -540,6 +540,23 @@ export interface RepoRow {
   exists: boolean;
 }
 
+/**
+ * A registry entry left behind by a test run.
+ *
+ * Both test suites index throwaway repositories, and every one of them
+ * registers itself globally, so a development machine collects `.tmpXXXXXX`
+ * entries at the rate it runs tests. Fifteen of them filled the Health page's
+ * Repositories section and pushed the repository actually open off the list.
+ *
+ * The pattern is `tempfile`'s own: the literal `.tmp` and exactly six random
+ * alphanumerics. Matching that rather than a bare `.tmp` prefix keeps a real
+ * repository that happens to start with `.tmp` out of the net, and the caller
+ * exempts the open repository regardless, so this can never hide the row the
+ * page is about.
+ */
+export const isTempRepo = (name: string): boolean =>
+  /^\.tmp[A-Za-z0-9]{6}$/.test(name);
+
 /** Repos manager: table with status badges, prune-stale, and per-row remove. */
 export function buildReposHtml(rows: RepoRow[]): string {
   const staleCount = rows.filter((r) => !r.exists).length;
@@ -1631,12 +1648,32 @@ export function buildStatsHtml(
   );
 
   // Repositories
+  //
+  // Test leftovers are counted apart from repositories a person opened. They
+  // are never worth a row: the section had fifteen of them and every one said
+  // the same thing. The open repository is never treated as one, whatever it
+  // is called.
+  const repoTemps = (health.repos ?? []).filter(
+    (r) => r.name !== health.activeRepo && isTempRepo(r.name)
+  );
+  const repoReal = (health.repos ?? []).filter(
+    (r) => !(r.name !== health.activeRepo && isTempRepo(r.name))
+  );
+  const repoStale = (health.repos ?? []).filter((r) => !r.exists).length;
   const repoSec = section(
     "Repositories",
-    health.repos === null ? statusChip("mute", "unknown") : statusChip("mute", `${health.repos.length} registered`),
-    health.repos && health.repos.some((r) => !r.exists)
-      ? act(`Prune stale (${health.repos.filter((r) => !r.exists).length})`, "prune", "primary")
-      : "",
+    health.repos === null
+      ? statusChip("mute", "unknown")
+      : statusChip("mute", `${repoReal.length} registered`) +
+          (repoTemps.length > 0 ? statusChip("mute", `${repoTemps.length} from tests`) : ""),
+    // Two bulk fixes, because they clear different things. Prune drops entries
+    // whose database is gone, which is what the CLI's prune does and is all it
+    // does; it never touches a temp entry whose database is still on disk, and
+    // that is the state this machine was in with fifteen of them.
+    (repoStale > 0 ? act(`Prune stale (${repoStale})`, "prune", "primary") : "") +
+      (repoTemps.length > 0
+        ? act(`Remove test repos (${repoTemps.length})`, "removeTempRepos")
+        : ""),
     health.repos === null
       ? unavailable("Could not read the repository registry.")
       : (() => {
@@ -1655,7 +1692,7 @@ export function buildStatsHtml(
           const REPO_ROWS = 8;
           const rank = (r: RepoRow): number =>
             r.name === health.activeRepo ? 0 : r.exists ? 1 : 2;
-          const sorted = [...health.repos].sort((a, b) => rank(a) - rank(b));
+          const sorted = [...repoReal].sort((a, b) => rank(a) - rank(b));
           const shown = sorted.slice(0, REPO_ROWS);
           const hidden = sorted.slice(REPO_ROWS);
           const hiddenStale = hidden.filter((r) => !r.exists).length;
@@ -1678,15 +1715,21 @@ export function buildStatsHtml(
                       ? "active, no database"
                       : "database missing",
                   r.exists ? "ok" : "warn",
-                  r.exists
+                  // Remove is offered on every row but the open one. It used to
+                  // appear only on rows whose database was already missing,
+                  // which left no way to drop an entry for a repository you
+                  // have finished with while its database is still on disk, and
+                  // that is most of what accumulates here.
+                  //
+                  // The name travels in a data attribute, not inside a JS
+                  // string literal in the onclick. `esc` escapes for HTML, and
+                  // the parser decodes the entity before the JS is parsed, so a
+                  // name containing a quote would have broken out of the
+                  // literal. Registry names are basename-derived so this was
+                  // unlikely rather than safe.
+                  active
                     ? ""
-                    : // The name travels in a data attribute, not inside a JS
-                      // string literal in the onclick. `esc` escapes for HTML,
-                      // and the parser decodes the entity before the JS is
-                      // parsed, so a name containing a quote would have broken
-                      // out of the literal. Registry names are basename-derived
-                      // so this was unlikely rather than safe.
-                      `<button class="btn mini ghost" data-name="${esc(r.name)}" onclick="removeRepoRow(this)">Remove</button>`,
+                    : `<button class="btn mini ghost" data-name="${esc(r.name)}" onclick="removeRepoRow(this)">Remove</button>`,
                   r.path ? `Graph database: ${r.path}` : r.name
                 );
               })
@@ -1702,6 +1745,17 @@ export function buildStatsHtml(
               ? `<div class="hrow muted">and ${hidden.length} more${
                   hiddenStale > 0 ? `, ${hiddenStale} with no database` : ""
                 }</div>`
+              : "") +
+            // Said, not silently dropped. Hiding rows is how this page would
+            // start lying again; the count and the way to clear them are both
+            // on the page, and Remove test repos in the header is the fix.
+            (repoTemps.length > 0
+              ? `<div class="hrow muted">${repoTemps.length} test ${
+                  repoTemps.length === 1 ? "repository" : "repositories"
+                } left by test runs, not listed</div>`
+              : "") +
+            (shown.length === 0 && repoTemps.length === 0
+              ? `<div class="hrow muted">No repositories registered.</div>`
               : "")
           );
         })()
