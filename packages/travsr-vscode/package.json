@@ -121,7 +121,7 @@
       },
       {
         "command": "travsr.showGraphStats",
-        "title": "Travsr: Graph Stats",
+        "title": "Travsr: Health",
         "icon": "$(graph)"
       },
       {
@@ -133,11 +133,6 @@
         "command": "travsr.reindexNow",
         "title": "Travsr: Re-index Now",
         "icon": "$(sync)"
-      },
-      {
-        "command": "travsr.showLanguages",
-        "title": "Travsr: Languages",
-        "icon": "$(extensions)"
       },
       {
         "command": "travsr.openFileGraph",
@@ -253,11 +248,6 @@
           "command": "travsr.reindexNow",
           "when": "view == travsrGraph",
           "group": "2_travsr@2"
-        },
-        {
-          "command": "travsr.showLanguages",
-          "when": "view == travsrGraph",
-          "group": "2_travsr@3"
         },
         {
           "command": "travsr.openContextExplorer",

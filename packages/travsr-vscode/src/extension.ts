@@ -226,7 +226,6 @@ export function activate(context: vscode.ExtensionContext): void {
       type ItemId =
         | "graphStats"
         | "repos"
-        | "languages"
         | "reindex"
         | "restart"
         | "settings"
@@ -235,9 +234,8 @@ export function activate(context: vscode.ExtensionContext): void {
         | "close";
       type ActionItem = vscode.QuickPickItem & { id: ItemId };
       const items: vscode.QuickPickItem[] = [
-        { label: "$(graph) Graph stats",              id: "graphStats" } as ActionItem,
+        { label: "$(pulse) Health",                    id: "graphStats" } as ActionItem,
         { label: "$(repo) Registered repos",          id: "repos"      } as ActionItem,
-        { label: "$(extensions) Languages",           id: "languages"  } as ActionItem,
         { label: "$(sync) Re-index now",              id: "reindex"    } as ActionItem,
         { label: "", kind: vscode.QuickPickItemKind.Separator },
         { label: "$(refresh) Restart daemon",         id: "restart"  } as ActionItem,
@@ -258,9 +256,6 @@ export function activate(context: vscode.ExtensionContext): void {
           break;
         case "repos":
           await vscode.commands.executeCommand("travsr.showRepos");
-          break;
-        case "languages":
-          await vscode.commands.executeCommand("travsr.showLanguages");
           break;
         case "reindex":
           await vscode.commands.executeCommand("travsr.reindexNow");
@@ -459,7 +454,8 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // CLI↔UI parity commands (VSCODE-247): askSymbol, manageSynonyms,
-  // showDependencies, showExecutionPath, showRepos, showGraphStats, showLanguages.
+  // showDependencies, showExecutionPath, showRepos, showGraphStats (Health,
+  // which also carries the languages table).
   registerParityCommands(proxy, context, binary, () => {
     codeLensProvider.clearCache();
     hoverProvider.clearCache();
@@ -606,7 +602,7 @@ async function checkBinaryAndPrompt(
       // re-learn a fact about a binary the user chose themselves, is the wrong
       // trade. The steps below probe because each of them runs at most once (they
       // persist the path they picked, so the next activation lands here), and the
-      // Languages panel re-checks the shape from the payload it already fetches,
+      // Health page re-checks the shape from the payload it already fetches,
       // which covers this branch at no extra cost.
       return; // valid, nothing to do
     } catch (e) {
@@ -900,13 +896,30 @@ async function reindexNow(
     {
       location: vscode.ProgressLocation.Notification,
       title: "Travsr: re-indexing…",
-      cancellable: false,
+      // Cancellable, matching the `init` the Health panel runs for a repository
+      // with no graph. Indexing a large repository takes minutes, and the two
+      // paths running the same command with different escape hatches was an
+      // inconsistency the user pays for exactly when it is slow.
+      cancellable: true,
     },
-    () =>
+    (_progress, token) =>
       new Promise<void>((resolve) => {
         const proc = cp.spawn(binary, ["init"], {
           cwd: workspaceRoot,
           env: { ...process.env, TERM: "dumb", NO_COLOR: "1" },
+        });
+        let cancelled = false;
+        let settled = false;
+        const finish = (): void => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        const sub = token.onCancellationRequested(() => {
+          cancelled = true;
+          channel.appendLine("Re-index cancelled by the user.");
+          proc.kill();
         });
         proc.stdout?.on("data", (d: Buffer) => channel.appendLine(d.toString().trimEnd()));
         proc.stderr?.on("data", (d: Buffer) => channel.appendLine(d.toString().trimEnd()));
@@ -916,16 +929,25 @@ async function reindexNow(
             .then((a) => {
               if (a === "Show logs") channel.show();
             });
-          resolve();
+          finish();
         };
-        proc.on("error", (e) => fail(e.message));
+        proc.on("error", (e) => {
+          sub.dispose();
+          if (cancelled) return finish();
+          fail(e.message);
+        });
         proc.on("exit", (code) => {
-          if (code === 0) {
+          sub.dispose();
+          // A killed process exits non-zero. Reporting that as a failure would
+          // be the extension calling the user's own cancellation an error.
+          if (cancelled) {
+            void vscode.window.showInformationMessage("Travsr: re-index cancelled.");
+          } else if (code === 0) {
             void vscode.window.showInformationMessage("Travsr re-index complete.");
           } else {
             fail(`exit code ${code ?? "unknown"}`);
           }
-          resolve();
+          finish();
         });
       })
   );
