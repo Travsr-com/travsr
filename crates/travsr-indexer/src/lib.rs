@@ -41,8 +41,8 @@ pub use lsif::{
 };
 pub use ra_runner::run_ra_lsif;
 pub use runner::{
-    run_lsif_emitter, run_lsif_emitter_with_root, run_lsif_py_emitter, run_scip_python,
-    synthesize_js_tsconfig, JS_EXTENSIONS,
+    emitter_missing, run_lsif_emitter, run_lsif_emitter_with_root, run_lsif_py_emitter,
+    run_scip_python, synthesize_js_tsconfig, EmitterNotFound, JS_EXTENSIONS,
 };
 pub use travsr_analysis::ParseOutput;
 pub use travsr_core::{Edge, Node};

@@ -104,6 +104,10 @@ impl Plugin for TypeScriptPlugin {
         // allowJs tsconfig covering exactly this repo's JS files. A no-op when
         // there are no JS files; idempotent where a real allowJs tsconfig
         // already covered them (the dedup below drops the overlap).
+        //
+        // `req.files` is None only on the legacy "sidecar walks itself"
+        // protocol path; every `init --semantic` supplies indexable_paths, so
+        // the JS pass simply does not run there.
         if let Some(rel_files) = req.files.as_ref() {
             let js_abs: Vec<std::path::PathBuf> = rel_files
                 .iter()
@@ -130,7 +134,14 @@ impl Plugin for TypeScriptPlugin {
                             }
                             Err(e) => tracing::warn!("js lsif ingest: {e}"),
                         },
-                        Err(e) => tracing::debug!("js lsif emitter not available: {e}"),
+                        // Only a failure to *start* the emitter is "not
+                        // available". One that ran and failed (a pre-`--root`
+                        // emitter hits SEC-003 here) is a real fault and must be
+                        // visible at default verbosity, stderr head included.
+                        Err(e) if travsr_indexer::emitter_missing(&e) => {
+                            tracing::debug!("js lsif emitter not available: {e}")
+                        }
+                        Err(e) => tracing::warn!("js lsif emitter failed: {e:#}"),
                     }
                 }
                 Ok(None) => {}

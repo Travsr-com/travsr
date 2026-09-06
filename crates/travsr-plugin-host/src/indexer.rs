@@ -941,6 +941,11 @@ impl PluginIndexer {
                                 // when there are no JS files (pure-TS repos), and
                                 // its writes are idempotent where a real allowJs
                                 // tsconfig already covered them.
+                                //
+                                // `item.files` is None only on the legacy
+                                // "sidecar walks itself" protocol path; every
+                                // `init --semantic` supplies indexable_paths,
+                                // so the JS pass simply does not run there.
                                 if let Some(rel_files) = item.files.as_ref() {
                                     let js_abs: Vec<std::path::PathBuf> = rel_files
                                         .iter()
@@ -976,8 +981,23 @@ impl PluginIndexer {
                                                         }
                                                     }
                                                 }
-                                                Err(e) => tracing::debug!(
-                                                    "js lsif emitter not available: {e}"
+                                                // Only a failure to *start* the
+                                                // emitter is "not available".
+                                                // One that ran and failed (a
+                                                // pre-`--root` emitter hits
+                                                // SEC-003 here) is a real fault
+                                                // and must be visible at
+                                                // default verbosity, stderr
+                                                // head included.
+                                                Err(e)
+                                                    if travsr_indexer::emitter_missing(&e) =>
+                                                {
+                                                    tracing::debug!(
+                                                        "js lsif emitter not available: {e}"
+                                                    )
+                                                }
+                                                Err(e) => tracing::warn!(
+                                                    "js lsif emitter failed: {e:#}"
                                                 ),
                                             }
                                         }

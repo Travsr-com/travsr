@@ -268,6 +268,36 @@ pub fn run_lsif_emitter_with_root(tsconfig: &Path, root: &Path) -> anyhow::Resul
     run_lsif_emitter_impl(tsconfig, Some(root))
 }
 
+/// Minimum `travsr-lsif-ts` that understands `--root`. Older emitters ignore
+/// the flag, so `basePath` stays the synthesized tsconfig's temp dir and the
+/// SEC-003 containment check rejects every `files[]` entry as outside the root.
+/// The emitter ships separately from the binary, so that is the normal upgrade
+/// path, not a corner case — the failure must name its own fix.
+const LSIF_TS_MIN_VERSION_FOR_ROOT: &str = "0.5.0";
+
+/// Marker attached to the *spawn* failure in [`run_lsif_emitter_impl`] so
+/// callers can tell "the emitter is not installed" — expected, log at debug —
+/// from "the emitter ran and failed" — actionable, log at warn with its stderr.
+/// Test with [`emitter_missing`].
+#[derive(Debug)]
+pub struct EmitterNotFound;
+
+impl std::fmt::Display for EmitterNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("travsr-lsif-ts could not be started")
+    }
+}
+
+impl std::error::Error for EmitterNotFound {}
+
+/// True when `err` from [`run_lsif_emitter`] / [`run_lsif_emitter_with_root`]
+/// means the emitter could not be started at all. False for every failure of an
+/// emitter that *did* run (non-zero exit, timeout, oversized output), which is
+/// a real fault and must not be reported to the user as "not available".
+pub fn emitter_missing(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<EmitterNotFound>())
+}
+
 fn run_lsif_emitter_impl(tsconfig: &Path, root: Option<&Path>) -> anyhow::Result<String> {
     let (program, prefix_args) = resolve_lsif_emitter();
     let mut command = std::process::Command::new(&program);
@@ -279,12 +309,12 @@ fn run_lsif_emitter_impl(tsconfig: &Path, root: Option<&Path>) -> anyhow::Result
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .with_context(|| {
-            format!(
+        .map_err(|e| {
+            anyhow::Error::new(EmitterNotFound).context(format!(
                 "could not run travsr-lsif-ts for {} \
-                 (emitter not found; check TRAVSR_LSIF_TS or reinstall travsr)",
+                 (emitter not found: {e}; check TRAVSR_LSIF_TS or reinstall travsr)",
                 tsconfig.display()
-            )
+            ))
         })?;
 
     let (status, stdout_bytes, stderr) =
@@ -292,7 +322,15 @@ fn run_lsif_emitter_impl(tsconfig: &Path, root: Option<&Path>) -> anyhow::Result
 
     if !status.success() {
         let stderr_head = stderr.lines().take(5).collect::<Vec<_>>().join("\n");
-        anyhow::bail!("travsr-lsif-ts exited with {status}: {stderr_head}");
+        // An emitter predating `--root` fails exactly here on the synthesized
+        // pass, so point at the version rather than leaving a bare SEC-003
+        // rejection the reader cannot act on.
+        let hint = if root.is_some() {
+            format!(" (--root needs travsr-lsif-ts >= {LSIF_TS_MIN_VERSION_FOR_ROOT}; reinstall the emitter if it is older)")
+        } else {
+            String::new()
+        };
+        anyhow::bail!("travsr-lsif-ts exited with {status}: {stderr_head}{hint}");
     }
 
     Ok(String::from_utf8_lossy(&stdout_bytes).into_owned())
@@ -335,17 +373,20 @@ pub fn synthesize_js_tsconfig(
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .collect();
 
-    // `module`/`moduleResolution` = commonjs/node is the lenient resolver that
-    // handles `require()` (the reported CommonJS case) and still resolves ESM
-    // import paths well enough for indexing. checkJs/noEmit keep it a pure
-    // resolution pass — we never type-check or write output.
+    // `node16` resolves `require()` (the reported CommonJS case) and honours
+    // the real `.mjs`/`.cjs` extension semantics this pass targets. It replaces
+    // `commonjs`/`node` (node10), which TypeScript has scheduled for removal in
+    // 6.0; measured on a CJS + ESM + JSX fixture the two emit byte-identical
+    // dumps, so this is future-proofing at no resolution cost. TS requires
+    // `module` and `moduleResolution` to agree here (TS5095). checkJs/noEmit
+    // keep it a pure resolution pass — we never type-check or write output.
     let config = serde_json::json!({
         "compilerOptions": {
             "allowJs": true,
             "checkJs": false,
             "noEmit": true,
-            "module": "commonjs",
-            "moduleResolution": "node",
+            "module": "node16",
+            "moduleResolution": "node16",
             "target": "es2020",
             "resolveJsonModule": true,
             "skipLibCheck": true,
@@ -1303,6 +1344,25 @@ mod tests {
         assert_eq!(dump.len(), 131072);
     }
 
+    // ── emitter failure classification (#833 review) ────────────────────────
+
+    #[test]
+    fn emitter_missing_distinguishes_spawn_failure_from_a_failed_run() {
+        // Spawn failure: the emitter is not installed. Callers log this at
+        // debug and move on.
+        let not_installed = anyhow::Error::new(EmitterNotFound)
+            .context("could not run travsr-lsif-ts for /tmp/x/tsconfig.json");
+        assert!(emitter_missing(&not_installed));
+
+        // The emitter ran and rejected the run (this is what a pre-`--root`
+        // emitter does to the synthesized pass). It must NOT be reported as
+        // "not available", or a stale emitter is undiagnosable.
+        let ran_and_failed = anyhow::anyhow!(
+            "travsr-lsif-ts exited with exit status: 1: SEC-003: file outside root"
+        );
+        assert!(!emitter_missing(&ran_and_failed));
+    }
+
     // ── synthesize_js_tsconfig (#833) ───────────────────────────────────────
 
     #[test]
@@ -1333,6 +1393,16 @@ mod tests {
         // allowJs is the whole point — without it tsc ignores .js sources.
         assert_eq!(json["compilerOptions"]["allowJs"], serde_json::json!(true));
         assert_eq!(json["compilerOptions"]["noEmit"], serde_json::json!(true));
+        // node16, not the deprecated node10 resolver, and both keys must agree
+        // or tsc rejects the config outright (TS5095).
+        assert_eq!(
+            json["compilerOptions"]["module"],
+            serde_json::json!("node16")
+        );
+        assert_eq!(
+            json["compilerOptions"]["moduleResolution"],
+            serde_json::json!("node16")
+        );
         // Exactly the files we asked for, in order, so the compiler processes
         // only what Phase A indexed (no directory walk, no orphan-edge risk).
         assert_eq!(

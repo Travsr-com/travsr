@@ -350,6 +350,30 @@ mod tests {
         list.into_iter().map(|n| (n.id, n)).collect()
     }
 
+    // ── collect_source_files depth-0 rule (#833) ────────────────────────────
+
+    #[test]
+    fn collects_from_a_root_whose_own_name_starts_with_a_dot() {
+        // `travsr index .` reaches walkdir with a root whose file_name() is
+        // "."; the dotfile rule used to prune it and the walk yielded nothing.
+        // A root literally named ".hidden" is the same case, without the cwd
+        // dependence. The rule must still prune dot-entries *below* the root.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join(".hidden");
+        std::fs::create_dir(&root).expect("create root");
+        std::fs::write(root.join("main.rs"), "fn main() {}").expect("write source");
+        std::fs::create_dir(root.join(".git")).expect("create .git");
+        std::fs::write(root.join(".git/config.rs"), "fn nope() {}").expect("write pruned");
+
+        let files = collect_source_files(&root).expect("walk must succeed");
+
+        let names: Vec<_> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        assert_eq!(names, vec!["main.rs"], "got {files:?}");
+    }
+
     #[test]
     fn attributes_call_to_narrowest_enclosing_fn() {
         // outer spans 1..20, inner spans 5..10; an occurrence on line 7 must
