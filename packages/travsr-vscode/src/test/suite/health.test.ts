@@ -1,5 +1,5 @@
 import * as assert from "assert";
-import { buildStatsHtml, computeVerdict, UNKNOWN_INDEX } from "../../webviews";
+import { buildStatsHtml, buildReposHtml, computeVerdict, UNKNOWN_INDEX } from "../../webviews";
 import type { Diagnostic, HealthData, IndexHealth, StatsView } from "../../webviews";
 import { EMPTY_HEALTH } from "../../webviews";
 import { parseIndexHealth } from "../../commands";
@@ -101,6 +101,14 @@ const WARN: Diagnostic = {
   title: "'java' analysis ran but found no symbols",
   hint: "'java' analysis ran but found no symbols, re-run `travsr init --semantic --force`",
   command: "travsr init --semantic --force",
+};
+
+/** Just the Repositories section, so an assertion about it cannot be satisfied
+ *  by markup from the activity feed or the log reader further down the page. */
+const repoSection = (html: string): string => {
+  const start = html.indexOf(">Repositories</span>");
+  assert.ok(start >= 0, "the Repositories section is on the page");
+  return html.slice(start, html.indexOf("</details>", start));
 };
 
 suite("index status parsing", () => {
@@ -449,7 +457,7 @@ suite("health panel rendering", () => {
     const HANDLED = new Set([
       "refresh", "startDaemon", "restartDaemon", "stopDaemon", "reindex", "fullRebuild",
       "installHook", "installEmbed", "reinstallEmbed", "changeEmbedModel",
-      "runFsck", "compact", "registerMcp", "prune", "remove", "removeTempRepos",
+      "runFsck", "compact", "registerMcp", "prune", "removeTempRepos",
       "fixLang", "disableLang",
       "runFix", "copyFix", "openFile", "setLogLines", "setLogFile", "setLogAuto",
       "initRepo", "detectLangs", "downloadBinary", "openBinarySetting",
@@ -535,7 +543,7 @@ suite("health panel rendering", () => {
     assert.ok(html.includes("travsr"), "a live repo is shown");
     assert.ok(html.includes("and 62 more"), "the rest are counted, not listed");
     assert.ok(html.includes("Prune stale (68)"), "and the bulk fix is offered");
-    assert.ok((html.match(/removeRepoRow\(/g) ?? []).length <= 8, "rows are capped");
+    assert.ok((repoSection(html).match(/<div class="hrow">/g) ?? []).length <= 8, "rows are capped");
   });
 
   test("the open repository is listed however full the registry is", () => {
@@ -629,9 +637,10 @@ suite("health panel rendering", () => {
     assert.ok(!sec.includes("Remove test repos"), "and there is nothing to bulk remove");
   });
 
-  test("Remove is offered on every row except the one you have open", () => {
-    // It used to appear only where the database was already gone, so an entry
-    // for a repository you had finished with could not be dropped at all.
+  test("the rows report, and carry no destructive control of their own", () => {
+    // This section is a list you mostly read. The two bulk fixes in its header
+    // cover what accumulates, and per-row removal lives in the Repos panel,
+    // which is the surface for editing the registry.
     const mix: HealthData = {
       ...FULL,
       repos: [
@@ -641,12 +650,46 @@ suite("health panel rendering", () => {
       ],
       activeRepo: "menuservice",
     };
-    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, mix);
-    assert.ok(html.includes('data-name="old-project"'), "a live row can be removed");
-    assert.ok(html.includes('data-name="logrot-testrepo"'), "so can a stale one");
+    const sec = repoSection(buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, mix));
+    assert.ok(sec.includes("old-project") && sec.includes("logrot-testrepo"), "every repo listed");
+    assert.ok(!sec.includes(">Remove<"), "no per-row Remove");
+    assert.ok(!sec.includes("data-name="), "and no name wired to a row handler");
+    assert.ok(sec.includes("Prune stale (1)"), "the bulk fix is still there");
+  });
+
+  test("a long repository name wraps rather than painting over its status", () => {
+    // `inboundrequesthandler` already overran the old fixed 110px key column.
+    // A name several times that long must still leave the status readable, and
+    // must not be cut down to something the reader cannot identify.
+    const long = "inboundrequesthandler-integration-tests-legacy-migration";
+    const wide: HealthData = {
+      ...FULL,
+      repos: [{ name: long, path: "c:/r/inbound", exists: true }],
+      activeRepo: "",
+    };
+    const sec = repoSection(buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, wide));
+    assert.ok(sec.includes(long), "the whole name is in the row, not an ellipsis");
+    assert.ok(sec.includes("database present"), "and the status is still rendered");
+    // The key column is a floor with a ceiling, and wraps between them. Without
+    // `overflow-wrap` a single long token does not break and pushes the value
+    // out of the row instead.
+    const css = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, wide);
+    assert.ok(css.includes("min-width: 110px"), "the column has a floor");
+    assert.ok(css.includes("max-width: 45%"), "and a ceiling");
+    assert.ok(css.includes("overflow-wrap: anywhere"), "so a long token breaks inside its cell");
+  });
+
+  test("a long name is still readable on hover, alongside its database path", () => {
+    const long = "inboundrequesthandler-integration-tests-legacy-migration";
+    const wide: HealthData = {
+      ...FULL,
+      repos: [{ name: long, path: "c:/r/inbound", exists: true }],
+      activeRepo: "",
+    };
+    const sec = repoSection(buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, wide));
     assert.ok(
-      !html.includes('data-name="menuservice"'),
-      "but not the repository this page describes"
+      sec.includes(`title="${long}\nGraph database: c:/r/inbound"`),
+      "the tooltip leads with the name, then says which checkout it is"
     );
   });
 
@@ -708,23 +751,20 @@ suite("health panel rendering", () => {
     assert.ok(html.includes("database present"), "a live row says what was checked");
     assert.ok(html.includes("database missing"), "and a stale row still does");
     assert.ok(
-      html.includes('title="Graph database: c:/r/travsr"'),
+      html.includes('title="travsr\nGraph database: c:/r/travsr"'),
       "the path distinguishes two checkouts that share a basename"
     );
   });
 
   test("a repo name reaches the handler as data, not as a JS string literal", () => {
-    // esc() escapes for HTML, and the parser decodes the entity before the JS
-    // in an onclick is parsed, so a name carrying a quote would have broken out
-    // of the literal it was interpolated into.
-    const awkward: HealthData = {
-      ...FULL,
-      repos: [{ name: "it's-gone", path: "c:/t", exists: false }],
-    };
-    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, awkward);
+    // The Repos panel owns per-row removal now, and it had the bug the Health
+    // page was fixed for: esc() escapes for HTML, and the parser decodes the
+    // entity before the JS in an onclick is parsed, so a name carrying an
+    // apostrophe closed the literal it sat in and the button did nothing.
+    const html = buildReposHtml([{ name: "it's-gone", path: "c:/t", exists: false }]);
     assert.ok(html.includes('data-name="it&#39;s-gone"'), "the name is an attribute");
-    assert.ok(html.includes("removeRepoRow(this)"), "and the handler reads it from the element");
-    assert.ok(!/removeRepoRow\(this, '/.test(html), "never interpolated into the call");
+    assert.ok(html.includes("removeRepo(this)"), "and the handler reads it from the element");
+    assert.ok(!/removeRepo\(this,\s*'/.test(html), "never interpolated into the call");
   });
 
   test("Refresh stays disabled until the redraw replaces the document", () => {

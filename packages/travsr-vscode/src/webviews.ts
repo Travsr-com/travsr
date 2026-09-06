@@ -563,10 +563,16 @@ export function buildReposHtml(rows: RepoRow[]): string {
   const tableRows = rows
     .map(
       (r) =>
+        // The name travels in a data attribute, not inside a JS string literal
+        // in the onclick. `esc` escapes for HTML, and the parser decodes the
+        // entity before the JS is parsed, so a registry name carrying an
+        // apostrophe closed the literal it sat in and the button did nothing at
+        // all. Registry names are basename-derived, so this was unlikely rather
+        // than safe.
         `<tr><td class="mono">${esc(r.name)}</td>
 <td class="mono muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis" title="${esc(r.path)}">${esc(r.path)}</td>
 <td>${r.exists ? '<span class="badge ok">active</span>' : '<span class="badge stale">stale</span>'}</td>
-<td><button class="x-btn" title="Remove from registry" onclick="removeRepo(this,'${esc(r.name)}')">✕</button></td></tr>`
+<td><button class="x-btn" title="Remove from registry" data-name="${esc(r.name)}" onclick="removeRepo(this)">✕</button></td></tr>`
     )
     .join("\n");
 
@@ -582,7 +588,7 @@ export function buildReposHtml(rows: RepoRow[]): string {
 
   const script = `
 function prune(btn){ setLoading(btn,true,'Prune stale (${staleCount})'); vscode.postMessage({command:'prune'}); }
-function removeRepo(btn,n){ setLoading(btn,true,'✕'); vscode.postMessage({command:'remove', name:n}); }
+function removeRepo(btn){ setLoading(btn,true,'✕'); vscode.postMessage({command:'remove', name: btn.dataset.name || ''}); }
 function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({command:'refresh'}); }`;
 
   return webviewShell("Travsr Repos", body, script);
@@ -1715,22 +1721,20 @@ export function buildStatsHtml(
                       ? "active, no database"
                       : "database missing",
                   r.exists ? "ok" : "warn",
-                  // Remove is offered on every row but the open one. It used to
-                  // appear only on rows whose database was already missing,
-                  // which left no way to drop an entry for a repository you
-                  // have finished with while its database is still on disk, and
-                  // that is most of what accumulates here.
-                  //
-                  // The name travels in a data attribute, not inside a JS
-                  // string literal in the onclick. `esc` escapes for HTML, and
-                  // the parser decodes the entity before the JS is parsed, so a
-                  // name containing a quote would have broken out of the
-                  // literal. Registry names are basename-derived so this was
-                  // unlikely rather than safe.
-                  active
-                    ? ""
-                    : `<button class="btn mini ghost" data-name="${esc(r.name)}" onclick="removeRepoRow(this)">Remove</button>`,
-                  r.path ? `Graph database: ${r.path}` : r.name
+                  // No per-row Remove. This section reports which repositories
+                  // travsr knows about; the two bulk fixes in its header cover
+                  // what actually accumulates (entries whose database is gone,
+                  // and entries left by test runs), and the Repos panel keeps a
+                  // per-row remove for everything else. A destructive control
+                  // beside every row of a list you mostly read is a misclick
+                  // waiting to happen.
+                  "",
+                  // The tooltip carries the full name first: a name past the
+                  // key column wraps rather than being cut, but it is still the
+                  // thing you hover to read. The database path follows it,
+                  // because two checkouts can share a basename and the registry
+                  // shows nothing else to tell them apart.
+                  r.path ? `${r.name}\nGraph database: ${r.path}` : r.name
                 );
               })
               .join("") +
@@ -1941,11 +1945,6 @@ tickChecked();
 // a shell by round-tripping through this document.
 function verdictAction(btn, msg){ setLoading(btn,true,btn.textContent); vscode.postMessage({command: msg}); }
 function panelAction(btn, msg){ setLoading(btn,true,btn.textContent); vscode.postMessage({command: msg}); }
-function removeRepoRow(btn){
-  setLoading(btn,true,'Remove');
-  vscode.postMessage({command:'remove', name: btn.dataset.name || ''});
-}
-
 // Scroll to the log reader on this page. Deliberately not a message to the
 // extension: nothing needs to be spawned or opened, so a round trip would only
 // add latency and a way to fail.

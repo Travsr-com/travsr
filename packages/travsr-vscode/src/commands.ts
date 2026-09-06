@@ -1533,7 +1533,23 @@ export function registerShowRepos(client: McpClient): vscode.Disposable {
         `Pruned ${m ? m[1] : "0"} stale repo(s).`
       );
     } else if (msg.command === "remove") {
-      await client.callTool("repos_remove", { name: (msg as { command: "remove"; name: string }).name });
+      // `repos_remove` resolves a display basename only when it is
+      // unambiguous, and answers "ambiguous" or "not found" otherwise. That
+      // answer was thrown away, so a click that removed nothing looked exactly
+      // like one that worked: the row came back after the refresh with no
+      // explanation. Two checkouts of the same project register the same
+      // basename, which is the case that produces it.
+      const name = (msg as { command: "remove"; name: string }).name;
+      const res = stripEnvelope(await client.callTool("repos_remove", { name })).trim();
+      if (res.startsWith("ambiguous")) {
+        void vscode.window.showWarningMessage(
+          `Travsr: more than one registered repository is named ${name}, so this entry was left alone. Remove it by path with travsr repos remove.`
+        );
+      } else if (res !== "ok") {
+        void vscode.window.showWarningMessage(
+          `Travsr: could not remove ${name} from the registry (${res || "the registry did not answer"}).`
+        );
+      }
     }
     await refresh();
   };
@@ -1851,28 +1867,9 @@ export function registerShowGraphStats(
       await refresh();
       return;
     }
-    if (msg.command === "remove") {
-      // `repos_remove` resolves a display basename only when it is
-      // unambiguous, and answers "ambiguous" or "not found" otherwise. That
-      // answer was thrown away, so a click that removed nothing looked exactly
-      // like one that worked: the row came back after the refresh with no
-      // explanation. Two checkouts of the same project register the same
-      // basename, which is the case that produces it.
-      const res = stripEnvelope(
-        await client.callTool("repos_remove", { name: msg.name })
-      ).trim();
-      await refresh();
-      if (res.startsWith("ambiguous")) {
-        void vscode.window.showWarningMessage(
-          `Travsr: more than one registered repository is named ${msg.name}, so this entry was left alone. Remove it by path with travsr repos remove.`
-        );
-      } else if (res !== "ok") {
-        void vscode.window.showWarningMessage(
-          `Travsr: could not remove ${msg.name} from the registry (${res || "the registry did not answer"}).`
-        );
-      }
-      return;
-    }
+    // No `remove` here. The Repositories section on this page reports state and
+    // offers the two bulk fixes in its header; per-row removal lives in the
+    // Repos panel, which is the surface for editing the registry.
     if (msg.command === "removeTempRepos") {
       // The names come from the render this page last produced, never from the
       // webview, which posts no argument at all. Same rule as the diagnostics
