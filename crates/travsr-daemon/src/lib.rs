@@ -4555,8 +4555,10 @@ fn ratify_live_overlay(store: &mut SqliteStore, ratified: &[String]) {
 ///
 /// The work itself lives in the store
 /// ([`SqliteStore::reconcile_ref_resolution_states`]): one transaction, keyed on
-/// evidence only (a matching `edge_sites` row, a missing `src` node), so it
-/// never deletes a genuine unresolved reference and a second run is a no-op.
+/// evidence only (a matching `edge_sites(src, line)` row, a missing `src`
+/// node), and a second run is a no-op. The site match is per line, not per
+/// name, so a line with several references loses all its pending rows once any
+/// of them resolves; see the store method's doc for that limitation.
 ///
 /// Fail-open, like the rest of ratification: a reconcile that errors leaves
 /// stale-but-honest rows behind and never costs the graph anything, so it is
@@ -4599,6 +4601,26 @@ fn reconcile_ref_resolution_states_on_startup(store: &std::sync::Mutex<SqliteSto
         ),
         Err(e) => tracing::warn!("startup ref_resolution_state reconcile failed: {e:#}"),
     }
+}
+
+/// Open the daemon's writable store and run the startup hygiene it owes the
+/// index.
+///
+/// This is the only way `run` obtains its store, and the #811 startup reconcile
+/// ([`reconcile_ref_resolution_states_on_startup`]) lives inside it rather than
+/// as a separate statement after the open, so the daemon cannot come up with a
+/// store that skipped it. A restart on a current index never reaches Phase B
+/// ratification, which makes this the one place stale `pending` rows a previous
+/// session left behind can be retired; a test opens a store through here and
+/// checks they are gone.
+fn open_daemon_store(
+    db_path: &Path,
+) -> anyhow::Result<std::sync::Arc<std::sync::Mutex<SqliteStore>>> {
+    let store = std::sync::Arc::new(std::sync::Mutex::new(
+        SqliteStore::open(db_path).context("opening graph.db")?,
+    ));
+    reconcile_ref_resolution_states_on_startup(&store);
+    Ok(store)
 }
 
 /// The `nodes.language` values whose live overlay this Phase B run may retire.
@@ -9769,10 +9791,10 @@ mod tests {
         let before = graph_fingerprint(&db_path);
         let marker_before = meta(&db_path, "phase_b_commit");
 
-        // What the daemon does on startup, in order: open the store, reconcile,
-        // and let the scheduler decide whether Phase B is due.
-        let store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
-        reconcile_ref_resolution_states_on_startup(&store);
+        // What the daemon does on startup, in order: open the store through the
+        // same helper `run` uses (which reconciles), then let the scheduler
+        // decide whether Phase B is due.
+        let store = open_daemon_store(&db_path).unwrap();
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
         arm_phase_b_if_pending(&store, &sched);
         assert!(
@@ -9842,6 +9864,61 @@ mod tests {
             raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
             "genuine"
         );
+        assert_eq!(raw_pending_count(&db_path), 1);
+    }
+
+    /// The daemon's store-open path itself (`run` has no other), on a graph.db
+    /// holding one stale pending row, one genuine one and one orphan. Guards the
+    /// startup half of #811 at the point `run` depends on: remove the reconcile
+    /// from `open_daemon_store` and this fails.
+    #[test]
+    fn opening_the_daemon_store_reconciles_stale_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let (caller, ghost) = {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", "abc123").unwrap();
+            store.set_meta("phase_b_commit", "abc123").unwrap();
+            let caller = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/a.ts", "typescript", "fn:caller"),
+                "function",
+            );
+            let callee = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/b.ts", "typescript", "fn:callee"),
+                "function",
+            );
+            store.put_node(&caller).unwrap();
+            store.put_node(&callee).unwrap();
+            store
+                .record_edge_sites(&[(caller.id, callee.id, 3, None)])
+                .unwrap();
+            let ghost = travsr_core::NodeId(0xDEAD_BEEF);
+            let row = |src, line, name: &str| travsr_store::RefResolution {
+                src,
+                ref_line: line,
+                ref_col: 0,
+                name: name.to_string(),
+                state: "pending",
+                resolved_dst: None,
+            };
+            store
+                .upsert_ref_resolution_states(&[
+                    row(caller.id, 3, "callee"),  // stale: a site exists on line 3
+                    row(caller.id, 7, "mystery"), // genuine: no site on line 7
+                    row(ghost, 1, "gone"),        // orphan: no such node
+                ])
+                .unwrap();
+            (caller.id, ghost)
+        };
+        assert_eq!(raw_pending_count(&db_path), 3, "precondition");
+
+        let store = open_daemon_store(&db_path).expect("the daemon's store open");
+        drop(store);
+
+        assert!(!raw_has_row(&db_path, caller, 3, "callee"), "stale row");
+        assert!(!raw_has_row(&db_path, ghost, 1, "gone"), "orphan row");
+        assert!(raw_has_row(&db_path, caller, 7, "mystery"), "genuine row");
         assert_eq!(raw_pending_count(&db_path), 1);
     }
 
@@ -12525,14 +12602,9 @@ impl Daemon {
         }
 
         let db_path = travsr_dir.join("graph.db");
-        let store = Arc::new(Mutex::new(
-            SqliteStore::open(&db_path).context("opening graph.db")?,
-        ));
-        // #811: a restart on a current index never reaches Phase B
-        // ratification, so this is the only chance to retire `pending` rows a
-        // previous session (or a pre-fix CLI rebuild) left behind. Evidence-
-        // keyed deletes only; no graph work.
-        reconcile_ref_resolution_states_on_startup(&store);
+        // Opens graph.db and runs the #811 startup reconcile; see
+        // `open_daemon_store` for why the two are one step.
+        let store = open_daemon_store(&db_path)?;
         // R5 (#342): separate read-only connection so Query messages do not
         // hold the write mutex while the indexer worker needs it.
         let read_store = Arc::new(Mutex::new(

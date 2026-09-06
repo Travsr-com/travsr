@@ -6449,14 +6449,26 @@ LIMIT ?4",
     /// keyed purely on evidence in the store, so it is safe to run whenever the
     /// graph is at rest and needs no knowledge of *which* Phase B produced it:
     ///
-    /// - a `pending` row with a matching `edge_sites(src, line)` is resolved by
-    ///   definition and goes;
+    /// - a `pending` row with a matching `edge_sites(src, line)` is treated as
+    ///   resolved and goes;
     /// - a row whose `src` node no longer exists describes a reference that no
     ///   longer exists and goes;
-    /// - everything else stays. A genuine unresolved reference has no site and a
-    ///   live node, and this must never touch it. Wiping the table would be the
-    ///   easy fix and the wrong one: the surviving rows are the honest record of
-    ///   what is still unresolved.
+    /// - everything else stays. Wiping the table would be the easy fix and the
+    ///   wrong one: the surviving rows are the honest record of what is still
+    ///   unresolved.
+    ///
+    /// Granularity is `(src, ref_line)`, not `(src, ref_line, name)`, because
+    /// `edge_sites` records where a call was resolved and not which name it
+    /// resolved. A line holding several references, `a(b(), c())` or a chained
+    /// call, therefore has every `pending` row on it cleared as soon as Phase B
+    /// records any site there, including abstentions on the other names. That is
+    /// the pre-existing [`Self::clear_resolved_pending_refs`] contract (RFC-027
+    /// section 8.3, finding 3 chose this over `src` alone), not something #811
+    /// introduced, and it errs towards under-reporting on multi-reference lines:
+    /// on this repository roughly a third of pending rows share a line with a
+    /// differently named reference. Scoping by name needs `edge_sites` to carry
+    /// one, which is a schema change and out of scope here. A row on a line with
+    /// no site at all, and a live `src` node, is never touched.
     ///
     /// Both deletes run in one transaction so a failure leaves the table exactly
     /// as it was rather than half reconciled, and both are idempotent: a second
