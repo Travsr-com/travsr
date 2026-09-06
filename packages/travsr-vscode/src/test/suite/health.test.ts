@@ -44,6 +44,10 @@ const FULL: HealthData = {
   logFileName: "daemon.log.2026-09-02",
   logFileSize: "4 KB",
   commitHook: false,
+  embedModels: [
+    { id: "bge-small", description: "fast, 384 dim", installed: true, active: true, downloadMb: 133 },
+    { id: "bge-base", description: "better recall", installed: false, active: false, downloadMb: 418 },
+  ],
   sidecars: [
     { name: "embed", state: "not installed, semantic search off", ok: false, action: "installEmbed" },
     { name: "rerank", state: "v0.4.1, ready", ok: true, action: "reinstallEmbed" },
@@ -441,7 +445,7 @@ suite("health panel rendering", () => {
       buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, STOPPED);
     const HANDLED = new Set([
       "refresh", "startDaemon", "restartDaemon", "reindex", "fullRebuild",
-      "installHook", "installEmbed", "reinstallEmbed",
+      "installHook", "installEmbed", "reinstallEmbed", "changeEmbedModel",
       "runFsck", "compact", "registerMcp", "prune", "remove", "fixLang", "disableLang",
       "runFix", "copyFix", "openFile", "setLogLines", "setLogFile", "setLogAuto",
       "initRepo", "detectLangs", "downloadBinary", "openBinarySetting",
@@ -470,6 +474,26 @@ suite("health panel rendering", () => {
       if (LOG_OWNED.has(h)) continue;
       assert.ok(posted.has(h), `${h} is handled but no button posts it`);
     }
+  });
+
+  test("the embed row offers a model switch only when there is a choice", () => {
+    const withChoice = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, FULL);
+    assert.ok(withChoice.includes("Change model"), "two backends means a choice");
+    // One backend, or a catalog that could not be read, is not a choice, and a
+    // picker with a single entry is a dead end dressed as an option.
+    const single = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, {
+      ...FULL,
+      embedModels: [FULL.embedModels[0]],
+    });
+    assert.ok(!single.includes("Change model"), "one backend offers nothing to switch to");
+  });
+
+  test("the embed action says reinstall, because that is what it does", () => {
+    // `embed init --reinstall` re-downloads the binary and its model and
+    // re-embeds the repository. Calling that a restart understated it.
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, FULL);
+    assert.ok(html.includes("Reinstall"), "the label matches the command");
+    assert.ok(!html.includes(">Restart</button>"), "and no longer claims a restart");
   });
 
   test("the unindexed verdict offers an action that indexes", () => {

@@ -916,6 +916,15 @@ export interface LanguageRow {
  *  place and any one of them can be unavailable while the rest are fine. A
  *  section whose data is missing says so rather than rendering a confident
  *  empty state. */
+/** One embedding backend as `embed list --json` reports it. */
+export interface EmbedModel {
+  id: string;
+  description: string;
+  installed: boolean;
+  active: boolean;
+  downloadMb: number | null;
+}
+
 export interface HealthData {
   /** Whether the background daemon is up, as `travsr daemon status` reports it.
    *
@@ -941,6 +950,8 @@ export interface HealthData {
   logFileSize: string;
   commitHook: boolean | null;
   sidecars: SidecarRow[] | null;
+  /** The embedding catalog, for the model picker. Empty when it could not be read. */
+  embedModels: EmbedModel[];
   agents: AgentRow[] | null;
   repos: RepoRow[] | null;
   activeRepo: string;
@@ -964,6 +975,7 @@ export const EMPTY_HEALTH: HealthData = {
   logFileSize: "",
   commitHook: null,
   sidecars: null,
+  embedModels: [],
   agents: null,
   repos: null,
   activeRepo: "",
@@ -1421,7 +1433,10 @@ export function buildStatsHtml(
               s.name,
               s.state,
               s.ok ? "ok" : "warn",
-              s.action ? act(s.action === "installEmbed" ? "Install" : "Reinstall", s.action, s.ok ? "ghost" : "primary") : ""
+              (s.name === "embed" && health.embedModels.length > 1
+                ? act("Change model", "changeEmbedModel")
+                : "") +
+                (s.action ? act(s.action === "installEmbed" ? "Install" : "Reinstall", s.action, s.ok ? "ghost" : "primary") : "")
             )
           )
           .join("")

@@ -43,6 +43,7 @@ import type { Diagnostic, LogEntry, LogFileInfo } from "./webviews";
 import type { IndexHealth } from "./webviews";
 import type {
   HealthData,
+  EmbedModel,
   SidecarRow,
   AgentRow,
   IntegrityView,
@@ -921,9 +922,22 @@ export async function gatherHealth(
   // Sidecars. `embed list --json` reports every model in the catalog; the panel
   // only needs whether the active one is on disk.
   let sidecars: SidecarRow[] | null = null;
+  let embedModels: EmbedModel[] = [];
   if (embedOut.trim() !== "") {
     try {
-      const models = JSON.parse(embedOut) as Array<{ installed?: boolean; active?: boolean; id?: string }>;
+      const models = JSON.parse(embedOut) as Array<{
+        installed?: boolean; active?: boolean; id?: string;
+        description?: string; download_mb?: number;
+      }>;
+      embedModels = models
+        .filter((m) => typeof m.id === "string")
+        .map((m) => ({
+          id: m.id as string,
+          description: typeof m.description === "string" ? m.description : "",
+          installed: m.installed === true,
+          active: m.active === true,
+          downloadMb: typeof m.download_mb === "number" ? m.download_mb : null,
+        }));
       const active = models.find((m) => m.active === true);
       const anyInstalled = models.some((m) => m.installed === true);
       const embedOk = active?.installed === true;
@@ -1039,6 +1053,7 @@ export async function gatherHealth(
     logFileSize: newest ? formatLogSize(newest.size) : "",
     commitHook,
     sidecars,
+    embedModels,
     agents,
     repos,
     activeRepo: activeRepoName,
@@ -1381,6 +1396,7 @@ type PanelMessage =
   | { command: "installHook" }
   | { command: "installEmbed" }
   | { command: "reinstallEmbed" }
+  | { command: "changeEmbedModel" }
   | { command: "runFsck" }
   | { command: "compact" }
   | { command: "registerMcp" }
@@ -1690,6 +1706,45 @@ export function registerShowGraphStats(
         const go = await vscode.window.showWarningMessage(warning, { modal: true }, "Run");
         if (go !== "Run") return;
       }
+      runTravsrCommand(argv, repoRoot());
+      return;
+    }
+    if (msg.command === "changeEmbedModel") {
+      // The catalog comes from the `embed list --json` this render already
+      // read, so opening the picker costs no spawn. The id never comes from
+      // the webview: it is chosen here from that list.
+      const models = lastHealth.embedModels;
+      if (models.length === 0) {
+        void vscode.window.showWarningMessage("Travsr: could not read the embedding catalog.");
+        return;
+      }
+      const pick = await vscode.window.showQuickPick(
+        models.map((m) => ({
+          label: m.active ? `$(check) ${m.id}` : m.id,
+          description: m.installed ? "installed" : m.downloadMb ? `${m.downloadMb} MB download` : "not installed",
+          detail: m.description,
+          id: m.id,
+          installed: m.installed,
+          active: m.active,
+        })),
+        { title: "Travsr: embedding model", placeHolder: "Switch the active embedding model" }
+      );
+      if (pick === undefined || pick.active) return;
+      // Two different commands, and the difference matters: `switch` only
+      // repoints config and fails on a model whose weights are absent, while
+      // `init --backend` downloads first. Picking by what is on disk keeps the
+      // uninstalled case from dead-ending on an error.
+      const argv = pick.installed
+        ? ["embed", "switch", pick.id]
+        : ["embed", "init", "--backend", pick.id];
+      const go = await vscode.window.showWarningMessage(
+        pick.installed
+          ? `Switch the active embedding model to ${pick.id}? Existing vectors for the current model are kept, and the repository is re-embedded with the new one.`
+          : `Install ${pick.id} and make it active? This downloads the model, then re-embeds the repository.`,
+        { modal: true },
+        pick.installed ? "Switch" : "Install"
+      );
+      if (go === undefined) return;
       runTravsrCommand(argv, repoRoot());
       return;
     }

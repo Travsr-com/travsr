@@ -262,6 +262,7 @@ suite("VSCODE-247: CLI↔UI parity commands are registered", () => {
       "travsr.showGraphStats",
       "travsr.showLanguages",
       "travsr.reindexNow",
+      "travsr.stopDaemon",
     ]) {
       assert.ok(commands.includes(id), `command ${id} must be registered`);
     }
