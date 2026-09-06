@@ -1,8 +1,8 @@
 /**
  * VSCODE-247 — interactive management webviews.
  *
- * Pure HTML builders for the Synonyms editor, Repos manager, Graph Stats
- * dashboard, and Languages panel. Each builder returns a complete document via
+ * Pure HTML builders for the Synonyms editor, Repos manager and Health
+ * dashboard (which carries the languages table). Each builder returns a complete document via
  * `webviewShell`, styled with the canonical travsr-designer tokens and a strict
  * CSP. The builders are framework-free (no React) and pure so they can be
  * unit-tested without a real webview.
@@ -236,6 +236,72 @@ export function webviewShell(title: string, body: string, script: string): strin
   .banner.idle { background: var(--bg-elev); border-color: var(--border); color: var(--fg-muted); }
   /* #755: contract-skew notice. Block, not flex: it carries prose plus a row of
      actions, so the parts must stack rather than share a baseline. */
+  .banner.verdict { align-items: center; gap: 10px; }
+  .banner.verdict strong { flex-shrink: 0; }
+  .banner.verdict span { flex-grow: 1; min-width: 0; }
+  .banner.verdict .vact { flex-shrink: 0; margin-left: auto; }
+  .banner.warn2 { background: var(--gold-deep, var(--orange-deep)); border-color: var(--gold);
+    color: var(--gold); }
+  .card.warn .v { color: var(--gold); }
+  .card.bad .v { color: var(--error); }
+  .card .n { margin-top: 2px; font-size: 10px; color: var(--gold); }
+  .phead { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 12px; }
+  .phead h2 { margin: 0; }
+  .phead .sub { margin: 2px 0 0; font-size: 11px; }
+  .phead-a { margin-left: auto; display: flex; align-items: center; gap: 9px; }
+  .checked { font-size: 11px; color: var(--fg-muted); }
+  .hcols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    align-items: start; margin-top: 12px; }
+  .hcol { display: flex; flex-direction: column; gap: 10px; }
+  .hsec { border: 1px solid var(--border); border-radius: 6px;
+    overflow: hidden; background: var(--bg-elev); }
+  .hsec > summary { list-style: none; cursor: pointer; min-height: 30px; padding: 0 10px 0 6px;
+    display: flex; align-items: center; gap: 7px; background: var(--bg);
+    border-bottom: 1px solid var(--border); }
+  .hsec > summary::-webkit-details-marker { display: none; }
+  .hsec > summary .nm { font-size: 11px; font-weight: 600; color: var(--fg); }
+  .hsec .chev { width: 13px; height: 13px; flex-shrink: 0; color: var(--fg-muted);
+    transition: transform .12s ease; }
+  .hsec[open] > summary .chev { transform: rotate(90deg); }
+  .hsec .sacts { margin-left: 8px; display: flex; gap: 5px; }
+  .chip { margin-left: auto; display: inline-flex; align-items: center; gap: 4px;
+    font-size: 10px; white-space: nowrap; }
+  .chip.ok { color: var(--green); }
+  .chip.warn { color: var(--gold); }
+  .chip.bad { color: var(--error); }
+  .chip.mute { color: var(--fg-muted); }
+  .ci { width: 12px; height: 12px; flex-shrink: 0; }
+  .hrows { padding: 6px 10px 8px; }
+  .hrow { display: flex; align-items: center; gap: 9px; min-height: 22px; font-size: 12px; }
+  .hrow.muted { color: var(--fg-muted); font-size: 11px; padding: 2px 0; }
+  .hrow.mono-only { font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+    font-size: 10px; color: var(--fg-muted); padding-left: 118px; min-height: 17px; }
+  /* The key column is a floor, not a box: a repo name longer than 110px wraps
+     inside its own cell instead of painting over the value beside it. */
+  .hrow > span:first-child { flex: 0 0 auto; min-width: 110px; max-width: 45%; color: var(--fg-muted);
+    overflow-wrap: anywhere; word-break: break-word; line-height: 1.3; }
+  .hrow b { font-weight: 400; color: var(--fg); display: inline-flex; align-items: center;
+    gap: 5px; flex-grow: 1; min-width: 0;
+    font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 11px; }
+  .hrow b.ok { color: var(--green); }
+  .hrow b.warn { color: var(--gold); }
+  .hrow b.bad { color: var(--error); }
+  .hrow .ra { width: auto; margin-left: auto; flex-shrink: 0; }
+  table.ltbl { width: 100%; border-collapse: collapse; }
+  table.ltbl th { text-align: left; font-size: 9px; letter-spacing: .05em;
+    text-transform: uppercase; color: var(--fg-muted); font-weight: 600; padding: 0 6px 4px 0; }
+  table.ltbl td { font-size: 11px; color: var(--fg); padding: 3px 6px 3px 0;
+    border-top: 1px solid var(--border); }
+  table.ltbl td.ok { color: var(--green); }
+  table.ltbl td.warn { color: var(--gold); }
+  table.ltbl td .ci { vertical-align: -2px; margin-right: 4px; }
+  table.ltbl .ra { text-align: right; padding-right: 0; white-space: nowrap; }
+  table.ltbl td.mute { color: var(--fg-subtle); }
+  table.ltbl .lprereq { font-size: 10px; color: var(--fg-subtle); line-height: 1.3; }
+  .btn.mini { padding: 2px 8px; font-size: 11px; }
+  .btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--fg-muted); }
+  .diag-a { display: flex; align-items: center; gap: 7px; }
+  .diag-a .diag-cmd { flex-grow: 1; }
   .banner.warn { display: block; background: var(--orange-deep); border-color: var(--orange);
     color: var(--fg); }
   .banner.warn b { color: var(--orange); }
@@ -338,11 +404,22 @@ function setLoading(btn, loading, label) {
   btn.innerHTML = loading ? '<span class="spinner">⟳</span> …' : label;
   if (loading) btn.dataset.label = label;
 }
+// A button whose work ends by replacing this whole document stays disabled
+// until that happens. The unlockButtons message fires the instant the
+// extension receives it, before any of the work, which is right for actions
+// that leave the document standing and wrong for a redraw: it re-enabled
+// Refresh while a render that can take seconds was still running, so the
+// button could be pressed again and again.
+function setSticky(btn, label) {
+  setLoading(btn, true, label);
+  btn.dataset.sticky = '1';
+}
 window.addEventListener('message', function(ev) {
   const d = ev.data;
   if (!d) return;
   if (d.command === 'unlockButtons') {
     document.querySelectorAll('button.btn').forEach(function(b) {
+      if (b.dataset.sticky) return;
       b.disabled = false;
       if (b.dataset.label) { b.innerHTML = b.dataset.label; delete b.dataset.label; }
     });
@@ -463,16 +540,39 @@ export interface RepoRow {
   exists: boolean;
 }
 
+/**
+ * A registry entry left behind by a test run.
+ *
+ * Both test suites index throwaway repositories, and every one of them
+ * registers itself globally, so a development machine collects `.tmpXXXXXX`
+ * entries at the rate it runs tests. Fifteen of them filled the Health page's
+ * Repositories section and pushed the repository actually open off the list.
+ *
+ * The pattern is `tempfile`'s own: the literal `.tmp` and exactly six random
+ * alphanumerics. Matching that rather than a bare `.tmp` prefix keeps a real
+ * repository that happens to start with `.tmp` out of the net, and the caller
+ * exempts the open repository regardless, so this can never hide the row the
+ * page is about.
+ */
+export const isTempRepo = (name: string): boolean =>
+  /^\.tmp[A-Za-z0-9]{6}$/.test(name);
+
 /** Repos manager: table with status badges, prune-stale, and per-row remove. */
 export function buildReposHtml(rows: RepoRow[]): string {
   const staleCount = rows.filter((r) => !r.exists).length;
   const tableRows = rows
     .map(
       (r) =>
+        // The name travels in a data attribute, not inside a JS string literal
+        // in the onclick. `esc` escapes for HTML, and the parser decodes the
+        // entity before the JS is parsed, so a registry name carrying an
+        // apostrophe closed the literal it sat in and the button did nothing at
+        // all. Registry names are basename-derived, so this was unlikely rather
+        // than safe.
         `<tr><td class="mono">${esc(r.name)}</td>
 <td class="mono muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis" title="${esc(r.path)}">${esc(r.path)}</td>
 <td>${r.exists ? '<span class="badge ok">active</span>' : '<span class="badge stale">stale</span>'}</td>
-<td><button class="x-btn" title="Remove from registry" onclick="removeRepo(this,'${esc(r.name)}')">✕</button></td></tr>`
+<td><button class="x-btn" title="Remove from registry" data-name="${esc(r.name)}" onclick="removeRepo(this)">✕</button></td></tr>`
     )
     .join("\n");
 
@@ -488,7 +588,7 @@ export function buildReposHtml(rows: RepoRow[]): string {
 
   const script = `
 function prune(btn){ setLoading(btn,true,'Prune stale (${staleCount})'); vscode.postMessage({command:'prune'}); }
-function removeRepo(btn,n){ setLoading(btn,true,'✕'); vscode.postMessage({command:'remove', name:n}); }
+function removeRepo(btn){ setLoading(btn,true,'✕'); vscode.postMessage({command:'remove', name: btn.dataset.name || ''}); }
 function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({command:'refresh'}); }`;
 
   return webviewShell("Travsr Repos", body, script);
@@ -711,6 +811,315 @@ export interface StatsView {
   lastIndexed: string;
 }
 
+/** What the daemon reports about drift between the index and the checkout.
+ *
+ *  Read from `get_index_status` rather than re-derived from the Git extension's
+ *  HEAD: `is_stale` is deliberately tri-state and already handles short-SHA
+ *  comparison and linked worktrees (#636), and duplicating that here would give
+ *  the panel a second opinion that can disagree with `travsr status`. */
+export interface IndexHealth {
+  /** null means the daemon could not decide, which is not the same as fresh. */
+  isStale: boolean | null;
+  behindBy: number | null;
+  indexedCommit: string;
+  headCommit: string;
+  phaseA: string;
+  workingTreeDirty: boolean | null;
+  /** False when the reply was empty, which is what an older binary that does
+   *  not serve `get_index_status` looks like. The panel says so rather than
+   *  rendering the gaps as answers. */
+  available: boolean;
+}
+
+export const UNKNOWN_INDEX: IndexHealth = {
+  isStale: null,
+  behindBy: null,
+  indexedCommit: "",
+  headCommit: "",
+  phaseA: "",
+  workingTreeDirty: null,
+  available: false,
+};
+
+/** One sidecar row. `state` is rendered verbatim, never re-derived from the
+ *  other fields, so the panel and `travsr embed list` cannot disagree. */
+export interface SidecarRow {
+  name: string;
+  state: string;
+  ok: boolean;
+  /** The action this row offers, absent when there is nothing to do. */
+  action?: "installEmbed" | "reinstallEmbed";
+  /** The active backend id, so a reinstall can name it. Without it the CLI
+   *  opens its interactive model menu in a terminal the user did not ask for. */
+  backend?: string;
+}
+
+/** One agent config the extension knows how to write. */
+export interface AgentRow {
+  name: string;
+  registered: boolean;
+  /** Why it is not registered: a missing config file reads differently from a
+   *  config that exists and simply has no travsr entry. */
+  detail: string;
+}
+
+export interface IntegrityView {
+  /** null when the daemon could not be asked, which is not the same as clean. */
+  healthy: boolean | null;
+  ghostCount: number | null;
+  ghostSample: string[];
+  lexicalOk: boolean | null;
+  dbSize: string;
+  logSize: string;
+  logFiles: number;
+}
+
+/** One row of the Health page's Languages table.
+ *
+ *  Two facts the CLI reports are kept apart on purpose, because they answer
+ *  different questions and used to be collapsed into one column: whether the
+ *  analyzer is installed on this machine (`installed`, the global fact) and
+ *  whether full analysis is turned on for the repository this page describes
+ *  (`repoState`, the per-repo corpus trust gate). A language can be installed
+ *  everywhere and still be off here, and the remedy for that is not an
+ *  install. */
+export interface LanguageRow {
+  language: string;
+  /** The CLI's own word for it, rendered as given. */
+  analysis: string;
+  full: boolean;
+  /** `lang list` reports what is installed and enabled; it does not count
+   *  symbols. This is the CLI's own status line, not a count, because inventing
+   *  a number here is how the table came to say "resolved" for a language that
+   *  a diagnostic on the same page said had resolved nothing. */
+  statusLine: string;
+  /** True when a diagnostic on this page names this language. Without it the
+   *  table and the diagnostic card contradict each other: `lang list` reports a
+   *  language as installed and active while `travsr status` warns that it ran
+   *  and produced no symbols. Both are true, and the row has to show it. */
+  flagged: boolean;
+  /** Analyzer present on this machine (the CLI's `installed`). Global: it says
+   *  nothing about whether this repo may use it. */
+  installed: boolean;
+  /** Per-repo enablement, the CLI's `repoState` tag rendered as sent. `unknown`
+   *  is the extension's own word for a tag it did not recognise (#755): never a
+   *  value that looks like a real answer. */
+  repoState: "always_on" | "enabled" | "needs_analyzer" | "not_enabled" | "no_repo" | "unknown";
+  /** Whether full analysis can run on this OS at all. False means no build
+   *  exists here, so no install is ever offered for the row. */
+  availableHere: boolean;
+  /** The OS word for the unavailable case ("Windows"), else "". */
+  osName: string;
+  /** What the project needs for full analysis ("JDK + Gradle"). "" when the
+   *  analyzer needs nothing; "unknown" when the CLI did not report it. */
+  prerequisites: string;
+  builtin: boolean;
+  /** The graph found files of this language in the repo. False rows are not
+   *  rendered: there is nothing here for the analyzer to read, so nothing to
+   *  install or enable. True when the graph could not say. */
+  inRepo: boolean;
+  /** Which fix this row offers, or none. These are different commands and
+   *  offering the wrong one wastes the user's time:
+   *  - `install`: no analyzer on this machine, run `lang install <language>`,
+   *    which also turns it on for this repo;
+   *  - `enable`: installed globally but off for this repo, turn it on in config
+   *    without downloading anything;
+   *  - `permission`: installed, but its build tools cannot run isolated on this
+   *    OS and need the user's one-time consent;
+   *  - `semantic`: enabled, but a warning on this page says it resolved
+   *    nothing, so re-run the semantic pass. */
+  fix: "install" | "enable" | "permission" | "semantic" | "none";
+  /** Full analysis is on and this is not a builtin, so it can be turned off. */
+  canDisable: boolean;
+}
+
+/** Everything the page needs beyond the metric tiles and the log.
+ *
+ *  Each field is independently optional, because each comes from a different
+ *  place and any one of them can be unavailable while the rest are fine. A
+ *  section whose data is missing says so rather than rendering a confident
+ *  empty state. */
+/** One embedding backend as `embed list --json` reports it. */
+export interface EmbedModel {
+  id: string;
+  description: string;
+  installed: boolean;
+  active: boolean;
+  downloadMb: number | null;
+}
+
+export interface HealthData {
+  /** Whether the background daemon is up, as `travsr daemon status` reports it.
+   *
+   *  This is NOT the same question as "can the extension query the graph". The
+   *  extension spawns its own `travsr mcp --stdio` child, which opens the
+   *  database directly and keeps answering with no daemon anywhere. Reading the
+   *  MCP client's connection state as the daemon's state is what made this page
+   *  report "running" beside a terminal saying `daemon: not running`. */
+  daemonRunning: boolean;
+  /** The daemon's own words, so a starting daemon and a daemon whose last start
+   *  failed do not both collapse to "not running". */
+  daemonDetail: string;
+  /** Whether the extension can query at all. Queries survive a stopped daemon;
+   *  what does not survive is anything refreshing the graph. */
+  mcpConnected: boolean;
+  /** Parsed out of the daemon's own log, which is the only source that still
+   *  works after the process has gone. */
+  daemonPid: string;
+  daemonStopped: string;
+  lastEditor: string;
+  binaryVersion: string;
+  logFileName: string;
+  logFileSize: string;
+  commitHook: boolean | null;
+  sidecars: SidecarRow[] | null;
+  /** The embedding catalog, for the model picker. Empty when it could not be read. */
+  embedModels: EmbedModel[];
+  agents: AgentRow[] | null;
+  repos: RepoRow[] | null;
+  activeRepo: string;
+  languages: LanguageRow[] | null;
+  /** #755: set when the resolved binary's `lang list --json` predates the fields
+   *  the Languages section reads. The rows are withheld (`languages` is null) and
+   *  the section says which binary is behind instead of guessing at cells. */
+  languagesSkew?: LangContractSkew;
+  integrity: IntegrityView | null;
+}
+
+export const EMPTY_HEALTH: HealthData = {
+  daemonRunning: false,
+  daemonDetail: "",
+  mcpConnected: false,
+  daemonPid: "",
+  daemonStopped: "",
+  lastEditor: "",
+  binaryVersion: "",
+  logFileName: "",
+  logFileSize: "",
+  commitHook: null,
+  sidecars: null,
+  embedModels: [],
+  agents: null,
+  repos: null,
+  activeRepo: "",
+  languages: null,
+  integrity: null,
+};
+
+export type Verdict = "offline" | "stale" | "degraded" | "healthy" | "unindexed";
+
+export interface VerdictView {
+  verdict: Verdict;
+  /** One word, so the state never rides on the banner colour alone. */
+  headline: string;
+  detail: string;
+  /** The action that resolves this state, or undefined when there is nothing
+   *  to offer (healthy, or a state whose fix is not a single command). */
+  action?: { label: string; message: "startDaemon" | "reindex" | "initRepo" };
+}
+
+/** Decide what the page says at the top.
+ *
+ *  Order matters and is not arbitrary. A stopped daemon outranks staleness
+ *  because nothing below the banner is live in that state, and staleness
+ *  outranks analyzer warnings because a stale graph makes every other number on
+ *  the page describe a commit the user is no longer on. */
+export function computeVerdict(
+  mcpConnected: boolean,
+  daemonRunning: boolean,
+  index: IndexHealth,
+  diags: Diagnostic[],
+  hasGraph: boolean
+): VerdictView {
+  // No graph at all comes first, whatever the daemon is doing: `travsr init`
+  // is the first command in any repository, and it starts the daemon itself.
+  // Offering "Start daemon" here sent people to a daemon with nothing to
+  // serve, and the next thing they had to do was still `init`.
+  if (!hasGraph) {
+    return {
+      verdict: "unindexed",
+      headline: "No graph yet",
+      detail: mcpConnected
+        ? "This repository has not been indexed, so there is nothing for the editor or an agent to traverse."
+        : "This repository has not been indexed yet, so there is nothing for Travsr to answer from. Indexing it also starts the daemon.",
+      action: { label: "Index this repo", message: "initRepo" },
+    };
+  }
+  // Being unable to query at all is the worst state, and it is a different
+  // state from the background daemon being stopped: the extension's own
+  // `travsr mcp --stdio` child answers from the database with no daemon
+  // anywhere, so a stopped daemon costs freshness, not answers.
+  if (!mcpConnected) {
+    return {
+      verdict: "offline",
+      headline: "Not answering",
+      detail: "Travsr could not be reached, so the numbers below are read from the graph on disk rather than from a live index.",
+      action: { label: "Start daemon", message: "startDaemon" },
+    };
+  }
+  // Queries work, but nothing is watching the repository. Commits and saves
+  // will not refresh the graph, so this is a real degradation even though the
+  // numbers on the page may all be correct.
+  //
+  // This is checked before staleness, which is the order the comment above this
+  // function has always described and the order the code did not have. Stopped
+  // and stale together is the state this panel was built for, and ranking stale
+  // first offered Reindex, which fixes freshness once and leaves nothing
+  // watching, so the next commit re-stales the graph. Start daemon is the more
+  // complete remedy: the daemon reconciles HEAD drift on its first tick after
+  // startup (`reconcile_head_drift`, run immediately rather than after the
+  // first five-minute interval), so it catches the graph up and then keeps it
+  // up. `is_stale` is commit-identity only, which is exactly what that
+  // reconciliation keys on.
+  if (!daemonRunning) {
+    return {
+      verdict: "degraded",
+      headline: "Not watching",
+      detail:
+        index.isStale === true
+          ? `Queries are answered from the graph on disk, but the daemon is not running, so commits and saves will not refresh it. The graph describes ${index.indexedCommit || "an earlier commit"}; starting the daemon catches it up and keeps it up.`
+          : "Queries are answered from the graph on disk, but the daemon is not running, so commits and saves will not refresh it.",
+      action: { label: "Start daemon", message: "startDaemon" },
+    };
+  }
+  if (index.isStale === true) {
+    const behind =
+      index.behindBy !== null && index.behindBy > 0
+        ? `Your checkout is ${index.behindBy} commit${index.behindBy > 1 ? "s" : ""} ahead of it.`
+        : "Your checkout is on a different commit.";
+    return {
+      verdict: "stale",
+      headline: "Stale",
+      detail: `The graph describes ${index.indexedCommit || "an earlier commit"}. ${behind}`,
+      action: { label: "Reindex", message: "reindex" },
+    };
+  }
+  const errs = diags.filter((d) => d.severity === "error").length;
+  if (diags.length > 0) {
+    const warns = diags.length - errs;
+    const parts = [
+      errs > 0 ? `${errs} error${errs > 1 ? "s" : ""}` : "",
+      warns > 0 ? `${warns} warning${warns > 1 ? "s" : ""}` : "",
+    ].filter(Boolean);
+    return {
+      verdict: "degraded",
+      headline: "Degraded",
+      // The verb agrees with the subject: one warning affects, two warnings
+      // affect, and an error plus a warning also affect.
+      detail: `The graph is fresh, but ${parts.join(" and ")} ${
+        diags.length === 1 ? "affects" : "affect"
+      } what it can answer.`,
+    };
+  }
+  return {
+    verdict: "healthy",
+    headline: "Healthy",
+    detail: index.available
+      ? `Graph fresh at commit ${index.indexedCommit || "HEAD"}, with no analyzer or index problems reported.`
+      : "No analyzer or index problems reported.",
+  };
+}
+
 /** Severity ranks, the same semantics `travsr daemon logs --level` uses: warn
  *  means warn and above, not warn alone. */
 const LOG_RANK: Record<string, number> = { TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4 };
@@ -773,7 +1182,7 @@ export function buildLogRowsHtml(log: LogEntry[]): string {
     .join("\n");
 }
 
-/** Graph stats dashboard: metric cards, recent activity, and the log tail. */
+/** Health dashboard: metric cards, recent activity, and the log tail. */
 export function buildStatsHtml(
   stats: StatsView,
   log: LogEntry[] = [],
@@ -801,10 +1210,29 @@ export function buildStatsHtml(
    *  back set the way the user left it after a full redraw. The timer itself
    *  lives in the extension, not in this document, because a redraw replaces
    *  this document. */
-  autoSeconds: number = 0
+  autoSeconds: number = 0,
+  /** Drift as the daemon reports it. Defaults to unavailable so every existing
+   *  caller, and every test that predates this, still renders. */
+  index: IndexHealth = UNKNOWN_INDEX,
+  /** Everything the sections need. Defaults to empty, which renders each
+   *  section as "could not read this" rather than as a clean bill of health. */
+  health: HealthData = EMPTY_HEALTH,
+  /** Shown in the header, so a multi-repo user can see which repository the
+   *  page is describing without reading the paths in the rows. */
+  repoName: string = "",
+  repoPath: string = ""
 ): string {
-  const card = (k: string, v: string): string =>
-    `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
+  const daemonRunning = health.daemonRunning;
+  const hasGraph = stats.nodes !== "—" && stats.nodes !== "0";
+  const verdict = computeVerdict(health.mcpConnected, daemonRunning, index, diags, hasGraph);
+
+  /** A metric tile. `state` colours the value and adds a word beside it, so a
+   *  tile is never amber without saying why. */
+  const card = (k: string, v: string, state?: "warn" | "bad", note?: string): string =>
+    `<div class="card${state ? ` ${state}` : ""}"><div class="k">${esc(k)}</div>` +
+    `<div class="v">${esc(v)}</div>` +
+    (note ? `<div class="n">${esc(note)}</div>` : "") +
+    `</div>`;
 
   // The feed is lifecycle, not traffic. `query.served` fires on every query and
   // would bury a Phase B failure under a hundred cache hits, so only events with
@@ -865,33 +1293,496 @@ export function buildStatsHtml(
   // Health reads before anything else, because "is something wrong" is the
   // question the panel is opened with. All clear is its own state, not an empty
   // list: nothing found and nothing checked look identical otherwise.
-  const errs = diags.filter((d) => d.severity === "error").length;
-  const warns = diags.length - errs;
-  const health = diags.length
-    ? `<div class="banner bad">
-<strong>${errs ? `${errs} error${errs > 1 ? "s" : ""}` : ""}${errs && warns ? " &middot; " : ""}${warns ? `${warns} warning${warns > 1 ? "s" : ""}` : ""}</strong>
-<span>affecting what the graph can answer</span></div>`
-    : log.length
-      ? `<div class="banner good"><strong>All clear</strong><span>no analyzer or index problems reported</span></div>`
-      : `<div class="banner idle"><strong>Daemon not running</strong>
-<span>start it to keep the graph fresh: <span class="mono">travsr daemon start</span></span></div>`;
+  const VERDICT_CLASS: Record<Verdict, string> = {
+    offline: "bad",
+    stale: "warn2",
+    degraded: "warn2",
+    unindexed: "idle",
+    healthy: "good",
+  };
+  const verdictBanner =
+    `<div class="banner ${VERDICT_CLASS[verdict.verdict]} verdict">` +
+    `<strong>${esc(verdict.headline)}</strong>` +
+    `<span>${esc(verdict.detail)}</span>` +
+    (verdict.action
+      ? `<button class="btn primary vact" onclick="verdictAction(this, '${verdict.action.message}')">${esc(
+          verdict.action.label
+        )}</button>`
+      : "") +
+    `</div>`;
 
   const diagCards = diags.length
     ? `<div class="diags">` +
       diags
-        .map(
-          (d) =>
+        .map((d) => {
+          // The heading is a claim and the body is the explanation. They used to
+          // be the same sentence twice over, because `title` is `hint` with the
+          // trailing "run `cmd`" clause cut off, and the card rendered both: the
+          // heading read as a sentence truncated mid-thought and the body
+          // repeated it in full. Show the body only when it says something the
+          // heading did not.
+          const extra = d.hint.startsWith(d.title) ? d.hint.slice(d.title.length).trim() : d.hint;
+          const body = extra !== "" && extra !== d.title ? extra.replace(/^[-,;.\s]+/, "") : "";
+          return (
             `<div class="diag ${d.severity}">` +
             `<div class="diag-t">${d.severity === "error" ? "&#10007;" : "&#9888;"} ${esc(d.title)}</div>` +
-            `<div class="diag-h">${esc(d.hint)}</div>` +
+            (body ? `<div class="diag-h">${esc(body)}</div>` : "") +
             (d.command
-              ? `<div class="diag-a"><code class="diag-cmd">${esc(d.command)}</code></div>`
+              ? `<div class="diag-a"><code class="diag-cmd">${esc(d.command)}</code>` +
+                `<button class="btn mini" onclick="runFix(this, ${diags.indexOf(d)})">Run</button>` +
+                `<button class="btn mini ghost" onclick="copyFix(this, ${diags.indexOf(d)})">Copy</button>` +
+                `</div>`
               : "") +
             `</div>`
-        )
+          );
+        })
         .join("\n") +
       `</div>`
     : "";
+
+  // ── Sections ──────────────────────────────────────────────────────────────
+  // Each is a real <details>, so collapsing survives without any script, and a
+  // section whose data could not be read says so rather than rendering an
+  // empty state that reads as "nothing wrong here".
+
+  const OK_ICON = `<svg class="ci" viewBox="0 0 16 16" fill="none"><path d="M3 8.4 6.4 11.8 13 5.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  const WARN_ICON = `<svg class="ci" viewBox="0 0 16 16" fill="none"><path d="M8 2.6 14.4 13H1.6L8 2.6Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 6.5v3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="8" cy="11.3" r=".8" fill="currentColor"/></svg>`;
+  const BAD_ICON = `<svg class="ci" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.8" stroke="currentColor" stroke-width="1.3"/><path d="M4.4 11.6 11.6 4.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`;
+  const CHEV = `<svg class="chev" viewBox="0 0 16 16" fill="none"><path d="M6 3.5 10.5 8 6 12.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+  /** A status chip. The word is not optional: colour alone never carries it. */
+  const statusChip = (tone: "ok" | "warn" | "bad" | "mute", word: string): string =>
+    `<span class="chip ${tone}">${tone === "ok" ? OK_ICON : tone === "bad" ? BAD_ICON : tone === "warn" ? WARN_ICON : ""}${esc(word)}</span>`;
+
+  const act = (label: string, message: string, tone: "primary" | "ghost" = "ghost"): string =>
+    `<button class="btn mini ${tone === "primary" ? "primary" : "ghost"}" onclick="panelAction(this, '${message}')">${esc(label)}</button>`;
+
+  // `keyTitle` overrides the hover text on the label. It defaults to the label
+  // itself, which is what a truncated row needs; the repository rows pass the
+  // database path instead, because two checkouts can share a basename and the
+  // registry shows nothing else to tell them apart.
+  const row = (
+    k: string,
+    v: string,
+    tone?: "ok" | "warn" | "bad",
+    trailing = "",
+    keyTitle?: string
+  ): string =>
+    `<div class="hrow"><span title="${esc(keyTitle ?? k)}">${esc(k)}</span>` +
+    `<b class="${tone ?? ""}">${tone === "ok" ? OK_ICON : tone === "warn" ? WARN_ICON : tone === "bad" ? BAD_ICON : ""}${esc(v)}</b>` +
+    (trailing ? `<span class="ra">${trailing}</span>` : "") +
+    `</div>`;
+
+  const section = (title: string, chipHtml: string, actions: string, inner: string): string =>
+    `<details class="hsec" open><summary>${CHEV}<span class="nm">${esc(title)}</span>` +
+    `${chipHtml}${actions ? `<span class="sacts">${actions}</span>` : ""}</summary>` +
+    `<div class="hrows">${inner}</div></details>`;
+
+  const unavailable = (why: string): string => `<div class="hrow muted">${esc(why)}</div>`;
+
+  // Daemon
+  const daemonSec = section(
+    "Daemon",
+    daemonRunning ? statusChip("ok", "running") : statusChip("bad", "not running"),
+    // Stop is offered only while it is running, and only here. It is the one
+    // action on this page that makes things worse rather than better, so it
+    // sits with the section that owns the daemon and confirms before running.
+    daemonRunning
+      ? act("Restart", "restartDaemon") + act("Stop", "stopDaemon")
+      : act("Start", "startDaemon", "primary"),
+    // The daemon's own sentence, verbatim. "starting", "not responding" and
+    // "last start failed" are all distinct answers and none of them should be
+    // flattened into a bare running/not-running by this panel.
+    row(
+      "Status",
+      health.daemonDetail || (daemonRunning ? "running" : "not running"),
+      daemonRunning ? "ok" : "bad"
+    ) +
+      // Stated separately because the two are genuinely independent: the
+      // extension queries its own `travsr mcp --stdio` child, which answers
+      // from the database whether or not a daemon is up.
+      row(
+        "Queries",
+        health.mcpConnected ? "answering from the graph on disk" : "not answering",
+        health.mcpConnected ? "ok" : "bad"
+      ) +
+      (!daemonRunning && health.mcpConnected
+        ? row("Watching", "no, commits and saves will not refresh the graph", "warn")
+        : "") +
+      (health.daemonPid && daemonRunning ? row("Process", `pid ${health.daemonPid}`) : "") +
+      (!daemonRunning && health.daemonStopped
+        ? row("Last stopped", health.daemonStopped)
+        : "") +
+      (health.lastEditor ? row("Last editor", health.lastEditor) : "") +
+      (health.binaryVersion ? row("Version", health.binaryVersion) : "") +
+      // The button scrolls to the Daemon log section on this page rather than
+      // opening the file in an editor. That section reads the same file with
+      // severity filters, a rotated-file picker and an auto-refresh, so opening
+      // the raw file would be a second, worse way to read it.
+      (health.logFileName
+        ? row(
+            "Log file",
+            `${health.logFileName}  ${health.logFileSize}`,
+            undefined,
+            `<button class="btn mini ghost" onclick="showLog()">View log</button>`
+          )
+        : "")
+  );
+
+  // Index freshness
+  const indexInner = index.available
+    ? row("Indexed commit", index.indexedCommit || "unknown") +
+      row(
+        "Checkout HEAD",
+        index.headCommit
+          ? index.behindBy !== null && index.behindBy > 0
+            ? `${index.headCommit}, ${index.behindBy} commit${index.behindBy > 1 ? "s" : ""} ahead`
+            : index.headCommit
+          : "unknown",
+        index.isStale === true ? "warn" : undefined
+      ) +
+      (index.workingTreeDirty === true ? row("Working tree", "modified files not yet indexed") : "") +
+      (index.phaseA ? row("Phase A", `${index.phaseA}, ${stats.nodes} nodes`) : "") +
+      (health.commitHook === null
+        ? ""
+        : health.commitHook
+          ? row("Commit hook", "installed", "ok")
+          : row("Commit hook", "not installed, so commits do not refresh", "warn", act("Install", "installHook", "primary")))
+    : // Why it is missing matters, and these are different faults. An empty
+      // reply while Travsr is not answering, or while the daemon is stopped, is
+      // not evidence about the binary's age, and saying so sent the reader to
+      // check the wrong thing.
+      unavailable(
+        !health.mcpConnected
+          ? "Index status could not be read: Travsr is not answering."
+          : !daemonRunning
+            ? "Index status could not be read while the daemon is stopped."
+            : "Index status is not reported by this binary."
+      );
+
+  const indexSec = section(
+    "Index freshness",
+    index.isStale === true ? statusChip("warn", "stale") : index.available ? statusChip("ok", "fresh") : statusChip("mute", "unknown"),
+    act("Reindex", "reindex", "primary") + act("Full rebuild", "fullRebuild"),
+    indexInner
+  );
+
+  // Sidecars
+  const sidecarSec = section(
+    "Sidecars",
+    health.sidecars === null
+      ? statusChip("mute", "unknown")
+      : health.sidecars.every((s) => s.ok)
+        ? statusChip("ok", `${health.sidecars.length} ready`)
+        : statusChip("warn", `${health.sidecars.filter((s) => !s.ok).length} missing`),
+    "",
+    health.sidecars === null
+      ? unavailable("Could not read the sidecar list.")
+      : health.sidecars
+          .map((s) =>
+            row(
+              s.name,
+              s.state,
+              s.ok ? "ok" : "warn",
+              (s.name === "embed" && health.embedModels.length > 1
+                ? act("Change model", "changeEmbedModel")
+                : "") +
+                (s.action ? act(s.action === "installEmbed" ? "Install" : "Reinstall", s.action, s.ok ? "ghost" : "primary") : "")
+            )
+          )
+          .join("")
+  );
+
+  // Storage and integrity
+  const integ = health.integrity;
+  const integSec = section(
+    "Storage and integrity",
+    integ === null
+      ? statusChip("mute", "not checked")
+      : integ.ghostCount && integ.ghostCount > 0
+        ? statusChip("warn", `${integ.ghostCount} ghost path${integ.ghostCount > 1 ? "s" : ""}`)
+        : statusChip("ok", "consistent"),
+    act("Run fsck", "runFsck") + act("Compact", "compact"),
+    integ === null
+      ? unavailable("Could not read the integrity report.")
+      : row("graph.db", integ.dbSize) +
+        // No action. Log pruning is the daemon's own job, applied at start and
+        // when the day rolls, against a 7 file and 50 MB budget; there is no
+        // user-facing command to trigger it and offering one here would mean
+        // wiring a button to something else.
+        row(
+          "Logs",
+          `${integ.logSize}, ${integ.logFiles} file${integ.logFiles === 1 ? "" : "s"}, pruned by the daemon`
+        ) +
+        row(
+          "Ghost paths",
+          integ.ghostCount === null
+            ? "unknown"
+            : integ.ghostCount === 0
+              ? "none, every node points at a real file"
+              : `${integ.ghostCount} entries point at files that no longer exist`,
+          integ.ghostCount ? "warn" : "ok"
+        ) +
+        integ.ghostSample.slice(0, 2).map((p) => `<div class="hrow mono-only">${esc(p)}</div>`).join("") +
+        row(
+          "Text index",
+          integ.lexicalOk === null ? "unknown" : integ.lexicalOk ? "consistent with the node table" : "out of step with the node table",
+          integ.lexicalOk === false ? "warn" : "ok"
+        )
+  );
+
+  // Languages. This is the one place the extension reports per-language state
+  // (the separate Languages panel was folded in here): what is installed on
+  // this machine, what is turned on for this repo, and the one action that
+  // moves a row forward.
+  // Only languages the repo contains and this OS can run count towards the
+  // chip: a missing analyzer for a language the repo has no files in is not a
+  // problem with this repo.
+  const langHere = (health.languages ?? []).filter((l) => l.availableHere && l.inRepo);
+  const langPartial = langHere.filter((l) => !l.full || l.flagged).length;
+  const langSec = section(
+    "Languages",
+    health.languages === null
+      ? statusChip("mute", "unknown")
+      : langPartial > 0
+        ? statusChip("warn", `${langPartial} partial`)
+        : statusChip("ok", `${langHere.length} full`),
+    act("Detect", "detectLangs"),
+    health.languagesSkew !== undefined
+      ? skewBanner(health.languagesSkew)
+      : health.languages === null
+      ? unavailable("Could not read the language list.")
+      : (() => {
+        const thead = `<thead><tr><th>Language</th><th>Analysis</th><th>Global installed</th><th>This repo</th><th class="ra">Action</th></tr></thead>`;
+        // The index is into `health.languages`, which is what the extension
+        // looks a click up in, so it must survive the split below.
+        const renderRow = (l: LanguageRow, i: number): string => {
+            // A language the CLI calls active can still be the subject of a
+            // warning on this same page. Showing the tick alone there is the
+            // table contradicting the card below it.
+            const tone = !l.availableHere ? "mute" : !l.full || l.flagged ? "warn" : "ok";
+            const icon = tone === "ok" ? OK_ICON : tone === "warn" ? WARN_ICON : "";
+            const analysisText = !l.availableHere
+              ? `not available on ${l.osName || "this platform"}`
+              : l.flagged
+                ? `${l.analysis}, see the warning below`
+                : l.analysis;
+            // Global: is the analyzer on this machine at all. Unavailable rows
+            // have no honest answer, so the cell stays empty rather than "no".
+            const globalCell = !l.availableHere
+              ? `<td class="mute">-</td>`
+              : l.installed
+                ? `<td class="ok">${OK_ICON}installed</td>`
+                : `<td class="warn">${WARN_ICON}not installed</td>`;
+            // This repo: the CLI's tag, rendered, never re-derived (#755).
+            const repoText =
+              {
+                always_on: "always on",
+                enabled: "enabled",
+                needs_analyzer: "no analyzer",
+                not_enabled: "not enabled",
+                no_repo: "n/a",
+                unknown: "unknown",
+              }[l.repoState] ?? "unknown";
+            const repoTone =
+              !l.availableHere || l.repoState === "no_repo"
+                ? "mute"
+                : l.repoState === "always_on" || l.repoState === "enabled"
+                  ? "ok"
+                  : "warn";
+            const repoTip =
+              {
+                always_on: "Built in, on for every repository",
+                enabled: "Full analysis is on for this repository",
+                needs_analyzer: `Authorized for this repository, but the analyzer is not installed on this machine, so only structural analysis runs until it is.`,
+                not_enabled: `Installed on this machine but off for this repository. Enable it here, or run travsr lang install ${l.language} in this repository.`,
+                no_repo: "Open a repository to see per-repository state",
+                unknown: `travsr did not report per-repository state for ${l.language}. Update travsr, or set travsr.binaryPath to a current binary.`,
+              }[l.repoState] ?? "";
+            const repoCell = !l.availableHere
+              ? `<td class="mute">-</td>`
+              : `<td class="${repoTone}" title="${esc(repoTip)}">${repoTone === "ok" ? OK_ICON : repoTone === "warn" ? WARN_ICON : ""}${esc(repoText)}</td>`;
+            const primary =
+              l.fix === "install"
+                ? `<button class="btn mini primary" onclick="fixLang(this, ${i})" title="Downloads the analyzer and turns full analysis on for this repository">Install analyzer</button>`
+                : l.fix === "enable"
+                  ? `<button class="btn mini primary" onclick="fixLang(this, ${i})" title="Turns full analysis on for this repository; nothing is downloaded">Enable for this repo</button>`
+                  : l.fix === "permission"
+                    ? `<button class="btn mini primary" onclick="fixLang(this, ${i})" title="Full analysis for ${esc(l.language)} needs your one-time permission to run on ${esc(l.osName || "this OS")}; it uses your project's own build tools">Allow &amp; enable</button>`
+                    : l.fix === "semantic"
+                      ? `<button class="btn mini primary" onclick="fixLang(this, ${i})">Re-run semantic</button>`
+                      : "";
+            const disable = l.canDisable
+              ? `<button class="btn mini" onclick="disableLang(this, ${i})" title="Turn full analysis off for ${esc(l.language)}">Disable</button>`
+              : "";
+            const actions = primary || disable ? `${primary}${primary && disable ? " " : ""}${disable}` : "-";
+            const prereq =
+              l.prerequisites !== ""
+                ? `<div class="lprereq" title="${esc(l.prerequisites === "unknown" ? `travsr did not report prerequisites for ${l.language}.` : "What this project needs for full analysis")}">needs: ${esc(l.prerequisites)}</div>`
+                : "";
+            return (
+              `<tr><td>${esc(l.language)}${prereq}</td>` +
+              `<td class="${tone}">${icon}${esc(analysisText)}</td>` +
+              globalCell +
+              repoCell +
+              `<td class="ra">${actions}</td></tr>`
+            );
+          };
+        // Only languages the repo contains. The catalog knows sixteen; a repo
+        // with three of them gets three rows, and a language it has no files
+        // in is not listed at all. The index passed to the buttons is still
+        // the position in `health.languages`, which is what a click is looked
+        // up in, so the filter must not renumber.
+        const here = health.languages
+          .map((l, i) => (l.inRepo ? renderRow(l, i) : ""))
+          .join("");
+        return here
+          ? `<table class="ltbl">${thead}<tbody>${here}</tbody></table>`
+          : unavailable("The graph found no supported languages in this repository yet.");
+      })()
+  );
+
+  // Agent connections
+  const agentSec = section(
+    "Agent connections",
+    health.agents === null
+      ? statusChip("mute", "unknown")
+      : statusChip(
+          health.agents.every((a) => a.registered) ? "ok" : "warn",
+          `${health.agents.filter((a) => a.registered).length} of ${health.agents.length}`
+        ),
+    act("Register all", "registerMcp", "primary"),
+    health.agents === null
+      ? unavailable("Could not read the agent configs.")
+      : health.agents
+          .map((a) =>
+            row(
+              a.name,
+              a.detail,
+              a.registered ? "ok" : "warn",
+              a.registered ? "" : act("Register", "registerMcp", "primary")
+            )
+          )
+          .join("")
+  );
+
+  // Repositories
+  //
+  // Test leftovers are counted apart from repositories a person opened. They
+  // are never worth a row: the section had fifteen of them and every one said
+  // the same thing. The open repository is never treated as one, whatever it
+  // is called.
+  const repoTemps = (health.repos ?? []).filter(
+    (r) => r.name !== health.activeRepo && isTempRepo(r.name)
+  );
+  const repoReal = (health.repos ?? []).filter(
+    (r) => !(r.name !== health.activeRepo && isTempRepo(r.name))
+  );
+  const repoStale = (health.repos ?? []).filter((r) => !r.exists).length;
+  const repoSec = section(
+    "Repositories",
+    health.repos === null
+      ? statusChip("mute", "unknown")
+      : statusChip("mute", `${repoReal.length} registered`) +
+          (repoTemps.length > 0 ? statusChip("mute", `${repoTemps.length} from tests`) : ""),
+    // Two bulk fixes, because they clear different things. Prune drops entries
+    // whose database is gone, which is what the CLI's prune does and is all it
+    // does; it never touches a temp entry whose database is still on disk, and
+    // that is the state this machine was in with fifteen of them.
+    (repoStale > 0 ? act(`Prune stale (${repoStale})`, "prune", "primary") : "") +
+      (repoTemps.length > 0
+        ? act(`Remove test repos (${repoTemps.length})`, "removeTempRepos")
+        : ""),
+    health.repos === null
+      ? unavailable("Could not read the repository registry.")
+      : (() => {
+          // Capped. A machine that has run the test suite accumulates one
+          // registry entry per temp repo, so this reached seventy rows of
+          // `.tmpXXXXXX` and buried every real repository.
+          //
+          // The repository this page describes sorts first whatever else is in
+          // the registry. Ranking on `exists` alone was not enough: temp repos
+          // whose database is still on disk rank the same as the open one, the
+          // registry arrives sorted by name, and `.tmp` sorts before most real
+          // names, so fifteen live temp entries pushed the active repository
+          // past the cap and the page never showed the row it is about. Live
+          // ones come next, since those are the ones worth acting on, and
+          // Prune stale in the header clears the rest in one go.
+          const REPO_ROWS = 8;
+          const rank = (r: RepoRow): number =>
+            r.name === health.activeRepo ? 0 : r.exists ? 1 : 2;
+          const sorted = [...repoReal].sort((a, b) => rank(a) - rank(b));
+          const shown = sorted.slice(0, REPO_ROWS);
+          const hidden = sorted.slice(REPO_ROWS);
+          const hiddenStale = hidden.filter((r) => !r.exists).length;
+          return (
+            shown
+              .map((r) => {
+                const active = r.name === health.activeRepo;
+                return row(
+                  r.name,
+                  // What was checked is whether the graph database is on disk,
+                  // nothing about the working tree. This said "ok", which reads
+                  // as a verdict on the repository and is more than the check
+                  // supports: a repo deleted months ago still says "ok" for as
+                  // long as its database survives in ~/.travsr.
+                  r.exists
+                    ? active
+                      ? "active"
+                      : "database present"
+                    : active
+                      ? "active, no database"
+                      : "database missing",
+                  r.exists ? "ok" : "warn",
+                  // No per-row Remove. This section reports which repositories
+                  // travsr knows about; the two bulk fixes in its header cover
+                  // what actually accumulates (entries whose database is gone,
+                  // and entries left by test runs), and the Repos panel keeps a
+                  // per-row remove for everything else. A destructive control
+                  // beside every row of a list you mostly read is a misclick
+                  // waiting to happen.
+                  "",
+                  // The tooltip carries the full name first: a name past the
+                  // key column wraps rather than being cut, but it is still the
+                  // thing you hover to read. The database path follows it,
+                  // because two checkouts can share a basename and the registry
+                  // shows nothing else to tell them apart.
+                  r.path ? `${r.name}\nGraph database: ${r.path}` : r.name
+                );
+              })
+              .join("") +
+            // The stale count belongs to the rows that were hidden. It was
+            // taken over the whole registry, so a registry that is mostly
+            // stale reported more missing databases than there are hidden
+            // rows ("and 7 more, 12 of which have no database"). When none of
+            // the hidden rows are stale there is nothing to qualify, and the
+            // clause was a double negative reading "0 of which have no
+            // database".
+            (hidden.length > 0
+              ? `<div class="hrow muted">and ${hidden.length} more${
+                  hiddenStale > 0 ? `, ${hiddenStale} with no database` : ""
+                }</div>`
+              : "") +
+            // Said, not silently dropped. Hiding rows is how this page would
+            // start lying again; the count and the way to clear them are both
+            // on the page, and Remove test repos in the header is the fix.
+            (repoTemps.length > 0
+              ? `<div class="hrow muted">${repoTemps.length} test ${
+                  repoTemps.length === 1 ? "repository" : "repositories"
+                } left by test runs, not listed</div>`
+              : "") +
+            (shown.length === 0 && repoTemps.length === 0
+              ? `<div class="hrow muted">No repositories registered.</div>`
+              : "")
+          );
+        })()
+  );
+
+  const sections =
+    `<div class="hcols">` +
+    `<div class="hcol">${daemonSec}${indexSec}${sidecarSec}${integSec}</div>` +
+    `<div class="hcol">${langSec}${diagCards}${agentSec}${repoSec}</div>` +
+    `</div>`;
 
   // The File control. One file at a time is the whole point: the panel used to
   // read across rotations, which made "the last 500 lines" a stream with no way
@@ -925,22 +1816,58 @@ export function buildStatsHtml(
   }`
       : "";
 
+  const semanticTile = (() => {
+    // Only languages the repo contains and this OS can run: a row that says
+    // "not available on Windows" is a fact about the platform, and one the
+    // repo has no files in is a fact about the catalog, neither a partial
+    // analysis of this repo.
+    const langs = health.languages?.filter((l) => l.availableHere && l.inRepo) ?? null;
+    if (langs === null || langs.length === 0) return "";
+    // A count, not a symbol total. `lang list` does not report symbol counts,
+    // and the tile used to print "0 symbols" for one partial language while
+    // five others were fully analysed, which read as though nothing resolved.
+    const bad = langs.filter((l) => !l.full || l.flagged);
+    const good = langs.length - bad.length;
+    return bad.length > 0
+      ? card("Semantic", `${good} of ${langs.length}`, "warn", bad.map((l) => l.language).join(", "))
+      : card("Semantic", "full", undefined, `${langs.length} languages`);
+  })();
+
   const body = `
-<h2>Graph stats</h2>
-<p class="sub">Live metrics for the indexed graph.</p>
+<div class="phead">
+  <div>
+    <h2>${esc(repoName || "Health")}</h2>
+    <p class="sub mono">${esc(repoPath)}</p>
+  </div>
+  <div class="phead-a">
+    <span class="checked" id="checkedAt" data-at="${Date.now()}">checked just now</span>
+    <label class="sel">Auto
+      <select id="logAuto" onchange="onLogAutoChange()"
+              title="Refresh the whole page on a timer. Every tick is a full redraw, so the log filter, the severity chip, the toggles and the scroll position are reset each time. Off by default.">
+        ${autoOptions}
+      </select>
+    </label>
+    <button class="btn" id="refreshBtn" onclick="doRefresh(this)">Refresh</button>
+  </div>
+</div>
+
+${verdictBanner}
+
 <div class="cards">
-  ${card("Nodes", stats.nodes)}
+  ${card("Nodes", stats.nodes, undefined, "on disk")}
   ${card("Edges", stats.edges)}
   ${card("Schema", stats.schemaVersion)}
   ${card("DB size", stats.dbSize)}
-  ${card("Last indexed", stats.lastIndexed)}
-</div>
-<div class="toolbar" style="margin-top:16px">
-  <button class="btn" id="refreshBtn" onclick="doRefresh(this)">Refresh</button>
+  ${card(
+    "Last indexed",
+    stats.lastIndexed,
+    index.isStale === true ? "warn" : undefined,
+    index.isStale === true ? "stale" : undefined
+  )}
+  ${semanticTile}
 </div>
 
-${health}
-${diagCards}
+${sections}
 
 <div class="split">
 <section class="col-activity">
@@ -951,7 +1878,7 @@ ${activityRows}
 </tbody></table>
 </section>
 
-<section class="col-log">
+<section class="col-log" id="daemonLogSection">
 <h2>Daemon log</h2>
 <div class="log-bar">
   <input id="logSearch" type="search" placeholder="Filter lines\u2026" oninput="filterLog()"
@@ -983,12 +1910,6 @@ ${activityRows}
       <option value="1440">24h</option>
     </select>
   </label>
-  <label class="sel">Auto
-    <select id="logAuto" onchange="onLogAutoChange()"
-            title="Re-read the log on a timer. Only the lines are replaced, so the filter, the severity chip and the scroll position are kept; the metric cards and the health banner move on Refresh.">
-      ${autoOptions}
-    </select>
-  </label>
   <label class="tog"><input type="checkbox" id="logUtc" onchange="filterLog()"> UTC</label>
   <label class="tog"><input type="checkbox" id="logJson" onchange="filterLog()"> JSON</label>
 </div>
@@ -1000,7 +1921,60 @@ ${logRows}
 </div>`;
 
   const script = `
-function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({command:'refresh'}); }
+function doRefresh(btn){ setSticky(btn,'Refresh'); vscode.postMessage({command:'refresh'}); }
+
+// How long ago this document was built, ticking so the reader can tell whether
+// what they are looking at is seconds or an hour old. Without it the header
+// said "checked just now" forever, which also meant a Refresh produced no
+// visible change on an otherwise unchanged page.
+//
+// The timestamp is stamped into the markup at render time and the timer lives
+// in the document, which is the right way round: a refresh assigns
+// the whole webview HTML, so the timer dies with the document it describes
+// and the replacement starts its own. No backticks in this comment: it lives
+// inside a template literal.
+function agoText(ms){
+  var s = Math.max(0, Math.round(ms / 1000));
+  if (s < 5) return 'checked just now';
+  if (s < 60) return 'checked ' + s + 's ago';
+  var m = Math.floor(s / 60);
+  if (m < 60) return 'checked ' + m + 'm ago';
+  var h = Math.floor(m / 60);
+  return 'checked ' + h + 'h ' + (m % 60) + 'm ago';
+}
+function tickChecked(){
+  var el = document.getElementById('checkedAt');
+  if (!el) return;
+  var at = Number(el.getAttribute('data-at'));
+  if (!at) return;
+  el.textContent = agoText(Date.now() - at);
+}
+setInterval(tickChecked, 1000);
+tickChecked();
+
+// The verdict's action and the per-diagnostic fixes. Only an index reaches the
+// extension, never the command text: the extension holds the diagnostics it
+// rendered and looks the command up, so nothing a log file said can be sent to
+// a shell by round-tripping through this document.
+function verdictAction(btn, msg){ setLoading(btn,true,btn.textContent); vscode.postMessage({command: msg}); }
+function panelAction(btn, msg){ setLoading(btn,true,btn.textContent); vscode.postMessage({command: msg}); }
+// Scroll to the log reader on this page. Deliberately not a message to the
+// extension: nothing needs to be spawned or opened, so a round trip would only
+// add latency and a way to fail.
+function showLog(){
+  var s = document.getElementById('daemonLogSection');
+  if (!s) return;
+  s.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  var input = document.getElementById('logSearch');
+  if (input) input.focus({ preventScroll: true });
+}
+function fixLang(btn, i){ setLoading(btn,true,btn.textContent); vscode.postMessage({command:'fixLang', index:i}); }
+function disableLang(btn, i){ setLoading(btn,true,btn.textContent); vscode.postMessage({command:'disableLang', index:i}); }
+// #755: the skew banner's two remedies, the same actions the palette exposes.
+function downloadBinary(btn){ setLoading(btn,true,btn.textContent); vscode.postMessage({command:'downloadBinary'}); }
+function openBinarySetting(){ vscode.postMessage({command:'openBinarySetting'}); }
+function runFix(btn, i){ setLoading(btn,true,'Run'); vscode.postMessage({command:'runFix', index:i}); }
+function copyFix(btn, i){ vscode.postMessage({command:'copyFix', index:i}); }
 
 var minRank = 0;
 function setLevel(id, btn) {
@@ -1224,12 +2198,6 @@ export function formatLogSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** A per-language node count from the graph. */
-export interface LangCount {
-  language: string;
-  count: number;
-}
-
 /** An available language tool from `travsr lang list --json`. */
 export interface LangInfo {
   language: string;
@@ -1282,11 +2250,12 @@ export interface LangInfo {
   contract?: number;
 }
 
-/** #755: what `buildLanguagesHtml` reads out of every row and cannot re-derive.
- *  A binary whose `lang list --json` omits any of these predates this panel's
- *  contract, and rendering its rows produces silently wrong cells (a `status`
- *  that falls back to "partial", a `repoState` that interpolates the literal
- *  string "undefined"). Exported so the parser and the panel agree on one list.
+/** #755: what the Health page's Languages section reads out of every row and
+ *  cannot re-derive. A binary whose `lang list --json` omits any of these
+ *  predates this extension's contract, and rendering its rows produces silently
+ *  wrong cells (a `status` that falls back to "partial", a `repoState` that
+ *  interpolates the literal string "undefined"). Exported so the parser and the
+ *  renderer agree on one list.
  *
  *  Deliberately NOT every field on `LangInfo`. `needsApproval` and
  *  `elevatedHosts` are still declared (and still emitted) so an older CLI's JSON
@@ -1338,7 +2307,7 @@ function skewBanner(skew: LangContractSkew): string {
   return `<div class="banner warn" role="alert">
   <b>The <code>travsr</code> this window resolved is older than this extension expects.</b>
   <p style="margin:6px 0 0">${reported} ${fields}
-  Rather than show cells it would have to guess at, the available-tools list is held back.</p>
+  Rather than show cells it would have to guess at, the language rows are held back.</p>
   ${which}
   <p style="margin:8px 0 0">
     <button class="btn primary" onclick="downloadBinary(this)">Download a current binary</button>
@@ -1347,235 +2316,3 @@ function skewBanner(skew: LangContractSkew): string {
 </div>`;
 }
 
-/** Languages panel: indexed section + available section with install actions.
- *
- *  `skew` (#755) is set when the resolved binary's `lang list --json` predates the
- *  fields this panel reads. The available-tools rows are then withheld and replaced
- *  by an actionable banner: rendering them would produce a table that silently
- *  disagrees with `travsr lang list`, which is the whole failure this guards. */
-export function buildLanguagesHtml(
-  indexed: LangCount[],
-  available: LangInfo[],
-  targetRepo?: string,
-  skew?: LangContractSkew
-): string {
-  // ── Indexed section ──────────────────────────────────────────────────────────
-  const indexedRows = indexed.length
-    ? indexed
-        .map(
-          (l) =>
-            `<tr><td><span class="lang-dot"></span><span class="mono">${esc(l.language)}</span></td>
-<td style="text-align:right;color:var(--fg-muted)">${l.count.toLocaleString()}</td></tr>`
-        )
-        .join("\n")
-    : `<tr><td colspan="2" class="empty" style="font-style:normal">No language metadata yet.&nbsp; <button class="btn primary" id="initBtn" onclick="initRepo(this)">Initialize this repo</button></td></tr>`;
-  const indexedNote = indexed.length
-    ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural analysis; includes test &amp; fixture files.</p>`
-    : "";
-
-  // ── Available section ────────────────────────────────────────────────────────
-  const detectedLangs = new Set(indexed.map((l) => l.language));
-
-  // #755: skew short-circuits the rows entirely. Even with the per-cell guards
-  // below, a table of "unknown / unknown / unknown" rows is a worse answer than
-  // one sentence naming the wrong binary — the guards exist so a single odd row
-  // degrades gracefully, not so a whole skewed payload gets rendered.
-  const availRows = skew
-    ? ""
-    : available
-    .map((l) => {
-      // #755: every row here is `JSON.parse` of another process's stdout, so at
-      // runtime any field can be absent no matter what `LangInfo` declares. Read
-      // presence through an untyped view so the guards below are real branches
-      // and not comparisons the compiler proves impossible and prunes.
-      const sent = l as unknown as Record<string, unknown>;
-      const detected = detectedLangs.has(l.language);
-      // Render the CLI's computed status — never re-derive it here, so the panel
-      // can never disagree with `travsr lang list`.
-      const isActive = l.status === "active";
-      // No build for this OS: full analysis can never run here, so the panel must
-      // never offer an install. `status` and `availableOnThisPlatform` come from
-      // one CLI predicate and always agree; check both defensively.
-      const unavailableHere =
-        l.status === "unsupported" || !l.availableOnThisPlatform;
-      const osName =
-        ({ windows: "Windows", macos: "macOS", linux: "Linux" } as Record<string, string>)[
-          l.unavailableTarget ?? ""
-        ] ?? "this platform";
-      // The CLI's needs_consent line names the exact command (`allow-unsandboxed`),
-      // which is fine in a terminal but is internal wording for a panel with a
-      // button. Use plain prose here instead of echoing that line.
-      const permissionTip =
-        `Full analysis for ${l.language} needs your one-time permission to run on ` +
-        `${osName}. It uses your project's own build tools, the same as if you ran ` +
-        `the build yourself. Click to allow and enable it.`;
-
-      // Analysis column: one word per status, its plain (jargon-free) line as the
-      // tooltip — except needs_consent, whose CLI line names an internal command.
-      // #755: a status the CLI did not send (an older binary, or a tag added by a
-      // newer one) must read as unknown. The old `?? ["stale","partial"]` fallback
-      // asserted "partial" — a specific, checkable claim about the language — on the
-      // strength of a missing field, which is how every row came out "partial".
-      const badge = (
-        {
-          active: ["ok", "active"],
-          partial: ["stale", "partial"],
-          needs_approval: ["dim", "needs approval"],
-          needs_consent: ["dim", "needs permission"],
-          unsupported: ["dim", "not available here"],
-        } as Record<string, [string, string]>
-      )[l.status] ?? ["dim", "unknown"];
-      const badgeTip =
-        l.status === "needs_consent"
-          ? permissionTip
-          : typeof sent["statusLine"] === "string"
-            ? l.statusLine
-            : `travsr did not report a status for ${l.language}. Update travsr, or set travsr.binaryPath to a current binary.`;
-      const analysisBadges = `<span class="badge ${badge[0]}" title="${esc(badgeTip)}">${badge[1]}</span>`;
-
-      // Raw action HTML (used directly when detected or active; wrapped otherwise).
-      let rawAction: string;
-      if (unavailableHere) {
-        // Honest dead-end: no install offered, structure still works. Tooltip is
-        // the CLI's own plain line ("...not available on windows").
-        rawAction = `<span class="badge dim" title="${esc(badgeTip)}">Not available on ${esc(osName)}</span>`;
-      } else if (isActive && !l.builtin) {
-        rawAction = `<button class="btn danger" onclick="removeLang(this,'${esc(l.language)}')">Disable</button>`;
-      } else if (isActive) {
-        // A built-in analyzer that is live (e.g. python): nothing to install or turn off.
-        rawAction = `<span class="badge ok" title="${esc(badgeTip)}">on</span>`;
-      } else if (l.status === "needs_consent") {
-        // Installed, but needs the user's one-time permission to run on this OS.
-        // One click records it and re-indexes — no docs trip, no command to type.
-        rawAction = `<button class="btn primary" title="${esc(permissionTip)}" onclick="grantPermission(this,'${esc(l.language)}')">Allow &amp; enable</button>`;
-      } else {
-        // partial → installable here. Elevated languages (java, kotlin, scala,
-        // csharp) land here too now that elevated access is auto-granted for local
-        // use (ADR-017 amendment): they show a plain Install, no consent form.
-        // Languages that need an external build tool (scala, php) also land here:
-        // the Prerequisites column already names the tool, so this is a plain
-        // Install, not a redirect to a docs site.
-        rawAction = `<button class="btn primary" onclick="installLang(this,'${esc(l.language)}')">Install</button>`;
-      }
-
-      // Gate: undetected + inactive non-builtins get a disclosure instead of a direct
-      // button. Builtins, active languages, and platform-unavailable ones show their
-      // cell directly — the last so "Not available on <OS>" is never buried.
-      const actionCell =
-        !unavailableHere && !detected && !isActive && !l.builtin
-          ? `<details class="not-here"><summary>Not in this repo</summary><div class="not-here-body">${rawAction}</div></details>`
-          : rawAction;
-
-      // This repo: is full analysis actually turned on for the target repo (the
-      // corpus trust gate), independent of whether the tool is installed. This is
-      // the fact that keeps "active on this machine" from being read as "on here".
-      // #755: these are object lookups on a CLI-supplied enum tag. An absent or
-      // unrecognised tag used to interpolate the literal string "undefined" into
-      // the cell, so every row read "undefined" against a stale binary. Fall back
-      // to a placeholder that says the value is unknown and names the remedy —
-      // never to a value that looks like a real answer.
-      const repoText =
-        {
-          always_on: "always on",
-          enabled: "enabled",
-          needs_analyzer: "no analyzer",
-          not_enabled: "not enabled",
-          no_repo: "n/a",
-        }[l.repoState] ?? "unknown";
-      const repoCls =
-        l.repoState === "enabled" || l.repoState === "always_on"
-          ? "ok"
-          : l.repoState === "not_enabled" || l.repoState === "needs_analyzer"
-            ? "stale"
-            : "dim";
-      const repoTip =
-        {
-          always_on: "Built in, always on for every repo",
-          enabled: "Full analysis is on for this repo",
-          needs_analyzer: `Authorized for this repo, but its analyzer isn't installed yet, only structural analysis runs until it is. Install it: travsr lang install ${l.language}`,
-          not_enabled: `Full analysis is off for this repo. Enable it: travsr lang install ${l.language} (run in this repo)`,
-          no_repo: "Open a repo to see per-repo status",
-        }[l.repoState] ??
-        `travsr did not report per-repo state for ${l.language}. Update travsr, or set travsr.binaryPath to a current binary.`;
-      const repoBadge = `<span class="badge ${repoCls}" title="${esc(repoTip)}">${repoText}</span>`;
-
-      // #755: an absent `prerequisites` is not the same fact as an analyzer with no
-      // external dependency, and "—" claims the latter. Say the value is unknown.
-      const prereqText =
-        sent["prerequisites"] === undefined || sent["prerequisites"] === null
-          ? `<span style="color:var(--fg-subtle)" title="travsr did not report prerequisites for ${esc(l.language)}.">unknown</span>`
-          : l.prerequisites && l.prerequisites !== "none"
-            ? `<span style="color:var(--fg-subtle)">${esc(l.prerequisites)}</span>`
-            : `<span style="color:var(--fg-subtle)">-</span>`;
-
-      return `<tr>
-<td><span class="mono">${esc(l.language)}</span></td>
-<td>${analysisBadges}</td>
-<td>${repoBadge}</td>
-<td>${prereqText}</td>
-<td>${actionCell}</td></tr>`;
-    })
-    .join("\n");
-
-  // When several repos are open the panel names the one install/detect will
-  // target and offers a one-click change, so the destination is never a guess.
-  const sub = targetRepo
-    ? `<p class="sub">Target repo: <b>${esc(targetRepo)}</b>; install &amp; detect run here. <a href="#" onclick="pickRepo();return false" style="color:var(--green)">change</a></p>`
-    : `<p class="sub">Indexed languages in this repo and available semantic analysis tools.</p>`;
-
-  // #755: with a skewed payload the empty-table placeholder would read as "no
-  // tools available", which is a claim about the machine rather than about the
-  // binary. Say what actually happened.
-  const availEmpty = skew
-    ? '<tr><td colspan="5" class="empty">Held back; the resolved travsr is older than this panel expects (see above).</td></tr>'
-    : '<tr><td colspan="5" class="empty">No analysis tools available yet. Use Reload above to check again.</td></tr>';
-
-  const body = `
-<h2>Languages</h2>
-${sub}
-${skew ? skewBanner(skew) : ""}
-<div class="toolbar">
-  <button class="btn" id="detectBtn" onclick="detectLangs(this)">Detect &amp; install</button>
-  <button class="btn" id="refreshBtn" onclick="doRefresh(this)" title="Refresh indexed counts (fast)">Refresh</button>
-  <button class="btn" id="reloadBtn" onclick="reloadAvail(this)" title="Refresh the list of available analysis tools">Reload available tools</button>
-</div>
-<section>
-  <h3>Indexed in this repo</h3>
-  <table><thead><tr><th>Language</th><th style="text-align:right">Nodes</th></tr></thead>
-  <tbody>${indexedRows}</tbody></table>
-  ${indexedNote}
-</section>
-<section>
-  <h3>Available tools</h3>
-  <table><thead><tr><th>Language</th><th>Semantic</th><th>This repo</th><th>Prerequisites</th><th>Action</th></tr></thead>
-  <tbody>${availRows || availEmpty}</tbody></table>
-</section>`;
-
-  const script = `
-function pickRepo() {
-  vscode.postMessage({command:'pickRepo'});
-}
-function installLang(btn, lang) {
-  setLoading(btn, true, 'Install');
-  vscode.postMessage({command:'installLang', language:lang});
-}
-function removeLang(btn, lang) {
-  setLoading(btn, true, 'Disable');
-  vscode.postMessage({command:'removeLang', language:lang});
-}
-function grantPermission(btn, lang) {
-  setLoading(btn, true, 'Allow &amp; enable');
-  vscode.postMessage({command:'enableWithPermission', language:lang});
-}
-function detectLangs(btn) {
-  setLoading(btn, true, 'Detect &amp; install');
-  vscode.postMessage({command:'detectLangs'});
-}
-function doRefresh(btn) { setLoading(btn, true, 'Refresh'); vscode.postMessage({command:'refresh'}); }
-function reloadAvail(btn) { setLoading(btn, true, 'Reload available tools'); vscode.postMessage({command:'reloadAvailable'}); }
-function initRepo(btn) { setLoading(btn, true, btn.innerText || 'Initialize this repo'); vscode.postMessage({command:'initRepo'}); }
-function downloadBinary(btn) { setLoading(btn, true, 'Download a current binary'); vscode.postMessage({command:'downloadBinary'}); }
-function openBinarySetting() { vscode.postMessage({command:'openBinarySetting'}); }`;
-
-  return webviewShell("Travsr Languages", body, script);
-}
