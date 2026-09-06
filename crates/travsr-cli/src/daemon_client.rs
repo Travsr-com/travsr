@@ -240,7 +240,10 @@ pub fn open_read_store(db_path: &Path) -> anyhow::Result<SqliteStore> {
 /// its own hedged drift note keyed to the note that was actually printed rather
 /// than to a fresh recomputation of the same predicate.
 pub fn warn_if_call_graph_degraded(db_path: &Path) -> bool {
-    let cross = warn_if_cross_checkout(db_path);
+    // Every caller of this entry (`ask`, `references`, `graph --all`, and the
+    // call-edge directions of `graph`) rides call edges, so the folded-in
+    // degraded caveat applies to all of them.
+    let cross = warn_if_cross_checkout(db_path, true);
     if !cross {
         warn_if_phase_b_degraded(db_path);
     }
@@ -271,15 +274,22 @@ pub(crate) fn warn_if_phase_b_degraded(db_path: &Path) {
 /// describes, which is wrong for `deps`, `pattern` and `status` just as much as
 /// for `callers`. A complete answer about the wrong tree is still wrong.
 ///
+/// `reads_call_edges` says whether *this command's* answer rides call edges,
+/// and so whether the folded-in degraded caveat ("an empty or short result from
+/// it is not authoritative either") applies to what it is about to print. It is
+/// the same question the Phase B split above answers, asked by the same call
+/// sites: `pattern` greps a file set and `graph --direction deps` rides Phase A
+/// import edges, so both are complete whether or not Phase B has run, and
+/// telling their users to distrust a complete result is the exact failure those
+/// exemptions exist to prevent. Standing in a worktree must not bring the claim
+/// back through a different door.
+///
 /// Classifies from the filesystem first and opens the store only once the note
 /// is certain, so the ordinary case costs no store open at all. When it does
 /// open, it reads both the commit to name and whether the served index is
 /// Phase B degraded from the *same* handle, so the degraded caveat costs no
 /// second open.
-pub fn warn_if_cross_checkout(db_path: &Path) -> bool {
-    if crate::repo::worktree_note_suppressed() {
-        return false;
-    }
+pub fn warn_if_cross_checkout(db_path: &Path, reads_call_edges: bool) -> bool {
     let Ok(cwd) = std::env::current_dir() else {
         return false;
     };
@@ -289,10 +299,20 @@ pub fn warn_if_cross_checkout(db_path: &Path) -> bool {
     let Some(served) = db_path.parent().and_then(Path::parent) else {
         return false;
     };
+    // Classify first, mute second. `TRAVSR_NO_WORKTREE_NOTE` silences this note;
+    // it must not also report "not a cross-checkout", because callers key the
+    // suppression of the freshness and drift notes to this return value and
+    // both of those are wrong here whether or not the user wants to read about
+    // it. Opting out of one accurate note would otherwise hand back two
+    // misleading ones. Returning before the store open keeps the hatch as cheap
+    // as it was.
+    if crate::repo::worktree_note_suppressed() {
+        return true;
+    }
     let (commit, degraded) = match open_read_store(db_path) {
         Ok(s) => (
             s.get_meta("last_commit").ok().flatten(),
-            travsr_mcp::phase_b_degraded_note(&s).is_some(),
+            reads_call_edges && travsr_mcp::phase_b_degraded_note(&s).is_some(),
         ),
         Err(_) => (None, false),
     };

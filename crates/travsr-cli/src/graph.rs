@@ -100,15 +100,22 @@ pub fn run(
     // complete answer might be missing something, which is both wrong and the
     // fastest way to teach someone to ignore the warning that matters.
     //
-    // The cross-checkout note is not subject to that split: it says which tree
-    // the answer describes, and a complete `deps` answer about the wrong
-    // checkout is still the wrong answer. Emitting it explicitly here, rather
-    // than relying on `warn_if_call_graph_degraded` to delegate to it, keeps the
-    // "every direction gets the cross-checkout note" rule visible at the call
-    // site that owns the split — a refactor of that delegation cannot silently
-    // drop it from `callers` / `blast-radius`.
-    let cross = daemon_client::warn_if_cross_checkout(&db_path);
-    if !cross && !matches!(direction, Direction::Deps) {
+    // The cross-checkout note itself is not subject to that split: it says which
+    // tree the answer describes, and a complete `deps` answer about the wrong
+    // checkout is still the wrong answer. Its folded-in degraded caveat *is*
+    // subject to it, being the Phase B claim above in different words. Emitting
+    // the note explicitly here, rather than relying on
+    // `warn_if_call_graph_degraded` to delegate to it, keeps the "every
+    // direction gets the cross-checkout note" rule visible at the call site that
+    // owns the split — a refactor of that delegation cannot silently drop it
+    // from `callers` / `blast-radius`.
+    //
+    // One local drives both halves so they cannot drift apart: it decides
+    // whether the standalone Phase B note is printed *and* whether the
+    // cross-checkout note carries that same claim as its degraded caveat.
+    let reads_call_edges = !matches!(direction, Direction::Deps);
+    let cross = daemon_client::warn_if_cross_checkout(&db_path, reads_call_edges);
+    if !cross && reads_call_edges {
         daemon_client::warn_if_phase_b_degraded(&db_path);
     }
 

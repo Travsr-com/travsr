@@ -209,7 +209,8 @@ pub(crate) fn cross_checkout_note(
          Everything it reports, including any path, line number or symbol, \
          describes that tree, not this one. This is not index staleness: \
          re-indexing that checkout will never make it describe this worktree. \
-         Run `travsr init` here to give this worktree its own index.{}]",
+         Run `travsr init` here to give this worktree its own index.{} \
+         (set TRAVSR_NO_WORKTREE_NOTE=1 to silence this note)]",
         here.display(),
         served.display(),
         commit,
@@ -233,8 +234,15 @@ pub(crate) fn served_by_other_checkout(cwd: &Path, db_path: &Path) -> Option<Pat
 }
 
 /// The note for [`served_by_other_checkout`], or `None` when the answer really
-/// does describe the tree the caller is standing in (or the note is suppressed
-/// by `TRAVSR_NO_WORKTREE_NOTE`).
+/// does describe the tree the caller is standing in.
+///
+/// Classification only: `TRAVSR_NO_WORKTREE_NOTE` is deliberately **not** read
+/// here. `Some` means "this answer is about another checkout", which is also
+/// what tells a caller to drop its own hedged drift note — a claim that stays
+/// true when the user has merely asked not to read about it. Collapsing the two
+/// into one `None` would mean muting this note handed the user back the two
+/// misleading notes it replaces. The caller mutes the *print* via
+/// [`worktree_note_suppressed`]; see `travsr status`.
 ///
 /// `served_commit` is the index's `last_commit` when the caller already has a
 /// store open, otherwise `None`; this resolver deliberately does not open one,
@@ -246,9 +254,6 @@ pub(crate) fn cross_checkout_note_for_db(
     db_path: &Path,
     served_commit: Option<&str>,
 ) -> Option<String> {
-    if worktree_note_suppressed() {
-        return None;
-    }
     let served = db_path.parent()?.parent()?;
     let here = served_by_other_checkout(cwd, db_path)?;
     Some(cross_checkout_note(&here, served, served_commit, false))
@@ -257,9 +262,15 @@ pub(crate) fn cross_checkout_note_for_db(
 /// Escape hatch (`TRAVSR_NO_WORKTREE_NOTE`): serving a linked worktree from the
 /// main index is the intended #302 behavior, and an agent setup that spawns
 /// worktrees under `.claude/worktrees/` sees the note on every read call. Read
-/// at the emit entry points, never in [`served_by_other_checkout`], so the
-/// classifier itself stays a pure predicate the tests can pin. Follows the
-/// crate's existing `TRAVSR_NO_RERANK` / `TRAVSR_ABSTAIN_GUESSES` convention.
+/// at the emit entry points, never in [`served_by_other_checkout`] or
+/// [`cross_checkout_note_for_db`], so the classification a caller keys its own
+/// note suppression to stays a pure predicate. Follows the crate's existing
+/// `TRAVSR_NO_RERANK` / `TRAVSR_ABSTAIN_GUESSES` convention.
+///
+/// Silences the print only. It never turns a cross-checkout answer back into an
+/// ordinary one: the freshness and drift notes stay suppressed, because they
+/// are wrong here whether or not the user wants to read about it. The note
+/// names this variable so the people it is aimed at can find it.
 pub(crate) fn worktree_note_suppressed() -> bool {
     std::env::var_os("TRAVSR_NO_WORKTREE_NOTE").is_some()
 }
@@ -496,6 +507,10 @@ mod tests {
             note.contains("not index staleness"),
             "the note must not be mistaken for the staleness warning it replaces: {note}"
         );
+        // The hatch is reachable only from the note: it is in no `--help` and no
+        // doc, so the people seeing this on every read call have nowhere else to
+        // find it.
+        assert!(note.contains("TRAVSR_NO_WORKTREE_NOTE=1"), "got: {note}");
     }
 
     /// A linked worktree answered from its own root is not a cross-checkout
@@ -539,6 +554,34 @@ mod tests {
     /// process-global and the suite runs in parallel.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Holds [`ENV_LOCK`] and restores `TRAVSR_NO_WORKTREE_NOTE` on drop.
+    ///
+    /// Both halves matter only on a red run, which is the run whose output has
+    /// to be readable. Without the restore, a failing assert leaves the var set
+    /// for every later test in the process; without `into_inner`, the panic that
+    /// caused it also poisons the mutex, so the next test to take the lock dies
+    /// on the poison and reports as a second, unrelated failure that buries the
+    /// first. There is no state behind this lock to be corrupted, so ignoring
+    /// the poison is sound.
+    struct EnvGuard {
+        // Held for its `Drop`, never read.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn acquire() -> Self {
+            Self {
+                _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("TRAVSR_NO_WORKTREE_NOTE");
+        }
+    }
+
     /// End-to-end over the production predicate against a **real** `git
     /// worktree` (not a hand-built pointer file): exercises both the gitlink
     /// shape git actually writes and the `<root>/.travsr/graph.db ->
@@ -565,12 +608,11 @@ mod tests {
     }
 
     /// `cross_checkout_note_for_db` (the `travsr status` entry) names both roots
-    /// for a real worktree and stays silent in the main checkout. Holds the env
-    /// lock because it reads `TRAVSR_NO_WORKTREE_NOTE`.
+    /// for a real worktree and stays silent in the main checkout. Takes no env
+    /// lock: this entry is pure classification and no longer reads
+    /// `TRAVSR_NO_WORKTREE_NOTE`.
     #[test]
     fn cross_checkout_note_for_db_names_the_worktree() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("TRAVSR_NO_WORKTREE_NOTE");
         let Some((_tmp, main, wt)) = main_and_worktree() else {
             return;
         };
@@ -604,11 +646,19 @@ mod tests {
         );
     }
 
-    /// `TRAVSR_NO_WORKTREE_NOTE` suppresses the note at the emit entry even on a
-    /// genuine cross-checkout worktree. Holds the env lock; restores the env.
+    /// `TRAVSR_NO_WORKTREE_NOTE` silences the *print*, and must not also erase
+    /// the *classification*.
+    ///
+    /// The two are what a caller keys two different decisions to: whether to
+    /// print this note, and whether the freshness and drift notes it replaces
+    /// still apply. Folding the hatch into the classifier made muting one
+    /// accurate note hand the user back two misleading ones, so this pins that
+    /// `cross_checkout_note_for_db` keeps answering "yes, another checkout"
+    /// regardless of the variable, and that the variable is visible on its own
+    /// through [`worktree_note_suppressed`] for the emitter to act on.
     #[test]
-    fn worktree_note_env_var_suppresses_the_note() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn worktree_note_hatch_is_separate_from_the_classification() {
+        let _guard = EnvGuard::acquire();
         let Some((_tmp, main, wt)) = main_and_worktree() else {
             return;
         };
@@ -620,8 +670,11 @@ mod tests {
 
         std::env::set_var("TRAVSR_NO_WORKTREE_NOTE", "1");
         assert!(worktree_note_suppressed());
-        assert!(cross_checkout_note_for_db(&wt, &db, Some("abc1234")).is_none());
-        std::env::remove_var("TRAVSR_NO_WORKTREE_NOTE");
+        assert!(
+            cross_checkout_note_for_db(&wt, &db, Some("abc1234")).is_some(),
+            "the hatch must silence the note, not reclassify the answer as \
+             belonging to this tree"
+        );
     }
 
     /// Once a worktree has its own index (a write command created

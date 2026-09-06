@@ -235,9 +235,15 @@ pub fn run() -> anyhow::Result<()> {
     // ("expected in a linked worktree; otherwise ...") over a fact `status`
     // already knows, and its "wait for the daemon to reconcile" advice cannot
     // work when the served index describes a tree that is not this one.
+    //
+    // `TRAVSR_NO_WORKTREE_NOTE` silences the cross-checkout note but must not
+    // resurrect the drift note in its place, so the hatch is read here, at the
+    // print, rather than folded into the classification above.
     let stored = payload.last_commit.as_deref().unwrap_or("");
     if let Some(note) = crate::repo::cross_checkout_note_for_db(&cwd, &db_path, Some(stored)) {
-        eprintln!("warning: {note}");
+        if !crate::repo::worktree_note_suppressed() {
+            eprintln!("warning: {note}");
+        }
     } else if let Some(head) = head.as_deref() {
         if let Some(note) = travsr_mcp::head_index_mismatch_note(head, stored) {
             eprintln!("{note}");

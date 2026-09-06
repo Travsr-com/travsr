@@ -37,9 +37,11 @@ pub fn run(
     // `find_pattern` greps the *served* index's file set, so from a linked
     // worktree served by another checkout every `path:line` printed below is
     // that tree's, rendered as a repo-relative path that reads as this one's.
-    // Only this note applies here: the search reads no call edges, so the Phase
-    // B freshness warning would be beside the point.
-    daemon_client::warn_if_cross_checkout(&db_path);
+    // Only this note applies here, and only its "which tree" half: the search
+    // reads no call edges, so the Phase B freshness warning would be beside the
+    // point — hence `reads_call_edges: false`, which also keeps that claim from
+    // riding in as the cross-checkout note's degraded caveat.
+    daemon_client::warn_if_cross_checkout(&db_path, false);
 
     // UX-009: use the raw (un-enveloped, un-escaped) pattern body. The plain
     // `find_pattern` returns the model-facing `<travsr-data>` envelope with
