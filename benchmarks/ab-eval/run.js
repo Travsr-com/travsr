@@ -86,7 +86,9 @@ function prepareFixture(fixtureRelPath, name) {
 // Model an agent without Travsr: git grep the symbol/query to find candidate
 // files, then read every candidate in full to decide the answer.
 function filesArm(task, dir) {
-  const term = task.symbol || task.query;
+  // files_term lets a task whose graph query is a qualified name (PaymentService.charge)
+  // model what an agent would really grep for, instead of a literal that matches nothing.
+  const term = task.files_term || task.symbol || task.query;
   let candidates = [];
   try {
     const out = execFileSync('git', ['grep', '-I', '-l', '--fixed-strings', term], {
@@ -197,7 +199,7 @@ for (const task of MANIFEST.tasks) {
   const cls = task.class || 'callers';
   console.log(`\n=== [${cls}] ${task.name} — "${task.question}" ===`);
   const dir = prepareFixture(task.fixture, task.name);
-  const init = travsr(['init', '--quiet'], dir);
+  const init = travsr(['init', '--quiet', '--semantic'], dir);
   if (init.status !== 0) {
     failures.push(`${task.name}: travsr init failed (exit ${init.status})`);
     fs.rmSync(dir, { recursive: true, force: true });

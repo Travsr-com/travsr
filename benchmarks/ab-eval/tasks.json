@@ -9,10 +9,11 @@
   "tasks": [
     {
       "class": "callers",
-      "name": "callers-of-PaymentService",
-      "question": "Which files call PaymentService?",
+      "name": "callers-of-PaymentService.charge",
+      "question": "Which files call PaymentService.charge?",
       "fixture": "fixtures/ts-callers",
-      "symbol": "PaymentService",
+      "symbol": "PaymentService.charge",
+      "files_term": "charge",
       "self_path": "service.ts",
       "expect_files": ["controller.ts"]
     },
@@ -32,7 +33,7 @@
       "query": "PaymentService",
       "fixture": "fixtures/ts-callers",
       "expect_symbols": ["PaymentService", "charge"],
-      "expect_files": ["service.ts"]
+      "expect_files": ["controller.ts", "service.ts"]
     },
     {
       "class": "context",
@@ -41,7 +42,7 @@
       "query": "Greeter",
       "fixture": "fixtures/ts-small",
       "expect_symbols": ["Greeter", "hello"],
-      "expect_files": ["a.ts"]
+      "expect_files": ["a.ts", "b.ts"]
     },
     {
       "class": "ask",

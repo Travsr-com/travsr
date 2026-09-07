@@ -99,7 +99,7 @@ for (const corpus of MANIFEST.corpora) {
   const dir = prepareCorpus(corpus);
 
   // ── Perf section (#295-T6): cold init wall time + graph size ──────────────
-  const init = travsr(['init', '--quiet'], dir);
+  const init = travsr(['init', '--quiet', '--semantic'], dir);
   if (init.status !== 0) {
     failures.push(`${corpus.name}: travsr init failed (exit ${init.status}): ${init.stderr.slice(0, 500)}`);
     report.corpora.push({ name: corpus.name, init_failed: true });
