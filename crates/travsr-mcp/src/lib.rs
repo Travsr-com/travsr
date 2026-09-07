@@ -126,7 +126,8 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
 
     use travsr_error::StoreError;
     use travsr_plugin_host::{
-        active_backend_id, embed_backends, lookup_embed_backend, EmbedQueryHook, EmbedSupervisor,
+        active_backend_id, embed_backends, lookup_embed_backend, repo_backend_id, EmbedQueryHook,
+        EmbedSupervisor,
     };
     use travsr_store::{EmbedKnnHook, EmbedReadiness, EmbedScoreHook};
 
@@ -137,12 +138,30 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     }
 
     let Some(home) = dirs::home_dir() else { return };
-    let backend = active_backend_id()
+    // #481: the embedding backend is a per-repo setting; `~/.travsr/embed.toml`
+    // is only the fallback. Reading the machine-global id here started the
+    // sidecar with a different model than this repo's index was built with, so
+    // `knn_hook`/`doc_knn_hook` were armed against a space that does not exist
+    // for that model id. The doc hook then stayed `None` forever and the docs
+    // section vanished with no error on every `get_context`, while `travsr ask`
+    // (served by the daemon, which resolves the repo model) still rendered it.
+    // Same resolution order as travsr-cli's embed paths.
+    let backend = db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(repo_backend_id)
+        .or_else(active_backend_id)
         .as_deref()
         .and_then(lookup_embed_backend)
         .or_else(|| embed_backends().first())
         .cloned();
     let Some(backend) = backend else { return };
+
+    // Mirror the daemon's guard (travsr-daemon: `embed model_id mismatch`): if
+    // the index records a model, the sidecar's must match it or the hooks would
+    // query a space built by a different encoder. Read before the init thread
+    // because `store` is not `Send`.
+    let stored_model = store.get_meta("current_embed_model").ok().flatten();
 
     let binary = home
         .join(".travsr")
@@ -188,6 +207,15 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
             let supervisor = EmbedSupervisor::try_start(&binary, &db_path_bg, &model_id_bg);
             if supervisor.is_active() {
                 if let Some(mid) = supervisor.model_id().map(str::to_string) {
+                    if stored_model.as_deref().is_some_and(|stored| stored != mid) {
+                        tracing::warn!(
+                            stored_model = ?stored_model,
+                            plugin_model = %mid,
+                            "embed model_id mismatch, semantic search disabled. \
+                             Run `travsr embed reindex` to rebuild embeddings with the installed model."
+                        );
+                        return;
+                    }
                     if let Some(hook) = supervisor.knn_hook(mid.clone()) {
                         // Warm the sidecar (ONNX + HNSW load) BEFORE arming the
                         // hook, so the first real query never pays the cold-start
