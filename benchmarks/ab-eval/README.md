@@ -20,7 +20,7 @@ Three classes of structural question are evaluated:
 | Arm | What it models | Answer | Context cost |
 |---|---|---|---|
 | **graph** | An agent wired to the Travsr MCP server | file nodes / ranked rows returned by one Travsr query | tokens of the **answer payload** - 0 source files read |
-| **files-only** | An agent with only `grep` + `read` (Copilot/Cursor-style) | every file that textually mentions the symbol (`git grep -l` on its unqualified name) | tokens of **all** those files, read in full |
+| **files-only** | An agent with only `grep` + `read` (Copilot/Cursor-style) | every file that textually mentions the symbol (`git grep -l`, falling back to its unqualified name when the qualified one matches nothing and is not a path) | tokens of **all** those files, read in full |
 
 The graph arm's cost is the answer Travsr returns, not the `--format json` CLI
 debug envelope - an MCP-wired agent forwards the resolved answer, not the raw

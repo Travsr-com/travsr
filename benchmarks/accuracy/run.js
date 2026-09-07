@@ -4,8 +4,10 @@
 // Nightly accuracy benchmark runner (#318 O8).
 //
 // For every enabled corpus in manifest.json:
-//   1. copy the fixture into a temp git repo and run `travsr init` (timed —
-//      this doubles as the #295-T6 init-at-scale perf section),
+//   1. copy the fixture into a temp git repo and run `travsr init --semantic`
+//      (timed: this doubles as the #295-T6 init-at-scale perf section, so
+//      init_seconds covers Phase A plus a synchronous Phase B, not Phase A
+//      alone),
 //   2. run each ground-truth query case through the release binary,
 //   3. score recall / precision / seed resolution per class, plus latency
 //      p50/p95 and output token cost per query,
@@ -39,6 +41,11 @@ if (!fs.existsSync(BIN)) {
 }
 
 const ENV = { ...process.env, TRAVSR_DISABLE_REGISTRY: '1', RUST_LOG: 'error' };
+
+// Named so the semantic-index failure below can quote the argv it actually ran:
+// the regression it guards against is someone dropping `--semantic`, and a
+// hardcoded message would then name a command that was never issued.
+const INIT_ARGS = ['init', '--quiet', '--semantic'];
 
 function sh(cmd, args, cwd) {
   execFileSync(cmd, args, { cwd, env: ENV, stdio: 'pipe' });
@@ -98,8 +105,10 @@ for (const corpus of MANIFEST.corpora) {
   console.log(`\n=== corpus: ${corpus.name} ===`);
   const dir = prepareCorpus(corpus);
 
-  // ── Perf section (#295-T6): cold init wall time + graph size ──────────────
-  const init = travsr(['init', '--quiet', '--semantic'], dir);
+  // ── Perf section (#295-T6): cold Phase A + Phase B init wall time and graph
+  // size. `--semantic` makes Phase B synchronous, so init_seconds is the whole
+  // index build, not the Phase A figure this section reported before.
+  const init = travsr(INIT_ARGS, dir);
   if (init.status !== 0) {
     failures.push(`${corpus.name}: travsr init failed (exit ${init.status}): ${init.stderr.slice(0, 500)}`);
     report.corpora.push({ name: corpus.name, init_failed: true });
@@ -116,7 +125,7 @@ for (const corpus of MANIFEST.corpora) {
   const semanticState = semantic ? semantic[1].trim() : '(not reported by travsr status)';
   if (semanticState !== 'complete') {
     failures.push(
-      `${corpus.name}: semantic index not built. \`travsr init --semantic\` exited 0 but ` +
+      `${corpus.name}: semantic index not built. \`travsr ${INIT_ARGS.join(' ')}\` exited 0 but ` +
       `\`travsr status\` reports "semantic: ${semanticState}", so Phase B did not complete and ` +
       `the graph has no call edges. Every caller assertion below would score zero against it.`
     );

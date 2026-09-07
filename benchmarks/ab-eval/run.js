@@ -50,6 +50,11 @@ if (!fs.existsSync(BIN)) {
 
 const ENV = { ...process.env, TRAVSR_DISABLE_REGISTRY: '1', RUST_LOG: 'error' };
 
+// Named so the semantic-index failure below can quote the argv it actually ran:
+// the regression it guards against is someone dropping `--semantic`, and a
+// hardcoded message would then name a command that was never issued.
+const INIT_ARGS = ['init', '--quiet', '--semantic'];
+
 function sh(cmd, args, cwd) {
   execFileSync(cmd, args, { cwd, env: ENV, stdio: 'pipe' });
 }
@@ -94,20 +99,38 @@ function prepareFixture(fixtureRelPath, name) {
 // ── FILES arm (shared by callers + context classes) ───────────────────────────
 // Model an agent without Travsr: git grep the symbol/query to find candidate
 // files, then read every candidate in full to decide the answer.
-function filesArm(task, dir) {
-  // Derived, never author-supplied: the term is the unqualified tail of the task's
-  // graph query, which is what an agent would really grep for when the graph query
-  // is a qualified name (PaymentService.charge greps `charge`, not a literal that
-  // matches nothing). Keeping it mechanical stops the published token-reduction
-  // figure from being tunable by picking a cheaper grep.
-  const term = (task.symbol || task.query).split('.').pop();
-  let candidates = [];
+function grepFiles(term, dir) {
   try {
     const out = execFileSync('git', ['grep', '-I', '-l', '--fixed-strings', term], {
       cwd: dir, env: ENV, encoding: 'utf8',
     });
-    candidates = out.split('\n').map(s => s.trim()).filter(Boolean);
-  } catch (_) { /* no matches → empty */ }
+    return out.split('\n').map(s => s.trim()).filter(Boolean);
+  } catch (_) { return []; /* no matches */ }
+}
+
+function filesArm(task, dir) {
+  // Derived, never author-supplied: grep the task's graph query verbatim, and
+  // fall back to its unqualified tail only for a qualified symbol name, which
+  // is not itself a greppable literal (PaymentService.charge appears in no
+  // file, `charge` does).
+  //
+  // The tail is taken only when the query does not name a file in the corpus.
+  // Splitting on any dot is content-dependent truncation: a filename-shaped
+  // query would grep its extension ('a.ts' -> 'ts'), match every file that
+  // merely mentions the extension, and inflate the FILES arm, which is the
+  // denominator of the published mean_token_reduction. A zero-match test alone
+  // does not catch that, because a filename usually does not appear inside the
+  // files either, so it falls through to the extension anyway.
+  //
+  // A path-shaped query therefore greps verbatim and may match nothing, which
+  // fails the task on `cheaper`. That is deliberate: a task that cannot state a
+  // FILES baseline should fail loudly, not quietly raise the published figure.
+  const full = task.symbol || task.query;
+  const namesAFile = fs.existsSync(path.join(dir, full));
+  let candidates = grepFiles(full, dir);
+  if (candidates.length === 0 && !namesAFile && full.includes('.')) {
+    candidates = grepFiles(full.split('.').pop(), dir);
+  }
 
   let contextChars = 0;
   for (const rel of candidates) {
@@ -211,7 +234,7 @@ for (const task of MANIFEST.tasks) {
   const cls = task.class || 'callers';
   console.log(`\n=== [${cls}] ${task.name} — "${task.question}" ===`);
   const dir = prepareFixture(task.fixture, task.name);
-  const init = travsr(['init', '--quiet', '--semantic'], dir);
+  const init = travsr(INIT_ARGS, dir);
   if (init.status !== 0) {
     failures.push(`${task.name}: travsr init failed (exit ${init.status})`);
     fs.rmSync(dir, { recursive: true, force: true });
@@ -225,7 +248,7 @@ for (const task of MANIFEST.tasks) {
   const semantic = semanticState(dir);
   if (semantic !== 'complete') {
     failures.push(
-      `${task.name}: semantic index not built. \`travsr init --semantic\` exited 0 but ` +
+      `${task.name}: semantic index not built. \`travsr ${INIT_ARGS.join(' ')}\` exited 0 but ` +
       `\`travsr status\` reports "semantic: ${semantic}", so Phase B did not complete and the ` +
       `graph has no call edges. The graph arm below would score zero against it.`
     );
