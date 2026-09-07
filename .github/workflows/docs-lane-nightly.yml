@@ -85,8 +85,19 @@ jobs:
       - name: Install embedding backend (arctic-embed-m-v1.5)
         run: ./target/release/travsr embed init --backend arctic-embed-m-v1.5
 
+      # `--semantic` builds Phase B synchronously, so the index is final before
+      # any gate runs. Plain `init` deliberately leaves `phase_b_commit` unset
+      # for the daemon to pick up, and Gate 5 stops and starts a daemon in the
+      # middle of the run: its phase_b_tick calls arm_phase_b_if_pending, which
+      # arms immediately when phase_b_commit != last_commit, so a background
+      # Phase B would grow call edges underneath the arms while they are being
+      # scored. The gates themselves are otherwise indifferent to Phase B, since
+      # they carry no caller assertions and gates 2/3/5d compare two arms inside
+      # one run against one shared index. Measured cost on this repo: 9.8s plain
+      # vs 2m30s semantic, against a 90 minute job budget the embed pass below
+      # dominates.
       - name: Index this repo
-        run: ./target/release/travsr init
+        run: ./target/release/travsr init --semantic
 
       - name: Build embeddings (code + doc spaces)
         run: ./target/release/travsr embed reindex
