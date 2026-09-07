@@ -4590,6 +4590,7 @@ pub(crate) fn build_context_signals(
         phase_b_pending(store),
         has_embed,
         embed_warming,
+        has_embed && store.embed_disabled(),
         store.has_embed_db(),
         knn_degraded,
         overflow_msg,
@@ -4610,6 +4611,7 @@ fn build_context_signals_with_r2(
     phase_b_pending: bool,
     has_embed: bool,
     embed_warming: bool,
+    embed_disabled: bool,
     embed_initialized: bool,
     knn_degraded: bool,
     overflow_msg: Option<&str>,
@@ -4635,6 +4637,13 @@ fn build_context_signals_with_r2(
     if embed_warming {
         parts.push(
             "[note: semantic embeddings still warming up (sidecar starting); this result is lexical-only; retry in a few seconds for full semantic ranking]",
+        );
+    } else if embed_disabled {
+        // Arming finished with no hook installed, so unlike `warming` this will
+        // not resolve on a retry. Most often the index was built with a
+        // different embedding model than the one installed.
+        parts.push(
+            "[note: semantic search unavailable (the embedding sidecar did not start, or the index was built with a different model); results are lexical only. Run `travsr embed status` to check, then `travsr embed reindex` if the model changed]",
         );
     } else if has_embed && knn_degraded {
         parts.push(
@@ -4768,17 +4777,33 @@ fn omit_seed_via(grouped: bool, ms: crate::seed::MatchSource) -> bool {
 /// are partitioned into Exact → Semantic → Relevant sections (each preceded by a
 /// one-line header) and sorted within a section by descending display score.
 /// Display-only: the knapsack set is unchanged — only presentation order differs.
+///
+/// #870: the ungrouped path keeps its flat code lines, but doc entries still
+/// get their header. `grouped` is false for a result of four nodes or fewer,
+/// where per-section headers cost more than they save. That is a rule about
+/// *code* rows, which carry their own kind and path. A doc entry carries
+/// neither: the header is the only thing that marks the line as author-written
+/// prose (§4.1, mitigation M2), and it is the only handle a consumer has for
+/// finding the section at all. Dropping it left doc lines rendered bare among
+/// the code rows, so `get_context` reported no docs for a query `ask` answered
+/// from one. That is the shape of a result on a sparse graph (a repo indexed
+/// without Phase B), not an edge case. A docs-free response is unaffected and
+/// stays byte-identical.
 fn assemble_context_body(
     entries: Vec<(crate::seed::MatchSource, f32, String)>,
     sep: &str,
     grouped: bool,
 ) -> String {
     if !grouped {
-        return entries
+        let (docs, code): (Vec<_>, Vec<_>) = entries
             .into_iter()
-            .map(|(_, _, line)| line)
-            .collect::<Vec<_>>()
-            .join(sep);
+            .partition(|(ms, _, _)| *ms == crate::seed::MatchSource::Docs);
+        let mut out: Vec<String> = code.into_iter().map(|(_, _, line)| line).collect();
+        if !docs.is_empty() {
+            out.push(match_source_header(crate::seed::MatchSource::Docs).to_string());
+            out.extend(docs.into_iter().map(|(_, _, line)| line));
+        }
+        return out.join(sep);
     }
     let mut entries = entries;
     entries.sort_by(|a, b| {
@@ -5321,6 +5346,12 @@ fn get_context_body(
     // sidecar is still cold. Distinguishes "warming up" from "embeddings off"
     // so the header/notes never silently claim full semantic coverage.
     let embed_warming = has_embed && !store.embed_ready();
+    // #874: arming can settle with no hook installed (sidecar refused to start,
+    // or the index was built with a different embedding model). The MCP
+    // injector installs its meta-hooks unconditionally so `initialize` never
+    // blocks, so `has_embed` stays true and the query would otherwise report
+    // `embeddings: on` while the semantic lane is permanently dead.
+    let embed_disabled = has_embed && store.embed_disabled();
 
     // R3: track per-query KNN health; has_embed=true doesn't mean KNN worked.
     let mut knn_degraded = false;
@@ -5353,7 +5384,7 @@ fn get_context_body(
         .map(|f| f as &dyn Fn(&str, &[NodeId]) -> Vec<(NodeId, f32)>);
     let seed_set =
         crate::seed::build_seed_set(store, query, filter, knn_pairs, &knn_oracle, score_ref);
-    let tier_label = if has_embed && !seed_set.seeds.is_empty() {
+    let tier_label = if has_embed && !embed_disabled && !seed_set.seeds.is_empty() {
         "exact+lexical+semantic"
     } else {
         "exact+lexical"
@@ -5469,6 +5500,8 @@ fn get_context_body(
         "degraded"
     } else if embed_warming {
         "warming"
+    } else if embed_disabled {
+        "disabled"
     } else if has_embed {
         "on"
     } else {
@@ -6045,6 +6078,7 @@ fn get_context_body(
             phase_b,
             has_embed,
             embed_warming,
+            embed_disabled,
             embed_initialized,
             knn_degraded,
             overflow_msg.as_deref(),
@@ -6094,6 +6128,7 @@ fn get_context_body(
             phase_b,
             has_embed,
             embed_warming,
+            embed_disabled,
             embed_initialized,
             knn_degraded,
             overflow_msg.as_deref(),
@@ -11703,6 +11738,41 @@ mod snippet_tests {
         assert!(
             !result.contains("warming"),
             "armed readiness must not emit warming note; got: {result}"
+        );
+    }
+
+    /// #874: arming settled with no hook installed (model mismatch, or a sidecar
+    /// that never started). The meta-hook is still present, so `has_embed` is
+    /// true and readiness is armed — without the third state this reads as
+    /// `embeddings: on` over a semantic lane that can never answer.
+    #[test]
+    fn get_context_disabled_reports_disabled_header_and_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let readiness = travsr_store::EmbedReadiness::new();
+        readiness.mark_disabled();
+        readiness.mark_ready();
+        store.set_embed_readiness(readiness);
+        let knn: EmbedKnnFn<'_> = &|_q, _k| vec![];
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, Some(knn));
+        assert!(
+            result.contains("embeddings: disabled"),
+            "a settled-but-unarmed hook must not report `on`; got: {result}"
+        );
+        assert!(
+            !result.contains("exact+lexical+semantic"),
+            "retrieval tier must not claim semantic; got: {result}"
+        );
+        assert!(
+            result.contains("semantic search unavailable"),
+            "must emit the unavailable note; got: {result}"
+        );
+        assert!(
+            !result.contains("warming"),
+            "disabled is settled, not warming; got: {result}"
         );
     }
 

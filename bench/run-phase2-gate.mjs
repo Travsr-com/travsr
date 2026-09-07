@@ -56,7 +56,17 @@ const ROOT = join(HERE, "..");
 const BIN = join(ROOT, "target/release/travsr");
 const LABEL = process.env.BENCH_LABEL || "travsr";
 const REPO = process.env.BENCH_REPO || ROOT;
-const BUDGET = process.env.BENCH_BUDGET || "4000";
+// A non-numeric BENCH_BUDGET reaches get_context as a raw string, where it is
+// neither the default nor anything the caller meant. Fall back to the default
+// and say so instead of running the gates at a budget nobody typed.
+const BUDGET = (() => {
+  const raw = process.env.BENCH_BUDGET || "4000";
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) return raw;
+  console.error(`[budget] BENCH_BUDGET=${JSON.stringify(raw)} is not a positive number; using 4000`);
+  return "4000";
+})();
+
 const seededPath = join(HERE, `queries-seeded-${LABEL}.json`);
 const docsPath = join(HERE, `queries-docs-${LABEL}.json`);
 
@@ -286,13 +296,48 @@ function parseDocLine(line) {
   return m ? { path: m[1].trim(), heading: m[2].trim() } : null;
 }
 
+// Every section header `match_source_header` (crates/travsr-mcp/src/tools.rs)
+// can emit, keyed by the matching `MatchSource::label()`. Each pattern matches
+// the leading words that *name* the section; the trailing gloss ("(not
+// relevance-ranked)", "graph-adjacent context") is prose and may be reworded
+// without breaking the parse.
+//
+// This list has to be exhaustive. The previous
+// `/^##\s+(exact|semantic|docs|relevant)\b/` matched three of the five headers:
+// "## related, ranked by relevance" and "## tests, test entry points &
+// fixtures" fell through as ordinary body lines, which left `cur` pointing at
+// the *previous* section. The damage was silent and asymmetric across the two
+// arms this harness exists to compare: with docs off the tests rows were
+// counted under `exact`, and with docs on they landed in `cur === "docs"`,
+// failed `parseDocLine`'s " § " requirement and were dropped outright. Enabling
+// the docs lane therefore deleted a whole section from the scored set and
+// shifted every later rank, on byte-identical product output.
+// `sections.semantic` was always empty for the same reason.
+//
+// The parse assumes grouped output. `get_context` only emits these headers when
+// `match_source_grouping_enabled() && n_nodes > 4` (tools.rs); a grounded
+// response below that node count carries no headers and scores as zero nodes.
+// None occur in either seeded set (checked), and the abstain path has its own
+// detector, so this is recorded rather than worked around.
+const SECTION_HEADERS = [
+  [/^##\s+exact matches\b/, "exact"],
+  [/^##\s+related, ranked by relevance\b/, "semantic"],
+  [/^##\s+docs\b/, "docs"],
+  [/^##\s+tests\b/, "tests"],
+  [/^##\s+relevant\b/, "relevant"],
+];
+
 function parseSections(text) {
-  const sections = { exact: [], semantic: [], docs: [], relevant: [] };
+  const sections = { exact: [], semantic: [], docs: [], tests: [], relevant: [] };
   let cur = null;
   for (const line of strip(text).split("\n")) {
-    const sec = /^##\s+(exact|semantic|docs|relevant)\b/.exec(line);
-    if (sec) {
-      cur = sec[1];
+    // Every `##` line is a section boundary, recognised or not. An unrecognised
+    // one discards its body instead of appending it to whatever came before, so
+    // a future header rename surfaces as a section going empty (loud, and
+    // visible in the report) rather than as silently mis-attributed rows.
+    if (/^##\s/.test(line)) {
+      const known = SECTION_HEADERS.find(([re]) => re.test(line));
+      cur = known ? known[1] : null;
       continue;
     }
     if (!cur || !line.trim()) continue;
@@ -308,8 +353,18 @@ function parseSections(text) {
   }
   return sections;
 }
+// Section order matches the product's own render order (MatchSource::trust_rank,
+// seed.rs), so a rank here is the rank the reading model sees.
+//
+// `tests` counts as a code node: it is code, it is rendered to the model, it is
+// inside the `[N nodes]` footer, and several `expect` entries in the seeded
+// query files are test function names. It is also what the off arm has always
+// been scored on. Before the header fix the tests rows were being counted under
+// `exact`, so including them here reproduces every historical off-arm number
+// exactly (verified: zero differing rows over the 44-query travsr set) and the
+// fix only repairs the on arm, where they were being dropped.
 function codeNodes(sections) {
-  return [...sections.exact, ...sections.semantic, ...sections.relevant];
+  return [...sections.exact, ...sections.semantic, ...sections.tests, ...sections.relevant];
 }
 function confidence(text) {
   const m = /confidence:\s*(\w+)/i.exec(strip(text));
@@ -911,6 +966,26 @@ try {
 
 // ── gate verdicts ───────────────────────────────────────────────────────────
 const gate1 = docsSummary["hit@1"] >= 0.6 && docsSummary["hit@3"] >= 0.9;
+// Both arms run at BUDGET, and both gates stay equalities.
+//
+// #869 read the off/on movement on this set as the §4.3 budget carve
+// (`knapsack(items, token_budget - doc_tokens)`) truncating the on arm's code
+// lane, and proposed running the off arm at a reduced budget with `>=` gates to
+// compensate. Measured on the travsr set, that premise does not hold: off@4000
+// and off@3200 produce zero differing rows, the largest response is 2326 tokens
+// against a 3200 budget so the knapsack budget never binds, and measured
+// doc_tokens is around 90 against an 800 cap. The single off/on difference the
+// issue rests on (C10, rank 10 -> 7) was `parseSections` dropping the tests
+// section under docs-on, not the budget; with that fixed, off and on differ on
+// zero rows.
+//
+// The carve is real in principle, so a corpus where the budget does bind could
+// still surface it. It is not compensated for here: handicapping the off arm
+// makes `on >= off` close to unfailable while the console still reads "code
+// regression", which is a worse failure than the one it avoids. If a bind is
+// ever measured, equalise per query (the on arm's doc_tokens is recoverable
+// from `sections.docs`: entries are rendered verbatim and doc_tokens is
+// `sum(line.len()/4 + 1)`, knapsack.rs) rather than handicapping the arm.
 const gate2 = onSummary["hit@1"] === offSummary["hit@1"] && onSummary["hit@10"] === offSummary["hit@10"];
 const gate3 = onSummary.abstainRate === offSummary.abstainRate;
 const inference = summarizeInference(docsRows, probeRows);
@@ -927,6 +1002,13 @@ const gate4 = inference.pass;
 //   5d  no code regression on `ask` between docs off and on, mirroring gates
 //       2 and 3 on the second surface.
 const askVacuous = !askSummary || askSummary.queriesWithDocs === 0;
+// 5d mirrors gates 2 and 3 on the `ask` surface and is an equality for the same
+// reason. `ask` has the identical §4.3 carve (query.rs:
+// `knapsack(items, DEFAULT_TOKEN_BUDGET.saturating_sub(doc_tokens))`) over a
+// hardcoded 4096 with no flag and no env override, so its budget is not
+// adjustable from here at all. As on get_context, the carve was measured not to
+// bind on this corpus, so `===` stands: any movement is unexplained, and
+// perQueryRegressions is where to look before calling it a ranking regression.
 const askCodeStable =
   !!askOffSummary &&
   !!askOnSummary &&
@@ -957,7 +1039,13 @@ const report = {
   generatedAt: new Date().toISOString(),
   repo: LABEL,
   gate1_docHit: { pass: gate1, ...docsSummary, threshold: "hit@1>=0.60, hit@3>=0.90" },
-  gate2_codeRegression: { pass: gate2, off: offSummary, on: onSummary, perQueryRegressions },
+  gate2_codeRegression: {
+    pass: gate2,
+    off: offSummary,
+    on: onSummary,
+    perQueryRegressions,
+    tokenBudget: Number(BUDGET),
+  },
   gate3_abstainRegression: { pass: gate3, offAbstainRate: offSummary.abstainRate, onAbstainRate: onSummary.abstainRate },
   gate4_singleInference: inference,
   gate5_askSurface: {
@@ -968,6 +1056,14 @@ const report = {
     codeOff: askOffSummary,
     codeOn: askOnSummary,
     codeStable: askCodeStable,
+    // Recorded, not compensated for: both ask arms run at DEFAULT_TOKEN_BUDGET
+    // (4096, query.rs, no flag or env override) and the on arm's code lane
+    // loses doc_tokens to the docs section, so it has slightly less room. The
+    // carve was measured not to bind on this corpus; treat a codeStable:false
+    // as unexplained movement and check perQueryRegressions.
+    codeStableBudgetCaveat:
+      "both ask arms run at DEFAULT_TOKEN_BUDGET; the on arm's code lane loses " +
+      "doc_tokens to the docs section, so it has strictly less room than the off arm",
     docsLeakedWhileOff: askOffLeak,
     surfaceParity: surfaceCmp,
     daemonReadyMs: askDaemonReadyMs,

@@ -1739,6 +1739,45 @@ mod tests {
         );
     }
 
+    /// #870: the two surfaces must agree on doc *presence*. `ask` returns
+    /// `docs` as its own field on every return path, so a doc entry is always
+    /// findable; `get_context` renders the same entries into its body, where
+    /// the section header is the only thing that marks them as prose. That
+    /// header used to be dropped whenever the code lane selected four nodes or
+    /// fewer (`group_output`), which is the normal shape of a result on a
+    /// sparse graph: a repo indexed without Phase B, where PPR has almost no
+    /// edges to expand along. The doc lines then reached the model as bare
+    /// lines among the code rows, and every consumer that finds the section by
+    /// its header (the docs-lane gate, the VS Code Context Explorer) read the
+    /// response as carrying no docs at all.
+    #[test]
+    fn ask_and_context_agree_on_doc_presence_when_few_nodes_are_selected() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        docs_env_on();
+        let (mut store, ..) = seeded_store();
+        with_doc_chunk(
+            &mut store,
+            "docs/adrs/ADR-001-coding-standards.md",
+            "doc:coding-standards/consequences",
+        );
+
+        let ask = ask_query(&store, "PaymentService", None).unwrap();
+        let ctx = crate::tools::get_context_raw(&store, "PaymentService", 4000, false, None);
+        docs_env_off();
+
+        assert_eq!(ask.docs.len(), 1, "docs: {:?}", ask.docs);
+        assert!(
+            ctx.contains("docs/adrs/ADR-001-coding-standards.md"),
+            "get_context must render the same doc entry: {ctx}"
+        );
+        assert!(
+            ctx.contains("## docs"),
+            "the doc entry must carry its section header on both surfaces: {ctx}"
+        );
+    }
+
     // ── Ambiguity resolution tests (issue #565 / RFC-002) ──────────────────
 
     #[test]

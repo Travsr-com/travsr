@@ -67,9 +67,10 @@ jobs:
         with:
           node-version: 20
 
-      # Runs in milliseconds and needs no index, so a broken harness or a
-      # regressed Gate 4 classifier fails here rather than after an hour of
-      # indexing. Also the negative control: it asserts the gate can still fail.
+      # Runs in milliseconds and needs no index and no binary, so a broken
+      # harness or a regressed Gate 4 classifier fails here in seconds rather
+      # than after a cold release build and an hour of indexing. Also the
+      # negative control: it asserts the gate can still fail.
       - name: Self-test the gate harness
         run: node bench/run-phase2-gate.mjs --self-test
 
