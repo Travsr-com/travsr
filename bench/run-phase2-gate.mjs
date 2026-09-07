@@ -46,7 +46,7 @@
 // starts is stopped and a plain one is started again at the end (its original
 // environment cannot be recovered — the script says so when it happens).
 
-import { spawn, execFile, execFileSync } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -56,10 +56,9 @@ const ROOT = join(HERE, "..");
 const BIN = join(ROOT, "target/release/travsr");
 const LABEL = process.env.BENCH_LABEL || "travsr";
 const REPO = process.env.BENCH_REPO || ROOT;
-// A non-numeric BENCH_BUDGET used to reach the on arm as a raw string while
-// CODE_ONLY_BUDGET below became the literal "NaN", so the two arms would have run
-// at different budgets for a reason nobody typed. Fall back to the default and
-// say so instead.
+// A non-numeric BENCH_BUDGET reaches get_context as a raw string, where it is
+// neither the default nor anything the caller meant. Fall back to the default
+// and say so instead of running the gates at a budget nobody typed.
 const BUDGET = (() => {
   const raw = process.env.BENCH_BUDGET || "4000";
   const n = Number(raw);
@@ -68,54 +67,6 @@ const BUDGET = (() => {
   return "4000";
 })();
 
-// Gate 2 compares the code lane across docs off/on, but #376 §4.3 spends the
-// docs section's measured cost out of the *same* budget
-// (`knapsack(items, token_budget - doc_tokens)`), so the on arm's code lane runs
-// with strictly less room than the off arm's. A query whose last kept result sits
-// on that truncation boundary then drops out under docs-on for a reason that has
-// nothing to do with ranking, and the gate reports a code regression that is
-// really a smaller budget. That is #869.
-//
-// Run the off arm at the *least* code budget the on arm could have had:
-// `doc_tokens` is clamped to `docs.budget_pct` of the budget, so
-// `BUDGET * (1 - pct/100)` is the on arm's worst case. The off arm is then
-// handicapped to the on arm rather than advantaged over it, and Gate 2 becomes
-// one-sided (below): docs must not make the code lane *worse*. Truncation can no
-// longer manufacture a failure, while a genuine ranking regression still trips it.
-//
-// The percentage is read from the binary's own config resolution rather than
-// hardcoded, so a repo that retunes `docs.budget_pct` retunes this with it. This
-// needs BIN to exist, so any caller that runs this file (including --self-test)
-// must build the release binary first; the fallback below is loud rather than
-// silent so a run that took it cannot be mistaken for a resolved value.
-//
-// Caveat, deliberately not fixed here: `budget_cap` is a ceiling, not the spend.
-// build_docs_section (tools.rs) stops before exceeding it, so a real docs section
-// of a handful of entries costs tens of tokens against a cap of hundreds. The on
-// arm's code lane therefore usually runs well above CODE_ONLY_BUDGET and the off
-// arm is handicapped rather than equalised. Tightening that means a per-query
-// off-arm budget of `BUDGET - doc_tokens(on arm, that query)`, and doc_tokens is
-// not reported in the get_context response - recovering it would mean
-// re-deriving the product's token cost model here, which is the drift this
-// harness exists to catch. The residual is recorded in the report.
-function docsBudgetPct() {
-  try {
-    const out = execFileSync(BIN, ["config", "get", "docs.budget_pct"], {
-      cwd: REPO,
-      encoding: "utf8",
-    });
-    const m = /^\s*([\d.]+)/.exec(out);
-    if (m) return Number(m[1]);
-    console.error(`[budget] could not parse \`config get docs.budget_pct\` output: ${JSON.stringify(out)}`);
-  } catch (e) {
-    console.error(`[budget] \`config get docs.budget_pct\` failed (${String(e?.message ?? e)}); is ${BIN} built?`);
-  }
-  return 20; // travsr-config default (seed.rs: docs_budget_pct_default_is_20)
-}
-const DOCS_BUDGET_PCT = docsBudgetPct();
-const CODE_ONLY_BUDGET = String(
-  Math.max(1, Math.floor(Number(BUDGET) * (1 - DOCS_BUDGET_PCT / 100)))
-);
 const seededPath = join(HERE, `queries-seeded-${LABEL}.json`);
 const docsPath = join(HERE, `queries-docs-${LABEL}.json`);
 
@@ -345,13 +296,48 @@ function parseDocLine(line) {
   return m ? { path: m[1].trim(), heading: m[2].trim() } : null;
 }
 
+// Every section header `match_source_header` (crates/travsr-mcp/src/tools.rs)
+// can emit, keyed by the matching `MatchSource::label()`. Each pattern matches
+// the leading words that *name* the section; the trailing gloss ("(not
+// relevance-ranked)", "graph-adjacent context") is prose and may be reworded
+// without breaking the parse.
+//
+// This list has to be exhaustive. The previous
+// `/^##\s+(exact|semantic|docs|relevant)\b/` matched three of the five headers:
+// "## related, ranked by relevance" and "## tests, test entry points &
+// fixtures" fell through as ordinary body lines, which left `cur` pointing at
+// the *previous* section. The damage was silent and asymmetric across the two
+// arms this harness exists to compare: with docs off the tests rows were
+// counted under `exact`, and with docs on they landed in `cur === "docs"`,
+// failed `parseDocLine`'s " § " requirement and were dropped outright. Enabling
+// the docs lane therefore deleted a whole section from the scored set and
+// shifted every later rank, on byte-identical product output.
+// `sections.semantic` was always empty for the same reason.
+//
+// The parse assumes grouped output. `get_context` only emits these headers when
+// `match_source_grouping_enabled() && n_nodes > 4` (tools.rs); a grounded
+// response below that node count carries no headers and scores as zero nodes.
+// None occur in either seeded set (checked), and the abstain path has its own
+// detector, so this is recorded rather than worked around.
+const SECTION_HEADERS = [
+  [/^##\s+exact matches\b/, "exact"],
+  [/^##\s+related, ranked by relevance\b/, "semantic"],
+  [/^##\s+docs\b/, "docs"],
+  [/^##\s+tests\b/, "tests"],
+  [/^##\s+relevant\b/, "relevant"],
+];
+
 function parseSections(text) {
-  const sections = { exact: [], semantic: [], docs: [], relevant: [] };
+  const sections = { exact: [], semantic: [], docs: [], tests: [], relevant: [] };
   let cur = null;
   for (const line of strip(text).split("\n")) {
-    const sec = /^##\s+(exact|semantic|docs|relevant)\b/.exec(line);
-    if (sec) {
-      cur = sec[1];
+    // Every `##` line is a section boundary, recognised or not. An unrecognised
+    // one discards its body instead of appending it to whatever came before, so
+    // a future header rename surfaces as a section going empty (loud, and
+    // visible in the report) rather than as silently mis-attributed rows.
+    if (/^##\s/.test(line)) {
+      const known = SECTION_HEADERS.find(([re]) => re.test(line));
+      cur = known ? known[1] : null;
       continue;
     }
     if (!cur || !line.trim()) continue;
@@ -367,8 +353,18 @@ function parseSections(text) {
   }
   return sections;
 }
+// Section order matches the product's own render order (MatchSource::trust_rank,
+// seed.rs), so a rank here is the rank the reading model sees.
+//
+// `tests` counts as a code node: it is code, it is rendered to the model, it is
+// inside the `[N nodes]` footer, and several `expect` entries in the seeded
+// query files are test function names. It is also what the off arm has always
+// been scored on. Before the header fix the tests rows were being counted under
+// `exact`, so including them here reproduces every historical off-arm number
+// exactly (verified: zero differing rows over the 44-query travsr set) and the
+// fix only repairs the on arm, where they were being dropped.
 function codeNodes(sections) {
-  return [...sections.exact, ...sections.semantic, ...sections.relevant];
+  return [...sections.exact, ...sections.semantic, ...sections.tests, ...sections.relevant];
 }
 function confidence(text) {
   const m = /confidence:\s*(\w+)/i.exec(strip(text));
@@ -423,15 +419,15 @@ const DOCS_OFF = { TRAVSR_DOCS_ENABLED: "0" };
 const DOCS_ON = { TRAVSR_DOCS_ENABLED: "1" };
 
 // ── run one arm (docs on/off) over the seeded query set ─────────────────────
-async function runSeeded(docsEnabled, budget = BUDGET) {
+async function runSeeded(docsEnabled) {
   const { queries } = JSON.parse(readFileSync(seededPath, "utf8"));
   const mcp = new Mcp(docsEnabled ? DOCS_ON : DOCS_OFF);
   await mcp.init();
-  await mcp.call("get_context", { query: "warmup", token_budget: budget });
+  await mcp.call("get_context", { query: "warmup", token_budget: BUDGET });
 
   const rows = [];
   for (const q of queries) {
-    const { text, ms } = await mcp.call("get_context", { query: q.query, token_budget: budget });
+    const { text, ms } = await mcp.call("get_context", { query: q.query, token_budget: BUDGET });
     const sections = parseSections(text);
     const nodes = codeNodes(sections);
     const abstain = isAbstain(text, nodes);
@@ -876,7 +872,7 @@ function summarizeDocs(rows) {
 console.error(`=== #376 Phase 2 gate — ${LABEL} (repo: ${REPO}) ===`);
 
 console.error("\n[off] running queries-seeded with TRAVSR_DOCS_ENABLED=0...");
-const offRows = await runSeeded(false, CODE_ONLY_BUDGET);
+const offRows = await runSeeded(false);
 docsEnabledGlobal = false;
 const offSummary = summarizeCode(offRows);
 console.error(JSON.stringify(offSummary, null, 2));
@@ -970,18 +966,28 @@ try {
 
 // ── gate verdicts ───────────────────────────────────────────────────────────
 const gate1 = docsSummary["hit@1"] >= 0.6 && docsSummary["hit@3"] >= 0.9;
-// One-sided by design: the off arm already ran at the on arm's worst-case code
-// budget, so "on is better" is a real improvement, not an artefact, and must not
-// fail the gate the way `===` did.
-const gate2 = onSummary["hit@1"] >= offSummary["hit@1"] && onSummary["hit@10"] >= offSummary["hit@10"];
-// Same #869 artefact as gate 2, one gate over, so it gets the same treatment.
-// `isAbstain` keys off `nodes.length === 0`, which is budget-dependent through
-// the very same `knapsack(items, token_budget - doc_tokens)` carve: one large
-// node that survives at BUDGET and is truncated at CODE_ONLY_BUDGET flips
-// abstainRate by 1/N with no ranking change at all. One-sided in the direction
-// that matters - abstainRate counts *correct* abstentions on the unanswerable
-// set, so higher is better and docs must not make it worse.
-const gate3 = onSummary.abstainRate >= offSummary.abstainRate;
+// Both arms run at BUDGET, and both gates stay equalities.
+//
+// #869 read the off/on movement on this set as the §4.3 budget carve
+// (`knapsack(items, token_budget - doc_tokens)`) truncating the on arm's code
+// lane, and proposed running the off arm at a reduced budget with `>=` gates to
+// compensate. Measured on the travsr set, that premise does not hold: off@4000
+// and off@3200 produce zero differing rows, the largest response is 2326 tokens
+// against a 3200 budget so the knapsack budget never binds, and measured
+// doc_tokens is around 90 against an 800 cap. The single off/on difference the
+// issue rests on (C10, rank 10 -> 7) was `parseSections` dropping the tests
+// section under docs-on, not the budget; with that fixed, off and on differ on
+// zero rows.
+//
+// The carve is real in principle, so a corpus where the budget does bind could
+// still surface it. It is not compensated for here: handicapping the off arm
+// makes `on >= off` close to unfailable while the console still reads "code
+// regression", which is a worse failure than the one it avoids. If a bind is
+// ever measured, equalise per query (the on arm's doc_tokens is recoverable
+// from `sections.docs`: entries are rendered verbatim and doc_tokens is
+// `sum(line.len()/4 + 1)`, knapsack.rs) rather than handicapping the arm.
+const gate2 = onSummary["hit@1"] === offSummary["hit@1"] && onSummary["hit@10"] === offSummary["hit@10"];
+const gate3 = onSummary.abstainRate === offSummary.abstainRate;
 const inference = summarizeInference(docsRows, probeRows);
 const gate4 = inference.pass;
 
@@ -996,17 +1002,13 @@ const gate4 = inference.pass;
 //   5d  no code regression on `ask` between docs off and on, mirroring gates
 //       2 and 3 on the second surface.
 const askVacuous = !askSummary || askSummary.queriesWithDocs === 0;
-// 5d carries the #869 budget confound that gates 2 and 3 no longer do, and the
-// asymmetry runs the other way. `ask` has the identical carve
-// (query.rs: `knapsack(items, DEFAULT_TOKEN_BUDGET.saturating_sub(doc_tokens))`)
-// but DEFAULT_TOKEN_BUDGET is a hardcoded 4096 with no flag and no env override
-// (`travsr ask --help`: only --format/--examples/--cmds), so the off arm cannot
-// be handicapped the way CODE_ONLY_BUDGET handicaps gate 2's. Here the *on* arm
-// is the disadvantaged one, so a one-sided `>=` would not protect it either -
-// it would demand improvement from the arm that has less room. `===` is kept
-// deliberately: it is the honest statement that any movement is unexplained.
-// Read a 5d failure with that in mind, and check perQueryRegressions before
-// calling it a ranking regression.
+// 5d mirrors gates 2 and 3 on the `ask` surface and is an equality for the same
+// reason. `ask` has the identical §4.3 carve (query.rs:
+// `knapsack(items, DEFAULT_TOKEN_BUDGET.saturating_sub(doc_tokens))`) over a
+// hardcoded 4096 with no flag and no env override, so its budget is not
+// adjustable from here at all. As on get_context, the carve was measured not to
+// bind on this corpus, so `===` stands: any movement is unexplained, and
+// perQueryRegressions is where to look before calling it a ranking regression.
 const askCodeStable =
   !!askOffSummary &&
   !!askOnSummary &&
@@ -1026,16 +1028,8 @@ const gate5 =
 // which dominates the wall-clock delta and is an accepted cost pending the
 // selective/hybrid reranking follow-up (§12's untried lever). Reported so the
 // number stays visible and any *change* in it is noticed.
-//
-// #869 changed what this ratio measures: the off arm now runs at
-// CODE_ONLY_BUDGET and the on arm at BUDGET, so the ratio absorbs a budget delta
-// of `docs.budget_pct` on top of the cross-encoder cost. It is no longer a
-// like-for-like latency comparison, and the report says so.
 const latencyRatio = onSummary.medianMs / Math.max(1, offSummary.medianMs);
 
-// Zips rows from two arms that ran at different budgets (see gate 2). A row that
-// moves only because the off arm had less room is not a ranking regression, so
-// this is evidence to read, not a verdict.
 const perQueryRegressions = offRows
   .map((o, i) => ({ o, n: onRows[i] }))
   .filter(({ o, n }) => o.rank !== n.rank || o.abstain !== n.abstain)
@@ -1050,24 +1044,7 @@ const report = {
     off: offSummary,
     on: onSummary,
     perQueryRegressions,
-    // #869: the arms did not run at the same budget, and the comparison is
-    // one-sided because of it. Recorded so a reader of this artifact is not
-    // misled into treating off-vs-on as like-for-like.
-    budgets: {
-      offTokenBudget: Number(CODE_ONLY_BUDGET),
-      onTokenBudget: Number(BUDGET),
-      docsBudgetPct: DOCS_BUDGET_PCT,
-      rationale:
-        "the off arm runs at the least code budget the on arm could have had " +
-        "(BUDGET * (1 - docs.budget_pct/100)), so docs-lane truncation cannot " +
-        "manufacture a code regression",
-      residual:
-        "docs.budget_pct is a ceiling, not the spend: a real docs section costs " +
-        "far less than the cap, so the on arm's code lane typically runs above " +
-        "offTokenBudget. The off arm is handicapped, not equalised, and the extra " +
-        "headroom can lift a borderline query over the hit@10 line. Equalising " +
-        "per query needs the on arm's doc_tokens, which get_context does not report.",
-    },
+    tokenBudget: Number(BUDGET),
   },
   gate3_abstainRegression: { pass: gate3, offAbstainRate: offSummary.abstainRate, onAbstainRate: onSummary.abstainRate },
   gate4_singleInference: inference,
@@ -1079,11 +1056,11 @@ const report = {
     codeOff: askOffSummary,
     codeOn: askOnSummary,
     codeStable: askCodeStable,
-    // 5d is still an unequal-budget comparison, unlike gates 2 and 3. `ask` is
-    // pinned to DEFAULT_TOKEN_BUDGET (4096, query.rs) with no flag or env
-    // override, so the off arm cannot be handicapped to the on arm's worst case
-    // and the on arm is the one losing doc_tokens. Treat a codeStable:false as
-    // "unexplained movement", not necessarily a ranking regression.
+    // Recorded, not compensated for: both ask arms run at DEFAULT_TOKEN_BUDGET
+    // (4096, query.rs, no flag or env override) and the on arm's code lane
+    // loses doc_tokens to the docs section, so it has slightly less room. The
+    // carve was measured not to bind on this corpus; treat a codeStable:false
+    // as unexplained movement and check perQueryRegressions.
     codeStableBudgetCaveat:
       "both ask arms run at DEFAULT_TOKEN_BUDGET; the on arm's code lane loses " +
       "doc_tokens to the docs section, so it has strictly less room than the off arm",
@@ -1101,14 +1078,8 @@ const report = {
     accepted: true,
     offMedianMs: offSummary.medianMs,
     onMedianMs: onSummary.medianMs,
-    offTokenBudget: Number(CODE_ONLY_BUDGET),
-    onTokenBudget: Number(BUDGET),
     ratio: +latencyRatio.toFixed(3),
-    comparable: false,
-    cause:
-      "second full cross-encoder pass per query (docs lane), plan §12, plus the " +
-      "#869 budget delta: the arms run at offTokenBudget vs onTokenBudget, so this " +
-      "ratio is not a like-for-like latency comparison",
+    cause: "second full cross-encoder pass per query (docs lane), plan §12",
     followUp: "selective/hybrid reranking — only invoke the cross-encoder when raw cosine is ambiguous (§12)",
   },
   docsRows,
@@ -1117,8 +1088,8 @@ const report = {
 writeFileSync(join(HERE, `report-phase2-gate-${LABEL}.json`), JSON.stringify(report, null, 2));
 console.error(`\n=== VERDICT (${LABEL}) ===`);
 console.error(`Gate 1 (doc hit@1/hit@3):   ${gate1 ? "PASS" : "FAIL"}  (hit@1=${docsSummary["hit@1"]}, hit@3=${docsSummary["hit@3"]})`);
-console.error(`Gate 2 (code regression):   ${gate2 ? "PASS" : "FAIL"}  (off hit@1=${offSummary["hit@1"]}/hit@10=${offSummary["hit@10"]} @${CODE_ONLY_BUDGET}, on hit@1=${onSummary["hit@1"]}/hit@10=${onSummary["hit@10"]} @${BUDGET})`);
-console.error(`Gate 3 (abstain regression):${gate3 ? "PASS" : "FAIL"}  (off=${offSummary.abstainRate} @${CODE_ONLY_BUDGET}, on=${onSummary.abstainRate} @${BUDGET})`);
+console.error(`Gate 2 (code regression):   ${gate2 ? "PASS" : "FAIL"}  (off hit@1=${offSummary["hit@1"]}/hit@10=${offSummary["hit@10"]}, on hit@1=${onSummary["hit@1"]}/hit@10=${onSummary["hit@10"]})`);
+console.error(`Gate 3 (abstain regression):${gate3 ? "PASS" : "FAIL"}  (off=${offSummary.abstainRate}, on=${onSummary.abstainRate})`);
 console.error(
   `Gate 4 (single inference):  ${gate4 ? "PASS" : "FAIL"}  ` +
     `(${inference.totalInferences} inferences / ${inference.totalMemoHits} memo hits over ` +

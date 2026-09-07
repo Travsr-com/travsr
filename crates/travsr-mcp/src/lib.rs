@@ -211,7 +211,12 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
             // unconditionally, so `has_embed` is true regardless, and a
             // readiness that never flips makes every `get_context` block for
             // `embed_arm_wait_ms()` before degrading to lexical-only.
-            let arm = || {
+            //
+            // Returns whether a KNN hook was actually installed. A `false` is
+            // not a transient state: nothing retries, so semantic search is off
+            // for the life of this process and the query path has to be told,
+            // or it reports `embeddings: on` over a lane that cannot run.
+            let arm = || -> bool {
                 let supervisor = EmbedSupervisor::try_start(&binary, &db_path_bg, &model_id_bg);
                 if supervisor.is_active() {
                     if let Some(mid) = supervisor.model_id().map(str::to_string) {
@@ -222,7 +227,7 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
                                 "embed model_id mismatch, semantic search disabled. \
                                  Run `travsr embed reindex` to rebuild embeddings with the installed model."
                             );
-                            return;
+                            return false;
                         }
                         if let Some(hook) = supervisor.knn_hook(mid.clone()) {
                             // Warm the sidecar (ONNX + HNSW load) BEFORE arming the
@@ -256,12 +261,19 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
                                 model_id = %mid,
                                 "embed plugin active, Step 4 (semantic ANN) enabled"
                             );
+                            return true;
                         }
                     }
                 }
                 // supervisor drops here; sidecar stays alive via the hook's Arc.
+                false
             };
-            arm();
+            if !arm() {
+                // Recorded before `mark_ready` so a thread woken by it observes
+                // both flags, and the query path can say `embeddings: disabled`
+                // instead of `on` over a lane that will never answer.
+                readiness_bg.mark_disabled();
+            }
             // Signal arm-complete AFTER the slots are populated so any thread
             // woken by `mark_ready` sees whatever `arm` managed to install.
             readiness_bg.mark_ready();

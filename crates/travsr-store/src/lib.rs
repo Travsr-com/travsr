@@ -321,6 +321,7 @@ pub type EmbedScoreHook =
 /// "embeddings off" — so the opening query of a session silently runs lexical-only.
 pub struct EmbedReadiness {
     armed: std::sync::atomic::AtomicBool,
+    disabled: std::sync::atomic::AtomicBool,
     waiters: (std::sync::Mutex<()>, std::sync::Condvar),
 }
 
@@ -329,6 +330,7 @@ impl EmbedReadiness {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             armed: std::sync::atomic::AtomicBool::new(false),
+            disabled: std::sync::atomic::AtomicBool::new(false),
             waiters: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
         })
     }
@@ -341,9 +343,29 @@ impl EmbedReadiness {
         self.waiters.1.notify_all();
     }
 
+    /// Record that arming finished with no hook installed, so semantic search
+    /// is off for the life of this process (sidecar failed to start, or the
+    /// index was built with a different embedding model).
+    ///
+    /// Distinct from "not ready": the injector still calls `mark_ready` after
+    /// this, because readiness means "arming has settled" and a readiness that
+    /// never flips makes every query block for the full arm-wait. Without this
+    /// third state the query path sees a ready handle behind an installed
+    /// meta-hook and reports `embeddings: on` while nothing semantic can run.
+    /// Call before `mark_ready` so a woken waiter observes both.
+    pub fn mark_disabled(&self) {
+        self.disabled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// True once `mark_ready` has fired.
     pub fn is_ready(&self) -> bool {
         self.armed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// True once `mark_disabled` has fired.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Block up to `timeout` for arming; returns the final ready state.
@@ -1479,6 +1501,22 @@ impl SqliteStore {
         match &self.embed_readiness {
             Some(r) => r.is_ready(),
             None => true,
+        }
+    }
+
+    /// Whether arming finished without installing a KNN hook, so the injected
+    /// meta-hook can only ever return an empty result.
+    ///
+    /// `has_embed` is true whenever a hook is present, and the MCP injector
+    /// installs its meta-hooks unconditionally so `initialize` never blocks on
+    /// the sidecar. That makes hook presence a poor proxy for "semantic search
+    /// works": this reports the difference. `false` for callers that registered
+    /// no readiness (daemon, `travsr ask`, tests), which is correct there -
+    /// those paths install a hook only once it is real.
+    pub fn embed_disabled(&self) -> bool {
+        match &self.embed_readiness {
+            Some(r) => r.is_disabled(),
+            None => false,
         }
     }
 
