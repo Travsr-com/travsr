@@ -67,14 +67,20 @@ jobs:
         with:
           node-version: 20
 
+      - name: Build release binary
+        run: cargo build --release
+
       # Runs in milliseconds and needs no index, so a broken harness or a
       # regressed Gate 4 classifier fails here rather than after an hour of
       # indexing. Also the negative control: it asserts the gate can still fail.
+      #
+      # Must follow the build: loading this file resolves CODE_ONLY_BUDGET by
+      # shelling out to `travsr config get docs.budget_pct`, which needs the
+      # release binary. Run before it and that lookup fails and falls back to the
+      # hardcoded default, so the self-test would never exercise the real value.
+      # `config get` reads config only, so it is fine this far ahead of the index.
       - name: Self-test the gate harness
         run: node bench/run-phase2-gate.mjs --self-test
-
-      - name: Build release binary
-        run: cargo build --release
 
       # The gates are measured against arctic-embed-m-v1.5 and only that model:
       # DOC_FLOOR and DOC_RERANK_FLOOR are raw score thresholds in one model's
