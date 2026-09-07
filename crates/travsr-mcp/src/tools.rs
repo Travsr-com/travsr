@@ -4777,17 +4777,33 @@ fn omit_seed_via(grouped: bool, ms: crate::seed::MatchSource) -> bool {
 /// are partitioned into Exact → Semantic → Relevant sections (each preceded by a
 /// one-line header) and sorted within a section by descending display score.
 /// Display-only: the knapsack set is unchanged — only presentation order differs.
+///
+/// #870: the ungrouped path keeps its flat code lines, but doc entries still
+/// get their header. `grouped` is false for a result of four nodes or fewer,
+/// where per-section headers cost more than they save. That is a rule about
+/// *code* rows, which carry their own kind and path. A doc entry carries
+/// neither: the header is the only thing that marks the line as author-written
+/// prose (§4.1, mitigation M2), and it is the only handle a consumer has for
+/// finding the section at all. Dropping it left doc lines rendered bare among
+/// the code rows, so `get_context` reported no docs for a query `ask` answered
+/// from one. That is the shape of a result on a sparse graph (a repo indexed
+/// without Phase B), not an edge case. A docs-free response is unaffected and
+/// stays byte-identical.
 fn assemble_context_body(
     entries: Vec<(crate::seed::MatchSource, f32, String)>,
     sep: &str,
     grouped: bool,
 ) -> String {
     if !grouped {
-        return entries
+        let (docs, code): (Vec<_>, Vec<_>) = entries
             .into_iter()
-            .map(|(_, _, line)| line)
-            .collect::<Vec<_>>()
-            .join(sep);
+            .partition(|(ms, _, _)| *ms == crate::seed::MatchSource::Docs);
+        let mut out: Vec<String> = code.into_iter().map(|(_, _, line)| line).collect();
+        if !docs.is_empty() {
+            out.push(match_source_header(crate::seed::MatchSource::Docs).to_string());
+            out.extend(docs.into_iter().map(|(_, _, line)| line));
+        }
+        return out.join(sep);
     }
     let mut entries = entries;
     entries.sort_by(|a, b| {
