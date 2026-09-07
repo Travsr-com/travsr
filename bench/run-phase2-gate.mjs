@@ -46,7 +46,7 @@
 // starts is stopped and a plain one is started again at the end (its original
 // environment cannot be recovered — the script says so when it happens).
 
-import { spawn, execFile } from "node:child_process";
+import { spawn, execFile, execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -57,6 +57,38 @@ const BIN = join(ROOT, "target/release/travsr");
 const LABEL = process.env.BENCH_LABEL || "travsr";
 const REPO = process.env.BENCH_REPO || ROOT;
 const BUDGET = process.env.BENCH_BUDGET || "4000";
+
+// Gate 2 compares the code lane across docs off/on, but #376 §4.3 spends the
+// docs section's measured cost out of the *same* budget
+// (`knapsack(items, token_budget - doc_tokens)`), so the on arm's code lane runs
+// with strictly less room than the off arm's. A query whose last kept result sits
+// on that truncation boundary then drops out under docs-on for a reason that has
+// nothing to do with ranking, and the gate reports a code regression that is
+// really a smaller budget. That is #869.
+//
+// Run the off arm at the *least* code budget the on arm could have had:
+// `doc_tokens` is clamped to `docs.budget_pct` of the budget, so
+// `BUDGET * (1 - pct/100)` is the on arm's worst case. The off arm is then
+// handicapped to the on arm rather than advantaged over it, and Gate 2 becomes
+// one-sided (below): docs must not make the code lane *worse*. Truncation can no
+// longer manufacture a failure, while a genuine ranking regression still trips it.
+//
+// The percentage is read from the binary's own config resolution rather than
+// hardcoded, so a repo that retunes `docs.budget_pct` retunes this with it.
+function docsBudgetPct() {
+  try {
+    const out = execFileSync(BIN, ["config", "get", "docs.budget_pct"], {
+      cwd: REPO,
+      encoding: "utf8",
+    });
+    const m = /^\s*([\d.]+)/.exec(out);
+    if (m) return Number(m[1]);
+  } catch {}
+  return 20; // travsr-config default (seed.rs: docs_budget_pct_default_is_20)
+}
+const CODE_ONLY_BUDGET = String(
+  Math.max(1, Math.floor(Number(BUDGET) * (1 - docsBudgetPct() / 100)))
+);
 const seededPath = join(HERE, `queries-seeded-${LABEL}.json`);
 const docsPath = join(HERE, `queries-docs-${LABEL}.json`);
 
@@ -364,15 +396,15 @@ const DOCS_OFF = { TRAVSR_DOCS_ENABLED: "0" };
 const DOCS_ON = { TRAVSR_DOCS_ENABLED: "1" };
 
 // ── run one arm (docs on/off) over the seeded query set ─────────────────────
-async function runSeeded(docsEnabled) {
+async function runSeeded(docsEnabled, budget = BUDGET) {
   const { queries } = JSON.parse(readFileSync(seededPath, "utf8"));
   const mcp = new Mcp(docsEnabled ? DOCS_ON : DOCS_OFF);
   await mcp.init();
-  await mcp.call("get_context", { query: "warmup", token_budget: BUDGET });
+  await mcp.call("get_context", { query: "warmup", token_budget: budget });
 
   const rows = [];
   for (const q of queries) {
-    const { text, ms } = await mcp.call("get_context", { query: q.query, token_budget: BUDGET });
+    const { text, ms } = await mcp.call("get_context", { query: q.query, token_budget: budget });
     const sections = parseSections(text);
     const nodes = codeNodes(sections);
     const abstain = isAbstain(text, nodes);
@@ -817,7 +849,7 @@ function summarizeDocs(rows) {
 console.error(`=== #376 Phase 2 gate — ${LABEL} (repo: ${REPO}) ===`);
 
 console.error("\n[off] running queries-seeded with TRAVSR_DOCS_ENABLED=0...");
-const offRows = await runSeeded(false);
+const offRows = await runSeeded(false, CODE_ONLY_BUDGET);
 docsEnabledGlobal = false;
 const offSummary = summarizeCode(offRows);
 console.error(JSON.stringify(offSummary, null, 2));
@@ -911,7 +943,10 @@ try {
 
 // ── gate verdicts ───────────────────────────────────────────────────────────
 const gate1 = docsSummary["hit@1"] >= 0.6 && docsSummary["hit@3"] >= 0.9;
-const gate2 = onSummary["hit@1"] === offSummary["hit@1"] && onSummary["hit@10"] === offSummary["hit@10"];
+// One-sided by design: the off arm already ran at the on arm's worst-case code
+// budget, so "on is better" is a real improvement, not an artefact, and must not
+// fail the gate the way `===` did.
+const gate2 = onSummary["hit@1"] >= offSummary["hit@1"] && onSummary["hit@10"] >= offSummary["hit@10"];
 const gate3 = onSummary.abstainRate === offSummary.abstainRate;
 const inference = summarizeInference(docsRows, probeRows);
 const gate4 = inference.pass;
