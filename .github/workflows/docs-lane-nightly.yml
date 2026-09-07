@@ -84,8 +84,13 @@ jobs:
       - name: Install embedding backend (arctic-embed-m-v1.5)
         run: ./target/release/travsr embed init --backend arctic-embed-m-v1.5
 
+      # `--semantic` builds Phase B synchronously, so the gates measure a graph
+      # that has call edges in it. Plain `init` is the same RC-1 defect the two
+      # benchmark harnesses carried. Measured cost on this repo: 9.8s plain vs
+      # 2m30s semantic, against a 90 minute job budget the embed pass below
+      # dominates.
       - name: Index this repo
-        run: ./target/release/travsr init
+        run: ./target/release/travsr init --semantic
 
       - name: Build embeddings (code + doc spaces)
         run: ./target/release/travsr embed reindex

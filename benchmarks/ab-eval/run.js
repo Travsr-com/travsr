@@ -73,6 +73,15 @@ function setMetrics(expected, got) {
   };
 }
 
+/**
+ * The `semantic:` field of `travsr status`. "complete" means Phase B ran and the
+ * graph carries call edges; anything else means it did not.
+ */
+function semanticState(dir) {
+  const m = /\bsemantic: ([^|\n]+)/.exec(travsr(['status'], dir).stdout);
+  return m ? m[1].trim() : '(not reported by travsr status)';
+}
+
 function prepareFixture(fixtureRelPath, name) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `travsr-ab-${name}-`));
   fs.cpSync(path.join(REPO_ROOT, fixtureRelPath), dir, { recursive: true });
@@ -86,9 +95,12 @@ function prepareFixture(fixtureRelPath, name) {
 // Model an agent without Travsr: git grep the symbol/query to find candidate
 // files, then read every candidate in full to decide the answer.
 function filesArm(task, dir) {
-  // files_term lets a task whose graph query is a qualified name (PaymentService.charge)
-  // model what an agent would really grep for, instead of a literal that matches nothing.
-  const term = task.files_term || task.symbol || task.query;
+  // Derived, never author-supplied: the term is the unqualified tail of the task's
+  // graph query, which is what an agent would really grep for when the graph query
+  // is a qualified name (PaymentService.charge greps `charge`, not a literal that
+  // matches nothing). Keeping it mechanical stops the published token-reduction
+  // figure from being tunable by picking a cheaper grep.
+  const term = (task.symbol || task.query).split('.').pop();
   let candidates = [];
   try {
     const out = execFileSync('git', ['grep', '-I', '-l', '--fixed-strings', term], {
@@ -202,6 +214,22 @@ for (const task of MANIFEST.tasks) {
   const init = travsr(['init', '--quiet', '--semantic'], dir);
   if (init.status !== 0) {
     failures.push(`${task.name}: travsr init failed (exit ${init.status})`);
+    fs.rmSync(dir, { recursive: true, force: true });
+    continue;
+  }
+
+  // `init --semantic` exits 0 even when Phase B degrades, and a Phase A only
+  // graph carries no call edges, so the graph arm would report `recall 0
+  // precision 0 -> []` and read as a retrieval regression instead of a broken
+  // harness. Assert the semantic index was actually built.
+  const semantic = semanticState(dir);
+  if (semantic !== 'complete') {
+    failures.push(
+      `${task.name}: semantic index not built. \`travsr init --semantic\` exited 0 but ` +
+      `\`travsr status\` reports "semantic: ${semantic}", so Phase B did not complete and the ` +
+      `graph has no call edges. The graph arm below would score zero against it.`
+    );
+    console.log(`  ✗ semantic index not built (travsr status reports "semantic: ${semantic}")`);
     fs.rmSync(dir, { recursive: true, force: true });
     continue;
   }

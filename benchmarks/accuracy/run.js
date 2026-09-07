@@ -107,6 +107,24 @@ for (const corpus of MANIFEST.corpora) {
   }
   const initSeconds = init.ms / 1000;
   const status = travsr(['status'], dir);
+
+  // `init --semantic` exits 0 even when Phase B degrades, and a Phase A only
+  // graph carries no call edges, so every caller case would score zero and read
+  // as a product regression instead of a broken harness. Assert the semantic
+  // index was actually built and fail the corpus loudly if it was not.
+  const semantic = /\bsemantic: ([^|\n]+)/.exec(status.stdout);
+  const semanticState = semantic ? semantic[1].trim() : '(not reported by travsr status)';
+  if (semanticState !== 'complete') {
+    failures.push(
+      `${corpus.name}: semantic index not built. \`travsr init --semantic\` exited 0 but ` +
+      `\`travsr status\` reports "semantic: ${semanticState}", so Phase B did not complete and ` +
+      `the graph has no call edges. Every caller assertion below would score zero against it.`
+    );
+    report.corpora.push({ name: corpus.name, semantic_missing: true, semantic_state: semanticState });
+    fs.rmSync(dir, { recursive: true, force: true });
+    continue;
+  }
+
   const counts = /nodes: (\d+) \| edges: (\d+)/.exec(status.stdout) || [null, '0', '0'];
   const perf = {
     init_seconds: Number(initSeconds.toFixed(2)),

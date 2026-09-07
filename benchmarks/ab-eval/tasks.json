@@ -1,5 +1,5 @@
 {
-  "$comment": "A/B eval manifest (#318 O9). Tasks have three classes: 'callers' — structural graph query (travsr graph --direction callers); 'context' — full PPR+knapsack retrieval pipeline (travsr ask --format json), gated on symbol+file recall/precision and token cost; 'ask' — seed resolution quality, gated on rank-1 exact match. The GRAPH arm is held to exact correctness and must never cost more context tokens than the FILES arm. Mean token reduction is reported, not gated, because in-repo fixtures are deliberately tiny.",
+  "$comment": "A/B eval manifest (#318 O9). Tasks have three classes: 'callers' — structural graph query (travsr graph --direction callers); 'context' — full PPR+knapsack retrieval pipeline (travsr ask --format json), gated on symbol+file recall/precision and token cost; 'ask' — seed resolution quality, gated on rank-1 exact match. The GRAPH arm is held to exact correctness and must never cost more context tokens than the FILES arm. Mean token reduction is reported, not gated, because in-repo fixtures are deliberately tiny. Task fields are 'class', 'name', 'question', 'fixture', 'symbol' (callers) or 'query' (context/ask), 'self_path', 'expect_files', 'expect_symbols' (context) and 'expect_top_symbol' (ask). There is deliberately no field for the FILES arm's grep term: it is derived mechanically from 'symbol' or 'query' (their unqualified tail), so the reported token reduction cannot be tuned by choosing a cheaper grep.",
   "iterations": 3,
   "thresholds": {
     "graph_recall": 1.0,
@@ -13,7 +13,6 @@
       "question": "Which files call PaymentService.charge?",
       "fixture": "fixtures/ts-callers",
       "symbol": "PaymentService.charge",
-      "files_term": "charge",
       "self_path": "service.ts",
       "expect_files": ["controller.ts"]
     },
