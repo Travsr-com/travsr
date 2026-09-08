@@ -42,7 +42,30 @@ pub fn scip_name_kind(symbol: &str) -> Option<ScipName<'_>> {
     // counted as a def miss; take everything after the 4th space instead so the
     // whole chain (spaces and all) is parsed as one unit.
     let descriptor_chain = symbol.splitn(5, ' ').nth(4)?;
+    descriptor_chain_kind(descriptor_chain)
+}
 
+/// Extract `(container, name, kind)` from a SemanticDB symbol.
+///
+/// SemanticDB symbols are the descriptor chain alone, with no
+/// `<scheme> <mgr> <pkg> <version>` metadata prefix and so no spaces:
+/// `scala/util/parsing/combinator/Parsers#phrase().`. The descriptor grammar
+/// itself is the same one SCIP uses, so only the missing prefix separates them
+/// and [`scip_name_kind`]'s `splitn(5, ' ').nth(4)` rejects every one of them.
+/// Without this the scala sidecar's defs never became unification candidates:
+/// its `sdb:` nodes kept their own identity, ref edges pointed at those while
+/// `references <name>` resolved to the Phase A twin, and every scala query
+/// answered 0 against a fully populated graph. They were not even counted as
+/// misses, so `travsr status` reported nothing wrong.
+pub fn semanticdb_name_kind(symbol: &str) -> Option<ScipName<'_>> {
+    // `sdb_vname` packs signatures as `sdb:{symbol}`. Strip it so a symbol with
+    // no package path (`sdb:Foo#`) does not carry the prefix into the name.
+    descriptor_chain_kind(symbol.strip_prefix("sdb:").unwrap_or(symbol))
+}
+
+/// Parse a bare SCIP/SemanticDB descriptor chain, the part after any metadata
+/// prefix. Shared by [`scip_name_kind`] and [`semanticdb_name_kind`].
+fn descriptor_chain_kind(descriptor_chain: &str) -> Option<ScipName<'_>> {
     // Namespace descriptor `Name/`: Obj-C emits protocols this way
     // (`Speakable/`), and a protocol is a unifiable type (Phase A `protocol:`).
     // Restrict to a SINGLE-segment name — multi-segment package paths
@@ -445,6 +468,37 @@ mod tests {
             name,
             kind,
         }
+    }
+
+    // A SemanticDB symbol is the descriptor chain with no SCIP metadata
+    // prefix. `scip_name_kind` requires that prefix, so scala's defs parsed as
+    // nothing and never became unification candidates: ref edges pointed at the
+    // `sdb:` node while `references <name>` resolved to the Phase A twin, and
+    // every scala query returned 0 against a populated graph.
+    #[test]
+    fn semanticdb_method_parses_without_a_scip_metadata_prefix() {
+        assert_eq!(
+            scip_name_kind("scala/util/parsing/combinator/Parsers#phrase()."),
+            None,
+            "no metadata prefix, so the SCIP parser must still reject it"
+        );
+        assert_eq!(
+            semanticdb_name_kind("sdb:scala/util/parsing/combinator/Parsers#phrase()."),
+            Some(parsed(Some("Parsers"), "phrase", "function"))
+        );
+    }
+
+    #[test]
+    fn semanticdb_class_and_prefixless_symbol() {
+        assert_eq!(
+            semanticdb_name_kind("sdb:scala/util/parsing/combinator/Parsers#"),
+            Some(parsed(None, "Parsers", "class"))
+        );
+        // No package path: the `sdb:` prefix must not leak into the name.
+        assert_eq!(
+            semanticdb_name_kind("sdb:Foo#"),
+            Some(parsed(None, "Foo", "class"))
+        );
     }
 
     #[test]

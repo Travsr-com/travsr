@@ -138,6 +138,17 @@ pub fn unify_all(
         // re-unified against themselves.
         let (parsed, is_scip) = match travsr_indexer::scip_unifier::scip_name_kind(scip_sym) {
             Some(p) => (p, true),
+            // Scala's sidecar reads SemanticDB, whose symbols are a bare
+            // descriptor chain with none of SCIP's `<scheme> <mgr> <pkg>
+            // <version>` prefix, so `scip_name_kind` rejects all of them. Parsed
+            // as SCIP-shaped rather than Phase-A-shaped, because the descriptor
+            // grammar is SCIP's: `…/Parsers#phrase().`.
+            None if node.vname.language.as_str() == "scala" => {
+                match travsr_indexer::scip_unifier::semanticdb_name_kind(&node.vname.signature) {
+                    Some(p) => (p, true),
+                    None => continue,
+                }
+            }
             None if matches!(node.vname.language.as_str(), "kotlin" | "swift" | "dart") => {
                 match travsr_indexer::scip_unifier::native_name_kind(
                     &node.vname.signature,
