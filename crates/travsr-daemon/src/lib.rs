@@ -2428,11 +2428,16 @@ fn resolve_unresolved_calls(
                 // `class:T`, not Rust's `struct:`/`enum:`/`trait:`. Without it a
                 // real graph class was treated as an external type (#529 branch
                 // 2), dropping legitimate cross-file method edges.
+                // `interface:` belongs here for the same reason `class:` did:
+                // Go/Java/Kotlin/C#/TypeScript all emit it as a distinct Phase A
+                // prefix, so an interface-typed receiver was read as an external
+                // type and its calls dropped at #529 branch 2.
                 [
                     format!("struct:{t}"),
                     format!("enum:{t}"),
                     format!("trait:{t}"),
                     format!("class:{t}"),
+                    format!("interface:{t}"),
                 ]
             })
             .collect()
