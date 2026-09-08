@@ -361,10 +361,16 @@ fn decode_phase_b_warnings(
                     rest.to_string(),
                     (
                         "failed",
+                        // The cause lives in the analyzer's own stderr, which the
+                        // host now forwards at warn. Do not assert it is the
+                        // project: the same symptom is produced by travsr
+                        // invoking the analyzer wrongly, and naming one cause
+                        // sends the reader the wrong way.
                         format!(
                             "semantic analyzer for '{rest}' ran but found no symbols despite \
                              '{rest}' sources being present, re-run \
-                             `travsr init --semantic --force` after fixing the project setup"
+                             `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` \
+                             to see the analyzer's own diagnostics"
                         ),
                     ),
                 );
