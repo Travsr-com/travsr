@@ -113,6 +113,69 @@ fn fuzzy_correct_jaccard() -> f64 {
         .unwrap_or(0.7)
 }
 
+/// Strip ONE regular English inflectional suffix, or `None` when the token
+/// carries none.
+///
+/// This is not a stemmer in the Porter sense and must not become one. It exists
+/// for a single measured failure: an English query says "grouped", "parsed",
+/// "queries", and the symbol is `groupBy`, `parseAll`, `query`. The inflected
+/// form is not a segment of any signature, so whole-word resolution finds
+/// nothing and the query abstains against a symbol that is plainly there.
+///
+/// Why not widen the #709 typo corrector instead: it compares whole leaf names
+/// by byte-trigram Jaccard, and `grouped` vs `groupby` scores 0.429 against a
+/// 0.7 floor. Reaching it would mean lowering the floor to where unrelated
+/// salad words ground, which is exactly what that floor is defending.
+///
+/// This is the cheaper and safer lever because it stays EXACT. The stem is fed
+/// back through the same whole-segment boundary predicate as any other token,
+/// so `grouped` -> `group` resolves only because `group` is a real segment of
+/// `groupBy`. A stem that matches nothing changes nothing.
+///
+/// Rules, applied in order, first hit wins:
+///   `-ies`/`-ied` -> `y`   (queries -> query, specified -> specify)
+///   `-ing`        -> strip (grouping -> group)
+///   `-ed`         -> strip (grouped -> group, parsed -> pars… see below)
+///   `-es`         -> strip, only after a sibilant (matches -> match)
+///   `-s`          -> strip, never `-ss` (callers -> caller)
+///
+/// The stem must be at least 4 characters, so short words cannot collapse into
+/// generic fragments. `-ed` on a verb whose stem ends in `e` yields `pars` from
+/// `parsed`, which is under-length in some cases and simply produces no match
+/// in others; both are handled by the same rule, that a stem which resolves to
+/// nothing is discarded.
+fn inflectional_stem(token: &str) -> Option<String> {
+    const MIN_STEM: usize = 4;
+    let t = token;
+    if t.len() < 5 || !t.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    let stem = if let Some(base) = lower.strip_suffix("ies").or(lower.strip_suffix("ied")) {
+        format!("{base}y")
+    } else if let Some(base) = lower.strip_suffix("ing") {
+        base.to_string()
+    } else if let Some(base) = lower.strip_suffix("ed") {
+        base.to_string()
+    } else if let Some(base) = lower.strip_suffix("es").filter(|b| {
+        // Only a sibilant stem takes `-es`. Otherwise the `e` belongs to the
+        // word, so this arm must DECLINE rather than answer: `names` is `name`
+        // plus `s`, and taking `-es` here would yield `nam`. Declining lets the
+        // plain `-s` arm below handle it.
+        b.ends_with(['s', 'x', 'z']) || b.ends_with("ch") || b.ends_with("sh")
+    }) {
+        base.to_string()
+    } else if lower.ends_with('s') && !lower.ends_with("ss") {
+        lower[..lower.len() - 1].to_string()
+    } else {
+        return None;
+    };
+    if stem.len() < MIN_STEM || stem == lower {
+        return None;
+    }
+    Some(stem)
+}
+
 /// RRF k constant — controls how sharply the top ranks dominate.
 fn rrf_k() -> f32 {
     std::env::var("TRAVSR_RRF_K")
@@ -2175,12 +2238,33 @@ pub(crate) fn build_seed_set(
     // call. `fuzzy_correct_symbols` costs one distinct-signature scan whatever
     // the token count, so batching keeps a query carrying several unresolved
     // tokens at a single scan rather than one scan per token on this hot path.
+    //
+    // A token that resolves to nothing gets one more exact attempt before the
+    // fuzzy corrector sees it: its inflectional stem. An English question says
+    // "grouped" where the symbol is `groupBy`, and the inflected form is not a
+    // segment of any signature, so the direct pass finds nothing at all. The
+    // stem goes through this same `boundary` predicate, so it is still a
+    // whole-segment match against a real symbol, not a loosening of the gate.
+    // Ordered ahead of the #709 correction deliberately: an exact match on a
+    // known-regular suffix is stronger evidence than a trigram near-miss, and it
+    // keeps the corrector's strict 0.7 floor intact.
     let by_token: Vec<(String, Vec<CoreNode>, bool)> = content_tokens
         .iter()
         .map(|token| {
             let nodes = store.search_nodes_by_name(token).unwrap_or_default();
-            let has_direct = nodes.iter().any(|n| boundary(token, n));
-            (token.clone(), nodes, has_direct)
+            if nodes.iter().any(|n| boundary(token, n)) {
+                return (token.clone(), nodes, true);
+            }
+            if let Some(stem) = inflectional_stem(token) {
+                let stem_nodes = store.search_nodes_by_name(&stem).unwrap_or_default();
+                if stem_nodes.iter().any(|n| boundary(&stem, n)) {
+                    // Carry the stem forward as the token: frequency, IDF and the
+                    // anchor's own label must all measure the form that actually
+                    // exists in the index, exactly as the #709 correction does.
+                    return (stem, stem_nodes, true);
+                }
+            }
+            (token.clone(), nodes, false)
         })
         .collect();
     let missed: Vec<&str> = by_token
@@ -3834,6 +3918,43 @@ mod tests {
         for norm in [0.05f32, 0.5, 1.0] {
             assert!(scope_gate_drops(true, false, norm, 2.0));
         }
+    }
+
+    /// The stemmer must reach the measured misses and nothing looser. Each
+    /// accepted case is a real query form whose symbol exists under another
+    /// inflection; each rejection is a shape that would have widened the gate.
+    #[test]
+    fn inflectional_stem_covers_regular_suffixes_only() {
+        // The measured misses.
+        assert_eq!(inflectional_stem("grouped").as_deref(), Some("group"));
+        assert_eq!(inflectional_stem("grouping").as_deref(), Some("group"));
+        assert_eq!(inflectional_stem("queries").as_deref(), Some("query"));
+        assert_eq!(inflectional_stem("specified").as_deref(), Some("specify"));
+        assert_eq!(inflectional_stem("callers").as_deref(), Some("caller"));
+        assert_eq!(inflectional_stem("matches").as_deref(), Some("match"));
+
+        // No recognised suffix: unchanged tokens must never be rewritten.
+        assert_eq!(inflectional_stem("group"), None);
+        assert_eq!(inflectional_stem("parser"), None);
+
+        // `-es` only after a sibilant. `names` is `name` + `s`, and taking the
+        // `-es` arm would yield `nam`.
+        assert_eq!(inflectional_stem("names").as_deref(), Some("name"));
+
+        // `-ss` is not a plural.
+        assert_eq!(inflectional_stem("address"), None);
+        assert_eq!(inflectional_stem("process"), None);
+
+        // Short input, and a stem that would fall under the length floor.
+        // `tries` -> `try` is a correct stem but only 3 characters, and a
+        // fragment that short is exactly what the floor is there to reject.
+        assert_eq!(inflectional_stem("used"), None);
+        assert_eq!(inflectional_stem("tries"), None);
+        assert_eq!(inflectional_stem("cars"), None);
+
+        // Non-alphabetic tokens are identifiers, not English words.
+        assert_eq!(inflectional_stem("get_callers"), None);
+        assert_eq!(inflectional_stem("node_ids"), None);
     }
 
     #[test]
