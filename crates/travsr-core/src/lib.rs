@@ -33,7 +33,20 @@ pub mod noise;
 ///       existing `.travsr/graph.db` so the daemon skew check and the
 ///       `travsr status` warning force a full re-index (RFC-014 "Re-index
 ///       Policy").
-pub const SIGNATURE_FORMAT_VERSION: u8 = 2;
+///   3 - current: Objective-C method signatures carry the WHOLE selector
+///       (`method:Class.setWidth:height:`) instead of only its leading keyword
+///       (`method:Class.setWidth`). The old form collapsed every selector
+///       sharing a first keyword onto one node, so sibling methods lost their
+///       own identity and calls between them degenerated into self-loops the
+///       store dropped. Node identity therefore changes for every ObjC method.
+///       A v2 database cannot be migrated in place: incremental reindex only
+///       re-parses files that changed, so an ObjC repo would hold collapsed
+///       signatures for untouched files and full selectors for the rest, with
+///       nothing able to tell the halves apart. Bumping makes that impossible
+///       by invalidating the database outright, which the daemon reports as
+///       "run `travsr init` to rebuild it" rather than silently serving a
+///       half-migrated graph.
+pub const SIGNATURE_FORMAT_VERSION: u8 = 3;
 
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
 

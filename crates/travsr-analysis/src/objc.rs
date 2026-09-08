@@ -21,11 +21,14 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     // The positional anchor prevents capturing the superclass identifier.
     //
     // Method name: in tree-sitter-objc's CST, `method_selector_no_list` and
-    // `keyword_selector` are NOT named nodes — the method name collapses into
-    // a direct `(identifier)` child of `method_definition`/`method_declaration`.
-    // We anchor immediately after `(method_type)` to get the selector's leading
-    // keyword only (e.g. "setWidth" in "setWidth:(int)w height:(int)h"), skipping
-    // the trailing keyword identifiers that also appear as direct children.
+    // `keyword_selector` are NOT named nodes: every selector keyword collapses
+    // into a separate direct `(identifier)` child of
+    // `method_definition`/`method_declaration`. The anchor after `(method_type)`
+    // captures the leading keyword only, so exactly one node is emitted per
+    // method; `full_selector` (via `name_hook`) then rebuilds the whole selector
+    // from that node's siblings, so `setWidth:(int)w height:(int)h` is stored as
+    // `setWidth:height:` rather than as a bare `setWidth` that collides with
+    // every other selector starting the same way.
     queries: r#"
 (class_interface "@interface" . (identifier) @class.name)
 (class_implementation "@implementation" . (identifier) @impl.name)
@@ -56,8 +59,79 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     decl_kinds: &["function_definition"],
     type_refinements: &[],
     post_parse: None,
+    name_hook: Some(full_selector),
     get_grammar: || tree_sitter::Language::new(tree_sitter_objc::LANGUAGE),
 };
+
+/// Rebuild an Objective-C method's full selector from the captured leading
+/// keyword, so each selector is a distinct node.
+///
+/// The query captures only the first `identifier` after `(method_type)`, but a
+/// selector is spelled across alternating sibling nodes:
+///
+/// ```text
+/// method_definition
+///   identifier "policyWithPinningMode"   ← the captured node
+///   method_parameter ":(AFSSLPinningMode)pinningMode"
+///   identifier "withPinnedCertificates"
+///   method_parameter ":(NSSet *)pinnedCertificates"
+///   compound_statement "{ ... }"
+/// ```
+///
+/// Parameter *names* (`pinningMode`) are nested inside `method_parameter`, never
+/// direct children, so the direct `identifier` children are keyword parts only.
+/// The one exception is a trailing macro: `- (instancetype)init
+/// NS_DESIGNATED_INITIALIZER;` puts `NS_DESIGNATED_INITIALIZER` in the same
+/// position as a second keyword. A keyword part therefore counts only when a
+/// `method_parameter` immediately precedes it, which ends the walk at the macro
+/// and yields `init`.
+///
+/// Each `method_parameter` contributes one `:`, including a nameless one
+/// (`- (void)anon:(int)a :(int)b` → `anon::`), matching the real selector.
+/// A method with no parameters keeps its bare name and no trailing colon
+/// (`- (void)reload` → `reload`), again matching the real selector.
+///
+/// Returns `None` for any capture that is not a method selector, leaving the
+/// captured text in place.
+fn full_selector(cap: tree_sitter::Node, sig_prefix: &str, source: &[u8]) -> Option<String> {
+    if sig_prefix != "fn" {
+        return None;
+    }
+    let parent = cap.parent()?;
+    if !matches!(parent.kind(), "method_definition" | "method_declaration") {
+        return None;
+    }
+
+    let mut selector = cap.utf8_text(source).ok()?.trim().to_string();
+    if selector.is_empty() {
+        return None;
+    }
+
+    // Walk the siblings after the captured keyword. `after_parameter` tracks
+    // whether the previous sibling was a `method_parameter`, which is what
+    // licenses the next identifier to be read as a keyword part rather than as
+    // a trailing attribute macro.
+    let mut after_parameter = false;
+    let mut sibling = cap.next_sibling();
+    while let Some(node) = sibling {
+        match node.kind() {
+            "method_parameter" => {
+                selector.push(':');
+                after_parameter = true;
+            }
+            "identifier" if after_parameter => {
+                selector.push_str(node.utf8_text(source).ok()?.trim());
+                after_parameter = false;
+            }
+            // The body, the terminating `;`, an availability macro, `, ...` on a
+            // variadic method: the selector is complete.
+            _ => break,
+        }
+        sibling = node.next_sibling();
+    }
+
+    Some(selector)
+}
 
 /// Parse an Objective-C source file into graph nodes and edges.
 pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
@@ -136,6 +210,81 @@ pub fn header_is_objc(source: &str) -> Option<bool> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use std::io::Write as _;
+
+    /// Signatures a source snippet produces, in emission order.
+    fn signatures(src: &str) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Fixture.m");
+        std::fs::File::create(&path)
+            .expect("create")
+            .write_all(src.as_bytes())
+            .expect("write");
+        super::parse("corp", &path, "Fixture.m")
+            .expect("parse")
+            .nodes
+            .into_iter()
+            .map(|n| n.vname.signature)
+            .collect()
+    }
+
+    #[test]
+    fn a_multi_part_selector_keeps_every_keyword() {
+        // The bug this covers: both selectors used to collapse onto
+        // `method:Foo.policyWithPinningMode`, so the unique index kept one node
+        // and the two-argument method had none at all.
+        let sigs = signatures(
+            "@implementation Foo\n\
+             + (id)policyWithPinningMode:(int)m { return nil; }\n\
+             + (id)policyWithPinningMode:(int)m withPinnedCertificates:(id)c { return nil; }\n\
+             @end\n",
+        );
+        assert!(sigs.contains(&"method:Foo.policyWithPinningMode:".to_string()));
+        assert!(
+            sigs.contains(&"method:Foo.policyWithPinningMode:withPinnedCertificates:".to_string())
+        );
+    }
+
+    #[test]
+    fn a_no_argument_selector_takes_no_trailing_colon() {
+        let sigs = signatures("@implementation Foo\n- (void)reload { }\n@end\n");
+        assert!(sigs.contains(&"method:Foo.reload".to_string()));
+    }
+
+    #[test]
+    fn a_trailing_macro_is_not_read_as_a_selector_keyword() {
+        // `NS_DESIGNATED_INITIALIZER` sits in the same direct-child position a
+        // second selector keyword would, but no `method_parameter` precedes it,
+        // so the walk stops before it. An availability macro parses as its own
+        // node kind and stops the walk the same way.
+        let sigs = signatures(
+            "@interface Foo\n\
+             - (instancetype)init NS_DESIGNATED_INITIALIZER;\n\
+             + (instancetype)new NS_UNAVAILABLE;\n\
+             @end\n",
+        );
+        assert!(sigs.contains(&"method:Foo.init".to_string()));
+        assert!(sigs.contains(&"method:Foo.new".to_string()));
+    }
+
+    #[test]
+    fn a_nameless_keyword_part_still_contributes_its_colon() {
+        // `- (void)anon:(int)a :(int)b` really is the selector `anon::`.
+        let sigs = signatures("@interface Foo\n- (void)anon:(int)a :(int)b;\n@end\n");
+        assert!(sigs.contains(&"method:Foo.anon::".to_string()));
+    }
+
+    #[test]
+    fn a_c_function_in_an_objc_file_is_untouched() {
+        // The hook only fires under a `method_definition`/`method_declaration`
+        // parent, so a plain C function keeps the captured text.
+        let sigs = signatures("int add(int a, int b) { return a + b; }\n");
+        assert!(sigs.contains(&"fn:add".to_string()));
+    }
 }
 
 #[cfg(test)]

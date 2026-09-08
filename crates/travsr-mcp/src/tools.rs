@@ -810,9 +810,20 @@ fn provenance_marker(edge: &travsr_core::Edge) -> &'static str {
 /// `fn:SqliteStore.iter_edges_to` → `iter_edges_to`,
 /// `fn:crate::repo::find_git_root` → `find_git_root`.
 fn simple_name(signature: &str) -> String {
-    // rsplit(':') drops the `kind:` prefix and yields the last `::` component;
-    // then split off any `.`/`#` method/scope qualifier.
-    let after_kind = signature.rsplit(':').next().unwrap_or(signature);
+    // An Objective-C selector spells its own colons inside the name
+    // (`method:Foo.setWidth:height:`), so the `rsplit(':')` below would eat the
+    // whole thing and return "". A stored selector always ends in `:`, which no
+    // other language's signature does, so split only the `kind:` prefix there
+    // and keep the rest.
+    let after_kind = if signature.ends_with(':') {
+        signature
+            .split_once(':')
+            .map_or(signature, |(_, rest)| rest)
+    } else {
+        // rsplit(':') drops the `kind:` prefix and yields the last `::` component;
+        // then split off any `.`/`#` method/scope qualifier.
+        signature.rsplit(':').next().unwrap_or(signature)
+    };
     after_kind
         .rsplit(['.', '#'])
         .next()
@@ -958,6 +969,15 @@ pub(crate) enum RefTarget {
     /// Multiple definitions and no disambiguating `path` — return the list so the
     /// caller can re-query with a `path` hint (never silently pick `[0]`).
     Ambiguous(Vec<CoreNode>),
+    /// One Objective-C method family reached by its selector head: every
+    /// arity of `policyWithPinningMode:` when the query was
+    /// `policyWithPinningMode`. Distinct from [`Self::Ambiguous`] on purpose:
+    /// these are not rival definitions a `path` hint could choose between, they
+    /// are the same method spelled at different arities in one class, and the
+    /// head is the only thing a developer can type for them. References are the
+    /// union over the family; a caller who wants one arity types the full
+    /// selector, which resolves uniquely.
+    Family(Vec<CoreNode>),
     /// No definition matched the name.
     None,
 }
@@ -1030,6 +1050,31 @@ fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -
                 .collect(),
             Err(e) => {
                 tracing::warn!("resolve_symbol_nodes search '{symbol}': {e}");
+                Vec::new()
+            }
+        };
+    }
+
+    // Tier 2b: Objective-C selector head. Phase A stores the whole selector
+    // (`method:AFSecurityPolicy.policyWithPinningMode:withPinnedCertificates:`)
+    // so selectors sharing a leading keyword stay distinct nodes, but the
+    // leading keyword is the only part a developer types. Match on it, and only
+    // once the exact tiers above have found nothing, so this can never widen a
+    // name that already resolves. `selector_head` returns a non-selector leaf
+    // unchanged, so a plain name reaching here still matches nothing new.
+    if candidates.is_empty() && !symbol.contains(':') {
+        candidates = match store.search_nodes_by_name(symbol) {
+            Ok(nodes) => nodes
+                .into_iter()
+                .filter(|n| {
+                    n.kind != "file"
+                        && n.kind != "import"
+                        && travsr_core::ident::selector_head(&simple_name(&n.vname.signature))
+                            == symbol
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("resolve_symbol_nodes selector head '{symbol}': {e}");
                 Vec::new()
             }
         };
@@ -1119,6 +1164,14 @@ pub(crate) fn resolve_reference_targets(
         }
     }
 
+    // An Objective-C selector family reached by its head is one method, not
+    // rival definitions, see `RefTarget::Family`. Same class, same head, and
+    // every member an actual multi-part selector; two classes that both declare
+    // a `policyWithPinningMode:` are still genuinely ambiguous and fall through.
+    if candidates.len() > 1 && is_selector_family(&candidates, symbol) {
+        return RefTarget::Family(candidates);
+    }
+
     match candidates.len() {
         0 => RefTarget::None,
         1 => candidates
@@ -1127,6 +1180,28 @@ pub(crate) fn resolve_reference_targets(
             .unwrap_or(RefTarget::None),
         _ => RefTarget::Ambiguous(candidates),
     }
+}
+
+/// Whether every candidate is a multi-part Objective-C selector of ONE class
+/// whose leading keyword is `head`: the [`RefTarget::Family`] test.
+///
+/// Requires a shared container so this never merges two classes' same-named
+/// selectors, which is real ambiguity a `path` hint should resolve.
+fn is_selector_family(candidates: &[CoreNode], head: &str) -> bool {
+    let container_of = |sig: &str| -> Option<String> {
+        let body = sig.split_once(':').map_or(sig, |(_, rest)| rest);
+        body.rsplit_once('.').map(|(c, _)| c.to_string())
+    };
+    let first = match container_of(&candidates[0].vname.signature) {
+        Some(c) => c,
+        None => return false,
+    };
+    candidates.iter().all(|n| {
+        let leaf = simple_name(&n.vname.signature);
+        leaf.ends_with(':')
+            && travsr_core::ident::selector_head(&leaf) == head
+            && container_of(&n.vname.signature).as_deref() == Some(first.as_str())
+    })
 }
 
 /// #647: message for a `path` hint that matched no definition of a symbol that
@@ -1301,6 +1376,20 @@ pub fn find_references_structured(
 
     let target = match resolve_reference_targets(store, symbol, path) {
         RefTarget::Unique(n) => n,
+        // One method family reached by its selector head: report every arity as
+        // a candidate and the union of their occurrence sites, rather than a
+        // "pick one" the caller cannot act on.
+        RefTarget::Family(nodes) => {
+            out.status = "resolved";
+            out.candidates = nodes.iter().map(ResolvedSymbol::from_node).collect();
+            out.resolved_to = nodes.first().map(ResolvedSymbol::from_node);
+            let sites = family_reference_sites(store, &nodes);
+            let total = sites.len();
+            out.total = Some(total);
+            out.truncated = total > MAX_REFERENCE_SITES;
+            out.references = sites.into_iter().take(MAX_REFERENCE_SITES).collect();
+            return out;
+        }
         RefTarget::Ambiguous(nodes) => {
             out.status = "ambiguous";
             out.note = Some(format!(
@@ -1317,7 +1406,7 @@ pub fn find_references_structured(
             if let Some(hint) = path {
                 let elsewhere = match resolve_reference_targets(store, symbol, None) {
                     RefTarget::Unique(n) => vec![n],
-                    RefTarget::Ambiguous(nodes) => nodes,
+                    RefTarget::Ambiguous(nodes) | RefTarget::Family(nodes) => nodes,
                     RefTarget::None => Vec::new(),
                 };
                 if !elsewhere.is_empty() {
@@ -1370,6 +1459,7 @@ pub fn find_references_structured(
 fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> String {
     let target = match resolve_reference_targets(store, symbol, path) {
         RefTarget::Unique(n) => n,
+        RefTarget::Family(nodes) => return references_body_for_family(store, &nodes),
         RefTarget::None => {
             // #647: a `path` hint that filtered out every real definition must
             // not read as a definitive "0 references" — that is the exact
@@ -1380,7 +1470,9 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
             if let Some(hint) = path {
                 match resolve_reference_targets(store, symbol, None) {
                     RefTarget::Unique(n) => return path_miss_message(symbol, hint, &[n]),
-                    RefTarget::Ambiguous(nodes) => return path_miss_message(symbol, hint, &nodes),
+                    RefTarget::Ambiguous(nodes) | RefTarget::Family(nodes) => {
+                        return path_miss_message(symbol, hint, &nodes)
+                    }
                     RefTarget::None => {}
                 }
             }
@@ -1406,6 +1498,63 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
     };
 
     references_body_for_target(store, &target)
+}
+
+/// Union of the occurrence sites of every member of a selector family,
+/// deduplicated by `path:line` and ordered the same way `reference_sites` orders
+/// one node's sites. Two arities of one selector can be used on the same source
+/// line (`[self policyWithPinningMode:m withPinnedCertificates:c]` is one line
+/// carrying both heads), so the dedup is load-bearing, not defensive.
+fn family_reference_sites(store: &SqliteStore, family: &[CoreNode]) -> Vec<travsr_core::RefSite> {
+    let mut sites: Vec<travsr_core::RefSite> = Vec::new();
+    for n in family {
+        match store.reference_sites(n.id) {
+            Ok(s) => sites.extend(s),
+            Err(e) => tracing::warn!("family_reference_sites {}: {e}", n.vname.signature),
+        }
+    }
+    sites.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    sites.dedup();
+    sites
+}
+
+/// Render the reference body for a selector family: which arities the head
+/// reached, then the union of their occurrence sites.
+fn references_body_for_family(store: &SqliteStore, family: &[CoreNode]) -> String {
+    let mut lines = Vec::new();
+    let head = format!(
+        "resolved: {} selector(s) of one method family:",
+        family.len()
+    );
+    lines.push(head);
+    for n in family {
+        let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+        lines.push(format!(
+            "  {} ({}) \u{2014} {}{}",
+            display_label(n),
+            n.kind,
+            n.vname.path,
+            loc
+        ));
+    }
+
+    let sites = family_reference_sites(store, family);
+    if sites.is_empty() {
+        // Defer to the single-target renderer for the honest degraded/zero
+        // caveat rather than restating it: with no sites the family's first
+        // member carries exactly the same answer.
+        return references_body_for_target(store, &family[0]);
+    }
+    let total = sites.len();
+    let shown = total.min(MAX_REFERENCE_SITES);
+    lines.push(format!("{total} reference(s):"));
+    for s in sites.into_iter().take(MAX_REFERENCE_SITES) {
+        lines.push(format!("{}:{}", s.path, s.line));
+    }
+    if total > shown {
+        lines.push(format!("[truncated: showing {shown} of {total} sites]"));
+    }
+    lines.join("\n")
 }
 
 /// Render the reference body for an already-resolved target: the `resolved:`

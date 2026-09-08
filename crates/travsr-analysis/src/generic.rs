@@ -75,11 +75,33 @@ pub struct LanguageConfig {
     /// classes, so the broad query stays and the kind is refined in Rust
     /// (`refine_type`). Empty ⇒ no folding to refine (every non-Kotlin config).
     pub type_refinements: &'static [TypeRefinement],
+    /// Optional override for the name text a definition capture contributes to
+    /// its signature, consulted in place of the captured node's own text.
+    ///
+    /// The shared pipeline assumes a definition's name is exactly the text of
+    /// one captured node. Objective-C breaks that assumption: a selector is
+    /// spelled across several sibling keyword identifiers
+    /// (`policyWithPinningMode:withPinnedCertificates:`), only the first of
+    /// which a single capture can name. Capturing every keyword instead would
+    /// emit one node per part, so the name has to be rebuilt in Rust from the
+    /// captured node's siblings.
+    ///
+    /// `Some(name)` replaces the captured text; `None` keeps it. `None` for
+    /// every language whose names are a single token.
+    pub name_hook: Option<NameHook>,
     /// Returns the tree-sitter grammar for this language.
     /// Stored as a function pointer so `LanguageConfig` is `const`-constructible
     /// (tree-sitter `Language` itself is not directly `const`-constructible).
     pub get_grammar: fn() -> tree_sitter::Language,
 }
+
+/// Rebuilds the name a definition capture contributes to its signature
+/// (see [`LanguageConfig::name_hook`]).
+///
+/// Receives the captured node, the signature prefix it was captured under
+/// (`"fn"`, `"class"`, ...) and the file bytes. Returning `None` leaves the
+/// captured node's own text in place.
+pub type NameHook = fn(cap: tree_sitter::Node, sig_prefix: &str, source: &[u8]) -> Option<String>;
 
 /// A language-specific post-parse expansion pass (see [`LanguageConfig::post_parse`]).
 /// Receives the parsed tree/source via [`PostParseCtx`] and appends synthetic
@@ -216,7 +238,16 @@ pub fn parse_with_config(
                 None => (node_kind, sig_prefix),
             };
 
-            let text = cap.node.utf8_text(&source).unwrap_or("").trim();
+            // A language may spell one name across several sibling nodes
+            // (Objective-C selectors); the hook rebuilds it from the captured
+            // node. `None` leaves the captured node's own text in place.
+            let hooked = config
+                .name_hook
+                .and_then(|h| h(cap.node, sig_prefix, &source));
+            let text = match &hooked {
+                Some(name) => name.trim(),
+                None => cap.node.utf8_text(&source).unwrap_or("").trim(),
+            };
             if text.is_empty() {
                 continue;
             }

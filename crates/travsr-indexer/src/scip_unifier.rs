@@ -324,18 +324,16 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
                 sigs.push(format!("fn:{c}.{name}"));
             }
             sigs.push(format!("fn:{name}"));
-            // #449: ObjC multi-part selectors (`setWidth:height:`): Phase A
-            // anchors the method signature on the leading selector keyword
-            // (`fn:setWidth`), so add leading-keyword candidates too.
-            if let Some((leading, _)) = name.split_once(':') {
-                if !leading.is_empty() {
-                    if let Some(c) = parsed.container {
-                        sigs.push(format!("method:{c}.{leading}"));
-                        sigs.push(format!("fn:{c}.{leading}"));
-                    }
-                    sigs.push(format!("fn:{leading}"));
-                }
-            }
+            // #449 used to add leading-keyword candidates here
+            // (`method:Foo.setWidth` for `setWidth:height:`) because Phase A
+            // truncated an Objective-C selector to its leading keyword. Phase A
+            // now stores the whole selector, so the full-selector candidates
+            // above match directly and a leading-keyword candidate could only
+            // ever match a DIFFERENT method: a genuinely zero-argument
+            // `- (void)setWidth` in the same class. That is not a harmless
+            // last-resort either, because `find_ts_node_for_unification` orders
+            // span-containment ahead of candidate priority, so the wrong node
+            // wins whenever its span contains the SCIP line.
             sigs
         }
         "class" => [
@@ -974,9 +972,10 @@ mod tests {
     }
 
     #[test]
-    fn candidates_selector_adds_leading_keyword() {
-        // #449: Phase A objc anchors method sigs on the leading selector keyword
-        // (`fn:setWidth`), so colon-bearing names add leading-keyword candidates.
+    fn candidates_selector_keeps_the_whole_selector() {
+        // Phase A stores the whole Objective-C selector, so the full-selector
+        // candidates are the only correct targets. A leading-keyword candidate
+        // (`method:Foo.setWidth`) would name a different method entirely.
         let sigs = candidate_signatures(&parsed(Some("Foo"), "setWidth:height:", "function"));
         assert_eq!(
             sigs,
@@ -984,9 +983,6 @@ mod tests {
                 "method:Foo.setWidth:height:",
                 "fn:Foo.setWidth:height:",
                 "fn:setWidth:height:",
-                "method:Foo.setWidth",
-                "fn:Foo.setWidth",
-                "fn:setWidth"
             ]
         );
         // Colon-free names are unchanged.

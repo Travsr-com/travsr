@@ -863,7 +863,12 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
     let seed =
         match crate::tools::resolve_reference_targets(store, &args.query, args.path.as_deref()) {
             crate::tools::RefTarget::Unique(n) => Some(n),
-            crate::tools::RefTarget::Ambiguous(list) => {
+            // A selector family is listed like an ambiguity here rather than
+            // merged: a graph has one root, and the arities of a selector are
+            // distinct nodes with distinct neighbourhoods. Naming the full
+            // selector picks one. (`find_references` unions them instead, since
+            // a reference list has no root to conflict over.)
+            crate::tools::RefTarget::Ambiguous(list) | crate::tools::RefTarget::Family(list) => {
                 let candidates_entries: Vec<NodeEntry> =
                     list.iter().map(|n| node_entry(n, 0)).collect();
                 candidates = Some(candidates_entries);
