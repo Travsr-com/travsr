@@ -2312,7 +2312,7 @@ fn run_git_grep(
         tracing::warn!("find_pattern re-included pass failed: {detail}");
     }
 
-    // Two filters, both closing the same gap from the other direction: git can
+    // Three filters, all closing the same gap from the other direction: git can
     // see files the walker refuses to index, so a match from one of them would
     // be a file `find_references` can never corroborate.
     //
@@ -2328,6 +2328,19 @@ fn run_git_grep(
     //    matcher the walker applies (`add_custom_ignore_filename`) keeps both
     //    tools on one set of files. Pass-2 paths are whitelisted by
     //    construction, so this half only ever drops pass-1 lines.
+    // 3. Neither of those covers a file the walker skips on its *name*: a
+    //    generated `index.scip` sitting at the repo root is in no skip dir and
+    //    no ignore file, yet `travsr_core::is_indexable_path` rejects it, so it
+    //    contributes nothing to the graph. `git grep -I` does not help — git's
+    //    binary heuristic only looks for a NUL byte in the first 8000 bytes and
+    //    this protobuf has none, so git classifies it as text and emits raw
+    //    binary as "matches". Routing through the same classifier the indexer
+    //    walk uses is what makes the tool's own claim ("search over the graph's
+    //    file set") true. Deliberately an extension/name test and NOT an
+    //    intersection with existing graph node paths: pass 1 passes
+    //    `--untracked` on purpose so a brand-new source file is searchable
+    //    before it is committed or indexed, and an intersection would break
+    //    that freshness guarantee for exactly those files.
     //
     // Each grep line is `path:line:col:text`, so the path is the prefix before
     // the first ':'.
@@ -2343,6 +2356,9 @@ fn run_git_grep(
                 .components()
                 .any(|c| SKIP_DIRS.iter().any(|skip| c.as_os_str() == *skip));
             if in_skip_dir {
+                return false;
+            }
+            if !travsr_core::is_indexable_path(std::path::Path::new(path)) {
                 return false;
             }
             match &travsrignore {
