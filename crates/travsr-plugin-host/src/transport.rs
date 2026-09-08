@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use travsr_error::IndexError;
 use travsr_plugin_protocol::{
     codec::{decode_message, write_message},
-    HandshakeRequest, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
-    PluginRequest, PluginResponse, PROTOCOL_VERSION,
+    DiagnosticSeverity, HandshakeRequest, InvokeRequest, InvokeResponse, ParseRequest,
+    ParseResponse, Plugin, PluginRequest, PluginResponse, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,17 +471,50 @@ impl Transport for Sidecar {
                 // A clean handshake + invoke that nonetheless yields zero nodes is
                 // the exact shape of a silent analyzer failure (e.g. libclang
                 // denied a sandbox read → every TU fails to parse → empty index).
-                // Echo the sidecar's own stderr at debug so the cause is
-                // recoverable rather than surfacing only as a generic zero-node
-                // warning with a misdirecting remedy.
+                // Echo the sidecar's own stderr so the cause is recoverable
+                // rather than surfacing only as a generic zero-node warning with
+                // a misdirecting remedy.
+                //
+                // At warn, not debug: the sidecar has already decided this run
+                // produced nothing, and its stderr is the only place the reason
+                // exists. Emitting it at debug meant the default-verbosity user
+                // saw "produced no symbols" with no way to reach the cause, and
+                // `travsr status` then blamed their project. Three separate
+                // language failures (scala's over-matching stdlib filter, php's
+                // wrong analyzer CWD, java's skipped test compilation) each
+                // stayed invisible behind exactly this line.
                 if resp.nodes.is_empty() {
                     let tail = self.stderr_ring.tail();
                     if !tail.is_empty() {
-                        tracing::debug!(
+                        tracing::warn!(
                             lang = %self.language,
                             stderr = %tail,
                             "Phase B: sidecar returned zero nodes; sidecar stderr follows"
                         );
+                    }
+                }
+                // Structured diagnostics, unlike the stderr echo above, are NOT
+                // gated on an empty result. That gate is why they exist: a run
+                // that returns some nodes and still knows it is degraded (java
+                // skipping test compilation, a stale emitter binary) had no way
+                // to be heard, because the only channel opened on total failure.
+                // Echoing these unconditionally is safe where echoing stderr was
+                // not: the sidecar opts in per record, so there is no routine
+                // chatter to flood.
+                for d in &resp.diagnostics {
+                    match d.severity {
+                        DiagnosticSeverity::Warning => tracing::warn!(
+                            lang = %self.language,
+                            code = %d.code,
+                            "Phase B: {}",
+                            d.message
+                        ),
+                        DiagnosticSeverity::Info => tracing::info!(
+                            lang = %self.language,
+                            code = %d.code,
+                            "Phase B: {}",
+                            d.message
+                        ),
                     }
                 }
                 Ok(resp)
