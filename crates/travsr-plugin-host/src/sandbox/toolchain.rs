@@ -86,8 +86,9 @@ impl RepoWrite {
 
 /// The exact repo-relative subpaths `language`'s Phase B analyzer must write,
 /// keeping the rest of the repo root read-only. Empty for every language except
-/// scala: `sbt compile` writes build outputs to `target/` and `project/target/`
-/// inside the project (sbt's layout has no out-of-tree build option), and
+/// scala: `sbt compile` writes build outputs to `target/` inside the project
+/// (sbt's layout has no out-of-tree build option): at the root, under
+/// `project/`, and once per platform in an sbt-crossproject tree. And
 /// SemanticDB is enabled via a settings file (`.travsr-semanticdb.sbt`) the
 /// wrapper drops alongside `build.sbt`. Narrowing to these subpaths — rather than
 /// the whole repo root — means a hostile `build.sbt` executed by sbt during
@@ -99,8 +100,31 @@ pub fn repo_write_subpaths(language: &str) -> &'static [RepoWrite] {
         "scala" => &[
             RepoWrite::Dir("target"),
             RepoWrite::Dir("project/target"),
+            // sbt's meta-build of the meta-build. Present in a real crossproject
+            // tree and written by the same `sbt compile`.
+            RepoWrite::Dir("project/project/target"),
+            // #832 moved the scala sidecar to sbt-crossproject support on the
+            // read side (`find_semanticdb_files` walks `target/` at any depth,
+            // and its own test asserts `jvm/target` and `native/target`), but
+            // this grant stayed on the single-module layout. A crossproject
+            // build writes SemanticDB per platform: on the pinned
+            // scala-parser-combinators fixture all 150 `.semanticdb` files land
+            // under js/jvm/native and NONE under the granted `target/`. On macOS
+            // scala runs under the `Elevated` policy, which skips sandbox-exec
+            // entirely, so the mismatch is invisible there; on Linux the repo
+            // root is a `--ro-bind` and those writes take EROFS.
+            RepoWrite::Dir("js/target"),
+            RepoWrite::Dir("jvm/target"),
+            RepoWrite::Dir("native/target"),
             RepoWrite::File(".travsr-semanticdb.sbt"),
         ],
+        // scip-php has no `--output`: it hardcodes `index.scip` relative to its
+        // working directory, which has to be the repo for it to find
+        // composer.json at all. Without this grant the sidecar's write is denied
+        // and `file_put_contents` returns false with a zero exit status, i.e. a
+        // silent empty index rather than a reported failure. The sidecar moves
+        // the file into scratch and removes it, so nothing survives the run.
+        "php" => &[RepoWrite::File("index.scip")],
         _ => &[],
     }
 }
