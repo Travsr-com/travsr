@@ -5767,6 +5767,65 @@ LIMIT ?4",
         Ok(id.map(i64_to_node_id))
     }
 
+    /// G1 overload-collapse rung: the tree-sitter node at `(corpus, path)`
+    /// matching one of `signatures`, but ONLY when the whole candidate set
+    /// matches exactly one node in that file.
+    ///
+    /// Unlike [`Self::find_ts_node_for_unification`] this ignores the SCIP
+    /// definition line entirely. It exists for the case where line proximity is
+    /// the wrong question: Phase A signatures carry no parameter list, so an
+    /// overload set `C.n(...)` collapses into one node anchored at the first
+    /// overload, while SCIP emits a separate def per overload at its own line.
+    /// The later overloads are the same method group, just not near that anchor.
+    ///
+    /// The uniqueness requirement is the safety property, and the caller must
+    /// pass container-qualified candidates only (see
+    /// `travsr_indexer::scip_unifier::overload_collapse_signatures`). With those,
+    /// "the only match in this file" and "the right match" are the same thing.
+    /// Two or more matches mean the assumption does not hold here, so it returns
+    /// `None` rather than guessing.
+    pub fn find_unique_ts_node_in_file(
+        &self,
+        corpus: &str,
+        path: &str,
+        signatures: &[String],
+    ) -> anyhow::Result<Option<NodeId>> {
+        if signatures.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = (3..signatures.len() + 3)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        // LIMIT 2 so "exactly one" is decidable without counting the whole file.
+        let sql = format!(
+            "SELECT id FROM nodes \
+             WHERE corpus = ?1 AND path = ?2 \
+               AND signature IN ({placeholders}) \
+               AND line IS NOT NULL \
+             LIMIT 2"
+        );
+        let mut bind: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(signatures.len() + 2);
+        bind.push(&corpus);
+        bind.push(&path);
+        for sig in signatures {
+            bind.push(sig);
+        }
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .context("find_unique_ts_node_in_file: prepare")?;
+        let ids: Vec<i64> = stmt
+            .query_map(bind.as_slice(), |row| row.get(0))
+            .context("find_unique_ts_node_in_file: query")?
+            .collect::<Result<Vec<_>, _>>()
+            .context("find_unique_ts_node_in_file: rows")?;
+        Ok(match ids.as_slice() {
+            [only] => Some(i64_to_node_id(*only)),
+            _ => None,
+        })
+    }
+
     /// The set of paths in `corpus` that carry at least one Phase A definition —
     /// a node whose signature is not a `scip:` descriptor and whose kind is not
     /// the synthetic `file` node. #780: SCIP tools (scip-ruby) index gitignored

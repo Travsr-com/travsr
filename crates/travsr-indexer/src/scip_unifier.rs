@@ -308,6 +308,18 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
         "function" => {
             let mut sigs = Vec::with_capacity(6);
             if let Some(c) = parsed.container {
+                // A constructor's SCIP leaf is a fixed marker, not the name the
+                // Phase A parser saw. scip-dotnet emits `Type#`.ctor`().`, but
+                // tree-sitter reads a `constructor_declaration` whose name IS the
+                // type, so Phase A wrote `method:Type.Type`. Without this the two
+                // never meet: every C# constructor def stayed an orphan SCIP node
+                // and took its whole ref/call fan-in with it, so `graph <Type>
+                // --direction callers` reached none of the `new Type(...)` sites.
+                if name == ".ctor" {
+                    sigs.push(format!("method:{c}.{c}"));
+                    sigs.push(format!("fn:{c}.{c}"));
+                    sigs.push(format!("fn:{c}"));
+                }
                 sigs.push(format!("method:{c}.{name}"));
                 sigs.push(format!("fn:{c}.{name}"));
             }
@@ -362,6 +374,37 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
         }
         _ => Vec::new(),
     }
+}
+
+/// The container-qualified candidates alone, for the overload-collapse rung.
+///
+/// Phase A signatures carry no parameter list, so every overload of `C.n` in a
+/// file hashes to ONE tree-sitter node, anchored at the first overload's span.
+/// SCIP keeps them apart (`C#n().`, `C#n(+1).`, ...), so only the first overload
+/// falls inside that span; the rest miss both span-containment and the +/-5
+/// proximity window and orphan. That is not a line-distance problem, it is a
+/// cardinality mismatch: N SCIP defs legitimately share one Phase A node.
+///
+/// The container qualification is what makes resolving it by uniqueness safe.
+/// `method:C.n` names one method group in one file, so a single match is the
+/// right match by construction. The unqualified `fn:n` fallback carries no such
+/// guarantee and is deliberately excluded: an unrelated free function of the
+/// same name would be the "unique" match and would silently absorb the edges.
+///
+/// Returns empty for anything that is not a container-qualified callable, which
+/// disables the rung rather than widening it.
+pub fn overload_collapse_signatures(parsed: &ScipName<'_>) -> Vec<String> {
+    if parsed.kind != "function" {
+        return Vec::new();
+    }
+    let Some(c) = parsed.container else {
+        return Vec::new();
+    };
+    let name = parsed.name;
+    if name == ".ctor" {
+        return vec![format!("method:{c}.{c}"), format!("fn:{c}.{c}")];
+    }
+    vec![format!("method:{c}.{name}"), format!("fn:{c}.{name}")]
 }
 
 /// Parse a *bespoke-sidecar* node signature into a [`ScipName`] for G1
