@@ -5502,7 +5502,22 @@ fn get_context_body(
     }
 
     // Retrieval header — declared here so it can be prepended to the response body.
-    let n_resolved = seed_set.terms.iter().filter(|t| t.resolved).count();
+    // #529: report the count the abstention gate actually reads, not the looser
+    // `t.resolved` count. They are different numbers under the same name: the gate
+    // additionally requires `idf_w >= idf_coverage_min`, so a query whose tokens
+    // all matched something generic printed e.g. "coverage 4/5" while the gate saw
+    // 0/5 and abstained. An agent reading the envelope could not predict whether it
+    // would get an answer. The generic remainder is still surfaced, distinguished,
+    // because "4 tokens matched but none specifically enough" explains the verdict
+    // that a bare "0/5" only states.
+    let n_resolved = seed_set.n_resolved_gated;
+    let n_resolved_loose = seed_set.terms.iter().filter(|t| t.resolved).count();
+    let n_generic = n_resolved_loose.saturating_sub(n_resolved);
+    let coverage_note = if n_generic > 0 {
+        format!(" (+{n_generic} too generic to count)")
+    } else {
+        String::new()
+    };
     let n_terms = seed_set.terms.len();
 
     // R8: index freshness header — lets the AI know exactly which commit the graph
@@ -5526,7 +5541,7 @@ fn get_context_body(
     let freshness_header = format!("[index commit: {index_commit}, embeddings: {embed_status}]\n");
 
     let retrieval_header = format!(
-        "{freshness_header}[retrieval: {tier_label} | coverage {n_resolved}/{n_terms} | confidence: {} ]\n",
+        "{freshness_header}[retrieval: {tier_label} | coverage {n_resolved}/{n_terms}{coverage_note} | confidence: {} ]\n",
         seed_set.confidence.label()
     );
 

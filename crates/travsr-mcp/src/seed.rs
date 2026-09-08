@@ -467,6 +467,13 @@ pub(crate) struct SeedSet {
     /// Reserved for future response annotation.
     #[allow(dead_code)]
     pub coverage: f32,
+    /// Numerator of [`SeedSet::coverage`]: the number of content tokens that both
+    /// resolved AND cleared the IDF-specificity bar (`idf_w >= idf_coverage_min`).
+    /// This is the count the abstention gate actually reads, which is why the
+    /// response envelope reports it: a bare `t.resolved` count can be several
+    /// times larger (every token that matched anything at all, however generic),
+    /// so an agent shown that number cannot predict whether it will get an answer.
+    pub n_resolved_gated: usize,
     pub confidence: Confidence,
     /// Top raw BM25 score (positive) from the lexical FTS path; 0.0 if no FTS results.
     /// Reserved for future response annotation.
@@ -3036,6 +3043,7 @@ pub(crate) fn build_seed_set(
         seeds,
         terms,
         coverage,
+        n_resolved_gated: n_resolved,
         confidence,
         top_bm25,
     }
