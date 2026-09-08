@@ -334,6 +334,7 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     daemon_client::warn_if_call_graph_degraded(&db_path);
 
     let mut served_cold_path = false;
+    let mut cold_path_embed_unarmed = false;
     let payload: AskPayload = match daemon_client::try_query(
         &repo_root,
         "ask",
@@ -347,6 +348,10 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             // FTS-only if the sidecar binary is absent or the index is not built.
             travsr_daemon::try_inject_embed_hook_readonly(&mut store, &db_path);
             let knn = store.embed_knn_fn();
+            // Embeddings exist on disk and this process still has no hook. That
+            // is the read-only injector doing what it documents, not a build in
+            // progress, and the caller is told so below.
+            cold_path_embed_unarmed = store.has_embed_db() && knn.is_none();
             let knn_ref = knn
                 .as_ref()
                 .map(|f| f as &dyn Fn(&str, u32) -> Vec<(travsr_core::NodeId, f32)>);
@@ -360,6 +365,20 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     // a docs section would not have helped, so the note was pure recurring noise.
     if served_cold_path && payload.matched && !payload.no_results {
         note_cold_path_cannot_render_docs(&repo_root);
+    }
+    // Unlike the docs note, this one matters most when the query FAILED: the
+    // payload's own signal for this state reads "embedding in progress; run
+    // `travsr embed status`", which sends the user to a command that will report
+    // the index complete. Nothing is in progress. The cold path declines to arm
+    // the hook, by design, and only this process knows that.
+    if served_cold_path && cold_path_embed_unarmed {
+        eprintln!(
+            "note: this repo has embeddings, but no travsr daemon is running, so \
+             this query is served by the read-only cold path, which does not load \
+             the embedding sidecar. The answer is lexical only and will not \
+             improve on a retry. Start the daemon with `travsr daemon start` for \
+             semantic ranking."
+        );
     }
 
     if matches!(format, OutputFormat::Json) {
