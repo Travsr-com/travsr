@@ -729,11 +729,10 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         let Some(src_node) = node_map.get(&edge.src) else {
             continue;
         };
-        // RFC-027 section 10: mark an un-ratified edge so a reader never takes
-        // the live overlay for committed truth. Only `live` is called out —
-        // every other provenance is ratified, and tagging all of them would be
-        // noise on the common case.
-        let live = live_marker(edge);
+        // Mark an edge a reader must not take at face value. Two cases: an
+        // un-ratified `live` overlay edge (RFC-027 section 10), and a ref/call
+        // edge resolved by leaf-name matching rather than by type.
+        let live = provenance_marker(edge);
         // True call edge: try to expand into exact call-site lines.
         if tag == "[call]" {
             if let Some(root) = &repo_root {
@@ -772,19 +771,36 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
     lines.join("\n")
 }
 
-/// RFC-027 section 10: the suffix marking an edge as part of the live overlay.
+/// The suffix marking an edge whose confidence differs from the default.
 ///
-/// Empty for every ratified provenance, so the common case reads exactly as it
-/// did before. A `live` edge is resolved but not yet ratified — precise enough
-/// to act on, and honest that the commit-gated pipeline has not confirmed it
-/// yet. Consumers that need ground truth filter it out; consumers that ignore
-/// provenance simply see a fresher graph, which is the additive default
-/// section 10 asks for.
-fn live_marker(edge: &travsr_core::Edge) -> &'static str {
-    if edge.provenance.as_deref() == Some("live") {
-        " [live: resolved from your uncommitted edit, not yet ratified]"
-    } else {
-        ""
+/// Empty for a type-resolved, ratified edge, so the common case reads exactly
+/// as it did before. Two cases are called out:
+///
+/// * `live` (RFC-027 section 10): resolved but not yet ratified, precise
+///   enough to act on, and honest that the commit-gated pipeline has not
+///   confirmed it. Consumers needing ground truth filter it out; consumers
+///   ignoring provenance simply see a fresher graph.
+/// * `tree-sitter` on a `ref/call` edge: produced by `resolve_unresolved_calls`
+///   matching a bare callee name against the graph, not by a compiler resolving
+///   a type. Ratified, and still capable of being wrong. Its uniqueness gate
+///   ("exactly one same-named candidate") is evidence about the *index*, not
+///   about the call: a local binding the Phase A parser does not model (a JS
+///   `const f = () => …`) leaves the only same-named node in an unrelated
+///   package as the unique winner, and the edge is written as fact. The gate is
+///   also skipped entirely when the call carries a crate hint, which fans out to
+///   every path-matching candidate.
+///
+/// The old comment here asserted that "every other provenance is ratified" and
+/// stopped there, which conflated ratified with correct. Restricted to
+/// `RefCall`: Phase A's `defines/binding` and `depends` edges are also
+/// `tree-sitter` and are structural facts from the AST, not name guesses.
+fn provenance_marker(edge: &travsr_core::Edge) -> &'static str {
+    match edge.provenance.as_deref() {
+        Some("live") => " [live: resolved from your uncommitted edit, not yet ratified]",
+        Some("tree-sitter") if edge.kind == travsr_core::EdgeKind::RefCall => {
+            " [heuristic: matched by name, not resolved by type]"
+        }
+        _ => "",
     }
 }
 
@@ -1525,7 +1541,7 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
             );
         }
         // WS-3 (C3): a Dart index built without resolved dependencies drops
-        // every cross-package reference, so "no recorded uses" would be a
+        // every cross-package reference, so "recorded no uses" would be a
         // confident zero the index cannot support even when the file itself was
         // analysed. Soften it, mirroring the partial-coverage case above.
         if target.vname.language == "dart"
@@ -1544,13 +1560,17 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
             );
         }
         // Coverage is effectively complete for this language and this symbol has
-        // neither occurrence rows nor ref/call edges: a genuine zero. (If the
-        // same name is also defined elsewhere, bare calls to it are left
-        // unindexed to avoid mis-targeting — precision over recall.)
+        // neither occurrence rows nor ref/call edges. Report that as the fact it
+        // is. We cannot tell from here whether the uses do not exist, whether an
+        // ambiguous bare call was deliberately skipped, or whether the analyzer
+        // never emitted an occurrence for the call shape at all (scip-dotnet, for
+        // one, emits nothing for a generic invocation), so do not name a cause.
         return format!(
-            "{header}\n0 reference(s). This symbol has no recorded uses. If this \
-             name is also defined elsewhere, bare calls to it are left unindexed \
-             to avoid mis-targeting; use `find_pattern` for a textual search."
+            "{header}\n0 reference(s). The index recorded no uses of this symbol. \
+             That can mean it has none, or that the call sites were not indexed: \
+             an ambiguous bare call is skipped by design, and some analyzers emit \
+             no occurrence for certain call shapes. Use `find_pattern` for a \
+             textual search to tell the two apart."
         );
     }
     let callers = store.get_nodes(&caller_ids).unwrap_or_default();
@@ -12190,28 +12210,57 @@ mod snippet_tests {
         );
     }
 
-    /// The overlay marker is attached per edge, and only to un-ratified ones.
+    /// The marker is attached per edge, and only where the edge's confidence
+    /// differs from the default: an un-ratified `live` overlay edge, or a
+    /// name-matched (rather than type-resolved) `ref/call`.
     #[test]
-    fn only_a_live_edge_is_marked_in_caller_output() {
+    fn only_a_live_or_heuristic_edge_is_marked_in_caller_output() {
         let ratified = travsr_core::Edge::new(
             travsr_core::NodeId(1),
             travsr_core::NodeId(2),
             travsr_core::EdgeKind::RefCall,
         );
         assert_eq!(
-            live_marker(&ratified),
+            provenance_marker(&ratified),
             "",
             "an unlabelled edge is not marked"
         );
 
-        let mut ts = ratified.clone();
-        ts.provenance = Some("tree-sitter".to_string());
-        assert_eq!(live_marker(&ts), "", "ratified provenance is not marked");
+        let mut scip = ratified.clone();
+        scip.provenance = Some("scip".to_string());
+        assert_eq!(
+            provenance_marker(&scip),
+            "",
+            "a type-resolved edge is not marked"
+        );
+
+        // A `ref/call` labelled tree-sitter came from leaf-name matching in
+        // `resolve_unresolved_calls`, not from a compiler, so it is marked.
+        let mut ts_call = ratified.clone();
+        ts_call.provenance = Some("tree-sitter".to_string());
+        assert!(
+            provenance_marker(&ts_call).contains("matched by name"),
+            "a name-matched call edge must say so"
+        );
+
+        // Phase A's own structural edges are tree-sitter too, and are facts
+        // read off the AST. They must stay unmarked.
+        let mut ts_structural = travsr_core::Edge::new(
+            travsr_core::NodeId(1),
+            travsr_core::NodeId(2),
+            travsr_core::EdgeKind::DefinesBinding,
+        );
+        ts_structural.provenance = Some("tree-sitter".to_string());
+        assert_eq!(
+            provenance_marker(&ts_structural),
+            "",
+            "a structural Phase A edge is not a name guess"
+        );
 
         let mut live = ratified.clone();
         live.provenance = Some("live".to_string());
         assert!(
-            live_marker(&live).contains("not yet ratified"),
+            provenance_marker(&live).contains("not yet ratified"),
             "a live edge must say so"
         );
     }
@@ -13382,7 +13431,7 @@ mod snippet_tests {
     fn find_references_softens_zero_when_target_file_has_no_occurrences() {
         // #450: the language gate passes (another file of the same language has
         // occurrence rows), but the target's OWN file has none — so a definitive
-        // "no recorded uses" would be a claim the index cannot support.
+        // "recorded no uses" would be a claim the index cannot support.
         use travsr_core::{Node, VName};
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
 
@@ -13418,7 +13467,7 @@ mod snippet_tests {
             "should name the unanalysed file: {out}"
         );
         assert!(
-            !out.contains("has no recorded uses"),
+            !out.contains("recorded no uses"),
             "must not assert absence: {out}"
         );
     }
@@ -13454,7 +13503,7 @@ mod snippet_tests {
 
         let out = find_references(&store, "unused", None);
         assert!(
-            out.contains("has no recorded uses"),
+            out.contains("recorded no uses"),
             "analysed file should still give a definitive zero: {out}"
         );
         assert!(
