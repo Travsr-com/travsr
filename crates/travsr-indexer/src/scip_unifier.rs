@@ -322,6 +322,37 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
                 }
                 sigs.push(format!("method:{c}.{name}"));
                 sigs.push(format!("fn:{c}.{name}"));
+                // A bespoke sidecar (`native_name_kind`: kotlin KLS, swift,
+                // dart) reports the FULL dotted nesting path as the container,
+                // while Phase A qualifies a member by the single nearest NAMED
+                // type container (`enclosing_container`). The two disagree
+                // wherever the nesting adds a scope Phase A does not qualify
+                // by: a Kotlin companion object
+                // (`Annotations.Companion.isList` vs `method:Annotations.isList`),
+                // a nested class (`Issue224Test.Data2.toString` vs
+                // `method:Data2.toString`), an object expression inside a
+                // function (`PathMatcherTest.scatteredObject.pm.onMatch` vs
+                // `method:PathMatcherTest.onMatch`). None of those candidates
+                // matched, so the definition never unified and survived as a
+                // SECOND node covering the same source span as its Phase A
+                // twin. Caller attribution (`fetch_all_fn_spans` +
+                // `find_narrowest_enclosing`) then had two equal-width
+                // candidates and broke the tie on `id`, a content hash, so
+                // which one owned the call depended on whether the sidecar's
+                // node happened to be there. Measured on klaxon: 42 exact span
+                // collisions, 112 of 2337 in-span sites decided that way.
+                // Which segment Phase A used is not recoverable from the
+                // string, so offer every one and let the same-file + in-span
+                // gate in `find_ts_node_for_unification` pick. SCIP
+                // descriptors keep only the innermost container
+                // (`split_container`) and never contain a `.`, so this arm is
+                // inert for every SCIP language.
+                if c.contains('.') {
+                    for seg in c.split('.') {
+                        sigs.push(format!("method:{seg}.{name}"));
+                        sigs.push(format!("fn:{seg}.{name}"));
+                    }
+                }
             }
             sigs.push(format!("fn:{name}"));
             // #449 used to add leading-keyword candidates here
@@ -988,6 +1019,30 @@ mod tests {
         // Colon-free names are unchanged.
         let sigs = candidate_signatures(&parsed(Some("Foo"), "run", "function"));
         assert_eq!(sigs, vec!["method:Foo.run", "fn:Foo.run", "fn:run"]);
+    }
+
+    #[test]
+    fn candidates_function_offers_every_segment_of_a_dotted_container() {
+        // A bespoke sidecar reports the full nesting path; Phase A qualifies by
+        // the nearest NAMED type container, which can be any segment of it: the
+        // outermost for a Kotlin companion object (`method:Annotations.isList`),
+        // the innermost for a nested class (`method:Data2.toString`). Both must
+        // be offered. `candidates_function_with_container` covers the undotted
+        // case, which every SCIP language produces and this must not disturb.
+        let sigs =
+            candidate_signatures(&parsed(Some("Annotations.Companion"), "isList", "function"));
+        assert_eq!(
+            sigs,
+            vec![
+                "method:Annotations.Companion.isList",
+                "fn:Annotations.Companion.isList",
+                "method:Annotations.isList",
+                "fn:Annotations.isList",
+                "method:Companion.isList",
+                "fn:Companion.isList",
+                "fn:isList",
+            ]
+        );
     }
 
     #[test]
