@@ -2360,13 +2360,48 @@ impl SqliteStore {
                         params![file.vname_path],
                     )
                     .context("removing FTS word map rows")?;
+                    // Owned-edge-only delete, the same ownership rule
+                    // [`Self::reindex_replace`] states: this file owns its
+                    // outbound edges, and inbound edges belong to whoever wrote
+                    // them. The blunt `OR dst IN (…)` this replaced also deleted
+                    // inbound edges to symbols that *survive* the re-parse, and
+                    // nothing re-derives those, because the file that owns them
+                    // is not being re-parsed here. A relative TypeScript import is
+                    // exactly that shape (`import:./billing --resolves-to-->
+                    // file:src/billing.ts`: `src` in the importer, `dst` in the
+                    // target), so re-indexing the target erased the importer's
+                    // edge. Whether it did depended on the order the parallel
+                    // parse workers happened to deliver the two files in, which
+                    // is why `travsr init --force` dropped a random subset of
+                    // `resolves-to` edges with no error while a fresh index (the
+                    // staging path, which has no delete pass) stayed stable.
+                    let removed_ids: Vec<i64> = {
+                        let new_ids: std::collections::HashSet<i64> =
+                            file.nodes.iter().map(|n| node_id_to_i64(n.id)).collect();
+                        let mut stmt = tx
+                            .prepare("SELECT id FROM nodes WHERE path = ?1")
+                            .context("preparing old-id snapshot")?;
+                        let rows = stmt
+                            .query_map(params![file.vname_path], |r| r.get::<_, i64>(0))
+                            .context("querying old ids")?
+                            .collect::<rusqlite::Result<Vec<i64>>>()
+                            .context("collecting old ids")?;
+                        rows.into_iter()
+                            .filter(|id| !new_ids.contains(id))
+                            .collect()
+                    };
                     tx.execute(
-                        "DELETE FROM edges \
-                         WHERE src IN (SELECT id FROM nodes WHERE path = ?1) \
-                            OR dst IN (SELECT id FROM nodes WHERE path = ?1)",
+                        "DELETE FROM edges WHERE src IN (SELECT id FROM nodes WHERE path = ?1)",
                         params![file.vname_path],
                     )
-                    .context("deleting edges for path")?;
+                    .context("deleting owned edges for path")?;
+                    // A symbol the re-parse dropped still takes its inbound
+                    // edges with it, so the narrower delete above never trades a
+                    // lost edge for a dangling one.
+                    for removed_id in &removed_ids {
+                        tx.execute("DELETE FROM edges WHERE dst = ?1", params![removed_id])
+                            .context("deleting inbound edges for a removed symbol")?;
+                    }
                     tx.execute("DELETE FROM nodes WHERE path = ?1", params![file.vname_path])
                         .context("deleting nodes for path")?;
 
@@ -16178,5 +16213,148 @@ mod tests {
         // Signed saturating_sub saturates at i64::MIN rather than zero, which
         // is what produced the negative in the first place.
         assert_eq!(super::backfill_counts(0, i64::MAX).0, 0);
+    }
+
+    /// A cross-file Phase A edge must not depend on the order the batch writer
+    /// happened to receive the two files in.
+    ///
+    /// `import:./billing --resolves-to--> file:src/billing.ts` has its `src` in
+    /// the importer and its `dst` in the target. Re-writing the target used to
+    /// delete every edge pointing *into* its nodes, so the importer's edge
+    /// survived only when the importer came last in the batch. Batch order on
+    /// the init path is whatever the parallel parse workers deliver, so
+    /// `travsr init --force` dropped a random subset of `resolves-to` edges
+    /// with no error.
+    ///
+    /// Deterministic by construction: it does not race two threads, it pins
+    /// both orders of the same batch and requires them to agree.
+    #[test]
+    fn a_rewritten_batch_keeps_cross_file_edges_in_either_order() {
+        let file_node =
+            |path: &str| Node::new(VName::new("c", "", path, "typescript", "file"), "file");
+        let import_node = Node::new(
+            VName::new("c", "", "src/caller.ts", "typescript", "import:./billing"),
+            "import",
+        );
+        let billing = file_node("src/billing.ts");
+        let caller = file_node("src/caller.ts");
+
+        let caller_graph = || FileGraph {
+            vname_path: "src/caller.ts".into(),
+            new_hash: "h-caller".into(),
+            nodes: vec![caller.clone(), import_node.clone()],
+            edges: vec![
+                Edge::new(caller.id, import_node.id, EdgeKind::Depends),
+                Edge::new(import_node.id, billing.id, EdgeKind::ResolvesTo),
+            ],
+            source: None,
+        };
+        let billing_graph = || FileGraph {
+            vname_path: "src/billing.ts".into(),
+            new_hash: "h-billing".into(),
+            nodes: vec![billing.clone()],
+            edges: vec![],
+            source: None,
+        };
+        let resolves_to = |store: &SqliteStore| -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM edges WHERE kind = 'resolves-to'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        // Both orders re-write an index that already holds both files, which is
+        // what `--force` does: its graph purge leaves the nodes of on-disk
+        // files in place, so every file takes the incremental branch below.
+        for importer_first in [false, true] {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            store
+                .write_file_graphs_batch(&[billing_graph(), caller_graph()], false)
+                .unwrap();
+            assert_eq!(
+                resolves_to(&store),
+                1,
+                "precondition: the first index resolves the import"
+            );
+
+            let batch = if importer_first {
+                vec![caller_graph(), billing_graph()]
+            } else {
+                vec![billing_graph(), caller_graph()]
+            };
+            store.write_file_graphs_batch(&batch, false).unwrap();
+            assert_eq!(
+                resolves_to(&store),
+                1,
+                "re-indexing both files must keep the import edge \
+                 (importer_first = {importer_first})"
+            );
+        }
+    }
+
+    /// The other half of the ownership rule: a symbol the re-parse dropped must
+    /// still take its inbound edges with it, or the narrower delete above would
+    /// trade a lost edge for a dangling one.
+    #[test]
+    fn a_rewritten_batch_drops_inbound_edges_of_a_removed_symbol() {
+        let caller = Node::new(
+            VName::new("c", "", "src/caller.ts", "typescript", "fn:checkout"),
+            "function",
+        );
+        let charge = Node::new(
+            VName::new("c", "", "src/billing.ts", "typescript", "fn:charge"),
+            "function",
+        );
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .write_file_graphs_batch(
+                &[
+                    FileGraph {
+                        vname_path: "src/billing.ts".into(),
+                        new_hash: "h1".into(),
+                        nodes: vec![charge.clone()],
+                        edges: vec![],
+                        source: None,
+                    },
+                    FileGraph {
+                        vname_path: "src/caller.ts".into(),
+                        new_hash: "h-caller".into(),
+                        nodes: vec![caller.clone()],
+                        edges: vec![Edge::new(caller.id, charge.id, EdgeKind::RefCall)],
+                        source: None,
+                    },
+                ],
+                false,
+            )
+            .unwrap();
+        assert_eq!(store.count_orphans().unwrap(), 0);
+
+        // `charge` is renamed away; nothing re-derives the caller's edge.
+        store
+            .write_file_graphs_batch(
+                &[FileGraph {
+                    vname_path: "src/billing.ts".into(),
+                    new_hash: "h2".into(),
+                    nodes: vec![Node::new(
+                        VName::new("c", "", "src/billing.ts", "typescript", "fn:bill"),
+                        "function",
+                    )],
+                    edges: vec![],
+                    source: None,
+                }],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.count_orphans().unwrap(),
+            0,
+            "a removed symbol must take its inbound edges with it"
+        );
     }
 }
