@@ -2642,8 +2642,15 @@ fn collect_global(
     mut f: impl FnMut(&SqliteStore, &str, bool) -> String,
 ) -> String {
     // SEC-002: validate repo arg before registry lookup.
+    //
+    // `validate_mcp_repo_key_arg`, not the shared `validate_mcp_arg`: every
+    // registry key is an absolute repo root, which `validate_mcp_arg` rejects
+    // outright, so every tool routed through here answered an empty result for
+    // any real repo named by `repo`. Same reasoning as `resolve_repo_db_path`
+    // and `observability::resolve_single_repo` (#636) - the value is only ever
+    // compared for exact `HashMap` key equality, never opened as a path.
     if let Some(name) = target_repo {
-        if let Err(reason) = validate_mcp_arg(name) {
+        if let Err(reason) = crate::sanitize::validate_mcp_repo_key_arg(name) {
             tracing::warn!("collect_global rejected invalid repo arg: {reason}");
             return String::new();
         }
@@ -7807,9 +7814,11 @@ mod tests {
         );
     }
 
-    /// SEC-002 end-to-end: an absolute-path repo arg must also be rejected.
+    /// An absolute-path repo arg is a well-formed registry key (every key is an
+    /// absolute repo root), so it is no longer rejected outright; naming one
+    /// that is not registered simply misses and returns the empty envelope.
     #[test]
-    fn get_dependencies_global_rejects_absolute_repo_arg() {
+    fn get_dependencies_global_absolute_repo_arg_that_is_not_registered_is_empty() {
         let repos: HashMap<String, PathBuf> = HashMap::new();
         let result = get_dependencies_global(&repos, "src/main.ts", Some("/etc/passwd"));
         assert_eq!(
@@ -8462,6 +8471,43 @@ mod tests {
             result.matches("worker.go:").count(),
             2,
             "one edge → two call sites: {result}"
+        );
+    }
+
+    /// Every structural tool routed through `collect_global` takes a `repo`
+    /// argument whose only legal values are the registry's keys, and every key
+    /// is an absolute repo root. The shared `validate_mcp_arg` rejects those
+    /// outright, so naming a real repo returned an empty envelope from all of
+    /// them.
+    #[test]
+    fn a_global_tool_answers_for_a_repo_named_by_its_absolute_key() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db).unwrap();
+            let callee = Node::new(
+                VName::new("", "", "pay.rs", "rust", "fn:charge"),
+                "function",
+            );
+            let caller = Node::new(
+                VName::new("", "", "cart.rs", "rust", "fn:checkout"),
+                "function",
+            );
+            store.put_node(&callee).unwrap();
+            store.put_node(&caller).unwrap();
+            store
+                .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        // Registry keys are `repo_root.to_string_lossy()`, i.e. absolute paths.
+        let key = dir.path().to_string_lossy().to_string();
+        let repos: HashMap<String, PathBuf> = HashMap::from([(key.clone(), db)]);
+
+        let result = get_callers_global(&repos, "charge", Some(&key));
+        assert!(
+            result.contains("cart.rs"),
+            "a repo named by its absolute registry key must answer: {result}"
         );
     }
 
