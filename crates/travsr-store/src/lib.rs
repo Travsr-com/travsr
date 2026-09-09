@@ -5371,9 +5371,24 @@ LIMIT ?4",
                 // `find_references <field>` returns real occurrences while
                 // `get_callers` (which reads the ref/call *edge* set, not
                 // edge_sites) stays free of field reads.
-                "SELECT DISTINCT n.path AS path, es.line AS line \
+                // The occurrence row itself carries no provenance - only
+                // `edges` does - so LEFT JOIN it back to recover how the edge
+                // behind each site was resolved. LEFT, not inner: a resolved
+                // SCIP occurrence that is not a call (a type reference, #650)
+                // has no edge row at all and must still be returned.
+                // `MAX(...)` over the group keeps the old `DISTINCT (path,
+                // line)` row set exactly while answering "was ANY contributing
+                // edge name-matched", so two edges landing on one line cannot
+                // hide a heuristic one behind a resolved one. Restricted to
+                // 'ref/call' to match `provenance_marker`: tree-sitter is the
+                // ordinary provenance of a structural field reference.
+                "SELECT n.path AS path, es.line AS line, \
+                 MAX(es.kind = 'ref/call' AND e.provenance = 'tree-sitter') AS heuristic \
                  FROM edge_sites es JOIN nodes n ON n.id = es.src \
+                 LEFT JOIN edges e \
+                   ON e.src = es.src AND e.dst = es.dst AND e.kind = es.kind \
                  WHERE es.dst = ?1 AND es.kind IN ('ref/call', 'ref/field') \
+                 GROUP BY n.path, es.line \
                  ORDER BY n.path, es.line",
             )
             .context("preparing reference_sites query")?;
@@ -5381,19 +5396,64 @@ LIMIT ?4",
             .query_map(params![node_id_to_i64(dst)], |row| {
                 let path: String = row.get(0)?;
                 let line: i64 = row.get(1)?;
-                Ok((path, line))
+                // NULL when no contributing row had an edge to read.
+                let heuristic: Option<i64> = row.get(2)?;
+                Ok((path, line, heuristic))
             })
             .context("executing reference_sites query")?;
         let mut out = Vec::new();
         for row in rows {
-            let (path, line) = row.context("decoding reference_sites row")?;
+            let (path, line, heuristic) = row.context("decoding reference_sites row")?;
             out.push(travsr_core::RefSite {
                 path,
                 // Clamp defensively — stored lines are already 1-based u32.
                 line: u32::try_from(line).unwrap_or(0),
+                heuristic: heuristic.unwrap_or(0) != 0,
             });
         }
         tracing::debug!(sites_returned = out.len());
+        Ok(out)
+    }
+
+    /// Recorded `ref/call` occurrence lines of ONE edge (`src` -> `dst`), in
+    /// ascending order, capped at `max`.
+    ///
+    /// `get_callers` expands a `(src, dst, kind)`-deduplicated call edge into
+    /// its individual sites. It used to do that by re-scanning the caller's
+    /// source for the callee's name, which counts anything spelled the same:
+    /// a comment, a string, and the callee's own declaration. This reads the
+    /// occurrence store instead - the same rows `reference_sites` serves - so
+    /// the two tools cannot disagree about where a symbol is called. An empty
+    /// result means no occurrence rows exist for this edge (a language not yet
+    /// feeding `edge_sites`), and the caller falls back to the textual scan.
+    pub fn edge_call_site_lines(
+        &self,
+        src: NodeId,
+        dst: NodeId,
+        max: usize,
+    ) -> anyhow::Result<Vec<u32>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT line FROM edge_sites \
+                 WHERE src = ?1 AND dst = ?2 AND kind = 'ref/call' \
+                 ORDER BY line LIMIT ?3",
+            )
+            .context("preparing edge_call_site_lines query")?;
+        let rows = stmt
+            .query_map(
+                params![
+                    node_id_to_i64(src),
+                    node_id_to_i64(dst),
+                    i64::try_from(max).unwrap_or(i64::MAX)
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .context("executing edge_call_site_lines query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(u32::try_from(row.context("decoding edge_call_site_lines row")?).unwrap_or(0));
+        }
         Ok(out)
     }
 
@@ -11181,15 +11241,18 @@ mod tests {
             vec![
                 travsr_core::RefSite {
                     path: "a.rs".into(),
-                    line: 2
+                    line: 2,
+                    heuristic: false
                 },
                 travsr_core::RefSite {
                     path: "a.rs".into(),
-                    line: 10
+                    line: 10,
+                    heuristic: false
                 },
                 travsr_core::RefSite {
                     path: "b.rs".into(),
-                    line: 3
+                    line: 3,
+                    heuristic: false
                 },
             ]
         );
@@ -11300,7 +11363,8 @@ mod tests {
             sites,
             vec![travsr_core::RefSite {
                 path: "user.rs".into(),
-                line: 14
+                line: 14,
+                heuristic: false
             }]
         );
     }
@@ -11538,7 +11602,8 @@ mod tests {
             sites,
             vec![travsr_core::RefSite {
                 path: "a.rs".into(),
-                line: 5
+                line: 5,
+                heuristic: false
             }]
         );
     }
@@ -11681,7 +11746,8 @@ mod tests {
             sites,
             vec![travsr_core::RefSite {
                 path: "b.rs".into(),
-                line: 9
+                line: 9,
+                heuristic: false
             }]
         );
     }
@@ -11773,7 +11839,8 @@ mod tests {
             store.reference_sites(y.id).unwrap(),
             vec![travsr_core::RefSite {
                 path: "a.rs".into(),
-                line: 5
+                line: 5,
+                heuristic: false
             }],
             "a preserved definition's occurrence is remapped onto its current line"
         );
@@ -11961,7 +12028,8 @@ mod tests {
             store.reference_sites(y).unwrap(),
             vec![travsr_core::RefSite {
                 path: "a.rs".into(),
-                line: 8
+                line: 8,
+                heuristic: false
             }],
             "the preserved definition's occurrence must be remapped to its current line"
         );

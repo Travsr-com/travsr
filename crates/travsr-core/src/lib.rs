@@ -793,6 +793,19 @@ pub struct RefSite {
     pub path: String,
     /// 1-based source line of the occurrence.
     pub line: u32,
+    /// True when at least one `ref/call` edge behind this site carries
+    /// `provenance = 'tree-sitter'`, i.e. it was matched by leaf name rather
+    /// than resolved by a compiler. Such a site can be wholly fabricated: a
+    /// local binding Phase A does not model leaves the only same-named node in
+    /// an unrelated file as the unique winner, and every occurrence enumerated
+    /// under it points at the wrong symbol. Renderers mark these; a `false`
+    /// means either compiler-resolved or (for an occurrence with no edge row of
+    /// its own, e.g. a SCIP type reference) nothing to flag.
+    ///
+    /// `#[serde(default)]` so a payload written before this field existed still
+    /// deserializes, reading as "nothing to flag" exactly as it did then.
+    #[serde(default)]
+    pub heuristic: bool,
 }
 
 /// Human-readable label for a node in `graph` / reference output.

@@ -716,10 +716,11 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
 
     // #399: resolve exact call-site `path:line`s for true call edges. A RefCall
     // edge is deduplicated by `(src,dst,kind)`, so one edge can stand for several
-    // calls from the same caller — we re-scan the caller's source span for the
-    // callee's name to recover each site. Requires `repo_root` (stored in meta by
-    // init); absent (older indexes) or unresolvable → fall back to the caller's
-    // definition line, never worse than before.
+    // calls from the same caller — the recorded `edge_sites` occurrences recover
+    // each site. Only when a language feeds no occurrence rows do we re-scan the
+    // caller's source span for the callee's name, which requires `repo_root`
+    // (stored in meta by init); absent (older indexes) or unresolvable → fall
+    // back to the caller's definition line, never worse than before.
     let repo_root = resolve_repo_root(store);
     let callee_name = simple_name(&seed.vname.signature);
     const MAX_SITES_PER_CALLER: usize = 50;
@@ -733,8 +734,31 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         // un-ratified `live` overlay edge (RFC-027 section 10), and a ref/call
         // edge resolved by leaf-name matching rather than by type.
         let live = provenance_marker(edge);
-        // True call edge: try to expand into exact call-site lines.
+        // True call edge: try to expand into exact call-site lines. Prefer the
+        // recorded occurrences, which `find_references` also reads, over the
+        // textual re-scan: the scan matches the callee's name anywhere in the
+        // caller's span, so a comment, a string, or the callee's own `const f =
+        // (…)` declaration was reported as a call and the two tools disagreed
+        // about the same symbol.
         if tag == "[call]" {
+            let recorded = store
+                .edge_call_site_lines(edge.src, edge.dst, MAX_SITES_PER_CALLER)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("get_callers occurrence lookup error: {e}");
+                    Vec::new()
+                });
+            if !recorded.is_empty() {
+                for line in recorded {
+                    lines.push(format!(
+                        "{tag} {} ({}) \u{2014} {}:{}{live}",
+                        display_label(src_node),
+                        src_node.kind,
+                        src_node.vname.path,
+                        line
+                    ));
+                }
+                continue;
+            }
             if let Some(root) = &repo_root {
                 let sites = call_site_lines(src_node, root, &callee_name, MAX_SITES_PER_CALLER);
                 if !sites.is_empty() {
@@ -797,10 +821,22 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
 fn provenance_marker(edge: &travsr_core::Edge) -> &'static str {
     match edge.provenance.as_deref() {
         Some("live") => " [live: resolved from your uncommitted edit, not yet ratified]",
-        Some("tree-sitter") if edge.kind == travsr_core::EdgeKind::RefCall => {
-            " [heuristic: matched by name, not resolved by type]"
-        }
+        Some("tree-sitter") if edge.kind == travsr_core::EdgeKind::RefCall => HEURISTIC_MARKER,
         _ => "",
+    }
+}
+
+/// The name-matched-edge caveat, shared by `get_callers` (via
+/// [`provenance_marker`]) and `find_references` (via `RefSite::heuristic`), so
+/// the two tools cannot describe the same edge in two different words.
+const HEURISTIC_MARKER: &str = " [heuristic: matched by name, not resolved by type]";
+
+/// The marker for one occurrence site, empty unless it is name-matched.
+fn site_marker(site: &travsr_core::RefSite) -> &'static str {
+    if site.heuristic {
+        HEURISTIC_MARKER
+    } else {
+        ""
     }
 }
 
@@ -1514,7 +1550,16 @@ fn family_reference_sites(store: &SqliteStore, family: &[CoreNode]) -> Vec<travs
         }
     }
     sites.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
-    sites.dedup();
+    // Dedup on `path:line` only: `a` is the later duplicate about to be
+    // dropped, so fold its flag into the survivor rather than letting a
+    // differing `heuristic` split one site into two rows.
+    sites.dedup_by(|a, b| {
+        let same = a.path == b.path && a.line == b.line;
+        if same {
+            b.heuristic |= a.heuristic;
+        }
+        same
+    });
     sites
 }
 
@@ -1549,7 +1594,7 @@ fn references_body_for_family(store: &SqliteStore, family: &[CoreNode]) -> Strin
     let shown = total.min(MAX_REFERENCE_SITES);
     lines.push(format!("{total} reference(s):"));
     for s in sites.into_iter().take(MAX_REFERENCE_SITES) {
-        lines.push(format!("{}:{}", s.path, s.line));
+        lines.push(format!("{}:{}{}", s.path, s.line, site_marker(&s)));
     }
     if total > shown {
         lines.push(format!("[truncated: showing {shown} of {total} sites]"));
@@ -1580,7 +1625,7 @@ fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String 
             lines.push(header);
             lines.push(format!("{total} reference(s):"));
             for s in sites.into_iter().take(MAX_REFERENCE_SITES) {
-                lines.push(format!("{}:{}", s.path, s.line));
+                lines.push(format!("{}:{}{}", s.path, s.line, site_marker(&s)));
             }
             if total > shown {
                 lines.push(format!("[truncated: showing {shown} of {total} sites]"));
@@ -8471,6 +8516,147 @@ mod tests {
             result.matches("worker.go:").count(),
             2,
             "one edge → two call sites: {result}"
+        );
+    }
+
+    /// Recorded occurrences win over the textual re-scan. The scan counts the
+    /// callee's name anywhere in the caller's span, so the callee's own
+    /// declaration and a mention in a comment were reported as calls and
+    /// `get_callers` disagreed with `find_references` about the same symbol.
+    #[test]
+    fn get_callers_prefers_recorded_occurrences_over_the_textual_scan() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        // Three textual hits inside `run`'s span: a comment (3), the local
+        // declaration (4), and the one real call (5).
+        std::fs::write(
+            dir.path().join("app.ts"),
+            "x\nfunction run() {\n  // row is built below\n  const row = () => 1;\n  row();\n}\n",
+        )
+        .unwrap();
+
+        let callee = Node::new(
+            VName::new("", "", "grid.ts", "typescript", "fn:row"),
+            "function",
+        );
+        let caller = Node::new(
+            VName::new("", "", "app.ts", "typescript", "fn:run"),
+            "function",
+        )
+        .with_line(2)
+        .with_end_line(6);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .set_meta("repo_root", dir.path().to_str().unwrap())
+            .unwrap();
+
+        // Without occurrence rows the scan still runs: all three lines report.
+        let scanned = get_callers(&store, "row");
+        assert_eq!(
+            scanned.matches("app.ts:").count(),
+            3,
+            "the textual fallback is unchanged when nothing was recorded: {scanned}"
+        );
+
+        // With the real occurrence recorded, only that site is reported.
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 5, None)])
+            .unwrap();
+        let result = get_callers(&store, "row");
+        assert!(result.contains("app.ts:5"), "the real call site: {result}");
+        assert!(
+            !result.contains("app.ts:4"),
+            "a declaration is not a call site: {result}"
+        );
+        assert!(
+            !result.contains("app.ts:3"),
+            "a comment is not a call site: {result}"
+        );
+        assert_eq!(
+            result.matches("app.ts:").count(),
+            1,
+            "get_callers must report exactly the recorded occurrences: {result}"
+        );
+    }
+
+    /// A site whose only backing edge was matched by leaf name must say so.
+    /// `reference_sites` used to select `path` and `line` alone and never touch
+    /// `edges`, the only table holding provenance, so a wholly fabricated site
+    /// was served as a resolved fact.
+    #[test]
+    fn find_references_marks_a_name_matched_site() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("", "", "grid.ts", "typescript", "fn:row"),
+            "function",
+        );
+        let guessed = Node::new(
+            VName::new("", "", "app.ts", "typescript", "fn:render"),
+            "function",
+        );
+        let resolved = Node::new(
+            VName::new("", "", "page.ts", "typescript", "fn:draw"),
+            "function",
+        );
+        let typed = Node::new(
+            VName::new("", "", "types.ts", "typescript", "fn:shape"),
+            "function",
+        );
+        for n in [&callee, &guessed, &resolved, &typed] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(
+                &Edge::new(guessed.id, callee.id, EdgeKind::RefCall)
+                    .with_provenance("tree-sitter".to_string()),
+            )
+            .unwrap();
+        // `put_edge` hardcodes tree-sitter provenance; the semantic writer is
+        // the one that records a compiler-resolved edge.
+        store
+            .put_edge_lsif(&Edge::new(resolved.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        // `typed` has an occurrence but no edge of its own: a resolved
+        // reference that is not a call (#650). Nothing to flag there either.
+        store
+            .record_edge_sites(&[
+                (guessed.id, callee.id, 7, None),
+                (resolved.id, callee.id, 9, None),
+                (typed.id, callee.id, 3, None),
+            ])
+            .unwrap();
+
+        let structured = find_references_structured(&store, "row", None);
+        assert_eq!(structured.total, Some(3));
+        let flags: Vec<(String, bool)> = structured
+            .references
+            .iter()
+            .map(|r| (format!("{}:{}", r.path, r.line), r.heuristic))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("app.ts:7".to_string(), true),
+                ("page.ts:9".to_string(), false),
+                ("types.ts:3".to_string(), false),
+            ],
+            "only the name-matched site is flagged"
+        );
+
+        let text = find_references(&store, "row", None);
+        assert!(
+            text.contains(&format!("app.ts:7{HEURISTIC_MARKER}")),
+            "the name-matched site carries the caveat: {text}"
+        );
+        assert!(
+            !text.contains(&format!("page.ts:9{HEURISTIC_MARKER}")),
+            "the compiler-resolved site carries no caveat: {text}"
         );
     }
 
