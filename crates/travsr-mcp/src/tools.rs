@@ -2604,6 +2604,38 @@ pub fn find_pattern_global(
     wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT))
 }
 
+/// Resolve one named registry entry to its live graph.db path.
+///
+/// Mirrors `collect_global`'s stale-entry filter for the single-repo case, for
+/// callers that need to open the store themselves.
+///
+/// Validates with `validate_mcp_repo_key_arg`, not the shared `validate_mcp_arg`:
+/// every registry key is an absolute repo root, which `validate_mcp_arg` rejects
+/// outright, so a caller could never name a real repo. Same reasoning and same
+/// exact-key-equality use as `observability::resolve_single_repo` (#636) - see
+/// that validator's doc for why the relaxed guard set is safe here.
+fn resolve_repo_db_path<'a>(
+    repos: &'a HashMap<String, PathBuf>,
+    name: &str,
+) -> Option<&'a PathBuf> {
+    // SEC-002: validate repo arg before registry lookup.
+    if let Err(reason) = crate::sanitize::validate_mcp_repo_key_arg(name) {
+        tracing::warn!("get_context_global rejected invalid repo arg: {reason}");
+        return None;
+    }
+    match repos.get(name) {
+        Some(db_path) if db_path.exists() => Some(db_path),
+        Some(db_path) => {
+            tracing::debug!("skipping stale registry entry: {}", db_path.display());
+            None
+        }
+        None => {
+            tracing::warn!("repo '{name}' not found in registry");
+            None
+        }
+    }
+}
+
 fn collect_global(
     repos: &HashMap<String, PathBuf>,
     target_repo: Option<&str>,
@@ -4358,6 +4390,10 @@ pub(crate) fn get_context_authed(
 
 /// Raw variant — returns body without envelope. Used by global aggregation to
 /// prevent double-sanitization when multiple stores are aggregated before wrapping.
+///
+/// Reads the KNN hook off `store` rather than taking it as an argument: in global
+/// mode the caller opens the store and arms it, so hardcoding `None` here left the
+/// semantic lane off for every registry-wide `get_context`.
 pub(crate) fn get_context_raw(
     store: &SqliteStore,
     query: &str,
@@ -4365,6 +4401,7 @@ pub(crate) fn get_context_raw(
     include_snippets: bool,
     snippet_budget: Option<usize>,
 ) -> String {
+    let knn = store.embed_knn_fn();
     get_context_body(
         store,
         query,
@@ -4372,7 +4409,7 @@ pub(crate) fn get_context_raw(
         &OpenFilter,
         include_snippets,
         snippet_budget,
-        None,
+        knn.as_ref().map(|f| f as EmbedKnnFn),
     )
 }
 
@@ -6535,21 +6572,31 @@ pub fn get_context_global(
     // R4: use a per-repo header block rather than prefixing every line with
     // "[repo_name]". Per-line prefixing pollutes blank lines, footer lines, and
     // notes with repo tags that look like noise in an LLM context window.
-    let raw = if repo.is_some() {
-        collect_global(repos, repo, |store, repo_name, single| {
-            let result = get_context_raw(
-                store,
-                seed_query,
-                token_budget,
-                include_snippets,
-                snippet_budget,
-            );
-            if result.is_empty() || single {
-                result
-            } else {
-                format!("[repo: {repo_name}]\n{result}")
-            }
-        })
+    // Named repo: open the store here rather than through `collect_global`, which
+    // is shared with the 12 structural tools. Only this path arms the embed
+    // sidecar, so `get_callers` and friends never pay for a model load. With a
+    // single candidate the per-repo `[repo: ...]` header never applied, so it is
+    // not reproduced here.
+    let raw = if let Some(name) = repo {
+        match resolve_repo_db_path(repos, name) {
+            Some(db_path) => match SqliteStore::open_read_only(db_path) {
+                Ok(mut store) => {
+                    crate::inject_embed_hook(&mut store, db_path);
+                    get_context_raw(
+                        &store,
+                        seed_query,
+                        token_budget,
+                        include_snippets,
+                        snippet_budget,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!("failed to open {}: {e}", db_path.display());
+                    String::new()
+                }
+            },
+            None => String::new(),
+        }
     } else {
         // Fan-out: rank repos by result size (token-rich responses first).
         let mut candidates: Vec<(&str, &PathBuf)> =
@@ -6560,7 +6607,11 @@ pub fn get_context_global(
         let mut parts: Vec<(usize, String)> = Vec::new();
         for (repo_name, db_path) in &candidates {
             match SqliteStore::open_read_only(db_path) {
-                Ok(store) => {
+                Ok(mut store) => {
+                    // Lookup-only: a fan-out must never arm N sidecars for an
+                    // N-repo registry. A repo an earlier named query warmed keeps
+                    // its semantic lane; an unwarmed one stays lexical.
+                    crate::inject_cached_embed_hook(&mut store, db_path);
                     let result = get_context_raw(
                         &store,
                         seed_query,
