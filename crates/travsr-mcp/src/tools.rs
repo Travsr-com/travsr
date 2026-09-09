@@ -677,26 +677,54 @@ fn crash_caveat(lang: &str) -> String {
 fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
     use travsr_core::EdgeKind;
 
-    let nodes = match store.search_nodes_by_name(symbol) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!("get_callers search error: {e}");
-            return String::new();
+    // Resolve the name through the same ladder `find_references` and `travsr
+    // graph` use, so two distinct definitions that share a name are never
+    // collapsed to whichever one the FTS ranking happened to put first. That
+    // silent pick reported one definition's callers under the other's name, and
+    // a reader concluded the unreported definition had none.
+    //
+    // Only an *exact* resolution (full signature, exact simple name, selector
+    // head, dotted member) reaches this guard, so the partial matching the tool
+    // schema documents is untouched: a partial query resolves to `None` here and
+    // falls through to the same name search as before.
+    let seeds: Vec<CoreNode> = match resolve_reference_targets(store, symbol, None) {
+        RefTarget::Unique(n) => vec![n],
+        // A selector family is one Objective-C method spelled at several
+        // arities, not rival definitions, and no `path` could choose between
+        // them. Union their callers, as `find_references` unions their sites.
+        RefTarget::Family(nodes) => nodes,
+        RefTarget::Ambiguous(nodes) => {
+            return ambiguous_definitions_message(
+                symbol,
+                &nodes,
+                "get_callers takes no `path` hint: use find_references with a `path` \
+                 (or `travsr graph --path`) to pick one of:",
+            )
         }
+        RefTarget::None => match store.search_nodes_by_name(symbol) {
+            Ok(n) => n.into_iter().take(1).collect(),
+            Err(e) => {
+                tracing::warn!("get_callers search error: {e}");
+                return String::new();
+            }
+        },
     };
 
-    let seed = match nodes.first() {
+    let seed = match seeds.first() {
         Some(n) => n,
         None => return String::new(),
     };
 
-    let edges = match store.iter_edges_to(seed.id) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!("get_callers edge query error: {e}");
-            return String::new();
+    let mut edges = Vec::new();
+    for node in &seeds {
+        match store.iter_edges_to(node.id) {
+            Ok(e) => edges.extend(e),
+            Err(e) => {
+                tracing::warn!("get_callers edge query error: {e}");
+                return String::new();
+            }
         }
-    };
+    }
 
     let relevant: Vec<_> = edges
         .iter()
@@ -1240,6 +1268,31 @@ fn is_selector_family(candidates: &[CoreNode], head: &str) -> bool {
     })
 }
 
+/// The refusal every surface returns for [`RefTarget::Ambiguous`]: the count, an
+/// `advice` sentence naming the escape hatch that surface actually offers, then
+/// one line per rival definition.
+///
+/// Shared so `find_references` and `get_callers` cannot drift into describing
+/// the same ambiguity differently, which is how `get_callers` came to describe
+/// it not at all.
+fn ambiguous_definitions_message(symbol: &str, nodes: &[CoreNode], advice: &str) -> String {
+    let mut out = format!(
+        "'{symbol}' is ambiguous, {} definitions. {advice}\n",
+        nodes.len()
+    );
+    for n in nodes.iter().take(MAX_REFERENCE_SITES) {
+        let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+        out.push_str(&format!(
+            "  {} ({}) \u{2014} {}{}\n",
+            display_label(n),
+            n.kind,
+            n.vname.path,
+            loc
+        ));
+    }
+    out.trim_end().to_string()
+}
+
 /// #647: message for a `path` hint that matched no definition of a symbol that
 /// does resolve elsewhere. Shows where the symbol actually lives so the answer
 /// is never mistaken for a real "0 references".
@@ -1515,21 +1568,11 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
             return String::new();
         }
         RefTarget::Ambiguous(nodes) => {
-            let mut out = format!(
-                "'{symbol}' is ambiguous, {} definitions. Re-run with a `path` hint to pick one:\n",
-                nodes.len()
-            );
-            for n in nodes.iter().take(MAX_REFERENCE_SITES) {
-                let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
-                out.push_str(&format!(
-                    "  {} ({}) \u{2014} {}{}\n",
-                    display_label(n),
-                    n.kind,
-                    n.vname.path,
-                    loc
-                ));
-            }
-            return out.trim_end().to_string();
+            return ambiguous_definitions_message(
+                symbol,
+                &nodes,
+                "Re-run with a `path` hint to pick one:",
+            )
         }
     };
 
@@ -7936,6 +7979,178 @@ mod tests {
         assert!(
             crashed.contains("semantic analysis for 'rust' crashed on its last run"),
             "a crashed language must carry the incompleteness caveat: {crashed}"
+        );
+    }
+
+    /// get_callers used to seed on `search_nodes_by_name(..).first()`, so two
+    /// distinct definitions sharing a name collapsed to whichever one the FTS
+    /// ranked first: it returned that one's callers, said nothing about the
+    /// other, and a reader concluded the unreported definition had no callers.
+    /// `find_references` and `travsr graph` already refuse here; get_callers now
+    /// refuses with them.
+    #[test]
+    fn get_callers_refuses_two_distinct_definitions_of_one_name() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let unifier = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-indexer/src/scip_unifier.rs",
+                "rust",
+                "fn:candidate_signatures",
+            ),
+            "function",
+        );
+        let live = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-daemon/src/live_resolve.rs",
+                "rust",
+                "fn:candidate_signatures",
+            ),
+            "function",
+        );
+        let unifier_caller = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-daemon/src/scip_unifier.rs",
+                "rust",
+                "fn:unify_one",
+            ),
+            "function",
+        );
+        let live_caller = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-daemon/src/live_resolve.rs",
+                "rust",
+                "fn:resolve_live",
+            ),
+            "function",
+        );
+        for n in [&unifier, &live, &unifier_caller, &live_caller] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(unifier_caller.id, unifier.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(live_caller.id, live.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let out = get_callers_raw(&store, "candidate_signatures");
+        assert!(
+            out.contains("'candidate_signatures' is ambiguous, 2 definitions"),
+            "two definitions of one name must be refused, not silently picked: {out}"
+        );
+        assert!(
+            out.contains("crates/travsr-indexer/src/scip_unifier.rs")
+                && out.contains("crates/travsr-daemon/src/live_resolve.rs"),
+            "the refusal must name both definitions: {out}"
+        );
+        assert!(
+            !out.contains("fn:unify_one") && !out.contains("fn:resolve_live"),
+            "no single definition's callers may be presented as the answer: {out}"
+        );
+
+        // A `path`-shaped escape hatch exists on find_references, and the refusal
+        // points at it, so the answer is still reachable in one more call.
+        let pinned = find_references_raw(&store, "candidate_signatures", Some("scip_unifier.rs"));
+        assert!(
+            !pinned.contains("is ambiguous"),
+            "the path hint the refusal advertises must disambiguate: {pinned}"
+        );
+    }
+
+    /// The guard keys on two *exact definitions*, not on "more than one node
+    /// matched", so the partial matching the get_callers schema documents
+    /// ("partial match supported") still resolves and answers.
+    #[test]
+    fn get_callers_keeps_documented_partial_matching() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("c", "", "svc.rs", "rust", "fn:charge_customer"),
+            "function",
+        );
+        let caller = Node::new(
+            VName::new("c", "", "main.rs", "rust", "fn:process"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let out = get_callers_raw(&store, "charge");
+        assert!(
+            !out.contains("is ambiguous"),
+            "a partial query is not an ambiguous definition: {out}"
+        );
+        assert!(
+            out.contains("fn:process"),
+            "partial match must still answer: {out}"
+        );
+    }
+
+    /// An Objective-C selector family is one method at several arities, not rival
+    /// definitions (see `RefTarget::Family`). get_callers must union their callers,
+    /// the way find_references unions their sites, never refuse.
+    #[test]
+    fn get_callers_unions_a_selector_family_rather_than_refusing() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let short = Node::new(
+            VName::new(
+                "c",
+                "",
+                "AFSecurityPolicy.m",
+                "objc",
+                "method:AFSecurityPolicy.policyWithPinningMode:",
+            ),
+            "method",
+        );
+        let long = Node::new(
+            VName::new(
+                "c",
+                "",
+                "AFSecurityPolicy.m",
+                "objc",
+                "method:AFSecurityPolicy.policyWithPinningMode:withPinnedCertificates:",
+            ),
+            "method",
+        );
+        let short_caller = Node::new(
+            VName::new("c", "", "Session.m", "objc", "method:Session.configure"),
+            "method",
+        );
+        let long_caller = Node::new(
+            VName::new("c", "", "Pinning.m", "objc", "method:Pinning.install"),
+            "method",
+        );
+        for n in [&short, &long, &short_caller, &long_caller] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(short_caller.id, short.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(long_caller.id, long.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let out = get_callers_raw(&store, "policyWithPinningMode");
+        assert!(
+            !out.contains("is ambiguous"),
+            "a selector family is one method, not rival definitions: {out}"
+        );
+        assert!(
+            out.contains("Session.configure") && out.contains("Pinning.install"),
+            "every arity's callers must be present: {out}"
         );
     }
 
