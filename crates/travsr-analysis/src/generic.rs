@@ -386,18 +386,38 @@ fn is_import_prefix(sig_prefix: &str) -> bool {
 /// `decl_kinds` (a full definition with body), that node's end row is the span
 /// end. Otherwise falls back to the one-hop `name.parent()` end row, which is
 /// correct for grammars where the name is a direct child of its declaration.
+/// Either way the row is clamped by [`clamp_to_next_sibling`].
 fn decl_end_line(node: tree_sitter::Node<'_>, decl_kinds: &[&str]) -> Option<u32> {
+    let line = node.start_position().row as u32 + 1;
     if !decl_kinds.is_empty() {
         let mut cur = node.parent();
         for _ in 0..6 {
             let Some(n) = cur else { break };
             if decl_kinds.contains(&n.kind()) {
-                return Some(n.end_position().row as u32 + 1);
+                return Some(clamp_to_next_sibling(n, line));
             }
             cur = n.parent();
         }
     }
-    node.parent().map(|p| p.end_position().row as u32 + 1)
+    node.parent().map(|p| clamp_to_next_sibling(p, line))
+}
+
+/// End row of `decl` as a 1-based line, clamped so a definition's span cannot
+/// run into the sibling that follows it.
+///
+/// tree-sitter-scala ends an expression-bodied `function_definition` at the
+/// start position of the *next* declaration (column 0 of its line, or its
+/// indent column), so the raw end row is that sibling's own line. The two
+/// spans then overlap on the boundary line and a reference occurrence there
+/// sits inside two equally wide spans, leaving caller attribution to break the
+/// tie by NodeId. Never clamps below `line`, the definition's start line.
+fn clamp_to_next_sibling(decl: tree_sitter::Node<'_>, line: u32) -> u32 {
+    let end = decl.end_position().row as u32 + 1;
+    // `next.start_position().row` is 0-based, so it is exactly the 1-based
+    // line *before* the sibling begins.
+    decl.next_sibling().map_or(end, |next| {
+        end.min(next.start_position().row as u32).max(line)
+    })
 }
 
 /// Walk up from a definition capture to the nearest enclosing type container.

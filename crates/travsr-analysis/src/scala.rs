@@ -68,6 +68,27 @@ mod tests {
     }
 
     #[test]
+    fn expression_bodied_def_span_stops_before_the_next_def() {
+        // tree-sitter-scala keeps an expression-bodied `function_definition`
+        // open across the newline and the next line's indent, so the raw end
+        // row lands on the following declaration. Two adjacent defs then own
+        // the boundary line and caller attribution has to break the tie by
+        // NodeId (#527 fallout). Spans must not overlap.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.scala");
+        std::fs::write(&path, "trait T {\n  def a =\n    1\n  def b =\n    2\n}\n").unwrap();
+        let out = parse("corp", &path, "t.scala").unwrap();
+        let mut spans: Vec<(u32, u32)> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "method")
+            .map(|n| (n.line.unwrap_or(0), n.end_line.unwrap_or(0)))
+            .collect();
+        spans.sort_unstable();
+        assert_eq!(spans, vec![(2, 3), (4, 5)]);
+    }
+
+    #[test]
     fn parse_class_trait_object() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sample.scala");
