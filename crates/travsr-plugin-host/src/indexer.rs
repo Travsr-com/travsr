@@ -59,6 +59,11 @@ fn classify_empty_output(lang: &str, nodes_empty: bool, no_occurrences: bool) ->
 }
 
 /// Per-language Phase B outcome reported by [`PluginIndexer::invoke_phase_b_all`].
+///
+/// Every field here that is a user-facing warning has a matching variant in
+/// [`PhaseBWarningClass`](crate::phase_b::PhaseBWarningClass), which is what the
+/// consumers iterate. Nothing enforces that pairing, so a field added here needs
+/// its variant added there by hand (#760).
 #[derive(Debug, Default, Clone)]
 
 pub struct PhaseBOutcome {
