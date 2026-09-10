@@ -1280,6 +1280,22 @@ pub fn init_repo_with_progress(
 
     let nodes_before = store.node_count().context("counting nodes before init")? as i64;
 
+    // RFC-002: an index stamped with an older signature format cannot be
+    // repaired incrementally. The hash delta below only re-parses files whose
+    // bytes changed, so untouched files would keep their old-format signatures
+    // inside a database the stamp now calls current, and nothing downstream
+    // could tell the two halves apart. Read the stored version BEFORE the stamp
+    // overwrites it and drive the same full-rebuild path `--force` uses.
+    // A read failure counts as skew: rebuilding is the recoverable direction.
+    let stored_sig_version = store.get_signature_format_version().unwrap_or(0);
+    let format_skew = nodes_before > 0 && stored_sig_version != SIGNATURE_FORMAT_VERSION;
+    if format_skew {
+        eprintln!(
+            "index format changed (v{stored_sig_version} -> v{SIGNATURE_FORMAT_VERSION}), \
+             rebuilding from scratch"
+        );
+    }
+
     // Stamp the format version BEFORE indexing so that the reindex_files calls
     // below see version == SIGNATURE_FORMAT_VERSION and don't skip files.
     store
@@ -1319,14 +1335,17 @@ pub fn init_repo_with_progress(
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
     // UX-004: `--force` bypasses the incremental up-to-date short-circuit by
-    // purging the existing graph so every file is re-parsed below (node_count then
-    // reads 0, which also re-activates the fast staging path). Config that changes
+    // purging the existing graph so every file is re-parsed below. Config that changes
     // *semantic* output but not file content — e.g. `--allow-unsandboxed-lsif` —
     // is not part of the per-file hash delta, so without this a re-run would say
     // "up to date" while never rebuilding those edges. Uses a 100%-ceiling policy
     // because wiping the whole graph is the explicit, user-requested intent here.
-    if force && store.node_count().unwrap_or(0) > 0 {
-        tracing::info!("--force: purging graph for a full rebuild");
+    //
+    // `format_skew` takes the same path for the same reason: every NodeId in the
+    // stored graph was hashed under a different signature format, so re-parsing
+    // only the changed files would leave the two formats mixed.
+    if (force || format_skew) && store.node_count().unwrap_or(0) > 0 {
+        tracing::info!(force, format_skew, "purging graph for a full rebuild");
         let empty_walked = std::collections::HashSet::<String>::new();
         let purge_policy = travsr_core::SafetyPolicy {
             mass_delete_ceiling_pct: 1.0,
@@ -1335,22 +1354,19 @@ pub fn init_repo_with_progress(
         store
             .reconcile(&empty_walked, &purge_policy, repo_root, &corpus)
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("--force full-graph purge")?;
+            .context("full-graph purge before rebuild")?;
         // #757 audit: `reconcile` only prunes nodes for files absent from disk,
         // so on-disk files keep their nodes AND their `files` content-hash rows.
         // The hash-delta below would then skip every unchanged file, leaving the
-        // whole point of `--force` (re-parse with the current analyzer, even
+        // whole point of the rebuild (re-parse with the current analyzer, even
         // when file bytes are unchanged) unmet — it reported "up to date" over an
         // index an older binary built. Clearing the hash cache makes every file
-        // look new, so `--force` genuinely re-parses the repo.
+        // look new, so the rebuild genuinely re-parses the repo.
         let cleared = store
             .clear_file_hashes()
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("--force clearing file hash cache")?;
-        tracing::info!(
-            cleared,
-            "--force: cleared file hash cache for full re-parse"
-        );
+            .context("clearing file hash cache before rebuild")?;
+        tracing::info!(cleared, "cleared file hash cache for full re-parse");
     }
 
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
@@ -8216,6 +8232,46 @@ mod tests {
             store.get_signature_format_version().unwrap(),
             0,
             "version must not be updated by reindex on mismatch"
+        );
+    }
+
+    #[test]
+    fn init_repo_rebuilds_on_signature_format_skew() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        std::fs::write(tmp.path().join("b.ts"), "export class B { go() {} }").unwrap();
+
+        let first = init_repo(tmp.path()).unwrap();
+        assert_eq!(first.files_indexed, 2);
+
+        // Control: with the stamp current, a re-init takes the incremental path
+        // and re-parses nothing.
+        let unchanged = init_repo(tmp.path()).unwrap();
+        assert_eq!(
+            unchanged.files_indexed, 0,
+            "an unchanged re-init must skip every file"
+        );
+
+        // Simulate a graph built by a binary with an older signature format.
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store
+                .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION - 1)
+                .unwrap();
+        }
+
+        let rebuilt = init_repo(tmp.path()).unwrap();
+        assert_eq!(
+            rebuilt.files_indexed, 2,
+            "format skew must re-parse every file, not stamp the current version \
+             over half-migrated signatures"
+        );
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            travsr_core::SIGNATURE_FORMAT_VERSION
         );
     }
 

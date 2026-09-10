@@ -10,6 +10,49 @@ use travsr_plugin_protocol::{
     ParseResponse, Plugin, PluginRequest, PluginResponse, PROTOCOL_VERSION,
 };
 
+/// Caps on the `InvokeResponse::diagnostics` the host will echo.
+///
+/// A sidecar is an untrusted peer (RFC-011 section 3), and nothing on the wire
+/// bounds this list or its fields except the 1 GiB frame cap: ~5M records of 200
+/// bytes is a legal response. The host logs every record it accepts, and the
+/// daemon never deletes the log file it is currently writing, so an unbounded
+/// echo is both disk exhaustion and evidence destruction (genuine lines pushed
+/// out of the log read window). The stderr channel these replaced is bounded at
+/// 64 lines; these are bounded here.
+const MAX_DIAGNOSTICS: usize = 32;
+const MAX_DIAGNOSTIC_CODE_BYTES: usize = 256;
+const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 1024;
+
+/// Whether `code` has the dotted-identifier shape its wire contract documents
+/// (`java.tests-not-compiled`). Nothing on the wire enforces it, and the host
+/// emits `code` as a tracing FIELD, where an arbitrary value could impersonate a
+/// log key for anything that later selects on it.
+fn is_diagnostic_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= MAX_DIAGNOSTIC_CODE_BYTES
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// Strip control characters and cut to `limit` bytes on a char boundary.
+///
+/// `tracing-subscriber`'s fmt layer escapes ANSI today, but travsr neither pins
+/// nor tests that, and it does not escape `\n` / `\r` at all: a message with
+/// newlines forges apparent log lines on the plain stderr layer. Owning the
+/// property here makes it one sanitising step rather than a borrowed one.
+fn sanitize_diagnostic(s: &str, limit: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(limit));
+    for ch in s.chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if out.len() + ch.len_utf8() > limit {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginHealth {
     Ok,
@@ -498,24 +541,44 @@ impl Transport for Sidecar {
                 // that returns some nodes and still knows it is degraded (java
                 // skipping test compilation, a stale emitter binary) had no way
                 // to be heard, because the only channel opened on total failure.
-                // Echoing these unconditionally is safe where echoing stderr was
-                // not: the sidecar opts in per record, so there is no routine
-                // chatter to flood.
-                for d in &resp.diagnostics {
+                //
+                // "The sidecar opts in per record" is not a bound. The sidecar is
+                // untrusted, so the record count and both field lengths are its
+                // choice up to the frame cap; the host caps all three itself
+                // before anything reaches the log.
+                let total = resp.diagnostics.len();
+                for d in resp.diagnostics.iter().take(MAX_DIAGNOSTICS) {
+                    // A malformed `code` costs the record its code, not its
+                    // message: the prose is the part a developer reads, and
+                    // dropping the record would lose a real diagnostic over a
+                    // field that is only an index key.
+                    let code = if is_diagnostic_code(&d.code) {
+                        d.code.as_str()
+                    } else {
+                        "plugin.invalid-code"
+                    };
+                    let message = sanitize_diagnostic(&d.message, MAX_DIAGNOSTIC_MESSAGE_BYTES);
                     match d.severity {
                         DiagnosticSeverity::Warning => tracing::warn!(
                             lang = %self.language,
-                            code = %d.code,
+                            code = %code,
                             "Phase B: {}",
-                            d.message
+                            message
                         ),
                         DiagnosticSeverity::Info => tracing::info!(
                             lang = %self.language,
-                            code = %d.code,
+                            code = %code,
                             "Phase B: {}",
-                            d.message
+                            message
                         ),
                     }
+                }
+                if total > MAX_DIAGNOSTICS {
+                    tracing::warn!(
+                        lang = %self.language,
+                        dropped = total - MAX_DIAGNOSTICS,
+                        "Phase B: sidecar sent {total} diagnostics; logged the first {MAX_DIAGNOSTICS}"
+                    );
                 }
                 Ok(resp)
             }
@@ -587,5 +650,32 @@ mod tests {
     fn sidecar_stub_is_disabled() {
         let s = Sidecar::stub("kotlin");
         assert!(matches!(s.health(), PluginHealth::Disabled(_)));
+    }
+
+    // A hostile sidecar's diagnostic fields are attacker-chosen: the host must
+    // cut them on a char boundary rather than panicking mid-codepoint.
+    #[test]
+    fn sanitize_diagnostic_cuts_on_a_char_boundary() {
+        let cut = sanitize_diagnostic("\u{e9}\u{e9}\u{e9}", 3);
+        assert_eq!(cut, "\u{e9}");
+    }
+
+    // Newlines are what forge a log line; EscapeGuard does not touch them.
+    #[test]
+    fn sanitize_diagnostic_strips_control_characters() {
+        let cut = sanitize_diagnostic("a\nb\r\u{1b}[31mc", MAX_DIAGNOSTIC_MESSAGE_BYTES);
+        assert_eq!(cut, "a b  [31mc");
+    }
+
+    #[test]
+    fn diagnostic_code_shape_is_enforced() {
+        assert!(is_diagnostic_code("java.tests-not-compiled"));
+        assert!(is_diagnostic_code("emitter.version_mismatch"));
+        assert!(!is_diagnostic_code(""));
+        assert!(!is_diagnostic_code("has space"));
+        assert!(!is_diagnostic_code("forged\nevent=shutdown"));
+        assert!(!is_diagnostic_code(
+            &"a".repeat(MAX_DIAGNOSTIC_CODE_BYTES + 1)
+        ));
     }
 }

@@ -315,10 +315,19 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
                 // never meet: every C# constructor def stayed an orphan SCIP node
                 // and took its whole ref/call fan-in with it, so `graph <Type>
                 // --direction callers` reached none of the `new Type(...)` sites.
+                //
+                // Container-qualified forms only. A bare `fn:{c}` would also be
+                // fed to rung 2, whose corpus-wide uniqueness gate has no
+                // container qualification and no position check, so an
+                // unrelated top-level `fn:Foo` anywhere in the repo could be its
+                // single match and absorb every `new Foo(...)` edge. It buys
+                // nothing anyway: C# routes through `generic.rs`, which writes
+                // `class:`/`struct:`/`interface:`/`enum:` for the type and
+                // qualifies a `constructor_declaration` by its enclosing type
+                // container, so Phase A never emits `fn:Foo` for a C# type.
                 if name == ".ctor" {
                     sigs.push(format!("method:{c}.{c}"));
                     sigs.push(format!("fn:{c}.{c}"));
-                    sigs.push(format!("fn:{c}"));
                 }
                 sigs.push(format!("method:{c}.{name}"));
                 sigs.push(format!("fn:{c}.{name}"));

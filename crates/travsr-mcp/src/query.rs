@@ -115,6 +115,14 @@ pub struct TreeStep {
     /// payloads from daemons predating this field deserializable.
     #[serde(default)]
     pub incoming: bool,
+    /// `true` for a `ref/call` edge whose provenance is `tree-sitter`: one
+    /// `resolve_unresolved_calls` matched by bare callee name, not one a
+    /// compiler resolved by type. Mirrors the condition `provenance_marker` in
+    /// `tools.rs` uses for its `[heuristic: ...]` suffix, so the tree view and
+    /// `find_references` cannot describe the same edge differently.
+    /// `serde(default)` keeps older daemon payloads deserializable.
+    #[serde(default)]
+    pub heuristic: bool,
 }
 
 /// Coverage / completeness metadata (#318 O5) — distinguishes "no callers"
@@ -974,6 +982,8 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             } else {
                 (current_id, next_id)
             };
+            let heuristic =
+                edge_kind == travsr_core::EdgeKind::RefCall && edge_provenance == "tree-sitter";
             edges_raw.push((src, dst, edge_kind.as_str().to_string(), edge_provenance));
 
             if !visited.contains(&next_id) {
@@ -989,6 +999,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                     edge_kind: edge_kind.as_str().to_string(),
                     child: next_id.0,
                     incoming: edge_incoming,
+                    heuristic,
                 });
                 queue.push_back((next_id, depth + 1, child_expand));
             }

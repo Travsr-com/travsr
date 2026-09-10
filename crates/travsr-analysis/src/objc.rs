@@ -80,11 +80,26 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 ///
 /// Parameter *names* (`pinningMode`) are nested inside `method_parameter`, never
 /// direct children, so the direct `identifier` children are keyword parts only.
-/// The one exception is a trailing macro: `- (instancetype)init
-/// NS_DESIGNATED_INITIALIZER;` puts `NS_DESIGNATED_INITIALIZER` in the same
-/// position as a second keyword. A keyword part therefore counts only when a
-/// `method_parameter` immediately precedes it, which ends the walk at the macro
-/// and yields `init`.
+/// The one exception is a trailing argument-less macro: both
+/// `- (instancetype)init NS_DESIGNATED_INITIALIZER;` and
+/// `- (id)initWithFrame:(CGRect)f NS_DESIGNATED_INITIALIZER;` put the macro in
+/// the same position a further keyword would take, so nothing *before* it tells
+/// the two apart. What comes *after* does: a real keyword is always followed by
+/// its `method_parameter`, a trailing macro never is. A keyword is therefore
+/// held pending and committed only once the next sibling proves it, and a macro
+/// left pending when the walk ends is dropped. (A macro that carries an
+/// argument list, `NS_SWIFT_NAME(...)` or `__attribute__((...))`, parses as its
+/// own node kind nested inside the preceding `method_parameter` and never
+/// reaches this walk at all.)
+///
+/// `comment` is a tree-sitter extra and appears as an ordinary sibling between
+/// selector parts, so a wrapped Cocoa signature with a trailing `//` comment
+/// must step over it rather than end there. A preprocessor conditional inside a
+/// selector is not a `preproc_*` sibling: tree-sitter-objc recovers it as an
+/// `ERROR` sibling, which is stepped over the same way rather than ending the
+/// selector at the `#if`. Recovery there is approximate, since a keyword the
+/// `ERROR` node happens to swallow is lost, but the result keeps the selector's
+/// arity instead of truncating it onto a genuinely shorter method's key.
 ///
 /// Each `method_parameter` contributes one `:`, including a nameless one
 /// (`- (void)anon:(int)a :(int)b` → `anon::`), matching the real selector.
@@ -107,24 +122,25 @@ fn full_selector(cap: tree_sitter::Node, sig_prefix: &str, source: &[u8]) -> Opt
         return None;
     }
 
-    // Walk the siblings after the captured keyword. `after_parameter` tracks
-    // whether the previous sibling was a `method_parameter`, which is what
-    // licenses the next identifier to be read as a keyword part rather than as
-    // a trailing attribute macro.
-    let mut after_parameter = false;
+    // Walk the siblings after the captured keyword. `pending` holds an
+    // identifier that is a keyword part only if a `method_parameter` follows
+    // it; if the walk ends first it was a trailing macro and is dropped.
+    let mut pending: Option<&str> = None;
     let mut sibling = cap.next_sibling();
     while let Some(node) = sibling {
         match node.kind() {
+            // Sits between selector parts without being one: step over it and
+            // leave `pending` alone.
+            "comment" | "ERROR" => {}
             "method_parameter" => {
+                if let Some(keyword) = pending.take() {
+                    selector.push_str(keyword);
+                }
                 selector.push(':');
-                after_parameter = true;
             }
-            "identifier" if after_parameter => {
-                selector.push_str(node.utf8_text(source).ok()?.trim());
-                after_parameter = false;
-            }
-            // The body, the terminating `;`, an availability macro, `, ...` on a
-            // variadic method: the selector is complete.
+            "identifier" => pending = Some(node.utf8_text(source).ok()?.trim()),
+            // The body, the terminating `;`, `, ...` on a variadic method: the
+            // selector is complete.
             _ => break,
         }
         sibling = node.next_sibling();
@@ -258,9 +274,9 @@ mod selector_tests {
     #[test]
     fn a_trailing_macro_is_not_read_as_a_selector_keyword() {
         // `NS_DESIGNATED_INITIALIZER` sits in the same direct-child position a
-        // second selector keyword would, but no `method_parameter` precedes it,
-        // so the walk stops before it. An availability macro parses as its own
-        // node kind and stops the walk the same way.
+        // second selector keyword would, but no `method_parameter` follows it,
+        // so it is never committed. An availability macro parses as its own
+        // node kind and is not a keyword either.
         let sigs = signatures(
             "@interface Foo\n\
              - (instancetype)init NS_DESIGNATED_INITIALIZER;\n\
@@ -269,6 +285,58 @@ mod selector_tests {
         );
         assert!(sigs.contains(&"method:Foo.init".to_string()));
         assert!(sigs.contains(&"method:Foo.new".to_string()));
+    }
+
+    #[test]
+    fn a_trailing_macro_after_a_parameter_is_still_not_a_keyword() {
+        // The arity-0 guard above held under a lookbehind rule too; these do
+        // not. Once the selector has one parameter, a lookbehind sees the macro
+        // as licensed and appends it, producing
+        // `initWithFrame:NS_DESIGNATED_INITIALIZER`, which no Phase B selector
+        // can ever match.
+        let sigs = signatures(
+            "@interface Foo\n\
+             - (instancetype)initWithFrame:(CGRect)f NS_DESIGNATED_INITIALIZER;\n\
+             - (id)responseObjectForResponse:(id)r data:(id)d NS_SWIFT_NOTHROW;\n\
+             @end\n",
+        );
+        assert!(
+            sigs.contains(&"method:Foo.initWithFrame:".to_string()),
+            "got {sigs:?}"
+        );
+        assert!(
+            sigs.contains(&"method:Foo.responseObjectForResponse:data:".to_string()),
+            "got {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn a_comment_between_keywords_does_not_truncate_the_selector() {
+        // `comment` is a tree-sitter extra, so it lands as a real sibling in the
+        // middle of the selector. Ending the walk there gave
+        // `requestWithMethod:`, i.e. the collision this hook exists to prevent.
+        let sigs = signatures(
+            "@implementation Client\n\
+             - (id)requestWithMethod:(NSString *)method   // HTTP verb\n\
+                           URLString:(NSString *)url\n\
+                          parameters:(id)params { return nil; }\n\
+             @end\n",
+        );
+        assert!(
+            sigs.contains(&"method:Client.requestWithMethod:URLString:parameters:".to_string()),
+            "got {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn a_comment_before_the_first_colon_keeps_the_selector_a_selector() {
+        // Worse than truncation: ending at the comment produced `method:Pre.pre`,
+        // a colon-less leaf indistinguishable from a genuine no-argument method.
+        let sigs = signatures("@interface Pre\n- (void)pre /* c */ :(int)a and:(int)b;\n@end\n");
+        assert!(
+            sigs.contains(&"method:Pre.pre:and:".to_string()),
+            "got {sigs:?}"
+        );
     }
 
     #[test]

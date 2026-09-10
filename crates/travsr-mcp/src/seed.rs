@@ -151,7 +151,10 @@ fn inflectional_stem(token: &str) -> Option<String> {
         return None;
     }
     let lower = t.to_ascii_lowercase();
-    let stem = if let Some(base) = lower.strip_suffix("ies").or(lower.strip_suffix("ied")) {
+    let stem = if let Some(base) = lower
+        .strip_suffix("ies")
+        .or_else(|| lower.strip_suffix("ied"))
+    {
         format!("{base}y")
     } else if let Some(base) = lower.strip_suffix("ing") {
         base.to_string()
@@ -174,6 +177,31 @@ fn inflectional_stem(token: &str) -> Option<String> {
         return None;
     }
     Some(stem)
+}
+
+/// The second exact attempt for a token the `-es` arm claimed: `stem` + `e`.
+///
+/// The sibilant test in [`inflectional_stem`] is applied to the base AFTER
+/// `-es` is stripped, so a word whose real stem ends in `e` preceded by a
+/// sibilant takes that arm and the correct `-s` arm below it is unreachable
+/// (the arms are an `else if` chain, and the MIN_STEM check at the end returns
+/// `None` rather than falling through). `responses` yielded `respons`, and the
+/// query abstained against `ok_response` and `error_response`, which the
+/// singular `response` finds. Same class: `caches` -> `cach`, `phases` ->
+/// `phas`, `databases` -> `databas`, `parses` -> `pars`, `releases` ->
+/// `releas`.
+///
+/// `None` unless the `-es` arm is what produced `stem`, so nothing else changes.
+/// Used only when `stem` itself resolved to nothing, and fed through the same
+/// whole-segment boundary predicate: still one more EXACT attempt, not fuzzy
+/// matching.
+fn inflectional_stem_restoring_e(token: &str, stem: &str) -> Option<String> {
+    let lower = token.to_ascii_lowercase();
+    let base = lower.strip_suffix("es")?;
+    if base != stem {
+        return None;
+    }
+    Some(format!("{stem}e"))
 }
 
 /// RRF k constant — controls how sharply the top ranks dominate.
@@ -2263,6 +2291,14 @@ pub(crate) fn build_seed_set(
                     // exists in the index, exactly as the #709 correction does.
                     return (stem, stem_nodes, true);
                 }
+                // The `-es` arm shadows the `-s` arm, so a stem it produced that
+                // resolves to nothing gets the `e` restored before we give up.
+                if let Some(alt) = inflectional_stem_restoring_e(token, &stem) {
+                    let alt_nodes = store.search_nodes_by_name(&alt).unwrap_or_default();
+                    if alt_nodes.iter().any(|n| boundary(&alt, n)) {
+                        return (alt, alt_nodes, true);
+                    }
+                }
             }
             (token.clone(), nodes, false)
         })
@@ -3955,6 +3991,30 @@ mod tests {
         // Non-alphabetic tokens are identifiers, not English words.
         assert_eq!(inflectional_stem("get_callers"), None);
         assert_eq!(inflectional_stem("node_ids"), None);
+    }
+
+    /// The `-es` arm shadows the `-s` arm for any word whose real stem ends in
+    /// `e` after a sibilant, and the chain cannot fall through to it.
+    #[test]
+    fn restoring_e_recovers_the_stem_the_es_arm_shadowed() {
+        for (word, shadowed, real) in [
+            ("responses", "respons", "response"),
+            ("caches", "cach", "cache"),
+            ("databases", "databas", "database"),
+            ("releases", "releas", "release"),
+        ] {
+            assert_eq!(inflectional_stem(word).as_deref(), Some(shadowed));
+            assert_eq!(
+                inflectional_stem_restoring_e(word, shadowed).as_deref(),
+                Some(real)
+            );
+        }
+
+        // Only a stem the `-es` arm itself produced gets the second attempt.
+        assert_eq!(inflectional_stem_restoring_e("grouped", "group"), None);
+        assert_eq!(inflectional_stem_restoring_e("grouping", "group"), None);
+        // `names` takes the `-s` arm, so its stem is not the `-es` base.
+        assert_eq!(inflectional_stem_restoring_e("names", "name"), None);
     }
 
     #[test]

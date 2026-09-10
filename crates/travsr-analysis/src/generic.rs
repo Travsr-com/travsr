@@ -411,13 +411,31 @@ fn decl_end_line(node: tree_sitter::Node<'_>, decl_kinds: &[&str]) -> Option<u32
 /// spans then overlap on the boundary line and a reference occurrence there
 /// sits inside two equally wide spans, leaving caller attribution to break the
 /// tie by NodeId. Never clamps below `line`, the definition's start line.
+///
+/// Only that overlap is clamped. Merely sharing the end *row* with the next
+/// sibling is not one: `}  /* trailing */` puts a comment on the closing brace
+/// line, and `... } int after(int y) { .. }` puts a whole second definition
+/// there, yet in both cases the definition really does end where it ends and
+/// shortening it drops its own last line (and, for the crammed case, the call
+/// sites on it). So extras are skipped when picking the sibling, and the clamp
+/// applies only when the definition's end position has actually run past where
+/// that sibling starts.
 fn clamp_to_next_sibling(decl: tree_sitter::Node<'_>, line: u32) -> u32 {
     let end = decl.end_position().row as u32 + 1;
+    let mut next = decl.next_sibling();
+    while let Some(n) = next {
+        if !n.is_extra() {
+            break;
+        }
+        next = n.next_sibling();
+    }
+    let Some(next) = next else { return end };
+    if decl.end_position() < next.start_position() {
+        return end;
+    }
     // `next.start_position().row` is 0-based, so it is exactly the 1-based
     // line *before* the sibling begins.
-    decl.next_sibling().map_or(end, |next| {
-        end.min(next.start_position().row as u32).max(line)
-    })
+    end.min(next.start_position().row as u32).max(line)
 }
 
 /// Walk up from a definition capture to the nearest enclosing type container.
@@ -684,6 +702,50 @@ mod tests {
             f.end_line,
             Some(4),
             "span must reach the closing brace (line 4), not end at the signature line"
+        );
+    }
+
+    #[test]
+    fn a_comment_after_the_closing_brace_does_not_shorten_the_span() {
+        // A `comment` is a tree-sitter extra and still shows up as the next
+        // sibling, on the closing brace's own line. Clamping to it dropped the
+        // brace line off every definition written this way, classes and structs
+        // included.
+        let src = "int helper(int x) { return x; }\n\n\
+             int trailing(int x) {\n    return helper(x);\n}  /* trailing comment */\n";
+        let out = parse_str(&crate::c::CONFIG, "trailing.c", src);
+        let f = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "fn:trailing")
+            .expect("fn:trailing node");
+        assert_eq!(f.line, Some(3));
+        assert_eq!(
+            f.end_line,
+            Some(5),
+            "the span must still reach the closing brace"
+        );
+    }
+
+    #[test]
+    fn a_definition_crammed_onto_the_closing_line_does_not_shorten_the_span() {
+        // `after` starts on `crammed`'s last line but two columns past where
+        // `crammed` ends, so there is no overlap to clamp. Clamping anyway cut
+        // `crammed` to lines 2..2 and pushed the `helper(x)` call on line 3 outside
+        // it, so `find_narrowest_enclosing` attributed the call to the file.
+        let src = "int helper(int x) { return x; }\n\
+             int crammed(int x) {\n    return helper(x); }  int after(int y) { return y; }\n";
+        let out = parse_str(&crate::c::CONFIG, "crammed.c", src);
+        let f = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "fn:crammed")
+            .expect("fn:crammed node");
+        assert_eq!(f.line, Some(2));
+        assert_eq!(
+            f.end_line,
+            Some(3),
+            "the span must cover the line the body actually ends on"
         );
     }
 

@@ -348,9 +348,12 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             // FTS-only if the sidecar binary is absent or the index is not built.
             travsr_daemon::try_inject_embed_hook_readonly(&mut store, &db_path);
             let knn = store.embed_knn_fn();
-            // Embeddings exist on disk and this process still has no hook. That
-            // is the read-only injector doing what it documents, not a build in
-            // progress, and the caller is told so below.
+            // An embed.db sibling exists and this process still has no hook, so
+            // ranking here is lexical only. `knn.is_none()` is redundant today
+            // (`try_inject_embed_hook_readonly` is currently a no-op, so `knn`
+            // is always `None` on this path); it is kept because it is what the
+            // flag actually means, and dropping it would silently start lying
+            // the day that injector gains a body.
             cold_path_embed_unarmed = store.has_embed_db() && knn.is_none();
             let knn_ref = knn
                 .as_ref()
@@ -368,15 +371,17 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     }
     // Unlike the docs note, this one matters most when the query FAILED: the
     // payload's own signal for this state reads "embedding in progress; run
-    // `travsr embed status`", which sends the user to a command that will report
-    // the index complete. Nothing is in progress. The cold path declines to arm
-    // the hook, by design, and only this process knows that.
+    // `travsr embed status`", which sends the user to a command that may well
+    // report the index complete. The cold path declines to arm the hook, by
+    // design, and only this process knows that. What it does NOT know is why no
+    // daemon answered, or whether the embedding index is finished, so the note
+    // below claims neither.
     if served_cold_path && cold_path_embed_unarmed {
         eprintln!(
-            "note: this repo has embeddings, but no travsr daemon is running, so \
-             this query is served by the read-only cold path, which does not load \
-             the embedding sidecar. The answer is lexical only and will not \
-             improve on a retry. Start the daemon with `travsr daemon start` for \
+            "note: this repo has an embedding index, but this query was not served \
+             by a daemon, so it fell back to the read-only cold path, which does \
+             not load the embedding sidecar. The answer is lexical only. Run \
+             `travsr daemon status` to see whether a daemon is available for \
              semantic ranking."
         );
     }

@@ -132,10 +132,10 @@ struct EmbedHooks {
 /// measured at ~2.1 s of arm cost per `get_context` on a small repo. This keeps
 /// the hooks (and so the sidecar) alive across calls.
 ///
-/// Never evicted: one entry per repo the process has actually served a named
-/// `get_context` for. Only [`inject_embed_hook`] inserts; the global fan-out
-/// reads through [`inject_cached_embed_hook`] so a query with no `repo` argument
-/// can never spawn a sidecar per registered repo.
+/// One entry per repo the process has actually served a named `get_context`
+/// for, capped at [`MAX_CACHED_EMBED_HOOKS`]. Only [`inject_embed_hook`]
+/// inserts; the global fan-out reads through [`inject_cached_embed_hook`] so a
+/// query with no `repo` argument can never spawn a sidecar per registered repo.
 fn embed_hook_cache(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, EmbedHooks>> {
     static CACHE: std::sync::OnceLock<
@@ -143,6 +143,14 @@ fn embed_hook_cache(
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
+
+/// Ceiling on cached entries. Each one pins a sidecar process holding a
+/// 200-1400 MB ONNX model for the life of the daemon, and global mode puts no
+/// bound on how many repos one process is asked to serve. Past the cap the
+/// hooks are still built and used for the call, they are just not kept: those
+/// repos pay the arm cost again next time instead of the process growing
+/// without limit.
+const MAX_CACHED_EMBED_HOOKS: usize = 8;
 
 fn install_embed_hooks(store: &mut SqliteStore, hooks: EmbedHooks) {
     store.set_embed_readiness(hooks.readiness);
@@ -182,16 +190,37 @@ pub(crate) fn inject_cached_embed_hook(store: &mut SqliteStore, db_path: &Path) 
 /// sidecar is still loading, and delegates to the real KNN hook once it is ready.
 /// This produces "embedding in progress" signals in `get_context` responses rather
 /// than blank results or a 15–25 s connect stall.
+///
+/// The lookup and the insert happen under ONE lock. Releasing it around
+/// `build_embed_hooks` let two concurrent SSE requests for the same cold repo
+/// both miss, both spawn a sidecar, and the loser's process stay alive with its
+/// model resident and nothing referencing it. `build_embed_hooks` only starts
+/// the arming thread, so holding the lock across it does not serialise the
+/// 15-25 s model load.
 pub(crate) fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
-    if inject_cached_embed_hook(store, db_path) {
-        return;
-    }
-    let Some(hooks) = build_embed_hooks(store, db_path) else {
+    // A poisoned cache degrades to "no hook" rather than bringing down the query.
+    let Ok(mut cache) = embed_hook_cache().lock() else {
         return;
     };
-    if let Ok(mut cache) = embed_hook_cache().lock() {
-        cache.insert(db_path.to_path_buf(), hooks.clone());
-    }
+    let hooks = match cache.get(db_path) {
+        Some(hooks) => hooks.clone(),
+        None => {
+            let Some(hooks) = build_embed_hooks(store, db_path) else {
+                return;
+            };
+            if cache.len() < MAX_CACHED_EMBED_HOOKS {
+                cache.insert(db_path.to_path_buf(), hooks.clone());
+            } else {
+                tracing::debug!(
+                    cap = MAX_CACHED_EMBED_HOOKS,
+                    "embed hook cache full, not retaining hooks for {}",
+                    db_path.display()
+                );
+            }
+            hooks
+        }
+    };
+    drop(cache);
     install_embed_hooks(store, hooks);
 }
 
@@ -214,9 +243,7 @@ fn build_embed_hooks(store: &SqliteStore, db_path: &Path) -> Option<EmbedHooks> 
         return None;
     }
 
-    let Some(home) = dirs::home_dir() else {
-        return None;
-    };
+    let home = dirs::home_dir()?;
     // #481: the embedding backend is a per-repo setting; `~/.travsr/embed.toml`
     // is only the fallback. Reading the machine-global id here started the
     // sidecar with a different model than this repo's index was built with, so
@@ -234,7 +261,7 @@ fn build_embed_hooks(store: &SqliteStore, db_path: &Path) -> Option<EmbedHooks> 
         .and_then(lookup_embed_backend)
         .or_else(|| embed_backends().first())
         .cloned();
-    let Some(backend) = backend else { return None };
+    let backend = backend?;
 
     // Mirror the daemon's guard (travsr-daemon: `embed model_id mismatch`): if
     // the index records a model, the sidecar's must match it or the hooks would

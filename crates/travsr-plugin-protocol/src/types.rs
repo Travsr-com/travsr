@@ -115,8 +115,14 @@ pub struct PluginDiagnostic {
     /// Stable dotted identifier for the condition, e.g.
     /// `java.tests-not-compiled`, `emitter.version-mismatch`. Machine-readable
     /// and greppable across runs; the prose in `message` is not.
+    ///
+    /// The shape is enforced by the host, not by this type: a sidecar is
+    /// untrusted, so `travsr-plugin-host`'s `is_diagnostic_code` accepts only
+    /// `[A-Za-z0-9._-]` and logs anything else under a neutral placeholder code.
     pub code: String,
-    /// One line, addressed to the developer running the index.
+    /// One line, addressed to the developer running the index. The host strips
+    /// control characters and truncates before logging, and caps how many
+    /// records of a single response it will echo at all.
     pub message: String,
 }
 

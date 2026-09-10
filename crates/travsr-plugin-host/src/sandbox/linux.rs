@@ -97,6 +97,22 @@ pub fn build_sandboxed_command(
     cmd.args(["--ro-bind", repo.as_ref(), repo.as_ref()]); // repo: ro
     for entry in crate::sandbox::toolchain::repo_write_subpaths(language) {
         let host = std::path::Path::new(repo.as_ref()).join(entry.subpath());
+        // A grant path must be a real path inside the repo, never a link out of
+        // it. `create_dir_all`, `OpenOptions::open` and bwrap's own `--bind`
+        // source resolution all FOLLOW symlinks, and this code runs UNSANDBOXED
+        // as the user: a repo shipping php's `index.scip` as a link to
+        // `~/.ssh/authorized_keys` would get that target created and then
+        // bind-mounted WRITABLE into the sandbox. Skipping the grant costs that
+        // language its build output; binding it costs the user's home directory.
+        if grant_path_has_symlink(Path::new(repo.as_ref()), entry.subpath()) {
+            tracing::warn!(
+                language = %language,
+                subpath = %entry.subpath(),
+                "repo-write grant skipped: a component of the path is a symlink, \
+                 which would bind its target writable into the sandbox (ADR-017 Rule 1)"
+            );
+            continue;
+        }
         match entry {
             crate::sandbox::toolchain::RepoWrite::Dir(_) => {
                 let _ = std::fs::create_dir_all(&host);
@@ -110,6 +126,21 @@ pub fn build_sandboxed_command(
                     .append(true)
                     .open(&host);
             }
+        }
+        // Re-stat the leaf the create just produced: fail closed if it is a
+        // symlink after all (the check above raced) or if the create failed and
+        // left no bind source at all.
+        let is_real = std::fs::symlink_metadata(&host)
+            .map(|m| !m.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_real {
+            tracing::warn!(
+                language = %language,
+                subpath = %entry.subpath(),
+                "repo-write grant skipped: the path is not a real file or directory after \
+                 creating it, so there is nothing safe to bind"
+            );
+            continue;
         }
         let host = host.to_string_lossy();
         cmd.args(["--bind", host.as_ref(), host.as_ref()]); // writable subpath
@@ -163,6 +194,30 @@ pub fn build_sandboxed_command(
         cmd.env("PATH", format!("{travsr_bin}:{base}"));
     }
     Ok(SandboxedSpawn::Wrapped(cmd))
+}
+
+/// Whether any existing component of `root`/`subpath` is a symlink.
+///
+/// Checked component by component, not just at the leaf: a link anywhere on the
+/// path (`target` -> `/`, then `target/x`) escapes the repo just as well. A
+/// component that does not exist yet is fine, since it is created as a real
+/// dir/file immediately after and the result is re-stat'd before the bind.
+#[cfg(target_os = "linux")]
+fn grant_path_has_symlink(root: &Path, subpath: &str) -> bool {
+    let mut p = root.to_path_buf();
+    for component in Path::new(subpath).components() {
+        p.push(component);
+        match std::fs::symlink_metadata(&p) {
+            Ok(md) => {
+                if md.file_type().is_symlink() {
+                    return true;
+                }
+            }
+            // Does not exist yet: nothing to follow.
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Returns true if `bwrap` is on PATH (installed).

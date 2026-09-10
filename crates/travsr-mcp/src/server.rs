@@ -137,7 +137,8 @@ fn handle_tool_call(
         }
         "get_callers" => {
             let symbol = args["symbol"].as_str().unwrap_or("");
-            tools::get_callers(store, symbol)
+            let path = args["path"].as_str().filter(|s| !s.is_empty());
+            tools::get_callers(store, symbol, path)
         }
         "find_references" => {
             let symbol = args["symbol"].as_str().unwrap_or("");
@@ -374,7 +375,8 @@ pub fn tools_list() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "symbol": { "type": "string", "description": "Symbol name to find callers of (partial match supported)" }
+                        "symbol": { "type": "string", "description": "Symbol name to find callers of (partial match supported)" },
+                        "path": { "type": "string", "description": "Optional path hint to scope an overloaded name to a file or directory: a filename, a relative path, a directory prefix, or a path fragment (e.g. ppr.rs, src/ppr.rs, crates/travsr-retrieval, retrieval)" }
                     },
                     "required": ["symbol"],
                     "additionalProperties": false
@@ -809,9 +811,12 @@ fn handle_tool_call_global(
         "get_dependencies" => {
             tools::get_dependencies_global(repos, args["file"].as_str().unwrap_or(""), repo_arg)
         }
-        "get_callers" => {
-            tools::get_callers_global(repos, args["symbol"].as_str().unwrap_or(""), repo_arg)
-        }
+        "get_callers" => tools::get_callers_global(
+            repos,
+            args["symbol"].as_str().unwrap_or(""),
+            args["path"].as_str().filter(|s| !s.is_empty()),
+            repo_arg,
+        ),
         "find_references" => tools::find_references_global(
             repos,
             args["symbol"].as_str().unwrap_or(""),
@@ -1013,6 +1018,7 @@ pub fn tools_list_global() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "symbol": { "type": "string", "description": "Symbol name to find callers of (partial match supported)" },
+                        "path": { "type": "string", "description": "Optional path hint to scope an overloaded name to a file or directory: a filename, a relative path, a directory prefix, or a path fragment (e.g. ppr.rs, src/ppr.rs, crates/travsr-retrieval, retrieval)" },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["symbol"],

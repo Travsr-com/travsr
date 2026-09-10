@@ -2211,9 +2211,13 @@ impl SqliteStore {
     ///
     /// For each `FileGraph` in `batch`:
     /// 1. Retract old FTS rows + decrement vocab refcounts for the path.
-    /// 2. Delete old edges and nodes for the path.
-    /// 3. Insert new nodes and edges.
+    /// 2. Delete old edges and nodes for the (corpus, path).
+    /// 3. Insert new nodes.
     /// 4. Upsert the file hash.
+    ///
+    /// Edges are inserted once, after every file in the batch has written its
+    /// nodes, so the endpoint-existence guard cannot drop a cross-file edge
+    /// whose target file happens to be written later in the same batch.
     ///
     /// When `bulk=true` (init path), step 3 writes only `nodes_fts_map` rows
     /// instead of the full FTS5 + vocab update per node.  Call
@@ -2248,6 +2252,16 @@ impl SqliteStore {
                 .transaction()
                 .context("starting batch write transaction")?;
             let mut counts = BatchWriteCounts::default();
+            // Incremental-path edges are held until every file in the batch has
+            // written its nodes. The endpoint guard below drops an edge whose
+            // `dst` node does not exist yet, and a cross-file edge names a node
+            // another file in this same batch owns (a TypeScript
+            // `import:./billing --resolves-to--> file:src/billing.ts`, whose
+            // target `file:` node only `src/billing.ts` writes). Inserting per
+            // file made that depend on the order the parallel parse workers
+            // happened to deliver the two files in. The staging path is already
+            // immune, since it promotes all nodes before filtering edges.
+            let mut pending_edges: Vec<&travsr_core::Edge> = Vec::new();
 
             for file in batch {
                 // RFC-027 #813: body hash per definition, from this file's own
@@ -2312,17 +2326,29 @@ impl SqliteStore {
                     }
                 } else {
                     // ── incremental path: delete existing rows, then upsert ───
+                    // Every delete below is scoped by (corpus, path), the key
+                    // [`Self::reindex_replace`] uses: a path is unique within a
+                    // corpus, not across them (one corpus per language plus the
+                    // external-package corpora). This API takes no `corpus`
+                    // argument, so it comes from the file's own nodes; a parse
+                    // that produced none leaves it NULL, which matches the whole
+                    // path exactly as these statements did before.
+                    let corpus: Option<&str> =
+                        file.nodes.first().map(|n| n.vname.corpus.as_str());
                     // Load old FTS tokens BEFORE removing map rows so vocab can
                     // be decremented correctly.
                     let old_token_strings: Vec<String> = {
                         let mut stmt = tx
                             .prepare(
                                 "SELECT m.tokens FROM nodes_fts_map m \
-                                 JOIN nodes n ON n.id = m.node_id WHERE n.path = ?1",
+                                 JOIN nodes n ON n.id = m.node_id \
+                                 WHERE n.path = ?1 AND (?2 IS NULL OR n.corpus = ?2)",
                             )
                             .context("preparing old-token load")?;
                         let mapped = stmt
-                            .query_map(params![file.vname_path], |row| row.get::<_, String>(0))
+                            .query_map(params![file.vname_path, corpus], |row| {
+                                row.get::<_, String>(0)
+                            })
                             .context("querying old tokens")?;
                         let owned: rusqlite::Result<Vec<String>> = mapped.collect();
                         owned.context("collecting old tokens")?
@@ -2331,14 +2357,15 @@ impl SqliteStore {
                         "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) \
                          SELECT 'delete', m.node_id, m.tokens \
                          FROM nodes_fts_map m JOIN nodes n ON n.id = m.node_id \
-                         WHERE n.path = ?1",
-                        params![file.vname_path],
+                         WHERE n.path = ?1 AND (?2 IS NULL OR n.corpus = ?2)",
+                        params![file.vname_path, corpus],
                     )
                     .context("retracting FTS rows")?;
                     tx.execute(
                         "DELETE FROM nodes_fts_map \
-                         WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
-                        params![file.vname_path],
+                         WHERE node_id IN (SELECT id FROM nodes \
+                           WHERE path = ?1 AND (?2 IS NULL OR corpus = ?2))",
+                        params![file.vname_path, corpus],
                     )
                     .context("removing FTS map rows")?;
                     for ts in &old_token_strings {
@@ -2350,14 +2377,15 @@ impl SqliteStore {
                         "INSERT INTO nodes_fts_words(nodes_fts_words, rowid, sig, path) \
                          SELECT 'delete', m.node_id, m.sig_words, m.path_words \
                          FROM nodes_fts_words_map m JOIN nodes n ON n.id = m.node_id \
-                         WHERE n.path = ?1",
-                        params![file.vname_path],
+                         WHERE n.path = ?1 AND (?2 IS NULL OR n.corpus = ?2)",
+                        params![file.vname_path, corpus],
                     )
                     .context("retracting FTS word rows")?;
                     tx.execute(
                         "DELETE FROM nodes_fts_words_map \
-                         WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
-                        params![file.vname_path],
+                         WHERE node_id IN (SELECT id FROM nodes \
+                           WHERE path = ?1 AND (?2 IS NULL OR corpus = ?2))",
+                        params![file.vname_path, corpus],
                     )
                     .context("removing FTS word map rows")?;
                     // Owned-edge-only delete, the same ownership rule
@@ -2379,10 +2407,13 @@ impl SqliteStore {
                         let new_ids: std::collections::HashSet<i64> =
                             file.nodes.iter().map(|n| node_id_to_i64(n.id)).collect();
                         let mut stmt = tx
-                            .prepare("SELECT id FROM nodes WHERE path = ?1")
+                            .prepare(
+                                "SELECT id FROM nodes \
+                                 WHERE path = ?1 AND (?2 IS NULL OR corpus = ?2)",
+                            )
                             .context("preparing old-id snapshot")?;
                         let rows = stmt
-                            .query_map(params![file.vname_path], |r| r.get::<_, i64>(0))
+                            .query_map(params![file.vname_path, corpus], |r| r.get::<_, i64>(0))
                             .context("querying old ids")?
                             .collect::<rusqlite::Result<Vec<i64>>>()
                             .context("collecting old ids")?;
@@ -2391,19 +2422,34 @@ impl SqliteStore {
                             .collect()
                     };
                     tx.execute(
-                        "DELETE FROM edges WHERE src IN (SELECT id FROM nodes WHERE path = ?1)",
-                        params![file.vname_path],
+                        "DELETE FROM edges WHERE src IN (SELECT id FROM nodes \
+                           WHERE path = ?1 AND (?2 IS NULL OR corpus = ?2))",
+                        params![file.vname_path, corpus],
                     )
                     .context("deleting owned edges for path")?;
                     // A symbol the re-parse dropped still takes its inbound
                     // edges with it, so the narrower delete above never trades a
                     // lost edge for a dangling one.
-                    for removed_id in &removed_ids {
-                        tx.execute("DELETE FROM edges WHERE dst = ?1", params![removed_id])
-                            .context("deleting inbound edges for a removed symbol")?;
+                    // `prepare_cached` once, not `tx.execute` per id: on a
+                    // `--force` re-parse `removed_ids` is the whole repo's node
+                    // set, and an uncached execute re-prepares the statement for
+                    // every one of them.
+                    if !removed_ids.is_empty() {
+                        let mut del_inbound = tx
+                            .prepare_cached("DELETE FROM edges WHERE dst = ?1")
+                            .context("preparing inbound-edge delete")?;
+                        for removed_id in &removed_ids {
+                            del_inbound
+                                .execute(params![removed_id])
+                                .context("deleting inbound edges for a removed symbol")?;
+                        }
                     }
-                    tx.execute("DELETE FROM nodes WHERE path = ?1", params![file.vname_path])
-                        .context("deleting nodes for path")?;
+                    tx.execute(
+                        "DELETE FROM nodes \
+                         WHERE path = ?1 AND (?2 IS NULL OR corpus = ?2)",
+                        params![file.vname_path, corpus],
+                    )
+                    .context("deleting nodes for path")?;
 
                     for node in &file.nodes {
                         let id_i64 = node_id_to_i64(node.id);
@@ -2446,31 +2492,7 @@ impl SqliteStore {
                         }
                         counts.nodes_upserted += 1;
                     }
-                    for edge in &file.edges {
-                        // UX-9: this file's nodes are inserted just above and every
-                        // other file's nodes already live in `nodes` (incremental
-                        // path runs against a populated store), so guard both
-                        // endpoints here too — a parser edge to an un-emitted node
-                        // (e.g. Ruby `class ::Hash` reopening) must not persist a
-                        // dangling half-edge. `execute` returns 0 when the guard
-                        // rejects it, keeping `edges_upserted` honest.
-                        let inserted = tx
-                            .execute(
-                                "INSERT INTO edges(src,dst,kind,provenance,confidence) \
-                                 SELECT ?1,?2,?3,'tree-sitter',?4 \
-                                 WHERE EXISTS(SELECT 1 FROM nodes n WHERE n.id = ?1) \
-                                   AND EXISTS(SELECT 1 FROM nodes n WHERE n.id = ?2) \
-                                 ON CONFLICT(src,dst,kind) DO NOTHING",
-                                params![
-                                    node_id_to_i64(edge.src),
-                                    node_id_to_i64(edge.dst),
-                                    edge.kind.as_str(),
-                                    edge.confidence.map(|c| c as i64),
-                                ],
-                            )
-                            .context("inserting edge in batch")?;
-                        counts.edges_upserted += inserted as u64;
-                    }
+                    pending_edges.extend(&file.edges);
                 }
 
                 // File hash goes to production in both paths — one row per
@@ -2485,6 +2507,36 @@ impl SqliteStore {
                 )
                 .context("writing file hash in batch")?;
                 counts.files_written += 1;
+            }
+
+            // UX-9: every batch node now exists, and every other file's nodes
+            // already live in `nodes` (the incremental path runs against a
+            // populated store), so guard both endpoints here: a parser edge to
+            // an un-emitted node (e.g. Ruby `class ::Hash` reopening, or a
+            // speculative import candidate whose file does not exist) must not
+            // persist a dangling half-edge. `execute` returns 0 when the guard
+            // rejects it, keeping `edges_upserted` honest.
+            if !pending_edges.is_empty() {
+                let mut ins_edge = tx
+                    .prepare_cached(
+                        "INSERT INTO edges(src,dst,kind,provenance,confidence) \
+                         SELECT ?1,?2,?3,'tree-sitter',?4 \
+                         WHERE EXISTS(SELECT 1 FROM nodes n WHERE n.id = ?1) \
+                           AND EXISTS(SELECT 1 FROM nodes n WHERE n.id = ?2) \
+                         ON CONFLICT(src,dst,kind) DO NOTHING",
+                    )
+                    .context("preparing batch edge insert")?;
+                for edge in pending_edges {
+                    let inserted = ins_edge
+                        .execute(params![
+                            node_id_to_i64(edge.src),
+                            node_id_to_i64(edge.dst),
+                            edge.kind.as_str(),
+                            edge.confidence.map(|c| c as i64),
+                        ])
+                        .context("inserting edge in batch")?;
+                    counts.edges_upserted += inserted as u64;
+                }
             }
 
             tx.commit().context("committing batch write transaction")?;
@@ -3315,6 +3367,12 @@ impl SqliteStore {
 
             let mut callers = DirtySet::default();
             if !removed_ids.is_empty() {
+                // Prepared once for the whole loop, same reason as the batch
+                // writer's loop: an uncached execute re-prepares once per
+                // removed id, and on a `--force` re-parse that is every node.
+                let mut del_inbound = tx
+                    .prepare_cached("DELETE FROM edges WHERE dst = ?1")
+                    .context("preparing inbound orphan delete")?;
                 for &removed_id in &removed_ids {
                     // Find callers before deleting their inbound edge.
                     let mut stmt = tx
@@ -3330,7 +3388,8 @@ impl SqliteStore {
                         callers.insert(row.context("reading caller path")?);
                     }
                     // Eagerly delete inbound orphan edges for this removed symbol.
-                    tx.execute("DELETE FROM edges WHERE dst = ?1", params![removed_id])
+                    del_inbound
+                        .execute(params![removed_id])
                         .context("deleting inbound orphan edges for removed symbol")?;
                 }
             }
@@ -5414,9 +5473,34 @@ LIMIT ?4",
                 // `MAX(...)` over the group keeps the old `DISTINCT (path,
                 // line)` row set exactly while answering "was ANY contributing
                 // edge name-matched", so two edges landing on one line cannot
-                // hide a heuristic one behind a resolved one. Restricted to
-                // 'ref/call' to match `provenance_marker`: tree-sitter is the
-                // ordinary provenance of a structural field reference.
+                // hide a heuristic one behind a resolved one.
+                //
+                // The two disjuncts mirror `travsr-mcp::provenance_marker`
+                // exactly, so `find_references` and `get_callers` cannot
+                // describe the same edge differently: 'live' is an un-ratified
+                // overlay edge whatever its kind, and 'tree-sitter' is a name
+                // guess only for a call ('tree-sitter' is also the ordinary
+                // provenance of a structural field reference, which is why the
+                // second disjunct stays restricted to 'ref/call').
+                //
+                // Coverage limit, measured on this repo's own index
+                // (16158 nodes): 11703 of 29566 'ref/call' occurrence rows,
+                // 39.6%, find no edge row in the LEFT JOIN at all, and 11637 of
+                // those have both endpoints alive in `nodes`, so they are real
+                // servable sites rather than dangling rows. Every one comes back
+                // `heuristic = NULL -> false` and is therefore presented as
+                // resolved fact. The MAX only decides the 60% that do join;
+                // the fail-open default for the rest is documented on
+                // `travsr_core::RefSite::heuristic`.
+                // `live` is deliberately NOT flagged here. `RefSite::heuristic`
+                // is a bool and renders as "matched by name, not resolved by
+                // type", which is false of a live edge: that edge IS resolved,
+                // it is only unratified, and `get_callers` says so in its own
+                // words. Flagging it here would caveat it with the wrong cause.
+                // The clause could not fire today in any case, since
+                // `put_edge_live` writes `edges` and never `edge_sites`, so a
+                // live edge has no occurrence row to join. Telling the two
+                // apart needs a variant on `RefSite` rather than a bool.
                 "SELECT n.path AS path, es.line AS line, \
                  MAX(es.kind = 'ref/call' AND e.provenance = 'tree-sitter') AS heuristic \
                  FROM edge_sites es JOIN nodes n ON n.id = es.src \
@@ -16270,23 +16354,30 @@ mod tests {
         // Both orders re-write an index that already holds both files, which is
         // what `--force` does: its graph purge leaves the nodes of on-disk
         // files in place, so every file takes the incremental branch below.
+        //
+        // The seed uses the SAME order as the rewrite, so `importer_first` also
+        // covers the INSERT half: the import target is a file this batch has
+        // not written yet when the importer is processed, which is what a newly
+        // added file looks like. Seeding target-first would have satisfied its
+        // own precondition either way and never exercised that.
         for importer_first in [false, true] {
+            let batch = || {
+                if importer_first {
+                    vec![caller_graph(), billing_graph()]
+                } else {
+                    vec![billing_graph(), caller_graph()]
+                }
+            };
             let mut store = SqliteStore::open_in_memory().unwrap();
-            store
-                .write_file_graphs_batch(&[billing_graph(), caller_graph()], false)
-                .unwrap();
+            store.write_file_graphs_batch(&batch(), false).unwrap();
             assert_eq!(
                 resolves_to(&store),
                 1,
-                "precondition: the first index resolves the import"
+                "the first index must resolve the import \
+                 (importer_first = {importer_first})"
             );
 
-            let batch = if importer_first {
-                vec![caller_graph(), billing_graph()]
-            } else {
-                vec![billing_graph(), caller_graph()]
-            };
-            store.write_file_graphs_batch(&batch, false).unwrap();
+            store.write_file_graphs_batch(&batch(), false).unwrap();
             assert_eq!(
                 resolves_to(&store),
                 1,

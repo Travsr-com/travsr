@@ -288,27 +288,6 @@ pub fn unify_all(
             continue;
         }
 
-        // Rung 2: the declaration is the *only* Phase A node and it lives in
-        // another file, so rung 1 has nothing to key on. This is the C/C++
-        // out-of-line member definition: `widget.h` declares `Widget::draw`,
-        // `widget.cpp` defines it, and Phase A anchored the header. Without
-        // this the SCIP definition survives as an orphan and takes every
-        // ref/call edge with it, so `travsr references draw` answers zero
-        // while the edges exist and point somewhere unreachable.
-        //
-        // Guarded on uniqueness rather than on position: a declaration's line
-        // says nothing about its definition's, and more than one candidate
-        // means the name is ambiguous in this repo (two same-named `static`
-        // functions in different translation units are different functions).
-        //
-        // Restricted to callables and types (#708 review). `candidate_signatures`
-        // qualifies those by container where it can (`method:Widget.draw`), but
-        // a `variable` yields only bare `var:name` / `const:name` /
-        // `static:name`. Names like `count`, `size`, `buf` are common enough
-        // that an unrelated `static int count;` elsewhere in the repo is often
-        // the single other match, and uniqueness cannot tell "the only match"
-        // from "the right match": it would alias the definition onto an
-        // unrelated node and corrupt its ref/call edges with no error at all.
         // Rung 1b: the SCIP def is one overload of a method group whose Phase A
         // node is shared by every overload. Phase A signatures carry no
         // parameter list, so `C#n().`, `C#n(+1).`, ... all belong to the single
@@ -343,6 +322,27 @@ pub fn unify_all(
             }
         }
 
+        // Rung 2: the declaration is the *only* Phase A node and it lives in
+        // another file, so rung 1 has nothing to key on. This is the C/C++
+        // out-of-line member definition: `widget.h` declares `Widget::draw`,
+        // `widget.cpp` defines it, and Phase A anchored the header. Without
+        // this the SCIP definition survives as an orphan and takes every
+        // ref/call edge with it, so `travsr references draw` answers zero
+        // while the edges exist and point somewhere unreachable.
+        //
+        // Guarded on uniqueness rather than on position: a declaration's line
+        // says nothing about its definition's, and more than one candidate
+        // means the name is ambiguous in this repo (two same-named `static`
+        // functions in different translation units are different functions).
+        //
+        // Restricted to callables and types (#708 review). `candidate_signatures`
+        // qualifies those by container where it can (`method:Widget.draw`), but
+        // a `variable` yields only bare `var:name` / `const:name` /
+        // `static:name`. Names like `count`, `size`, `buf` are common enough
+        // that an unrelated `static int count;` elsewhere in the repo is often
+        // the single other match, and uniqueness cannot tell "the only match"
+        // from "the right match": it would alias the definition onto an
+        // unrelated node and corrupt its ref/call edges with no error at all.
         if !matches!(kind, "function" | "class") {
             continue;
         }

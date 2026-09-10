@@ -369,7 +369,7 @@ fn decode_phase_b_warnings(
                         format!(
                             "semantic analyzer for '{rest}' ran but found no symbols despite \
                              '{rest}' sources being present, re-run \
-                             `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` \
+                             `RUST_LOG=travsr_plugin_host=warn travsr init --semantic --force` \
                              to see the analyzer's own diagnostics"
                         ),
                     ),

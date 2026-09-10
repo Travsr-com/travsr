@@ -26,7 +26,7 @@ pub mod noise;
 /// Version history:
 ///   0 — legacy (no version byte; all pre-RFC-002 databases)
 ///   1 — Tree-sitter vocabulary (`class:X`, `fn:X`, `method:X.Y`, `var:X`)
-///   2 — current: RFC-014 Phase B graph unification. Phase A now captures
+///   2 — RFC-014 Phase B graph unification. Phase A now captures
 ///       type-definition nodes and `end_line` spans that the G1/G2 unification
 ///       passes depend on, so v1 databases lack the tree-sitter nodes that
 ///       SCIP symbols unify onto. Bumping intentionally invalidates every
@@ -42,10 +42,18 @@ pub mod noise;
 ///       A v2 database cannot be migrated in place: incremental reindex only
 ///       re-parses files that changed, so an ObjC repo would hold collapsed
 ///       signatures for untouched files and full selectors for the rest, with
-///       nothing able to tell the halves apart. Bumping makes that impossible
-///       by invalidating the database outright, which the daemon reports as
-///       "run `travsr init` to rebuild it" rather than silently serving a
-///       half-migrated graph.
+///       nothing able to tell the halves apart.
+///
+/// The constant does not invalidate anything by itself. It is a marker two code
+/// paths compare against and act on, and both must keep doing so for a bump to
+/// mean anything:
+///   * `reindex_files` (the commit hook and the watcher) refuses to touch a
+///     graph whose stored version differs, and tells the user to run
+///     `travsr init`.
+///   * `init_repo_with_progress` reads the stored version before re-stamping it
+///     and, on a mismatch, purges the graph and clears the file-hash cache so
+///     every file is re-parsed, exactly as `--force` does, rather than taking
+///     the incremental path.
 pub const SIGNATURE_FORMAT_VERSION: u8 = 3;
 
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
