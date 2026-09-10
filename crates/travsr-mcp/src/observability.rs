@@ -2398,7 +2398,7 @@ mod tests {
     /// fails here. Same treatment `is_native_phase_b` got in #752: assert
     /// against the real decision, not against a copy of it.
     #[test]
-    fn phase_b_warning_classes_match_the_cli() {
+    fn every_phase_b_warning_class_the_daemon_writes_is_decoded() {
         use travsr_plugin_host::phase_b::PhaseBWarningClass;
         // `scip_unification_misses` is deliberately not in `ALL`: it is a
         // repo-wide rate, not a per-language state, and neither surface treats

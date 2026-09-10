@@ -146,9 +146,10 @@ fn phase_b_warning_lines(warnings: &str) -> Vec<String> {
     // Trust is per-repo, not per-language: a single `install` enables
     // every language at once, so collapse the "not enabled here" notices
     // into one line rather than repeating it per language (matches init).
+    let untrusted_prefix = format!("{}:", Warn::UntrustedCorpus.tag());
     let untrusted: Vec<&str> = warnings
         .split(',')
-        .filter_map(|w| w.strip_prefix(&format!("{}:", Warn::UntrustedCorpus.tag())))
+        .filter_map(|w| w.strip_prefix(&untrusted_prefix))
         .collect();
     if !untrusted.is_empty() {
         out.push(format!(

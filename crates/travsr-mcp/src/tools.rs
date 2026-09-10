@@ -264,12 +264,18 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
 /// `zero_nodes` is likewise excluded: an analyzer that ran and found nothing is a
 /// valid answer, not missing coverage.
 fn phase_b_unanalyzed_note(store: &SqliteStore) -> Option<String> {
-    const CLASSES: &[&str] = &[
-        "crashed",
-        "skipped_no_analyzer",
-        "needs_approval",
-        "needs_consent",
-    ];
+    use travsr_plugin_host::phase_b::PhaseBWarningClass as Warn;
+    // A deliberate subset of `Warn::ALL`, not an exhaustive consumer, so #760's
+    // iterate-every-variant guard does not apply. The tags still come from the
+    // enum: `phase_b_state` names these same four through `Warn::*.tag()`, and
+    // the two halves of that invariant drift if one side writes literals.
+    let classes = [
+        Warn::Crashed,
+        Warn::SkippedNoAnalyzer,
+        Warn::NeedsApproval,
+        Warn::NeedsConsent,
+    ]
+    .map(|c| c.tag());
     let warnings = store.get_meta("phase_b_warnings").ok().flatten()?;
     let mut langs: Vec<&str> = Vec::new();
     for warn in warnings.split(',') {
@@ -277,7 +283,7 @@ fn phase_b_unanalyzed_note(store: &SqliteStore) -> Option<String> {
         let Some((class, rest)) = warn.split_once(':') else {
             continue;
         };
-        if !CLASSES.contains(&class) {
+        if !classes.contains(&class) {
             continue;
         }
         // `version_mismatch` and friends carry `lang:extra`; take the language.
@@ -551,9 +557,10 @@ fn phase_b_lang_crashed(store: &SqliteStore, lang: &str) -> bool {
         .ok()
         .flatten()
         .is_some_and(|warnings| {
+            let crashed = travsr_plugin_host::phase_b::PhaseBWarningClass::Crashed.tag();
             warnings.split(',').any(|entry| {
                 let mut parts = entry.splitn(3, ':');
-                parts.next() == Some("crashed") && parts.next() == Some(lang)
+                parts.next() == Some(crashed) && parts.next() == Some(lang)
             })
         })
 }
