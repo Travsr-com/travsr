@@ -104,7 +104,10 @@ pub fn build_sandboxed_command(
         // `~/.ssh/authorized_keys` would get that target created and then
         // bind-mounted WRITABLE into the sandbox. Skipping the grant costs that
         // language its build output; binding it costs the user's home directory.
-        if grant_path_has_symlink(Path::new(repo.as_ref()), entry.subpath()) {
+        if crate::sandbox::toolchain::grant_path_has_symlink(
+            Path::new(repo.as_ref()),
+            entry.subpath(),
+        ) {
             tracing::warn!(
                 language = %language,
                 subpath = %entry.subpath(),
@@ -194,30 +197,6 @@ pub fn build_sandboxed_command(
         cmd.env("PATH", format!("{travsr_bin}:{base}"));
     }
     Ok(SandboxedSpawn::Wrapped(cmd))
-}
-
-/// Whether any existing component of `root`/`subpath` is a symlink.
-///
-/// Checked component by component, not just at the leaf: a link anywhere on the
-/// path (`target` -> `/`, then `target/x`) escapes the repo just as well. A
-/// component that does not exist yet is fine, since it is created as a real
-/// dir/file immediately after and the result is re-stat'd before the bind.
-#[cfg(target_os = "linux")]
-fn grant_path_has_symlink(root: &Path, subpath: &str) -> bool {
-    let mut p = root.to_path_buf();
-    for component in Path::new(subpath).components() {
-        p.push(component);
-        match std::fs::symlink_metadata(&p) {
-            Ok(md) => {
-                if md.file_type().is_symlink() {
-                    return true;
-                }
-            }
-            // Does not exist yet: nothing to follow.
-            Err(_) => return false,
-        }
-    }
-    false
 }
 
 /// Returns true if `bwrap` is on PATH (installed).

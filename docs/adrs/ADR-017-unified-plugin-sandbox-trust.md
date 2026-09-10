@@ -297,6 +297,42 @@ SandboxPolicy::Standard
 > **Approved by:** _pending Principal Security Engineer sign-off (drafted
 > 2026-09-10 with the fix for the symlinked-grant escape)._
 
+> **Amendment A7 — Windows honours the A6 enumeration per subpath, not as a
+> boolean (2026-09-10)**
+>
+> A6 authorises specific repo-relative subpaths. Linux binds each one and macOS
+> emits a Seatbelt rule for each one, but the Windows AppContainer path read the
+> enumeration through a `needs_repo_write(language) -> bool` helper and, when it
+> was true, granted `ACCESS_GENERIC_ALL` on the **repo root**. That is Rule 1
+> inverted on one platform: a hostile `composer.json` or composer plugin
+> executed during indexing could rewrite any file in the repo, including source
+> and `.git`, where the same language on Linux and macOS may write one file.
+>
+> The helper's own comment justified the coarse bool on the grounds that "scala
+> is `WindowsSandbox::Unsupported` there and never reaches it". That stopped
+> being true when A6 added php, which is `WindowsSandbox::Supported`.
+>
+> Windows now grants `ACCESS_GENERIC_READ` on the repo root unconditionally and
+> a separate `ACCESS_GENERIC_ALL` per authorised subpath, inheritable for a
+> directory grant and this-object-only for a file grant. As on Linux, the host
+> materialises each path first (an ACL can only be set on an object that
+> exists), which is also what lets the root stay read-only: the analyzer opens
+> an existing file rather than needing `FILE_ADD_FILE` on the directory. The
+> symlink guard A6 introduced is now shared by both platforms
+> (`toolchain::grant_path_has_symlink`) instead of living inside the Linux
+> builder, since Windows creates the same paths as the same unsandboxed user.
+> `needs_repo_write` is deleted: with no caller left, keeping it would preserve
+> the shape that caused this.
+>
+> Not verified by execution. The AppContainer tests live in
+> `sandbox-windows.yml`, which is `workflow_dispatch` only and does not run on
+> pull requests, so this change is covered by a Windows-target type-check and by
+> the portable guard unit test, not by a spawn on Windows. Running that workflow
+> before merge is the remaining verification.
+>
+> **Approved by:** _pending Principal Security Engineer sign-off (drafted
+> 2026-09-10)._
+
 Mechanism by platform (DevOps owns the implementation, Security owns the policy):
 
 | Platform | Primary mechanism | Fallback |

@@ -129,11 +129,32 @@ pub fn repo_write_subpaths(language: &str) -> &'static [RepoWrite] {
     }
 }
 
-/// Whether `language`'s analyzer needs any repo-root write grant at all. Derived
-/// from [`repo_write_subpaths`]; the Windows AppContainer path uses this coarse
-/// bool (scala is `WindowsSandbox::Unsupported` there and never reaches it).
-pub fn needs_repo_write(language: &str) -> bool {
-    !repo_write_subpaths(language).is_empty()
+/// Whether any existing component of `root`/`subpath` is a symlink.
+///
+/// Checked component by component, not just at the leaf: a link anywhere on the
+/// path (`target` -> `/`, then `target/x`) escapes the repo just as well. A
+/// component that does not exist yet is fine, since it is created as a real
+/// dir/file immediately after and the result is re-stat'd before it is granted.
+///
+/// Shared by every platform that materialises a repo-write grant: the host
+/// creates the path as the user, UNSANDBOXED, so a repo shipping php's
+/// `index.scip` as a link to `~/.ssh/authorized_keys` would otherwise get that
+/// target created and then handed to the sandbox writable.
+pub fn grant_path_has_symlink(root: &std::path::Path, subpath: &str) -> bool {
+    let mut p = root.to_path_buf();
+    for component in std::path::Path::new(subpath).components() {
+        p.push(component);
+        match std::fs::symlink_metadata(&p) {
+            Ok(md) => {
+                if md.file_type().is_symlink() {
+                    return true;
+                }
+            }
+            // Does not exist yet: nothing to follow.
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Compute the toolchain grants for a language's Phase B analyzer.
@@ -1171,6 +1192,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         dir
+    }
+
+    /// The repo-write grant guard: every platform that materialises a grant
+    /// calls this before creating the path as the user, so a link anywhere on
+    /// it must be refused, not just at the leaf.
+    #[test]
+    fn grant_path_symlink_guard_rejects_a_link_at_any_component() {
+        use super::grant_path_has_symlink;
+        let root = scratch("grantlink");
+
+        // A path that does not exist yet is fine: it gets created as a real
+        // file or directory immediately after, then re-stat'd.
+        assert!(!grant_path_has_symlink(&root, "index.scip"));
+
+        // A real file and a real nested directory are both fine.
+        std::fs::write(root.join("real.scip"), b"").expect("write file");
+        std::fs::create_dir_all(root.join("jvm/target")).expect("create dirs");
+        assert!(!grant_path_has_symlink(&root, "real.scip"));
+        assert!(!grant_path_has_symlink(&root, "jvm/target"));
+
+        #[cfg(unix)]
+        {
+            let outside = root.join("outside.txt");
+            std::fs::write(&outside, b"secret").expect("write outside");
+
+            // Leaf is a link.
+            std::os::unix::fs::symlink(&outside, root.join("linked.scip")).expect("symlink");
+            assert!(grant_path_has_symlink(&root, "linked.scip"));
+
+            // An intermediate component is a link: the leaf below it is a real
+            // directory, so a leaf-only check would pass this.
+            let elsewhere = root.join("elsewhere");
+            std::fs::create_dir_all(elsewhere.join("target")).expect("create elsewhere");
+            std::os::unix::fs::symlink(&elsewhere, root.join("js")).expect("symlink dir");
+            assert!(grant_path_has_symlink(&root, "js/target"));
+        }
     }
 
     /// Homebrew layout: `<root>/bin/dotnet` with the SDK under `<root>/libexec`.
