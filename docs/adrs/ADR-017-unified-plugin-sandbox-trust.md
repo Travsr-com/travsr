@@ -381,6 +381,64 @@ SandboxPolicy::Standard
 > **Approved by:** _pending Principal Security Engineer sign-off (drafted
 > 2026-09-10)._
 
+> **Amendment A8 — java, kotlin and csharp get the same build-output grant scala
+> already has (2026-09-11)**
+>
+> These three drive the project's own build tool (maven, gradle, dotnet), which
+> writes its output into the project. They held no repo-write grant at all, so on
+> Linux the `--ro-bind` repo root made javac and the SemanticDB compiler plugin
+> take EROFS and the language indexed to nothing. All three are
+> `RequiresElevated`, and macOS skips `sandbox-exec` entirely for that policy, so
+> the gap never showed on the development platform.
+>
+> The authorised set gains:
+>
+> ```
+> java:   target/ build/ .gradle/
+> kotlin: build/ .gradle/
+> csharp: obj/ bin/
+> ```
+>
+> **Measured, not reasoned.** On Linux under bwrap (arm64, Debian, maven 3.9),
+> with `target/` bound over a read-only repo root: writing new files inside it,
+> deleting files inside it, and deleting its whole CONTENTS all succeed, while a
+> write outside the grant is still denied (EROFS). The single operation that
+> fails is removing the `target` DIRECTORY itself, because that is a write to the
+> read-only parent. By default maven-clean-plugin treats that as fatal:
+> `Failed to delete /repo/target`, BUILD FAILURE, no index at all.
+>
+> The sidecar therefore passes `-Dmaven.clean.failOnError=false`
+> (travsr-lang#31). Re-measured with it: clean still clears the contents, the
+> undeletable directory degrades to a WARNING, javac runs, BUILD SUCCESS. The
+> contents are all `clean` was needed for, since scip-java passes
+> `-Dmaven.compiler.useIncrementalCompilation=false` and clearing the classes is
+> what makes every source stale again. Gradle needs no equivalent, because
+> scip-java drives it through `scipCompileAll` and never runs `clean`.
+>
+> **Residual risk (accepted).** A hostile `pom.xml`, `build.gradle` or `.csproj`
+> executes during indexing, which is inherent to analysing those projects, and
+> can now write under the listed build directories. It still cannot touch source,
+> `.git`, or anything outside the list. This is strictly LESS exposure than the
+> status quo on macOS, where all three run with no filesystem confinement at all.
+> The grants are compile-time `&'static str` matched on `language`, with no `..`
+> and no repo-controlled input, so Rule 3 holds.
+>
+> **Verification gap, stated.** java/maven is verified end to end on Linux as
+> above. kotlin and csharp are the same mechanism on their toolchains' standard
+> output directories and are NOT verified end to end. If either still indexes
+> empty on Linux, the missing directory belongs on this list, and that is the
+> expected way this list grows.
+>
+> **Supersedes** the earlier review position that this needed an RFC on the grant
+> mechanism before anything could be granted. That position rested on an
+> unexecuted reading of the bwrap source and, once run, cost four lines and one
+> maven flag.
+>
+> Pinned by `repo_write_grants_are_exactly_the_authorised_set`.
+>
+> **Approved by:** _pending Principal Security Engineer sign-off (drafted
+> 2026-09-11)._
+
 Mechanism by platform (DevOps owns the implementation, Security owns the policy):
 
 | Platform | Primary mechanism | Fallback |

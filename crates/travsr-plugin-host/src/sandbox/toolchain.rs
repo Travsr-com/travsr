@@ -85,7 +85,11 @@ impl RepoWrite {
 }
 
 /// The exact repo-relative subpaths `language`'s Phase B analyzer must write,
-/// keeping the rest of the repo root read-only. Empty for every language except
+/// keeping the rest of the repo root read-only. Empty for every language whose
+/// analyzer writes only outside the repo; non-empty for the ones that drive the
+/// project's own build tool (scala, java, kotlin, csharp) and for php, whose
+/// analyzer hardcodes its output path.
+///
 /// scala: `sbt compile` writes build outputs to `target/` inside the project
 /// (sbt's layout has no out-of-tree build option): at the root, under
 /// `project/`, and once per platform in an sbt-crossproject tree. And
@@ -125,6 +129,33 @@ pub fn repo_write_subpaths(language: &str) -> &'static [RepoWrite] {
         // silent empty index rather than a reported failure. The sidecar moves
         // the file into scratch and removes it, so nothing survives the run.
         "php" => &[RepoWrite::File("index.scip")],
+        // These three drive the project's own build tool, which writes its
+        // output into the project. Same trade scala already makes, same shape
+        // of grant, and without it their Phase B is dead on Linux: the repo root
+        // is a `--ro-bind`, so javac and the compiler plugin take EROFS and the
+        // language indexes to nothing. All three are `RequiresElevated`, which
+        // on macOS skips the sandbox entirely, which is why this was invisible.
+        //
+        // Verified on Linux for java/maven (bwrap, arm64): with `target/` bound
+        // over a read-only root, writing new files, deleting files inside it and
+        // deleting its CONTENTS all succeed, and a write outside the grant is
+        // still denied. Only removing the `target` directory itself fails, and
+        // the java sidecar passes `-Dmaven.clean.failOnError=false` so `clean`
+        // degrades that to a warning: contents are still cleared, javac still
+        // runs, BUILD SUCCESS. Gradle needs no equivalent flag because scip-java
+        // drives it through `scipCompileAll` and never runs `clean`.
+        //
+        // kotlin and csharp are the same mechanism on the standard output
+        // directories for their toolchains, but they are NOT verified end to end
+        // the way java is. If one of them still indexes empty on Linux, the
+        // missing directory belongs on this list.
+        "java" => &[
+            RepoWrite::Dir("target"),
+            RepoWrite::Dir("build"),
+            RepoWrite::Dir(".gradle"),
+        ],
+        "kotlin" => &[RepoWrite::Dir("build"), RepoWrite::Dir(".gradle")],
+        "csharp" => &[RepoWrite::Dir("obj"), RepoWrite::Dir("bin")],
         _ => &[],
     }
 }

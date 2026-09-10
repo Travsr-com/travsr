@@ -576,18 +576,38 @@ fn repo_write_grants_are_exactly_the_authorised_set() {
         vec![RepoWrite::File("index.scip")],
         "php's repo-write grant must be the single output file, never a directory"
     );
+    // These three drive the project's own build tool, which writes into the
+    // project. Verified on Linux for java/maven: `target/` bound over a
+    // read-only root lets clean clear the contents and javac run, while a write
+    // outside the grant is still denied.
+    assert_eq!(
+        repo_write_subpaths("java").to_vec(),
+        vec![
+            RepoWrite::Dir("target"),
+            RepoWrite::Dir("build"),
+            RepoWrite::Dir(".gradle"),
+        ],
+        "java's repo-write grant must match ADR-017 Amendment A8 exactly"
+    );
+    assert_eq!(
+        repo_write_subpaths("kotlin").to_vec(),
+        vec![RepoWrite::Dir("build"), RepoWrite::Dir(".gradle")],
+        "kotlin's repo-write grant must match ADR-017 Amendment A8 exactly"
+    );
+    assert_eq!(
+        repo_write_subpaths("csharp").to_vec(),
+        vec![RepoWrite::Dir("obj"), RepoWrite::Dir("bin")],
+        "csharp's repo-write grant must match ADR-017 Amendment A8 exactly"
+    );
 
     // Everything else keeps a fully read-only repo root.
     for lang in [
         "go",
-        "java",
-        "kotlin",
         "rust",
         "python",
         "typescript",
         "javascript",
         "ruby",
-        "csharp",
         "dart",
         "swift",
         "objectivec",
@@ -602,7 +622,7 @@ fn repo_write_grants_are_exactly_the_authorised_set() {
     }
 
     // No grant may name the repo root itself or escape it.
-    for lang in ["scala", "php"] {
+    for lang in ["scala", "php", "java", "kotlin", "csharp"] {
         for entry in repo_write_subpaths(lang) {
             let sub = entry.subpath();
             assert!(
