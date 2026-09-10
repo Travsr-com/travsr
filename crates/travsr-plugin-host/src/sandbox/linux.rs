@@ -8,6 +8,16 @@ use std::process::Command;
 /// Permitted env vars (ADR-017 Rule 1). TMPDIR set by caller to scratch dir.
 pub const ENV_ALLOWLIST: &[&str] = &["PATH", "LANG", "LC_ALL"];
 
+/// Where the host's scratch directory is mounted INSIDE the sandbox.
+///
+/// bwrap remaps it rather than binding it at its own host path, so this is the
+/// only name a sandboxed sidecar can reach it by: `/tmp` is not bound and the
+/// namespace root is a fresh tmpfs, so the host path resolves to nothing. Both
+/// the `--bind` below and the `TMPDIR` handed to the child use this constant,
+/// and so does [`crate::sandbox::sidecar_scratch_path`], which is what tells a
+/// sidecar the name it can actually open.
+pub const SCRATCH_MOUNT: &str = "/travsr-scratch";
+
 #[cfg(target_os = "linux")]
 pub fn build_sandboxed_command(
     program: &str,
@@ -87,13 +97,13 @@ pub fn build_sandboxed_command(
     // which runs as that same UID since we don't remap with --unshare-user — can
     // write to it. bwrap creates the /travsr-scratch mount point in its root
     // tmpfs automatically. A plain --tmpfs would be root-owned and unwritable.
-    cmd.args(["--bind", scratch.as_ref(), "/travsr-scratch"]); // writable scratch
-                                                               // ADR-017 Rule 1: the repo root is read-only. A language that must write
-                                                               // build outputs into its own project tree (scala: sbt has no out-of-tree
-                                                               // build) gets writable binds for exactly those subpaths, layered over the
-                                                               // read-only root — never the whole repo. bwrap needs the mount source to
-                                                               // exist, so the host subpath is created first (build-artifact dirs / the
-                                                               // generated settings file — the same paths the analyzer writes anyway).
+    cmd.args(["--bind", scratch.as_ref(), SCRATCH_MOUNT]); // writable scratch
+                                                           // ADR-017 Rule 1: the repo root is read-only. A language that must write
+                                                           // build outputs into its own project tree (scala: sbt has no out-of-tree
+                                                           // build) gets writable binds for exactly those subpaths, layered over the
+                                                           // read-only root — never the whole repo. bwrap needs the mount source to
+                                                           // exist, so the host subpath is created first (build-artifact dirs / the
+                                                           // generated settings file — the same paths the analyzer writes anyway).
     cmd.args(["--ro-bind", repo.as_ref(), repo.as_ref()]); // repo: ro
     for entry in crate::sandbox::toolchain::repo_write_subpaths(language) {
         let host = std::path::Path::new(repo.as_ref()).join(entry.subpath());
@@ -183,7 +193,7 @@ pub fn build_sandboxed_command(
             cmd.env(key, val);
         }
     }
-    cmd.env("TMPDIR", "/travsr-scratch");
+    cmd.env("TMPDIR", SCRATCH_MOUNT);
     // Per-language toolchain env (e.g. GOPATH/GOCACHE/GOMODCACHE/HOME) so the
     // analyzer's build tool locates its caches inside the cleared sandbox env.
     for (key, val) in &tc.env {

@@ -34,11 +34,26 @@ pub struct InvokeRequest {
     /// with plugin binaries that predate this field.
     #[serde(default)]
     pub corpus: String,
-    /// Sandbox-authorized writable scratch directory. Sidecar tools that need to
-    /// write temp files (e.g. scip-clang SCIP output, scip-ruby index) MUST place
-    /// them under this path — the sandbox's write grant covers only this directory.
-    /// Defaults to empty (older daemons) in which case the sidecar may fall back to
-    /// `std::env::temp_dir()`, accepting that the sandbox may deny the write.
+    /// Sandbox-authorized writable scratch directory, expressed as the SIDECAR
+    /// sees it rather than as the host does. Sidecar tools that need to write
+    /// temp files (e.g. scip-clang SCIP output, scip-ruby index) SHOULD place
+    /// them under this path: the sandbox's write grant covers only this
+    /// directory.
+    ///
+    /// The two views differ on Linux, where bwrap binds the host directory at a
+    /// fixed mount point instead of at its own path, so the host path resolves
+    /// to nothing inside the namespace. `travsr-plugin-host`'s
+    /// `sandbox::sidecar_scratch_path` is what converts one to the other.
+    ///
+    /// Falling back to `std::env::temp_dir()` is safe rather than a gamble, and
+    /// the previous wording here had it backwards: the sandbox sets `TMPDIR` to
+    /// that same scratch mount, so the fallback lands in exactly the directory
+    /// the write grant covers.
+    ///
+    /// Validate before trusting it. Empty means a daemon older than the field,
+    /// and a daemon older than the remap above sends its own host path, which a
+    /// sandboxed sidecar cannot open. Check that it names a directory this
+    /// process can see and fall back to a tempdir when it does not.
     #[serde(default)]
     pub scratch: PathBuf,
     /// Pre-walked list of source files for this language (repo-root-relative paths),

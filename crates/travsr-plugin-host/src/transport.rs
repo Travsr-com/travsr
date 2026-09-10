@@ -479,8 +479,17 @@ impl Transport for Sidecar {
     fn invoke_phase_b(&self, mut req: InvokeRequest) -> Result<InvokeResponse, IndexError> {
         // Inject the sandbox-authorized scratch dir so the sidecar can write
         // temp files (SCIP output, etc.) inside the sandbox's allowed write area.
+        //
+        // As the SIDECAR sees it, not as this process does. On Linux bwrap binds
+        // the host directory at a fixed mount point instead of at its own path,
+        // so sending the host path handed the sidecar a name that resolves to
+        // nothing inside its namespace: every write through the field failed and
+        // the language reported a zero-node index with no error. `ruby`, `c` and
+        // `cpp` all consume this field directly, so all three were affected.
+        // See `sandbox::sidecar_scratch_path` for why the remap is
+        // unconditional on Linux and a no-op everywhere else.
         if let Some(scratch) = self._scratch.as_ref() {
-            req.scratch = scratch.path().to_path_buf();
+            req.scratch = crate::sandbox::sidecar_scratch_path(scratch.path());
         }
         let io_lock = match &self.io {
             Some(m) => m,
