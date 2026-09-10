@@ -7361,7 +7361,6 @@ fn strip_native_kind_prefix(label: &str) -> &str {
         .unwrap_or(label)
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Mark the name-matched edges in a `get_graph_json` edge array.
 ///
 /// The tree view flagged these and the edge array did not, so a renderer
@@ -7380,6 +7379,7 @@ fn mark_heuristic_edges(edges: &mut [serde_json::Value]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn get_graph_json_raw(
     store: &SqliteStore,
     query: &str,
