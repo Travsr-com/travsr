@@ -286,13 +286,43 @@ SandboxPolicy::Standard
 > hostile php repo's composer configuration, run during indexing (inherent to
 > analysing them) and can write under the listed build directories and the two
 > named files. They still cannot modify source, `.git`, or any path outside the
-> list, and can no longer reach outside the repo through a symlinked grant path.
-> php's single grant is a file, not a directory. Pinned by
+> list. php's single grant is a file, not a directory. Pinned by
 > `repo_write_grants_are_exactly_the_authorised_set` (all platforms, enumerates
 > the list so a future widening must be a deliberate test edit),
 > `sandbox_scala_repo_write_is_narrowed_to_build_subpaths` and
 > `sandbox_php_repo_write_is_narrowed_to_index_scip` (Linux, run bwrap on CI), and
 > `sandbox_symlinked_repo_write_grant_is_refused` (Linux).
+>
+> **Scope of the symlink guard (Security review, 2026-09-11).** It closes the
+> threat this ADR models, which is hostile repo *content*: a link committed to
+> the repository, and so present before the run starts, is refused at every
+> component of the grant path. It does NOT close a concurrent local attacker who
+> swaps an intermediate component between the component walk and the
+> `create_dir_all`, because the post-create re-stat checks the leaf only and
+> resolves the components above it. That attacker already has code execution as
+> the user on the machine being indexed, which is outside this ADR's model, so it
+> is accepted rather than mitigated. Closing it properly needs
+> `openat2(RESOLVE_NO_SYMLINKS)` on Linux and the equivalent elsewhere. The
+> earlier wording here claimed the guard meant a grant path "can no longer reach
+> outside the repo", which overstates it; that sentence is removed above.
+>
+> **The host writes into the checkout to establish these grants (Security review,
+> 2026-09-11).** bwrap needs its bind source to exist and a Windows ACL can only
+> be set on an existing object, so the host `create_dir_all`s every `Dir` grant
+> and touches every `File` grant, as the user and UNSANDBOXED, on every run of
+> that language. Indexing a scala repo therefore creates up to six directories
+> and one file in the working tree, and nothing removes them. Not an escape, but
+> it is unrequested mutation of the user's tree by the mechanism that exists to
+> prevent mutation, and it dirties `git status`. Accepted for now, tracked for
+> whoever next touches this path.
+>
+> **`.travsr-semanticdb.sbt` is already vestigial (Security review,
+> 2026-09-11).** travsr-lang#31 (commit `e00ccfc`) replaced the injected settings
+> file with an `sbt` command line, so no current sidecar writes that name. The
+> grant is retained deliberately: already-released sidecars still inject the file
+> and would take EROFS on Linux without it. Drop it once a minimum sidecar
+> version is enforced. The enumeration above therefore lists one grant that is
+> live for old sidecars only.
 >
 > **Approved by:** _pending Principal Security Engineer sign-off (drafted
 > 2026-09-10 with the fix for the symlinked-grant escape)._
@@ -329,6 +359,24 @@ SandboxPolicy::Standard
 > pull requests, so this change is covered by a Windows-target type-check and by
 > the portable guard unit test, not by a spawn on Windows. Running that workflow
 > before merge is the remaining verification.
+>
+> **A `File` grant is wider than it needs to be (Security review, 2026-09-11).**
+> `ACCESS_GENERIC_ALL` on a file maps to `FILE_ALL_ACCESS`, which includes
+> `DELETE`. A sidecar has no legitimate reason to unlink a file in the user's
+> repository, and granting it opens a one-way door: the delete succeeds, and the
+> recreate then needs `FILE_ADD_FILE` on the repo root, which is deliberately
+> only `ACCESS_GENERIC_READ`. travsr-lang#31 hit exactly that and destroyed the
+> user's `index.scip` on Windows before it was corrected on the sidecar side.
+> The durable fix belongs here, not there: a `RepoWrite::File` should be granted
+> read plus write WITHOUT `DELETE`, so the class is unreachable whatever a
+> sidecar does. Recorded as SEV-4 (defence in depth) rather than a merge blocker,
+> because the sidecar-side fix removes the live exploit path and narrowing the
+> mask is a change to the trust-boundary crate that deserves its own review.
+>
+> **Type-check confirmed (Security review, 2026-09-11).**
+> `cargo check --target x86_64-pc-windows-gnu -p travsr-plugin-host --all-targets`
+> is clean, so the claim above is now evidenced rather than asserted. It is still
+> not a spawn: running `sandbox-windows.yml` before merge remains required.
 >
 > **Approved by:** _pending Principal Security Engineer sign-off (drafted
 > 2026-09-10)._
