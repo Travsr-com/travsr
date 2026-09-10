@@ -145,16 +145,28 @@ pub fn repo_write_subpaths(language: &str) -> &'static [RepoWrite] {
         // runs, BUILD SUCCESS. Gradle needs no equivalent flag because scip-java
         // drives it through `scipCompileAll` and never runs `clean`.
         //
-        // kotlin and csharp are the same mechanism on the standard output
-        // directories for their toolchains, but they are NOT verified end to end
-        // the way java is. If one of them still indexes empty on Linux, the
-        // missing directory belongs on this list.
+        // kotlin and csharp were measured the same way, on the same host.
+        // csharp needed nothing beyond `obj/` and `bin/`: `dotnet build` writes
+        // its assembly and succeeds. kotlin needed one directory that guessing
+        // would have missed, and did miss: the Kotlin Gradle Plugin opens a
+        // build session under `<project>/.kotlin/sessions/`, so without it
+        // `compileKotlin` dies with
+        // `FileSystemException: .kotlin/sessions/....salive: Read-only file
+        // system` while every other grant is in place. With it, the same build
+        // compiles. `.kotlin` is deliberately NOT on java's list: a pure java
+        // gradle build never loads that plugin, and a mixed java/kotlin repo
+        // that turns out to need it is one line, added when it is observed
+        // rather than guessed at now.
         "java" => &[
             RepoWrite::Dir("target"),
             RepoWrite::Dir("build"),
             RepoWrite::Dir(".gradle"),
         ],
-        "kotlin" => &[RepoWrite::Dir("build"), RepoWrite::Dir(".gradle")],
+        "kotlin" => &[
+            RepoWrite::Dir("build"),
+            RepoWrite::Dir(".gradle"),
+            RepoWrite::Dir(".kotlin"),
+        ],
         "csharp" => &[RepoWrite::Dir("obj"), RepoWrite::Dir("bin")],
         _ => &[],
     }

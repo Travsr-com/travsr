@@ -591,7 +591,14 @@ fn repo_write_grants_are_exactly_the_authorised_set() {
     );
     assert_eq!(
         repo_write_subpaths("kotlin").to_vec(),
-        vec![RepoWrite::Dir("build"), RepoWrite::Dir(".gradle")],
+        vec![
+            RepoWrite::Dir("build"),
+            RepoWrite::Dir(".gradle"),
+            // The Kotlin Gradle Plugin's build session dir. Measured: without
+            // it compileKotlin dies on a read-only .kotlin/sessions/ even with
+            // every other grant present.
+            RepoWrite::Dir(".kotlin"),
+        ],
         "kotlin's repo-write grant must match ADR-017 Amendment A8 exactly"
     );
     assert_eq!(

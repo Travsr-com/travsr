@@ -395,7 +395,7 @@ SandboxPolicy::Standard
 >
 > ```
 > java:   target/ build/ .gradle/
-> kotlin: build/ .gradle/
+> kotlin: build/ .gradle/ .kotlin/
 > csharp: obj/ bin/
 > ```
 >
@@ -423,11 +423,25 @@ SandboxPolicy::Standard
 > The grants are compile-time `&'static str` matched on `language`, with no `..`
 > and no repo-controlled input, so Rule 3 holds.
 >
-> **Verification gap, stated.** java/maven is verified end to end on Linux as
-> above. kotlin and csharp are the same mechanism on their toolchains' standard
-> output directories and are NOT verified end to end. If either still indexes
-> empty on Linux, the missing directory belongs on this list, and that is the
-> expected way this list grows.
+> **All three verified on Linux (2026-09-11).** kotlin and csharp were measured
+> the same way, on the same host, rather than inferred from java.
+>
+> csharp needed nothing beyond `obj/` and `bin/`: `dotnet build --no-restore`
+> inside the sandbox emits its assembly and reports `Build succeeded, 0 Errors`.
+>
+> kotlin needed a directory that inference had missed, and this is the reason
+> the list is measured rather than reasoned. With `build/` and `.gradle/` granted
+> and outputs wiped to force a real compile, `compileKotlin` FAILED on
+> `java.nio.file.FileSystemException:
+> /repo/.kotlin/sessions/kotlin-compiler-*.salive: Read-only file system`. The
+> Kotlin Gradle Plugin opens a build session under `<project>/.kotlin/`. Adding
+> that one directory turns the same build into `BUILD SUCCESSFUL` with the class
+> file written. An earlier run that reported success without it proved nothing:
+> every task was `UP-TO-DATE`, which is why the outputs are wiped first.
+>
+> `.kotlin/` is deliberately NOT on java's list. A pure java gradle build never
+> loads that plugin. A mixed java/kotlin repo that turns out to need it is one
+> line, added when it is observed rather than guessed at now.
 >
 > **Supersedes** the earlier review position that this needed an RFC on the grant
 > mechanism before anything could be granted. That position rested on an
