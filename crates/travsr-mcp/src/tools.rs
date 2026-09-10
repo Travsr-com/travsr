@@ -3944,17 +3944,27 @@ fn ambiguous_endpoint_message(which: &str, name: &str, candidates: &[CoreNode]) 
     } else {
         // A real path off the candidate list, not a `<dir>` placeholder: the MCP
         // sanitizer escapes angle brackets, so a placeholder reaches the caller
-        // as `&lt;dir&gt;`. `graph` uses the same idiom for its signature hint.
+        // as `&lt;dir&gt;` (#799 review round 2). `graph` uses the same idiom for
+        // its signature hint.
+        //
+        // When no candidate carries a path (the empty string sorts first, so this
+        // is reachable) the `graph --path` half is dropped rather than filled with
+        // a placeholder. Prose in an argument position does not read as a command,
+        // and a bracketed one would reintroduce the very escaping this avoids.
         let example = candidates
             .first()
             .map(|n| n.vname.path.as_str())
-            .filter(|p| !p.is_empty())
-            .unwrap_or("<the file you want>");
+            .filter(|p| !p.is_empty());
+        let lever = match example {
+            Some(path) => {
+                format!("find_references (`path` hint) or `travsr graph {name} --path {path}`")
+            }
+            None => "find_references (`path` hint)".to_string(),
+        };
         format!(
             "{head} A signature listed once below resolves uniquely on a re-run; one \
              listed more than once returns this same list, and get_execution_path takes \
-             no path argument. For those, narrow by location first with find_references \
-             (`path` hint) or `travsr graph {name} --path {example}`:"
+             no path argument. For those, narrow by location first with {lever}:"
         )
     };
     for n in candidates.into_iter().take(limit) {
@@ -12445,6 +12455,52 @@ mod snippet_tests {
             result.contains("which each resolve uniquely"),
             "distinct signatures each resolve uniquely, so the hatch is real \
              here and must be offered; got: {result}"
+        );
+    }
+
+    /// #799 review round 2: no branch of `ambiguous_endpoint_message` may emit
+    /// angle brackets. The MCP sanitizer escapes them, so a `<dir>`-shaped
+    /// placeholder reaches the caller as `&lt;dir&gt;` -- the defect the real-path
+    /// hint was introduced to avoid. The empty-path fallback is the branch that
+    /// reintroduced it, and it is reachable: the empty string sorts first.
+    #[test]
+    fn get_execution_path_ambiguity_never_emits_angle_brackets() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Same signature twice (so the non-unique branch fires) with the
+        // path-sorted first candidate carrying no path at all.
+        for path in ["", "b/y.rb"] {
+            store
+                .put_node(&Node::new(
+                    VName::new("t", "", path, "ruby", "method:Runner.run"),
+                    "method",
+                ))
+                .unwrap();
+        }
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "b/y.rb", "ruby", "method:Runner.sink"),
+                "method",
+            ))
+            .unwrap();
+
+        let result = get_execution_path(&store, "Runner.run", "sink");
+        assert!(
+            result.contains("ambiguous"),
+            "precondition: the set must be ambiguous; got: {result}"
+        );
+        // The `<travsr-data>` envelope is added by the caller and legitimately
+        // carries brackets, so assert on the body it wraps.
+        let body = result
+            .replace("<travsr-data>", "")
+            .replace("</travsr-data>", "");
+        assert!(
+            !body.contains('<') && !body.contains('>'),
+            "no branch may emit angle brackets, the sanitizer escapes them; got: {body}"
+        );
+        assert!(
+            !body.contains("&lt;") && !body.contains("&gt;"),
+            "and none may reach the caller already escaped; got: {body}"
         );
     }
 
