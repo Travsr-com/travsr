@@ -5,7 +5,7 @@
 //! `run_scip_python`     — scip-python SCIP indexer for Python (legacy / deprecated).
 
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -253,20 +253,68 @@ fn resolve_lsif_emitter() -> (String, Vec<String>) {
 /// - Non-zero exit code (first 5 lines of stderr included)
 /// - Timeout exceeded
 pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
+    run_lsif_emitter_impl(tsconfig, None)
+}
+
+/// Like [`run_lsif_emitter`], but computes emitted VName paths and the SEC-003
+/// containment root against `root` rather than the tsconfig's own directory.
+///
+/// Used when `tsconfig` is a synthesized ephemeral file living outside the repo
+/// (see [`synthesize_js_tsconfig`]) so that JavaScript sources without a project
+/// tsconfig still get semantic edges (#833). The emitter's repo-relative paths
+/// must match the tree-sitter node ids, which the Rust side computes relative to
+/// the repo root, so `root` must be that repo root.
+pub fn run_lsif_emitter_with_root(tsconfig: &Path, root: &Path) -> anyhow::Result<String> {
+    run_lsif_emitter_impl(tsconfig, Some(root))
+}
+
+/// Minimum `travsr-lsif-ts` that understands `--root`. Older emitters ignore
+/// the flag, so `basePath` stays the synthesized tsconfig's temp dir and the
+/// SEC-003 containment check rejects every `files[]` entry as outside the root.
+/// The emitter ships separately from the binary, so that is the normal upgrade
+/// path, not a corner case — the failure must name its own fix.
+const LSIF_TS_MIN_VERSION_FOR_ROOT: &str = "0.5.0";
+
+/// Marker attached to the *spawn* failure in [`run_lsif_emitter_impl`] so
+/// callers can tell "the emitter is not installed" — expected, log at debug —
+/// from "the emitter ran and failed" — actionable, log at warn with its stderr.
+/// Test with [`emitter_missing`].
+#[derive(Debug)]
+pub struct EmitterNotFound;
+
+impl std::fmt::Display for EmitterNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("travsr-lsif-ts could not be started")
+    }
+}
+
+impl std::error::Error for EmitterNotFound {}
+
+/// True when `err` from [`run_lsif_emitter`] / [`run_lsif_emitter_with_root`]
+/// means the emitter could not be started at all. False for every failure of an
+/// emitter that *did* run (non-zero exit, timeout, oversized output), which is
+/// a real fault and must not be reported to the user as "not available".
+pub fn emitter_missing(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<EmitterNotFound>())
+}
+
+fn run_lsif_emitter_impl(tsconfig: &Path, root: Option<&Path>) -> anyhow::Result<String> {
     let (program, prefix_args) = resolve_lsif_emitter();
-    let child = std::process::Command::new(&program)
-        .args(&prefix_args)
-        .arg("--project")
-        .arg(tsconfig)
+    let mut command = std::process::Command::new(&program);
+    command.args(&prefix_args).arg("--project").arg(tsconfig);
+    if let Some(root) = root {
+        command.arg("--root").arg(root);
+    }
+    let child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .with_context(|| {
-            format!(
+        .map_err(|e| {
+            anyhow::Error::new(EmitterNotFound).context(format!(
                 "could not run travsr-lsif-ts for {} \
-                 (emitter not found; check TRAVSR_LSIF_TS or reinstall travsr)",
+                 (emitter not found: {e}; check TRAVSR_LSIF_TS or reinstall travsr)",
                 tsconfig.display()
-            )
+            ))
         })?;
 
     let (status, stdout_bytes, stderr) =
@@ -274,10 +322,90 @@ pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
 
     if !status.success() {
         let stderr_head = stderr.lines().take(5).collect::<Vec<_>>().join("\n");
-        anyhow::bail!("travsr-lsif-ts exited with {status}: {stderr_head}");
+        // An emitter predating `--root` fails exactly here on the synthesized
+        // pass, so point at the version rather than leaving a bare SEC-003
+        // rejection the reader cannot act on.
+        let hint = if root.is_some() {
+            format!(" (--root needs travsr-lsif-ts >= {LSIF_TS_MIN_VERSION_FOR_ROOT}; reinstall the emitter if it is older)")
+        } else {
+            String::new()
+        };
+        anyhow::bail!("travsr-lsif-ts exited with {status}: {stderr_head}{hint}");
     }
 
     Ok(String::from_utf8_lossy(&stdout_bytes).into_owned())
+}
+
+/// File extensions treated as JavaScript for the synthesized-tsconfig pass.
+/// TypeScript (`ts`/`tsx`/`mts`/`cts`) is already covered by a project tsconfig
+/// when one exists, so only these are swept into the JS fallback.
+pub const JS_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs"];
+
+/// Write an ephemeral `tsconfig.json` into a fresh temp dir that makes the
+/// TypeScript compiler resolve `js_files` with `allowJs`, so CommonJS / plain-JS
+/// repos get real cross-file semantic edges even when they ship no project
+/// tsconfig (or one that omits `allowJs`) — issue #833.
+///
+/// `js_files` MUST be absolute paths that live under the repo root the caller
+/// later passes to [`run_lsif_emitter_with_root`]; the emitter's SEC-003
+/// containment check rejects anything resolving outside it. The paths go into
+/// the config's `files[]` (not an `include` glob) so the compiler processes
+/// exactly the set Phase A indexed — no directory walk, and no ranges emitted
+/// for files that have no tree-sitter node (which would orphan edges).
+///
+/// Returns the owning [`tempfile::TempDir`] (keep it alive until the emitter has
+/// run) together with the written tsconfig path, or `Ok(None)` when `js_files`
+/// is empty.
+pub fn synthesize_js_tsconfig(
+    js_files: &[PathBuf],
+) -> anyhow::Result<Option<(tempfile::TempDir, PathBuf)>> {
+    if js_files.is_empty() {
+        return Ok(None);
+    }
+
+    let dir = tempfile::Builder::new()
+        .prefix("travsr-js-tsconfig-")
+        .tempdir()
+        .context("creating synthetic tsconfig dir")?;
+
+    let files: Vec<String> = js_files
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+
+    // `bundler` resolution is the permissive resolver that handles both the
+    // CommonJS `require()` case #833 reports and extensionless relative ESM
+    // imports (`import { add } from './math'`) — the ordinary Vite / webpack /
+    // Next convention. It replaces `commonjs`/`node` (node10), which TypeScript
+    // removes in 6.0. `node16` was the first replacement tried, but under a
+    // `"type": "module"` package it treats an extensionless `.js` import as
+    // unresolved ESM and, with `checkJs` off, drops the cross-file reference
+    // with no diagnostic: measured over CJS + ESM fixtures node16 leaves CJS
+    // byte-identical but takes the ESM case from 2 reference edges to 0, the
+    // opposite of what this pass is for. `module: "preserve"` is the pairing
+    // `moduleResolution: "bundler"` requires and lets a file mix `import` and
+    // `require`. checkJs/noEmit keep it a pure resolution pass — we never
+    // type-check or write output. (integration.test.ts pins the ESM behaviour;
+    // a config-keys-only test cannot, since the keys are exactly what changed.)
+    let config = serde_json::json!({
+        "compilerOptions": {
+            "allowJs": true,
+            "checkJs": false,
+            "noEmit": true,
+            "module": "preserve",
+            "moduleResolution": "bundler",
+            "target": "es2020",
+            "resolveJsonModule": true,
+            "skipLibCheck": true,
+        },
+        "files": files,
+    });
+
+    let path = dir.path().join("tsconfig.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&config)?)
+        .with_context(|| format!("writing synthetic tsconfig {}", path.display()))?;
+
+    Ok(Some((dir, path)))
 }
 
 // ── scip-python ───────────────────────────────────────────────────────────────
@@ -1221,5 +1349,75 @@ mod tests {
             .expect("must return within watchdog window");
         let dump = result.expect("must succeed").expect("must be Some");
         assert_eq!(dump.len(), 131072);
+    }
+
+    // ── emitter failure classification (#833 review) ────────────────────────
+
+    #[test]
+    fn emitter_missing_distinguishes_spawn_failure_from_a_failed_run() {
+        // Spawn failure: the emitter is not installed. Callers log this at
+        // debug and move on.
+        let not_installed = anyhow::Error::new(EmitterNotFound)
+            .context("could not run travsr-lsif-ts for /tmp/x/tsconfig.json");
+        assert!(emitter_missing(&not_installed));
+
+        // The emitter ran and rejected the run (this is what a pre-`--root`
+        // emitter does to the synthesized pass). It must NOT be reported as
+        // "not available", or a stale emitter is undiagnosable.
+        let ran_and_failed = anyhow::anyhow!(
+            "travsr-lsif-ts exited with exit status: 1: SEC-003: file outside root"
+        );
+        assert!(!emitter_missing(&ran_and_failed));
+    }
+
+    // ── synthesize_js_tsconfig (#833) ───────────────────────────────────────
+
+    #[test]
+    fn synthesize_js_tsconfig_returns_none_for_no_js_files() {
+        let out = synthesize_js_tsconfig(&[]).expect("must not error");
+        assert!(out.is_none(), "empty input must synthesize nothing");
+    }
+
+    #[test]
+    fn synthesize_js_tsconfig_enables_allow_js_and_lists_the_files() {
+        let files = vec![
+            PathBuf::from("/repo/math.js"),
+            PathBuf::from("/repo/main.js"),
+        ];
+        let (dir, path) = synthesize_js_tsconfig(&files)
+            .expect("must not error")
+            .expect("must synthesize a config");
+
+        // The config lives inside the temp dir, not the repo.
+        assert!(
+            path.starts_with(dir.path()),
+            "tsconfig must live in the temp dir"
+        );
+        assert_eq!(path.file_name().unwrap(), "tsconfig.json");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // allowJs is the whole point — without it tsc ignores .js sources.
+        assert_eq!(json["compilerOptions"]["allowJs"], serde_json::json!(true));
+        assert_eq!(json["compilerOptions"]["noEmit"], serde_json::json!(true));
+        // bundler resolution, not the deprecated node10 resolver, paired with
+        // `module: "preserve"` (bundler requires an esnext/preserve module).
+        // This only guards that the Rust side writes the intended keys; the ESM
+        // extensionless-import behaviour those keys buy is pinned by the
+        // emitter's integration.test.ts, which a config-keys check cannot cover.
+        assert_eq!(
+            json["compilerOptions"]["module"],
+            serde_json::json!("preserve")
+        );
+        assert_eq!(
+            json["compilerOptions"]["moduleResolution"],
+            serde_json::json!("bundler")
+        );
+        // Exactly the files we asked for, in order, so the compiler processes
+        // only what Phase A indexed (no directory walk, no orphan-edge risk).
+        assert_eq!(
+            json["files"],
+            serde_json::json!(["/repo/math.js", "/repo/main.js"])
+        );
     }
 }

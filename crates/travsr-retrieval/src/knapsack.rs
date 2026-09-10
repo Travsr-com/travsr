@@ -115,7 +115,11 @@ pub fn knapsack(items: Vec<(Node, f32)>, token_budget: usize) -> Vec<Node> {
 /// Greedy fallback: sort by value/cost ratio, fill until budget exhausted.
 /// Near-optimal when per-item weights are similar (typical for PPR output).
 fn knapsack_greedy(items: &[(Node, f32)], token_budget: usize) -> Vec<Node> {
-    tracing::warn!(
+    // #824: debug, not warn. At the default 4096 budget this fires for any
+    // n > 122, so on a broad query it is the ordinary path, not an anomaly, and
+    // a WARN that fires on the ordinary path only teaches operators to ignore
+    // warnings. The selection is still budget-correct either way.
+    tracing::debug!(
         n = items.len(),
         token_budget,
         "knapsack: DP_CELL_LIMIT exceeded, falling back to greedy"

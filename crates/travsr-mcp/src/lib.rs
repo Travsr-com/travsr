@@ -126,7 +126,8 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
 
     use travsr_error::StoreError;
     use travsr_plugin_host::{
-        active_backend_id, embed_backends, lookup_embed_backend, EmbedQueryHook, EmbedSupervisor,
+        active_backend_id, embed_backends, lookup_embed_backend, repo_backend_id, EmbedQueryHook,
+        EmbedSupervisor,
     };
     use travsr_store::{EmbedKnnHook, EmbedReadiness, EmbedScoreHook};
 
@@ -137,12 +138,30 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     }
 
     let Some(home) = dirs::home_dir() else { return };
-    let backend = active_backend_id()
+    // #481: the embedding backend is a per-repo setting; `~/.travsr/embed.toml`
+    // is only the fallback. Reading the machine-global id here started the
+    // sidecar with a different model than this repo's index was built with, so
+    // `knn_hook`/`doc_knn_hook` were armed against a space that does not exist
+    // for that model id. The doc hook then stayed `None` forever and the docs
+    // section vanished with no error on every `get_context`, while `travsr ask`
+    // (served by the daemon, which resolves the repo model) still rendered it.
+    // Same resolution order as travsr-cli's embed paths.
+    let backend = db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(repo_backend_id)
+        .or_else(active_backend_id)
         .as_deref()
         .and_then(lookup_embed_backend)
         .or_else(|| embed_backends().first())
         .cloned();
     let Some(backend) = backend else { return };
+
+    // Mirror the daemon's guard (travsr-daemon: `embed model_id mismatch`): if
+    // the index records a model, the sidecar's must match it or the hooks would
+    // query a space built by a different encoder. Read before the init thread
+    // because `store` is not `Send`.
+    let stored_model = store.get_meta("current_embed_model").ok().flatten();
 
     let binary = home
         .join(".travsr")
@@ -185,48 +204,79 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     std::thread::Builder::new()
         .name("embed-hook-init".into())
         .spawn(move || {
-            let supervisor = EmbedSupervisor::try_start(&binary, &db_path_bg, &model_id_bg);
-            if supervisor.is_active() {
-                if let Some(mid) = supervisor.model_id().map(str::to_string) {
-                    if let Some(hook) = supervisor.knn_hook(mid.clone()) {
-                        // Warm the sidecar (ONNX + HNSW load) BEFORE arming the
-                        // hook, so the first real query never pays the cold-start
-                        // cost that would trip the host's 600 ms KNN breaker and
-                        // silently degrade to FTS. Blocking — we are already on a
-                        // background init thread, so this delays nothing visible.
-                        supervisor.prewarm();
-                        // RFC-019: arm the query-embedding hook before the KNN slot
-                        // so a query that observes `Some(knn)` also observes the
-                        // score hook (never a half-armed state).
-                        if let Some(qhook) = supervisor.embed_query_hook() {
-                            if let Ok(mut guard) = score_slot_bg.lock() {
-                                *guard = Some(qhook);
+            // Arming lives in a closure so that every exit from it - model
+            // mismatch, inactive supervisor, absent knn hook - still reaches the
+            // single `mark_ready` below. Readiness means "arming has settled",
+            // not "a hook exists": the meta-hooks further down are installed
+            // unconditionally, so `has_embed` is true regardless, and a
+            // readiness that never flips makes every `get_context` block for
+            // `embed_arm_wait_ms()` before degrading to lexical-only.
+            //
+            // Returns whether a KNN hook was actually installed. A `false` is
+            // not a transient state: nothing retries, so semantic search is off
+            // for the life of this process and the query path has to be told,
+            // or it reports `embeddings: on` over a lane that cannot run.
+            let arm = || -> bool {
+                let supervisor = EmbedSupervisor::try_start(&binary, &db_path_bg, &model_id_bg);
+                if supervisor.is_active() {
+                    if let Some(mid) = supervisor.model_id().map(str::to_string) {
+                        if stored_model.as_deref().is_some_and(|stored| stored != mid) {
+                            tracing::warn!(
+                                stored_model = ?stored_model,
+                                plugin_model = %mid,
+                                "embed model_id mismatch, semantic search disabled. \
+                                 Run `travsr embed reindex` to rebuild embeddings with the installed model."
+                            );
+                            return false;
+                        }
+                        if let Some(hook) = supervisor.knn_hook(mid.clone()) {
+                            // Warm the sidecar (ONNX + HNSW load) BEFORE arming the
+                            // hook, so the first real query never pays the cold-start
+                            // cost that would trip the host's 600 ms KNN breaker and
+                            // silently degrade to FTS. Blocking — we are already on a
+                            // background init thread, so this delays nothing visible.
+                            supervisor.prewarm();
+                            // RFC-019: arm the query-embedding hook before the KNN slot
+                            // so a query that observes `Some(knn)` also observes the
+                            // score hook (never a half-armed state).
+                            if let Some(qhook) = supervisor.embed_query_hook() {
+                                if let Ok(mut guard) = score_slot_bg.lock() {
+                                    *guard = Some(qhook);
+                                }
                             }
-                        }
-                        if let Ok(mut guard) = slot_bg.lock() {
-                            *guard = Some(hook);
-                        }
-                        // #376 Phase 2: arm the doc hook alongside the code hook.
-                        // `None` when the sidecar predates doc-space support or
-                        // has no doc-space index — `doc_slot` then simply stays
-                        // empty forever, and `doc_lane_seeds` (seed.rs) treats an
-                        // absent hook as "docs unavailable", not an error.
-                        if let Some(doc_hook) = supervisor.doc_knn_hook(mid.clone()) {
-                            if let Ok(mut guard) = doc_slot_bg.lock() {
-                                *guard = Some(doc_hook);
+                            if let Ok(mut guard) = slot_bg.lock() {
+                                *guard = Some(hook);
                             }
+                            // #376 Phase 2: arm the doc hook alongside the code hook.
+                            // `None` when the sidecar predates doc-space support or
+                            // has no doc-space index — `doc_slot` then simply stays
+                            // empty forever, and `doc_lane_seeds` (seed.rs) treats an
+                            // absent hook as "docs unavailable", not an error.
+                            if let Some(doc_hook) = supervisor.doc_knn_hook(mid.clone()) {
+                                if let Ok(mut guard) = doc_slot_bg.lock() {
+                                    *guard = Some(doc_hook);
+                                }
+                            }
+                            tracing::info!(
+                                model_id = %mid,
+                                "embed plugin active, Step 4 (semantic ANN) enabled"
+                            );
+                            return true;
                         }
-                        // Signal arm-complete AFTER the slots are populated so any
-                        // thread woken by `mark_ready` sees `Some(hook)`.
-                        readiness_bg.mark_ready();
-                        tracing::info!(
-                            model_id = %mid,
-                            "embed plugin active, Step 4 (semantic ANN) enabled"
-                        );
                     }
                 }
+                // supervisor drops here; sidecar stays alive via the hook's Arc.
+                false
+            };
+            if !arm() {
+                // Recorded before `mark_ready` so a thread woken by it observes
+                // both flags, and the query path can say `embeddings: disabled`
+                // instead of `on` over a lane that will never answer.
+                readiness_bg.mark_disabled();
             }
-            // supervisor drops here; sidecar stays alive via the hook's Arc.
+            // Signal arm-complete AFTER the slots are populated so any thread
+            // woken by `mark_ready` sees whatever `arm` managed to install.
+            readiness_bg.mark_ready();
         })
         .ok();
 

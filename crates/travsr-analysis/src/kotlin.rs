@@ -64,6 +64,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
             prefix: "enum",
         },
     ],
+    post_parse: None,
     get_grammar: || tree_sitter::Language::new(tree_sitter_kotlin_ng::LANGUAGE),
 };
 

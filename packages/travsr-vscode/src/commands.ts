@@ -7,8 +7,9 @@
  *   travsr.showDependencies  direct + transitive imports, click-navigable
  *   travsr.showExecutionPath lowest-cost path between two symbols, rendered in the graph
  *   travsr.showRepos         registry manager webview
- *   travsr.showGraphStats    graph metrics dashboard webview
- *   travsr.showLanguages     indexed + available languages, install from UI
+ *   travsr.showGraphStats    Health panel: verdict, metrics, daemon, index, languages
+ *                            (installed on this machine vs enabled for this repo)
+ *   travsr.showLanguages     alias of showGraphStats (the Languages panel was folded in)
  *
  * Pure helpers (stripEnvelope, parsers, openAtLine) are exported for unit tests.
  */
@@ -24,21 +25,33 @@ import {
   buildSynonymsHtml,
   buildReposHtml,
   buildStatsHtml,
-  buildLanguagesHtml,
   buildPanelLoadingHtml,
   LOG_MAX_LINES,
   LOG_MAX_FILES_LISTED,
   LOG_AUTO_SECONDS,
-  buildLogRowsHtml,
+  UNKNOWN_INDEX,
+  formatLogSize,
+  EMPTY_HEALTH,
   LANG_CONTRACT_FIELDS,
   LANG_CONTRACT_VERSION,
+  isTempRepo,
   type RepoRow,
   type StatsView,
-  type LangCount,
   type LangInfo,
   type LangContractSkew,
 } from "./webviews";
 import type { Diagnostic, LogEntry, LogFileInfo } from "./webviews";
+import type { IndexHealth } from "./webviews";
+import type {
+  HealthData,
+  EmbedModel,
+  SidecarRow,
+  AgentRow,
+  IntegrityView,
+  LanguageRow,
+} from "./webviews";
+import { resolveAgentTargets } from "./mcpRegister";
+import { runTravsrCommand, parseTravsrInvocation } from "./terminal";
 
 // ── Pure helpers (unit-testable) ────────────────────────────────────────────
 
@@ -170,19 +183,6 @@ export function parseReposList(raw: string): RepoRow[] {
     });
 }
 
-/** Parse `repo_languages` TSV output (`lang\tcount`) into LangCount rows. */
-export function parseLanguageCounts(raw: string): LangCount[] {
-  const inner = stripEnvelope(raw);
-  return inner
-    .split("\n")
-    .filter((l) => l.trim())
-    .map((l) => {
-      const [lang, cnt] = l.split("\t");
-      return { language: lang ?? "", count: parseInt(cnt ?? "0", 10) };
-    })
-    .filter((l) => l.language);
-}
-
 /** The outcome of reading a `travsr lang list --json` payload.
  *
  *  #755: parsing used to be a bare `JSON.parse(...) as LangInfo[]`, so a binary
@@ -202,7 +202,7 @@ export interface LangListParse {
 
 /**
  * Validate the shape of `travsr lang list --json` rows against the contract the
- * Languages panel renders (#755).
+ * Health page's Languages section renders (#755).
  *
  * Keys on field presence, not on the version string: an npm-bundled build and a
  * current one both self-report `1.0.0` while emitting different shapes, so a
@@ -271,7 +271,7 @@ const LANG_LIST_TIMEOUT_MS = 60_000;
  * #755: ask a resolved binary whether its `lang list --json` speaks the contract
  * this extension renders.
  *
- * Runs the same read-only command the Languages panel runs, with no cwd — the
+ * Runs the same read-only command the Health page runs, with no cwd — the
  * per-repo column is irrelevant to a shape check, and a repo-less probe works
  * before any workspace is chosen. Returns `[]` for "current" and the missing
  * field names otherwise.
@@ -318,7 +318,7 @@ export function contractSkewMessage(
       : `reports lang-list contract revision ${reportedContract}, but this extension needs ${LANG_CONTRACT_VERSION}`;
   return (
     `Travsr: the travsr binary at ${binary} is older than this extension expects; it ${rev}. ` +
-    `Missing: ${missingFields.join(", ")}. The Languages panel is held back until a current ` +
+    `Missing: ${missingFields.join(", ")}. The Languages section of the Health panel is held back until a current ` +
     `binary is resolved; indexing and search are unaffected.`
   );
 }
@@ -701,6 +701,369 @@ function shortTarget(target: string): string {
 }
 
 /** Build the stats dashboard view from `get_graph_stats` + local graph.db. */
+/** Parse the `get_index_status` envelope. Anything unparseable is reported as
+ *  unavailable rather than as a healthy default. */
+export function parseIndexHealth(raw: string): IndexHealth {
+  const body = stripEnvelope(raw).trim();
+  if (body === "") return UNKNOWN_INDEX;
+  try {
+    const p = JSON.parse(body) as {
+      indexed_commit?: unknown;
+      head_commit?: unknown;
+      staleness?: { behind_by?: unknown; is_stale?: unknown; working_tree_dirty?: unknown };
+      phase_a?: { state?: unknown };
+    };
+    const s = p.staleness ?? {};
+    const str = (v: unknown): string => (typeof v === "string" ? v : "");
+    const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
+    const bool = (v: unknown): boolean | null => (typeof v === "boolean" ? v : null);
+    return {
+      isStale: bool(s.is_stale),
+      behindBy: num(s.behind_by),
+      indexedCommit: str(p.indexed_commit),
+      headCommit: str(p.head_commit),
+      phaseA: str(p.phase_a?.state),
+      workingTreeDirty: bool(s.working_tree_dirty),
+      available: true,
+    };
+  } catch {
+    return UNKNOWN_INDEX;
+  }
+}
+
+/** Map `travsr lang list --json` rows to the Health page's Languages table.
+ *
+ *  Pure, so every branch of the table can be tested without spawning the CLI.
+ *  Two facts stay separate: `installed` (the analyzer is on this machine) and
+ *  `repoState` (full analysis is on for this repository). They used to be
+ *  collapsed into one column, and a language that was installed everywhere but
+ *  off for the repo was offered an install it did not need.
+ *
+ *  #755: every row is `JSON.parse` of another process's stdout, so at runtime a
+ *  field can be absent whatever `LangInfo` declares. Absent values read as
+ *  "unknown", never as a value that looks like a real answer. */
+export function parseRepoLanguages(raw: string): Set<string> {
+  // `repo_languages` prints one `language\tcount` line per language the graph
+  // holds nodes for. Names are the same canonical tags the catalog uses.
+  const out = new Set<string>();
+  for (const line of stripEnvelope(raw).split("\n")) {
+    const lang = line.split("\t")[0]?.trim().toLowerCase();
+    if (lang) out.add(lang);
+  }
+  return out;
+}
+
+export function buildLanguageRows(
+  langs: LangInfo[],
+  diags: Diagnostic[],
+  /** Languages the graph found in this repo (`repo_languages`). Empty means the
+   *  graph could not say, and then nothing is gated: hiding every action on a
+   *  repo that has not been indexed yet would leave the user with no way in. */
+  detected: ReadonlySet<string> = new Set()
+): LanguageRow[] {
+  const REPO_STATES: ReadonlySet<string> = new Set([
+    "always_on", "enabled", "needs_analyzer", "not_enabled", "no_repo",
+  ]);
+  const OS_NAMES: Record<string, string> = { windows: "Windows", macos: "macOS", linux: "Linux" };
+  return langs.map((l) => {
+    const sent = l as unknown as Record<string, unknown>;
+    const statusKnown = typeof sent["status"] === "string";
+    const full = l.status === "active";
+    // No build for this OS: full analysis can never run here, so the row never
+    // offers an install. `status` and `availableOnThisPlatform` come from one CLI
+    // predicate and always agree; check both defensively.
+    const availableHere = l.status !== "unsupported" && sent["availableOnThisPlatform"] !== false;
+    const osName = OS_NAMES[l.unavailableTarget ?? ""] ?? "";
+    const repoState: LanguageRow["repoState"] = REPO_STATES.has(String(sent["repoState"]))
+      ? l.repoState
+      : "unknown";
+    const installed = sent["installed"] === true;
+    const builtin = sent["builtin"] === true;
+    // Present in this repo, as the graph sees it. A language the repo does not
+    // contain is not shown: turning on an analyzer for files that do not exist
+    // changes nothing, and sixteen rows for a three-language repo is noise.
+    const inRepo = detected.size === 0 || detected.has(l.language.toLowerCase());
+    // Cross-referenced against the warnings on this same page. `lang list` can
+    // call a language active while `travsr status` warns that it ran and
+    // resolved nothing; both are true, and the row has to say so rather than
+    // showing a bare tick beside a contradicting card.
+    const flagged = diags.some((d) =>
+      new RegExp(`\\b${l.language.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(
+        `${d.title} ${d.hint}`
+      )
+    );
+    const analysis = !statusKnown ? "unknown" : full ? "full" : "structural only";
+    // The CLI's own sentence. `lang list` never counts symbols, so anything
+    // numeric here would be invented.
+    const statusLine =
+      typeof sent["statusLine"] === "string" && l.statusLine !== ""
+        ? l.statusLine
+        : full
+          ? "installed and enabled"
+          : analysis;
+    const prerequisites =
+      sent["prerequisites"] === undefined || sent["prerequisites"] === null
+        ? "unknown"
+        : l.prerequisites && l.prerequisites !== "none"
+          ? l.prerequisites
+          : "";
+    // One action per row, and it has to be the right one: an install where the
+    // analyzer is already on the machine downloads nothing and changes nothing.
+    let fix: LanguageRow["fix"] = "none";
+    if (!availableHere || !inRepo) fix = "none";
+    else if (l.status === "needs_consent") fix = "permission";
+    else if (!installed || repoState === "needs_analyzer") fix = "install";
+    else if (repoState === "not_enabled") fix = "enable";
+    else if (!full || flagged) fix = "semantic";
+    return {
+      language: l.language,
+      analysis,
+      full,
+      statusLine,
+      flagged,
+      installed,
+      repoState,
+      availableHere,
+      osName,
+      prerequisites,
+      builtin,
+      inRepo,
+      fix,
+      canDisable: availableHere && full && !builtin,
+    };
+  });
+}
+
+/** Gather everything the Health page's sections need.
+ *
+ *  Each source is independent and every one of them can fail on its own: the
+ *  daemon can be down while the CLI still answers, a binary can be too old for
+ *  a tool, a config file can be missing. So each lands in its own field and a
+ *  failure becomes `null`, which the page renders as "could not read this"
+ *  rather than as a clean bill of health. Nothing here throws.
+ *
+ *  The spawns run together rather than in sequence: `lang list` alone takes
+ *  about 17 seconds on Windows because it sweeps PATH per catalog language, and
+ *  serialising four of those would make opening the panel feel broken.
+ */
+export async function gatherHealth(
+  client: McpClient,
+  binary: string,
+  root: string | undefined,
+  log: LogEntry[],
+  dbSize: string,
+  logFiles: { files: LogFileInfo[]; onDisk: number },
+  activeRepoName: string,
+  diags: Diagnostic[] = []
+): Promise<HealthData> {
+  // Whether the extension can query, which is not the same question as whether
+  // the daemon is up: the extension's own `travsr mcp --stdio` child opens the
+  // database directly and keeps answering with no daemon anywhere.
+  const mcpConnected = client.isConnected();
+
+  // Read from the log, because it is the one source that still answers after
+  // the process has gone, which is exactly when this page gets opened.
+  const findEvent = (re: RegExp): string => {
+    for (const e of log) {
+      const m = re.exec(e.message ?? "");
+      if (m) return m[1] ?? "";
+    }
+    return "";
+  };
+  const daemonPid = findEvent(/\bpid[= ](\d+)/);
+  const daemonStopped = (() => {
+    const stop = log.find((e) => /daemon stopped|shutting down/i.test(e.message ?? ""));
+    if (stop === undefined) return "";
+    // Date and time, local. A bare clock time reads as "today" on a panel that
+    // is often opened days after the daemon last ran; the log's own RFC3339
+    // stamp carries the day, so use it and fall back to the clock only when the
+    // stamp does not parse.
+    const d = new Date(stop.iso);
+    if (Number.isNaN(d.getTime())) return stop.time;
+    const p = (n: number): string => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  })();
+  const lastEditor = (() => {
+    const ed = log.find((e) => /editor (attached|detached)/i.test(e.message ?? ""));
+    if (ed === undefined) return "";
+    const sess = /session=([\w-]+)/.exec(ed.message ?? "");
+    const verb = /detached/i.test(ed.message ?? "") ? "detached" : "attached";
+    return `${sess ? sess[1] : "editor"} ${verb} ${ed.time ?? ""}`.trim();
+  })();
+
+  const settle = async <T>(p: Promise<T>, fallback: T): Promise<T> => {
+    try {
+      return await p;
+    } catch {
+      return fallback;
+    }
+  };
+
+  const [versionOut, daemonOut, embedOut, langOut, healthRaw, reposRaw, repoLangsRaw] = await Promise.all([
+    settle(spawnLangCommand(binary, ["--version"], root ?? process.cwd()), ""),
+    settle(spawnLangCommand(binary, ["daemon", "status"], root ?? process.cwd(), 8_000), ""),
+    settle(spawnLangCommand(binary, ["embed", "list", "--json"], root ?? process.cwd()), ""),
+    settle(spawnLangCommand(binary, ["lang", "list", "--json"], root ?? process.cwd(), 60_000), ""),
+    settle(client.callTool("get_graph_health"), ""),
+    settle(client.callTool("repos_list"), ""),
+    // Which languages the graph actually found in this repo, so the Languages
+    // table only offers to install or enable an analyzer the repo can use.
+    settle(client.callTool("repo_languages"), ""),
+  ]);
+
+  const binaryVersion = (/(\d+\.\d+\.\d+[^\s]*)/.exec(versionOut) ?? [])[1] ?? "";
+
+  // The daemon's own answer, which is the same one `travsr daemon status`
+  // gives in a terminal. "starting" counts as up: the control socket is not
+  // ready yet but the process is alive and will start watching.
+  const daemonLine = (/^daemon:\s*(.+)$/m.exec(daemonOut) ?? [])[1]?.trim() ?? "";
+  const daemonRunning = /^running|^starting/.test(daemonLine);
+  const daemonDetail = daemonLine;
+
+  // Sidecars. `embed list --json` reports every model in the catalog; the panel
+  // only needs whether the active one is on disk.
+  let sidecars: SidecarRow[] | null = null;
+  let embedModels: EmbedModel[] = [];
+  if (embedOut.trim() !== "") {
+    try {
+      const models = JSON.parse(embedOut) as Array<{
+        installed?: boolean; active?: boolean; id?: string;
+        description?: string; download_mb?: number;
+      }>;
+      embedModels = models
+        .filter((m) => typeof m.id === "string")
+        .map((m) => ({
+          id: m.id as string,
+          description: typeof m.description === "string" ? m.description : "",
+          installed: m.installed === true,
+          active: m.active === true,
+          downloadMb: typeof m.download_mb === "number" ? m.download_mb : null,
+        }));
+      const active = models.find((m) => m.active === true);
+      const anyInstalled = models.some((m) => m.installed === true);
+      const embedOk = active?.installed === true;
+      sidecars = [
+        {
+          name: "embed",
+          state: embedOk
+            ? `${active?.id ?? "model"}, ready`
+            : anyInstalled
+              ? "installed but not active"
+              : "not installed, semantic search off",
+          ok: embedOk,
+          action: embedOk ? "reinstallEmbed" : "installEmbed",
+          backend: active?.id,
+        },
+      ];
+    } catch {
+      sidecars = null;
+    }
+  }
+
+  // Languages. The same JSON `travsr lang list` prints, mapped by
+  // `buildLanguageRows`, so the table can never disagree with the terminal. A
+  // payload whose rows predate the fields read here (#755) is withheld and
+  // reported as a skew rather than rendered as guesses.
+  let languages: LanguageRow[] | null = null;
+  let languagesSkew: LangContractSkew | undefined;
+  if (langOut.trim() !== "") {
+    const parsed = parseLangList(langOut);
+    if (parsed.missingFields.length > 0) {
+      languagesSkew = {
+        missingFields: parsed.missingFields,
+        binary,
+        ...(parsed.reportedContract !== undefined ? { reportedContract: parsed.reportedContract } : {}),
+      };
+    } else if (parsed.langs.length > 0) {
+      languages = buildLanguageRows(parsed.langs, diags, parseRepoLanguages(repoLangsRaw));
+    }
+  }
+
+  // Integrity, from the daemon's own report.
+  let integrity: IntegrityView | null = null;
+  const healthBody = stripEnvelope(healthRaw).trim();
+  if (healthBody !== "") {
+    try {
+      const h = JSON.parse(healthBody) as {
+        healthy?: boolean;
+        ghost_paths?: { count?: number; sample?: string[] };
+        lexical_index_parity?: { ok?: boolean };
+      };
+      integrity = {
+        healthy: typeof h.healthy === "boolean" ? h.healthy : null,
+        ghostCount: typeof h.ghost_paths?.count === "number" ? h.ghost_paths.count : null,
+        ghostSample: Array.isArray(h.ghost_paths?.sample) ? h.ghost_paths.sample.slice(0, 3) : [],
+        lexicalOk: typeof h.lexical_index_parity?.ok === "boolean" ? h.lexical_index_parity.ok : null,
+        dbSize,
+        logSize: formatLogSize(logFiles.files.reduce((a, f) => a + f.size, 0)),
+        logFiles: logFiles.files.length,
+      };
+    } catch {
+      integrity = null;
+    }
+  }
+
+  const repos = reposRaw.trim() === "" ? null : parseReposList(reposRaw);
+
+  // Agents. A missing config file and a config with no travsr entry are
+  // different answers, so they are reported differently.
+  let agents: AgentRow[] | null = null;
+  try {
+    agents = resolveAgentTargets(root).map((t) => {
+      if (!fs.existsSync(t.configPath)) {
+        return { name: t.name, registered: false, detail: "config file not found" };
+      }
+      try {
+        const txt = fs.readFileSync(t.configPath, "utf8");
+        const registered = /"travsr"\s*:/.test(txt);
+        return {
+          name: t.name,
+          registered,
+          detail: registered ? "registered" : "not registered",
+        };
+      } catch {
+        return { name: t.name, registered: false, detail: "config not readable" };
+      }
+    });
+  } catch {
+    agents = null;
+  }
+
+  // The hook is a file, so this answers whether commits actually refresh the
+  // graph rather than whether the feature exists.
+  let commitHook: boolean | null = null;
+  if (root !== undefined) {
+    try {
+      const hook = path.join(root, ".git", "hooks", "post-commit");
+      commitHook = fs.existsSync(hook) && /travsr/.test(fs.readFileSync(hook, "utf8"));
+    } catch {
+      commitHook = null;
+    }
+  }
+
+  const newest = logFiles.files[0];
+  return {
+    daemonRunning,
+    daemonDetail,
+    mcpConnected,
+    daemonPid,
+    daemonStopped,
+    lastEditor,
+    binaryVersion,
+    logFileName: newest?.name ?? "",
+    logFileSize: newest ? formatLogSize(newest.size) : "",
+    commitHook,
+    sidecars,
+    embedModels,
+    agents,
+    repos,
+    activeRepo: activeRepoName,
+    languages,
+    ...(languagesSkew !== undefined ? { languagesSkew } : {}),
+    integrity,
+  };
+}
+
 export function buildStatsView(raw: string): StatsView {
   const lines = stripEnvelope(raw).split("\n");
   const field = (key: string): string => {
@@ -1013,6 +1376,7 @@ type PanelMessage =
   | { command: "reset" }
   | { command: "prune" }
   | { command: "remove"; name: string }
+  | { command: "removeTempRepos" }
   | { command: "installLang"; language: string }
   | { command: "removeLang"; language: string }
   | { command: "enableWithPermission"; language: string }
@@ -1027,6 +1391,22 @@ type PanelMessage =
   | { command: "setLogLines"; lines: number }
   | { command: "setLogFile"; file: string }
   | { command: "setLogAuto"; seconds: number }
+  | { command: "startDaemon" }
+  | { command: "restartDaemon" }
+  | { command: "stopDaemon" }
+  | { command: "reindex" }
+  | { command: "fullRebuild" }
+  | { command: "installHook" }
+  | { command: "installEmbed" }
+  | { command: "reinstallEmbed" }
+  | { command: "changeEmbedModel" }
+  | { command: "runFsck" }
+  | { command: "compact" }
+  | { command: "registerMcp" }
+  | { command: "fixLang"; index: number }
+  | { command: "disableLang"; index: number }
+  | { command: "runFix"; index: number }
+  | { command: "copyFix"; index: number }
   | { command: "refresh" };
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
@@ -1153,7 +1533,23 @@ export function registerShowRepos(client: McpClient): vscode.Disposable {
         `Pruned ${m ? m[1] : "0"} stale repo(s).`
       );
     } else if (msg.command === "remove") {
-      await client.callTool("repos_remove", { name: (msg as { command: "remove"; name: string }).name });
+      // `repos_remove` resolves a display basename only when it is
+      // unambiguous, and answers "ambiguous" or "not found" otherwise. That
+      // answer was thrown away, so a click that removed nothing looked exactly
+      // like one that worked: the row came back after the refresh with no
+      // explanation. Two checkouts of the same project register the same
+      // basename, which is the case that produces it.
+      const name = (msg as { command: "remove"; name: string }).name;
+      const res = stripEnvelope(await client.callTool("repos_remove", { name })).trim();
+      if (res.startsWith("ambiguous")) {
+        void vscode.window.showWarningMessage(
+          `Travsr: more than one registered repository is named ${name}, so this entry was left alone. Remove it by path with travsr repos remove.`
+        );
+      } else if (res !== "ok") {
+        void vscode.window.showWarningMessage(
+          `Travsr: could not remove ${name} from the registry (${res || "the registry did not answer"}).`
+        );
+      }
     }
     await refresh();
   };
@@ -1164,15 +1560,27 @@ export function registerShowRepos(client: McpClient): vscode.Disposable {
 }
 
 /**
- * travsr.showGraphStats — read-only metrics dashboard webview.
+ * travsr.showGraphStats — the Health panel: verdict, metrics, daemon and index
+ * state, languages (installed on this machine versus enabled for this repo,
+ * with install, enable and disable actions), diagnostics and the daemon log.
  */
-export function registerShowGraphStats(client: McpClient): vscode.Disposable {
+export function registerShowGraphStats(
+  client: McpClient,
+  binary: string,
+  activeRepo: ActiveRepo
+): vscode.Disposable {
+  // Read the configured binary path at call time so we always use the value
+  // written by checkBinaryAndPrompt, which runs async after activation.
+  const getBinary = (): string =>
+    vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || binary;
   // Kept so a log-only refresh can redraw without re-running the two expensive
   // halves of a render, which is what changing Lines or File does. Undefined
   // until the first full pass, so a log-only refresh before then falls back to
   // doing the work.
   let lastStats: StatsView | undefined;
   let lastDiags: Diagnostic[] = [];
+  let lastIndex: IndexHealth = UNKNOWN_INDEX;
+  let lastHealth: HealthData = EMPTY_HEALTH;
   let logOnly = false;
   // How many lines the reader is asked for. The panel's Lines control raises
   // this when the user picks a window wider than what is already loaded, which
@@ -1223,18 +1631,12 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
       stopAuto();
       return;
     }
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (root === undefined) return;
-    const listed = daemonLogFileList(root);
-    const selected =
-      logFile !== undefined && listed.files.some((f) => f.name === logFile)
-        ? logFile
-        : (listed.files[0]?.name ?? "");
-    if (selected === "") return;
-    void entry.panel.webview.postMessage({
-      command: "setLogRows",
-      rows: buildLogRowsHtml(readDaemonLogFile(root, selected, logLines)),
-    });
+    // A full redraw, which is what the control now offers. It costs the panel
+    // state a redraw always costs (#767): the log filter, the severity chip,
+    // the toggles, the scroll position and any expanded row. That is stated in
+    // the control's own tooltip rather than left to be discovered, and the
+    // default is still Off.
+    void entry.refresh();
   };
 
   const render = async (): Promise<string> => {
@@ -1258,18 +1660,405 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
     const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
     // readDiagnostics spawns `travsr status`.
     const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
+    // Drift, straight from the daemon. An older binary does not serve this tool
+    // and the client answers "" for an unknown tool, which parseIndexHealth
+    // reports as unavailable rather than as fresh.
+    const index = reuse
+      ? lastIndex
+      : parseIndexHealth(await client.callTool("get_index_status"));
+    // The sections. Skipped on a log-only refresh, which is what changing Lines
+    // or File does: those spawns are the expensive half and nothing above the
+    // log has changed.
+    const health = reuse
+      ? lastHealth
+      : await gatherHealth(client, bin, root, log, stats.dbSize, logFiles, path.basename(root ?? ""), diags);
     lastStats = stats;
     lastDiags = diags;
+    lastIndex = index;
+    lastHealth = health;
     // A panel that was closed and reopened renders the stored interval as
     // selected, so the timer has to come back with it: otherwise the control
     // claims to be polling while nothing is.
     if (logAuto > 0 && autoTimer === undefined) {
       autoTimer = setInterval(autoTick, logAuto * 1000);
     }
-    return buildStatsHtml(stats, log, diags, logLines, { ...logFiles, selected }, logAuto);
+    return buildStatsHtml(
+      stats, log, diags, logLines, { ...logFiles, selected }, logAuto, index, health,
+      path.basename(root ?? ""), root ?? ""
+    );
   };
 
   const handle = async (msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
+    const repoRoot = (): string | undefined => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+    // Commands that run in the shared terminal. Each argv is a literal here,
+    // never assembled from anything the webview sent, so a panel that rendered
+    // hostile text still cannot choose what runs.
+    const TERMINAL_ACTIONS: Partial<Record<PanelMessage["command"], string[]>> = {
+      startDaemon: ["daemon", "start"],
+      restartDaemon: ["daemon", "restart"],
+      fullRebuild: ["init", "--force"],
+      // Plain `init`, not `--force`. It is incremental, skips when the graph is
+      // already up to date, and installs the hook as part of setup, which is
+      // all this row is asking for. `--force` is the same argv `fullRebuild`
+      // uses behind a modal, so sharing it here meant "Install" beside a
+      // missing commit hook silently discarded and rebuilt the whole index.
+      installHook: ["init"],
+      installEmbed: ["embed", "init"],
+      runFsck: ["fsck"],
+      compact: ["fsck", "--fix"],
+      // Without `--yes` this prompts per language. That is deliberate: it runs
+      // in a real terminal where the prompt works, and `--yes` would have the
+      // panel download several analyzers off one click.
+      detectLangs: ["lang", "detect"],
+    };
+    const argv = TERMINAL_ACTIONS[msg.command];
+    if (argv !== undefined) {
+      // The destructive ones say what they will do before doing it. Reindexing
+      // is not destructive; rebuilding and repairing both discard state.
+      const DESTRUCTIVE: Partial<Record<string, string>> = {
+        fullRebuild: "Rebuild the graph from scratch? The current index is discarded and rebuilt.",
+        compact: "Repair the index? Entries pointing at files that no longer exist are removed.",
+      };
+      const warning = DESTRUCTIVE[msg.command];
+      if (warning !== undefined) {
+        const go = await vscode.window.showWarningMessage(warning, { modal: true }, "Run");
+        if (go !== "Run") return;
+      }
+      runTravsrCommand(argv, repoRoot());
+      return;
+    }
+    if (msg.command === "stopDaemon") {
+      // The only action on this page that leaves things worse than it found
+      // them, so it asks first and names what stopping costs rather than
+      // relying on the word "stop" to carry it.
+      const go = await vscode.window.showWarningMessage(
+        "Stop the Travsr daemon? Queries keep working from the graph on disk, but commits and saves will no longer refresh it.",
+        { modal: true },
+        "Stop"
+      );
+      if (go !== "Stop") return;
+      runTravsrCommand(["daemon", "stop"], repoRoot());
+      // The daemon takes a moment to release its socket, and this page's whole
+      // point is reporting that state, so redraw once it has.
+      setTimeout(() => void refresh(), 1500);
+      return;
+    }
+    if (msg.command === "changeEmbedModel") {
+      // The catalog comes from the `embed list --json` this render already
+      // read, so opening the picker costs no spawn. The id never comes from
+      // the webview: it is chosen here from that list.
+      const models = lastHealth.embedModels;
+      if (models.length === 0) {
+        void vscode.window.showWarningMessage("Travsr: could not read the embedding catalog.");
+        return;
+      }
+      const pick = await vscode.window.showQuickPick(
+        models.map((m) => ({
+          label: m.active ? `$(check) ${m.id}` : m.id,
+          description: m.installed ? "installed" : m.downloadMb ? `${m.downloadMb} MB download` : "not installed",
+          detail: m.description,
+          id: m.id,
+          installed: m.installed,
+          active: m.active,
+        })),
+        { title: "Travsr: embedding model", placeHolder: "Switch the active embedding model" }
+      );
+      if (pick === undefined || pick.active) return;
+      // Two different commands, and the difference matters: `switch` only
+      // repoints config and fails on a model whose weights are absent, while
+      // `init --backend` downloads first. Picking by what is on disk keeps the
+      // uninstalled case from dead-ending on an error.
+      const argv = pick.installed
+        ? ["embed", "switch", pick.id]
+        : ["embed", "init", "--backend", pick.id];
+      const go = await vscode.window.showWarningMessage(
+        pick.installed
+          ? `Switch the active embedding model to ${pick.id}? Existing vectors for the current model are kept, and the repository is re-embedded with the new one.`
+          : `Install ${pick.id} and make it active? This downloads the model, then re-embeds the repository.`,
+        { modal: true },
+        pick.installed ? "Switch" : "Install"
+      );
+      if (go === undefined) return;
+      runTravsrCommand(argv, repoRoot());
+      return;
+    }
+    if (msg.command === "reinstallEmbed") {
+      // Not a process restart. `embed init --reinstall` re-downloads the sidecar
+      // binary and the ONNX model, then re-embeds the repository, so the button
+      // says Reinstall and this says what that costs before it starts.
+      //
+      // The backend is named explicitly: without it the CLI opens its
+      // interactive model menu, and a panel button should not drop the user
+      // into a prompt in a terminal they did not ask for.
+      const backend = lastHealth.sidecars?.find((s) => s.name === "embed")?.backend;
+      const go = await vscode.window.showWarningMessage(
+        backend === undefined
+          ? "Reinstall the embedding sidecar? This re-downloads it and re-embeds the repository."
+          : `Reinstall the embedding sidecar (${backend})? This re-downloads the binary and its model, then re-embeds the repository.`,
+        { modal: true },
+        "Reinstall"
+      );
+      if (go !== "Reinstall") return;
+      runTravsrCommand(
+        backend === undefined
+          ? ["embed", "init", "--reinstall", "--yes"]
+          : ["embed", "init", "--reinstall", "--backend", backend],
+        repoRoot()
+      );
+      return;
+    }
+    if (msg.command === "reindex") {
+      await vscode.commands.executeCommand("travsr.reindexNow");
+      await refresh();
+      return;
+    }
+    if (msg.command === "initRepo") {
+      // The unindexed verdict's primary action. Without this branch it fell
+      // through to the trailing refresh and re-rendered the same empty page,
+      // so the one button offered on a never-indexed repo did nothing.
+      //
+      // Runs under cancellable progress rather than in the terminal, matching
+      // the Languages panel: init on a large repo is long, and the panel has to
+      // redraw when it finishes so the page stops saying there is no graph.
+      const repo = repoRoot();
+      if (repo === undefined) {
+        void vscode.window.showWarningMessage("Travsr: open a folder to index it.");
+        return;
+      }
+      const binary =
+        vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
+      const { cancelled, code } = await spawnManagedInstall(
+        binary,
+        ["init"],
+        repo,
+        "Travsr: indexing this repository…"
+      );
+      if (cancelled) return;
+      if (code !== 0) {
+        void vscode.window.showErrorMessage(
+          `Travsr: indexing failed (exit ${code ?? "unknown"}). See the daemon log.`
+        );
+      }
+      await refresh();
+      return;
+    }
+    if (msg.command === "registerMcp") {
+      await vscode.commands.executeCommand("travsr.registerMcpServer");
+      await refresh();
+      return;
+    }
+    // Registry edits. These existed only in the Repos panel's own handler, so
+    // the same buttons on this page posted a message nothing listened for and
+    // silently did nothing.
+    if (msg.command === "prune") {
+      const stale = (lastHealth.repos ?? []).filter((r) => !r.exists).length;
+      const go = await vscode.window.showWarningMessage(
+        stale > 0
+          ? `Remove ${stale} registry entr${stale === 1 ? "y" : "ies"} whose database is missing? The repositories themselves are not touched.`
+          : "Prune stale registry entries?",
+        { modal: true },
+        "Prune"
+      );
+      if (go !== "Prune") return;
+      const result = stripEnvelope(await client.callTool("repos_prune"));
+      const m = /^pruned:\s*(\d+)/.exec(result.trim());
+      void vscode.window.showInformationMessage(`Travsr: pruned ${m ? m[1] : "0"} stale repo(s).`);
+      await refresh();
+      return;
+    }
+    // No `remove` here. The Repositories section on this page reports state and
+    // offers the two bulk fixes in its header; per-row removal lives in the
+    // Repos panel, which is the surface for editing the registry.
+    if (msg.command === "removeTempRepos") {
+      // The names come from the render this page last produced, never from the
+      // webview, which posts no argument at all. Same rule as the diagnostics
+      // Run buttons: the panel names an action, the extension decides what it
+      // acts on.
+      const names = (lastHealth.repos ?? [])
+        .filter((r) => r.name !== lastHealth.activeRepo && isTempRepo(r.name))
+        .map((r) => r.name);
+      if (names.length === 0) return;
+      const go = await vscode.window.showWarningMessage(
+        `Remove ${names.length} registry entr${names.length === 1 ? "y" : "ies"} left by test runs? Only the registry is edited. Any graph databases under ~/.travsr stay on disk.`,
+        { modal: true },
+        "Remove"
+      );
+      if (go !== "Remove") return;
+      let removed = 0;
+      for (const name of names) {
+        const res = stripEnvelope(
+          await client.callTool("repos_remove", { name })
+        ).trim();
+        if (res === "ok") removed++;
+      }
+      await refresh();
+      void vscode.window.showInformationMessage(
+        removed === names.length
+          ? `Travsr: removed ${removed} test registry entr${removed === 1 ? "y" : "ies"}.`
+          : `Travsr: removed ${removed} of ${names.length} test registry entries. The rest could not be resolved by name; travsr repos remove takes a path.`
+      );
+      return;
+    }
+    if (msg.command === "fixLang" || msg.command === "disableLang") {
+      // An index into the languages this render produced, so the webview never
+      // chooses the language name that reaches the command line.
+      const lang = lastHealth.languages?.[msg.index];
+      if (lang === undefined) return;
+      const bin = getBinary();
+      // The table was computed for the first workspace folder (that is the cwd
+      // `lang list` ran in), so actions target the same repo; the active-repo
+      // picker is the fallback when there is no folder.
+      const repo = repoRoot() ?? (await activeRepo.ensureChosen());
+      if (!repo) return;
+      const name = lang.language;
+      if (msg.command === "disableLang") {
+        if (!lang.canDisable) return;
+        const r = await spawnLangCommandResult(bin, ["lang", "remove", name], repo);
+        await refresh();
+        if (r.code === 0) {
+          void vscode.window.showInformationMessage(`Travsr: full analysis for ${name} is off.`);
+        } else {
+          void vscode.window.showErrorMessage(
+            `Travsr: could not disable ${name}. ${lastLine(r.out) || `Run \`travsr lang remove ${name}\` in a terminal for details.`}`
+          );
+        }
+        return;
+      }
+      switch (lang.fix) {
+        case "install": {
+          // Downloads the analyzer and, because cwd is the repo, turns full
+          // analysis on for it. Cancellable, no wall-clock kill: a slow download
+          // must never be cut off and reported as a false success.
+          const { out, cancelled, code } = await spawnManagedInstall(
+            bin,
+            ["lang", "install", name, "--no-interactive", "--yes"],
+            repo,
+            `Installing ${name}…`
+          );
+          await refresh();
+          if (cancelled) {
+            void vscode.window.showWarningMessage(
+              `Install of ${name} was cancelled; it may be partly done. Re-run, or run \`travsr lang install ${name}\` in a terminal.`
+            );
+          } else if (code === 2) {
+            // Set up, but the build tool the project needs is not installed, so
+            // full analysis cannot run yet. The CLI already phrases this.
+            const needTxt = lang.prerequisites && lang.prerequisites !== "unknown" ? ` (${lang.prerequisites})` : "";
+            void vscode.window.showWarningMessage(
+              lastLine(out) ||
+                `${name} is set up, but the build tool it needs${needTxt} was not found. Install it, then Refresh to get full analysis.`
+            );
+          } else if (code !== 0) {
+            void vscode.window.showErrorMessage(
+              `Install of ${name} failed. ${lastLine(out) || `Run \`travsr lang install ${name}\` in a terminal for details.`}`
+            );
+          } else {
+            void vscode.window.showInformationMessage(lastLine(out) || `${name} analyzer installed and enabled for this repository.`);
+          }
+          return;
+        }
+        case "enable": {
+          // Installed on this machine, off for this repo. `--skip-wrapper` turns
+          // the language on in config without downloading anything; full analysis
+          // then runs on the next semantic index, which is offered right away.
+          const { out, cancelled, code } = await spawnManagedInstall(
+            bin,
+            ["lang", "install", name, "--skip-wrapper", "--no-interactive", "--yes"],
+            repo,
+            `Enabling ${name} for this repository…`
+          );
+          await refresh();
+          if (cancelled) {
+            void vscode.window.showWarningMessage(`Enabling ${name} was cancelled.`);
+          } else if (code !== 0 && code !== 2) {
+            void vscode.window.showErrorMessage(
+              `Could not enable ${name}. ${lastLine(out) || `Run \`travsr lang install ${name}\` in this repository for details.`}`
+            );
+          } else {
+            const pick = await vscode.window.showInformationMessage(
+              `${name} is enabled for this repository. Full analysis runs on the next semantic index.`,
+              "Re-index now"
+            );
+            if (pick === "Re-index now") runTravsrCommand(["init", "--semantic", "--force"], repo);
+          }
+          return;
+        }
+        case "permission": {
+          // A security-relevant grant: full analysis for this language will run
+          // with the user's own privileges (its build tools cannot run isolated
+          // on this OS). Confirm in plain language first, record it, then
+          // re-index so it takes effect.
+          const ok = await vscode.window.showWarningMessage(
+            `Allow full analysis for ${name} to run on this machine?`,
+            {
+              modal: true,
+              detail:
+                "It will use your project's own build tools, the same as if you ran the build yourself, including downloading this project's dependencies. You can withdraw this permission later.",
+            },
+            "Allow"
+          );
+          if (ok !== "Allow") return;
+          // The modal above is the explicit grant, so pass `--yes`: the CLI
+          // refuses a non-interactive grant without it. Check the exit code: a
+          // consent step must not report success unless the permission was
+          // actually recorded.
+          const grant = await spawnLangCommandResult(bin, ["lang", "allow-unsandboxed", name, "--yes"]);
+          if (grant.code !== 0) {
+            await refresh();
+            void vscode.window.showErrorMessage(
+              `Could not enable ${name}: ${lastLine(grant.out) || "the permission was not recorded."}`
+            );
+            return;
+          }
+          const { cancelled } = await spawnManagedInstall(bin, ["init", "--semantic", "--force"], repo, `Enabling ${name}…`);
+          await refresh();
+          void (cancelled
+            ? vscode.window.showWarningMessage(`Enabling ${name} was cancelled before analysis finished. Refresh to check its state.`)
+            : vscode.window.showInformationMessage(`${name} is enabled. Full analysis will run on the next index.`));
+          return;
+        }
+        case "semantic":
+          runTravsrCommand(["init", "--semantic", "--force"], repo);
+          return;
+        default:
+          return;
+      }
+    }
+    // #755: the skew banner's two remedies, the same actions the palette exposes.
+    if (msg.command === "downloadBinary") {
+      await vscode.commands.executeCommand("travsr.downloadBinary");
+      await refresh();
+      return;
+    }
+    if (msg.command === "openBinarySetting") {
+      await vscode.commands.executeCommand("workbench.action.openSettings", "travsr.binaryPath");
+      return;
+    }
+    if (msg.command === "runFix" || msg.command === "copyFix") {
+      // The webview sends an index, not a command. The text is looked up here,
+      // in the diagnostics this render produced, so a log line cannot inject a
+      // command by being rendered into the page.
+      const cmd = lastDiags[msg.index]?.command;
+      if (cmd === undefined) return;
+      if (msg.command === "copyFix") {
+        await vscode.env.clipboard.writeText(cmd);
+        void vscode.window.showInformationMessage(`Travsr: copied \`${cmd}\``);
+        return;
+      }
+      const args = parseTravsrInvocation(cmd);
+      if (args === null) {
+        // Not a plain `travsr ...` call. Copy it rather than handing anything
+        // with shell syntax in it to a shell.
+        await vscode.env.clipboard.writeText(cmd);
+        void vscode.window.showWarningMessage(
+          "Travsr: that fix is not a plain travsr command, so it was copied instead of run."
+        );
+        return;
+      }
+      runTravsrCommand(args, repoRoot());
+      return;
+    }
     if (msg.command === "openFile") {
       // The log writes absolute paths in some places and repo-relative in
       // others, so both resolve against the repo root. The result must stay
@@ -1343,7 +2132,7 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
   };
 
   return vscode.commands.registerCommand("travsr.showGraphStats", () =>
-    openManagedPanel("travsrStats", "Travsr: Graph Stats", render, handle)
+    openManagedPanel("travsrStats", "Travsr: Health", render, handle)
   );
 }
 
@@ -1570,292 +2359,14 @@ function spawnManagedInstall(
   );
 }
 
-/**
- * travsr.showLanguages — Languages panel: indexed node counts from the graph +
- * available SCIP tools from `travsr lang list --json`, with one-click install
- * and disable.
- */
-export function registerShowLanguages(
-  client: McpClient,
-  binary: string,
-  activeRepo: ActiveRepo,
-  onAfterInit?: () => void
-): vscode.Disposable {
-  // `lang install` / `lang detect` / `init` run with the targeted repo as cwd, so
-  // the CLI derives the corpus exactly as the daemon does (git remote) and enables
-  // the right repo. The extension used to pass `--corpus <folder-basename>`, which
-  // never matched the daemon's corpus, and it only ever looked at the first
-  // workspace folder — wrong or ambiguous the moment several repos are open. The
-  // user now picks the target (ActiveRepo), shown in the status bar.
-
-  // Read the configured binary path at call time so we always use the value
-  // written by checkBinaryAndPrompt, which runs async after activation.
-  const getBinary = (): string =>
-    vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || binary;
-
-  let cachedAvailable: LangInfo[] = [];
-  let availableLoaded = false;
-  // #755: the shape verdict on the cached rows. Kept beside them so a refresh
-  // can never render rows from one binary under the verdict from another.
-  let cachedSkew: LangContractSkew | undefined;
-
-  // #755: the binaries already reported as skewed this session. The banner is in
-  // the panel every render, so the toast only has to fire the first time a given
-  // binary is seen — a Reload must not re-nag about a fact still on screen.
-  const skewReported = new Set<string>();
-
-  /** Load `lang list --json` and record both the rows and the shape verdict.
-   *  #755: a stale binary is reported once, here, instead of leaking into the
-   *  panel as cells the renderer had to guess at. */
-  const loadAvailable = async (): Promise<void> => {
-    const bin = getBinary();
-    // Run in the target repo so the CLI computes the per-repo "This repo" column
-    // (enabled / not enabled / …). Without a cwd it runs outside any repo and
-    // every non-builtin reads "n/a" (no_repo). `current()` never prompts.
-    // stdout only (#755 review): the payload has to survive a `tracing` line on
-    // stderr, which would otherwise blank the table AND report a false "current".
-    const parsed = parseLangList(
-      (
-        await spawnLangCommandResult(
-          bin,
-          ["lang", "list", "--json"],
-          activeRepo.current(),
-          LANG_LIST_TIMEOUT_MS
-        )
-      ).stdout
-    );
-    cachedAvailable = parsed.langs;
-    cachedSkew = parsed.missingFields.length
-      ? {
-          missingFields: parsed.missingFields,
-          ...(parsed.reportedContract !== undefined
-            ? { reportedContract: parsed.reportedContract }
-            : {}),
-          binary: bin,
-        }
-      : undefined;
-    availableLoaded = true;
-    // #755: this is the gate for a binary the user configured themselves —
-    // activation skips probing that case precisely because the payload is already
-    // being fetched here, so checking it costs nothing extra.
-    if (cachedSkew && !skewReported.has(bin)) {
-      skewReported.add(bin);
-      void vscode.window.showWarningMessage(
-        contractSkewMessage(bin, parsed.missingFields, parsed.reportedContract)
-      );
-    }
-  };
-
-  const render = async (): Promise<string> => {
-    const langsRaw = await client.callTool("repo_languages");
-    if (!availableLoaded) await loadAvailable();
-    // Show the target repo in the panel only when several are open — with one
-    // repo there is no ambiguity to surface.
-    const target = activeRepo.hasChoice() ? activeRepo.currentName() : undefined;
-    return buildLanguagesHtml(parseLanguageCounts(langsRaw), cachedAvailable, target, cachedSkew);
-  };
-
-  // Buttons are unlocked immediately by openManagedPanel's 'unlockButtons' postMessage
-  // sent before handle() is ever called. postStatus drives the in-panel status bar for
-  // operations that take >1s (install, detect, reload).
-  const handle = async (msg: PanelMessage, refresh: RefreshFn, postStatus: PostStatus): Promise<void> => {
-    if (msg.command === "reloadAvailable") {
-      availableLoaded = false;
-      postStatus('Reloading available tools…');
-      void loadAvailable().then(() => {
-        postStatus(""); // clear immediately, never couple clear to render()/callTool
-        void refresh();
-      });
-      return;
-    }
-    // #755: the two remedies the skew banner offers. Both are the same actions the
-    // command palette already exposes — the banner just puts them where the user
-    // hit the problem, so the fix is not a docs trip.
-    if (msg.command === "downloadBinary") {
-      await vscode.commands.executeCommand("travsr.downloadBinary");
-      availableLoaded = false;
-      await refresh();
-      return;
-    }
-    if (msg.command === "openBinarySetting") {
-      await vscode.commands.executeCommand(
-        "workbench.action.openSettings",
-        "travsr.binaryPath"
-      );
-      return;
-    }
-
-    switch (msg.command) {
-      case "installLang": {
-        // Prompt once if which repo is ambiguous; abort if dismissed.
-        const repo = await activeRepo.ensureChosen();
-        if (!repo) return;
-        const args = ["lang", "install", msg.language, "--no-interactive", "--yes"];
-        // cwd = the chosen repo so the CLI auto-enables it. Runs under a
-        // cancellable progress notification with no wall-clock kill, so a slow
-        // download is never cut off mid-flight and reported as a false success.
-        void spawnManagedInstall(getBinary(), args, repo, `Installing ${msg.language}…`).then(({ out, cancelled, code }) => {
-          availableLoaded = false;
-          void refresh();
-          if (cancelled) {
-            void vscode.window.showWarningMessage(
-              `Install of ${msg.language} was cancelled; it may be partly done. Re-run, or run \`travsr lang install ${msg.language}\` in a terminal.`
-            );
-          } else if (code === 2) {
-            // Set up, but the project build tool it needs is not installed, so full
-            // analysis cannot run yet. The CLI already phrases this; name the tool
-            // from the Prerequisites column as a fallback.
-            const need = cachedAvailable.find((x) => x.language === msg.language)?.prerequisites;
-            const needTxt = need && need !== "none" ? ` (${need})` : "";
-            void vscode.window.showWarningMessage(
-              lastLine(out) ||
-                `${msg.language} is set up, but the build tool it needs${needTxt} was not found. Install it, then Reload to get full analysis.`
-            );
-          } else if (code !== 0) {
-            // Any other non-zero (or signal) exit is a real failure. Report it as
-            // an error, not a success toast — e.g. an older CLI that still has the
-            // elevated-approval gate bails with code 1, which must not be reported
-            // as "installed".
-            void vscode.window.showErrorMessage(
-              `Install of ${msg.language} failed. ${
-                lastLine(out) || `Run \`travsr lang install ${msg.language}\` in a terminal for details.`
-              }`
-            );
-          } else {
-            void vscode.window.showInformationMessage(lastLine(out) || `${msg.language} tool installed.`);
-          }
-        });
-        return;
-      }
-      case "removeLang":
-        postStatus(`Disabling ${msg.language}…`);
-        void spawnLangCommand(getBinary(), ["lang", "remove", msg.language]).then(() => {
-          availableLoaded = false;
-          postStatus("");
-          void refresh();
-          void vscode.window.showInformationMessage(`Disabled language tool for ${msg.language}.`);
-        });
-        return;
-      case "enableWithPermission": {
-        // A security-relevant grant: full analysis for this language will run with
-        // the user's own privileges (its build tools cannot run isolated on this
-        // OS). Confirm in plain language first, then record it and re-index so it
-        // takes effect — no command to type.
-        const ok = await vscode.window.showWarningMessage(
-          `Allow full analysis for ${msg.language} to run on this machine?`,
-          {
-            modal: true,
-            detail:
-              "It will use your project's own build tools, the same as if you ran the build yourself, including downloading this project's dependencies. You can withdraw this permission later.",
-          },
-          "Allow"
-        );
-        if (ok !== "Allow") return;
-        const repo = await activeRepo.ensureChosen();
-        if (!repo) return;
-        postStatus(`Enabling ${msg.language}…`);
-        // Record the grant first, and stop if it fails. The modal above is the
-        // explicit user grant, so pass `--yes`: the CLI refuses a non-interactive
-        // grant without it (a VS Code spawn never has a terminal). Check the exit
-        // code — a security-consent step must not report success unless the
-        // permission was actually recorded.
-        const grant = await spawnLangCommandResult(getBinary(), [
-          "lang",
-          "allow-unsandboxed",
-          msg.language,
-          "--yes",
-        ]);
-        if (grant.code !== 0) {
-          postStatus("");
-          void refresh();
-          void vscode.window.showErrorMessage(
-            `Could not enable ${msg.language}: ${lastLine(grant.out) || "the permission was not recorded."}`
-          );
-          return;
-        }
-        const { cancelled } = await spawnManagedInstall(
-          getBinary(),
-          ["init", "--semantic", "--force"],
-          repo,
-          `Enabling ${msg.language}…`
-        );
-        availableLoaded = false;
-        postStatus("");
-        void refresh();
-        if (cancelled) {
-          void vscode.window.showWarningMessage(
-            `Enabling ${msg.language} was cancelled before analysis finished. Use Reload to try again.`
-          );
-        } else {
-          void vscode.window.showInformationMessage(
-            `${msg.language} is enabled. Full analysis will run on the next index.`
-          );
-        }
-        return;
-      }
-      case "pickRepo":
-        await activeRepo.pick();
-        void refresh();
-        return;
-      case "initRepo": {
-        const repo = await activeRepo.ensureChosen();
-        if (!repo) return;
-        // `init` rebuilds the graph and can run long on a large repo; cancellable
-        // progress, no fixed kill.
-        void spawnManagedInstall(getBinary(), ["init"], repo, "Initializing repo…").then(({ cancelled }) => {
-          if (cancelled) {
-            void vscode.window.showWarningMessage("Repo initialization was cancelled.");
-            return;
-          }
-          // Graph rebuilt — evict stale blast-radius and caller counts.
-          onAfterInit?.();
-          refreshOpenPanels();
-        });
-        return;
-      }
-      case "detectLangs": {
-        const repo = await activeRepo.ensureChosen();
-        if (!repo) return;
-        // cwd = the chosen repo so detect scans it, not the extension host's cwd.
-        // `--yes` makes the button live up to its "Detect & install" label: a
-        // spawned process has no terminal, so a bare `lang detect` would only ever
-        // print the list and install nothing. It may download an analyzer per
-        // detected language, so it runs under a cancellable notification with no
-        // wall-clock kill (a fixed timer would cut a slow batch off mid-download
-        // and report a false "complete"). Elevated languages that need approval
-        // are skipped by the CLI, never installed silently.
-        void spawnManagedInstall(getBinary(), ["lang", "detect", "--yes"], repo, "Detecting & installing languages…").then(({ cancelled }) => {
-          availableLoaded = false;
-          void refresh();
-          void vscode.window.showInformationMessage(
-            cancelled
-              ? "Detect & install was cancelled, some languages may not be set up. See the Languages panel."
-              : "Detect & install finished. See the Languages panel for per-language status."
-          );
-        });
-        return;
-      }
-      case "refresh":
-        availableLoaded = false;
-        await refresh();
-        return;
-      default:
-        break;
-    }
-    await refresh();
-  };
-
-  return vscode.commands.registerCommand("travsr.showLanguages", () =>
-    openManagedPanel("travsrLanguages", "Travsr: Languages", render, handle)
-  );
-}
-
 /** Register all VSCODE-247 commands. */
 export function registerParityCommands(
   client: McpClient,
   context: vscode.ExtensionContext,
   binary: string,
-  onAfterInit?: () => void
+  // Kept for the caller's sake: the Languages panel used it after an in-panel
+  // `init`; the Health panel runs `init` in a terminal, so nothing to hook.
+  _onAfterInit?: () => void
 ): void {
   const activeRepo = new ActiveRepo(context);
   context.subscriptions.push(
@@ -1865,7 +2376,12 @@ export function registerParityCommands(
     registerShowDependencies(client),
     registerShowExecutionPath(client, context),
     registerShowRepos(client),
-    registerShowGraphStats(client),
-    registerShowLanguages(client, binary, activeRepo, onAfterInit)
+    registerShowGraphStats(client, binary, activeRepo),
+    // The Languages panel was folded into Health. The command id stays as an
+    // alias so an existing keybinding or programmatic caller lands on the page
+    // that now holds that table; it is no longer contributed to the palette.
+    vscode.commands.registerCommand("travsr.showLanguages", () =>
+      vscode.commands.executeCommand("travsr.showGraphStats")
+    )
   );
 }

@@ -31,7 +31,7 @@ use travsr_core::{EdgeKind, Language};
 // ParseOutput and FfiMarker are now owned by travsr-analysis.
 pub use ffi::{FfiMarker, FfiMarkerKind};
 pub use ffi_resolver::FfiConfig;
-pub use hash::hash_file;
+pub use hash::{hash_bytes, hash_file};
 pub use lsif::ingest as ingest_lsif;
 pub use lsif::{
     ingest_g2 as ingest_lsif_g2, ingest_g2_from_reader as ingest_lsif_g2_from_reader,
@@ -40,7 +40,10 @@ pub use lsif::{
     LsifG2Output,
 };
 pub use ra_runner::run_ra_lsif;
-pub use runner::{run_lsif_emitter, run_lsif_py_emitter, run_scip_python};
+pub use runner::{
+    emitter_missing, run_lsif_emitter, run_lsif_emitter_with_root, run_lsif_py_emitter,
+    run_scip_python, synthesize_js_tsconfig, EmitterNotFound, JS_EXTENSIONS,
+};
 pub use travsr_analysis::ParseOutput;
 pub use travsr_core::{Edge, Node};
 pub use travsr_error::IndexError;

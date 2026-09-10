@@ -55,7 +55,7 @@ interface RefCtx {
   emitter: Emitter;
 }
 
-export function walk(tsconfigPath: string, emitter: Emitter): void {
+export function walk(tsconfigPath: string, emitter: Emitter, rootDir?: string): void {
   const configFile = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
   if (configFile.error) {
     throw new Error(
@@ -63,7 +63,14 @@ export function walk(tsconfigPath: string, emitter: Emitter): void {
     );
   }
 
-  const basePath = path.dirname(tsconfigPath);
+  // basePath drives three things: how relative config paths resolve, how VName
+  // paths are computed (path.relative(basePath, file)), and the SEC-003
+  // containment root. Normally that is the tsconfig's own directory. When
+  // `rootDir` is supplied the tsconfig is a synthesized ephemeral file living
+  // outside the repo (#833) whose `files[]` are absolute paths into the repo;
+  // basePath must then be the real repo root so emitted paths stay
+  // repo-relative and match the tree-sitter node ids the Rust side computes.
+  const basePath = rootDir ? path.resolve(rootDir) : path.dirname(tsconfigPath);
 
   // SEC-003 — Check 1: reject plugins / escaping extends / escaping references
   // before handing the config to the TS compiler. Hard error, no fallback.

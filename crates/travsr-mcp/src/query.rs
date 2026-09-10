@@ -242,12 +242,32 @@ pub struct StatusPayload {
     /// (serde default false), which reads as the pre-#583 behaviour.
     #[serde(default)]
     pub phase_b_dirty: bool,
+    /// References the live overlay resolved mid-edit (`ref_resolution_state`
+    /// state='resolved'). With `phase_b_dirty` set, a non-zero count is positive
+    /// evidence the editor/lexical lane recovered the edited region, so the
+    /// semantic surface is not degraded despite the reindex. Old daemons omit the
+    /// field (serde default 0).
+    #[serde(default)]
+    pub live_refs_resolved: u64,
+    /// References the live overlay recorded as still unresolved
+    /// (`ref_resolution_state` state='pending'): the honest count of edges that
+    /// are unknown until the next commit. Zero (with `live_refs_resolved` > 0)
+    /// means the live lane settled everything it detected. Old daemons omit the
+    /// field (serde default 0).
+    #[serde(default)]
+    pub live_refs_pending: u64,
     /// WS-2: comma-separated Dart package directories that were indexed without
     /// resolved dependencies (no `.dart_tool/package_config.json`), so their
     /// cross-package references are incomplete. Empty = resolved or no Dart.
     /// Old daemons omit the field (serde default None).
     #[serde(default)]
     pub dart_deps_unresolved: Option<String>,
+    /// #825: the actual SCIP definitions behind the `scip_unification_misses`
+    /// warning, one per line (`lang\tkind\tsymbol\tpath:line`), capped. Lets
+    /// `travsr status` name the unreconciled symbols instead of only counting
+    /// them. Empty/None = no misses. Old daemons omit it (serde default None).
+    #[serde(default)]
+    pub scip_unification_miss_list: Option<String>,
 }
 
 // ── status ────────────────────────────────────────────────────────────────────
@@ -257,6 +277,11 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
     // L11: detect FTS/nodes skew — indicates a partial write or a bad migration.
     // fts_count is the number of rows in nodes_fts (virtual FTS table).
     let fts_count = store.fts_node_count().unwrap_or(nodes);
+    // Live-overlay tallies, so a phase_b_dirty edit the editor lane already
+    // recovered reads as live-fresh rather than a blanket "stale". A read error
+    // degrades to zero, which keeps the conservative signal.
+    let resolved_refs = store.resolved_ref_count().unwrap_or(0);
+    let pending_refs = store.pending_ref_count().unwrap_or(0);
     Ok(StatusPayload {
         nodes,
         fts_nodes: fts_count,
@@ -270,7 +295,10 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
         rust_lsif_degraded: store.get_meta("rust_lsif_degraded")?,
         rerank: crate::rerank::rerank_status().to_string(),
         phase_b_dirty: store.get_meta("phase_b_dirty")?.as_deref() == Some("1"),
+        live_refs_resolved: resolved_refs,
+        live_refs_pending: pending_refs,
         dart_deps_unresolved: store.get_meta("dart_deps_unresolved")?,
+        scip_unification_miss_list: store.get_meta("scip_unification_miss_list")?,
     })
 }
 
@@ -717,17 +745,35 @@ fn is_containment_edge(kind: &travsr_core::EdgeKind) -> bool {
 /// containment edge reached in `Callers`/`Both` direction (#517 DD-1): the
 /// node is still recorded and displayed, but the traversal does not walk
 /// further from it, so a file's other definitions never enter the BFS queue.
+/// The read-side provenance of an edge that came out of a store reader, with a
+/// `tree-sitter` fallback for a constructed edge that never carried one.
+fn prov_of(e: &travsr_core::Edge) -> String {
+    e.provenance
+        .clone()
+        .unwrap_or_else(|| "tree-sitter".to_string())
+}
+
+/// One expansion step out of [`next_edges`]:
+/// `(edge_kind, next_id, expand, incoming, provenance)`. The 5th element is the
+/// edge's true `edges.provenance` (DEBT-75).
+pub type NextEdge = (travsr_core::EdgeKind, NodeId, bool, bool, String);
+
 pub fn next_edges(
     store: &SqliteStore,
     node_id: NodeId,
     direction: QueryDirection,
     edge_mode: QueryEdgeMode,
     is_seed: bool,
-) -> anyhow::Result<Vec<(travsr_core::EdgeKind, NodeId, bool, bool)>> {
+) -> anyhow::Result<Vec<NextEdge>> {
+    // DEBT-75: the 5th element is the edge's true `edges.provenance`, carried
+    // through from the store readers so callers no longer have to assume
+    // "tree-sitter". `unwrap_or` only fires on a constructed (never-read) edge,
+    // which cannot reach here.
     let mut out = Vec::new();
     if matches!(direction, QueryDirection::Deps | QueryDirection::Both) {
         for e in store.iter_edges_from(node_id)? {
-            out.push((e.kind, e.dst, true, false));
+            let prov = e.provenance.unwrap_or_else(|| "tree-sitter".to_string());
+            out.push((e.kind, e.dst, true, false, prov));
         }
     }
     if matches!(direction, QueryDirection::Callers | QueryDirection::Both) {
@@ -769,7 +815,7 @@ pub fn next_edges(
                 for e in &incoming {
                     let s = &e.kind;
                     if is_semantic_edge(s) || matches!(s, travsr_core::EdgeKind::DefinesBinding) {
-                        out.push((*s, e.src, !is_containment_edge(s), true));
+                        out.push((*s, e.src, !is_containment_edge(s), true, prov_of(e)));
                     }
                 }
             } else {
@@ -779,24 +825,24 @@ pub fn next_edges(
                 // judged from coverage in graph_query, not from this one node.
                 for e in &incoming {
                     let s = &e.kind;
-                    out.push((*s, e.src, !is_containment_edge(s), true));
+                    out.push((*s, e.src, !is_containment_edge(s), true, prov_of(e)));
                 }
             }
         } else {
             for e in &incoming {
                 let s = &e.kind;
-                out.push((*s, e.src, !is_containment_edge(s), true));
+                out.push((*s, e.src, !is_containment_edge(s), true, prov_of(e)));
             }
         }
     }
     // Multiple call sites (and the file-node definition splice) can yield the
     // same (kind, src, orientation) triple — collapse them for display.
     let mut seen = HashSet::new();
-    out.retain(|(kind, id, _, incoming)| seen.insert((*kind, *id, *incoming)));
+    out.retain(|(kind, id, _, incoming, _)| seen.insert((*kind, *id, *incoming)));
     // #517 DD-1: non-containment edges (the answer) precede containment edges
     // (orientation) from the same parent. Stable sort preserves DB order
     // within each group, so output stays deterministic.
-    out.sort_by_key(|(kind, _, _, _)| is_containment_edge(kind));
+    out.sort_by_key(|(kind, _, _, _, _)| is_containment_edge(kind));
     Ok(out)
 }
 
@@ -909,7 +955,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             continue;
         }
 
-        for (edge_kind, next_id, child_expand, edge_incoming) in next_edges(
+        for (edge_kind, next_id, child_expand, edge_incoming, edge_provenance) in next_edges(
             store,
             current_id,
             args.direction,
@@ -923,15 +969,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             } else {
                 (current_id, next_id)
             };
-            // DEBT(travsr-75): iter_edges_from/to do not return provenance, so
-            // BFS-traversed edges always show "tree-sitter" in JSON output even
-            // when the DB row is "lsif". Only --all mode (all_edges) is correct.
-            edges_raw.push((
-                src,
-                dst,
-                edge_kind.as_str().to_string(),
-                "tree-sitter".to_string(),
-            ));
+            edges_raw.push((src, dst, edge_kind.as_str().to_string(), edge_provenance));
 
             if !visited.contains(&next_id) {
                 if let Some(next_node) = store.get_node(next_id)? {
@@ -1698,6 +1736,45 @@ mod tests {
             payload.total_tokens <= DEFAULT_TOKEN_BUDGET,
             "total {} exceeded budget {DEFAULT_TOKEN_BUDGET}",
             payload.total_tokens
+        );
+    }
+
+    /// #870: the two surfaces must agree on doc *presence*. `ask` returns
+    /// `docs` as its own field on every return path, so a doc entry is always
+    /// findable; `get_context` renders the same entries into its body, where
+    /// the section header is the only thing that marks them as prose. That
+    /// header used to be dropped whenever the code lane selected four nodes or
+    /// fewer (`group_output`), which is the normal shape of a result on a
+    /// sparse graph: a repo indexed without Phase B, where PPR has almost no
+    /// edges to expand along. The doc lines then reached the model as bare
+    /// lines among the code rows, and every consumer that finds the section by
+    /// its header (the docs-lane gate, the VS Code Context Explorer) read the
+    /// response as carrying no docs at all.
+    #[test]
+    fn ask_and_context_agree_on_doc_presence_when_few_nodes_are_selected() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        docs_env_on();
+        let (mut store, ..) = seeded_store();
+        with_doc_chunk(
+            &mut store,
+            "docs/adrs/ADR-001-coding-standards.md",
+            "doc:coding-standards/consequences",
+        );
+
+        let ask = ask_query(&store, "PaymentService", None).unwrap();
+        let ctx = crate::tools::get_context_raw(&store, "PaymentService", 4000, false, None);
+        docs_env_off();
+
+        assert_eq!(ask.docs.len(), 1, "docs: {:?}", ask.docs);
+        assert!(
+            ctx.contains("docs/adrs/ADR-001-coding-standards.md"),
+            "get_context must render the same doc entry: {ctx}"
+        );
+        assert!(
+            ctx.contains("## docs"),
+            "the doc entry must carry its section header on both surfaces: {ctx}"
         );
     }
 

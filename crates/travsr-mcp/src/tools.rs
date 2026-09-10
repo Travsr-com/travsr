@@ -243,10 +243,105 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
     match (phase_b, last) {
         (None, Some(_)) => Some(PENDING.to_string()),
         (Some(pb), Some(lc)) if pb != lc => Some(PENDING.to_string()),
-        _ if dirty => Some(STALE.to_string()),
+        _ if dirty => {
+            // #583 set this flag on any mid-edit reindex, on the pre-live-lane
+            // premise that the dropped call edges are simply gone. The live
+            // overlay may have recovered them, so report the truth in three
+            // cases rather than a blanket "degraded, run init":
+            //   - no overlay ran (no resolution rows): the edges are genuinely
+            //     missing, so the stale note stands.
+            //   - some references are still pending: name that a few call edges
+            //     may be missing until commit, without the heavy "run init".
+            //   - nothing pending, but some resolved: the overlay recovered the
+            //     edits it detected. The counts are repo-wide and phase_b_dirty
+            //     is a single flag, so this cannot prove every dropped edge came
+            //     back (a headless generic-language edit leaves no rows to count,
+            //     yet feeds the same flag as an editor-resolved file). So it
+            //     still warns lightly that a few edges may be missing until the
+            //     commit, rather than falling through to "results current".
+            let resolved = store.resolved_ref_count().unwrap_or(0);
+            let pending = store.pending_ref_count().unwrap_or(0);
+            if resolved == 0 && pending == 0 {
+                Some(STALE.to_string())
+            } else if pending == 0 {
+                Some(
+                    "[note: a background re-index dropped some call edges; \
+                     uncommitted edits were re-resolved where detected, but a few \
+                     edges may still be missing until the next commit.]"
+                        .to_string(),
+                )
+            } else {
+                Some(format!(
+                    "[note: {pending} reference(s) in uncommitted edits are not \
+                     yet resolved, so a few call edges may be missing until the \
+                     next commit; other results are current.]"
+                ))
+            }
+        }
         // Current index, but not every language in it was analyzed.
         _ => phase_b_unanalyzed_note(store),
     }
+}
+
+/// RFC-027 section 10: tell a reader that this answer includes un-ratified
+/// edges, and where the remaining gaps are.
+///
+/// Two numbers, because they mean opposite things and an agent needs both:
+/// `live` edges are references the overlay *did* resolve ahead of the commit
+/// (extra freshness, not yet confirmed), while `pending` references are ones
+/// nothing could resolve (a known gap, deliberately not guessed at). Reporting
+/// only a count of live edges would read as pure upside and hide the abstentions
+/// that are the other half of a fail-closed lane.
+///
+/// `None` when the overlay is empty and nothing is pending, which is the state
+/// of any repo with no uncommitted edits — so the note never fires on a clean
+/// tree and costs a reader nothing.
+///
+/// `answer` is the rendered response this note will decorate. The **pending**
+/// half is scoped to the files that answer actually names, which is what makes
+/// it actionable rather than ambient: an agent asking "who calls `foo`" was
+/// previously told how many references are pending everywhere in the repo,
+/// which reads as though they relate to the answer it just got. Matching by
+/// substring rather than by parsing keeps this independent of each tool's output
+/// format, and the file set it tests against is capped, which also bounds a
+/// query that runs on every prose call.
+///
+/// The **live** half stays repo-wide and says so: it reports that an un-ratified
+/// overlay is in play at all, which is true of the whole graph the answer was
+/// drawn from, not of any one file in it.
+fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
+    /// Files considered when scoping the pending half. Beyond this the note is
+    /// advisory anyway, and the cap is what keeps the group-by bounded.
+    const PENDING_FILE_CAP: usize = 64;
+
+    let live = store.count_edges_with_provenance("live").ok().unwrap_or(0);
+    let pending: u64 = store
+        .pending_ref_counts_by_file(PENDING_FILE_CAP)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(path, _)| answer.contains(path.as_str()))
+        .map(|(_, n)| n)
+        .sum();
+    if live == 0 && pending == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if live > 0 {
+        parts.push(format!(
+            "{live} edge{} resolved from uncommitted edits and not yet ratified (repo-wide)",
+            if live == 1 { "" } else { "s" }
+        ));
+    }
+    if pending > 0 {
+        parts.push(format!(
+            "{pending} reference{} in the files above detected but not resolved",
+            if pending == 1 { "" } else { "s" }
+        ));
+    }
+    Some(format!(
+        "[note: live overlay active: {}. These resolve deterministically at the next commit; filter to provenance != live for ratified truth only.]",
+        parts.join("; ")
+    ))
 }
 
 /// Languages whose Phase B never produced call/ref edges on the last run, per
@@ -424,14 +519,16 @@ fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> S
         .ok()
         .flatten()
         .unwrap_or_default();
-    let mut out = body;
-    for note in [
+    // Computed against the answer as it stands, before any note is appended:
+    // `live_overlay_note` scopes its pending half to the files this answer
+    // names, and a note already appended is not part of the answer.
+    let notes = [
         phase_b_degraded_note(store),
+        live_overlay_note(store, &body),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    ];
+    let mut out = body;
+    for note in notes.into_iter().flatten() {
         if out.is_empty() {
             out = note;
         } else {
@@ -486,7 +583,11 @@ fn with_head_note(store: &SqliteStore, body: String) -> String {
 /// (#617) and the index/HEAD mismatch note (#645), each already carried in the
 /// `signals` array the global aggregator merges. `head` is injectable for the
 /// same testability reason as [`append_head_note`].
-fn read_note_signals(store: &SqliteStore, head: Option<&str>) -> Vec<serde_json::Value> {
+fn read_note_signals(
+    store: &SqliteStore,
+    head: Option<&str>,
+    answer: &str,
+) -> Vec<serde_json::Value> {
     let stored = store
         .get_meta("last_commit")
         .ok()
@@ -494,6 +595,11 @@ fn read_note_signals(store: &SqliteStore, head: Option<&str>) -> Vec<serde_json:
         .unwrap_or_default();
     [
         phase_b_degraded_note(store),
+        // RFC-027 section 10: the same live-overlay note the prose tools get,
+        // so a renderer or agent reading JSON is told just as plainly that this
+        // answer includes un-ratified edges, and scoped against the same kind of
+        // evidence (here the serialized nodes, which carry the file paths).
+        live_overlay_note(store, answer),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
     ]
     .into_iter()
@@ -630,6 +736,11 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         let Some(src_node) = node_map.get(&edge.src) else {
             continue;
         };
+        // RFC-027 section 10: mark an un-ratified edge so a reader never takes
+        // the live overlay for committed truth. Only `live` is called out —
+        // every other provenance is ratified, and tagging all of them would be
+        // noise on the common case.
+        let live = live_marker(edge);
         // True call edge: try to expand into exact call-site lines.
         if tag == "[call]" {
             if let Some(root) = &repo_root {
@@ -637,7 +748,7 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
                 if !sites.is_empty() {
                     for line in sites {
                         lines.push(format!(
-                            "{tag} {} ({}) \u{2014} {}:{}",
+                            "{tag} {} ({}) \u{2014} {}:{}{live}",
                             display_label(src_node),
                             src_node.kind,
                             src_node.vname.path,
@@ -652,7 +763,7 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         // report the node's definition line as before.
         let loc = src_node.line.map(|l| format!(":{l}")).unwrap_or_default();
         lines.push(format!(
-            "{tag} {} ({}) \u{2014} {}{}",
+            "{tag} {} ({}) \u{2014} {}{}{live}",
             display_label(src_node),
             src_node.kind,
             src_node.vname.path,
@@ -666,6 +777,22 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         lines.push(crash_caveat(&seed.vname.language));
     }
     lines.join("\n")
+}
+
+/// RFC-027 section 10: the suffix marking an edge as part of the live overlay.
+///
+/// Empty for every ratified provenance, so the common case reads exactly as it
+/// did before. A `live` edge is resolved but not yet ratified — precise enough
+/// to act on, and honest that the commit-gated pipeline has not confirmed it
+/// yet. Consumers that need ground truth filter it out; consumers that ignore
+/// provenance simply see a fresher graph, which is the additive default
+/// section 10 asks for.
+fn live_marker(edge: &travsr_core::Edge) -> &'static str {
+    if edge.provenance.as_deref() == Some("live") {
+        " [live: resolved from your uncommitted edit, not yet ratified]"
+    } else {
+        ""
+    }
 }
 
 /// Extract the bare symbol name from a stored signature for textual call-site
@@ -4470,6 +4597,7 @@ pub(crate) fn build_context_signals(
         phase_b_pending(store),
         has_embed,
         embed_warming,
+        has_embed && store.embed_disabled(),
         store.has_embed_db(),
         knn_degraded,
         overflow_msg,
@@ -4490,6 +4618,7 @@ fn build_context_signals_with_r2(
     phase_b_pending: bool,
     has_embed: bool,
     embed_warming: bool,
+    embed_disabled: bool,
     embed_initialized: bool,
     knn_degraded: bool,
     overflow_msg: Option<&str>,
@@ -4515,6 +4644,13 @@ fn build_context_signals_with_r2(
     if embed_warming {
         parts.push(
             "[note: semantic embeddings still warming up (sidecar starting); this result is lexical-only; retry in a few seconds for full semantic ranking]",
+        );
+    } else if embed_disabled {
+        // Arming finished with no hook installed, so unlike `warming` this will
+        // not resolve on a retry. Most often the index was built with a
+        // different embedding model than the one installed.
+        parts.push(
+            "[note: semantic search unavailable (the embedding sidecar did not start, or the index was built with a different model); results are lexical only. Run `travsr embed status` to check, then `travsr embed reindex` if the model changed]",
         );
     } else if has_embed && knn_degraded {
         parts.push(
@@ -4648,17 +4784,33 @@ fn omit_seed_via(grouped: bool, ms: crate::seed::MatchSource) -> bool {
 /// are partitioned into Exact → Semantic → Relevant sections (each preceded by a
 /// one-line header) and sorted within a section by descending display score.
 /// Display-only: the knapsack set is unchanged — only presentation order differs.
+///
+/// #870: the ungrouped path keeps its flat code lines, but doc entries still
+/// get their header. `grouped` is false for a result of four nodes or fewer,
+/// where per-section headers cost more than they save. That is a rule about
+/// *code* rows, which carry their own kind and path. A doc entry carries
+/// neither: the header is the only thing that marks the line as author-written
+/// prose (§4.1, mitigation M2), and it is the only handle a consumer has for
+/// finding the section at all. Dropping it left doc lines rendered bare among
+/// the code rows, so `get_context` reported no docs for a query `ask` answered
+/// from one. That is the shape of a result on a sparse graph (a repo indexed
+/// without Phase B), not an edge case. A docs-free response is unaffected and
+/// stays byte-identical.
 fn assemble_context_body(
     entries: Vec<(crate::seed::MatchSource, f32, String)>,
     sep: &str,
     grouped: bool,
 ) -> String {
     if !grouped {
-        return entries
+        let (docs, code): (Vec<_>, Vec<_>) = entries
             .into_iter()
-            .map(|(_, _, line)| line)
-            .collect::<Vec<_>>()
-            .join(sep);
+            .partition(|(ms, _, _)| *ms == crate::seed::MatchSource::Docs);
+        let mut out: Vec<String> = code.into_iter().map(|(_, _, line)| line).collect();
+        if !docs.is_empty() {
+            out.push(match_source_header(crate::seed::MatchSource::Docs).to_string());
+            out.extend(docs.into_iter().map(|(_, _, line)| line));
+        }
+        return out.join(sep);
     }
     let mut entries = entries;
     entries.sort_by(|a, b| {
@@ -5201,6 +5353,12 @@ fn get_context_body(
     // sidecar is still cold. Distinguishes "warming up" from "embeddings off"
     // so the header/notes never silently claim full semantic coverage.
     let embed_warming = has_embed && !store.embed_ready();
+    // #874: arming can settle with no hook installed (sidecar refused to start,
+    // or the index was built with a different embedding model). The MCP
+    // injector installs its meta-hooks unconditionally so `initialize` never
+    // blocks, so `has_embed` stays true and the query would otherwise report
+    // `embeddings: on` while the semantic lane is permanently dead.
+    let embed_disabled = has_embed && store.embed_disabled();
 
     // R3: track per-query KNN health; has_embed=true doesn't mean KNN worked.
     let mut knn_degraded = false;
@@ -5233,7 +5391,7 @@ fn get_context_body(
         .map(|f| f as &dyn Fn(&str, &[NodeId]) -> Vec<(NodeId, f32)>);
     let seed_set =
         crate::seed::build_seed_set(store, query, filter, knn_pairs, &knn_oracle, score_ref);
-    let tier_label = if has_embed && !seed_set.seeds.is_empty() {
+    let tier_label = if has_embed && !embed_disabled && !seed_set.seeds.is_empty() {
         "exact+lexical+semantic"
     } else {
         "exact+lexical"
@@ -5349,6 +5507,8 @@ fn get_context_body(
         "degraded"
     } else if embed_warming {
         "warming"
+    } else if embed_disabled {
+        "disabled"
     } else if has_embed {
         "on"
     } else {
@@ -5925,6 +6085,7 @@ fn get_context_body(
             phase_b,
             has_embed,
             embed_warming,
+            embed_disabled,
             embed_initialized,
             knn_degraded,
             overflow_msg.as_deref(),
@@ -5974,6 +6135,7 @@ fn get_context_body(
             phase_b,
             has_embed,
             embed_warming,
+            embed_disabled,
             embed_initialized,
             knn_degraded,
             overflow_msg.as_deref(),
@@ -6253,6 +6415,46 @@ pub struct GraphJsonParams<'a> {
     pub token_budget: usize,
     pub mode: &'a str,
     pub path_prefix: &'a str,
+    /// RFC-027 section 10: restrict edges by how they were derived.
+    ///
+    /// `""` (the default) returns everything, so an existing caller sees the
+    /// fresher graph and nothing changes for it. `"ratified"` excludes the live
+    /// overlay, for a consumer that needs only what the deterministic pipeline
+    /// has confirmed. Any other value names a single provenance exactly
+    /// (`tree-sitter`, `lsif`, `scip`, `live`).
+    ///
+    /// A word rather than a `!=` expression: the meaningful question a consumer
+    /// has is "confirmed, or everything", and spelling that as a filter grammar
+    /// would invite queries the store cannot answer cheaply.
+    pub provenance: &'a str,
+}
+
+impl Default for GraphJsonParams<'_> {
+    fn default() -> Self {
+        Self {
+            query: "",
+            direction: "both",
+            depth: 2,
+            kind_filter: "",
+            token_budget: 0,
+            mode: "",
+            path_prefix: "",
+            provenance: "",
+        }
+    }
+}
+
+/// Whether an edge with `provenance` passes the caller's filter.
+///
+/// Unknown filter values match nothing rather than everything: a typo should
+/// return an obviously empty graph, not silently ignore the constraint a
+/// consumer added precisely because it needed ground truth.
+fn provenance_allowed(filter: &str, provenance: &str) -> bool {
+    match filter {
+        "" => true,
+        "ratified" => provenance != "live",
+        exact => provenance == exact,
+    }
 }
 
 /// BFS from seed node(s) matching `query`, respecting `direction` and `depth`.
@@ -6268,6 +6470,7 @@ pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> Stri
         token_budget,
         mode,
         path_prefix,
+        provenance,
     } = params;
     if !matches!(*mode, "" | "overview") {
         tracing::warn!("get_graph_json rejected unknown mode: {mode}");
@@ -6305,6 +6508,7 @@ pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> Stri
         depth,
         kind_filter,
         *token_budget,
+        provenance,
         head.as_deref(),
     )
 }
@@ -6633,6 +6837,7 @@ fn strip_native_kind_prefix(label: &str) -> &str {
         .unwrap_or(label)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn get_graph_json_raw(
     store: &SqliteStore,
     query: &str,
@@ -6640,6 +6845,8 @@ fn get_graph_json_raw(
     depth: u8,
     kind_filter: &str,
     token_budget: usize,
+    // RFC-027 section 10: edge provenance filter. `""` returns everything.
+    provenance: &str,
     // #645/#661: the caller's live short HEAD for the index/HEAD drift signal.
     // Injected (not read from LAUNCH_CWD here) so the global aggregator can pass
     // *each* repo's own HEAD rather than the one workspace's — see
@@ -6913,30 +7120,36 @@ fn get_graph_json_raw(
             ) {
                 // First pass: dedup via edge_seen, enqueue new visits.
                 // Collect (dst_id, kind_s) only for edges that produce JSON output.
-                let mut new_edges: Vec<(NodeId, &str)> = Vec::new();
-                for (kind, next_id, child_expand, _incoming) in &nexts {
+                let mut new_edges: Vec<(NodeId, &str, &str)> = Vec::new();
+                for (kind, next_id, child_expand, _incoming, edge_prov) in &nexts {
                     let kind_s = edge_kind_str(kind);
+                    if !provenance_allowed(provenance, edge_prov) {
+                        continue;
+                    }
                     if edge_seen.insert((current_id, *next_id, kind_s)) {
-                        new_edges.push((*next_id, kind_s));
+                        new_edges.push((*next_id, kind_s, edge_prov.as_str()));
                     }
                     if visited.insert(*next_id) {
                         queue.push_back((*next_id, hop + 1, *child_expand));
                     }
                 }
                 // Batch-fetch dst nodes, then emit JSON edges in original order.
-                let dst_ids: Vec<NodeId> = new_edges.iter().map(|(id, _)| *id).collect();
+                let dst_ids: Vec<NodeId> = new_edges.iter().map(|(id, _, _)| *id).collect();
                 let node_map: HashMap<NodeId, CoreNode> = store
                     .get_nodes(&dst_ids)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|n| (n.id, n))
                     .collect();
-                for (dst_id, kind_s) in &new_edges {
+                for (dst_id, kind_s, provenance) in &new_edges {
                     if let Some(dst) = node_map.get(dst_id) {
+                        // RFC-027 section 10: renderers and agents need to tell
+                        // the un-ratified overlay from committed truth.
                         edges_out.push(serde_json::json!({
-                            "source": node_json_id(&node),
-                            "target": node_json_id(dst),
-                            "kind":   kind_s,
+                            "source":     node_json_id(&node),
+                            "target":     node_json_id(dst),
+                            "kind":       kind_s,
+                            "provenance": provenance,
                         }));
                     }
                 }
@@ -6952,30 +7165,34 @@ fn get_graph_json_raw(
                 hop == 0,
             ) {
                 // First pass: dedup via edge_seen, enqueue new visits.
-                let mut new_edges: Vec<(NodeId, &str)> = Vec::new();
-                for (kind, next_id, child_expand, _incoming) in &nexts {
+                let mut new_edges: Vec<(NodeId, &str, &str)> = Vec::new();
+                for (kind, next_id, child_expand, _incoming, edge_prov) in &nexts {
                     let kind_s = edge_kind_str(kind);
+                    if !provenance_allowed(provenance, edge_prov) {
+                        continue;
+                    }
                     if edge_seen.insert((*next_id, current_id, kind_s)) {
-                        new_edges.push((*next_id, kind_s));
+                        new_edges.push((*next_id, kind_s, edge_prov.as_str()));
                     }
                     if visited.insert(*next_id) {
                         queue.push_back((*next_id, hop + 1, *child_expand));
                     }
                 }
                 // Batch-fetch src nodes, then emit JSON edges in original order.
-                let src_ids: Vec<NodeId> = new_edges.iter().map(|(id, _)| *id).collect();
+                let src_ids: Vec<NodeId> = new_edges.iter().map(|(id, _, _)| *id).collect();
                 let node_map: HashMap<NodeId, CoreNode> = store
                     .get_nodes(&src_ids)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|n| (n.id, n))
                     .collect();
-                for (src_id, kind_s) in &new_edges {
+                for (src_id, kind_s, provenance) in &new_edges {
                     if let Some(src) = node_map.get(src_id) {
                         edges_out.push(serde_json::json!({
-                            "source": node_json_id(src),
-                            "target": node_json_id(&node),
-                            "kind":   kind_s,
+                            "source":     node_json_id(src),
+                            "target":     node_json_id(&node),
+                            "kind":       kind_s,
+                            "provenance": provenance,
                         }));
                     }
                 }
@@ -7037,7 +7254,7 @@ fn get_graph_json_raw(
     // incomplete (#617) and index/HEAD drift (#645) are independent and may both
     // apply. Carried as JSON `signals` array items (never appended as prose) so
     // the JSON body still parses; the global aggregator already merges `signals`.
-    let signals = read_note_signals(store, head);
+    let signals = read_note_signals(store, head, &out["nodes"].to_string());
     if !signals.is_empty() {
         out["signals"] = serde_json::Value::Array(signals);
     }
@@ -7064,6 +7281,7 @@ pub fn get_graph_json_global(
         token_budget: _,
         mode,
         path_prefix,
+        provenance,
     } = params;
     if *mode == "overview" {
         if !path_prefix.is_empty() {
@@ -7125,6 +7343,7 @@ pub fn get_graph_json_global(
                     depth,
                     kind_filter,
                     0,
+                    provenance,
                     head.as_deref(),
                 );
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
@@ -7439,7 +7658,7 @@ mod tests {
         store.put_node(&callee).unwrap();
         store.put_node(&caller).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 12)])
+            .record_edge_sites(&[(caller.id, callee.id, 12, None)])
             .unwrap();
 
         let clean = find_references_raw(&store, "charge", None);
@@ -8907,6 +9126,7 @@ mod tests {
                 direction: "both",
                 depth: 1,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "",
                 path_prefix: "",
@@ -8929,6 +9149,7 @@ mod tests {
                 direction: "both",
                 depth: 1,
                 kind_filter: "file",
+                provenance: "",
                 token_budget: 0,
                 mode: "",
                 path_prefix: "",
@@ -8975,6 +9196,7 @@ mod tests {
                 direction: "deps",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "",
                 path_prefix: "",
@@ -8989,6 +9211,7 @@ mod tests {
                 direction: "deps",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 30,
                 mode: "",
                 path_prefix: "",
@@ -9053,6 +9276,7 @@ mod tests {
                 direction: "both",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "overview",
                 path_prefix: "",
@@ -9113,6 +9337,7 @@ mod tests {
                 direction: "both",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "overview",
                 path_prefix: "",
@@ -9156,6 +9381,7 @@ mod tests {
                 direction: "both",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "overview",
                 path_prefix: "pkg/a/",
@@ -9227,6 +9453,7 @@ mod tests {
                 direction: "both",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "overview",
                 path_prefix: "pkg/a/",
@@ -9253,6 +9480,7 @@ mod tests {
                 direction: "both",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "badmode",
                 path_prefix: "",
@@ -9271,6 +9499,7 @@ mod tests {
                 direction: "both",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "overview",
                 path_prefix: "../etc/passwd",
@@ -9528,6 +9757,7 @@ mod tests {
                 direction: "callers",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "",
                 path_prefix: "",
@@ -9584,6 +9814,7 @@ mod tests {
                 direction: "deps",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "",
                 path_prefix: "",
@@ -10129,6 +10360,7 @@ mod snippet_tests {
                         edges: vec![],
                         vname_path: path,
                         new_hash: "deadbeef".to_string(),
+                        source: None,
                     }],
                     false,
                 )
@@ -11516,6 +11748,41 @@ mod snippet_tests {
         );
     }
 
+    /// #874: arming settled with no hook installed (model mismatch, or a sidecar
+    /// that never started). The meta-hook is still present, so `has_embed` is
+    /// true and readiness is armed — without the third state this reads as
+    /// `embeddings: on` over a semantic lane that can never answer.
+    #[test]
+    fn get_context_disabled_reports_disabled_header_and_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let readiness = travsr_store::EmbedReadiness::new();
+        readiness.mark_disabled();
+        readiness.mark_ready();
+        store.set_embed_readiness(readiness);
+        let knn: EmbedKnnFn<'_> = &|_q, _k| vec![];
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, Some(knn));
+        assert!(
+            result.contains("embeddings: disabled"),
+            "a settled-but-unarmed hook must not report `on`; got: {result}"
+        );
+        assert!(
+            !result.contains("exact+lexical+semantic"),
+            "retrieval tier must not claim semantic; got: {result}"
+        );
+        assert!(
+            result.contains("semantic search unavailable"),
+            "must emit the unavailable note; got: {result}"
+        );
+        assert!(
+            !result.contains("warming"),
+            "disabled is settled, not warming; got: {result}"
+        );
+    }
+
     // ── #617 structural-tool Phase-B degraded signals ─────────────────────────
 
     #[test]
@@ -11561,6 +11828,84 @@ mod snippet_tests {
         store.set_meta("phase_b_dirty", "1").unwrap();
         let note = phase_b_degraded_note(&store).expect("must flag stale");
         assert!(note.contains("call-graph edges degraded"), "got: {note}");
+    }
+
+    #[test]
+    fn phase_b_note_not_degraded_when_the_live_overlay_resolved_the_edit() {
+        // dirty, and the overlay resolved its references with nothing pending.
+        // This drops the heavy "degraded, run init" note, but not all caution:
+        // the counts are repo-wide, so a resolved file cannot prove a *separate*
+        // headless edit (which leaves no rows) also came back. So the note is a
+        // light "a few edges may be missing until the next commit", never the
+        // false "results are current".
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let n = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+            "function",
+        )
+        .with_line(1);
+        store.put_node(&n).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "a.rs",
+                &[travsr_store::RefResolution {
+                    src: n.id,
+                    ref_line: 2,
+                    ref_col: 0,
+                    name: "b".into(),
+                    state: "resolved",
+                    resolved_dst: None,
+                }],
+            )
+            .unwrap();
+        let note = phase_b_degraded_note(&store).expect("a light caution must remain");
+        assert!(
+            !note.contains("degraded") && !note.contains("run `travsr init`"),
+            "a resolved overlay must drop the heavy degraded/run-init note, got: {note}"
+        );
+        assert!(
+            note.contains("until the next commit"),
+            "the light caution must still name the commit as the full refresh, got: {note}"
+        );
+    }
+
+    #[test]
+    fn phase_b_note_names_pending_references_instead_of_run_init() {
+        // dirty with an unresolved reference: name the gap honestly, without the
+        // heavy "run travsr init".
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let n = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+            "function",
+        )
+        .with_line(1);
+        store.put_node(&n).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "a.rs",
+                &[travsr_store::RefResolution {
+                    src: n.id,
+                    ref_line: 2,
+                    ref_col: 0,
+                    name: "b".into(),
+                    state: "pending",
+                    resolved_dst: None,
+                }],
+            )
+            .unwrap();
+        let note = phase_b_degraded_note(&store).expect("a pending overlay must note the gap");
+        assert!(
+            note.contains("not yet resolved") && !note.contains("travsr init"),
+            "got: {note}"
+        );
     }
 
     #[test]
@@ -11749,6 +12094,170 @@ mod snippet_tests {
         assert!(out.contains("chk1111"), "head note: {out}");
     }
 
+    // ── RFC-027 section 10: the live overlay is legible, never silent ────────
+
+    /// The note never fires on a clean tree, so it costs an ordinary reader
+    /// nothing, and fires as soon as either half of the overlay is non-empty.
+    #[test]
+    fn the_live_overlay_note_fires_only_when_there_is_an_overlay() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        assert!(
+            live_overlay_note(&store, "a.ts").is_none(),
+            "a repo with no uncommitted edits must get no note"
+        );
+
+        let a = node_with("fn:a", "function", "a.ts");
+        let b = node_with("fn:b", "function", "b.ts");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store
+            .put_edge_live(&travsr_core::Edge::new(
+                a.id,
+                b.id,
+                travsr_core::EdgeKind::RefCall,
+            ))
+            .unwrap();
+
+        let note = live_overlay_note(&store, "a.ts").expect("an overlay must be announced");
+        assert!(note.contains("1 edge resolved"), "singular form: {note}");
+        assert!(
+            note.contains("provenance != live"),
+            "a reader must be told how to get ratified-only truth: {note}"
+        );
+    }
+
+    /// Both halves are reported, because they mean opposite things: live edges
+    /// are extra freshness, pending references are known gaps. Reporting only
+    /// the first would read as pure upside and hide the abstentions.
+    #[test]
+    fn the_live_overlay_note_reports_abstentions_as_well_as_resolutions() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = node_with("fn:a", "function", "a.ts");
+        store.put_node(&a).unwrap();
+        store
+            .replace_ref_resolution_states(
+                &a.vname.corpus,
+                "a.ts",
+                &[travsr_store::RefResolution {
+                    src: a.id,
+                    ref_line: 3,
+                    ref_col: 0,
+                    name: "save".to_string(),
+                    state: "pending",
+                    resolved_dst: None,
+                }],
+            )
+            .unwrap();
+
+        let note = live_overlay_note(&store, "callers in a.ts:3")
+            .expect("a pending reference must be announced");
+        assert!(
+            note.contains("1 reference in the files above detected but not resolved"),
+            "the abstention must be visible: {note}"
+        );
+
+        // Scoped, not ambient: an answer that never mentions `a.ts` must not be
+        // told about `a.ts`'s gaps.
+        assert!(
+            live_overlay_note(&store, "callers in unrelated.ts:9").is_none(),
+            "the pending half must not fire for a file the answer never names"
+        );
+    }
+
+    /// The overlay marker is attached per edge, and only to un-ratified ones.
+    #[test]
+    fn only_a_live_edge_is_marked_in_caller_output() {
+        let ratified = travsr_core::Edge::new(
+            travsr_core::NodeId(1),
+            travsr_core::NodeId(2),
+            travsr_core::EdgeKind::RefCall,
+        );
+        assert_eq!(
+            live_marker(&ratified),
+            "",
+            "an unlabelled edge is not marked"
+        );
+
+        let mut ts = ratified.clone();
+        ts.provenance = Some("tree-sitter".to_string());
+        assert_eq!(live_marker(&ts), "", "ratified provenance is not marked");
+
+        let mut live = ratified.clone();
+        live.provenance = Some("live".to_string());
+        assert!(
+            live_marker(&live).contains("not yet ratified"),
+            "a live edge must say so"
+        );
+    }
+
+    /// The filter defaults to returning everything, so an existing caller keeps
+    /// the fresher graph; `ratified` is the opt-in for ground truth only.
+    #[test]
+    fn the_provenance_filter_defaults_to_everything() {
+        assert!(provenance_allowed("", "live"));
+        assert!(provenance_allowed("", "scip"));
+
+        assert!(!provenance_allowed("ratified", "live"));
+        assert!(provenance_allowed("ratified", "tree-sitter"));
+        assert!(provenance_allowed("ratified", "scip"));
+
+        assert!(provenance_allowed("live", "live"));
+        assert!(!provenance_allowed("live", "scip"));
+
+        // An unknown filter matches nothing rather than everything: a typo must
+        // produce an obviously empty graph, not silently drop the constraint a
+        // consumer added because it needed ground truth.
+        assert!(!provenance_allowed("ratifed", "scip"));
+    }
+
+    /// The prose and JSON surfaces must announce the overlay identically. They
+    /// are separate seams (`append_read_notes` vs `read_note_signals`) because a
+    /// prose note appended to a JSON body would break `JSON.parse`, and it would
+    /// be easy for one to gain a note the other never learns about.
+    #[test]
+    fn both_surfaces_announce_the_live_overlay() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        let a = node_with("fn:a", "function", "a.ts");
+        let b = node_with("fn:b", "function", "b.ts");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store
+            .put_edge_live(&travsr_core::Edge::new(
+                a.id,
+                b.id,
+                travsr_core::EdgeKind::RefCall,
+            ))
+            .unwrap();
+
+        let prose = append_read_notes(&store, "body".to_string(), None);
+        assert!(prose.contains("live overlay active"), "prose: {prose}");
+
+        let signals = read_note_signals(&store, None, "a.ts");
+        assert!(
+            signals
+                .iter()
+                .any(|s| s.as_str().unwrap_or("").contains("live overlay active")),
+            "json signals: {signals:?}"
+        );
+
+        // And the JSON body still parses with the signal embedded.
+        let out = serde_json::json!({ "nodes": [], "edges": [], "signals": signals });
+        let text = serde_json::to_string(&out).unwrap();
+        serde_json::from_str::<serde_json::Value>(&text).expect("body must stay valid JSON");
+    }
+
+    /// Build a node for the overlay tests.
+    fn node_with(sig: &str, kind: &str, path: &str) -> travsr_core::Node {
+        travsr_core::Node::new(
+            travsr_core::VName::new("test", "", path, "typescript", sig),
+            kind,
+        )
+    }
+
     // ── #661 WS-D: head-only note on the deterministic path:line tools ────────
 
     #[test]
@@ -11800,7 +12309,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "old9999").unwrap();
 
-        let signals = read_note_signals(&store, Some("chk1111"));
+        let signals = read_note_signals(&store, Some("chk1111"), "a.ts");
         assert_eq!(signals.len(), 2, "both signals present: {signals:?}");
 
         // Embedding them in a graph-json envelope must still parse as JSON.
@@ -11822,9 +12331,9 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "idx0000").unwrap();
         // Markers agree (no Phase-B signal) and no caller HEAD ⇒ no signals at all.
-        assert!(read_note_signals(&store, None).is_empty());
+        assert!(read_note_signals(&store, None, "a.ts").is_empty());
         // Caller at the same commit ⇒ still no head signal.
-        assert!(read_note_signals(&store, Some("idx0000")).is_empty());
+        assert!(read_note_signals(&store, Some("idx0000"), "a.ts").is_empty());
     }
 
     /// get_callers must carry the note alongside real results when the marker
@@ -11896,6 +12405,7 @@ mod snippet_tests {
             direction: "both",
             depth: 2,
             kind_filter: "",
+            provenance: "",
             token_budget: 0,
             mode: "",
             path_prefix: "",
@@ -11924,6 +12434,7 @@ mod snippet_tests {
             direction: "both",
             depth: 2,
             kind_filter: "",
+            provenance: "",
             token_budget: 0,
             mode: "",
             path_prefix: "",
@@ -11944,6 +12455,7 @@ mod snippet_tests {
             direction: "both",
             depth: 1,
             kind_filter: "",
+            provenance: "",
             token_budget: 0,
             mode: "",
             path_prefix: "",
@@ -12159,6 +12671,7 @@ mod snippet_tests {
                 direction: "both",
                 depth: 1,
                 kind_filter: "file",
+                provenance: "",
                 token_budget: 0,
                 mode: "",
                 path_prefix: "",
@@ -12828,7 +13341,10 @@ mod snippet_tests {
         store.put_node(&caller).unwrap();
         // Two distinct occurrence lines from the same caller must both appear.
         store
-            .record_edge_sites(&[(caller.id, callee.id, 9), (caller.id, callee.id, 10)])
+            .record_edge_sites(&[
+                (caller.id, callee.id, 9, None),
+                (caller.id, callee.id, 10, None),
+            ])
             .unwrap();
 
         let out = find_references(&store, "charge", None);
@@ -12865,7 +13381,7 @@ mod snippet_tests {
         store.put_node(&callee).unwrap();
         store.put_node(&orphan).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 11)])
+            .record_edge_sites(&[(caller.id, callee.id, 11, None)])
             .unwrap();
 
         let out = find_references(&store, "orphan", None);
@@ -12909,7 +13425,7 @@ mod snippet_tests {
         store.put_node(&callee).unwrap();
         store.put_node(&unused).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 5)])
+            .record_edge_sites(&[(caller.id, callee.id, 5, None)])
             .unwrap();
 
         let out = find_references(&store, "unused", None);
@@ -13079,7 +13595,9 @@ mod snippet_tests {
         );
         store.put_node(&def).unwrap();
         store.put_node(&caller).unwrap();
-        store.record_edge_sites(&[(caller.id, def.id, 42)]).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, def.id, 42, None)])
+            .unwrap();
 
         for hint in [
             "crates/travsr-retrieval",  // directory prefix
@@ -13159,7 +13677,7 @@ mod snippet_tests {
         store.put_node(&shared_d).unwrap();
         store.put_node(&caller).unwrap();
         store
-            .record_edge_sites(&[(caller.id, shared_c.id, 7)])
+            .record_edge_sites(&[(caller.id, shared_c.id, 7, None)])
             .unwrap();
 
         let out = find_references(&store, "ClassC.shared", None);
@@ -13222,7 +13740,7 @@ mod snippet_tests {
         store.put_node(&shared).unwrap();
         store.put_node(&caller).unwrap();
         store
-            .record_edge_sites(&[(caller.id, shared.id, 4)])
+            .record_edge_sites(&[(caller.id, shared.id, 4, None)])
             .unwrap();
 
         let out = find_references(&store, "ClassC.shared", None);
@@ -14858,7 +15376,7 @@ mod issue_755_tests {
         store.put_node(&dog).unwrap();
         store.put_node(&target).unwrap();
         store
-            .record_edge_sites(&[(cat.id, target.id, 4), (dog.id, target.id, 7)])
+            .record_edge_sites(&[(cat.id, target.id, 4, None), (dog.id, target.id, 7, None)])
             .unwrap();
         let got = find_references_structured(&store, "speak", None);
         assert_eq!(got.status, "resolved");

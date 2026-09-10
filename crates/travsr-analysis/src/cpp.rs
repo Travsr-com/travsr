@@ -50,6 +50,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     ],
     decl_kinds: &["function_definition"],
     type_refinements: &[],
+    post_parse: None,
     get_grammar: || tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
 };
 

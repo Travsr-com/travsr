@@ -60,6 +60,19 @@ const cy = cytoscape({
     }},
     { selector: 'node[?root]', style: {
         'background-opacity': 0.38, 'border-width': 3, 'border-color': '#ffffff',
+        // The seed node is capped at the same size as any hub, so without a
+        // brighter name it looks like every other busy node in the picture.
+        color: '#ffffff', 'font-size': '12px', 'font-weight': 'bold',
+        'text-outline-width': 3, 'z-index': 1000,
+    }},
+    // ── Label level of detail ────────────────────────────────────────────────
+    // Cytoscape has no label collision avoidance, so a file with 157 nodes drew
+    // 157 names on top of each other. Ordinary nodes carry `.nolbl` and give up
+    // their label until the view is zoomed in far enough for the text to have
+    // room, or the pointer is on their neighbourhood. See applyLabelLod().
+    { selector: 'node.nolbl', style: { label: '' }},
+    { selector: 'node.lbl-keep', style: {
+        color: '#ffffff', 'text-outline-width': 3, 'z-index': 998,
     }},
     { selector: 'node[kind="var"]', style: {
         width: 42, height: 18, 'font-size': '9px', 'background-opacity': 0.22,
@@ -747,6 +760,10 @@ function renderGraph(bloomOriginId) {
   // client-side re-filters (depth, noise, vars) re-render without a round trip.
   paintDiagnostics();
 
+  // Decide which labels survive this render. progZoom sets the zoom
+  // asynchronously, so the pan/zoom handler re-runs this once it settles.
+  applyLabelLod();
+
   updateHint();
   updateStatusBar();
 }
@@ -1129,6 +1146,11 @@ cy.on('mouseover', 'node', evt => {
     cy.elements().not(':parent').difference(evt.target.closedNeighborhood()).addClass('softdim');
   }
 
+  // Name the neighbourhood the pointer is on, so a label-suppressed graph can
+  // still be read by sweeping across it rather than by zooming in and out.
+  evt.target.closedNeighborhood().nodes().addClass('lbl-keep');
+  applyLabelLod();
+
   if (FX.on && !blastOn) {
     const h1 = evt.target.closedNeighborhood().nodes().difference(evt.target);
     const h2 = h1.closedNeighborhood().nodes().difference(h1).difference(evt.target);
@@ -1184,6 +1206,8 @@ cy.on('mouseout', 'node', () => {
   tip.style.display = 'none';
   clearTimeout(tip._wt1); clearTimeout(tip._wt2);
   cy.elements().removeClass('wave-1 wave-2 softdim');
+  cy.nodes('.lbl-keep').removeClass('lbl-keep');
+  applyLabelLod();
   // Restore hover-spread
   if (_hoverSpread) {
     const s = _hoverSpread; _hoverSpread = null;
@@ -1204,6 +1228,9 @@ cy.on('tap', 'node', evt => {
     nbhd.removeClass('dimmed');
   });
   showDetail(n);
+  // Selection makes a node a landmark, and tapping changes no zoom, so the
+  // pan/zoom handler will not run. Refresh the labels here.
+  applyLabelLod();
   if (FX.on && evt.renderedPosition) shock(evt.renderedPosition.x, evt.renderedPosition.y);
 });
 cy.on('tap', evt => {
@@ -1370,7 +1397,70 @@ function drawMinimap() {
   ctx.strokeRect(X(ex.x1), Y(ex.y1), (ex.x2 - ex.x1) * sc, (ex.y2 - ex.y1) * sc);
 }
 
-cy.on('layoutstop pan zoom', () => { scheduleMinimapRedraw(); updateStatusBar(); });
+// ── Label level of detail ─────────────────────────────────────────────────────
+// Every node asked for its label at every zoom. At this repository's own
+// exec.rs that is 157 names in the space of about twenty, which renders as an
+// unreadable smear and hides the structure the graph exists to show.
+//
+// Zoomed out, only landmarks keep their name: the seed node and the busiest
+// hubs, capped at a fixed count so the number of labels cannot grow with the
+// graph. Zoomed in past LABEL_ZOOM the text has room, so everything is named.
+// Hovering reveals a neighbourhood on the way through (see the mouseover
+// handler), and the tooltip still answers for any single node.
+//
+// Package tiles, ghosts and compound parents are exempt throughout: for those
+// the label is the content, not an annotation on a dot.
+const LABEL_ZOOM = 1.15;
+const LABEL_LANDMARKS = 10;
+
+function labelableNodes() {
+  return cy.nodes().filter(n =>
+    !n.isParent() && n.data('kind') !== 'pkg' && n.data('kind') !== 'ghost');
+}
+
+function applyLabelLod() {
+  const ordinary = labelableNodes();
+  if (ordinary.length === 0) return;
+  const showAll = cy.zoom() >= LABEL_ZOOM;
+
+  const landmarks = new Set();
+  if (!showAll) {
+    ordinary.toArray()
+      .filter(n => !n.data('root'))
+      .sort((a, b) => (b.data('degree') || 0) - (a.data('degree') || 0))
+      .slice(0, LABEL_LANDMARKS)
+      .forEach(n => landmarks.add(n.id()));
+  }
+
+  cy.batch(() => {
+    ordinary.forEach(n => {
+      // Anything the user has singled out keeps its name whatever the zoom:
+      // the blast rings, a search hit, the current selection, a hovered
+      // neighbourhood. Suppressing those would break the feature that put
+      // the node on screen in the first place.
+      const singledOut =
+        n.selected() ||
+        n.hasClass('lbl-keep') ||
+        n.hasClass('node-search-hit') ||
+        n.hasClass('blast-root') || n.hasClass('blast-r1') ||
+        n.hasClass('blast-r2') || n.hasClass('blast-r3');
+      const keep = showAll || n.data('root') || landmarks.has(n.id()) || singledOut;
+      n.toggleClass('nolbl', !keep);
+    });
+  });
+}
+
+let _lodTimer = null;
+function scheduleLabelLod() {
+  clearTimeout(_lodTimer);
+  _lodTimer = setTimeout(applyLabelLod, 80);
+}
+
+cy.on('layoutstop pan zoom', () => {
+  scheduleMinimapRedraw();
+  updateStatusBar();
+  scheduleLabelLod();
+});
 
 // ── P2: Blast radius mode ─────────────────────────────────────────────────────
 function blastSelected() {
@@ -2063,7 +2153,14 @@ requestAnimationFrame(fxLoop);
       n.closedNeighborhood().removeClass('dimmed');
     });
     showDetail(n);
-    setTimeout(() => { if (_highlighted === n) { n.removeClass('node-search-hit'); _highlighted = null; } }, 2000);
+    applyLabelLod();
+    setTimeout(() => {
+      if (_highlighted === n) {
+        n.removeClass('node-search-hit');
+        _highlighted = null;
+        applyLabelLod();
+      }
+    }, 2000);
   }
 
   function setActive(idx) {

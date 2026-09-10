@@ -461,6 +461,26 @@ fn print_refused_reports(v: &serde_json::Value) {
 /// Everything else about the entry point is unchanged: same current-thread
 /// flavor, same async body (now `async_main`), same panic/exit behavior —
 /// `Builder::build()` failure panics just as the macro's expansion does.
+/// #777: what `travsr mcp` says when it is run in a terminal.
+///
+/// Separate from the call site so a test can assert the wording without faking
+/// a TTY, which is not portable.
+///
+/// Names the transport, why nothing happened, and both ways forward. The
+/// reported experience was a process that "appears frozen" with nothing on
+/// screen to act on, so an error that only said "not a tty" would reproduce the
+/// same dead end more quickly.
+fn mcp_tty_message() -> String {
+    "travsr mcp speaks JSON-RPC over stdin and is meant to be launched by an MCP \
+     client, not run directly.\n\
+     stdin is a terminal here, so there is no client to talk to and the server \
+     would wait forever for a request that never arrives.\n\
+     \n\
+     To connect it to your editor or agent: travsr connect\n\
+     To drive the protocol by hand: TRAVSR_MCP_ALLOW_TTY=1 travsr mcp"
+        .to_string()
+}
+
 fn main() {
     let max_blocking =
         (4 * travsr_plugin_host::resource_limits::effective_cpu_count()).clamp(8, 64);
@@ -1190,6 +1210,25 @@ async fn run(cli: Cli) -> Result<()> {
             global,
             db,
         } => {
+            // #777: `travsr mcp` speaks JSON-RPC over stdin, so on a terminal it
+            // blocks on a request that is never typed and looks frozen: no
+            // output, no prompt, no hint anything is wrong. It is only ever
+            // meant to be spawned as a subprocess by an MCP client.
+            //
+            // Guard on stdin, not stdout. A client that pipes stdin while
+            // leaving stderr on the terminal is a normal working setup, so
+            // testing stdout would refuse a legitimate launch. stdin being a
+            // terminal is what makes the server unusable, because there is no
+            // client on the other end to send a request.
+            //
+            // TRAVSR_MCP_ALLOW_TTY keeps the escape hatch for driving the
+            // protocol by hand, which is a real debugging workflow this would
+            // otherwise remove.
+            if std::io::IsTerminal::is_terminal(&std::io::stdin())
+                && std::env::var_os("TRAVSR_MCP_ALLOW_TTY").is_none()
+            {
+                anyhow::bail!(mcp_tty_message());
+            }
             if global {
                 travsr_mcp::serve_stdio_global()?;
             } else {
@@ -2245,6 +2284,29 @@ pub(crate) fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, dela
 
 #[cfg(test)]
 mod tests {
+
+    /// #777: running `travsr mcp` in a terminal must explain itself, not hang.
+    ///
+    /// Asserts the message rather than the TTY branch: faking a terminal on
+    /// stdin is not portable, and the branch itself is one `is_terminal` call.
+    /// What can regress silently is the wording, and the whole point of the
+    /// issue is that the user was left with nothing to act on.
+    #[test]
+    fn mcp_tty_message_says_what_to_do_next() {
+        let m = super::mcp_tty_message();
+        assert!(
+            m.contains("travsr connect"),
+            "must name the way to wire it up: {m}"
+        );
+        assert!(
+            m.contains("TRAVSR_MCP_ALLOW_TTY"),
+            "must name the override, or hand-driving the protocol becomes impossible: {m}"
+        );
+        assert!(
+            m.contains("stdin"),
+            "must say which stream is the problem: {m}"
+        );
+    }
     use super::*;
 
     /// RFC-025 §5.5 honesty test (b): a declared floor may never sit above what

@@ -19,6 +19,41 @@ use crate::repo::find_git_root;
 /// #583: equal markers are not sufficient evidence of freshness. A watcher
 /// reindex rewrites a file's Phase A nodes and drops that file's `ref/call`
 /// edges without moving HEAD, so both markers still agree while `get_callers`
+/// RFC-027 section 12: render the cumulative live-lane precision reading.
+///
+/// Returns `None` when nothing has been measured, so the line never appears on a
+/// repo that has not exercised the lane.
+///
+/// Coverage is always shown beside precision. A precision figure alone invites
+/// the reading "1.00 means it is perfect", when it may mean "two of four hundred
+/// claims were checkable and both happened to be right". The gate is on
+/// precision; coverage is what tells you whether the gate saw anything.
+fn live_precision_line(store: &travsr_store::SqliteStore) -> Option<String> {
+    let raw = store.get_meta("live_precision").ok().flatten()?;
+    let parts: Vec<u64> = raw
+        .split(',')
+        .filter_map(|p| p.trim().parse::<u64>().ok())
+        .collect();
+    let [agree, disagree, unverifiable] = parts.as_slice() else {
+        return None;
+    };
+    let total = agree + disagree + unverifiable;
+    if total == 0 {
+        return None;
+    }
+    let verified = agree + disagree;
+    let precision = if verified > 0 {
+        format!("{:.4}", *agree as f64 / verified as f64)
+    } else {
+        // Not "1.0000": nothing was checked, and saying so is the point.
+        "n/a".to_string()
+    };
+    Some(format!(
+        "live lane: precision {precision} over {verified}/{total} verifiable claims \
+         ({disagree} disagreed with semantic analysis)"
+    ))
+}
+
 /// and `get_blast_radius` answer from a graph degraded below the committed
 /// snapshot. Reporting `complete` there is the actual harm; the edges
 /// themselves return on the next commit's Phase B run.
@@ -49,7 +84,37 @@ fn phase_b_state(payload: &StatusPayload) -> String {
     match payload.phase_b_commit.as_deref() {
         Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => {
             if payload.phase_b_dirty {
-                "stale (run travsr init --semantic to refresh)".to_string()
+                // A mid-edit reindex dropped the changed region's committed
+                // edges. Whether that is a real degradation depends on the live
+                // overlay, in three cases:
+                //   - live lane inactive (no ref_resolution rows at all: a
+                //     headless daemon with no editor, or a generic-detector
+                //     language with no lexical floor): nothing recovered the
+                //     edit, so it is genuinely stale until a refresh.
+                //   - active with references still pending: name how many are
+                //     unknown until commit.
+                //   - active with nothing pending: the overlay resolved every
+                //     reference it detected, so "stale, re-run init" would be
+                //     wrong advice.
+                // The counts are repo-wide and phase_b_dirty is a single flag,
+                // so this last case cannot prove every dropped edge came back:
+                // an editor-resolved file and a headless generic-language edit
+                // (which leaves no rows at all) both feed one flag, and the
+                // resolved rows may belong only to the first. So it reports the
+                // recovery it can see without claiming a full refresh, which the
+                // commit-gated path is what actually delivers.
+                let live_active = payload.live_refs_resolved > 0 || payload.live_refs_pending > 0;
+                if !live_active {
+                    "stale (run travsr init --semantic to refresh)".to_string()
+                } else if payload.live_refs_pending > 0 {
+                    format!(
+                        "{} reference(s) in uncommitted edits not yet resolved",
+                        payload.live_refs_pending
+                    )
+                } else {
+                    "uncommitted edits resolved where detected; commit for a full refresh"
+                        .to_string()
+                }
             } else {
                 // #712: the marker now advances even when a language crashed, so
                 // the healthy languages are complete and queryable at HEAD. Name
@@ -117,6 +182,45 @@ fn warned_langs(payload: &StatusPayload, kind: &str) -> Vec<String> {
         .collect()
 }
 
+/// #825: render the unreconciled SCIP definitions behind the E6 miss warning.
+///
+/// The miss set is deterministic, so the actionable information is *which*
+/// definitions miss (which language/construct is failing), not a bare count.
+/// Each stored row is `lang\tkind\tsymbol\tpath:line`; a malformed row is passed
+/// through verbatim rather than dropped. Pure (no stderr) so it is unit-testable.
+///
+/// Display is capped at `SHOW`. `missed` is the true total from the warning's
+/// `missed/attempted` rate, which is larger than `list` whenever the daemon hit
+/// its own storage cap (`MAX_MISS_ROWS`) — the overflow line must count from it,
+/// not from the stored rows, or the tail contradicts the warning above it.
+fn unification_miss_lines(list: Option<&str>, missed: Option<usize>) -> Vec<String> {
+    const SHOW: usize = 20;
+    let Some(list) = list.filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let rows: Vec<&str> = list.lines().collect();
+    let mut out: Vec<String> = rows
+        .iter()
+        .take(SHOW)
+        .map(|row| {
+            let mut cols = row.split('\t');
+            match (cols.next(), cols.next(), cols.next(), cols.next()) {
+                (Some(lang), Some(kind), Some(symbol), Some(loc)) => {
+                    format!("  {lang} {kind} {symbol}  {loc}")
+                }
+                _ => format!("  {row}"),
+            }
+        })
+        .collect();
+    // `max(rows.len())` keeps the tail honest if the rate and the list ever
+    // disagree the other way (daemon/CLI skew): never under-report the rest.
+    let total = missed.unwrap_or(0).max(rows.len());
+    if total > out.len() {
+        out.push(format!("  … and {} more", total - out.len()));
+    }
+    out
+}
+
 /// #645 WS-B: the caller's live short HEAD, read at `cwd` (before the worktree
 /// redirect in `find_git_root`, so a linked worktree reports its own commit,
 /// not the main worktree's). `None` when git is unavailable or the dir is not a
@@ -138,7 +242,7 @@ fn head_at(cwd: &std::path::Path) -> Option<String> {
 /// daemon writes is rendered here. Printing straight to stderr from inside `run`
 /// left this consumer untestable, which is half of why classes could go missing
 /// from it unnoticed.
-fn phase_b_warning_lines(warnings: &str) -> Vec<String> {
+fn phase_b_warning_lines(warnings: &str, miss_list: Option<&str>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if warnings.is_empty() {
         return out;
@@ -269,9 +373,24 @@ fn phase_b_warning_lines(warnings: &str) -> Vec<String> {
             // duplicate node instead. `rate` is missed/attempted. Repo-wide,
             // not a per-language state, so it is deliberately not a
             // `PhaseBWarningClass` variant.
-            ["scip_unification_misses", rate] => out.push(format!(
-                "warning: {rate} semantic definitions did not match their parsed symbol, some references may resolve to a duplicate. Re-run `travsr init --semantic` if it persists."
-            )),
+            // Carries master's per-definition listing rather than the older
+            // one-line form: the extraction must not quietly revert work that
+            // landed on the block while this PR was in review.
+            ["scip_unification_misses", rate] => {
+                let missed = rate
+                    .split_once('/')
+                    .and_then(|(m, _)| m.parse::<usize>().ok());
+                let rows = unification_miss_lines(miss_list, missed);
+                let tail = if rows.is_empty() {
+                    "run `travsr init --semantic` once to record which definitions they are"
+                } else {
+                    "the unreconciled definitions are listed below"
+                };
+                out.push(format!(
+                    "warning: {rate} semantic definitions did not match their parsed symbol, so some references may resolve to a duplicate. This is deterministic (re-running the index will not change the count); {tail}."
+                ));
+                out.extend(rows);
+            }
             _ => {}
         }
     }
@@ -322,6 +441,22 @@ pub fn run() -> anyhow::Result<()> {
         payload.nodes, payload.edges, payload.schema, last_commit, phase_b_state, rerank_segment
     );
 
+    // RFC-027 section 12: the live lane's measured precision, so the per-language
+    // shipping gate has a number a human can read rather than a log line that
+    // scrolled away.
+    //
+    // Read straight from the store rather than added to `StatusPayload`: this is
+    // a diagnostic, and threading it through the query payload would mean a
+    // protocol bump that every mixed CLI/daemon pair then has to survive.
+    //
+    // Silent when the lane has never claimed anything, which is every repo that
+    // has not used it — a counter of zero is not news.
+    if let Ok(store) = daemon_client::open_read_store(&db_path) {
+        if let Some(line) = live_precision_line(&store) {
+            println!("{line}");
+        }
+    }
+
     // #645 WS-B: the freshness markers only ever compare against each other,
     // never against the repository. Compare the caller's live HEAD (read at cwd,
     // above) to the index's last_commit so a checkout at a different revision —
@@ -357,7 +492,8 @@ pub fn run() -> anyhow::Result<()> {
     // H3: surface Phase B warnings so the user knows about crashed/mismatched
     // analyzers without having to re-read the init output.
     if let Some(warnings) = &payload.phase_b_warnings {
-        for line in phase_b_warning_lines(warnings) {
+        for line in phase_b_warning_lines(warnings, payload.scip_unification_miss_list.as_deref())
+        {
             eprintln!("{line}");
         }
     }
@@ -426,6 +562,52 @@ mod tests {
     /// `Command::output()`. These pin the two answers it must give without
     /// hanging for either: a real repo reports a short SHA, a directory that is
     /// not a repo reports nothing.
+    /// The line never appears on a repo that has not used the live lane, and
+    /// never reports a precision it did not measure.
+    #[test]
+    fn live_precision_line_is_silent_until_something_is_measured() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        assert_eq!(live_precision_line(&store), None, "no reading, no line");
+
+        store.set_meta("live_precision", "0,0,0").unwrap();
+        assert_eq!(
+            live_precision_line(&store),
+            None,
+            "an empty tally is not news"
+        );
+
+        store.set_meta("live_precision", "garbage").unwrap();
+        assert_eq!(
+            live_precision_line(&store),
+            None,
+            "a corrupt value is not a reading"
+        );
+    }
+
+    /// Coverage is always shown, and an unverified sample says so instead of
+    /// rendering a perfect score it did not earn.
+    #[test]
+    fn live_precision_line_reports_coverage_beside_precision() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        store.set_meta("live_precision", "99,1,100").unwrap();
+        let line = live_precision_line(&store).unwrap();
+        assert!(line.contains("0.9900"), "precision: {line}");
+        assert!(line.contains("100/200"), "coverage must be visible: {line}");
+        assert!(
+            line.contains("1 disagreed"),
+            "false positives named: {line}"
+        );
+
+        // Nothing checkable: must not read as perfect.
+        store.set_meta("live_precision", "0,0,40").unwrap();
+        let line = live_precision_line(&store).unwrap();
+        assert!(
+            line.contains("n/a"),
+            "forty unchecked claims must not render as 1.0000: {line}"
+        );
+    }
+
     #[test]
     fn head_at_reports_a_sha_inside_a_repo_and_none_outside() {
         let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -473,7 +655,10 @@ mod tests {
             rust_lsif_degraded: None,
             rerank: String::new(),
             phase_b_dirty: dirty,
+            live_refs_resolved: 0,
+            live_refs_pending: 0,
             dart_deps_unresolved: None,
+            scip_unification_miss_list: None,
         }
     }
 
@@ -489,6 +674,48 @@ mod tests {
         assert_eq!(
             phase_b_state(&payload("abc", "abc", true)),
             "stale (run travsr init --semantic to refresh)"
+        );
+    }
+
+    #[test]
+    fn phase_b_reports_recovery_without_claiming_a_full_refresh() {
+        // The live lane resolved its references with nothing pending, so the
+        // dirty marker must not read as "stale, re-run init". But the counts are
+        // repo-wide, so this cannot prove a separate headless edit (which leaves
+        // no rows) also came back: the message reports the recovery it can see
+        // and names the commit as the full refresh, never a bare "up to date".
+        let mut p = payload("abc", "abc", true);
+        p.live_refs_resolved = 12;
+        p.live_refs_pending = 0;
+        assert_eq!(
+            phase_b_state(&p),
+            "uncommitted edits resolved where detected; commit for a full refresh"
+        );
+    }
+
+    #[test]
+    fn phase_b_names_pending_references_instead_of_a_blanket_stale() {
+        // Live lane active with some references still unresolved; report how many
+        // are unknown until commit rather than a flat "stale".
+        let mut p = payload("abc", "abc", true);
+        p.live_refs_resolved = 5;
+        p.live_refs_pending = 3;
+        assert_eq!(
+            phase_b_state(&p),
+            "3 reference(s) in uncommitted edits not yet resolved"
+        );
+    }
+
+    #[test]
+    fn phase_b_names_pending_even_when_nothing_resolved_yet() {
+        // The lane ran (rows exist) but settled nothing so far: still "active
+        // with pending", not the inactive "stale", so the count is honest.
+        let mut p = payload("abc", "abc", true);
+        p.live_refs_resolved = 0;
+        p.live_refs_pending = 4;
+        assert_eq!(
+            phase_b_state(&p),
+            "4 reference(s) in uncommitted edits not yet resolved"
         );
     }
 
@@ -550,6 +777,56 @@ mod tests {
     }
 
     #[test]
+    fn unification_misses_render_named_rows() {
+        // #825: the diagnostic names each unreconciled def (lang, kind, symbol,
+        // path:line) instead of only counting them.
+        let list = "swift\tclass\tAdHandler\tAd.swift:12\nruby\tfunction\tApp.missing\tapp.rb:99";
+        let lines = unification_miss_lines(Some(list), Some(2));
+        assert_eq!(
+            lines,
+            vec![
+                "  swift class AdHandler  Ad.swift:12".to_string(),
+                "  ruby function App.missing  app.rb:99".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unification_misses_cap_display_and_count_the_rest() {
+        let list = (0..25)
+            .map(|i| format!("go\tfunction\tf{i}\tx.go:{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = unification_miss_lines(Some(&list), Some(25));
+        assert_eq!(lines.len(), 21, "20 rows + one overflow line");
+        assert_eq!(lines.last().unwrap(), "  … and 5 more");
+    }
+
+    #[test]
+    fn unification_misses_overflow_counts_from_the_true_total() {
+        // #825 review: `write_phase_b_results` caps the STORED list at 100 rows
+        // while display caps at 20, so for the issue's 152/2632 case counting the
+        // remainder from the stored rows printed "… and 80 more" directly under a
+        // warning that said 152. The overflow must count from the rate.
+        let list = (0..100)
+            .map(|i| format!("swift\tclass\tT{i}\tA.swift:{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = unification_miss_lines(Some(&list), Some(152));
+        assert_eq!(lines.len(), 21);
+        assert_eq!(lines.last().unwrap(), "  … and 132 more");
+        // An unparseable rate must never under-report: fall back to the rows.
+        let lines = unification_miss_lines(Some(&list), None);
+        assert_eq!(lines.last().unwrap(), "  … and 80 more");
+    }
+
+    #[test]
+    fn unification_misses_empty_or_absent_render_nothing() {
+        assert!(unification_miss_lines(None, Some(152)).is_empty());
+        assert!(unification_miss_lines(Some(""), Some(152)).is_empty());
+    }
+
+    #[test]
     fn phase_b_zero_nodes_still_reports_complete() {
         // A run that COMPLETED and produced no symbols still completed — 0 nodes is
         // a valid result, not a failure — so it must not downgrade "complete".
@@ -579,7 +856,7 @@ mod tests {
     fn every_phase_b_warning_class_the_daemon_writes_is_rendered() {
         for class in Warn::ALL {
             let tag = class.tag();
-            let lines = phase_b_warning_lines(&class.sample_entry("go"));
+            let lines = phase_b_warning_lines(&class.sample_entry("go"), None);
             assert!(
                 !lines.is_empty(),
                 "class {tag:?} is written by the daemon but `travsr status` says nothing \
@@ -597,7 +874,7 @@ mod tests {
     /// arm that repeats it per language.
     #[test]
     fn untrusted_corpus_collapses_into_one_line_for_every_language() {
-        let lines = phase_b_warning_lines("untrusted_corpus:go,untrusted_corpus:php");
+        let lines = phase_b_warning_lines("untrusted_corpus:go,untrusted_corpus:php", None);
         assert_eq!(lines.len(), 1, "one line for the whole repo: {lines:?}");
         assert!(lines[0].contains("go, php"), "both named: {lines:?}");
     }

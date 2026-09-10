@@ -246,7 +246,7 @@ pub fn extract_native_phase_b(
         "dart emitter exited with {status}: {stderr_buf}"
     );
 
-    parse_emitter_output(&output_path, corpus)
+    parse_emitter_output(&output_path, corpus, root)
 }
 
 /// Dart packages under `root` whose dependencies are not resolved.
@@ -314,9 +314,53 @@ fn collect_unresolved(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Strin
     }
 }
 
+/// Convert a 0-based UTF-16 column to the 0-based UTF-8 byte column the
+/// occurrence store keeps (#813).
+///
+/// The Dart emitter declares `col_unit: "utf16"`, so this converts rather than
+/// guessing. `None` when the position is past the line or lands inside a
+/// character (the low half of a surrogate pair), because half a character is
+/// not a position an editor can resolve.
+fn utf16_col_to_byte(line: &str, character: i64) -> Option<u32> {
+    let target = usize::try_from(character).ok()?;
+    let mut units = 0usize;
+    for (byte_idx, ch) in line.char_indices() {
+        if units == target {
+            return Some(byte_idx as u32);
+        }
+        units += ch.len_utf16();
+        if units > target {
+            return None;
+        }
+    }
+    (units == target).then_some(line.len() as u32)
+}
+
+/// The occurrence column, kept only where no character encoding could change
+/// what it counts (#813).
+///
+/// The Dart emitter reports `col` in Dart string code units (UTF-16), while the
+/// occurrence store keeps a UTF-8 byte column. Rather than convert (and risk a
+/// wrong editor position, which is a wrong edge), keep the column only while the
+/// line prefix is pure ASCII, where the two are the same number. Outside that
+/// window the daemon name-searches the line exactly as it did before Dart
+/// carried a column at all.
+///
+/// Lives here rather than in a shared crate because `travsr-analysis` depends on
+/// `travsr-core` alone (see the crate docs), and the rule is six lines.
+fn encoding_agnostic_col(line: &str, character: i64) -> Option<u32> {
+    let col = usize::try_from(character).ok()?;
+    let bytes = line.as_bytes();
+    if col > bytes.len() {
+        return None;
+    }
+    bytes[..col].is_ascii().then_some(col as u32)
+}
+
 fn parse_emitter_output(
     json_path: &Path,
     corpus: &str,
+    root: &Path,
 ) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<ScipRef>)> {
     let bytes = std::fs::read(json_path)
         .with_context(|| format!("reading emitter output {}", json_path.display()))?;
@@ -327,6 +371,9 @@ fn parse_emitter_output(
 
     let root_val: serde_json::Value =
         serde_json::from_slice(&bytes).context("parsing emitter JSON")?;
+    // #813: the emitter declares what its `col` counts. An older emitter that
+    // declares nothing keeps the conservative encoding-agnostic behaviour.
+    let col_is_utf16 = root_val["col_unit"].as_str() == Some("utf16");
 
     let docs = root_val["documents"]
         .as_array()
@@ -371,6 +418,13 @@ fn parse_emitter_output(
         let Some(refs) = doc["references"].as_array() else {
             continue;
         };
+        // #813: the document's source, read once, so each reference's column can
+        // be accepted only where the encoding cannot change its meaning.
+        let doc_src = std::fs::read_to_string(root.join(path)).ok();
+        let doc_lines: Vec<&str> = doc_src
+            .as_deref()
+            .map(|t| t.lines().collect())
+            .unwrap_or_default();
         let file_id = VName::new(corpus, "", path, "dart", "file").id();
         for r in refs {
             let sym = r["symbol"].as_str().unwrap_or("");
@@ -393,6 +447,19 @@ fn parse_emitter_output(
                         // The Dart emitter reports call references; treat as calls
                         // so they create `ref/call` edges as before (#650).
                         is_call: true,
+                        // RFC-027 #813 P2: the emitter reports the reference's
+                        // column and declares its unit, so this converts rather
+                        // than guessing. An emitter too old to declare one falls
+                        // back to the encoding-agnostic window; anything that does
+                        // not resolve stays unset for the daemon to name-search.
+                        caller_col: r["col"].as_i64().and_then(|c| {
+                            let l = doc_lines.get((line as usize).checked_sub(1)?)?;
+                            if col_is_utf16 {
+                                utf16_col_to_byte(l, c)
+                            } else {
+                                encoding_agnostic_col(l, c)
+                            }
+                        }),
                     });
                 } else {
                     edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
@@ -413,6 +480,55 @@ fn parse_emitter_output(
 
 #[cfg(test)]
 mod tests {
+    /// #813: the emitter declares `col_unit: "utf16"`, so the column is
+    /// converted rather than dropped. Measured on a real emitter run over
+    /// `var s = "Caf\u{e9}"; return g.hello();`: it reports UTF-16 column 29 and
+    /// `hello` starts at byte 30, so the conversion is what makes that reference
+    /// resolvable at all.
+    #[test]
+    fn a_declared_utf16_column_is_converted_to_the_byte_column() {
+        let mixed = "    var s = \"Caf\u{e9}\"; return g.hello();";
+        assert_eq!(super::utf16_col_to_byte(mixed, 29), Some(30));
+        assert_eq!(&mixed.as_bytes()[30..35], b"hello");
+
+        // On an ASCII line the two units coincide.
+        let ascii = "    return g.hello();";
+        assert_eq!(super::utf16_col_to_byte(ascii, 13), Some(13));
+
+        // Half a character is not a position an editor can resolve.
+        let emoji = "x = \"\u{1F600}\"; y();";
+        assert_eq!(super::utf16_col_to_byte(emoji, 6), None);
+
+        // Degenerate inputs abstain rather than panicking.
+        assert_eq!(super::utf16_col_to_byte(ascii, -1), None);
+        assert_eq!(super::utf16_col_to_byte(ascii, 999), None);
+    }
+
+    /// #813: the Dart emitter reports its column in UTF-16 code units, so on a
+    /// line with a non-ASCII character the byte interpretation is off. Measured
+    /// on a real emitter run over `let s = "Caf\u{e9}"; return g.hello();`, the
+    /// emitter said col 29: byte 29 lands on `.hello()` while the intended token
+    /// starts at byte 30. Keeping that column would be a wrong editor position,
+    /// so the rule abstains there and keeps only the unambiguous ASCII prefix.
+    #[test]
+    fn a_dart_column_is_kept_only_where_utf16_and_bytes_agree() {
+        // ASCII prefix: UTF-16 index == byte index, so the column is safe.
+        let ascii = "    return g.hello();";
+        assert_eq!(super::encoding_agnostic_col(ascii, 13), Some(13));
+        assert_eq!(&ascii.as_bytes()[13..18], b"hello");
+
+        // Non-ASCII before the reference: the emitter's UTF-16 column is NOT the
+        // byte column, and nothing on the wire says which one it is. Abstain.
+        let mixed = "    var s = \"Caf\u{e9}\"; return g.hello();";
+        assert_eq!(super::encoding_agnostic_col(mixed, 29), None);
+        // Proof the abstention is warranted: byte 29 is not where `hello` starts.
+        assert_ne!(&mixed.as_bytes()[29..34], b"hello");
+
+        // Out-of-range and negative columns abstain rather than panic.
+        assert_eq!(super::encoding_agnostic_col(ascii, -1), None);
+        assert_eq!(super::encoding_agnostic_col(ascii, 999), None);
+    }
+
     use super::*;
     use std::io::Write as _;
 
@@ -446,7 +562,8 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(json.as_bytes()).unwrap();
 
-        let (nodes, edges, refs) = parse_emitter_output(f.path(), "c").unwrap();
+        let (nodes, edges, refs) =
+            parse_emitter_output(f.path(), "c", Path::new("/nonexistent")).unwrap();
 
         // One definition node, carrying kind + line span.
         assert_eq!(nodes.len(), 1);
@@ -487,7 +604,8 @@ mod tests {
     #[test]
     fn parse_emitter_output_empty_file_is_no_op() {
         let f = tempfile::NamedTempFile::new().unwrap();
-        let (nodes, edges, refs) = parse_emitter_output(f.path(), "c").unwrap();
+        let (nodes, edges, refs) =
+            parse_emitter_output(f.path(), "c", Path::new("/nonexistent")).unwrap();
         assert!(nodes.is_empty() && edges.is_empty() && refs.is_empty());
     }
 

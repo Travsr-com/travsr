@@ -58,6 +58,14 @@ pub struct LanguageConfig {
     /// ancestor whose kind is listed here. Empty ⇒ the 1-hop span is already
     /// correct for this grammar (name is a direct child of its declaration).
     pub decl_kinds: &'static [&'static str],
+    /// Optional post-parse expansion hook, run once after the capture pass with
+    /// the parsed tree and source so a language can synthesize nodes the shared
+    /// capture pipeline cannot express. Used by Ruby (#780) to expand
+    /// `attr_accessor`/`attr_reader`/`attr_writer` macros into their reader/writer
+    /// accessor method nodes (one macro → N synthetic names with a derived `=`
+    /// writer, which no single capture can produce). `None` for every language
+    /// whose definitions are all direct captures.
+    pub post_parse: Option<PostParseHook>,
     /// N4d refiners for grammars that fold several type kinds into one AST node
     /// with no distinguishing field (unlike Swift's `declaration_kind`).
     /// tree-sitter-kotlin-ng folds `class`/`interface`/`enum class` into
@@ -71,6 +79,31 @@ pub struct LanguageConfig {
     /// Stored as a function pointer so `LanguageConfig` is `const`-constructible
     /// (tree-sitter `Language` itself is not directly `const`-constructible).
     pub get_grammar: fn() -> tree_sitter::Language,
+}
+
+/// A language-specific post-parse expansion pass (see [`LanguageConfig::post_parse`]).
+/// Receives the parsed tree/source via [`PostParseCtx`] and appends synthetic
+/// nodes and their containment edges to the accumulating output.
+pub type PostParseHook = fn(&PostParseCtx<'_>, &mut Vec<Node>, &mut Vec<Edge>);
+
+/// Context handed to a [`PostParseHook`]: everything it needs to build VNames and
+/// containment edges consistent with the capture pass that ran before it.
+pub struct PostParseCtx<'a> {
+    /// Root of the parsed tree.
+    pub root: tree_sitter::Node<'a>,
+    /// File bytes (for `utf8_text` on captured nodes).
+    pub source: &'a [u8],
+    /// The corpus this file belongs to.
+    pub corpus: &'a str,
+    /// VName path of the file being parsed.
+    pub vname_path: &'a str,
+    /// Language string (`config.language.as_str()`), for VName construction.
+    pub lang: &'a str,
+    /// The file node's id, for edges parented to the file.
+    pub file_id: travsr_core::NodeId,
+    /// The parser config, so the hook can reuse `method_containers` /
+    /// `type_refinements` (e.g. via [`enclosing_container`]).
+    pub config: &'a LanguageConfig,
 }
 
 /// N4d: refine a folded type declaration's kind by the presence of a signal
@@ -265,6 +298,37 @@ pub fn parse_with_config(
         }
     }
 
+    // #780: the capture loop emits one node per matched capture, so a symbol
+    // whose definition site recurs — a Ruby ivar `@x` reassigned in several
+    // methods, a constant redeclared — yields several nodes that share one
+    // VName/NodeId at different lines. `flush_staging_to_production` documents
+    // the invariant "same NodeId => same VName => same parse output, so all are
+    // equal" and breaks any tie with `MAX(line)`, which would anchor the node on
+    // the last reassignment and defeat the SCIP def's line-proximity match.
+    // Collapse duplicates to the first occurrence in document order (query
+    // matches arrive in start-position order) so the invariant holds and the
+    // anchor line stays the definition, not a later write.
+    {
+        let mut seen_ids = std::collections::HashSet::new();
+        nodes.retain(|n| seen_ids.insert(n.id));
+    }
+
+    // #780: language-specific expansion the shared capture pipeline cannot
+    // express (Ruby `attr_*` macros → accessor method nodes). No-op for every
+    // config that leaves `post_parse` unset.
+    if let Some(hook) = config.post_parse {
+        let ctx = PostParseCtx {
+            root: tree.root_node(),
+            source: &source,
+            corpus,
+            vname_path,
+            lang: lang_str,
+            file_id,
+            config,
+        };
+        hook(&ctx, &mut nodes, &mut edges);
+    }
+
     // #479: single language-agnostic post-pass sets test_role from the collected
     // signals (no-op when the file has no test captures).
     crate::test_role::apply_test_roles(&test_signals, &mut nodes);
@@ -313,7 +377,7 @@ fn decl_end_line(node: tree_sitter::Node<'_>, decl_kinds: &[&str]) -> Option<u32
 /// signature prefix that container is captured under, so the caller can
 /// reconstruct the container's own VName (`{prefix}:{name}`) for the
 /// containment edge.
-fn enclosing_container<'a>(
+pub(crate) fn enclosing_container<'a>(
     node: tree_sitter::Node<'_>,
     method_containers: &[(&'static str, &'a str)],
     type_refinements: &[TypeRefinement],

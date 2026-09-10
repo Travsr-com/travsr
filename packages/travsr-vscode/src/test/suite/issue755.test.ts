@@ -4,13 +4,17 @@ import {
   parseLangList,
   parseAvailableLanguages,
   contractSkewMessage,
+  buildLanguageRows,
+  parseRepoLanguages,
 } from "../../commands";
 import {
-  buildLanguagesHtml,
+  buildStatsHtml,
+  EMPTY_HEALTH,
+  UNKNOWN_INDEX,
   LANG_CONTRACT_FIELDS,
   LANG_CONTRACT_VERSION,
 } from "../../webviews";
-import type { LangCount, LangInfo } from "../../webviews";
+import type { HealthData, LangInfo, StatsView } from "../../webviews";
 
 /**
  * #755 Part A — the Languages panel rendered a stale binary's `lang list --json`
@@ -50,10 +54,17 @@ const CURRENT_ROW = {
   prerequisites: "Go toolchain",
 };
 
-const INDEXED: LangCount[] = [{ language: "go", count: 42 }];
-
 /** A well-formed row, for the mixed-payload cases. */
 const GOOD: LangInfo = CURRENT_ROW as unknown as LangInfo;
+
+const STATS: StatsView = { nodes: "1", edges: "1", schemaVersion: "1", dbSize: "1 B", lastIndexed: "now" };
+
+/** Render the Health page with just these language rows, the surface that
+ *  replaced the Languages panel. */
+function healthWith(languages: HealthData["languages"], skew?: HealthData["languagesSkew"]): string {
+  const health: HealthData = { ...EMPTY_HEALTH, languages, ...(skew ? { languagesSkew: skew } : {}) };
+  return buildStatsHtml(STATS, [], [], 500, undefined, 0, UNKNOWN_INDEX, health);
+}
 
 suite("#755 Part A: lang list --json shape validation", () => {
   test("a current payload reports no skew and states its contract revision", () => {
@@ -68,7 +79,7 @@ suite("#755 Part A: lang list --json shape validation", () => {
     assert.deepStrictEqual(
       got.missingFields.slice().sort(),
       ["prerequisites", "repoState", "status", "statusLine"],
-      "these are the four fields buildLanguagesHtml reads and cannot re-derive"
+      "these are the four fields the Languages table reads and cannot re-derive"
     );
     assert.strictEqual(
       got.reportedContract,
@@ -198,7 +209,7 @@ suite("#755 Part A: lang list --json shape validation", () => {
     ]) {
       assert.ok(
         (LANG_CONTRACT_FIELDS as readonly string[]).includes(f),
-        `${f} is read by buildLanguagesHtml and must be in the contract`
+        `${f} is read by buildLanguageRows and must be in the contract`
       );
     }
   });
@@ -252,9 +263,9 @@ suite("#755 Part A: the skew message is actionable", () => {
   });
 });
 
-suite("#755 Part A: the Languages panel withholds skewed rows", () => {
+suite("#755 Part A: the Health page withholds skewed rows", () => {
   test("a skewed payload shows an actionable banner instead of the rows", () => {
-    const html = buildLanguagesHtml(INDEXED, [STALE_ROW as unknown as LangInfo], undefined, {
+    const html = healthWith(null, {
       missingFields: ["status", "statusLine", "repoState", "prerequisites"],
       binary: "/home/u/.nvm/versions/node/v20/bin/travsr",
     });
@@ -263,40 +274,18 @@ suite("#755 Part A: the Languages panel withholds skewed rows", () => {
     assert.ok(html.includes("repoState") && html.includes("prerequisites"), "name the gaps");
     assert.ok(html.includes("downloadBinary("), "offer the download");
     assert.ok(html.includes("openBinarySetting("), "offer the settings path");
-    assert.ok(html.includes("Held back"), "the empty table must say why it is empty");
     assert.ok(
-      !html.includes("No analysis tools available yet"),
-      "that placeholder claims something about the machine, not about the binary"
+      !html.includes("Could not read the language list."),
+      "that placeholder claims a read failure, not a stale binary"
     );
-  });
-
-  test("the skewed payload's rows are not rendered at all", () => {
-    const html = buildLanguagesHtml([], [STALE_ROW as unknown as LangInfo], undefined, {
-      missingFields: ["status"],
-    });
-    assert.ok(
-      !html.includes('onclick="installLang'),
-      "an Install button derived from a missing status is exactly the wrong offer"
-    );
-    assert.ok(
-      !html.includes('<td><span class="mono">go</span></td>'),
-      "no row may be rendered from a payload the panel cannot read"
-    );
-  });
-
-  test("the indexed section still renders under a skew", () => {
-    // Indexed counts come from the MCP daemon, not from `lang list --json`, so a
-    // stale CLI must not blank facts that did not come from it.
-    const html = buildLanguagesHtml(INDEXED, [], undefined, { missingFields: ["status"] });
-    assert.ok(html.includes("42"), "node counts are unaffected by CLI skew");
-    assert.ok(html.includes("Indexed in this repo"));
+    assert.ok(!html.includes("fixLang(this,"), "no action derived from a missing status");
   });
 
   test("no skew means no banner and normal rows", () => {
-    const html = buildLanguagesHtml(INDEXED, [GOOD]);
+    const html = healthWith(buildLanguageRows([GOOD], []));
     assert.ok(!html.includes("older than this extension expects"));
     assert.ok(html.includes("Go toolchain"), "prerequisites render normally");
-    assert.ok(html.includes("badge ok"), "an active language keeps its badge");
+    assert.ok(html.includes("enabled</td>"), "an enabled language keeps its state");
   });
 });
 
@@ -309,70 +298,163 @@ suite("#755 Part A: per-cell guards never render the string 'undefined'", () => 
   const oddRow = { ...STALE_ROW, language: "php" } as unknown as LangInfo;
 
   test("an absent status reads as unknown, not as 'partial'", () => {
-    const html = buildLanguagesHtml([], [GOOD, oddRow]);
-    assert.ok(
-      html.includes(">unknown<"),
-      "a missing status must say the value is unknown"
-    );
-    assert.ok(
-      /did not report a status for php/.test(html),
-      `the tooltip must name the remedy; got no such tooltip`
-    );
+    const [good, odd] = buildLanguageRows([GOOD, oddRow], []);
+    assert.strictEqual(good.analysis, "full");
+    assert.strictEqual(odd.analysis, "unknown", "a missing status must say the value is unknown");
   });
 
   test("an absent repoState never interpolates the literal 'undefined'", () => {
-    const html = buildLanguagesHtml([], [GOOD, oddRow]);
-    assert.ok(
-      !html.includes(">undefined<"),
-      "this is the exact cell the issue reports as reading 'undefined'"
-    );
+    const rows = buildLanguageRows([GOOD, oddRow], []);
+    assert.strictEqual(rows[1].repoState, "unknown");
+    const html = healthWith(rows);
+    assert.ok(!html.includes(">undefined<"), "this is the exact cell the issue reports as reading 'undefined'");
     assert.ok(!/title="undefined"/.test(html), "nor as a tooltip");
+    assert.ok(/did not report per-repository state for php/.test(html), "the tooltip must name the remedy");
   });
 
   test("an absent prerequisites is not reported as 'no prerequisites'", () => {
-    const html = buildLanguagesHtml([], [oddRow]);
-    assert.ok(
-      /did not report prerequisites for php/.test(html),
-      "'—' means the analyzer needs nothing, which is a different claim"
-    );
+    const [row] = buildLanguageRows([oddRow], []);
+    assert.strictEqual(row.prerequisites, "unknown", "'' means the analyzer needs nothing, which is a different claim");
+    assert.ok(/did not report prerequisites for php/.test(healthWith([row])));
   });
 
   test("a needs_approval row from an older CLI still renders an action", () => {
     // Elevated access is auto-granted for local use now, so a current CLI never
-    // emits `needs_approval` — but an older one does, and the panel still has to
-    // give that row something to click rather than an empty Action cell.
+    // emits `needs_approval`, but an older one does, and the row still has to
+    // give that language something to click rather than an empty Action cell.
     const legacy = {
       ...CURRENT_ROW,
       language: "java",
       status: "needs_approval",
       needsApproval: true,
     } as unknown as LangInfo;
-    const html = buildLanguagesHtml([{ language: "java", count: 9 }], [legacy]);
-    assert.ok(html.includes("installLang"), "the row must offer a plain Install");
+    const [row] = buildLanguageRows([legacy], []);
+    assert.notStrictEqual(row.fix, "none", "the row must offer an action");
+    const html = healthWith([row]);
+    assert.ok(html.includes("fixLang(this, 0)"));
     assert.ok(!html.includes("undefined"), "and must not leak a guessed-at value");
   });
 
-  test("the whole panel is free of the string 'undefined' for a short row", () => {
-    const html = buildLanguagesHtml(INDEXED, [oddRow, GOOD]);
-    assert.ok(
-      !html.includes("undefined"),
-      "any 'undefined' reaching the HTML is a value the panel guessed at"
-    );
+  test("the whole page is free of the string 'undefined' for a short row", () => {
+    const html = healthWith(buildLanguageRows([oddRow, GOOD], []));
+    assert.ok(!html.includes("undefined"), "any 'undefined' reaching the HTML is a value the page guessed at");
   });
 
-  test("a status tag the panel does not know reads as unknown, not as partial", () => {
-    // Forward compatibility: a newer CLI adding a status must degrade to
-    // "unknown", not be asserted as "partial".
+  test("a status tag the panel does not know is never asserted as full", () => {
+    // Forward compatibility: a newer CLI adding a status must not be read as a
+    // live analysis the extension cannot see.
     const future = { ...CURRENT_ROW, status: "brand_new_state" } as unknown as LangInfo;
-    const html = buildLanguagesHtml([], [future]);
-    assert.ok(html.includes(">unknown<"), "an unrecognised tag is unknown");
-    assert.ok(!html.includes(">partial<"), "and must not be asserted as partial");
+    const [row] = buildLanguageRows([future], []);
+    assert.strictEqual(row.full, false);
+    assert.ok(!healthWith([row]).includes(">partial<"), "and must not be asserted as partial");
   });
 
   test("a repoState tag the panel does not know reads as unknown", () => {
     const future = { ...CURRENT_ROW, repoState: "brand_new_state" } as unknown as LangInfo;
-    const html = buildLanguagesHtml([], [future]);
+    const [row] = buildLanguageRows([future], []);
+    assert.strictEqual(row.repoState, "unknown");
+    const html = healthWith([row]);
     assert.ok(!html.includes("undefined"));
-    assert.ok(html.includes(">unknown<"));
+    assert.ok(html.includes("unknown</td>"), "the cell says the value is unknown");
+  });
+});
+
+suite("Health Languages: installed on this machine versus enabled for this repo", () => {
+  const base = { ...CURRENT_ROW, contract: 1 };
+  const row = (patch: Record<string, unknown>): LangInfo => ({ ...base, ...patch }) as unknown as LangInfo;
+
+  test("installed but off for this repo offers the enable, not an install", () => {
+    const [r] = buildLanguageRows([row({ language: "kotlin", status: "partial", repoState: "not_enabled", installed: true })], []);
+    assert.strictEqual(r.installed, true);
+    assert.strictEqual(r.repoState, "not_enabled");
+    assert.strictEqual(r.fix, "enable");
+    const html = healthWith([r]);
+    assert.ok(html.includes("Enable for this repo"));
+    assert.ok(!html.includes("Install analyzer"));
+  });
+
+  test("not installed offers the install, whatever the repo state says", () => {
+    const [r] = buildLanguageRows([row({ language: "go", status: "partial", repoState: "not_enabled", installed: false })], []);
+    assert.strictEqual(r.fix, "install");
+  });
+
+  test("a builtin missing its analyzer offers the install, never a green always-on", () => {
+    const [r] = buildLanguageRows([row({ language: "rust", status: "partial", repoState: "needs_analyzer", installed: false, builtin: true })], []);
+    assert.strictEqual(r.fix, "install");
+    assert.ok(healthWith([r]).includes("no analyzer"));
+  });
+
+  test("an unavailable language gets no action and says why", () => {
+    const [r] = buildLanguageRows([row({ language: "ruby", status: "unsupported", availableOnThisPlatform: false, unavailableTarget: "windows", installed: false })], []);
+    assert.strictEqual(r.availableHere, false);
+    assert.strictEqual(r.fix, "none");
+    const html = healthWith([r]);
+    assert.ok(html.includes("not available on Windows"));
+    assert.ok(!html.includes("fixLang(this,"));
+  });
+
+  test("an enabled non-builtin can be disabled; a builtin cannot", () => {
+    const rows = buildLanguageRows(
+      [
+        row({ language: "java", status: "active", repoState: "enabled", builtin: false }),
+        row({ language: "python", status: "active", repoState: "always_on", builtin: true }),
+      ],
+      []
+    );
+    assert.strictEqual(rows[0].canDisable, true);
+    assert.strictEqual(rows[1].canDisable, false);
+    const html = healthWith(rows);
+    assert.ok(html.includes("disableLang(this, 0)"));
+    assert.ok(!html.includes("disableLang(this, 1)"));
+  });
+
+  test("a language the repo does not contain is listed but never offered an enable or install", () => {
+    const detected = new Set(["typescript", "java"]);
+    const rows = buildLanguageRows(
+      [
+        row({ language: "java", status: "active", repoState: "enabled" }),
+        row({ language: "kotlin", status: "partial", repoState: "not_enabled", installed: true }),
+        row({ language: "go", status: "partial", repoState: "not_enabled", installed: false }),
+      ],
+      [],
+      detected
+    );
+    assert.strictEqual(rows[0].inRepo, true);
+    assert.strictEqual(rows[1].inRepo, false);
+    assert.strictEqual(rows[1].fix, "none", "installed elsewhere, but this repo has no kotlin: nothing to enable");
+    assert.strictEqual(rows[2].fix, "none", "and nothing to install for a language the repo does not use");
+    const html = healthWith(rows);
+    assert.ok(html.includes("<td>java"), "the language the repo has is listed");
+    assert.ok(!html.includes("<td>kotlin") && !html.includes("<td>go"), "the ones it does not have are not rendered at all");
+    assert.ok(!html.includes("Enable for this repo") && !html.includes("Install analyzer"));
+    // The index a button posts is the position in the full list, not in the
+    // rendered subset, since that is what the extension looks a click up in.
+    assert.ok(html.includes("disableLang(this, 0)"));
+  });
+
+  test("a repo with none of the catalog's languages says so instead of showing an empty table", () => {
+    const rows = buildLanguageRows([row({ language: "go", status: "partial" })], [], new Set(["cobol"]));
+    assert.ok(healthWith(rows).includes("no supported languages in this repository"));
+  });
+
+  test("when the graph cannot say which languages the repo has, nothing is gated", () => {
+    const [r] = buildLanguageRows([row({ language: "kotlin", status: "partial", repoState: "not_enabled", installed: true })], [], new Set());
+    assert.strictEqual(r.inRepo, true);
+    assert.strictEqual(r.fix, "enable");
+  });
+
+  test("repo_languages output parses to a set of canonical names", () => {
+    const set = parseRepoLanguages("<travsr-data>\ntypescript\t3200\nRust\t840\n\n</travsr-data>");
+    assert.deepStrictEqual([...set].sort(), ["rust", "typescript"]);
+    assert.strictEqual(parseRepoLanguages("").size, 0);
+  });
+
+  test("a warning on the page turns an active row into a semantic re-run", () => {
+    const [r] = buildLanguageRows(
+      [row({ language: "java", status: "active", repoState: "enabled" })],
+      [{ severity: "warn", title: "'java' analysis ran but found no symbols", hint: "re-run travsr init --semantic --force", command: "travsr init --semantic --force" }]
+    );
+    assert.strictEqual(r.flagged, true);
+    assert.strictEqual(r.fix, "semantic");
   });
 });
