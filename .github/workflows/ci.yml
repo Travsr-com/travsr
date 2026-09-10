@@ -398,6 +398,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The parser first: against a clean tree a broken scan and a correct one
+      # print the same thing, so the check below can never notice a parser
+      # regression. #690 (the brace scan latching onto an unrelated later
+      # "};") lived in here undetected for exactly that reason.
+      - name: check-target-maps.mjs self-test (#690)
+        run: node .github/scripts/check-target-maps.mjs --self-test
       - name: verify release matrix and installer target maps agree (#576)
         run: node .github/scripts/check-target-maps.mjs
 
