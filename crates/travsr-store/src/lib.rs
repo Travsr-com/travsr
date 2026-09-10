@@ -2211,7 +2211,7 @@ impl SqliteStore {
     ///
     /// For each `FileGraph` in `batch`:
     /// 1. Retract old FTS rows + decrement vocab refcounts for the path.
-    /// 2. Delete old edges and nodes for the (corpus, path).
+    /// 2. Delete old edges, their occurrence rows, and nodes for the (corpus, path).
     /// 3. Insert new nodes.
     /// 4. Upsert the file hash.
     ///
@@ -2328,9 +2328,10 @@ impl SqliteStore {
                     // ── incremental path: delete existing rows, then upsert ───
                     // Every delete below is scoped by (corpus, path), the key
                     // [`Self::reindex_replace`] uses: a path is unique within a
-                    // corpus, not across them (one corpus per language plus the
-                    // external-package corpora). This API takes no `corpus`
-                    // argument, so it comes from the file's own nodes; a parse
+                    // corpus, not across them (ARCH-102: one corpus per repo,
+                    // derived from its git remote, plus the external-package
+                    // corpora). This API takes no `corpus` argument, so it
+                    // comes from the file's own nodes; a parse
                     // that produced none leaves it NULL, which matches the whole
                     // path exactly as these statements did before.
                     let corpus: Option<&str> =
@@ -2427,6 +2428,27 @@ impl SqliteStore {
                         params![file.vname_path, corpus],
                     )
                     .context("deleting owned edges for path")?;
+                    // The occurrence rows follow the edges they describe.
+                    // `edge_sites` has no FK cascade (#299 F7), so a row used to
+                    // survive the delete above and then find no `edges` row in
+                    // `reference_sites`'s LEFT JOIN, which reads a missing join as
+                    // `heuristic = false` and so serves a stale line as resolved
+                    // fact. Owned rows only, the same ownership rule the edge
+                    // delete above uses and the one [`Self::reindex_replace`]
+                    // states: an occurrence's `src` is the enclosing node in this
+                    // same file, and inbound sites belong to the files that wrote
+                    // them. An inbound site can only have gone stale if the file
+                    // holding it changed, and that file's own re-parse purges it
+                    // here. Deleting them from this side would also be a full
+                    // scan per id: `edge_sites` is WITHOUT ROWID on
+                    // (src, dst, kind, line), so unlike `edges` it has no index
+                    // a `dst =` probe can seek on.
+                    tx.execute(
+                        "DELETE FROM edge_sites WHERE src IN (SELECT id FROM nodes \
+                           WHERE path = ?1 AND (?2 IS NULL OR corpus = ?2))",
+                        params![file.vname_path, corpus],
+                    )
+                    .context("deleting owned edge_sites for path")?;
                     // A symbol the re-parse dropped still takes its inbound
                     // edges with it, so the narrower delete above never trades a
                     // lost edge for a dangling one.
@@ -5870,9 +5892,11 @@ LIMIT ?4",
     /// proximity threshold.
     ///
     /// `signatures` is ordered most → least specific by the caller (e.g.
-    /// `method:Server.Serve`, `fn:Server.Serve`, `fn:Serve`); ties are broken
-    /// by candidate priority **first**, then line distance, so a less-specific
-    /// same-named node one line closer cannot shadow a more specific match.
+    /// `method:Server.Serve`, `fn:Server.Serve`, `fn:Serve`). Ties break by
+    /// span containment first, then narrowest containing span, then candidate
+    /// priority, then line distance (see the E6 note on the SQL below), so a
+    /// less-specific same-named node one line closer cannot shadow a more
+    /// specific match unless the SCIP line actually falls inside its span.
     ///
     /// The SQL string varies only by candidate count, so `prepare_cached`
     /// hits its statement cache across the millions of calls a monorepo
@@ -11868,6 +11892,56 @@ mod tests {
                 line: 9,
                 heuristic: false
             }]
+        );
+    }
+
+    #[test]
+    fn write_file_graphs_batch_purges_owned_edge_sites() {
+        // The incremental write path deletes a re-parsed file's owned edges but
+        // used to leave its occurrence rows behind. `reference_sites` LEFT JOINs
+        // `edges`, so an orphaned row came back `heuristic = false`, i.e. a stale
+        // line served as resolved fact. Same ownership rule as
+        // `reindex_replace_purges_owned_edge_sites`: owned rows go, inbound rows
+        // stay.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |path: &str, sig: &str| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", path, "rust", sig),
+                "function",
+            )
+        };
+        let owned_src = mk("a.rs", "fn:caller");
+        let callee = mk("a.rs", "fn:target");
+        let external = mk("b.rs", "fn:ext");
+        for node in [&owned_src, &callee, &external] {
+            store.put_node(node).unwrap();
+        }
+        store
+            .record_edge_sites(&[
+                // Owned: src lives in the file being re-parsed.
+                (owned_src.id, callee.id, 3, None),
+                // Inbound: src lives in another file, dst in this one.
+                (external.id, callee.id, 9, None),
+            ])
+            .unwrap();
+
+        let batch = vec![FileGraph {
+            vname_path: "a.rs".into(),
+            new_hash: "hash1".into(),
+            nodes: vec![owned_src.clone(), callee.clone()],
+            edges: vec![],
+            source: None,
+        }];
+        store.write_file_graphs_batch(&batch, false).unwrap();
+
+        assert_eq!(
+            store.reference_sites(callee.id).unwrap(),
+            vec![travsr_core::RefSite {
+                path: "b.rs".into(),
+                line: 9,
+                heuristic: false
+            }],
+            "owned a.rs:3 site must be purged, inbound b.rs:9 site must survive"
         );
     }
 

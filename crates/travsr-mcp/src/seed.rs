@@ -140,10 +140,9 @@ fn fuzzy_correct_jaccard() -> f64 {
 ///   `-s`          -> strip, never `-ss` (callers -> caller)
 ///
 /// The stem must be at least 4 characters, so short words cannot collapse into
-/// generic fragments. `-ed` on a verb whose stem ends in `e` yields `pars` from
-/// `parsed`, which is under-length in some cases and simply produces no match
-/// in others; both are handled by the same rule, that a stem which resolves to
-/// nothing is discarded.
+/// generic fragments. An arm that strips its suffix whole also eats a stem-final
+/// `e` (`parsed` -> `pars`); [`inflectional_stem_restoring_e`] makes the second
+/// exact attempt for those, and a stem that resolves to nothing is discarded.
 fn inflectional_stem(token: &str) -> Option<String> {
     const MIN_STEM: usize = 4;
     let t = token;
@@ -179,7 +178,8 @@ fn inflectional_stem(token: &str) -> Option<String> {
     Some(stem)
 }
 
-/// The second exact attempt for a token the `-es` arm claimed: `stem` + `e`.
+/// The second exact attempt for a stem one of the whole-suffix arms produced:
+/// `stem` + `e`.
 ///
 /// The sibilant test in [`inflectional_stem`] is applied to the base AFTER
 /// `-es` is stripped, so a word whose real stem ends in `e` preceded by a
@@ -191,17 +191,34 @@ fn inflectional_stem(token: &str) -> Option<String> {
 /// `phas`, `databases` -> `databas`, `parses` -> `pars`, `releases` ->
 /// `releas`.
 ///
-/// `None` unless the `-es` arm is what produced `stem`, so nothing else changes.
-/// Used only when `stem` itself resolved to nothing, and fed through the same
-/// whole-segment boundary predicate: still one more EXACT attempt, not fuzzy
-/// matching.
+/// The `-ed` and `-ing` arms lose the same `e` for the same reason, and this
+/// repo is full of the result: `cached` -> `cach` misses `cache`,
+/// `parsed`/`parsing` -> `pars` misses `parse`, `stored` -> `stor`, `merged`
+/// -> `merg`, `encoded` -> `encod`, `routing` -> `rout`. One `e` separates each
+/// of those from the symbol the query named.
+///
+/// `None` unless one of those three arms produced `stem`, so nothing else
+/// changes. Used only when `stem` itself resolved to nothing, and fed through
+/// the same whole-segment boundary predicate: still one more EXACT attempt, not
+/// fuzzy matching.
+///
+/// Residual risk, accepted: a stem is served through that exact predicate, so
+/// one that happens to be a real segment of unrelated code becomes a confident
+/// wrong anchor. `signed` -> `sign` lands on release signing, `missing` ->
+/// `miss` on cache misses. There is deliberately no stoplist for this: a
+/// hand-kept word list rots faster than it earns its keep. The 4-character
+/// floor and the ASCII-alphabetic gate in [`inflectional_stem`] already remove
+/// the worst of the class (`fixed` -> `fix`, `based` -> `bas`).
 fn inflectional_stem_restoring_e(token: &str, stem: &str) -> Option<String> {
     let lower = token.to_ascii_lowercase();
-    let base = lower.strip_suffix("es")?;
-    if base != stem {
-        return None;
-    }
-    Some(format!("{stem}e"))
+    // Only the arms that strip their suffix whole can eat a stem-final `e`.
+    // `-ies`/`-ied` rewrite to `y` and `-s` leaves the `e` in place, so a stem
+    // either of those produced never equals one of these bases.
+    ["es", "ed", "ing"]
+        .iter()
+        .filter_map(|suffix| lower.strip_suffix(suffix))
+        .any(|base| base == stem)
+        .then(|| format!("{stem}e"))
 }
 
 /// RRF k constant — controls how sharply the top ranks dominate.
@@ -2291,8 +2308,9 @@ pub(crate) fn build_seed_set(
                     // exists in the index, exactly as the #709 correction does.
                     return (stem, stem_nodes, true);
                 }
-                // The `-es` arm shadows the `-s` arm, so a stem it produced that
-                // resolves to nothing gets the `e` restored before we give up.
+                // The `-es`, `-ed` and `-ing` arms strip their suffix whole, so
+                // a stem one of them produced that resolves to nothing gets the
+                // `e` restored before we give up.
                 if let Some(alt) = inflectional_stem_restoring_e(token, &stem) {
                     let alt_nodes = store.search_nodes_by_name(&alt).unwrap_or_default();
                     if alt_nodes.iter().any(|n| boundary(&alt, n)) {
@@ -3993,15 +4011,22 @@ mod tests {
         assert_eq!(inflectional_stem("node_ids"), None);
     }
 
-    /// The `-es` arm shadows the `-s` arm for any word whose real stem ends in
-    /// `e` after a sibilant, and the chain cannot fall through to it.
+    /// The `-es`, `-ed` and `-ing` arms all strip their suffix whole, so a word
+    /// whose real stem ends in `e` loses it and the chain cannot fall through.
     #[test]
-    fn restoring_e_recovers_the_stem_the_es_arm_shadowed() {
+    fn restoring_e_recovers_the_stem_a_whole_suffix_arm_ate() {
         for (word, shadowed, real) in [
             ("responses", "respons", "response"),
             ("caches", "cach", "cache"),
             ("databases", "databas", "database"),
             ("releases", "releas", "release"),
+            ("cached", "cach", "cache"),
+            ("parsed", "pars", "parse"),
+            ("stored", "stor", "store"),
+            ("merged", "merg", "merge"),
+            ("encoded", "encod", "encode"),
+            ("parsing", "pars", "parse"),
+            ("routing", "rout", "route"),
         ] {
             assert_eq!(inflectional_stem(word).as_deref(), Some(shadowed));
             assert_eq!(
@@ -4010,10 +4035,10 @@ mod tests {
             );
         }
 
-        // Only a stem the `-es` arm itself produced gets the second attempt.
-        assert_eq!(inflectional_stem_restoring_e("grouped", "group"), None);
-        assert_eq!(inflectional_stem_restoring_e("grouping", "group"), None);
-        // `names` takes the `-s` arm, so its stem is not the `-es` base.
+        // `queries` takes the `-ies` arm, which rewrites to `y` rather than
+        // stripping, so its stem is not one of the three bases.
+        assert_eq!(inflectional_stem_restoring_e("queries", "query"), None);
+        // `names` takes the `-s` arm, which leaves the `e` in place.
         assert_eq!(inflectional_stem_restoring_e("names", "name"), None);
     }
 

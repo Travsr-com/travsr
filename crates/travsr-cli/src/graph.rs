@@ -439,8 +439,15 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
 
     // Rewrite edges through the redirect table; drop self-loops and duplicates.
     let mut seen: HashSet<(u64, u64, String)> = HashSet::new();
-    let mut edges: Vec<(u64, u64, String)> = Vec::new();
-    for EdgeEntry { src, dst, kind, .. } in &payload.edges {
+    let mut edges: Vec<(u64, u64, String, bool)> = Vec::new();
+    for EdgeEntry {
+        src,
+        dst,
+        kind,
+        heuristic,
+        ..
+    } in &payload.edges
+    {
         let s = import_redirect.get(src).copied().unwrap_or(*src);
         let d = import_redirect.get(dst).copied().unwrap_or(*dst);
         if s == d {
@@ -448,7 +455,7 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
         }
         let key = (s, d, kind.clone());
         if seen.insert(key) {
-            edges.push((s, d, kind.clone()));
+            edges.push((s, d, kind.clone(), *heuristic));
         }
     }
 
@@ -506,7 +513,7 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
     }
 
     // Emit edges; suppress defines/binding labels from containers to members.
-    for (src_id, dst_id, kind) in &edges {
+    for (src_id, dst_id, kind, heuristic) in &edges {
         let src_kind = nodes_map.get(src_id).map(|n| n.kind.as_str()).unwrap_or("");
         let dst_kind = nodes_map.get(dst_id).map(|n| n.kind.as_str()).unwrap_or("");
 
@@ -516,6 +523,11 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
 
         if suppress {
             println!("  n{src_id} -> n{dst_id};");
+        } else if *heuristic {
+            // Same mark the tree draws, in the form a renderer can show: the
+            // sigil on the label and a dashed line, so a name-matched call is
+            // never read off the picture as one a compiler resolved.
+            println!("  n{src_id} -> n{dst_id} [label=\"{kind} {HEURISTIC_SIGIL}\" style=dashed];");
         } else {
             println!("  n{src_id} -> n{dst_id} [label=\"{kind}\"];");
         }
@@ -603,6 +615,9 @@ fn build_graph_json(
                 "to": to,
                 "kind": e.kind,
                 "provenance": e.provenance,
+                // Additive: the flag the tree view already carries, so a JSON
+                // consumer does not have to re-derive it from kind+provenance.
+                "heuristic": e.heuristic,
             })
         })
         .collect();
@@ -694,6 +709,7 @@ mod tests {
                     .to_string(),
                 dst_sig: "scip:b/Greeter.java:semanticdb maven . . com/b/Greeter#greet()."
                     .to_string(),
+                heuristic: false,
             }],
             tree: vec![],
             coverage: None,

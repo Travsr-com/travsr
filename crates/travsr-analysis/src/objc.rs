@@ -101,6 +101,20 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 /// `ERROR` node happens to swallow is lost, but the result keeps the selector's
 /// arity instead of truncating it onto a genuinely shorter method's key.
 ///
+/// Stepping over `ERROR` needs a bound, because a *body* tree-sitter cannot
+/// parse is recovered as `ERROR` siblings too: `- (void)dealloc { [self.p
+/// removeObserver:self forKeyPath:@"f"]; }` yields `ERROR "{ [self."`, then
+/// `identifier "removeObserver"`, then `method_parameter ":self"`, all as
+/// direct children of the method, with no `compound_statement` sibling and no
+/// `body` field to stop on. Unbounded, the walk absorbs the body's first
+/// message send and names the method `deallocremoveObserver:forKeyPath:`.
+/// The bound is positional rather than a judgement about which `ERROR` nodes
+/// are safe: a selector cannot continue past the `{` that opens the body, so
+/// the walk ends at the first `{` in the source after the captured keyword,
+/// wherever it falls. That offset holds whether or not the body parses, since
+/// the brace is in the source either way, and a declaration with no body has
+/// no `{` and still ends on its `;`. Braces inside a `comment` do not count.
+///
 /// Each `method_parameter` contributes one `:`, including a nameless one
 /// (`- (void)anon:(int)a :(int)b` → `anon::`), matching the real selector.
 /// A method with no parameters keeps its bare name and no trailing colon
@@ -126,8 +140,20 @@ fn full_selector(cap: tree_sitter::Node, sig_prefix: &str, source: &[u8]) -> Opt
     // identifier that is a keyword part only if a `method_parameter` follows
     // it; if the walk ends first it was a trailing macro and is dropped.
     let mut pending: Option<&str> = None;
+    let mut consumed = cap.end_byte();
     let mut sibling = cap.next_sibling();
     while let Some(node) = sibling {
+        // Stop at the `{` that opens the body. `comment` is excluded because a
+        // brace inside one is text, not the body. `{` is ASCII, so it can never
+        // be a UTF-8 continuation byte and a raw byte scan is exact.
+        if node.kind() != "comment"
+            && source
+                .get(consumed..node.end_byte())
+                .is_some_and(|span| span.contains(&b'{'))
+        {
+            break;
+        }
+        consumed = node.end_byte();
         match node.kind() {
             // Sits between selector parts without being one: step over it and
             // leave `pending` alone.
@@ -340,10 +366,137 @@ mod selector_tests {
     }
 
     #[test]
+    fn a_brace_inside_a_comment_is_not_the_body() {
+        // The body bound is a `{` in the source, and a comment between selector
+        // parts is source too. Counting its braces would truncate the selector
+        // to `requestWithMethod:`, the collision this hook exists to prevent.
+        let sigs = signatures(
+            "@implementation Client\n\
+             - (id)requestWithMethod:(NSString *)method   // opens { here\n\
+                           URLString:(NSString *)url { return nil; }\n\
+             @end\n",
+        );
+        assert!(
+            sigs.contains(&"method:Client.requestWithMethod:URLString:".to_string()),
+            "got {sigs:?}"
+        );
+    }
+
+    #[test]
     fn a_nameless_keyword_part_still_contributes_its_colon() {
         // `- (void)anon:(int)a :(int)b` really is the selector `anon::`.
         let sigs = signatures("@interface Foo\n- (void)anon:(int)a :(int)b;\n@end\n");
         assert!(sigs.contains(&"method:Foo.anon::".to_string()));
+    }
+
+    #[test]
+    fn a_body_that_fails_to_parse_does_not_extend_the_selector() {
+        // AFURLSessionManager.m:149. tree-sitter recovers the whole body as
+        // `ERROR "{ [self."` plus loose `identifier`/`method_parameter`
+        // siblings, so the walk used to read the body's first message send as
+        // more selector and emit `method:Foo.deallocremoveObserver:forKeyPath:`.
+        let sigs = signatures(
+            "@implementation Foo\n\
+             - (void)dealloc {\n\
+             \x20   [self.downloadProgress removeObserver:self forKeyPath:@\"fractionCompleted\"];\n\
+             }\n\
+             @end\n",
+        );
+        assert!(
+            sigs.contains(&"method:Foo.dealloc".to_string()),
+            "got {sigs:?}"
+        );
+        assert!(
+            !sigs
+                .iter()
+                .any(|s| s.starts_with("method:Foo.dealloc") && s != "method:Foo.dealloc"),
+            "got {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn a_body_of_nested_brackets_and_macros_does_not_extend_the_selector() {
+        // AFURLSessionManager.m:425 and :682. A bare `NSAssert(...)` macro, a
+        // nested bracket expression and a message send inside a `return` all
+        // recover as loose siblings; none of them is selector.
+        let sigs = signatures(
+            "@implementation Foo\n\
+             - (void)af_resume {\n\
+             \x20   NSAssert([self respondsToSelector:@selector(state)], @\"no state\");\n\
+             }\n\
+             - (NSArray *)tasks {\n\
+             \x20   return [self tasksForKeyPath:NSStringFromSelector(_cmd)];\n\
+             }\n\
+             @end\n",
+        );
+        assert!(
+            sigs.contains(&"method:Foo.af_resume".to_string()),
+            "got {sigs:?}"
+        );
+        assert!(
+            sigs.contains(&"method:Foo.tasks".to_string()),
+            "got {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn a_parameterised_selector_stops_at_its_own_body() {
+        // AFURLSessionManager.m:898. The selector is complete before the body,
+        // but the body is a chain of `@selector(...)` comparisons that recover
+        // as `method_parameter` siblings, so it used to become
+        // `respondsToSelector:URLSession:::nil:::::nil::::nil::::`.
+        let sigs = signatures(
+            "@implementation Foo\n\
+             - (BOOL)respondsToSelector:(SEL)selector {\n\
+             \x20   if (selector == @selector(URLSession:didReceiveChallenge:completionHandler:)) {\n\
+             \x20       return self.sessionDidReceiveAuthenticationChallenge != nil;\n\
+             \x20   }\n\
+             \x20   return [super respondsToSelector:selector];\n\
+             }\n\
+             @end\n",
+        );
+        assert!(
+            sigs.contains(&"method:Foo.respondsToSelector:".to_string()),
+            "got {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn a_preproc_conditional_inside_a_selector_still_does_not_truncate_it() {
+        // The `ERROR`-stepping this fix bounds must still hold before the body:
+        // a `#if` between selector parts is an `ERROR` sibling, and ending the
+        // walk there would key a three-part selector as `sendRequest:`.
+        let sigs = signatures(
+            "@interface Foo\n\
+             - (void)sendRequest:(id)r\n\
+             #if TARGET_OS_IOS\n\
+             \x20            queue:(id)q\n\
+             #endif\n\
+             \x20         handler:(id)h;\n\
+             @end\n",
+        );
+        assert!(
+            sigs.iter()
+                .any(|s| s.starts_with("method:Foo.sendRequest:") && s.matches(':').count() >= 3),
+            "got {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_macro_on_a_defined_method_is_still_not_a_keyword() {
+        // The arity-0 macro guard has to survive the body bound: the macro is
+        // pending when the walk stops at `{`, and a pending keyword is dropped.
+        let sigs = signatures(
+            "@implementation Foo\n\
+             - (instancetype)init NS_DESIGNATED_INITIALIZER {\n\
+             \x20   return [super init];\n\
+             }\n\
+             @end\n",
+        );
+        assert!(
+            sigs.contains(&"method:Foo.init".to_string()),
+            "got {sigs:?}"
+        );
     }
 
     #[test]

@@ -397,7 +397,7 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "find_pattern",
-                "description": "Graph-scoped textual search (git grep) returning path:line:col: text. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or to files-importing(<symbol>) so results are confined to the graph-relevant file set.",
+                "description": "Textual search (git grep) over the repo's tracked and untracked text files, returning path:line:col: text. Not limited to the files the graph indexes: any file git shows as text can match, with known-binary formats and ignored paths removed. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or to files-importing(<symbol>).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1041,7 +1041,7 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "find_pattern",
-                "description": "Graph-scoped textual search (git grep) returning path:line:col: text. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or files-importing(<symbol>). Supply `repo` to scope; omit only to search across all repos.",
+                "description": "Textual search (git grep) over each repo's tracked and untracked text files, returning path:line:col: text. Not limited to the files the graph indexes: any file git shows as text can match, with known-binary formats and ignored paths removed. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or files-importing(<symbol>). Supply `repo` to scope; omit only to search across all repos.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

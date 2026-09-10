@@ -1296,12 +1296,6 @@ pub fn init_repo_with_progress(
         );
     }
 
-    // Stamp the format version BEFORE indexing so that the reindex_files calls
-    // below see version == SIGNATURE_FORMAT_VERSION and don't skip files.
-    store
-        .set_signature_format_version(SIGNATURE_FORMAT_VERSION)
-        .context("writing signature_format_version")?;
-
     // ARCH-102: detect canonical corpus from the git remote and persist it so
     // every VName in this graph uses the same corpus identifier.
     // reindex_files reads this value back on subsequent hook runs.
@@ -1320,6 +1314,15 @@ pub fn init_repo_with_progress(
         let empty_walked = std::collections::HashSet::<String>::new();
         let purge_policy = travsr_core::SafetyPolicy {
             mass_delete_ceiling_pct: 1.0,
+            // The TOCTOU re-check (§6.5 S3) exists for the ghost sweep, where a
+            // file reappearing on disk means it is not a ghost after all. Here
+            // the delete criterion is not absence but identity: the files still
+            // on disk are exactly the ones whose old-corpus nodes must go. Left
+            // on, the purge skipped every present file and deleted nothing, so
+            // the old node set survived a corpus change and the next re-parse
+            // added a second set under the new corpus for the same path (the
+            // per-path delete in `write_file_graphs_batch` is corpus-scoped).
+            toctou_recheck: false,
             ..Default::default()
         };
         store
@@ -1368,6 +1371,21 @@ pub fn init_repo_with_progress(
             .context("clearing file hash cache before rebuild")?;
         tracing::info!(cleared, "cleared file hash cache for full re-parse");
     }
+
+    // RFC-002: the stamp must come AFTER the purge above, because a rebuild
+    // that fails or that the user interrupts would otherwise leave the new
+    // version stamped over old-format nodes: `format_skew` would read false on
+    // every later run, the hash delta would skip every unchanged file, and the
+    // `reindex_files` guard would stop firing, so the skew would become
+    // permanently undetectable.
+    //
+    // Nothing below reads the stamp back. Init's own indexing does not route
+    // through `reindex_files` (see the note on that at the Phase B step), so
+    // the older "stamp early or reindex_files skips every file" reasoning did
+    // not apply to this path and is not what holds the position here.
+    store
+        .set_signature_format_version(SIGNATURE_FORMAT_VERSION)
+        .context("writing signature_format_version")?;
 
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
     // path at query time without threading repo_root through function signatures.
@@ -8273,6 +8291,108 @@ mod tests {
             store.get_signature_format_version().unwrap(),
             travsr_core::SIGNATURE_FORMAT_VERSION
         );
+    }
+
+    /// RFC-002: the stamp must not be written until the rebuild the skew
+    /// triggered has actually purged the old graph. Stamping first meant a
+    /// rebuild that failed (or that the user interrupted) left the current
+    /// version recorded over old-format nodes, after which `format_skew` read
+    /// false forever, the hash delta skipped every unchanged file and the
+    /// `reindex_files` guard stopped firing: the detector disarmed itself.
+    #[test]
+    fn init_repo_keeps_the_old_stamp_when_the_rebuild_purge_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let old = travsr_core::SIGNATURE_FORMAT_VERSION - 1;
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_signature_format_version(old).unwrap();
+        }
+
+        // Make the purge fail where an interrupted rebuild would stop: the
+        // `reconcile` call reads the `files` table before it deletes anything.
+        // The schema version already matches, so reopening the store runs no
+        // migration and does not put the table back.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("DROP TABLE files").unwrap();
+        }
+
+        assert!(
+            init_repo(tmp.path()).is_err(),
+            "a purge that cannot run must fail the init rather than continue"
+        );
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            old,
+            "a failed rebuild must leave the old stamp so the skew stays detectable"
+        );
+    }
+
+    /// ARCH-102: a corpus change rewrites every NodeId, so the old
+    /// node set has to go. `reconcile`'s TOCTOU re-check used to skip every file
+    /// still present on disk, which is all of them here, so the purge deleted
+    /// nothing and the next re-parse wrote a second node set for the same path
+    /// under the new corpus (the per-path delete is corpus-scoped).
+    #[test]
+    fn init_repo_purges_the_old_corpus_when_the_git_remote_appears() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpora = || -> Vec<(String, i64)> {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT corpus, count(*) FROM nodes GROUP BY corpus ORDER BY corpus")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(corpora().len(), 1, "one repo, one corpus");
+
+        // The repo gains an origin, so `detect_corpus` stops falling back to
+        // `local/<basename>` and every NodeId changes.
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                &tmp.path().to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/foo.git",
+            ])
+            .output()
+            .unwrap();
+
+        init_repo(tmp.path()).unwrap();
+        // Then edit the file, which is what makes the hash delta re-parse it and
+        // write the new-corpus node set.
+        std::fs::write(
+            tmp.path().join("a.ts"),
+            "export class A { go() {} go2() {} }",
+        )
+        .unwrap();
+        init_repo(tmp.path()).unwrap();
+
+        let after = corpora();
+        assert_eq!(
+            after.len(),
+            1,
+            "the old corpus must be purged, not left alongside the new one: {after:?}"
+        );
+        assert_eq!(after[0].0, "github.com/acme/foo");
     }
 
     #[test]

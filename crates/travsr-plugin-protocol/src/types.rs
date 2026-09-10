@@ -80,9 +80,9 @@ impl InvokeResponse {
 
 /// How loudly the host should surface a [`PluginDiagnostic`].
 ///
-/// Deliberately two-valued. A sidecar that wants finer control is asking the
-/// wrong question: anything it would file as `debug` belongs on its stderr,
-/// which the host already drains into a bounded ring.
+/// Deliberately two-valued for a sidecar to *choose* from. A sidecar that wants
+/// finer control is asking the wrong question: anything it would file as `debug`
+/// belongs on its stderr, which the host already drains into a bounded ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
@@ -90,6 +90,18 @@ pub enum DiagnosticSeverity {
     Warning,
     /// Context worth recording that does not qualify the result.
     Info,
+    /// A severity this host does not know, from a sidecar newer than it.
+    ///
+    /// Without this arm serde rejects the whole frame, `decode_message` fails,
+    /// and the host discards every node and edge of that run and marks the
+    /// sidecar crashed: a language's entire Phase B index lost over a field
+    /// designed to be ignorable.
+    ///
+    /// The host surfaces it as a warning rather than dropping it. An unknown
+    /// severity came from a sidecar that thought the record mattered, and a
+    /// warning a reader can disregard costs less than a caveat nobody sees.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A run-scoped diagnostic a Phase B sidecar wants its host to surface.
@@ -119,10 +131,17 @@ pub struct PluginDiagnostic {
     /// The shape is enforced by the host, not by this type: a sidecar is
     /// untrusted, so `travsr-plugin-host`'s `is_diagnostic_code` accepts only
     /// `[A-Za-z0-9._-]` and logs anything else under a neutral placeholder code.
+    ///
+    /// `serde(default)`: an absent field costs the record its code, exactly as a
+    /// malformed one does, instead of costing the run its whole index.
+    #[serde(default)]
     pub code: String,
     /// One line, addressed to the developer running the index. The host strips
     /// control characters and truncates before logging, and caps how many
     /// records of a single response it will echo at all.
+    ///
+    /// `serde(default)`: same reason as `code` above.
+    #[serde(default)]
     pub message: String,
 }
 
@@ -180,4 +199,71 @@ pub enum PluginResponse {
 pub struct PluginError {
     pub file: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{decode_message, encode_message};
+    use std::io::Cursor;
+    use travsr_core::{EdgeKind, NodeId, VName};
+
+    /// A sidecar newer than this host files a diagnostic at a severity the host
+    /// has never heard of, and omits the two string fields.
+    ///
+    /// Before the `serde(other)` and `serde(default)` arms the whole frame
+    /// failed to decode: the host marked the sidecar crashed and discarded the
+    /// language's entire node and edge set over an ignorable field.
+    #[test]
+    fn unknown_severity_keeps_the_runs_nodes_and_edges() {
+        let node = Node {
+            id: NodeId(1),
+            vname: VName {
+                corpus: "c".into(),
+                root: String::new(),
+                path: "a.rs".into(),
+                language: "rust".into(),
+                signature: "fn:a".into(),
+            },
+            kind: "function".into(),
+            package: String::new(),
+            line: Some(1),
+            end_line: Some(2),
+            test_role: Default::default(),
+        };
+        let edge = Edge {
+            src: NodeId(1),
+            dst: NodeId(1),
+            kind: EdgeKind::RefCall,
+            confidence: None,
+            provenance: None,
+        };
+        let resp = InvokeResponse {
+            nodes: vec![node],
+            edges: vec![edge],
+            refs: Vec::new(),
+            unresolved_calls: Vec::new(),
+            diagnostics: vec![PluginDiagnostic::warning("a.b", "m")],
+        };
+        let mut wire =
+            serde_json::to_value(PluginResponse::Invoke(resp)).expect("serialize response");
+        let diag = &mut wire["diagnostics"][0];
+        diag["severity"] = serde_json::json!("error");
+        diag.as_object_mut()
+            .expect("diagnostic is an object")
+            .retain(|k, _| k == "severity");
+
+        let frame = encode_message(&wire).expect("encode frame");
+        let decoded: PluginResponse =
+            decode_message(&mut Cursor::new(frame)).expect("unknown severity must still decode");
+
+        let PluginResponse::Invoke(out) = decoded else {
+            panic!("expected an invoke response");
+        };
+        assert_eq!(out.nodes.len(), 1, "nodes must survive an unknown severity");
+        assert_eq!(out.edges.len(), 1, "edges must survive an unknown severity");
+        assert_eq!(out.diagnostics[0].severity, DiagnosticSeverity::Unknown);
+        assert_eq!(out.diagnostics[0].code, "");
+        assert_eq!(out.diagnostics[0].message, "");
+    }
 }

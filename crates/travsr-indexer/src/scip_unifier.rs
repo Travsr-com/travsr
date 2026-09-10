@@ -424,10 +424,17 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
 /// cardinality mismatch: N SCIP defs legitimately share one Phase A node.
 ///
 /// The container qualification is what makes resolving it by uniqueness safe.
-/// `method:C.n` names one method group in one file, so a single match is the
-/// right match by construction. The unqualified `fn:n` fallback carries no such
-/// guarantee and is deliberately excluded: an unrelated free function of the
-/// same name would be the "unique" match and would silently absorb the edges.
+/// The guarantee is about nodes, not method groups: the `nodes` unique index is
+/// `(corpus, root, path, language, signature)` and Phase A does not qualify a
+/// signature by namespace, so a single match means exactly one NODE named
+/// `method:C.n` in that file. Two same-named containers in one file (e.g.
+/// `namespace A { class C { void n(); } }` and `namespace B { class C { ... } }`)
+/// already share that one node before this rung runs, and the rung then binds
+/// both SCIP defs to it. That is accepted: the alternative is an orphan node
+/// holding the fan-in, which is worse, and the shape is rare.
+/// The unqualified `fn:n` fallback carries no guarantee at all and is
+/// deliberately excluded: an unrelated free function of the same name would be
+/// the "unique" match and would silently absorb the edges.
 ///
 /// Returns empty for anything that is not a container-qualified callable, which
 /// disables the rung rather than widening it.

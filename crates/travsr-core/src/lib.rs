@@ -44,16 +44,25 @@ pub mod noise;
 ///       signatures for untouched files and full selectors for the rest, with
 ///       nothing able to tell the halves apart.
 ///
-/// The constant does not invalidate anything by itself. It is a marker two code
-/// paths compare against and act on, and both must keep doing so for a bump to
-/// mean anything:
-///   * `reindex_files` (the commit hook and the watcher) refuses to touch a
-///     graph whose stored version differs, and tells the user to run
-///     `travsr init`.
+/// The constant does not invalidate anything by itself. It is a marker some code
+/// paths compare against, and only those paths act on a bump:
+///   * The write paths refuse to advance the graph or the freshness marker when
+///     the stored version differs. `reindex_files` (the commit hook and the
+///     watcher) indexes nothing and returns success, logging the reason to the
+///     daemon log so the hook never blocks a commit; `reconcile_head_drift` and
+///     the CLI reindex leave `last_commit` unstamped so freshness is not claimed
+///     for a reindex that never ran.
+///   * `travsr status` is what tells the user, printing the format skew and
+///     asking for a `travsr init`.
 ///   * `init_repo_with_progress` reads the stored version before re-stamping it
 ///     and, on a mismatch, purges the graph and clears the file-hash cache so
 ///     every file is re-parsed, exactly as `--force` does, rather than taking
 ///     the incremental path.
+///
+/// Read paths do not check the version at all. `open_read_only` verifies the
+/// schema version only, so queries keep answering from the old-format graph: it
+/// is stale, not corrupt, and the write-path refusals above are what stop the
+/// two formats from ever mixing.
 pub const SIGNATURE_FORMAT_VERSION: u8 = 3;
 
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────

@@ -642,11 +642,18 @@ pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
         return phase_b_pending_json("Semantic call-edge index");
     }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
+    // Use the larger find-output limit, not the 4 KiB scalar cap: this tool
+    // enumerates one row per call site exactly as `find_references` does, and
+    // the scalar cap was cutting ~80% of a hub symbol's callers off mid-line
+    // with no notice (192 callers of `open_in_memory` arrived as 38 rows).
     // #617: append the staleness note (marker behind HEAD / dirty flag) so an
     // empty caller list is never mistaken for an authoritative "no callers".
     with_phase_b_note(
         store,
-        sanitize_for_mcp(&get_callers_raw(store, symbol, path)),
+        wrap_envelope(&sanitize_mcp_body_with_limit(
+            &get_callers_raw(store, symbol, path),
+            FIND_OUTPUT_LIMIT,
+        )),
     )
 }
 
@@ -849,6 +856,20 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
             loc
         ));
     }
+    // Cap the rows here rather than letting the byte limit cut one in half, and
+    // say how many were left out. A hub symbol has thousands of call sites and
+    // no reader can act on all of them; what a reader cannot survive is a list
+    // that stops without saying it stopped.
+    let total = lines.len();
+    if total > MAX_CALLER_ROWS {
+        lines.truncate(MAX_CALLER_ROWS);
+        lines.push(format!("[showing {MAX_CALLER_ROWS} of {total} callers]"));
+    }
+    // The sigil is the last thing appended to a row, so the rows that survived
+    // the cap are what decide whether the legend is worth a line.
+    if lines.iter().any(|l| l.ends_with(HEURISTIC_SIGIL_ROW)) {
+        lines.push(HEURISTIC_LEGEND.to_string());
+    }
     // #715: a crash in this language's last Phase B run leaves partial coverage
     // while the marker reads complete, so this list may be missing callers in the
     // un-indexed files. Attach the caveat to the confident (non-empty) answer.
@@ -857,6 +878,10 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     }
     lines.join("\n")
 }
+
+/// Cap on the caller rows `get_callers` returns, mirroring
+/// [`MAX_REFERENCE_SITES`] for the tool that enumerates the same shape of row.
+const MAX_CALLER_ROWS: usize = 500;
 
 /// The suffix marking an edge whose confidence differs from the default.
 ///
@@ -884,15 +909,29 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
 fn provenance_marker(edge: &travsr_core::Edge) -> &'static str {
     match edge.provenance.as_deref() {
         Some("live") => " [live: resolved from your uncommitted edit, not yet ratified]",
-        Some("tree-sitter") if edge.kind == travsr_core::EdgeKind::RefCall => HEURISTIC_MARKER,
+        Some("tree-sitter") if edge.kind == travsr_core::EdgeKind::RefCall => HEURISTIC_SIGIL_ROW,
         _ => "",
     }
 }
 
-/// The name-matched-edge caveat, shared by `get_callers` (via
-/// [`provenance_marker`]) and `find_references` (via `RefSite::heuristic`), so
-/// the two tools cannot describe the same edge in two different words.
+/// The name-matched-edge caveat, spelled out per site by `find_references` (via
+/// `RefSite::heuristic`), where one occurrence line carries it at most once.
 const HEURISTIC_MARKER: &str = " [heuristic: matched by name, not resolved by type]";
+
+/// The same caveat on a `get_callers` row: one character, plus one legend line
+/// at the end of the answer.
+///
+/// [`HEURISTIC_MARKER`] is 49 bytes on a ~70-byte row, and on a Phase-A-only
+/// language (Go, Java, C#, Ruby, PHP) essentially every call edge is
+/// name-matched, so the caveat itself was pushing callers out of the response.
+/// The CLI tree already made this trade for the same reason
+/// (`travsr-cli`'s `HEURISTIC_SIGIL`); the legend repeats its wording verbatim
+/// so the two surfaces cannot describe the same edge in two different words.
+const HEURISTIC_SIGIL_ROW: &str = " ~";
+
+/// Printed once, after the rows, and only when a marked row was actually
+/// rendered: a legend for a mark that is not on screen is noise.
+const HEURISTIC_LEGEND: &str = "~ = matched by name, not resolved by type";
 
 /// The marker for one occurrence site, empty unless it is name-matched.
 fn site_marker(site: &travsr_core::RefSite) -> &'static str {
@@ -1010,8 +1049,10 @@ pub fn get_dependencies_global(
             .and_then(|db| repo_head_from_registry_path(db));
         append_head_note(store, result, head.as_deref())
     });
-    // SEC-001: sanitize the fully-aggregated string once.
-    sanitize_for_mcp(&raw)
+    // SEC-001: sanitize the fully-aggregated string once, with the same
+    // row-enumerating limit the single-repo path uses: an aggregate over N
+    // repos is the last place a 4 KiB cap belongs.
+    wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT))
 }
 
 /// Global variant of `get_callers` — searches one named repo or all registered repos.
@@ -1062,11 +1103,11 @@ pub fn get_callers_global(
 /// the spirit of `MAX_SITES_PER_CALLER` but is per-symbol, not per-caller.
 const MAX_REFERENCE_SITES: usize = 500;
 
-/// Byte cap for `find_references` / `find_pattern` output. The default scalar
-/// cap (`sanitize_for_mcp`, 4 KiB) would truncate a capped 500-site list
-/// mid-line and drop the truncation notice — the same trap `get_snippets`
-/// avoids. These tools enumerate up to `MAX_*` rows, so they wrap with this
-/// larger limit instead (still well under the 1 MiB MCP hard ceiling).
+/// Byte cap for `find_references` / `find_pattern` / `get_callers` output. The
+/// default scalar cap (`sanitize_for_mcp`, 4 KiB) would truncate a capped
+/// 500-row list mid-line and drop the truncation notice, the same trap
+/// `get_snippets` avoids. These tools enumerate up to `MAX_*` rows, so they wrap
+/// with this larger limit instead (still well under the 1 MiB MCP hard ceiling).
 const FIND_OUTPUT_LIMIT: usize = 512_000;
 
 /// Resolution outcome for a `find_references` symbol argument.
@@ -1353,12 +1394,12 @@ fn ambiguous_definitions_message(symbol: &str, nodes: &[CoreNode], advice: &str)
 
 /// Cap on the definition lines [`ambiguous_definitions_message`] lists.
 ///
-/// `find_references` wraps its output with [`FIND_OUTPUT_LIMIT`], but
-/// `get_callers` wraps with `sanitize_for_mcp`'s 4 KiB scalar cap, which cut a
-/// 37-definition refusal off mid-line and dropped no notice saying so. 25 lines
-/// leave room for the header inside that budget, and the elided count is stated
-/// rather than implied. Deliberately not `MAX_REFERENCE_SITES`: a reader cannot
-/// act on 500 rival definitions anyway, they need the `path` hint.
+/// Both tools now wrap with [`FIND_OUTPUT_LIMIT`], but this list stays short on
+/// its own account: `get_callers` used to wrap with `sanitize_for_mcp`'s 4 KiB
+/// scalar cap, which cut a 37-definition refusal off mid-line and dropped no
+/// notice saying so. 25 lines are all a reader can act on, and the elided count
+/// is stated rather than implied. Deliberately not `MAX_REFERENCE_SITES`: a
+/// reader cannot act on 500 rival definitions anyway, they need the `path` hint.
 const MAX_AMBIGUOUS_DEFINITIONS: usize = 25;
 
 /// #647: message for a `path` hint that matched no definition of a symbol that
@@ -1959,7 +2000,11 @@ fn resolve_repo_root(store: &SqliteStore) -> Option<PathBuf> {
     store.resolve_repo_root()
 }
 
-/// Graph-scoped textual search: `git grep` confined to a bounded file set.
+/// Textual search: `git grep` over the repo's text files, minus the paths the
+/// walker hard-skips, the paths an ignore file excludes, and known-binary
+/// formats. Deliberately WIDER than the graph's own file set: a shell script, a
+/// Makefile or a lockfile is a legitimate answer to a textual query, and an
+/// extension allowlist reported "no matches" for all of them.
 ///
 /// `scope` selects the search set:
 ///   - `None` → whole repository (tracked files).
@@ -2678,10 +2723,55 @@ fn run_git_grep(
     // Extensions whose contents are bytes, not text. `.lsif` is deliberately
     // absent: LSIF is line-delimited JSON, and a text format belongs in a
     // textual search.
+    //
+    // Not exhaustive, and it does not have to be: `-I` above already drops
+    // anything with a NUL byte in its first 8 KB. This list only has to cover
+    // the formats git misclassifies as text, so it grows one entry at a time as
+    // one shows up. `pyc`, `pack`, `idx`, `node`, `safetensors` and `parquet`
+    // are here for that reason.
     const BINARY_EXTS: &[&str] = &[
-        "scip", "db", "sqlite", "onnx", "bin", "wasm", "so", "dylib", "dll", "exe", "a", "o",
-        "rlib", "class", "jar", "png", "jpg", "jpeg", "gif", "webp", "ico", "pdf", "zip", "gz",
-        "tgz", "bz2", "xz", "zst", "tar", "woff", "woff2", "ttf", "otf", "mp4", "mov", "mp3",
+        "scip",
+        "db",
+        "sqlite",
+        "onnx",
+        "safetensors",
+        "parquet",
+        "bin",
+        "wasm",
+        "so",
+        "dylib",
+        "dll",
+        "exe",
+        "node",
+        "a",
+        "o",
+        "rlib",
+        "class",
+        "jar",
+        "pyc",
+        "pack",
+        "idx",
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "webp",
+        "ico",
+        "pdf",
+        "zip",
+        "gz",
+        "tgz",
+        "bz2",
+        "xz",
+        "zst",
+        "tar",
+        "woff",
+        "woff2",
+        "ttf",
+        "otf",
+        "mp4",
+        "mov",
+        "mp3",
         "wav",
     ];
     let is_binary_ext = |path: &str| {
@@ -7272,6 +7362,24 @@ fn strip_native_kind_prefix(label: &str) -> &str {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Mark the name-matched edges in a `get_graph_json` edge array.
+///
+/// The tree view flagged these and the edge array did not, so a renderer
+/// presented a call `resolve_unresolved_calls` guessed by name as one a
+/// compiler resolved. Derived once from `kind` + `provenance` here rather than
+/// at each of the six sites that build an edge object, all of which already
+/// carry both. Additive: an edge that is not name-matched gains no key.
+fn mark_heuristic_edges(edges: &mut [serde_json::Value]) {
+    for e in edges.iter_mut() {
+        if crate::query::is_heuristic_edge(
+            e["kind"].as_str().unwrap_or_default(),
+            e["provenance"].as_str().unwrap_or_default(),
+        ) {
+            e["heuristic"] = serde_json::Value::Bool(true);
+        }
+    }
+}
+
 fn get_graph_json_raw(
     store: &SqliteStore,
     query: &str,
@@ -7670,6 +7778,7 @@ fn get_graph_json_raw(
 
     // Additive envelope fields (#318 O5/O6) — first-party consumers read only
     // `nodes`/`edges`; the global merge likewise ignores extra keys.
+    mark_heuristic_edges(&mut edges_out);
     let mut out = serde_json::json!({
         "nodes": nodes_out,
         "edges": edges_out,
@@ -9030,6 +9139,46 @@ mod tests {
         assert!(
             !text.contains(&format!("page.ts:9{HEURISTIC_MARKER}")),
             "the compiler-resolved site carries no caveat: {text}"
+        );
+    }
+
+    /// A name-matched call edge costs one character on the row plus one legend
+    /// line at the end, not 49 bytes on every row. On a Phase-A-only language
+    /// essentially every call edge is name-matched, so the long marker was
+    /// spending the output budget on the caveat instead of on callers.
+    #[test]
+    fn a_name_matched_caller_row_carries_the_sigil_and_one_legend() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let callee = Node::new(VName::new("", "", "grid.go", "go", "fn:row"), "function");
+        let a = Node::new(VName::new("", "", "a.go", "go", "fn:run_a"), "function").with_line(2);
+        let b = Node::new(VName::new("", "", "b.go", "go", "fn:run_b"), "function").with_line(3);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for n in [&callee, &a, &b] {
+            store.put_node(n).unwrap();
+        }
+        for caller in [&a, &b] {
+            store
+                .put_edge(
+                    &Edge::new(caller.id, callee.id, EdgeKind::RefCall)
+                        .with_provenance("tree-sitter".to_string()),
+                )
+                .unwrap();
+        }
+
+        let out = get_callers(&store, "row", None);
+        assert_eq!(
+            out.matches(HEURISTIC_SIGIL_ROW).count(),
+            2,
+            "one sigil per marked row: {out}"
+        );
+        assert_eq!(
+            out.matches(HEURISTIC_LEGEND).count(),
+            1,
+            "the legend is printed once, not per row: {out}"
+        );
+        assert!(
+            !out.contains("[heuristic:"),
+            "the per-row long marker is gone: {out}"
         );
     }
 
@@ -13043,9 +13192,14 @@ mod snippet_tests {
         // `resolve_unresolved_calls`, not from a compiler, so it is marked.
         let mut ts_call = ratified.clone();
         ts_call.provenance = Some("tree-sitter".to_string());
+        assert_eq!(
+            provenance_marker(&ts_call),
+            HEURISTIC_SIGIL_ROW,
+            "a name-matched call edge must carry the sigil"
+        );
         assert!(
-            provenance_marker(&ts_call).contains("matched by name"),
-            "a name-matched call edge must say so"
+            HEURISTIC_LEGEND.contains("matched by name, not resolved by type"),
+            "the legend must spell the sigil out in the CLI's words"
         );
 
         // Phase A's own structural edges are tree-sitter too, and are facts
