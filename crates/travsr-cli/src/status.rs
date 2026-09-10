@@ -492,8 +492,7 @@ pub fn run() -> anyhow::Result<()> {
     // H3: surface Phase B warnings so the user knows about crashed/mismatched
     // analyzers without having to re-read the init output.
     if let Some(warnings) = &payload.phase_b_warnings {
-        for line in phase_b_warning_lines(warnings, payload.scip_unification_miss_list.as_deref())
-        {
+        for line in phase_b_warning_lines(warnings, payload.scip_unification_miss_list.as_deref()) {
             eprintln!("{line}");
         }
     }
@@ -847,7 +846,8 @@ mod tests {
     ///
     /// This iterates `PhaseBWarningClass::ALL`, the enum the daemon formats
     /// `phase_b_warnings` from, so adding a class there and forgetting this
-    /// file fails the build. Same treatment `is_native_phase_b` got in #752:
+    /// file fails this test. Not the build: the compiler cannot catch it, which
+    /// is why the test is here. Same treatment `is_native_phase_b` got in #752:
     /// assert against the real decision, not against a copy of it.
     ///
     /// Turning it on immediately found one: `needs_approval` was downgrading

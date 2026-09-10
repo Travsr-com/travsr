@@ -15,8 +15,10 @@
 //! So this enum is the one source. The daemon formats its entries from
 //! [`PhaseBWarningClass::entry`], and each consumer's guard iterates
 //! [`PhaseBWarningClass::ALL`] and asserts that consumer handles every variant.
-//! Adding a class here without teaching both consumers about it fails the build,
-//! and there is no third list to keep in step.
+//! Adding a class here without teaching both consumers about it fails those
+//! guards. Not the build: nothing here is a compile error, which is precisely
+//! why the guards are needed. The variant list is generated into `ALL`, so
+//! there is no third list to keep in step.
 //!
 //! It lives in travsr-plugin-host because that is the crate the classes actually
 //! come from: every variant below is one field of

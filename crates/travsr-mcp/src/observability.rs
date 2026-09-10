@@ -310,8 +310,10 @@ fn error_payload(reason: &str) -> serde_json::Value {
 /// is how `untrusted_corpus` was missed). #760 made that enforceable rather
 /// than aspirational: the classes are the variants of
 /// `travsr_plugin_host::phase_b::PhaseBWarningClass`, the daemon formats from
-/// it, and `phase_b_warning_classes_match_the_cli` iterates it, so a class
-/// added there and forgotten here fails the build.
+/// it, and `every_phase_b_warning_class_the_daemon_writes_is_decoded` iterates
+/// it, so a class added there and forgotten here fails that test. Not the
+/// build: the compiler cannot see this, which is the whole reason the guard
+/// exists (#760).
 ///
 /// `corpus` is the store's `corpus` meta, needed only by the
 /// `untrusted_corpus` arm, whose remediation names the corpus to trust.
