@@ -735,11 +735,36 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
                     RefTarget::None => {}
                 }
             }
-            match store.search_nodes_by_name(symbol) {
-                Ok(n) => n.into_iter().take(1).collect(),
+            let partial = match store.search_nodes_by_name(symbol) {
+                Ok(n) => n,
                 Err(e) => {
                     tracing::warn!("get_callers search error: {e}");
                     return String::new();
+                }
+            };
+            // The `path` hint has to survive this fallback too. It used to be
+            // dropped here and the first FTS row won, so a hint naming one file
+            // was answered from a same-named symbol somewhere else entirely —
+            // the confident-wrong answer #647 removed from the exact tiers,
+            // still reachable through this one. Scoping here keeps the
+            // documented partial matching and makes the hint mean the same
+            // thing on every tier.
+            match path {
+                None => partial.into_iter().take(1).collect(),
+                Some(hint) => {
+                    let scoped: Vec<CoreNode> = partial
+                        .iter()
+                        .filter(|n| path_hint_matches(&n.vname.path, hint))
+                        .take(1)
+                        .cloned()
+                        .collect();
+                    // A hint that matches none of them says so, rather than
+                    // widening silently back to the whole repo (#647) or
+                    // answering an empty list that reads as "no callers".
+                    if scoped.is_empty() && !partial.is_empty() {
+                        return path_miss_message(symbol, hint, &partial);
+                    }
+                    scoped
                 }
             }
         }
@@ -8303,6 +8328,60 @@ mod tests {
         assert!(
             out.contains("fn:process"),
             "partial match must still answer: {out}"
+        );
+    }
+
+    /// The `path` hint has to mean the same thing on the partial tier as on the
+    /// exact ones. It used to be dropped once the exact ladder returned `None`,
+    /// so the fallback took the first FTS row and answered about a same-named
+    /// symbol in a file the hint excluded: #647's confident-wrong answer,
+    /// reachable through the one tier that never got the fix.
+    #[test]
+    fn get_callers_partial_fallback_still_honours_the_path_hint() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let mk =
+            |path: &str, sig: &str| Node::new(VName::new("c", "", path, "rust", sig), "function");
+        // Two partial matches for "charge", in two different directories.
+        let billing = mk("billing/svc.rs", "fn:charge_customer");
+        let payments = mk("payments/svc.rs", "fn:charge_card");
+        let billing_caller = mk("billing/main.rs", "fn:bill_it");
+        let payments_caller = mk("payments/main.rs", "fn:pay_it");
+        for n in [&billing, &payments, &billing_caller, &payments_caller] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(billing_caller.id, billing.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(
+                payments_caller.id,
+                payments.id,
+                EdgeKind::RefCall,
+            ))
+            .unwrap();
+
+        let pinned = get_callers_raw(&store, "charge", Some("billing"));
+        assert!(
+            pinned.contains("fn:bill_it"),
+            "the hinted directory's caller must be the answer: {pinned}"
+        );
+        assert!(
+            !pinned.contains("fn:pay_it"),
+            "a caller the hint excludes must not be reported: {pinned}"
+        );
+
+        // A hint matching no candidate must say so. Falling through to the
+        // unscoped first row is what this test exists to stop, and answering an
+        // empty list would read as an authoritative "no callers".
+        let missed = get_callers_raw(&store, "charge", Some("shipping"));
+        assert!(
+            missed.contains("no definition is under path 'shipping'"),
+            "a hint that matches nothing must be reported, not widened: {missed}"
+        );
+        assert!(
+            !missed.contains("fn:bill_it") && !missed.contains("fn:pay_it"),
+            "no caller list may be presented for a hint that matched nothing: {missed}"
         );
     }
 
