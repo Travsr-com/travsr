@@ -121,6 +121,18 @@ pub struct PhaseBReport {
     pub corpus: String,
     /// Languages for which semantic analysis ran successfully.
     pub ran: Vec<String>,
+    /// Phase B write calls that returned an error this run.
+    ///
+    /// A sidecar crash is per-language and `crashed` carries it, but a write
+    /// failure is per-RUN and takes every language's results with it: the batch
+    /// writers are one transaction each, so one bad row rolls back the whole
+    /// thing. That was invisible in the outcome. `write_phase_b_results` logged
+    /// a `warn!` at the call site and returned nothing, so a run that stored
+    /// none of what it computed still reported `outcome: Success` with
+    /// `lsif_edges: 0`, and `travsr status` read "semantic: complete" over a
+    /// gutted index. Folded into the run outcome so the completion event cannot
+    /// claim a clean run it did not have.
+    pub write_failures: usize,
     /// Languages P1-gated because no source files of that type exist in the
     /// repo. Not shown to the user — irrelevant when the language is absent.
     pub skipped_not_in_repo: Vec<String>,
@@ -1280,11 +1292,21 @@ pub fn init_repo_with_progress(
 
     let nodes_before = store.node_count().context("counting nodes before init")? as i64;
 
-    // Stamp the format version BEFORE indexing so that the reindex_files calls
-    // below see version == SIGNATURE_FORMAT_VERSION and don't skip files.
-    store
-        .set_signature_format_version(SIGNATURE_FORMAT_VERSION)
-        .context("writing signature_format_version")?;
+    // RFC-002: an index stamped with an older signature format cannot be
+    // repaired incrementally. The hash delta below only re-parses files whose
+    // bytes changed, so untouched files would keep their old-format signatures
+    // inside a database the stamp now calls current, and nothing downstream
+    // could tell the two halves apart. Read the stored version BEFORE the stamp
+    // overwrites it and drive the same full-rebuild path `--force` uses.
+    // A read failure counts as skew: rebuilding is the recoverable direction.
+    let stored_sig_version = store.get_signature_format_version().unwrap_or(0);
+    let format_skew = nodes_before > 0 && stored_sig_version != SIGNATURE_FORMAT_VERSION;
+    if format_skew {
+        eprintln!(
+            "index format changed (v{stored_sig_version} -> v{SIGNATURE_FORMAT_VERSION}), \
+             rebuilding from scratch"
+        );
+    }
 
     // ARCH-102: detect canonical corpus from the git remote and persist it so
     // every VName in this graph uses the same corpus identifier.
@@ -1304,6 +1326,15 @@ pub fn init_repo_with_progress(
         let empty_walked = std::collections::HashSet::<String>::new();
         let purge_policy = travsr_core::SafetyPolicy {
             mass_delete_ceiling_pct: 1.0,
+            // The TOCTOU re-check (§6.5 S3) exists for the ghost sweep, where a
+            // file reappearing on disk means it is not a ghost after all. Here
+            // the delete criterion is not absence but identity: the files still
+            // on disk are exactly the ones whose old-corpus nodes must go. Left
+            // on, the purge skipped every present file and deleted nothing, so
+            // the old node set survived a corpus change and the next re-parse
+            // added a second set under the new corpus for the same path (the
+            // per-path delete in `write_file_graphs_batch` is corpus-scoped).
+            toctou_recheck: false,
             ..Default::default()
         };
         store
@@ -1319,14 +1350,17 @@ pub fn init_repo_with_progress(
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
     // UX-004: `--force` bypasses the incremental up-to-date short-circuit by
-    // purging the existing graph so every file is re-parsed below (node_count then
-    // reads 0, which also re-activates the fast staging path). Config that changes
+    // purging the existing graph so every file is re-parsed below. Config that changes
     // *semantic* output but not file content — e.g. `--allow-unsandboxed-lsif` —
     // is not part of the per-file hash delta, so without this a re-run would say
     // "up to date" while never rebuilding those edges. Uses a 100%-ceiling policy
     // because wiping the whole graph is the explicit, user-requested intent here.
-    if force && store.node_count().unwrap_or(0) > 0 {
-        tracing::info!("--force: purging graph for a full rebuild");
+    //
+    // `format_skew` takes the same path for the same reason: every NodeId in the
+    // stored graph was hashed under a different signature format, so re-parsing
+    // only the changed files would leave the two formats mixed.
+    if (force || format_skew) && store.node_count().unwrap_or(0) > 0 {
+        tracing::info!(force, format_skew, "purging graph for a full rebuild");
         let empty_walked = std::collections::HashSet::<String>::new();
         let purge_policy = travsr_core::SafetyPolicy {
             mass_delete_ceiling_pct: 1.0,
@@ -1335,23 +1369,35 @@ pub fn init_repo_with_progress(
         store
             .reconcile(&empty_walked, &purge_policy, repo_root, &corpus)
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("--force full-graph purge")?;
+            .context("full-graph purge before rebuild")?;
         // #757 audit: `reconcile` only prunes nodes for files absent from disk,
         // so on-disk files keep their nodes AND their `files` content-hash rows.
         // The hash-delta below would then skip every unchanged file, leaving the
-        // whole point of `--force` (re-parse with the current analyzer, even
+        // whole point of the rebuild (re-parse with the current analyzer, even
         // when file bytes are unchanged) unmet — it reported "up to date" over an
         // index an older binary built. Clearing the hash cache makes every file
-        // look new, so `--force` genuinely re-parses the repo.
+        // look new, so the rebuild genuinely re-parses the repo.
         let cleared = store
             .clear_file_hashes()
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("--force clearing file hash cache")?;
-        tracing::info!(
-            cleared,
-            "--force: cleared file hash cache for full re-parse"
-        );
+            .context("clearing file hash cache before rebuild")?;
+        tracing::info!(cleared, "cleared file hash cache for full re-parse");
     }
+
+    // RFC-002: the stamp must come AFTER the purge above, because a rebuild
+    // that fails or that the user interrupts would otherwise leave the new
+    // version stamped over old-format nodes: `format_skew` would read false on
+    // every later run, the hash delta would skip every unchanged file, and the
+    // `reindex_files` guard would stop firing, so the skew would become
+    // permanently undetectable.
+    //
+    // Nothing below reads the stamp back. Init's own indexing does not route
+    // through `reindex_files` (see the note on that at the Phase B step), so
+    // the older "stamp early or reindex_files skips every file" reasoning did
+    // not apply to this path and is not what holds the position here.
+    store
+        .set_signature_format_version(SIGNATURE_FORMAT_VERSION)
+        .context("writing signature_format_version")?;
 
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
     // path at query time without threading repo_root through function signatures.
@@ -2428,11 +2474,16 @@ fn resolve_unresolved_calls(
                 // `class:T`, not Rust's `struct:`/`enum:`/`trait:`. Without it a
                 // real graph class was treated as an external type (#529 branch
                 // 2), dropping legitimate cross-file method edges.
+                // `interface:` belongs here for the same reason `class:` did:
+                // Go/Java/Kotlin/C#/TypeScript all emit it as a distinct Phase A
+                // prefix, so an interface-typed receiver was read as an external
+                // type and its calls dropped at #529 branch 2.
                 [
                     format!("struct:{t}"),
                     format!("enum:{t}"),
                     format!("trait:{t}"),
                     format!("class:{t}"),
+                    format!("interface:{t}"),
                 ]
             })
             .collect()
@@ -2882,6 +2933,36 @@ fn cross_link_manifest_deps(store: &mut SqliteStore) -> usize {
     linked
 }
 
+/// The run outcome reported by `phase_b.complete`, from what the run actually
+/// achieved.
+///
+/// A write failure is not a crash and no language reports it, but it costs the
+/// WHOLE run: each batch writer is one transaction, so a single failing row
+/// rolls back everything Phase B computed for every language. Before this it
+/// reached nothing, so a run that stored none of its results still reported
+/// `Success` with `lsif_edges: 0`, and `travsr status` read "semantic:
+/// complete" over a gutted index.
+///
+/// `Partial`, not `AllCrashed`, on a write failure. `AllCrashed` re-arms the
+/// scheduler on the next tick, and a retry cannot change the cause (a stale row
+/// is still stale on the next run), which is the persistent-retry loop #712
+/// exists to avoid. `Partial` is honest and settles.
+fn run_outcome(report: &PhaseBReport, made_progress: bool) -> phase_b_sched::RunOutcome {
+    if report.write_failures > 0 {
+        phase_b_sched::RunOutcome::Partial
+    } else if report.crashed.is_empty() {
+        phase_b_sched::RunOutcome::Success
+    } else if made_progress {
+        // Healthy languages advanced to HEAD, so the next scheduler tick early-
+        // returns (last_commit == phase_b_commit) instead of re-running: the
+        // loop settles after one back-off cycle rather than retrying a
+        // persistently broken sidecar forever (#464 follow-up, #712).
+        phase_b_sched::RunOutcome::Partial
+    } else {
+        phase_b_sched::RunOutcome::AllCrashed
+    }
+}
+
 fn write_phase_b_results(
     store: &mut SqliteStore,
     corpus: &str,
@@ -2901,6 +2982,9 @@ fn write_phase_b_results(
 ) {
     let pb_node_count = pb_nodes.len();
     let pb_edge_count = pb_edges.len();
+    // Each batch writer below is one transaction, so a single failing row loses
+    // every language's results for this run. Counted rather than only logged.
+    let mut write_failures = 0usize;
     // B: gate the C1 manifest cross-link (two unindexed full `nodes` scans) on
     // whether this cycle actually wrote any `crate` node. Computed before
     // `pb_nodes` is consumed below. C1 only creates value when `crate:*` nodes
@@ -2936,6 +3020,7 @@ fn write_phase_b_results(
         // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
         // These are analyzer/SCIP-derived structural edges (E1: provenance 'scip').
         if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges, "scip") {
+            write_failures += 1;
             tracing::warn!("semantic analysis batch write error: {e:#}");
         }
     } else {
@@ -2997,12 +3082,14 @@ fn write_phase_b_results(
 
         // G2 path: span-attributed ref/call edges.
         if let Err(e) = store.write_scip_attributed_batch(corpus, &pb_nodes, &pb_refs) {
+            write_failures += 1;
             tracing::warn!("semantic analysis attributed write error: {e:#}");
         }
         // Structural edges from SCIP relationships (Pass 2 in scip-reader) still
         // need to be written — they are not represented in ScipRef records.
         if !pb_edges.is_empty() {
             if let Err(e) = store.write_phase_b_batch(&[], &pb_edges, "scip") {
+                write_failures += 1;
                 tracing::warn!("semantic analysis structural edges write error: {e:#}");
             }
         }
@@ -3149,6 +3236,7 @@ fn write_phase_b_results(
         skipped_needs_approval: pb_outcome.skipped_needs_approval,
         skipped_needs_consent: pb_outcome.skipped_needs_consent,
         crashed: pb_outcome.crashed,
+        write_failures,
         produced_no_nodes: pb_outcome.produced_no_nodes,
         produced_no_references: pb_outcome.produced_no_references,
         version_mismatch: pb_outcome.version_mismatch,
@@ -4870,17 +4958,7 @@ fn run_background_phase_b_inner(
         let _ = s.set_meta("phase_b_dirty", "0");
     }
 
-    let outcome = if report.crashed.is_empty() {
-        phase_b_sched::RunOutcome::Success
-    } else if made_progress {
-        // Healthy languages advanced to HEAD, so the next scheduler tick early-
-        // returns (last_commit == phase_b_commit) instead of re-running: the
-        // loop settles after one back-off cycle rather than retrying a
-        // persistently broken sidecar forever (#464 follow-up, #712).
-        phase_b_sched::RunOutcome::Partial
-    } else {
-        phase_b_sched::RunOutcome::AllCrashed
-    };
+    let outcome = run_outcome(&report, made_progress);
     let succeeded = outcome != phase_b_sched::RunOutcome::AllCrashed;
 
     tracing::info!(
@@ -4889,6 +4967,7 @@ fn run_background_phase_b_inner(
         ran = report.ran.len(),
         lsif_edges = lsif_edges.len(),
         crashed = report.crashed.len(),
+        write_failures = report.write_failures,
         outcome = ?outcome,
         "semantic call and reference indexing complete"
     );
@@ -8212,6 +8291,198 @@ mod tests {
             0,
             "version must not be updated by reindex on mismatch"
         );
+    }
+
+    /// A Phase B write failure costs the whole run, because each batch writer is
+    /// one transaction: one bad row rolls back every language's results. It
+    /// reached the run outcome nowhere, so a run that stored NONE of what it
+    /// computed still logged `outcome: Success, lsif_edges: 0` and left
+    /// `travsr status` reading "semantic: complete" over a gutted index.
+    ///
+    /// Observed in production on this repo: 42 stale-format rows made
+    /// `write_scip_attributed_batch` fail on every run, discarding 946k lines of
+    /// rust-analyzer LSIF, and every one of those runs reported Success.
+    #[test]
+    fn a_write_failure_is_not_reported_as_a_clean_run() {
+        let clean = PhaseBReport {
+            ran: vec!["rust".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            run_outcome(&clean, true),
+            phase_b_sched::RunOutcome::Success,
+            "a run with no crashes and no write failures is a clean success"
+        );
+
+        let wrote_nothing = PhaseBReport {
+            ran: vec!["rust".into()],
+            write_failures: 1,
+            ..Default::default()
+        };
+        assert_ne!(
+            run_outcome(&wrote_nothing, true),
+            phase_b_sched::RunOutcome::Success,
+            "a run whose writes failed must not report a clean success"
+        );
+        // Partial, not AllCrashed: AllCrashed re-arms the scheduler every tick
+        // against a cause a retry cannot change.
+        assert_eq!(
+            run_outcome(&wrote_nothing, true),
+            phase_b_sched::RunOutcome::Partial
+        );
+
+        // A write failure outranks a clean crash list either way.
+        let both = PhaseBReport {
+            crashed: vec!["scala".into()],
+            write_failures: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            run_outcome(&both, false),
+            phase_b_sched::RunOutcome::Partial
+        );
+    }
+
+    #[test]
+    fn init_repo_rebuilds_on_signature_format_skew() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        std::fs::write(tmp.path().join("b.ts"), "export class B { go() {} }").unwrap();
+
+        let first = init_repo(tmp.path()).unwrap();
+        assert_eq!(first.files_indexed, 2);
+
+        // Control: with the stamp current, a re-init takes the incremental path
+        // and re-parses nothing.
+        let unchanged = init_repo(tmp.path()).unwrap();
+        assert_eq!(
+            unchanged.files_indexed, 0,
+            "an unchanged re-init must skip every file"
+        );
+
+        // Simulate a graph built by a binary with an older signature format.
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store
+                .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION - 1)
+                .unwrap();
+        }
+
+        let rebuilt = init_repo(tmp.path()).unwrap();
+        assert_eq!(
+            rebuilt.files_indexed, 2,
+            "format skew must re-parse every file, not stamp the current version \
+             over half-migrated signatures"
+        );
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            travsr_core::SIGNATURE_FORMAT_VERSION
+        );
+    }
+
+    /// RFC-002: the stamp must not be written until the rebuild the skew
+    /// triggered has actually purged the old graph. Stamping first meant a
+    /// rebuild that failed (or that the user interrupted) left the current
+    /// version recorded over old-format nodes, after which `format_skew` read
+    /// false forever, the hash delta skipped every unchanged file and the
+    /// `reindex_files` guard stopped firing: the detector disarmed itself.
+    #[test]
+    fn init_repo_keeps_the_old_stamp_when_the_rebuild_purge_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let old = travsr_core::SIGNATURE_FORMAT_VERSION - 1;
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_signature_format_version(old).unwrap();
+        }
+
+        // Make the purge fail where an interrupted rebuild would stop: the
+        // `reconcile` call reads the `files` table before it deletes anything.
+        // The schema version already matches, so reopening the store runs no
+        // migration and does not put the table back.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("DROP TABLE files").unwrap();
+        }
+
+        assert!(
+            init_repo(tmp.path()).is_err(),
+            "a purge that cannot run must fail the init rather than continue"
+        );
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            old,
+            "a failed rebuild must leave the old stamp so the skew stays detectable"
+        );
+    }
+
+    /// ARCH-102: a corpus change rewrites every NodeId, so the old
+    /// node set has to go. `reconcile`'s TOCTOU re-check used to skip every file
+    /// still present on disk, which is all of them here, so the purge deleted
+    /// nothing and the next re-parse wrote a second node set for the same path
+    /// under the new corpus (the per-path delete is corpus-scoped).
+    #[test]
+    fn init_repo_purges_the_old_corpus_when_the_git_remote_appears() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpora = || -> Vec<(String, i64)> {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT corpus, count(*) FROM nodes GROUP BY corpus ORDER BY corpus")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(corpora().len(), 1, "one repo, one corpus");
+
+        // The repo gains an origin, so `detect_corpus` stops falling back to
+        // `local/<basename>` and every NodeId changes.
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                &tmp.path().to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/foo.git",
+            ])
+            .output()
+            .unwrap();
+
+        init_repo(tmp.path()).unwrap();
+        // Then edit the file, which is what makes the hash delta re-parse it and
+        // write the new-corpus node set.
+        std::fs::write(
+            tmp.path().join("a.ts"),
+            "export class A { go() {} go2() {} }",
+        )
+        .unwrap();
+        init_repo(tmp.path()).unwrap();
+
+        let after = corpora();
+        assert_eq!(
+            after.len(),
+            1,
+            "the old corpus must be purged, not left alongside the new one: {after:?}"
+        );
+        assert_eq!(after[0].0, "github.com/acme/foo");
     }
 
     #[test]
