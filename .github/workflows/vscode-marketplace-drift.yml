@@ -33,6 +33,10 @@ on:
     # when someone runs `travsr lang install`; here every extension install in
     # the window lands on the wrong binary, so the window is the cost.
     - cron: '0 7 * * *'
+  # On a pull request the published-vs-release comparison is informational: only
+  # a republish can clear it, so gating unrelated PRs on it would block work none
+  # of them can unblock. The tree-pin check below it gates on every trigger,
+  # because that one IS fixable in a PR.
   pull_request:
     paths:
       - 'packages/travsr-vscode/src/installer.ts'
@@ -109,7 +113,21 @@ jobs:
             exit 0
           fi
 
-          echo "::error::the published extension installs v$DL but the current release is $LATEST"
+          SUMMARY="the published extension installs v$DL but the current release is $LATEST"
+
+          # Only a republish can clear this, and a pull request cannot publish.
+          # Failing PRs on it would block every unrelated change touching these
+          # paths on a state none of them can fix, so a PR reports it and moves
+          # on. The scheduled and post-release runs are the ones that gate,
+          # because those are the ones a human can act on.
+          if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+            echo "::warning::$SUMMARY (informational on a pull request: only a republish clears it)"
+            LEVEL=notice
+          else
+            echo "::error::$SUMMARY"
+            LEVEL=error
+          fi
+
           cat >&2 <<EOF
 
           Marketplace extension  $PUBLISHED  (tag $TAG)
@@ -121,4 +139,31 @@ jobs:
           packages/travsr-vscode/package.json, confirm DOWNLOAD_VERSION is
           ${LATEST#v}, and cut a new vscode-v* tag.
           EOF
+
+          [ "$LEVEL" = "notice" ] && exit 0
           exit 1
+
+      # What a pull request CAN fix, so this one gates on every trigger: the pin
+      # in the tree must name the current stable release. The step above reads
+      # what is published; this reads what the next publish would carry.
+      - name: the pin in this tree must name the current release
+        run: |
+          set -euo pipefail
+          DL=$(grep -m1 'export const DOWNLOAD_VERSION' \
+                 packages/travsr-vscode/src/installer.ts | cut -d'"' -f2)
+          LATEST=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isPrerelease,isDraft \
+            --jq '[.[] | select(.isPrerelease == false and .isDraft == false)
+                       | select(.tagName | startswith("v"))
+                       | select(.tagName | startswith("vscode-") | not)
+                       | .tagName][0]')
+          LATEST="${LATEST#v}"
+          [ -n "$LATEST" ] || { echo "could not resolve the latest stable release" >&2; exit 1; }
+          [ "$DL" = "$LATEST" ] || {
+            echo "::error::DOWNLOAD_VERSION $DL in the tree is not the current release v$LATEST"
+            echo "fix packages/travsr-vscode/src/installer.ts before the next publish" >&2
+            exit 1
+          }
+          echo "OK: the tree pins $DL, the current release"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
