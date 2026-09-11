@@ -55,6 +55,13 @@ impl WatcherHandle {
     }
 
     /// Raw OS events shed because the bounded queue was full.
+    ///
+    /// #802 review, deferred: read only by tests today, so a shed episode leaves
+    /// nothing behind but a throttled `tracing::warn!` that is easy to miss when
+    /// the symptom surfaces later as "my graph is stale". Surfacing it in
+    /// `travsr status` or `get_graph_stats` needs the live handle threaded from
+    /// the daemon through `StatusPayload` into travsr-cli, which is three crates
+    /// and outside this PR.
     pub fn raw_dropped(&self) -> u64 {
         self.raw_dropped.load(Ordering::Relaxed)
     }
@@ -94,6 +101,29 @@ const MAX_PENDING: usize = 100_000;
 /// be relevant and worth keeping.
 const RAW_EVENT_CAP: usize = 8_192;
 
+/// The cap the watcher actually builds its channel with.
+///
+/// #802 review: the shed test used to allocate its own `sync_channel::<u32>(2)`
+/// and assert that a full bounded channel returns `Full`. That is a documented
+/// property of the standard library, it passed unmodified on `master`, and it
+/// would pass with the production channel still unbounded, so the bound itself
+/// was untested. An override lets a test drive the real channel and observe
+/// `raw_dropped()` move.
+#[cfg(test)]
+static RAW_EVENT_CAP_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn raw_event_cap() -> usize {
+    #[cfg(test)]
+    {
+        let o = RAW_EVENT_CAP_OVERRIDE.load(Ordering::Relaxed);
+        if o > 0 {
+            return o;
+        }
+    }
+    RAW_EVENT_CAP
+}
+
 /// Mirrored by `travsr-mcp`'s own `SKIP_DIRS` so `find_pattern` searches the
 /// same file universe the graph is built from (#448). The dependency rules run
 /// `travsr-daemon → travsr-mcp`, so the constant cannot be shared; keep the two
@@ -119,10 +149,10 @@ enum PendingKind {
 
 /// Spawn the file-system watcher. Returns a `WatcherHandle`; drop it to stop.
 ///
-/// Blocks until the underlying kqueue/inotify watch is fully established and
-/// skip directories have been unwatched. This guarantees that when `spawn`
-/// returns, the caller can safely create files in `.travsr/` (e.g. the daemon
-/// control socket) without triggering kqueue ENOTSUP errors.
+/// Blocks until the underlying inotify/FSEvents watch is fully established and
+/// skip directories have been unwatched, so a caller that then writes into
+/// `.travsr/` (the daemon control socket, the WAL, the logs) is not feeding
+/// those writes straight back to itself as events.
 ///
 /// Events that originate from files whose mtime predates `start_time`
 /// (FSEvents on macOS can replay old events on startup) are silently dropped.
@@ -146,7 +176,7 @@ pub fn spawn(
     // reindex trigger, exactly as it already is for the debounce table: the
     // next event for a path supersedes the one dropped, and the periodic
     // reconcile catches anything missed entirely.
-    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<notify::Event>(RAW_EVENT_CAP);
+    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<notify::Event>(raw_event_cap());
     let raw_events = Arc::new(AtomicU64::new(0));
     let raw_dropped = Arc::new(AtomicU64::new(0));
 
@@ -192,8 +222,8 @@ pub fn spawn(
 
     // Ready channel: the event thread signals Ok(()) once the watch is fully
     // set up and skip dirs are unwatched. spawn() blocks on this before
-    // returning so the caller cannot create the socket before kqueue is done
-    // scanning — preventing the ENOTSUP race on .travsr/daemon.sock.
+    // returning, so the socket, WAL and logs the daemon writes into `.travsr/`
+    // are not delivered back to it as events for the life of the process.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
 
     // ── Event-processing thread ───────────────────────────────────────────────
@@ -212,16 +242,70 @@ pub fn spawn(
                 move |res: notify::Result<notify::Event>| {
                     if let Ok(ev) = res {
                         raw_events_cb.fetch_add(1, Ordering::Relaxed);
+
+                        // #802 review: this test runs HERE, ahead of `try_send`,
+                        // not in the event loop. The loop does not start until
+                        // after `ready_tx.send`, and establishing the watch is
+                        // itself an `IN_OPEN` per directory, so on inotify the
+                        // whole queue budget was spent before the daemon was even
+                        // ready. Measured on a tree with 15,664 directories under
+                        // `target/`: 15,670 accepted, 15,670 of them
+                        // `Access(Open)`, 7,478 shed, on a completely idle start.
+                        // With the filter here, 0 shed on the same tree.
+                        //
+                        // Nothing of value was being lost (these are discarded a
+                        // few lines later anyway), but the budget was gone, the
+                        // "shedding events" warning fired on every healthy
+                        // startup and so meant nothing, and `watch()` alone left
+                        // a 1.5 s window in which a genuine edit would be shed.
+                        // `RAW_EVENT_CAP` now only engages on real change events,
+                        // which is what it was written for.
+                        //
+                        // A READ is not a change, and on inotify it is reported
+                        // as one: `notify` subscribes to `IN_OPEN` (8.2.0
+                        // `inotify.rs:427`), so every file the daemon opens comes
+                        // back to it as an event, closing two cycles:
+                        //
+                        //   read .gitignore -> Access(Open) -> is_ignore_file ->
+                        //   build_ignore_matcher reads every .gitignore -> ...
+                        //
+                        //   edit a file -> Upsert -> reindex_files reads it ->
+                        //   Access(Open) -> newer than daemon start, so the
+                        //   staleness guard passes it -> Upsert -> ...
+                        //
+                        // `Access(Close(Write))` is kept: it is a genuine write
+                        // signal. Unreachable on fsevent, windows and kqueue,
+                        // none of which emit `Access` at all, which is why this
+                        // reproduces only on Linux.
+                        if matches!(
+                            ev.kind,
+                            EventKind::Access(AccessKind::Open(_) | AccessKind::Read)
+                        ) {
+                            return;
+                        }
+
                         // try_send, never send: this runs on the notify thread,
                         // and blocking it stalls the OS event source itself.
                         if let Err(std::sync::mpsc::TrySendError::Full(_)) = raw_tx.try_send(ev) {
                             let n = raw_dropped_cb.fetch_add(1, Ordering::Relaxed) + 1;
                             if n == 1 || n % 10_000 == 0 {
+                                // #802 review: the old text promised "the periodic
+                                // reconcile still catches missed paths". There is
+                                // no periodic filesystem reconcile.
+                                // `reconcile_tracked_tree` runs only from
+                                // `reconcile_head_drift`, which returns early
+                                // unless `last_commit != HEAD`, and the only
+                                // periodic tick is the 300 s GC. A shed edit to an
+                                // uncommitted file is recovered by nothing until a
+                                // commit, a checkout, or `travsr init`, while
+                                // `travsr status` still reports the index healthy
+                                // because `last_commit` matches HEAD.
                                 tracing::warn!(
                                     dropped = n,
-                                    cap = RAW_EVENT_CAP,
+                                    cap = raw_event_cap(),
                                     "watcher event queue full; shedding events. \
-                                     The periodic reconcile still catches missed paths."
+                                     Nothing recovers these until the next commit, \
+                                     checkout, or `travsr init`."
                                 );
                             }
                         }
@@ -250,11 +334,19 @@ pub fn spawn(
             // producing events that were queued and stat'd before being
             // discarded by `should_skip_all`.
             //
-            // This is not only a cost fix. `spawn`'s contract, which
-            // `lib.rs` relies on before binding the control socket, is that
-            // `.travsr/` is unwatched by the time it returns; otherwise the
-            // kqueue backend opens `daemon.sock` and gets ENOTSUP, killing the
-            // whole watch. That guarantee has never actually held.
+            // This is not only a cost fix. `.travsr/` is in `SKIP_DIRS`, and
+            // the daemon writes `graph.db-wal`, `embed.db` and rotating logs
+            // into it continuously. On inotify every one of those writes was an
+            // event the daemon delivered to itself and then filtered, for the
+            // lifetime of the process.
+            //
+            // #802 review: the rationale here used to be that kqueue would open
+            // `daemon.sock` and get ENOTSUP. That is unreachable. `notify` with
+            // default features selects FSEvents on macOS and inotify on Linux;
+            // kqueue is chosen only on the BSDs and iOS, none of which travsr
+            // ships. On the platforms it does ship, inotify watches directories
+            // only, FSEvents streams one recursive watch from the root, and
+            // Windows uses ReadDirectoryChangesW. None of them open the socket.
             //
             // Failures are logged and not fatal: a skip dir that does not exist
             // in this repo is the common case, and losing the optimisation is
@@ -276,37 +368,6 @@ pub fn spawn(
                 }
                 match raw_rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(event) => {
-                        // #801: a READ is not a change, and on inotify it is
-                        // reported as one. `notify` subscribes to `IN_OPEN`
-                        // (8.2.0 `inotify.rs:427`), so every file the daemon
-                        // opens comes back to it as an event, and the two reads
-                        // it does on the hot path close a cycle:
-                        //
-                        //   read .gitignore -> Access(Open) -> is_ignore_file ->
-                        //   build_ignore_matcher reads every .gitignore -> ...
-                        //
-                        //   edit a file -> Upsert -> reindex_files reads it ->
-                        //   Access(Open) -> newer than daemon start, so the
-                        //   staleness guard passes it -> Upsert -> ...
-                        //
-                        // The first spins at ~150k events/sec from a single
-                        // `cat .gitignore` by any process; the second reindexes
-                        // every edited file once per debounce interval until the
-                        // daemon restarts. Neither is reachable on fsevent,
-                        // windows or kqueue: none of them emit `Access` at all,
-                        // which is why this reproduces only on Linux.
-                        //
-                        // Placed above the matcher rebuild because that rebuild
-                        // runs before any per-path filtering, so nothing below
-                        // can break the cycle. `Access(Close(Write))` is kept: it
-                        // is a genuine write signal.
-                        if matches!(
-                            event.kind,
-                            EventKind::Access(AccessKind::Open(_) | AccessKind::Read)
-                        ) {
-                            continue;
-                        }
-
                         // #403: a change to any .gitignore/.travsrignore
                         // invalidates the cached matcher — rebuild it so newly
                         // ignored paths stop being indexed without a daemon
@@ -325,26 +386,67 @@ pub fn spawn(
                             // is the common case for the repo shape this issue
                             // was reported on, not an edge case.
                             //
-                            // Re-drop it the moment it appears. Gated on Create
-                            // first, which is a cheap enum match and rare next to
-                            // Modify, so the `should_skip_dir` and `is_dir` cost
-                            // is paid only when a directory is actually born.
-                            //
-                            // `should_skip_dir`, not `should_skip_all`: a
-                            // `build/` gitignore rule is directory only, so
-                            // asking the file-shaped question about a directory
-                            // answers "not ignored" and the tree stays watched.
-                            if matches!(event.kind, EventKind::Create(_))
-                                && should_skip_dir(path, &repo_root, &gitignore)
-                                && path.is_dir()
-                            {
-                                if let Err(e) = watcher.unwatch(path) {
-                                    tracing::debug!(
-                                        "unwatch {} not applied (non-fatal): {e}",
-                                        path.display()
+                            // Re-drop it the moment it appears. Gated on the
+                            // appearance kinds first, a cheap enum match and rare
+                            // next to Modify, so the directory work below is paid
+                            // only when one actually shows up.
+                            // #802 review: `Create(_)` alone misses a rename.
+                            // inotify reports a move into a watched tree as
+                            // `IN_MOVED_TO`, which notify maps to
+                            // `Modify(Name(To))`, so `mv target/ .`, a
+                            // `git checkout`, a tarball extraction and npm's
+                            // staging swap all left the tree fully watched and
+                            // brought #801 back until the daemon restarted.
+                            // Measured: 40 writes into a moved-in `target/`
+                            // produced 160 raw events with the narrow gate.
+                            let appeared = matches!(
+                                event.kind,
+                                EventKind::Create(_)
+                                    | EventKind::Modify(ModifyKind::Name(RenameMode::To))
+                            );
+                            if appeared {
+                                // `CreateKind::Folder` answers "is this a
+                                // directory" without a syscall on both inotify
+                                // and FSEvents (#802 review note). A rename-in
+                                // carries no such hint, so only that path pays
+                                // the stat.
+                                let is_dir = matches!(
+                                    event.kind,
+                                    EventKind::Create(notify::event::CreateKind::Folder)
+                                ) || path.is_dir();
+
+                                if is_dir {
+                                    // `should_skip_dir`, not `should_skip_all`: a
+                                    // `build/` gitignore rule is directory only,
+                                    // so asking the file-shaped question about a
+                                    // directory answers "not ignored" and the
+                                    // tree stays watched.
+                                    if should_skip_dir(path, &repo_root, &gitignore) {
+                                        if let Err(e) = watcher.unwatch(path) {
+                                            tracing::debug!(
+                                                "unwatch {} not applied (non-fatal): {e}",
+                                                path.display()
+                                            );
+                                        }
+                                        continue;
+                                    }
+
+                                    // A KEPT directory appeared, which may already
+                                    // contain skip dirs: `vendor/node_modules/`
+                                    // moved in delivers one event for `vendor/`
+                                    // and none for anything beneath it. A freshly
+                                    // created directory is empty, so this walk
+                                    // costs nothing there; a moved-in tree is
+                                    // where it does real work, and where it is
+                                    // the only thing that can find the nested
+                                    // skip dirs.
+                                    unwatch_skipped_subtrees_under(
+                                        &mut watcher,
+                                        path,
+                                        &repo_root,
+                                        &gitignore,
                                     );
                                 }
-                                continue;
                             }
 
                             // #801: the cheap prefix test runs FIRST. It used to
@@ -565,7 +667,26 @@ fn unwatch_skipped_subtrees(
     repo_root: &Path,
     gitignore: &Gitignore,
 ) {
-    for path in skipped_subtree_roots(repo_root, gitignore) {
+    unwatch_skipped_subtrees_under(watcher, repo_root, repo_root, gitignore);
+}
+
+/// [`unwatch_skipped_subtrees`] scoped to one subtree.
+///
+/// #802 review: a kept directory can arrive with skip dirs already nested inside
+/// it. `vendor/node_modules/` moved into the repo delivers one event for
+/// `vendor/`, and no `Create` at all for anything beneath it, so testing only
+/// the path named in the event leaves the nested tree fully watched. Scanning
+/// the new subtree covers that with the same mechanism as startup.
+///
+/// `scan_root` bounds the walk; `repo_root` stays the anchor `should_skip_dir`
+/// measures paths against, so the classification is identical to startup's.
+fn unwatch_skipped_subtrees_under(
+    watcher: &mut RecommendedWatcher,
+    scan_root: &Path,
+    repo_root: &Path,
+    gitignore: &Gitignore,
+) {
+    for path in skipped_subtree_roots_under(scan_root, repo_root, gitignore) {
         if let Err(e) = watcher.unwatch(&path) {
             tracing::debug!("unwatch {} not applied (non-fatal): {e}", path.display());
         }
@@ -582,8 +703,18 @@ fn unwatch_skipped_subtrees(
 /// costs work proportional to the tree that stays watched, which the daemon has
 /// to enumerate anyway, not to the `target/` being excluded.
 fn skipped_subtree_roots(repo_root: &Path, gitignore: &Gitignore) -> Vec<PathBuf> {
+    skipped_subtree_roots_under(repo_root, repo_root, gitignore)
+}
+
+/// [`skipped_subtree_roots`] bounded to `scan_root`. `repo_root` remains the
+/// anchor for classification, so a subtree scan and a full scan agree.
+fn skipped_subtree_roots_under(
+    scan_root: &Path,
+    repo_root: &Path,
+    gitignore: &Gitignore,
+) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    let mut stack = vec![repo_root.to_path_buf()];
+    let mut stack = vec![scan_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -673,6 +804,9 @@ mod tests {
             std::fs::write(root.join(format!("target/debug/deps/x{i}.rlib")), "junk").unwrap();
         }
         let from_skip = settled(|| handle.raw_events(), Duration::from_secs(10)) - after_watched;
+        // #802 review: drop before asserting, so a failure does not leave the
+        // watcher thread and its inotify watches running for the rest of the run.
+        drop(handle);
         assert!(
             from_skip < 40,
             "400 writes under target/ produced {from_skip} raw events: the tree is \
@@ -798,8 +932,10 @@ mod tests {
             || handle.raw_events() > before_reinclude,
             Duration::from_secs(5),
         );
+        let after_reinclude = handle.raw_events();
+        drop(handle);
         assert!(
-            handle.raw_events() > before_reinclude,
+            after_reinclude > before_reinclude,
             "`!vendored/` is re-included by .travsrignore, so the filter keeps it \
              and the watch must be kept: unwatching it would silently stop \
              indexing a tree the user asked to index"
@@ -852,9 +988,12 @@ mod tests {
         }
         let after_race = settled(|| handle.raw_events(), Duration::from_secs(20));
         // The producer going quiet does not prove the consumer has caught up,
-        // and it is the consumer that calls `unwatch`. Give it room.
+        // and it is the consumer that calls `unwatch`. Give it room, then settle
+        // again: #802 review noted the bare sleep let a straggler from the first
+        // burst be counted against the second sample. Re-settling folds any
+        // straggler into the baseline instead.
         std::thread::sleep(Duration::from_secs(1));
-        let before_second = handle.raw_events();
+        let before_second = settled(|| handle.raw_events(), Duration::from_secs(10));
 
         // The assertion, and the reason for the second batch: by now the unwatch
         // has certainly been applied, so these 400 writes are not racing
@@ -875,43 +1014,160 @@ mod tests {
              #801 (#801 review)",
             after_race - base
         );
+        drop(handle);
+    }
+    /// #802 review finding 2: a skip dir that arrives by RENAME is dropped too.
+    ///
+    /// The re-drop was gated on `Create(_)`. inotify reports a move into a
+    /// watched tree as `IN_MOVED_TO`, which notify maps to `Modify(Name(To))`,
+    /// so the gate could not fire. Measured on the narrow gate: 40 writes into a
+    /// moved-in `target/` produced 160 raw events.
+    ///
+    /// This matters because rename into place is how `git checkout`, `mv`,
+    /// tarball extraction and npm's staging swap all land trees, which is at
+    /// least as common as an in-place `mkdir`. The existing
+    /// `a_skip_dir_created_after_spawn_is_dropped_too` models
+    /// `cargo clean && cargo build`, which is the `Create` half, so the suite
+    /// reported success on the half that worked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_skip_dir_renamed_into_the_repo_is_dropped_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // Staged OUTSIDE the watched tree, then moved in: the whole point.
+        let staging = tempfile::tempdir().unwrap();
+        let staged = staging.path().join("target");
+        std::fs::create_dir_all(staged.join("debug/deps")).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<WatchEvent>(4096);
+        let handle = spawn(root, tx, Instant::now()).expect("watcher spawns");
+        for i in 0..20 {
+            std::fs::write(root.join(format!("src/f{i}.ts")), "x").unwrap();
+        }
+        wait_until(|| handle.raw_events() > 0, Duration::from_secs(5));
+        let base = settled(|| handle.raw_events(), Duration::from_secs(10));
+
+        // Rename it into the repo. Same filesystem, so this is a true rename and
+        // arrives as Modify(Name(To)), not Create.
+        let moved = root.join("target");
+        std::fs::rename(&staged, &moved).expect("rename into the repo");
+
+        // Let the consumer apply the unwatch, then settle so a straggler from the
+        // rename itself is folded into the baseline rather than the sample.
+        std::thread::sleep(Duration::from_secs(1));
+        let before_writes = settled(|| handle.raw_events(), Duration::from_secs(10));
+
+        for i in 0..400 {
+            std::fs::write(moved.join(format!("debug/deps/x{i}.rlib")), "junk").unwrap();
+        }
+        let from_moved = settled(|| handle.raw_events(), Duration::from_secs(20)) - before_writes;
+        drop(handle);
+
+        assert!(
+            from_moved < 40,
+            "400 writes into a target/ RENAMED into the repo produced {from_moved} \
+             raw events: the re-drop is gated on Create and a rename arrives as \
+             Modify(Name(To)), so the tree stayed watched and #801 returns until \
+             the daemon restarts ({} during the rename itself)",
+            before_writes - base
+        );
     }
 
-    /// #801: a full raw queue sheds rather than blocking the producer.
+    /// #802 review finding 2, narrower shape: a skip dir already NESTED inside a
+    /// kept directory that is moved in.
     ///
-    /// Scope, stated because the obvious test here does not work. I first wrote
-    /// this as "flood the watcher and assert it keeps accepting", and
-    /// mutation-checked it by reverting to the unbounded channel: it still
-    /// passed. An unbounded channel also keeps accepting, so that assertion
-    /// discriminated nothing. Forcing a real overflow through the watcher is not
-    /// reliable either, because the consumer drains roughly as fast as a test
-    /// loop can create files, so the queue empties as fast as it fills and drop
-    /// counts are timing dependent.
+    /// Measured on the narrow gate: `vendor/node_modules/` moved in whole
+    /// delivered zero `Create` events for any directory, and 40 writes into the
+    /// nested `node_modules` produced 160 raw events. Testing only the path named
+    /// in the event cannot reach it, which is why a kept directory that appears
+    /// now gets `unwatch_skipped_subtrees_under` run over its subtree.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_skip_dir_nested_in_a_moved_in_kept_dir_is_dropped_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let staged = staging.path().join("vendor");
+        std::fs::create_dir_all(staged.join("node_modules/pkg")).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<WatchEvent>(4096);
+        let handle = spawn(root, tx, Instant::now()).expect("watcher spawns");
+        for i in 0..20 {
+            std::fs::write(root.join(format!("src/f{i}.ts")), "x").unwrap();
+        }
+        wait_until(|| handle.raw_events() > 0, Duration::from_secs(5));
+
+        // `vendor/` is KEPT; only `node_modules/` beneath it is a skip dir.
+        let moved = root.join("vendor");
+        std::fs::rename(&staged, &moved).expect("rename into the repo");
+
+        std::thread::sleep(Duration::from_secs(1));
+        let before_writes = settled(|| handle.raw_events(), Duration::from_secs(10));
+
+        for i in 0..400 {
+            std::fs::write(
+                moved.join(format!("node_modules/pkg/x{i}.js")),
+                "module.exports = 1;",
+            )
+            .unwrap();
+        }
+        let from_nested = settled(|| handle.raw_events(), Duration::from_secs(20)) - before_writes;
+        drop(handle);
+
+        assert!(
+            from_nested < 40,
+            "400 writes into a node_modules/ nested inside a moved-in vendor/ \
+             produced {from_nested} raw events: no event names the nested skip \
+             dir, so only scanning the new subtree can find it (#802 review)"
+        );
+    }
+
+    /// #801 fix 3: the bounded raw queue sheds instead of blocking.
     ///
-    /// So this pins the property that actually matters and can be asserted
-    /// deterministically: when the queue is full, the producer sheds and keeps
-    /// going. `send` would block here, and the producer is the notify callback,
-    /// so blocking it stalls the OS event source itself: the watcher would stop
+    /// The producer is the notify callback. `send` would block there, and
+    /// blocking it stalls the OS event source itself, so the watcher would stop
     /// noticing edits rather than merely fall behind.
     ///
-    /// What this does NOT cover is the wiring, that the watcher's own channel is
-    /// the bounded kind. `RAW_EVENT_CAP`'s use at the `sync_channel` call is the
-    /// only place that is decided, and it is one line under review.
+    /// #802 review: the first version of this test built its own
+    /// `sync_channel::<u32>(2)` and asserted a full bounded channel returns
+    /// `Full`. That is a documented property of the standard library; it passed
+    /// unmodified on `master` and would pass with the production channel still
+    /// unbounded, so fix 3 was effectively untested. This drives the watcher's
+    /// own channel through `RAW_EVENT_CAP_OVERRIDE` and asserts `raw_dropped()`
+    /// moves, which discriminates: remove the bound and it fails.
+    ///
+    /// Linux only. It needs inotify's per-file event volume to overflow a small
+    /// cap faster than a 200 ms consumer timeout drains it.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_full_raw_queue_sheds_instead_of_blocking() {
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<u32>(2);
-        assert!(tx.try_send(1).is_ok());
-        assert!(tx.try_send(2).is_ok());
-        match tx.try_send(3) {
-            Err(std::sync::mpsc::TrySendError::Full(v)) => assert_eq!(v, 3),
-            other => panic!("a full bounded queue must report Full, got {other:?}"),
+        // #802 review: drives the production channel, not a hand-rolled one. With
+        // the bound removed this fails, because `raw_dropped()` never moves.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("seed.rs"), "fn main() {}").unwrap();
+
+        RAW_EVENT_CAP_OVERRIDE.store(4, Ordering::Relaxed);
+        let (tx, _rx) = mpsc::channel::<WatchEvent>(4096);
+        let handle = spawn(root, tx, Instant::now()).expect("watcher spawns");
+
+        // A burst far past a 4 slot queue. The consumer drains on a 200 ms
+        // timeout, so a flood this size cannot be absorbed slot by slot.
+        for i in 0..2_000 {
+            let _ = std::fs::write(root.join(format!("f{i}.rs")), "fn a() {}");
         }
-        // And the producer is still usable afterwards: shedding is not fatal.
-        let _ = _rx.recv().unwrap();
+
+        wait_until(|| handle.raw_dropped() > 0, Duration::from_secs(20));
+        let dropped = handle.raw_dropped();
+        drop(handle);
+        RAW_EVENT_CAP_OVERRIDE.store(0, Ordering::Relaxed);
+
         assert!(
-            tx.try_send(4).is_ok(),
-            "after a slot frees the producer must resume, or a single burst would \
-             permanently deafen the watcher"
+            dropped > 0,
+            "a flood past the cap must shed and count it, or the bound is not \
+             wired to the watcher's own channel (#801 fix 3)"
         );
     }
 
@@ -1103,6 +1359,7 @@ mod tests {
         assert!(status.success(), "cat .gitignore failed");
 
         let from_read = settled(|| handle.raw_events(), Duration::from_secs(10)) - after_write;
+        drop(handle);
         assert!(
             from_read < 100,
             "one read of .gitignore produced {from_read} raw events: the read is \
