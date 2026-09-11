@@ -5020,16 +5020,18 @@ LIMIT ?4",
         // this INSERT deliberately omits the column — a fresh Phase-B-only node
         // takes the schema default (`None`) and the ON CONFLICT leaves any
         // existing Phase-A role intact rather than clobbering it to `None`.
+        let mut stale_vname_skips = 0usize;
         for node in nodes {
             let id_i64 = node_id_to_i64(node.id);
-            tx.execute(
+            let written = tx.execute(
                 "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise) \
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                  package = excluded.package, \
                  line = COALESCE(excluded.line, nodes.line), \
                  end_line = COALESCE(excluded.end_line, nodes.end_line), \
-                 is_noise = excluded.is_noise",
+                 is_noise = excluded.is_noise \
+                 ON CONFLICT(corpus, root, path, language, signature) DO NOTHING",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -5045,9 +5047,27 @@ LIMIT ?4",
                 ],
             )
             .context("write_phase_b_batch: insert node")?;
+            // 0 rows means the vname target fired: this node's tuple is already
+            // held under a different id (a row written under an older
+            // SIGNATURE_FORMAT_VERSION, whose id hashes the version byte). It
+            // was not written, so its FTS rows would key on an id `nodes` does
+            // not hold. Skipping costs one node; letting the statement error
+            // would roll the transaction back and cost the whole Phase B run,
+            // which is what it did in `write_scip_attributed_batch`.
+            if written == 0 {
+                stale_vname_skips += 1;
+                continue;
+            }
             Self::put_node_fts(&tx, node).context("write_phase_b_batch: put_node_fts")?;
             Self::put_node_fts_words(&tx, node)
                 .context("write_phase_b_batch: put_node_fts_words")?;
+        }
+        if stale_vname_skips > 0 {
+            tracing::warn!(
+                skipped = stale_vname_skips,
+                "write_phase_b_batch: skipped nodes whose vname is already held under a \
+                 different id (stale signature format); run `travsr init` to rebuild"
+            );
         }
         // #712: never write a half-edge. An incomplete or partial sidecar result
         // can reference a node it never emitted (or one that a crashed language
