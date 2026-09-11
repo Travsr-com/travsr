@@ -542,9 +542,17 @@ fn with_phase_b_note(store: &SqliteStore, body: String) -> String {
 }
 
 /// #661 WS-D: append the index/HEAD mismatch note (#645) **only** — no Phase-B
-/// note — to a deterministic `path:line` tool's response. `find_references`,
-/// `get_dependencies` and `get_graph_json` assert `path:line` but do not depend
-/// on Phase B, so they carry the head-drift signal without the Phase-B one.
+/// note — to a deterministic `path:line` tool's response. `get_dependencies`
+/// and `get_graph_json` read `depends`/`resolves-to`, which Phase A emits, so
+/// they carry the head-drift signal without the Phase-B one.
+///
+/// `find_references` was on that list and should not have been. It serves
+/// `edge_sites` rows of kind `ref/call`, and on this repo's own index 7445 of
+/// the 8211 `ref/call` edges are Phase B's (`provenance = 'scip'`) against 766
+/// from tree-sitter. A watcher reindex drops a file's call edges without moving
+/// HEAD (#583), so the head note stays silent while the answer loses ~90% of
+/// its evidence, and a `0 reference(s)` reads as fact. It uses
+/// [`with_phase_b_note`] instead.
 ///
 /// `head` is split out as a parameter (the same injectable seam as
 /// [`append_read_notes`]) so the composition is deterministically testable
@@ -1499,7 +1507,7 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
     // path:line answers and intentionally carry no note.
     let body =
         sanitize_mcp_body_with_limit(&find_references_raw(store, symbol, path), FIND_OUTPUT_LIMIT);
-    wrap_envelope(&with_head_note(store, body))
+    wrap_envelope(&with_phase_b_note(store, body))
 }
 
 /// One resolved definition site, for the structured `find_references` result.
@@ -14547,6 +14555,35 @@ mod snippet_tests {
         assert!(
             !out.contains("not a definitive zero"),
             "should not soften when the file was analysed: {out}"
+        );
+    }
+
+    /// A watcher reindex drops a file's Phase B call edges without moving HEAD
+    /// (#583), so `find_references` on a symbol whose only caller sat in that
+    /// file answers `0` from an evidence set that is temporarily gone. The head
+    /// note cannot fire (HEAD did not move), so before this the zero carried no
+    /// caveat at all and read as fact. Dogfooded: `travsr references
+    /// detect_corpus` returned a bare 0 while the call sat at
+    /// `travsr-daemon/src/lib.rs:1303`.
+    #[test]
+    fn find_references_zero_says_so_when_phase_b_is_dirty() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Markers agree: HEAD did not move, so the head note stays silent.
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let orphan = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:orphaned"),
+            "function",
+        )
+        .with_line(3);
+        store.put_node(&orphan).unwrap();
+
+        let out = find_references(&store, "orphaned", None);
+        assert!(
+            out.contains("not authoritative"),
+            "a zero served while Phase B is dirty must not read as fact: {out}"
         );
     }
 
