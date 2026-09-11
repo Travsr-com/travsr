@@ -207,7 +207,7 @@ Full detail in [packages/travsr-vscode/CHANGELOG.md](packages/travsr-vscode/CHAN
 
 ### Changed
 
-- **Documentation-prose retrieval (#376) is on by default (#519).** `get_context`, `ask`, and `find_references`/`find_pattern`'s doc lane now search Markdown documentation (ADRs, RFCs, plans) alongside code by default, surfacing rationale and design docs relevant to a query. All five docs-lane accuracy/regression gates are green on both bench repos (travsr and kubernetes) against merged code. Turn it off with `travsr config set docs.enabled false`.
+- **Documentation-prose retrieval (#376) is on by default (#519).** `get_context`, `ask`, and `find_references`/`find_pattern`'s doc lane now search Markdown documentation (ADRs, RFCs, plans) alongside code by default, surfacing rationale and design docs relevant to a query. All five docs-lane accuracy/regression gates are green on both bench repos (travsr and kubernetes) against merged code. This is an egress change as well as a retrieval-quality one: doc results put Markdown file paths and humanized heading trails (`path § Heading Trail:line-range`, never prose bodies) into an agent's context with no opt-in, and the Markdown exclusion list is quality-driven (`changelog`, `license`, `generated/`), not sensitivity-driven, so `SECURITY.md`, `docs/runbooks/*.md` and internal architecture docs are all in scope. That text is author-controlled, so a vendored dependency's README or an untrusted PR branch can now reach the model by default where it previously needed an explicit opt-in. Turn it off with `travsr config set docs.enabled false`.
 
 ### Security
 
