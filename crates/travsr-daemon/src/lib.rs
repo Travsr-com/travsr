@@ -121,6 +121,18 @@ pub struct PhaseBReport {
     pub corpus: String,
     /// Languages for which semantic analysis ran successfully.
     pub ran: Vec<String>,
+    /// Phase B write calls that returned an error this run.
+    ///
+    /// A sidecar crash is per-language and `crashed` carries it, but a write
+    /// failure is per-RUN and takes every language's results with it: the batch
+    /// writers are one transaction each, so one bad row rolls back the whole
+    /// thing. That was invisible in the outcome. `write_phase_b_results` logged
+    /// a `warn!` at the call site and returned nothing, so a run that stored
+    /// none of what it computed still reported `outcome: Success` with
+    /// `lsif_edges: 0`, and `travsr status` read "semantic: complete" over a
+    /// gutted index. Folded into the run outcome so the completion event cannot
+    /// claim a clean run it did not have.
+    pub write_failures: usize,
     /// Languages P1-gated because no source files of that type exist in the
     /// repo. Not shown to the user — irrelevant when the language is absent.
     pub skipped_not_in_repo: Vec<String>,
@@ -2921,6 +2933,36 @@ fn cross_link_manifest_deps(store: &mut SqliteStore) -> usize {
     linked
 }
 
+/// The run outcome reported by `phase_b.complete`, from what the run actually
+/// achieved.
+///
+/// A write failure is not a crash and no language reports it, but it costs the
+/// WHOLE run: each batch writer is one transaction, so a single failing row
+/// rolls back everything Phase B computed for every language. Before this it
+/// reached nothing, so a run that stored none of its results still reported
+/// `Success` with `lsif_edges: 0`, and `travsr status` read "semantic:
+/// complete" over a gutted index.
+///
+/// `Partial`, not `AllCrashed`, on a write failure. `AllCrashed` re-arms the
+/// scheduler on the next tick, and a retry cannot change the cause (a stale row
+/// is still stale on the next run), which is the persistent-retry loop #712
+/// exists to avoid. `Partial` is honest and settles.
+fn run_outcome(report: &PhaseBReport, made_progress: bool) -> phase_b_sched::RunOutcome {
+    if report.write_failures > 0 {
+        phase_b_sched::RunOutcome::Partial
+    } else if report.crashed.is_empty() {
+        phase_b_sched::RunOutcome::Success
+    } else if made_progress {
+        // Healthy languages advanced to HEAD, so the next scheduler tick early-
+        // returns (last_commit == phase_b_commit) instead of re-running: the
+        // loop settles after one back-off cycle rather than retrying a
+        // persistently broken sidecar forever (#464 follow-up, #712).
+        phase_b_sched::RunOutcome::Partial
+    } else {
+        phase_b_sched::RunOutcome::AllCrashed
+    }
+}
+
 fn write_phase_b_results(
     store: &mut SqliteStore,
     corpus: &str,
@@ -2940,6 +2982,9 @@ fn write_phase_b_results(
 ) {
     let pb_node_count = pb_nodes.len();
     let pb_edge_count = pb_edges.len();
+    // Each batch writer below is one transaction, so a single failing row loses
+    // every language's results for this run. Counted rather than only logged.
+    let mut write_failures = 0usize;
     // B: gate the C1 manifest cross-link (two unindexed full `nodes` scans) on
     // whether this cycle actually wrote any `crate` node. Computed before
     // `pb_nodes` is consumed below. C1 only creates value when `crate:*` nodes
@@ -2975,6 +3020,7 @@ fn write_phase_b_results(
         // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
         // These are analyzer/SCIP-derived structural edges (E1: provenance 'scip').
         if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges, "scip") {
+            write_failures += 1;
             tracing::warn!("semantic analysis batch write error: {e:#}");
         }
     } else {
@@ -3036,12 +3082,14 @@ fn write_phase_b_results(
 
         // G2 path: span-attributed ref/call edges.
         if let Err(e) = store.write_scip_attributed_batch(corpus, &pb_nodes, &pb_refs) {
+            write_failures += 1;
             tracing::warn!("semantic analysis attributed write error: {e:#}");
         }
         // Structural edges from SCIP relationships (Pass 2 in scip-reader) still
         // need to be written — they are not represented in ScipRef records.
         if !pb_edges.is_empty() {
             if let Err(e) = store.write_phase_b_batch(&[], &pb_edges, "scip") {
+                write_failures += 1;
                 tracing::warn!("semantic analysis structural edges write error: {e:#}");
             }
         }
@@ -3188,6 +3236,7 @@ fn write_phase_b_results(
         skipped_needs_approval: pb_outcome.skipped_needs_approval,
         skipped_needs_consent: pb_outcome.skipped_needs_consent,
         crashed: pb_outcome.crashed,
+        write_failures,
         produced_no_nodes: pb_outcome.produced_no_nodes,
         produced_no_references: pb_outcome.produced_no_references,
         version_mismatch: pb_outcome.version_mismatch,
@@ -4909,17 +4958,7 @@ fn run_background_phase_b_inner(
         let _ = s.set_meta("phase_b_dirty", "0");
     }
 
-    let outcome = if report.crashed.is_empty() {
-        phase_b_sched::RunOutcome::Success
-    } else if made_progress {
-        // Healthy languages advanced to HEAD, so the next scheduler tick early-
-        // returns (last_commit == phase_b_commit) instead of re-running: the
-        // loop settles after one back-off cycle rather than retrying a
-        // persistently broken sidecar forever (#464 follow-up, #712).
-        phase_b_sched::RunOutcome::Partial
-    } else {
-        phase_b_sched::RunOutcome::AllCrashed
-    };
+    let outcome = run_outcome(&report, made_progress);
     let succeeded = outcome != phase_b_sched::RunOutcome::AllCrashed;
 
     tracing::info!(
@@ -4928,6 +4967,7 @@ fn run_background_phase_b_inner(
         ran = report.ran.len(),
         lsif_edges = lsif_edges.len(),
         crashed = report.crashed.len(),
+        write_failures = report.write_failures,
         outcome = ?outcome,
         "semantic call and reference indexing complete"
     );
@@ -8250,6 +8290,56 @@ mod tests {
             store.get_signature_format_version().unwrap(),
             0,
             "version must not be updated by reindex on mismatch"
+        );
+    }
+
+    /// A Phase B write failure costs the whole run, because each batch writer is
+    /// one transaction: one bad row rolls back every language's results. It
+    /// reached the run outcome nowhere, so a run that stored NONE of what it
+    /// computed still logged `outcome: Success, lsif_edges: 0` and left
+    /// `travsr status` reading "semantic: complete" over a gutted index.
+    ///
+    /// Observed in production on this repo: 42 stale-format rows made
+    /// `write_scip_attributed_batch` fail on every run, discarding 946k lines of
+    /// rust-analyzer LSIF, and every one of those runs reported Success.
+    #[test]
+    fn a_write_failure_is_not_reported_as_a_clean_run() {
+        let clean = PhaseBReport {
+            ran: vec!["rust".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            run_outcome(&clean, true),
+            phase_b_sched::RunOutcome::Success,
+            "a run with no crashes and no write failures is a clean success"
+        );
+
+        let wrote_nothing = PhaseBReport {
+            ran: vec!["rust".into()],
+            write_failures: 1,
+            ..Default::default()
+        };
+        assert_ne!(
+            run_outcome(&wrote_nothing, true),
+            phase_b_sched::RunOutcome::Success,
+            "a run whose writes failed must not report a clean success"
+        );
+        // Partial, not AllCrashed: AllCrashed re-arms the scheduler every tick
+        // against a cause a retry cannot change.
+        assert_eq!(
+            run_outcome(&wrote_nothing, true),
+            phase_b_sched::RunOutcome::Partial
+        );
+
+        // A write failure outranks a clean crash list either way.
+        let both = PhaseBReport {
+            crashed: vec!["scala".into()],
+            write_failures: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            run_outcome(&both, false),
+            phase_b_sched::RunOutcome::Partial
         );
     }
 
