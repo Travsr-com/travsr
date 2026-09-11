@@ -5181,16 +5181,40 @@ LIMIT ?4",
 
         // #479: see write_phase_b_batch — this Phase-B INSERT omits `test_role`
         // on purpose so it never clobbers a Phase-A role to `None`.
+        //
+        // TWO conflict targets, not one. `nodes` carries the `id` primary key
+        // AND `idx_nodes_vname` UNIQUE(corpus, root, path, language, signature),
+        // and a NodeId is `blake3(SIGNATURE_FORMAT_VERSION || …vname fields…)`
+        // (RFC-002), so a row written under an older format version holds THIS
+        // vname tuple under a DIFFERENT id. `ON CONFLICT(id)` cannot see that
+        // row, the vname index rejects the insert, and with a bare `?` the
+        // error took the whole transaction with it: every node, edge and
+        // occurrence Phase B produced for EVERY language, discarded over one
+        // stale row, while the run still reported success.
+        //
+        // Measured on this repo: 42 nodes of 16342, all under a `.claude/
+        // worktrees/…` directory indexed by a pre-v3 binary and never purged,
+        // silently cost 946k lines of rust-analyzer LSIF on every Phase B run
+        // (`lsif_edges: 0`), so no Rust semantic edge was ever re-derived.
+        //
+        // `DO NOTHING` on the vname target, not `DO UPDATE`: the conflicting
+        // row's id is its primary key and cannot be rewritten in place, and
+        // other rows already reference it. Skipping leaves the stale row for
+        // the format guard to purge at the next `travsr init` and lets the rest
+        // of the batch land, which is the difference between losing one symbol
+        // and losing the repo.
+        let mut stale_vname_skips = 0usize;
         for node in nodes {
             let id_i64 = node_id_to_i64(node.id);
-            tx.execute(
+            let written = tx.execute(
                 "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise) \
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                  package = excluded.package, \
                  line = COALESCE(excluded.line, nodes.line), \
                  end_line = COALESCE(excluded.end_line, nodes.end_line), \
-                 is_noise = excluded.is_noise",
+                 is_noise = excluded.is_noise \
+                 ON CONFLICT(corpus, root, path, language, signature) DO NOTHING",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -5206,9 +5230,22 @@ LIMIT ?4",
                 ],
             )
             .context("write_scip_attributed_batch: insert node")?;
+            // 0 rows means the vname target fired: this node was not written, so
+            // its FTS rows would key on an id `nodes` does not hold.
+            if written == 0 {
+                stale_vname_skips += 1;
+                continue;
+            }
             Self::put_node_fts(&tx, node).context("write_scip_attributed_batch: put_node_fts")?;
             Self::put_node_fts_words(&tx, node)
                 .context("write_scip_attributed_batch: put_node_fts_words")?;
+        }
+        if stale_vname_skips > 0 {
+            tracing::warn!(
+                skipped = stale_vname_skips,
+                "write_scip_attributed_batch: skipped nodes whose vname is already held \
+                 under a different id (stale signature format); run `travsr init` to rebuild"
+            );
         }
 
         // P4: build span cache — one SELECT per unique caller_path instead of one per ref.
@@ -16531,5 +16568,71 @@ mod tests {
             0,
             "a removed symbol must take its inbound edges with it"
         );
+    }
+
+    /// RFC-002: a `NodeId` is `blake3(SIGNATURE_FORMAT_VERSION || …vname…)`, so a
+    /// row written under an older format version holds its vname tuple under a
+    /// DIFFERENT id. `write_scip_attributed_batch` upserts `ON CONFLICT(id)`,
+    /// which cannot see that row, so `idx_nodes_vname` rejected the insert and
+    /// the bare `?` rolled the whole transaction back: every node, edge and
+    /// occurrence Phase B produced, for EVERY language, discarded over one stale
+    /// row, while the run still logged `outcome: Success`.
+    ///
+    /// Measured on the travsr repo itself: 42 stale rows out of 16342, all under
+    /// a `.claude/worktrees/…` directory left behind by a pre-v3 binary, threw
+    /// away 946k lines of rust-analyzer LSIF on every Phase B run
+    /// (`lsif_edges: 0`), so no Rust semantic edge was ever re-derived.
+    #[test]
+    fn a_stale_format_row_does_not_discard_the_whole_batch() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |path: &str, sig: &str| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", path, "rust", sig),
+                "function",
+            )
+            .with_line(1)
+            .with_end_line(9)
+        };
+
+        // A row as an older SIGNATURE_FORMAT_VERSION wrote it: this exact vname
+        // tuple, under an id that is not its current hash.
+        let stale = mk("old.rs", "fn:stale");
+        let stale_id = node_id_to_i64(stale.id) ^ 0x5555_5555_5555_5555u64 as i64;
+        store
+            .conn
+            .execute(
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, is_noise) \
+                 VALUES(?1, 'c', '', 'old.rs', 'rust', 'fn:stale', 'function', 0)",
+                params![stale_id],
+            )
+            .unwrap();
+
+        // Phase B re-emits that symbol under its current id, alongside an
+        // unrelated one.
+        let fresh = mk("new.rs", "fn:fresh");
+        store
+            .write_scip_attributed_batch("c", &[stale, fresh], &[])
+            .expect("one stale row must not fail the whole batch");
+
+        let survived: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM nodes WHERE signature = 'fn:fresh'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(survived, 1, "the rest of the batch must still be written");
+
+        // The stale row is left for the format guard to purge, never duplicated.
+        let stale_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM nodes WHERE signature = 'fn:stale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_rows, 1, "the vname must not be duplicated");
     }
 }
