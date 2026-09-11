@@ -818,7 +818,15 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     // (stored in meta by init); absent (older indexes) or unresolvable → fall
     // back to the caller's definition line, never worse than before.
     let repo_root = resolve_repo_root(store);
-    let callee_name = simple_name(&seed.vname.signature);
+    // One name per seed, not the first seed's name for every edge. A selector
+    // family is several arities of ONE method, and the textual fallback below
+    // searches the caller's span for the callee's own spelling, so keying every
+    // family member on arity [0]'s name scans for text that member never uses.
+    // Identical to the old behaviour for a `Unique` target, which is one seed.
+    let callee_names: std::collections::HashMap<travsr_core::NodeId, String> = seeds
+        .iter()
+        .map(|n| (n.id, simple_name(&n.vname.signature)))
+        .collect();
     const MAX_SITES_PER_CALLER: usize = 50;
 
     let mut lines: Vec<String> = Vec::new();
@@ -857,9 +865,10 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
                 });
             let sites: Vec<u32> = if recorded.is_empty() {
                 match repo_root.as_ref() {
-                    Some(root) => {
-                        call_site_lines(src_node, root, &callee_name, MAX_SITES_PER_CALLER)
-                    }
+                    Some(root) => match callee_names.get(&edge.dst) {
+                        Some(name) => call_site_lines(src_node, root, name, MAX_SITES_PER_CALLER),
+                        None => Vec::new(),
+                    },
                     None => Vec::new(),
                 }
             } else {
