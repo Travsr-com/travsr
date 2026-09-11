@@ -6846,6 +6846,20 @@ pub fn seed_trace(store: &SqliteStore, query: &str) -> String {
         score_ref,
     );
     out.push_str(&format!("CONF\t{}\n", seed_set.confidence.label()));
+    // #822: the gate inputs CONF is computed from, so a trace reader does not have
+    // to infer them from the per-token idf (which cannot express either).
+    out.push_str(&format!(
+        "GATES\tn_resolved={}\tcoverage={:.3}\tcoverage_ok={}\texact_anchor={}\tmax_rerank={}\trescued={}\n",
+        seed_set.n_resolved_gated,
+        seed_set.coverage,
+        seed_set.coverage_ok,
+        seed_set.exact_anchor_present,
+        seed_set
+            .max_rerank_score
+            .map(|r| format!("{r:.4}"))
+            .unwrap_or_else(|| "none".to_string()),
+        seed_set.anchor_rescued,
+    ));
     let final_ids: Vec<NodeId> = seed_set.seeds.iter().map(|s| s.node).collect();
     let final_nodes = store.get_nodes(&final_ids).unwrap_or_default();
     let by_id: HashMap<NodeId, &CoreNode> = final_nodes.iter().map(|n| (n.id, n)).collect();

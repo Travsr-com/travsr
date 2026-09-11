@@ -572,8 +572,6 @@ pub(crate) struct SeedSet {
     pub seeds: Vec<Seed>,
     pub terms: Vec<ResolvedTerm>,
     /// Fraction of content tokens that resolved to at least one anchor: [0.0, 1.0].
-    /// Reserved for future response annotation.
-    #[allow(dead_code)]
     pub coverage: f32,
     /// Numerator of [`SeedSet::coverage`]: the number of content tokens that both
     /// resolved AND cleared the IDF-specificity bar (`idf_w >= idf_coverage_min`).
@@ -583,6 +581,15 @@ pub(crate) struct SeedSet {
     /// so an agent shown that number cannot predict whether it will get an answer.
     pub n_resolved_gated: usize,
     pub confidence: Confidence,
+    /// #822 WS4-rescue gate inputs, recorded so `travsr explain` / `seed_trace`
+    /// can show WHY a query grounded or abstained. Reading them off the tokens
+    /// is not possible: `coverage_ok` has a second, no-reranker branch and
+    /// `exact_anchor_present` is the post-reordering anchor set, not a term's
+    /// raw `top_node`. Diagnostics only; nothing in retrieval reads them back.
+    pub exact_anchor_present: bool,
+    pub coverage_ok: bool,
+    pub max_rerank_score: Option<f32>,
+    pub anchor_rescued: bool,
     /// Top raw BM25 score (positive) from the lexical FTS path; 0.0 if no FTS results.
     /// Reserved for future response annotation.
     #[allow(dead_code)]
@@ -1495,14 +1502,53 @@ fn rerank_recall_floor() -> f32 {
     floor_env("TRAVSR_RERANK_RECALL_FLOOR").unwrap_or(0.15)
 }
 
+/// #822 follow-up: abstain on a query that has no content tokens at all.
+///
+/// `coverage` deliberately falls back to a neutral 0.5 when `n_content == 0` so a
+/// very short query can still be judged on BM25 and seed count. For a query that is
+/// nothing BUT stop-words that backfires: there is no lexical evidence to judge, yet
+/// the neutral 0.5 reads to the lexical lattice as half-covered and returns Weak.
+/// Measured on this repo with `TRAVSR_NO_RERANK=1`, every one of these grounded:
+/// `the of and is` (bench D2), `the`, `what is it`, `how do I do this`, `does it`.
+///
+/// Narrow by measurement, not by taste: a query with zero content tokens has nothing
+/// to retrieve ON, which is a different thing from a query whose tokens simply do not
+/// resolve here (`asdfqwerzxcv qqzzxxjjkk plughxyzzy` already abstains via
+/// `n_resolved == 0`). Every legitimate short query measured (`PPR`, `ask`, `io`,
+/// `fn`, `knapsack`) keeps at least one content token and is untouched, so this
+/// cannot refuse a real conceptual query.
+///
+/// Applies only when no rerank score exists. With a reranker the cross-encoder has
+/// its own opinion of the raw query string and already abstains on these, so leaving
+/// that branch alone keeps the reranked path byte-for-byte identical.
+fn contentless_query_confidence(
+    base: Confidence,
+    max_rerank: Option<f32>,
+    has_content_tokens: bool,
+) -> Confidence {
+    if max_rerank.is_none() && !has_content_tokens {
+        Confidence::None
+    } else {
+        base
+    }
+}
+
 /// #462 WS4: apply the anchor-gated rerank recall-floor rescue to a base verdict.
 ///
 /// Rescues `None → Weak` iff **all** hold: the base verdict abstained; the query is
 /// not a `g1_bypass` deterministic-path query; the query has non-zero grounded
 /// coverage (`coverage_ok` — at least one resolved token clears the IDF-coverage
-/// bar); a genuine exact lexical anchor grounds the query (`exact_anchor_present`);
-/// and the best rerank score clears `recall_floor`. Never promotes to Strong, and
+/// bar, checked only when a rerank score exists — see #822 below); a genuine exact
+/// lexical anchor grounds the query (`exact_anchor_present`); and the best rerank
+/// score, if there is one, clears `recall_floor`. Never promotes to Strong, and
 /// never touches a non-`None` verdict. Pure, so it is unit-testable without a store.
+///
+/// #822: `max_rerank: None` means the cross-encoder had no opinion at all (backend
+/// absent or disabled), not that it judged the query irrelevant. Gating the rescue on
+/// a score that was never produced made `ask "MatchSource"` abstain with no reranker
+/// installed, on a symbol `travsr references` resolves three definitions for. A
+/// missing score therefore gates nothing; the caller widens `coverage_ok` for that
+/// case so a literal symbol query still supplies the lexical evidence.
 ///
 /// RFC-022 D5 (RC-5): `coverage_ok` closes the WS4 over-rescue. Generic tokens
 /// (`get`/`map`/`handle`) still emit an exact anchor (`idf_w >= 0.15`) yet count
@@ -1522,7 +1568,8 @@ fn anchor_rescued_confidence(
         && !g1_bypass
         && coverage_ok
         && exact_anchor_present
-        && max_rerank.is_some_and(|r| r >= recall_floor)
+        // `is_none_or` is stable since 1.82; MSRV here is 1.75.
+        && max_rerank.map_or(true, |r| r >= recall_floor)
     {
         Confidence::Weak
     } else {
@@ -3110,6 +3157,7 @@ pub(crate) fn build_seed_set(
         g1_bypass, // G1: rare exact-symbol queries stay deterministic
         max_rerank_score,
     );
+    let confidence = contentless_query_confidence(confidence, max_rerank_score, !terms.is_empty());
 
     // #462 WS4: anchor-gated rerank recall-floor rescue. `early_exact_ids` is the
     // exact-anchor set that fed RRF — every id in it came from a token that cleared the
@@ -3121,15 +3169,26 @@ pub(crate) fn build_seed_set(
     // when the query is clearly anchored.) Rescues an otherwise-`None` prose query so
     // grounded when the cross-encoder still sees moderate relevance. See
     // [`anchor_rescued_confidence`].
+    let exact_anchor_present = !early_exact_ids.is_empty();
+    // RFC-022 D5: gate the rescue on non-zero grounded coverage. `n_resolved`
+    // counts only tokens clearing the IDF-coverage bar, so `coverage_ok` is
+    // false for an all-generic query (`get map handle`) that emits anchors but
+    // resolves no specific token — those must stay abstained.
+    // #822: with no cross-encoder score the IDF-coverage bar is the wrong
+    // instrument. `MatchSource` (idf 0.534), `LangResult` (0.522), `SeedSet`
+    // (0.502) and `TestRole` (0.442) all sit just UNDER `idf_coverage_min`
+    // (0.550), so `n_resolved` is 0 and `ask "MatchSource"` abstained on a
+    // symbol `references` resolves three definitions for. A query whose every
+    // content token resolved to a real symbol is lexically grounded regardless
+    // of that bar; a prose salad is not ("implement a distributed raft consensus
+    // protocol with leader election" resolves 1 of 7 tokens and stays abstained).
+    // Only widened when no score exists, so the reranked path keeps D5 exactly.
+    let coverage_ok = n_resolved >= 1
+        || (max_rerank_score.is_none() && !terms.is_empty() && terms.iter().all(|t| t.resolved));
+    let base_confidence = confidence;
     let confidence = if anchor_rescue_enabled() {
-        let exact_anchor_present = !early_exact_ids.is_empty();
-        // RFC-022 D5: gate the rescue on non-zero grounded coverage. `n_resolved`
-        // counts only tokens clearing the IDF-coverage bar, so `coverage_ok` is
-        // false for an all-generic query (`get map handle`) that emits anchors but
-        // resolves no specific token — those must stay abstained.
-        let coverage_ok = n_resolved >= 1;
         anchor_rescued_confidence(
-            confidence,
+            base_confidence,
             g1_bypass,
             max_rerank_score,
             exact_anchor_present,
@@ -3137,8 +3196,11 @@ pub(crate) fn build_seed_set(
             rerank_recall_floor(),
         )
     } else {
-        confidence
+        base_confidence
     };
+    // #822: `travsr explain` reports this so a reader can tell a rescued verdict
+    // from one the lexical lattice reached on its own.
+    let anchor_rescued = confidence != base_confidence;
 
     // RFC-022 Phase 0: seed-pipeline diagnostic behind `tracing::debug!`
     // (target `travsr::seed`), replacing the temporary `TRAVSR_DEBUG_SEED`
@@ -3183,6 +3245,10 @@ pub(crate) fn build_seed_set(
         coverage,
         n_resolved_gated: n_resolved,
         confidence,
+        exact_anchor_present,
+        coverage_ok,
+        max_rerank_score,
+        anchor_rescued,
         top_bm25,
     }
 }
@@ -3250,6 +3316,16 @@ pub struct ExplainDisposition {
     pub source: Option<&'static str>,
     pub rerank_score: Option<f32>,
     pub confidence: &'static str,
+    /// #822: the gate inputs the confidence verdict is actually computed from.
+    /// Without these `explain` showed a token's `idf` next to `idf_coverage_min`
+    /// and nothing else, so a reader could not tell that a token just under the
+    /// bar contributes 0 to `n_resolved` and turns `coverage_ok` off.
+    pub n_resolved: usize,
+    pub coverage: f32,
+    pub coverage_ok: bool,
+    pub exact_anchor_present: bool,
+    pub max_rerank_score: Option<f32>,
+    pub anchor_rescued: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3380,6 +3456,12 @@ pub(crate) fn explain_seed_set(
             source: seed.as_ref().map(|(_, s)| s.source.label()),
             rerank_score: seed.as_ref().and_then(|(_, s)| s.rerank_score),
             confidence: set.confidence.label(),
+            n_resolved: set.n_resolved_gated,
+            coverage: set.coverage,
+            coverage_ok: set.coverage_ok,
+            exact_anchor_present: set.exact_anchor_present,
+            max_rerank_score: set.max_rerank_score,
+            anchor_rescued: set.anchor_rescued,
         }
     };
 
@@ -3627,11 +3709,50 @@ mod tests {
     }
 
     #[test]
-    fn ws4_inert_without_a_rerank_score() {
-        // No cross-encoder signal (model absent / g1_bypass skip / over budget) → the
-        // rescue reads no relevance evidence and leaves the verdict untouched.
+    fn contentless_query_abstains_without_a_reranker_822() {
+        // #822 follow-up: "the of and is" tokenizes to zero content tokens, so
+        // `coverage` takes its neutral 0.5 fallback and the lexical lattice returned
+        // Weak on a query with no lexical evidence at all. With no rerank score to
+        // judge on instead, abstain.
+        assert_eq!(
+            contentless_query_confidence(Confidence::Weak, None, false),
+            Confidence::None,
+        );
+        // A query WITH content tokens is untouched, however short: `PPR`, `fn` and
+        // `knapsack` all keep one content token and must keep their verdict.
+        assert_eq!(
+            contentless_query_confidence(Confidence::Strong, None, true),
+            Confidence::Strong,
+        );
+        // The reranked path is left exactly as it was: the cross-encoder judges the
+        // raw query string itself and already abstains on these.
+        assert_eq!(
+            contentless_query_confidence(Confidence::Weak, Some(0.9), false),
+            Confidence::Weak,
+        );
+    }
+
+    #[test]
+    fn ws4_rescues_an_exact_anchor_with_no_reranker_822() {
+        // #822: with no cross-encoder backend the score is `None` because nothing was
+        // ever computed, not because the model judged the query irrelevant. Gating on
+        // it made `ask "MatchSource"` abstain on a symbol `references` resolves three
+        // definitions for. A missing score gates nothing, so a grounded exact anchor
+        // rescues on the lexical evidence alone.
         assert_eq!(
             anchor_rescued_confidence(Confidence::None, false, None, true, true, 0.15),
+            Confidence::Weak,
+        );
+        // ...but a missing score is NOT a licence to ground an unanchored query: the
+        // salad/no-anchor case still abstains with no reranker present.
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, false, None, false, true, 0.15),
+            Confidence::None,
+        );
+        // ...nor an all-generic query with no coverage (`get map handle`), scored or
+        // not: RFC-022 D5 still holds on both branches.
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, false, None, true, false, 0.15),
             Confidence::None,
         );
     }
