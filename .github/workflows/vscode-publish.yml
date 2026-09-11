@@ -44,6 +44,60 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # #882: this workflow had no version check of any kind, so a tag could
+      # publish an extension whose package.json still carried the version
+      # already on the Marketplace. `vsce` rejects a duplicate version, but
+      # only after test, compile, package and upload have run, and the failure
+      # names the registry rather than the file to fix.
+      #
+      # Deliberately NOT the whole fix for #882. The extension that shipped the
+      # stale binary pointer passed both checks below at publish time: the pin
+      # matched the then-latest stable release and only became wrong when the
+      # next one was cut 2h44m later. What catches that is
+      # vscode-marketplace-drift.yml, on the release side. These two close the
+      # publish-time holes, which are real but different.
+      - name: package.json version must match the tag
+        if: startsWith(github.ref, 'refs/tags/vscode-v')
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#vscode-v}"
+          PKG=$(node -p "require('./package.json').version")
+          [ "$TAG" = "$PKG" ] || {
+            echo "tag vscode-v$TAG != package.json version $PKG in packages/travsr-vscode/package.json" >&2
+            echo "bump package.json as part of the release, the Marketplace refuses a duplicate version" >&2
+            exit 1
+          }
+          echo "OK: package.json $PKG matches tag vscode-v$TAG"
+
+      # The mirror of release.yml's "vscode DOWNLOAD_VERSION must match tag on
+      # stable releases", pointing the other way: an extension must not ship a
+      # pointer at a release that does not exist, or one already superseded at
+      # the moment it is published.
+      - name: DOWNLOAD_VERSION must be the latest stable release
+        if: startsWith(github.ref, 'refs/tags/vscode-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DL=$(grep -m1 'export const DOWNLOAD_VERSION' src/installer.ts | cut -d'"' -f2)
+          # Stable only: prereleases are exempt for the same reason release.yml
+          # exempts them, a pin at an unpublished stable tag is a guaranteed 404.
+          LATEST=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isPrerelease,isDraft \
+            --jq '[.[] | select(.isPrerelease == false and .isDraft == false)
+                       | select(.tagName | startswith("v"))
+                       | select(.tagName | startswith("vscode-") | not)
+                       | .tagName][0]')
+          LATEST="${LATEST#v}"
+          [ -n "$LATEST" ] || { echo "could not resolve the latest stable release" >&2; exit 1; }
+          [ "$DL" = "$LATEST" ] || {
+            echo "DOWNLOAD_VERSION $DL != latest stable release v$LATEST" >&2
+            echo "the extension would install a binary that is not the current release" >&2
+            echo "fix packages/travsr-vscode/src/installer.ts" >&2
+            exit 1
+          }
+          echo "OK: DOWNLOAD_VERSION $DL is the latest stable release"
+
       - name: Audit npm dependencies
         run: npm audit --audit-level=high
 

@@ -1,0 +1,124 @@
+name: vscode marketplace drift
+
+# #882: the extension published to the Marketplace pins the binary it offers to
+# download (`DOWNLOAD_VERSION`). That pin is correct when the extension ships
+# and silently becomes wrong the moment the next stable binary release is cut,
+# because nothing republishes the extension. Users installing in the window
+# between the two get a binary one release behind, with no error.
+#
+# This is the direction neither existing gate covers:
+#
+#   release.yml         "vscode DOWNLOAD_VERSION must match tag on stable
+#                        releases" reads the pin out of the REPO at the tagged
+#                        commit. The repo is bumped in the release commit, so
+#                        that check passes while the published artifact lags.
+#   vscode-publish.yml  checks the pin at publish time. Verified against every
+#                        vscode-v* tag in history: the pin matched the
+#                        then-latest stable release on all of them, including
+#                        vscode-v0.11.0, the one that shipped this bug. A
+#                        publish-time check cannot see a release cut later.
+#
+# So this asks the Marketplace what is actually published and compares it
+# against the current stable release. Same shape and rationale as
+# lang-release-drift.yml: two systems that cannot see each other, reconciled by
+# asking the live one what it holds.
+
+on:
+  # A release is the event that creates the drift, so check immediately after
+  # one. `released` fires for stable publishes, not prereleases.
+  release:
+    types: [released]
+  schedule:
+    # Daily, not weekly like lang-release-drift. There the drift only matters
+    # when someone runs `travsr lang install`; here every extension install in
+    # the window lands on the wrong binary, so the window is the cost.
+    - cron: '0 7 * * *'
+  pull_request:
+    paths:
+      - 'packages/travsr-vscode/src/installer.ts'
+      - 'packages/travsr-vscode/package.json'
+      - '.github/workflows/vscode-marketplace-drift.yml'
+      - '.github/workflows/vscode-publish.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: published extension vs latest stable release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          # Tags are the record of what each published extension contained, so
+          # the shallow default is not enough.
+          fetch-depth: 0
+
+      - name: compare the published extension against the current release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 1. What is the current stable binary release?
+          #    `v*` excluding the vscode-v* family and any prerelease/draft.
+          LATEST=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isPrerelease,isDraft \
+            --jq '[.[] | select(.isPrerelease == false and .isDraft == false)
+                       | select(.tagName | startswith("v"))
+                       | select(.tagName | startswith("vscode-") | not)
+                       | .tagName][0]')
+          [ -n "$LATEST" ] || { echo "could not resolve the latest stable release" >&2; exit 1; }
+          echo "latest stable binary release: $LATEST"
+
+          # 2. What version is actually on the Marketplace?
+          #    Public gallery API. flags=914 asks for versions in the response.
+          PUBLISHED=$(curl -sS -X POST \
+            'https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery' \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json;api-version=7.2-preview.1' \
+            -d '{"filters":[{"criteria":[{"filterType":7,"value":"travsr.travsr-vscode"}]}],"flags":914}' \
+            | jq -r '.results[0].extensions[0].versions[0].version // empty')
+
+          if [ -z "$PUBLISHED" ]; then
+            # Not a silent pass: an unreachable gallery means we learned
+            # nothing, and "learned nothing" must not read as "no drift".
+            echo "::error::could not read the published extension version from the Marketplace"
+            exit 1
+          fi
+          echo "published extension version: $PUBLISHED"
+
+          # 3. What binary does THAT build point at? The vscode-v<version> tag
+          #    is the record of what shipped, which avoids downloading and
+          #    unpacking the .vsix to read one constant.
+          TAG="vscode-v$PUBLISHED"
+          git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || {
+            echo "::error::the Marketplace serves $PUBLISHED but no $TAG tag exists, so what it contains cannot be established"
+            exit 1
+          }
+          DL=$(git show "$TAG:packages/travsr-vscode/src/installer.ts" \
+                | grep -m1 'export const DOWNLOAD_VERSION' | cut -d'"' -f2)
+          [ -n "$DL" ] || { echo "::error::could not read DOWNLOAD_VERSION from $TAG" >&2; exit 1; }
+          echo "that build installs: v$DL"
+
+          # 4. The comparison.
+          if [ "v$DL" = "$LATEST" ]; then
+            echo "OK: the published extension installs $LATEST, the current release"
+            exit 0
+          fi
+
+          echo "::error::the published extension installs v$DL but the current release is $LATEST"
+          cat >&2 <<EOF
+
+          Marketplace extension  $PUBLISHED  (tag $TAG)
+            DOWNLOAD_VERSION     $DL
+          Current stable release $LATEST
+
+          Every fresh install that reaches the download prompt gets a binary
+          $DL instead of ${LATEST#v}. Republish the extension: bump
+          packages/travsr-vscode/package.json, confirm DOWNLOAD_VERSION is
+          ${LATEST#v}, and cut a new vscode-v* tag.
+          EOF
+          exit 1

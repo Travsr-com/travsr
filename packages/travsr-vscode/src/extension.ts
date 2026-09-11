@@ -776,8 +776,25 @@ async function runDownloadFlow(
   channel: vscode.OutputChannel,
   onDaemonFailed?: () => void
 ): Promise<void> {
+  // #882: the download and the handshake are reported separately. They used to
+  // share one `try`, and `adoptBinary` calls `connect()`, so a download that
+  // resolved, checksum-verified, extracted and installed correctly still
+  // reported "Travsr download failed" when the MCP handshake did not come up.
+  // That names the wrong stage, and the wrong stage is the one the user then
+  // tries to fix.
+  const report = (stage: string, e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    channel.appendLine(`[ERROR] ${stage}: ${msg}`);
+    void vscode.window
+      .showErrorMessage(`${stage}: ${msg}`, "Show logs")
+      .then((action) => {
+        if (action === "Show logs") channel.show();
+      });
+  };
+
+  let binPath: string;
   try {
-    const binPath = await vscode.window.withProgress(
+    binPath = await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
         title: `Installing Travsr v${DOWNLOAD_VERSION}…`,
@@ -789,25 +806,24 @@ async function runDownloadFlow(
           progress.report({ message: msg });
         })
     );
+  } catch (e) {
+    report("Travsr download failed", e);
+    return;
+  }
 
+  try {
     // Persist + auto-reconnect — fires onReconnect → status bar re-polls.
     await adoptBinary(binPath, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
-
-    void vscode.window.showInformationMessage(
-      `Travsr v${DOWNLOAD_VERSION} installed successfully.`
-    );
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    channel.appendLine(`[ERROR] Install failed: ${msg}`);
-    void vscode.window
-      .showErrorMessage(
-        `Travsr download failed: ${msg}`,
-        "Show logs"
-      )
-      .then((action) => {
-        if (action === "Show logs") channel.show();
-      });
+    // The binary is on disk and usable; only the connection failed. Say so, and
+    // say where it landed, so the user is not sent back to re-download it.
+    report(`Travsr v${DOWNLOAD_VERSION} installed to ${binPath}, but connecting to it failed`, e);
+    return;
   }
+
+  void vscode.window.showInformationMessage(
+    `Travsr v${DOWNLOAD_VERSION} installed successfully.`
+  );
 }
 
 async function doRestart(
