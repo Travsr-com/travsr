@@ -14,9 +14,16 @@ use travsr_core::Node;
 /// See RFC-010 §calibration for the calibration methodology.
 pub const TOKEN_CHARS_PER_TOKEN: usize = 4;
 
-/// Maximum DP table size in cells (n × W). At 4 bytes/cell this is 2 MB.
+/// Maximum DP table size in cells (n × W). At 4 bytes/cell this is 4 MB.
 /// When `n.saturating_mul(budget) > DP_CELL_LIMIT` the greedy fallback runs.
-pub const DP_CELL_LIMIT: usize = 500_000;
+///
+/// #824: sized so the default operating point runs the exact DP. PPR caps
+/// candidates at [`context_candidates`] (200) and the default budget is 4096,
+/// so 819_200 cells is the common case; measured 2.0 ms and a 3.1 MB table.
+/// The [`MAX_CONTEXT_BUDGET`] ceiling (6.4 M cells, 24 MB) is deliberately left
+/// above the limit: it measured 22 ms for no value gain over greedy, because a
+/// 32_000 budget fits every candidate and the knapsack never binds.
+pub const DP_CELL_LIMIT: usize = 1_000_000;
 
 /// Multiplier to convert f32 PPR scores → u32 for integer DP.
 /// 1_000_000 preserves low scores (e.g. 0.001 → 1000) that 1_000 would zero out.
@@ -115,10 +122,11 @@ pub fn knapsack(items: Vec<(Node, f32)>, token_budget: usize) -> Vec<Node> {
 /// Greedy fallback: sort by value/cost ratio, fill until budget exhausted.
 /// Near-optimal when per-item weights are similar (typical for PPR output).
 fn knapsack_greedy(items: &[(Node, f32)], token_budget: usize) -> Vec<Node> {
-    // #824: debug, not warn. At the default 4096 budget this fires for any
-    // n > 122, so on a broad query it is the ordinary path, not an anomaly, and
-    // a WARN that fires on the ordinary path only teaches operators to ignore
-    // warnings. The selection is still budget-correct either way.
+    // #824: debug, not warn. Since DP_CELL_LIMIT was raised this no longer fires
+    // at the default operating point, but it still does for budgets above ~5000
+    // at 200 candidates, where a budget that large fits every candidate and the
+    // greedy result is identical to the DP's. Not an anomaly, so not a warning.
+    // The selection is budget-correct on either path.
     tracing::debug!(
         n = items.len(),
         token_budget,
@@ -294,16 +302,70 @@ mod tests {
 
     #[test]
     fn greedy_fallback_triggered_at_cell_limit() {
-        // Build an input that exceeds DP_CELL_LIMIT: n * budget > 500_000.
-        // E.g. n=1001 nodes with budget=500 → 500_500 > 500_000.
-        let budget = 500;
+        // Build an input that exceeds DP_CELL_LIMIT: n * budget > 1_000_000.
+        // E.g. n=1001 nodes with budget=1000 → 1_001_000 > 1_000_000.
+        let budget = 1000;
         let items: Vec<(Node, f32)> = (0..1001)
             .map(|i| (make_node(&format!("fn:x{i}"), "f.ts"), 1.0))
             .collect();
+        assert!(
+            items.len() * budget > DP_CELL_LIMIT,
+            "this test must stay on the greedy side of DP_CELL_LIMIT"
+        );
         // Must not panic; just return something within budget.
         let result = knapsack(items, budget);
         let total: usize = result.iter().map(token_cost).sum();
         assert!(total <= budget, "greedy fallback must respect budget");
+    }
+
+    /// #824 symptom 2: the exact DP must run at the default operating point.
+    /// PPR caps candidates at 200 and the default budget is 4096, so before the
+    /// DP_CELL_LIMIT was raised every broad query fell through to greedy while
+    /// the docs claimed 0-1 knapsack. The items below are built so greedy and
+    /// the DP pick provably different sets: greedy takes the best-ratio item
+    /// `a` and then cannot fit `b` or `c`, while the optimum is `b` + `c`.
+    #[test]
+    fn dp_runs_at_default_operating_point_824() {
+        let budget = 4096;
+        let pad_n = 197;
+
+        // cost = (sig + kind + path) / 4, so the signature length sets the cost.
+        let a = Node::new(VName::new("c", "", "", "rust", "a".repeat(8194)), "fn");
+        let b = Node::new(VName::new("c", "", "", "rust", "b".repeat(8190)), "fn");
+        let c = Node::new(VName::new("c", "", "", "rust", "c".repeat(8190)), "fn");
+        assert_eq!(token_cost(&a), 2049);
+        assert_eq!(token_cost(&b), 2048);
+        assert_eq!(token_cost(&c), 2048);
+
+        let mut items = vec![(a.clone(), 0.002050_f32), (b, 0.002048), (c, 0.002048)];
+        for i in 0..pad_n {
+            let pad = Node::new(VName::new("c", "", format!("p{i}"), "rust", ""), "fn");
+            assert_eq!(token_cost(&pad), 1);
+            items.push((pad, 0.000001));
+        }
+
+        assert_eq!(items.len(), 200, "default candidate cap");
+        assert!(
+            items.len() * budget <= DP_CELL_LIMIT,
+            "the default operating point must stay on the exact-DP side"
+        );
+
+        let selected = knapsack(items, budget);
+        let total: usize = selected.iter().map(token_cost).sum();
+        assert!(total <= budget, "total {total} exceeds budget {budget}");
+
+        // Greedy would return `a` plus all 197 pads. The DP returns b + c.
+        assert_eq!(
+            selected.len(),
+            2,
+            "expected the exact optimum (b + c), got {} nodes",
+            selected.len()
+        );
+        assert!(
+            !selected.iter().any(|n| n.id == a.id),
+            "greedy's best-ratio pick must not be in the exact optimum"
+        );
+        assert_eq!(total, budget, "the optimum fills the budget exactly");
     }
 
     #[test]
