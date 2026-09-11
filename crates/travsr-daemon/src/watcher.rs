@@ -702,12 +702,8 @@ fn unwatch_skipped_subtrees_under(
 /// Prunes: a skipped directory is returned and never descended into, so the walk
 /// costs work proportional to the tree that stays watched, which the daemon has
 /// to enumerate anyway, not to the `target/` being excluded.
-fn skipped_subtree_roots(repo_root: &Path, gitignore: &Gitignore) -> Vec<PathBuf> {
-    skipped_subtree_roots_under(repo_root, repo_root, gitignore)
-}
-
-/// [`skipped_subtree_roots`] bounded to `scan_root`. `repo_root` remains the
-/// anchor for classification, so a subtree scan and a full scan agree.
+/// Bounded to `scan_root`. `repo_root` remains the anchor for classification, so
+/// a subtree scan and a full-tree scan agree about what is skipped.
 fn skipped_subtree_roots_under(
     scan_root: &Path,
     repo_root: &Path,
@@ -842,7 +838,7 @@ mod tests {
         }
 
         let gi = build_ignore_matcher(root);
-        let roots = skipped_subtree_roots(root, &gi);
+        let roots = skipped_subtree_roots_under(root, root, &gi);
         let rel: std::collections::HashSet<String> = roots
             .iter()
             .map(|p| {
