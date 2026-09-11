@@ -44,6 +44,10 @@ const QUERIES: &str = r"
 (call_expression
   function: (identifier) @require.fn
   arguments: (arguments . (string (string_fragment) @require.source)))
+(call_expression
+  arguments: (arguments
+    . (string . (string_fragment) @test.entry .)
+    . [(arrow_function) (function_expression)])) @test.scope
 ";
 
 /// Parse `abs_path` and emit graph records using `vname_path` as the stable
@@ -113,11 +117,12 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let mut cursor = QueryCursor::new();
     let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
-    // #479: TypeScript test entry points are BDD callbacks (`it(...)`,
-    // `test(...)`) for which Travsr emits no node (§9, out of scope for v1), so
-    // there is no `EntryPoint`. Instead a test *file* (`*.test.ts`, `*.spec.ts`,
-    // `__tests__/…`) is one whole `@test.scope`: every declaration in it is
-    // `Support`. The path gate is what keeps a production `testHelper` unmarked.
+    // #479: a test *file* (`*.test.ts`, `*.spec.ts`, `__tests__/…`) is one whole
+    // `@test.scope`: every declaration in it is `Support`. The path gate is what
+    // keeps a production `testHelper` unmarked. #674 adds the precise rule on
+    // top (a `describe` is its own scope, an `it`/`test` callback is an
+    // `EntryPoint`); this stays as the fallback for every declaration no
+    // `describe` encloses.
     let mut test_signals = crate::test_role::TestSignals::default();
     if ts_is_test_path(vname_path) {
         test_signals.push_scope_span(0, tree.root_node().end_position().row);
@@ -143,6 +148,58 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 .is_some_and(|n| n == "require.fn")
                 && c.node.utf8_text(source.as_slice()) == Ok("require")
         });
+
+        // #674: BDD test callbacks. Handled per match rather than per capture,
+        // because the name literal and its enclosing call are needed together
+        // and because the callee's *text* decides which of the two test signals
+        // applies, which this parser has to do in Rust (see `is_require_call`).
+        let bdd = capture_node(m, &capture_names, "test.scope")
+            .zip(capture_node(m, &capture_names, "test.entry"))
+            .and_then(|(call, name_node)| {
+                let callee = call.child_by_field_name("function")?;
+                let role = bdd_role(callee.utf8_text(source.as_slice()).ok()?)?;
+                let name = name_node.utf8_text(source.as_slice()).ok()?.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                Some((role, name.to_string(), call, name_node))
+            });
+        if let Some((role, name, call, name_node)) = bdd {
+            let name_row = name_node.start_position().row;
+            let chain = bdd_suite_chain(call, source.as_slice());
+            let parent_id = if chain.is_empty() {
+                file_id
+            } else {
+                emit::bdd_suite_node(corpus, vname_path, &chain.join(".")).id
+            };
+            let qualified = if chain.is_empty() {
+                name
+            } else {
+                format!("{}.{name}", chain.join("."))
+            };
+            let node = match role {
+                BddRole::Suite => {
+                    // The whole `describe(...)` is a test scope, so every
+                    // declaration nested in it is `Support` (#479) even when
+                    // nothing in the file's path says "test".
+                    test_signals
+                        .push_scope_span(call.start_position().row, call.end_position().row);
+                    emit::bdd_suite_node(corpus, vname_path, &qualified)
+                }
+                BddRole::Case => {
+                    // One line, the name literal, so only the callback node
+                    // itself becomes an `EntryPoint`; helpers around it stay
+                    // `Support` (#479 has entry win over scope).
+                    test_signals.push_entry_span(name_row, name_row);
+                    emit::bdd_test_node(corpus, vname_path, &qualified)
+                }
+            };
+            let node = node
+                .with_line(name_row as u32 + 1)
+                .with_end_line(call.end_position().row as u32 + 1);
+            output.edges.push(emit::defines_edge(parent_id, node.id));
+            output.nodes.push(node);
+        }
 
         for &capture in m.captures {
             let Some(cap_name) = capture_names.get(capture.index as usize) else {
@@ -307,6 +364,87 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     Ok(output)
 }
 
+/// #674: what a BDD framework call contributes. `describe(...)` opens a test
+/// scope; `it(...)` / `test(...)` is a test entry point.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BddRole {
+    Suite,
+    Case,
+}
+
+/// #674: classify a call by its callee text. A modifier suffix is dropped, so
+/// `it.only` / `test.each` / `describe.skip` classify as their base name.
+/// Anything else (`fetchAll("x", cb)`, `arr.map(...)`) is not a BDD call and
+/// emits nothing.
+fn bdd_role(callee: &str) -> Option<BddRole> {
+    match callee.split('.').next().unwrap_or(callee) {
+        "describe" => Some(BddRole::Suite),
+        "it" | "test" => Some(BddRole::Case),
+        _ => None,
+    }
+}
+
+/// #674: the `describe` names enclosing `call`, outermost first.
+///
+/// A callback's signature is qualified by this chain for the same reason a
+/// method is qualified by its class (N1): two suites in one file routinely reuse
+/// a case name, and an unqualified `test:works` would collapse them onto one
+/// VName. A `describe` whose own name is not a plain literal contributes no link
+/// (it has no node to contain anything), so the chain skips it.
+fn bdd_suite_chain(call: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut chain: Vec<String> = Vec::new();
+    let mut cur = call.parent();
+    while let Some(n) = cur {
+        if n.kind() == "call_expression" {
+            if let Some(name) = bdd_suite_name(n, source) {
+                chain.push(name);
+            }
+        }
+        cur = n.parent();
+    }
+    chain.reverse();
+    chain
+}
+
+/// #674: the string-literal name of `call` when it is a `describe(...)` suite.
+fn bdd_suite_name(call: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let callee = call.child_by_field_name("function")?;
+    if bdd_role(callee.utf8_text(source).ok()?) != Some(BddRole::Suite) {
+        return None;
+    }
+    let literal = call
+        .child_by_field_name("arguments")?
+        .named_child(0)
+        .filter(|n| n.kind() == "string")?;
+    if literal.named_child_count() != 1 {
+        return None; // escaped or interpolated: not one stable literal
+    }
+    let name = literal
+        .named_child(0)
+        .filter(|n| n.kind() == "string_fragment")?
+        .utf8_text(source)
+        .ok()?
+        .trim()
+        .to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The node of the single capture named `want` in `m`, if the match has one.
+fn capture_node<'t>(
+    m: &tree_sitter::QueryMatch<'_, 't>,
+    capture_names: &[String],
+    want: &str,
+) -> Option<tree_sitter::Node<'t>> {
+    m.captures
+        .iter()
+        .find(|c| {
+            capture_names
+                .get(c.index as usize)
+                .is_some_and(|n| n == want)
+        })
+        .map(|c| c.node)
+}
+
 /// #479: true when a TypeScript/JavaScript file is a test file by path — a
 /// `*.test.*` / `*.spec.*` basename, or anything under a `__tests__/` directory
 /// (Jest/Vitest conventions). Separator-agnostic so Windows store paths match.
@@ -460,6 +598,152 @@ mod tests {
             .filter(|n| n.kind == "import")
             .map(|n| n.vname.signature)
             .collect()
+    }
+
+    /// Parse `src` as `name` and return `(signature, kind, test_role)` for
+    /// every `test:`/`suite:` node it emitted, in document order.
+    fn bdd_nodes(name: &str, src: &str) -> Vec<(String, String, travsr_core::TestRole)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, src).unwrap();
+        parse("", &path, name)
+            .unwrap()
+            .nodes
+            .into_iter()
+            .filter(|n| n.kind == "test" || n.kind == "suite")
+            .map(|n| (n.vname.signature, n.kind, n.test_role))
+            .collect()
+    }
+
+    /// #674: a BDD callback gets its own node, named from the string literal and
+    /// qualified by the `describe` chain, and #479's evaluator classifies it.
+    /// Before this, Phase A emitted no node for a callback body at all, so the
+    /// only categorization available was the whole-file path rule.
+    #[test]
+    fn bdd_callbacks_become_nodes_with_a_test_role() {
+        use travsr_core::TestRole::{EntryPoint, Support};
+        let got = bdd_nodes(
+            "checkout.ts",
+            "describe(\"Payments\", () => {\n\
+             \x20 it(\"charges the card\", () => {});\n\
+             \x20 describe(\"refunds\", () => {\n\
+             \x20   test(\"refunds the card\", function () {});\n\
+             \x20 });\n\
+             });\n",
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("suite:Payments".to_string(), "suite".to_string(), Support),
+                (
+                    "test:Payments.charges the card".to_string(),
+                    "test".to_string(),
+                    EntryPoint
+                ),
+                (
+                    "suite:Payments.refunds".to_string(),
+                    "suite".to_string(),
+                    Support
+                ),
+                (
+                    "test:Payments.refunds.refunds the card".to_string(),
+                    "test".to_string(),
+                    EntryPoint
+                ),
+            ]
+        );
+    }
+
+    /// #674: a case node is contained by its enclosing suite, not the file, so
+    /// the graph carries the `describe` nesting.
+    #[test]
+    fn bdd_case_is_contained_by_its_suite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.ts");
+        std::fs::write(
+            &path,
+            "describe(\"Payments\", () => {\n  it(\"works\", () => {});\n});\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "c.ts").unwrap();
+        let suite = emit::bdd_suite_node("", "c.ts", "Payments").id;
+        let case = emit::bdd_test_node("", "c.ts", "Payments.works").id;
+        assert!(
+            out.edges.iter().any(|e| e.src == suite
+                && e.dst == case
+                && e.kind == travsr_core::EdgeKind::DefinesBinding),
+            "expected suite -> case containment, got {:?}",
+            out.edges
+        );
+    }
+
+    /// #674: a VName signature is identity, so only a name that is stable across
+    /// re-runs may become one. A template literal or a computed name is not, so
+    /// no node is emitted for it and the callback falls back to the enclosing
+    /// scope's `Support` classification.
+    #[test]
+    fn a_non_literal_test_name_emits_no_node() {
+        assert!(bdd_nodes("t.ts", "it(`renders ${n} rows`, () => {});\n").is_empty());
+        assert!(bdd_nodes("t2.ts", "it(name, () => {});\n").is_empty());
+        assert!(bdd_nodes("t3.ts", "it(\"a \\\"b\\\" c\", () => {});\n").is_empty());
+        assert!(bdd_nodes("t4.ts", "it(\"\", () => {});\n").is_empty());
+    }
+
+    /// #674: the callee's text is the whole gate. An ordinary call that happens
+    /// to take a string and a callback is not a test.
+    #[test]
+    fn only_bdd_callee_names_become_test_nodes() {
+        assert!(bdd_nodes("p.ts", "on(\"click\", () => {});\n").is_empty());
+        assert!(bdd_nodes("p2.ts", "items.forEach(\"x\", () => {});\n").is_empty());
+        // `it.only` / `test.each` keep the base name.
+        assert_eq!(
+            bdd_nodes("p3.ts", "it.only(\"works\", () => {});\n")
+                .into_iter()
+                .map(|(s, _, _)| s)
+                .collect::<Vec<_>>(),
+            vec!["test:works"]
+        );
+    }
+
+    /// #674: a callback node lives in its own `test:` namespace, so it can never
+    /// shadow a real function definition that shares its name.
+    #[test]
+    fn a_callback_never_collides_with_a_real_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.ts");
+        std::fs::write(
+            &path,
+            "export function works(): void {}\nit(\"works\", () => {});\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "s.ts").unwrap();
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(sigs.contains(&"fn:works"), "{sigs:?}");
+        assert!(sigs.contains(&"test:works"), "{sigs:?}");
+        assert_ne!(
+            emit::fn_node("", "s.ts", "works").id,
+            emit::bdd_test_node("", "s.ts", "works").id
+        );
+    }
+
+    /// #674 must not regress #479's whole-file path fallback: a declaration in a
+    /// `*.test.ts` file that no `describe` encloses is still `Support`.
+    #[test]
+    fn the_file_path_fallback_still_applies_outside_any_suite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calibrate.test.ts");
+        std::fs::write(&path, "export function setupFixture(): void {}\n").unwrap();
+        let out = parse("", &path, "src/calibrate.test.ts").unwrap();
+        let helper = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "fn:setupFixture")
+            .expect("helper node");
+        assert_eq!(helper.test_role, travsr_core::TestRole::Support);
     }
 
     /// #610: `require()` is a call expression, so the `import_statement`
