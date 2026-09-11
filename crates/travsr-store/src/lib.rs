@@ -2334,6 +2334,16 @@ impl SqliteStore {
                     // comes from the file's own nodes; a parse
                     // that produced none leaves it NULL, which matches the whole
                     // path exactly as these statements did before.
+                    //
+                    // Scoping is safe because only `init` can change a repo's
+                    // corpus: `travsr-daemon`'s `detect_corpus` has exactly one
+                    // call site, in `init_repo_with_progress`, and every other
+                    // write path (the commit hook, the watcher, the delete
+                    // paths) takes the corpus from `meta`. So outside init the
+                    // value derived here already equals the corpus of the rows
+                    // it deletes, and the scoping is a no-op. An init that does
+                    // change it purges the old corpus outright first, before any
+                    // batch reaches this branch.
                     let corpus: Option<&str> =
                         file.nodes.first().map(|n| n.vname.corpus.as_str());
                     // Load old FTS tokens BEFORE removing map rows so vocab can
