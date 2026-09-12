@@ -73,6 +73,14 @@ pub fn apply_live_resolutions(
     // a language that runs this lane alone (every non-native one, §8.3) could
     // never earn its per-language gate a reading.
     let mut states: Vec<travsr_store::RefResolution> = Vec::with_capacity(resolutions.len());
+    // #895: the occurrence rows for what this lane resolves. `put_edge_live`
+    // writes `edges` only, so without these a live-resolved reference exists as
+    // an edge with no use site and `find_references` reports zero for a
+    // reference the lane had just resolved. Batched and written after the loop,
+    // because `record_edge_sites` takes `&mut self` while the loop holds
+    // `&SqliteStore` reads.
+    let mut call_sites: Vec<(NodeId, NodeId, u32, Option<u32>)> = Vec::new();
+    let mut field_sites: Vec<(NodeId, NodeId, u32, Option<u32>)> = Vec::new();
     for r in resolutions {
         // The claim is keyed on the reference, so the edge's own source is the
         // key's `src`. A resolution whose line maps to no enclosing definition
@@ -83,7 +91,25 @@ pub fn apply_live_resolutions(
             .flatten();
         let claimed = match resolve_one(store, corpus, file, r) {
             Some(edge) => match store.put_edge_live(&edge) {
-                Ok(()) => Some(edge.dst),
+                Ok(()) => {
+                    // `col` is None, not `r.ref_col`: the editor sends 0-based
+                    // UTF-16 code units and `edge_sites.col` is 0-based UTF-8
+                    // bytes. A wrong column is worse than an absent one, which
+                    // the column is already optional for.
+                    match edge.kind {
+                        EdgeKind::RefCall => {
+                            call_sites.push((edge.src, edge.dst, r.ref_line, None))
+                        }
+                        EdgeKind::RefField => {
+                            field_sites.push((edge.src, edge.dst, r.ref_line, None))
+                        }
+                        // `is-implementation` gets no row: `reference_sites`
+                        // selects only ref/call and ref/field, so one would be
+                        // dead weight the sweep still has to clean up.
+                        _ => {}
+                    }
+                    Some(edge.dst)
+                }
                 Err(e) => {
                     // A write failure is a freshness loss, never a correctness
                     // one: the commit-gated path still ratifies this region.
@@ -116,6 +142,12 @@ pub fn apply_live_resolutions(
                 resolved_dst: claimed,
             });
         }
+    }
+    if let Err(e) = store.record_edge_sites(&call_sites) {
+        tracing::debug!(error = %e, "live call occurrence write failed");
+    }
+    if let Err(e) = store.record_field_sites(&field_sites) {
+        tracing::debug!(error = %e, "live field occurrence write failed");
     }
     if let Err(e) = store.upsert_ref_resolution_states(&states) {
         // Losing the claim costs the meter its evidence, never the graph its
@@ -389,6 +421,11 @@ pub fn resolve_unambiguous_lexical(
     // first. One pass, one replace.
     let mut states: Vec<travsr_store::RefResolution> =
         Vec::with_capacity(unresolved.len() + inheritance.len());
+    // #895: see `apply_live_resolutions`. This lane has the real 0-based UTF-8
+    // byte column (`UnresolvedCall::caller_col`), so unlike the editor lane it
+    // can record it.
+    let mut call_sites: Vec<(NodeId, NodeId, u32, Option<u32>)> = Vec::new();
+    let mut field_sites: Vec<(NodeId, NodeId, u32, Option<u32>)> = Vec::new();
 
     for call in unresolved {
         let name = travsr_core::ident::leaf_of(&call.callee_sig).to_string();
@@ -398,7 +435,21 @@ pub fn resolve_unambiguous_lexical(
         // swept, so the edges table can no longer say what the lane decided.
         let claimed = match lexical_one(store, call, locally_bound) {
             Some(edge) => match store.put_edge_live(&edge) {
-                Ok(()) => Some(edge.dst),
+                Ok(()) => {
+                    match edge.kind {
+                        EdgeKind::RefCall => {
+                            call_sites.push((edge.src, edge.dst, call.caller_line, call.caller_col))
+                        }
+                        EdgeKind::RefField => field_sites.push((
+                            edge.src,
+                            edge.dst,
+                            call.caller_line,
+                            call.caller_col,
+                        )),
+                        _ => {}
+                    }
+                    Some(edge.dst)
+                }
                 Err(e) => {
                     tracing::debug!(error = %e, "live lexical edge write failed");
                     None
@@ -472,6 +523,12 @@ pub fn resolve_unambiguous_lexical(
         }
     }
 
+    if let Err(e) = store.record_edge_sites(&call_sites) {
+        tracing::debug!(error = %e, "live lexical call occurrence write failed");
+    }
+    if let Err(e) = store.record_field_sites(&field_sites) {
+        tracing::debug!(error = %e, "live lexical field occurrence write failed");
+    }
     if let Err(e) = store.replace_ref_resolution_states(corpus, path, &states) {
         // Losing the pending record costs the freshness note its detail, never
         // the graph its correctness.
@@ -1387,6 +1444,89 @@ mod tests {
             .as_deref(),
             Some("live"),
             "the edge must be tagged live, never blended into ratified truth"
+        );
+    }
+
+    /// #895: a live-resolved reference must be visible to `find_references`.
+    ///
+    /// `put_edge_live` writes `edges` only, so before this the lane produced an
+    /// edge with no occurrence row and `reference_sites` — the query
+    /// `find_references` reads — returned nothing for a reference the lane had
+    /// just resolved. `get_callers` showed it (it walks edges); `find_references`
+    /// did not. Two tools, same graph, opposite answers.
+    #[test]
+    fn an_editor_resolution_is_visible_to_find_references() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "save", "src/user.ts", 17)],
+        );
+        assert_eq!(out.emitted, 1, "precondition: the lane resolved the edge");
+
+        let sites = store
+            .reference_sites(node_id("src/user.ts", "method:User.save"))
+            .expect("reference_sites");
+        assert_eq!(
+            sites.len(),
+            1,
+            "a live-resolved reference must have an occurrence row, not just an \
+             edge: {sites:?}"
+        );
+        assert_eq!(sites[0].path, "src/order.ts");
+        assert_eq!(sites[0].line, 18);
+        assert!(
+            sites[0].live,
+            "the site must carry the un-ratified caveat, not read as ratified \
+             fact: {:?}",
+            sites[0]
+        );
+        assert!(
+            !sites[0].heuristic,
+            "live is not heuristic: this edge WAS resolved, it is only \
+             un-ratified, and conflating the two caveats states the wrong cause"
+        );
+    }
+
+    /// #895: ratification must take the occurrence rows with the edges.
+    ///
+    /// `sweep_live_edges_for_languages` deletes what Phase B did NOT re-derive.
+    /// If its `edge_sites` rows survived, `reference_sites`' LEFT JOIN would find
+    /// no edge to read, both flags would come back NULL, and a guess this very
+    /// sweep decided to discard would render as ratified fact with no caveat —
+    /// strictly worse than never having shown it.
+    #[test]
+    fn sweeping_the_overlay_takes_its_occurrence_rows_with_it() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "save", "src/user.ts", 17)],
+        );
+        let dst = node_id("src/user.ts", "method:User.save");
+        assert_eq!(
+            store.reference_sites(dst).expect("before").len(),
+            1,
+            "precondition: the live site exists"
+        );
+
+        store
+            .sweep_live_edges_for_languages(&["typescript".to_string()])
+            .expect("sweep");
+
+        let after = store.reference_sites(dst).expect("after");
+        assert!(
+            after.is_empty(),
+            "a swept live edge must leave no orphan occurrence row behind, or it \
+             renders as ratified fact: {after:?}"
         );
     }
 

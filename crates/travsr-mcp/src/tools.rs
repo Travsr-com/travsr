@@ -992,7 +992,7 @@ const MAX_CALLER_ROWS: usize = 500;
 /// `tree-sitter` and are structural facts from the AST, not name guesses.
 fn provenance_marker(edge: &travsr_core::Edge) -> &'static str {
     match edge.provenance.as_deref() {
-        Some("live") => " [live: resolved from your uncommitted edit, not yet ratified]",
+        Some("live") => LIVE_MARKER,
         Some("tree-sitter") if edge.kind == travsr_core::EdgeKind::RefCall => HEURISTIC_SIGIL_ROW,
         _ => "",
     }
@@ -1001,6 +1001,12 @@ fn provenance_marker(edge: &travsr_core::Edge) -> &'static str {
 /// The name-matched-edge caveat, spelled out per site by `find_references` (via
 /// `RefSite::heuristic`), where one occurrence line carries it at most once.
 const HEURISTIC_MARKER: &str = " [heuristic: matched by name, not resolved by type]";
+
+/// The un-ratified-overlay marker, shared by `provenance_marker` (get_callers)
+/// and `site_marker` (find_references) so the two tools cannot describe the same
+/// edge in two different words. That constraint is stated in
+/// `travsr-store::reference_sites`.
+const LIVE_MARKER: &str = " [live: resolved from your uncommitted edit, not yet ratified]";
 
 /// The same caveat on a `get_callers` row: one character, plus one legend line
 /// at the end of the answer.
@@ -1017,9 +1023,15 @@ const HEURISTIC_SIGIL_ROW: &str = " ~";
 /// rendered: a legend for a mark that is not on screen is noise.
 const HEURISTIC_LEGEND: &str = "~ = matched by name, not resolved by type";
 
-/// The marker for one occurrence site, empty unless it is name-matched.
+/// The marker for one occurrence site, empty unless it carries a caveat.
+///
+/// `live` is checked first: an un-ratified site is the stronger statement about
+/// how much to trust the row, and the two flags are independent rather than
+/// exclusive (#895). A site can be both, in which case the live caveat wins.
 fn site_marker(site: &travsr_core::RefSite) -> &'static str {
-    if site.heuristic {
+    if site.live {
+        LIVE_MARKER
+    } else if site.heuristic {
         HEURISTIC_MARKER
     } else {
         ""
@@ -1799,6 +1811,9 @@ fn family_reference_sites(store: &SqliteStore, family: &[CoreNode]) -> Vec<travs
         let same = a.path == b.path && a.line == b.line;
         if same {
             b.heuristic |= a.heuristic;
+            // #895: same fold, or a family query silently drops the live caveat
+            // that the single-target query would have shown.
+            b.live |= a.live;
         }
         same
     });
