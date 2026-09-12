@@ -86,16 +86,22 @@ job_block() {
 
 # Everything between `if:` and the next job-level key, joined onto one line,
 # so multi-line `if: |` blocks are checked as a whole.
+#
+# Both consumers below read their whole input instead of exiting early. Under
+# `set -o pipefail` an early exit (awk `exit`, `head -1`, `grep -m1`) can hit
+# the producing awk with SIGPIPE and turn the pipeline into exit 141, which
+# `set -e` then treats as a test failure. Linux delivers that signal; Git Bash
+# on Windows does not, so the race only showed in CI.
 job_if() {
     job_block "$1" | awk '
-        /^    if:/ { p = 1; sub(/^    if:[[:space:]]*\|?[[:space:]]*/, ""); printf "%s ", $0; next }
-        p && /^    [A-Za-z0-9_-]+:/ { exit }
-        p { gsub(/^[[:space:]]+/, ""); printf "%s ", $0 }
+        !p && /^    if:/ { p = 1; sub(/^    if:[[:space:]]*\|?[[:space:]]*/, ""); printf "%s ", $0; next }
+        p && !done && /^    [A-Za-z0-9_-]+:/ { done = 1 }
+        p && !done { gsub(/^[[:space:]]+/, ""); printf "%s ", $0 }
     '
 }
 
 job_needs() {
-    job_block "$1" | grep -E '^    needs:' | head -1
+    job_block "$1" | awk '!found && /^    needs:/ { print; found = 1 }'
 }
 
 assert_contains() {
