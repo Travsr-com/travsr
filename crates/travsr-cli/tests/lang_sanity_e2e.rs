@@ -100,6 +100,10 @@ fn indexed_repo(lang: &str) -> tempfile::TempDir {
     let out = Command::new(travsr())
         .args(["init", "--semantic"])
         .current_dir(root)
+        // #893: without this, `travsr init` appends this tempdir to the
+        // developer's real ~/.travsr/registry.json and leaves the entry there
+        // after `tempfile` deletes the directory.
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
         .output()
         .expect("travsr init");
     assert!(
@@ -140,6 +144,8 @@ fn indexed_repo(lang: &str) -> tempfile::TempDir {
     let out = Command::new(travsr())
         .args(["init", "--semantic"])
         .current_dir(root)
+        // #893: same reason as the first pass above.
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
         .output()
         .expect("travsr re-init");
     assert!(
