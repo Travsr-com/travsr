@@ -939,9 +939,16 @@ impl PluginIndexer {
                                                 Err(e) => tracing::warn!("ts lsif ingest: {e}"),
                                             }
                                         }
-                                        Err(e) => {
+                                        // #878: only a failure to *start* the emitter
+                                        // is "not available" (the daemon's own LSIF
+                                        // pass records that skip in the outcome). An
+                                        // emitter that ran and failed is a real fault
+                                        // and must be visible at default verbosity,
+                                        // matching the JS pass below.
+                                        Err(e) if travsr_indexer::emitter_missing(&e) => {
                                             tracing::debug!("ts lsif emitter not available: {e}")
                                         }
+                                        Err(e) => tracing::warn!("ts lsif emitter failed: {e:#}"),
                                     }
                                 }
 

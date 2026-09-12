@@ -41,10 +41,14 @@ pub fn run(
 
     if json {
         // Machine-readable summary on stdout for CI; progress went to stderr.
-        let phase_b = if stats.phase_b_report.is_some() {
-            "complete"
-        } else {
-            "pending"
+        // #878: a CI consumer reads this field instead of the human summary, so
+        // it must not say `complete` over a run whose TypeScript LSIF pass was
+        // skipped, or whose analyzer crashed. `travsr status` calls both
+        // `partial`; agree with it.
+        let phase_b = match &stats.phase_b_report {
+            None => "pending",
+            Some(r) if r.lsif_skipped.is_some() || !r.crashed.is_empty() => "partial",
+            Some(_) => "complete",
         };
         let summary = serde_json::json!({
             "files_indexed": stats.files_indexed,

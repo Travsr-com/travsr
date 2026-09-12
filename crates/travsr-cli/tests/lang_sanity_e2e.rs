@@ -172,7 +172,12 @@ fn wait_for_phase_b(root: &Path, lang: &str) {
             .expect("travsr status");
         let text = String::from_utf8_lossy(&out.stdout).into_owned()
             + &String::from_utf8_lossy(&out.stderr);
-        if text.contains("semantic: complete") {
+        // `partial` is a settled state too: since #878 a TypeScript index built
+        // where `travsr-lsif-ts` is not discoverable (CI never builds the
+        // emitter's `dist/`) reports `partial (incomplete: typescript)` rather
+        // than a false `complete`. The probes below still hold on the native
+        // pass alone, which is what this suite has always exercised there.
+        if text.contains("semantic: complete") || text.contains("semantic: partial") {
             return;
         }
         if std::time::Instant::now() >= deadline {

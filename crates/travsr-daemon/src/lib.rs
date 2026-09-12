@@ -170,6 +170,54 @@ pub struct PhaseBReport {
     /// Shown to the user with a `travsr lang install <lang>` call-to-action.
     /// Tuple: (language, expected_version, got_version).
     pub version_mismatch: Vec<(String, u32, u32)>,
+    /// #878: the TypeScript LSIF pass was requested (a `tsconfig.json` is at the
+    /// repo root) but produced nothing, because `travsr-lsif-ts` could not be
+    /// started or failed. `typescript` still appears in `ran` (the native
+    /// tree-sitter pass did run), so without this the run read as a clean
+    /// success while the language was missing most of its `ref/call` edges.
+    pub lsif_skipped: Option<LsifSkip>,
+}
+
+/// #878: why the TypeScript LSIF pass produced no edges for a repo that asked
+/// for it (a `tsconfig.json` at the repo root).
+///
+/// Two classes, because they call for different fixes. `EmitterMissing` is a
+/// failure to *start* `travsr-lsif-ts` at all (discovery fell through, or an
+/// explicit `TRAVSR_LSIF_TS` names a missing file): the remedy is the install
+/// layout or the override. `EmitterFailed` is an emitter that ran and broke
+/// (non-zero exit, timeout, oversized output) or whose dump could not be
+/// ingested: the remedy is in its own stderr. Persisted to `phase_b_warnings`
+/// as `emitter_missing:typescript` / `emitter_failed:typescript` so `travsr
+/// status` and the MCP freshness notes disclose it the way a crashed sidecar
+/// is disclosed today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsifSkip {
+    pub reason: LsifSkipReason,
+    /// The underlying error, for the `init` summary. Not persisted: the meta
+    /// entry carries only the class, so free text (which may contain the `,`
+    /// and `:` the warning format is split on) never reaches it.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LsifSkipReason {
+    /// `travsr-lsif-ts` could not be spawned (see `travsr_indexer::EmitterNotFound`).
+    EmitterMissing,
+    /// The emitter started but did not yield a usable dump.
+    EmitterFailed,
+}
+
+impl LsifSkip {
+    /// The `phase_b_warnings` class this skip is recorded under. Must stay in
+    /// step with the arms in `travsr-cli/src/status.rs` and
+    /// `travsr-mcp/src/observability.rs` (`phase_b_warning_classes_match_the_cli`
+    /// pins the set on the MCP side).
+    pub fn warning_class(&self) -> &'static str {
+        match self.reason {
+            LsifSkipReason::EmitterMissing => "emitter_missing",
+            LsifSkipReason::EmitterFailed => "emitter_failed",
+        }
+    }
 }
 
 /// Progress events emitted during [`init_repo_with_progress`] so a caller (the
@@ -1783,8 +1831,10 @@ pub fn init_repo_with_progress(
 
         // LSIF semantic pass — adds RefCall edges on top of structural edges.
         // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
+        // #878: a skipped pass is carried into `write_phase_b_results` below,
+        // not just logged, so the summary and `travsr status` disclose it.
         let t_lsif = std::time::Instant::now();
-        run_lsif_pass(repo_root, &corpus, &mut store);
+        let lsif_skip = run_lsif_pass(repo_root, &corpus, &mut store);
         tracing::info!(
             elapsed_ms = t_lsif.elapsed().as_millis(),
             "TIMING: run_lsif_pass done"
@@ -1898,6 +1948,7 @@ pub fn init_repo_with_progress(
                 pb_refs,
                 pb_outcome,
                 (lsif_parsed, lsif_resolved),
+                lsif_skip.as_ref(),
             );
             // WS-2: flag Dart packages indexed without resolved dependencies.
             record_dart_resolution_state(&mut store, repo_root, present_languages.contains("dart"));
@@ -2963,6 +3014,7 @@ fn run_outcome(report: &PhaseBReport, made_progress: bool) -> phase_b_sched::Run
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_phase_b_results(
     store: &mut SqliteStore,
     corpus: &str,
@@ -2975,6 +3027,10 @@ fn write_phase_b_results(
     // Windows path bug where every ref parsed but none matched a Phase A node —
     // so `rust_lsif_degraded` reflects surviving edges, not just "did ra run".
     lsif_stats: (usize, usize),
+    // #878: `Some` when the TypeScript LSIF pass was due (tsconfig.json present)
+    // but `travsr-lsif-ts` could not run. Recorded in `phase_b_warnings` and on
+    // the report so the language is never reported as cleanly complete.
+    lsif_skip: Option<&LsifSkip>,
 ) -> (
     PhaseBReport,
     std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId>,
@@ -3167,6 +3223,13 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_no_compdb {
         warnings.push(format!("skipped_no_compdb:{lang}"));
     }
+    // #878: the TypeScript LSIF pass was due but `travsr-lsif-ts` never ran (or
+    // ran and failed). The native pass still ran, so `typescript` is in `ran`
+    // and the marker advances; this is what keeps `travsr status` from reading
+    // `complete` over an index missing most of the language's call edges.
+    if let Some(skip) = lsif_skip {
+        warnings.push(format!("{}:typescript", skip.warning_class()));
+    }
     // E6: surface SCIP def-unification misses (orphaned twins). Positional
     // span-containment makes this near-zero; a non-zero rate means Phase A
     // nodes the compiler defined were not matched, so their ref/call edges
@@ -3240,6 +3303,7 @@ fn write_phase_b_results(
         produced_no_nodes: pb_outcome.produced_no_nodes,
         produced_no_references: pb_outcome.produced_no_references,
         version_mismatch: pb_outcome.version_mismatch,
+        lsif_skipped: lsif_skip.cloned(),
     };
     (report, alias_map, dropped)
 }
@@ -4819,7 +4883,8 @@ fn run_background_phase_b_inner(
     // ── LSIF pass (TypeScript compiler — expensive, runs lock-free) ───────────
     // Collect edges into a Vec first; write them under the store lock below.
     // This mirrors the SCIP sidecar pattern and keeps queries warm throughout.
-    let lsif_edges = run_lsif_pass_collect(repo_root, &corpus);
+    // #878: a skipped pass is recorded, not just logged (see the inline path).
+    let (lsif_edges, lsif_skip) = run_lsif_pass_collect(repo_root, &corpus);
 
     // ── SCIP sidecar pass (all languages in parallel, lock-free) ─────────────
     // P6 (#329): single walk yields both present_languages and indexable_paths
@@ -4889,6 +4954,7 @@ fn run_background_phase_b_inner(
         pb_refs,
         pb_outcome,
         (lsif_parsed, lsif_resolved),
+        lsif_skip.as_ref(),
     );
     // WS-2: flag Dart packages indexed without resolved dependencies.
     record_dart_resolution_state(&mut s, repo_root, dart_present);
@@ -4966,6 +5032,9 @@ fn run_background_phase_b_inner(
         event = "phase_b.complete",
         ran = report.ran.len(),
         lsif_edges = lsif_edges.len(),
+        // #878: `lsif_edges = 0` alone cannot distinguish "no tsconfig" from
+        // "the emitter never ran"; the class says which.
+        lsif_skipped = report.lsif_skipped.as_ref().map(LsifSkip::warning_class),
         crashed = report.crashed.len(),
         write_failures = report.write_failures,
         outcome = ?outcome,
@@ -5508,46 +5577,72 @@ pub fn reindex_files(
 /// Used by the inline path (`--semantic` or no-commit repos). For the deferred
 /// path use [`run_lsif_pass_collect`] + write under the store lock.
 ///
-/// Failures (binary not on PATH, tsconfig absent, parse errors) are logged as
-/// warnings and silently skipped — they must never fail the overall index.
-fn run_lsif_pass(repo_root: &Path, corpus: &str, store: &mut SqliteStore) {
-    let edges = run_lsif_pass_collect(repo_root, corpus);
+/// Failures never fail the overall index, but they are not silent either:
+/// `Some(skip)` is returned when the pass was due and the emitter could not
+/// run, for the caller to hand to `write_phase_b_results` (#878).
+fn run_lsif_pass(repo_root: &Path, corpus: &str, store: &mut SqliteStore) -> Option<LsifSkip> {
+    let (edges, skip) = run_lsif_pass_collect(repo_root, corpus);
     for edge in &edges {
         if let Err(e) = store.put_edge_lsif(edge) {
             tracing::warn!("lsif edge write error: {e}");
         }
     }
     tracing::debug!("lsif pass: {} RefCall edges persisted", edges.len());
+    skip
 }
 
 /// Collect LSIF RefCall edges without holding the store lock.
 ///
-/// Returns an empty `Vec` when `tsconfig.json` is absent or the emitter fails.
-/// The caller writes the edges under the store lock. This split lets
-/// `run_background_phase_b` hold the lock only for the final write batch while
-/// the expensive TS compiler runs lock-free.
-fn run_lsif_pass_collect(repo_root: &Path, corpus: &str) -> Vec<travsr_core::Edge> {
+/// Returns `(edges, skip)`. `edges` is empty when `tsconfig.json` is absent or
+/// the emitter failed; `skip` is `Some` in the second case only, so a repo
+/// without a tsconfig is not reported as degraded (#878). The caller writes the
+/// edges under the store lock. This split lets `run_background_phase_b` hold
+/// the lock only for the final write batch while the expensive TS compiler
+/// runs lock-free.
+fn run_lsif_pass_collect(
+    repo_root: &Path,
+    corpus: &str,
+) -> (Vec<travsr_core::Edge>, Option<LsifSkip>) {
     let tsconfig = repo_root.join("tsconfig.json");
     if !tsconfig.exists() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     let dump = match run_lsif_emitter(&tsconfig) {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!("lsif emitter skipped: {e}");
-            return Vec::new();
+            // #878: this used to be the only trace of the skip, and only under
+            // RUST_LOG. The class is what the user-facing surfaces key on.
+            let reason = if travsr_indexer::emitter_missing(&e) {
+                LsifSkipReason::EmitterMissing
+            } else {
+                LsifSkipReason::EmitterFailed
+            };
+            tracing::warn!("lsif emitter skipped: {e:#}");
+            return (
+                Vec::new(),
+                Some(LsifSkip {
+                    reason,
+                    detail: format!("{e:#}"),
+                }),
+            );
         }
     };
 
     match ingest_lsif(&dump, corpus) {
         Ok(out) => {
             tracing::debug!("lsif pass: collected {} RefCall edges", out.edges.len());
-            out.edges
+            (out.edges, None)
         }
         Err(e) => {
-            tracing::warn!("lsif ingest error: {e}");
-            Vec::new()
+            tracing::warn!("lsif ingest error: {e:#}");
+            (
+                Vec::new(),
+                Some(LsifSkip {
+                    reason: LsifSkipReason::EmitterFailed,
+                    detail: format!("travsr-lsif-ts ran but its output could not be read: {e:#}"),
+                }),
+            )
         }
     }
 }
@@ -7713,6 +7808,7 @@ mod tests {
             pb_refs,
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
+            None,
         );
 
         // Literal repro from issue #449: "ClassA (Swift class instantiated via
@@ -8123,6 +8219,7 @@ mod tests {
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
+            None,
         );
         assert!(
             !linked(&store),
@@ -8138,6 +8235,7 @@ mod tests {
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
+            None,
         );
         assert!(
             linked(&store),
@@ -8179,6 +8277,7 @@ mod tests {
                 vec![],
                 travsr_plugin_host::PhaseBOutcome::default(),
                 stats,
+                None,
             );
         };
 

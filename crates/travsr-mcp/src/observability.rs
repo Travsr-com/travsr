@@ -490,6 +490,42 @@ fn decode_phase_b_warnings(
                     ),
                 );
             }
+            // #878: the TypeScript LSIF pass was due but `travsr-lsif-ts` could
+            // not be started (discovery is anchored on the travsr binary's own
+            // location, so a relocated binary loses it). The native pass ran, so
+            // the language has SOME call edges and the marker advanced: this is
+            // the one class where "done" would be a confident lie rather than a
+            // missing answer. Wording tracks `travsr status` (status.rs).
+            "emitter_missing" => {
+                out.insert(
+                    rest.to_string(),
+                    (
+                        "unavailable",
+                        format!(
+                            "full '{rest}' analysis is incomplete: the TypeScript analyzer \
+                             (travsr-lsif-ts) could not be started, so cross-file call and \
+                             reference edges are missing. Set TRAVSR_LSIF_TS to the emitter's \
+                             dist/index.js (or reinstall travsr), then re-run \
+                             `travsr init --semantic --force`"
+                        ),
+                    ),
+                );
+            }
+            "emitter_failed" => {
+                out.insert(
+                    rest.to_string(),
+                    (
+                        "failed",
+                        format!(
+                            "full '{rest}' analysis is incomplete: the TypeScript analyzer \
+                             (travsr-lsif-ts) started but failed, so cross-file call and \
+                             reference edges are missing. Re-run \
+                             `RUST_LOG=travsr_daemon=warn travsr init --semantic --force` \
+                             to see its error"
+                        ),
+                    ),
+                );
+            }
             _ => {}
         }
     }
@@ -2512,6 +2548,9 @@ mod tests {
             "no_references",
             "zero_nodes",
             "needs_consent",
+            // #878: the TypeScript LSIF pass skipped under a marker that advanced.
+            "emitter_missing",
+            "emitter_failed",
         ] {
             // `version_mismatch` carries `lang:expected:got`, the rest `lang`.
             let warning = if class == "version_mismatch" {
