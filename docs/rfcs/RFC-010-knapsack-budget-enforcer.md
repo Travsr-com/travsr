@@ -2,6 +2,8 @@
 
 > **Superseded in part (#457):** Kùzu was dropped as a storage backend; SQLite+WAL is the only backend. The `KuzuStore` stub requirements below no longer apply and are kept for historical context. See ADR-018.
 
+> **Amended in part (#824):** `DP_CELL_LIMIT` was raised from 500,000 to 1,000,000 cells, so the DP table ceiling is 4 MB rather than 2 MB, and the greedy-fallback log dropped from `warn` to `debug`. Every inline mention of 500,000 cells, 2 MB or a fallback warning below is the original value and is now stale. See [Amendment: #824](#amendment-824-2026-09-12-dp_cell_limit-raised-to-1000000) at the end of this document.
+
 | Field | Value |
 |---|---|
 | **Status** | Draft |
@@ -590,3 +592,42 @@ ship on green.
 - [ ] PPR output post-filtered by allowed corpora until PERF-012 lands.
 - [ ] `fuzz_knapsack` target added to `fuzz/Cargo.toml` and runs without panic in CI.
 - [ ] ADR-003 open question §Token budget integration marked resolved, references RFC-010.
+
+---
+
+## Amendment: #824 (2026-09-12): DP_CELL_LIMIT raised to 1,000,000
+
+`DP_CELL_LIMIT` is now `1_000_000`, not `500_000`
+(`crates/travsr-retrieval/src/knapsack.rs:26`). The original design body above is
+kept as the decision record and is not retro-edited, so it still carries the
+superseded numbers. Matched by text rather than line number, since line numbers
+move:
+
+| Stale text above | Current value |
+|---|---|
+| `500k cells × 4 bytes = 2 MB` | 1M cells × 4 bytes = 4 MB |
+| `pub const DP_CELL_LIMIT: usize = 500_000;` | `1_000_000` |
+| `DP_CELL_LIMIT = 500_000` cells (2 MB) | 1,000,000 cells (4 MB) |
+| `DP_CELL_LIMIT = 500_000` caps space at 2 MB | caps space at 4 MB |
+| `the ≤ 2 MB allocation per call` | ≤ 4 MB |
+| `At DP_CELL_LIMIT, it is exactly 2 MB` | exactly 4 MB |
+| `When n × budget > 500,000` | > 1,000,000 |
+
+The `500 × 1_000_000` in the `SCORE_SCALE` doc comment is unaffected: that is
+u32 overflow headroom, not the cell limit.
+
+**Why.** At the default operating point the old limit pushed `get_context` onto
+the greedy fallback, so the exact DP that this RFC specifies was not the path
+actually taken. Raising the limit lets the exact DP run there. The measurements
+justifying the new ceiling are in #883.
+
+**Log level.** The fallback log is `tracing::debug!`, not `tracing::warn!`
+(`knapsack.rs:130`). Above the new limit the fallback is reached only at budgets
+that fit every candidate, where greedy and DP select the same set, so it is not
+an anomaly worth warning about. This supersedes the `tracing::warn!` described in
+the Detailed Design and Drawbacks sections above.
+
+**Not guarded by a benchmark.** `crates/travsr-retrieval/benches/retrieval.rs`
+covers bfs, ppr and pcst only, and `scripts/check-p95.sh` gates bfs and ppr, so
+no CI check regression-detects knapsack cost at this limit. Raising the constant
+again should come with a knapsack bench.
