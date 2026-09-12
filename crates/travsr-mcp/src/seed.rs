@@ -6442,12 +6442,17 @@ mod tests {
     /// `[anchor_emit_cut 0.15, idf_coverage_min 0.55)` - specific enough to emit
     /// an anchor, too generic to count toward coverage. `TRAVSR_NO_RERANK` is
     /// the documented escape hatch for the no-reranker case (`score_fn` is the
-    /// KNN leg, not the cross-encoder); set the same unlocked way as
-    /// `TRAVSR_DISPLAY_TIER_CAP` above, and safe to set process-wide because
-    /// off is what CI already runs with, no model being installed there.
+    /// KNN leg, not the cross-encoder), and it is set under
+    /// [`crate::rerank::RERANK_ENV_LOCK`]: `rerank.rs`'s own tests
+    /// `remove_var` that same variable, both modules compile into one test
+    /// binary, and `reranker()` reads it live on every call, so an unlocked
+    /// `set_var` here races them on any machine with a model installed.
     #[test]
     fn all_generic_multi_token_query_keeps_coverage_ok_false_822() {
         use travsr_core::{Node, VName};
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("TRAVSR_NO_RERANK", "1");
         let mut store = SqliteStore::open_in_memory().unwrap();
 
