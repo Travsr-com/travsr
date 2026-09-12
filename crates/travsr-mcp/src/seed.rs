@@ -1547,8 +1547,10 @@ fn contentless_query_confidence(
 /// absent or disabled), not that it judged the query irrelevant. Gating the rescue on
 /// a score that was never produced made `ask "MatchSource"` abstain with no reranker
 /// installed, on a symbol `travsr references` resolves three definitions for. A
-/// missing score therefore gates nothing; the caller widens `coverage_ok` for that
-/// case so a literal symbol query still supplies the lexical evidence.
+/// missing score therefore gates nothing; the caller widens `coverage_ok` for a
+/// single-content-token query, where naming a real symbol IS the whole of the
+/// lexical evidence. Multi-token queries keep the IDF-coverage bar on both paths,
+/// so the D5 guarantee below is unchanged.
 ///
 /// RFC-022 D5 (RC-5): `coverage_ok` closes the WS4 over-rescue. Generic tokens
 /// (`get`/`map`/`handle`) still emit an exact anchor (`idf_w >= 0.15`) yet count
@@ -1568,7 +1570,9 @@ fn anchor_rescued_confidence(
         && !g1_bypass
         && coverage_ok
         && exact_anchor_present
-        // `is_none_or` is stable since 1.82; MSRV here is 1.75.
+        // Not `is_none_or`: workspace MSRV is 1.88, so it would compile, but
+        // `clippy.toml`'s msrv deliberately lags at 1.75 (ADR-001) and
+        // `clippy::incompatible_msrv` fails `-D warnings` on a 1.82 API.
         && max_rerank.map_or(true, |r| r >= recall_floor)
     {
         Confidence::Weak
@@ -3175,16 +3179,27 @@ pub(crate) fn build_seed_set(
     // false for an all-generic query (`get map handle`) that emits anchors but
     // resolves no specific token — those must stay abstained.
     // #822: with no cross-encoder score the IDF-coverage bar is the wrong
-    // instrument. `MatchSource` (idf 0.534), `LangResult` (0.522), `SeedSet`
-    // (0.502) and `TestRole` (0.442) all sit just UNDER `idf_coverage_min`
+    // instrument. `MatchSource` (idf 0.533), `LangResult` (0.522), `SeedSet`
+    // (0.502) and `TestRole` (0.438) all sit just UNDER `idf_coverage_min`
     // (0.550), so `n_resolved` is 0 and `ask "MatchSource"` abstained on a
-    // symbol `references` resolves three definitions for. A query whose every
-    // content token resolved to a real symbol is lexically grounded regardless
-    // of that bar; a prose salad is not ("implement a distributed raft consensus
-    // protocol with leader election" resolves 1 of 7 tokens and stays abstained).
+    // symbol `references` resolves three definitions for. Every one of those is
+    // a query of ONE content token that names a real symbol here, which is the
+    // whole of the lexical evidence the query offers, so scope the widening to
+    // exactly that shape.
+    //
+    // It must NOT be `terms.iter().all(|t| t.resolved)`: `resolved` is
+    // `!boundary_matched.is_empty()` (computed above, before the IDF cut), so
+    // any token naming any symbol anywhere sets it. For an all-generic query
+    // every content token qualifies, and `coverage_ok` would go true with
+    // `n_resolved == 0` - reopening exactly the D5 over-rescue this gate exists
+    // to close. Measured on this repo with `TRAVSR_NO_RERANK=1`, the `all`
+    // form flipped `name path kind`, `line kind path name` and `file path line`
+    // from ABSTAIN to GROUNDED; single-token scoping keeps all three abstained
+    // and still recovers 4 of the 4 reported symbols.
+    //
     // Only widened when no score exists, so the reranked path keeps D5 exactly.
-    let coverage_ok = n_resolved >= 1
-        || (max_rerank_score.is_none() && !terms.is_empty() && terms.iter().all(|t| t.resolved));
+    let coverage_ok =
+        n_resolved >= 1 || (max_rerank_score.is_none() && terms.len() == 1 && terms[0].resolved);
     let base_confidence = confidence;
     let confidence = if anchor_rescue_enabled() {
         anchor_rescued_confidence(
@@ -6406,6 +6421,102 @@ mod tests {
                 .map(|s| (s.node, s.source))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// #822 review: RFC-022 D5 must stay closed on the no-reranker branch.
+    ///
+    /// The first cut of the #822 widening was
+    /// `terms.iter().all(|t| t.resolved)`. `resolved` is `!boundary_matched
+    /// .is_empty()`, computed before the IDF cut, so every content token of an
+    /// all-generic query sets it: `coverage_ok` went true with `n_resolved ==
+    /// 0` and the WS4 rescue grounded a query with zero grounded coverage.
+    /// Measured on this repo with `TRAVSR_NO_RERANK=1`, that flipped `name path
+    /// kind`, `line kind path name` and `file path line` from ABSTAIN to
+    /// GROUNDED.
+    ///
+    /// This asserts the COMPUTED `coverage_ok` that `build_seed_set` puts on
+    /// the `SeedSet`, not a literal handed to `anchor_rescued_confidence`, so
+    /// it guards the call site the regression lived at. The three tokens are
+    /// made genuinely generic the way a real corpus makes them: ~60 bearers
+    /// each against the `n_total` floor of 1 000 puts `idf_w` near 0.40, inside
+    /// `[anchor_emit_cut 0.15, idf_coverage_min 0.55)` - specific enough to emit
+    /// an anchor, too generic to count toward coverage. `TRAVSR_NO_RERANK` is
+    /// the documented escape hatch for the no-reranker case (`score_fn` is the
+    /// KNN leg, not the cross-encoder); set the same unlocked way as
+    /// `TRAVSR_DISPLAY_TIER_CAP` above, and safe to set process-wide because
+    /// off is what CI already runs with, no model being installed there.
+    #[test]
+    fn all_generic_multi_token_query_keeps_coverage_ok_false_822() {
+        use travsr_core::{Node, VName};
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        for tok in ["get", "map", "handle"] {
+            for i in 0..60 {
+                let node = Node::new(
+                    VName::new(
+                        "corpus",
+                        "",
+                        format!("crates/travsr-demo/src/{tok}_{i}.rs"),
+                        "rust",
+                        format!("fn:{tok}_payload_{i}"),
+                    ),
+                    "function",
+                );
+                store.put_node(&node).unwrap();
+            }
+        }
+
+        let seed_set = build_seed_set(
+            &store,
+            "get map handle",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        // Preconditions: this is the over-rescue shape, not a query that simply
+        // failed to anchor. Every token resolved, an anchor was emitted, and no
+        // token cleared the coverage bar.
+        assert!(
+            seed_set.terms.len() > 1 && seed_set.terms.iter().all(|t| t.resolved),
+            "setup: every content token must resolve, terms: {:?}",
+            seed_set
+                .terms
+                .iter()
+                .map(|t| (&t.token, t.idf_w, t.resolved))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            seed_set.exact_anchor_present,
+            "setup: an exact anchor must be emitted, or the rescue is gated \
+             by `exact_anchor_present` instead and this proves nothing"
+        );
+        assert_eq!(
+            seed_set.n_resolved_gated,
+            0,
+            "setup: no token may clear idf_coverage_min, terms: {:?}",
+            seed_set
+                .terms
+                .iter()
+                .map(|t| (&t.token, t.idf_w))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            seed_set.max_rerank_score.is_none(),
+            "setup: this is the no-reranker branch"
+        );
+
+        assert!(
+            !seed_set.coverage_ok,
+            "all-generic multi-token query must keep coverage_ok false (RFC-022 D5)"
+        );
+        assert!(
+            !seed_set.anchor_rescued,
+            "and therefore must not be anchor-rescued"
+        );
+        std::env::remove_var("TRAVSR_NO_RERANK");
     }
 
     /// Found via CI (not local dev, where an installed embed backend masked
