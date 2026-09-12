@@ -21,6 +21,10 @@
 # #871 reported: the old promote condition accepted skipped as success, and
 # the gates were skipped on every real release.
 #
+# A gate that is not required for the channel may be `skipped`, but if it ran
+# it must have succeeded too: "not required" means the channel does not wait
+# for it, not that a red result is acceptable.
+#
 # Inputs (environment):
 #   CHANNEL         beta | rc | stable   (needs.channel.outputs.channel)
 #   GATE_FUZZ       needs['gate-fuzz'].result
@@ -82,16 +86,27 @@ for gate in fuzz osv accuracy ab-eval; do
         fi
     else
         req=no
-        verdict="not required for $CHANNEL"
+        case "$result" in
+            skipped|success) verdict="not required for $CHANNEL" ;;
+            *)
+                # Not required means the gate may be skipped for this channel,
+                # not that it may fail. A gate that ran and did not succeed has
+                # found something, whatever the channel; this also covers a
+                # gate whose channel condition was widened without updating
+                # the policy above.
+                verdict="BLOCKS release (ran and did not succeed)"
+                BLOCKED=1 ;;
+        esac
     fi
     printf '%-10s %-10s %-10s %s\n' "$gate" "$req" "${result:-<unset>}" "$verdict"
 done
 echo
 
 if [[ "$BLOCKED" -ne 0 ]]; then
-    echo "ERROR: a gate required for the '$CHANNEL' channel did not succeed." >&2
-    echo "  A result of 'skipped' or 'cancelled' blocks just like 'failure': a gate that" >&2
-    echo "  did not run has not vouched for this release. Fix the gate (or the workflow" >&2
+    echo "ERROR: a gate blocks the '$CHANNEL' channel (see the table above)." >&2
+    echo "  For a required gate, 'skipped' or 'cancelled' blocks just like 'failure': a gate" >&2
+    echo "  that did not run has not vouched for this release. A gate that is not required" >&2
+    echo "  still blocks if it ran and did not succeed. Fix the gate (or the workflow" >&2
     echo "  condition that stopped it running) and re-run the release." >&2
     exit 1
 fi

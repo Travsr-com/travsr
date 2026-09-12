@@ -20,7 +20,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/release-gates.sh"
-RELEASE_YML="$HERE/../workflows/release.yml"
+# Overridable so a deliberately broken copy (a mutant) can be checked against
+# the wiring assertions without editing the real workflow.
+RELEASE_YML="${RELEASE_YML:-$HERE/../workflows/release.yml}"
 
 PASS=0
 FAIL=0
@@ -56,17 +58,22 @@ expect 1 "stable, ab-eval cancelled -> block"                   stable success s
 expect 1 "stable, every gate skipped -> block (old push path)"  stable skipped skipped skipped skipped
 expect 1 "stable, gate result unset -> block"                   stable success success "" success
 
-# RC: fuzz, osv, accuracy required; ab-eval is not consulted.
+# RC: fuzz, osv, accuracy required; ab-eval may be skipped, but a gate that
+# ran and did not succeed blocks whatever the channel.
 expect 0 "rc, required gates success, ab-eval skipped -> publish" rc success success success skipped
-expect 0 "rc, required gates success, ab-eval failure -> publish (not required)" rc success success success failure
+expect 0 "rc, every gate success -> publish"                    rc success success success success
+expect 1 "rc, ab-eval ran and failed -> block (ran, not required, still blocks)" rc success success success failure
+expect 1 "rc, ab-eval cancelled -> block"                       rc success success success cancelled
 expect 1 "rc, accuracy skipped -> block (#871)"                 rc success success skipped skipped
 expect 1 "rc, accuracy failure -> block"                        rc success success failure skipped
 expect 1 "rc, fuzz skipped -> block"                            rc skipped success success skipped
 expect 1 "rc, osv cancelled -> block"                           rc success cancelled success skipped
 
-# Beta: not gated on these suites; the gates are skipped by design.
+# Beta: not gated on these suites; the gates are skipped by design. If they
+# did run (a widened channel condition), a failure still blocks.
 expect 0 "beta, every gate skipped -> publish"                  beta skipped skipped skipped skipped
-expect 0 "beta, gates ran and failed -> publish (not required)" beta failure failure failure failure
+expect 0 "beta, gates ran and passed -> publish"                beta success success success success
+expect 1 "beta, gates ran and failed -> block (ran, not required, still blocks)" beta failure failure failure failure
 
 # Guard rails: no channel or an unknown channel never releases.
 expect 1 "empty channel -> block"                               "" success success success success
@@ -138,8 +145,14 @@ assert_contains "gates verdict depends on channel"    "$(job_needs gates)" "chan
 # function (actions/runner#491). The verdict must run so it can say no.
 assert_contains "gates verdict runs even when a gate was skipped" "$(job_if gates)" "!cancelled()"
 assert_contains "gates verdict runs release-gates.sh" "$verdict" "release-gates.sh"
-for var in CHANNEL GATE_FUZZ GATE_OSV GATE_ACCURACY GATE_AB_EVAL; do
-    assert_contains "gates verdict passes $var to the script" "$verdict" "$var:"
+# Full key/value pairs, whitespace-normalised. Checking only that the key
+# exists would accept `GATE_ACCURACY: ${{ needs['gate-fuzz'].result }}`, which
+# reads fuzz's result twice and lets a red accuracy gate publish.
+verdict_flat="$(printf '%s' "$verdict" | tr -s '[:space:]' ' ')"
+assert_contains "gates verdict passes the channel to the script" "$verdict_flat" "CHANNEL: \${{ needs.channel.outputs.channel }}"
+for gate in fuzz osv accuracy ab-eval; do
+    var="GATE_$(printf '%s' "$gate" | tr 'a-z-' 'A-Z_')"
+    assert_contains "gates verdict passes $gate's own result as $var" "$verdict_flat" "$var: \${{ needs['gate-$gate'].result }}"
 done
 
 for consumer in publish promote; do
@@ -151,15 +164,26 @@ for consumer in publish promote; do
     cond="$(job_if "$consumer")"
     # No status function in the condition means GitHub adds success(), so
     # publish/promote run only when channel, build and the verdict succeeded.
-    assert_not_contains "$consumer relies on the implicit success() of its needs" "$cond" "always()"
-    assert_not_contains "$consumer does not reason about gate results itself"     "$cond" "gate-"
+    # Any of always(), success(), failure(), cancelled() (negated or not)
+    # replaces that default, and contains()/fromJSON() are how a result list
+    # would be smuggled back in, so reject every function call outright.
+    if printf '%s' "$cond" | grep -Eq '[A-Za-z_]+\('; then
+        fail "$consumer condition calls a function, which replaces the implicit success() on its needs: $cond"
+    else
+        ok "$consumer relies on the implicit success() of its needs (no function call in its condition)"
+    fi
+    assert_not_contains "$consumer does not reason about gate results itself" "$cond" "gate-"
+    assert_not_contains "$consumer does not reason about job results itself"  "$cond" ".result"
 done
 
-# The word is only ever allowed in the verdict script.
-if grep -nE "== *'skipped'" "$RELEASE_YML" >/dev/null; then
-    fail "release.yml compares a job result to 'skipped'; gate results are decided in release-gates.sh only"
+# Outside comments the word must not appear in release.yml at all: not as
+# `== 'skipped'`, not inside a contains()/fromJSON() list. Gate results are
+# decided in release-gates.sh only.
+uncommented="$(sed -e 's/#.*$//' "$RELEASE_YML")"
+if printf '%s\n' "$uncommented" | grep -n "skipped" >/dev/null; then
+    fail "release.yml mentions skipped outside a comment; gate results are decided in release-gates.sh only: $(printf '%s\n' "$uncommented" | grep -n skipped)"
 else
-    ok "release.yml never treats a skipped job as a result to accept"
+    ok "release.yml never reasons about a skipped job outside comments"
 fi
 
 echo

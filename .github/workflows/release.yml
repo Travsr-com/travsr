@@ -6,6 +6,12 @@ name: Release
 #                            next channel WITHOUT rebuilding (see the `promote` job).
 # Both paths run the promotion gates for the target channel and refuse to
 # publish or promote unless every required gate succeeded (see the `gates` job).
+# On the push path the gates run at the tag, so they vouch for the commit being
+# released. On the dispatch path a local `uses: ./...` runs at the dispatched
+# ref (normally master HEAD), not at the commit `promote_from` was built from;
+# see the #714 note in `promote`. There is deliberately no override: a red
+# required gate blocks rc and stable until the gate itself is fixed, and a
+# hotfix that cannot wait ships to beta, which is not gated on these suites.
 # Promotion reuses artifacts rather than rebuilding because Rust builds here are not
 # bit-reproducible across runs (runner image / cross toolchain drift) — rebuilding on
 # every promotion would mean "stable" is never actually the bits that were beta-tested.
@@ -488,6 +494,11 @@ jobs:
   # never run for a release. The policy itself lives in
   # .github/scripts/release-gates.sh (applied by the `gates` job below) and is
   # covered by .github/scripts/test-release-gates.sh in CI.
+  #
+  # The gates need only `channel`, not `verify-version` or `preflight`: both of
+  # those are push-only, so listing them here would skip every gate on the
+  # dispatch path. The cost is that a tag those guard rails reject still runs
+  # the suites once, in parallel with them.
   gate-fuzz:
     name: "gate: fuzz suite"
     if: needs.channel.outputs.channel != 'beta'

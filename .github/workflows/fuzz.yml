@@ -95,7 +95,7 @@ jobs:
           fi
           gh issue create \
             --title "[fuzz] ${{ matrix.target }} found a panic ($(date -u +%Y-%m-%d))" \
-            --body "Fuzz target \`${{ matrix.target }}\` crashed during the nightly fuzz run.
+            --body "Fuzz target \`${{ matrix.target }}\` crashed in the \`${{ github.workflow }}\` workflow (event: ${{ github.event_name }}, ref: \`${{ github.ref_name }}\`). When the workflow is \`Release\`, this ran as a release-promotion gate for that tag, not as the nightly.
 
           **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
