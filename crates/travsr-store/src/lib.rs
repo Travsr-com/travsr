@@ -1495,6 +1495,17 @@ impl SqliteStore {
                 current == latest,
                 "schema v{current} ≠ expected v{latest}, pending migrations; reopen writable"
             );
+            // C1 (#893): the recorded version does not describe the table shape.
+            // `nodes.body_hash` is added by an open-time step rather than by a
+            // numbered migration (see [`Self::ensure_body_hash_column`]), so a
+            // database an older build stamped at `latest` can still carry the
+            // pre-#813 narrow table, and the number-only check above admits it.
+            // Fail here instead of hitting `no such column` at query time: every
+            // caller falls back to a writable `open()`, which adds the column.
+            anyhow::ensure!(
+                store.column_exists("nodes", "body_hash")?,
+                "schema v{current} but nodes.body_hash is missing; reopen writable"
+            );
             Ok(store)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -15829,6 +15840,54 @@ mod tests {
             body_hash(node_id_to_i64(unstamped.id)),
             None,
             "a file with no source must leave body_hash NULL (preservation forgone)"
+        );
+    }
+
+    #[test]
+    fn read_only_open_rejects_current_version_database_missing_body_hash() {
+        // C1 (#893): `nodes.body_hash` is added by an open-time step rather than
+        // by a numbered migration, so a database a pre-RFC-027-#813 build stamped
+        // at the current schema version still carries the narrow `nodes` table.
+        // A read-only open that compares only the version number admits it, and
+        // any query touching `body_hash` then fails with `no such column`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        drop(SqliteStore::open(&db).unwrap());
+
+        // Reproduce the older table shape on an otherwise current database.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch("ALTER TABLE nodes DROP COLUMN body_hash")
+                .unwrap();
+        }
+        let probe = SqliteStore::open_read_only(&db);
+        // Guard the repro itself: the version must still read as current, which
+        // is precisely why a number-only check lets the narrow table through.
+        if let Ok(s) = &probe {
+            assert_eq!(
+                s.schema_version().unwrap(),
+                sqlite_migration_runner().latest_version(),
+                "repro must leave the version stamped at the current value"
+            );
+        }
+        let err = probe
+            .err()
+            .expect("read-only open must reject a database whose nodes table lacks body_hash");
+        assert!(
+            format!("{err}").contains("body_hash"),
+            "the error must name the missing column, got: {err}"
+        );
+
+        // The writable open is the heal path the read-only failure falls back to.
+        let healed = SqliteStore::open(&db).unwrap();
+        assert!(
+            healed.column_exists("nodes", "body_hash").unwrap(),
+            "a writable open must add the missing column"
+        );
+        drop(healed);
+        assert!(
+            SqliteStore::open_read_only(&db).is_ok(),
+            "the healed database must open read-only again"
         );
     }
 
