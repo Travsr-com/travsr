@@ -401,6 +401,14 @@ jobs:
       - name: verify release matrix and installer target maps agree (#576)
         run: node .github/scripts/check-target-maps.mjs
 
+  release-gates:
+    name: release promotion gate policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: verify the gate verdict policy and its release.yml wiring (#871)
+        run: bash .github/scripts/test-release-gates.sh
+
   install-sh-lint:
     name: "install.sh (shellcheck)"
     runs-on: ubuntu-latest

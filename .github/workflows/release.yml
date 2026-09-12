@@ -4,6 +4,8 @@ name: Release
 #   1. push a tag        -> build fresh artifacts, sign, publish to the tag's channel.
 #   2. workflow_dispatch  -> promote an already-published channel's artifacts to the
 #                            next channel WITHOUT rebuilding (see the `promote` job).
+# Both paths run the promotion gates for the target channel and refuse to
+# publish or promote unless every required gate succeeded (see the `gates` job).
 # Promotion reuses artifacts rather than rebuilding because Rust builds here are not
 # bit-reproducible across runs (runner image / cross toolchain drift) — rebuilding on
 # every promotion would mean "stable" is never actually the bits that were beta-tested.
@@ -136,6 +138,7 @@ jobs:
             "cargo-deny"
             "plugin-hashes.lock"
             "release/installer target maps"
+            "release promotion gate policy"
             "TL1/TL2 — zero LLM/embedding deps in travsr-mcp"
             "Phase 2 correctness suite"
             "Bench p95 < 50 ms"
@@ -287,8 +290,12 @@ jobs:
 
   publish:
     name: publish
+    # Implicit success(): channel, every build target and the gates verdict
+    # must all have succeeded. A gate that was required for this channel and
+    # failed, was cancelled or was skipped fails `gates`, which skips this job
+    # and leaves the run red (#871).
     if: github.event_name == 'push'
-    needs: [channel, build]
+    needs: [channel, build, gates]
     runs-on: ubuntu-latest
     environment:
       name: ${{ needs.channel.outputs.environment }}
@@ -471,15 +478,25 @@ jobs:
         run: npm publish --access public --provenance --tag "${{ needs.channel.outputs.npm_tag }}"
 
   # ── Promotion gates: reused CI suites, required past beta / into stable ───
+  #
+  # The gates run on BOTH release paths, scoped only by the target channel:
+  #   beta    none (fast-iteration channel; these suites run nightly anyway)
+  #   rc      fuzz, OSV, accuracy
+  #   stable  fuzz, OSV, accuracy, A/B eval
+  # Before #871 they were additionally conditioned on workflow_dispatch, and
+  # every release in this repo's history has been a tag push, so they had
+  # never run for a release. The policy itself lives in
+  # .github/scripts/release-gates.sh (applied by the `gates` job below) and is
+  # covered by .github/scripts/test-release-gates.sh in CI.
   gate-fuzz:
     name: "gate: fuzz suite"
-    if: github.event_name == 'workflow_dispatch' && needs.channel.outputs.channel != 'beta'
+    if: needs.channel.outputs.channel != 'beta'
     needs: [channel]
     uses: ./.github/workflows/fuzz.yml
 
   gate-osv:
     name: "gate: OSV scan"
-    if: github.event_name == 'workflow_dispatch' && needs.channel.outputs.channel != 'beta'
+    if: needs.channel.outputs.channel != 'beta'
     needs: [channel]
     permissions:
       contents: read
@@ -489,28 +506,53 @@ jobs:
 
   gate-accuracy:
     name: "gate: accuracy nightly"
-    if: github.event_name == 'workflow_dispatch' && needs.channel.outputs.channel != 'beta'
+    if: needs.channel.outputs.channel != 'beta'
     needs: [channel]
     uses: ./.github/workflows/accuracy-nightly.yml
 
   gate-ab-eval:
     name: "gate: A/B eval"
-    if: github.event_name == 'workflow_dispatch' && needs.channel.outputs.channel == 'stable'
+    if: needs.channel.outputs.channel == 'stable'
     needs: [channel]
     uses: ./.github/workflows/ab-eval.yml
+
+  # The one place gate results are read. Runs on both paths and for every
+  # channel, and applies the policy in .github/scripts/release-gates.sh: each
+  # gate required for the channel must have result `success`; failure,
+  # cancelled and skipped all block. publish and promote depend on this job
+  # (and only on this job) for gate state, so they inherit its verdict through
+  # the implicit success() on their `needs`.
+  gates:
+    name: "gate: verdict (${{ needs.channel.outputs.channel }})"
+    # !cancelled() rather than the implicit success(): a gate skipped for the
+    # channel would otherwise skip this job too, and publish/promote would
+    # never see a verdict (actions/runner#491). The script decides whether the
+    # skip was allowed.
+    if: ${{ !cancelled() }}
+    needs: [channel, gate-fuzz, gate-osv, gate-accuracy, gate-ab-eval]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Every gate required for this channel must have succeeded
+        env:
+          CHANNEL:       ${{ needs.channel.outputs.channel }}
+          GATE_FUZZ:     ${{ needs['gate-fuzz'].result }}
+          GATE_OSV:      ${{ needs['gate-osv'].result }}
+          GATE_ACCURACY: ${{ needs['gate-accuracy'].result }}
+          GATE_AB_EVAL:  ${{ needs['gate-ab-eval'].result }}
+        run: bash .github/scripts/release-gates.sh
 
   # ── Dispatch path only: promote a channel's artifacts, no rebuild ──────────
   promote:
     name: promote (reuse signed artifacts)
-    if: |
-      always() &&
-      github.event_name == 'workflow_dispatch' &&
-      needs.channel.result == 'success' &&
-      (needs['gate-fuzz'].result == 'success' || needs['gate-fuzz'].result == 'skipped') &&
-      (needs['gate-osv'].result == 'success' || needs['gate-osv'].result == 'skipped') &&
-      (needs['gate-accuracy'].result == 'success' || needs['gate-accuracy'].result == 'skipped') &&
-      (needs['gate-ab-eval'].result == 'success' || needs['gate-ab-eval'].result == 'skipped')
-    needs: [channel, gate-fuzz, gate-osv, gate-accuracy, gate-ab-eval]
+    # Implicit success(): channel and the gates verdict must have succeeded.
+    # Gate results are no longer read here; the old condition accepted a
+    # skipped gate as a pass (#871).
+    if: github.event_name == 'workflow_dispatch'
+    needs: [channel, gates]
     runs-on: ubuntu-latest
     environment:
       name: ${{ needs.channel.outputs.environment }}
