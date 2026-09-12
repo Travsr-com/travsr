@@ -3046,6 +3046,11 @@ fn collect_global(
 
     let single = candidates.len() == 1;
     let mut parts: Vec<String> = Vec::new();
+    // #893 B2: repos this fan-out could not open. Every caller below inherits
+    // the disclosure, so a partial cross-repo answer is never read as a
+    // complete one. Same note wording as `search_symbol_global`, which runs its
+    // own fan-out and cannot route through here.
+    let mut skipped: Vec<String> = Vec::new();
 
     for (repo_name, db_path) in candidates {
         match SqliteStore::open_read_only(db_path) {
@@ -3055,11 +3060,31 @@ fn collect_global(
                     parts.push(result);
                 }
             }
-            Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
+            Err(e) => {
+                tracing::warn!("failed to open {}: {e}", db_path.display());
+                skipped.push(format!("{repo_name} ({e})"));
+            }
         }
     }
 
-    parts.join("\n")
+    let joined = parts.join("\n");
+    if skipped.is_empty() {
+        return joined;
+    }
+    skipped.sort();
+    // Leading, not trailing: every caller sanitizes downstream and truncation
+    // runs from the end, which is exactly the large-fan-out case where this
+    // note matters most.
+    let note = format!(
+        "[note: this cross-repo answer is partial: {} registered repo(s) could not be opened and were skipped: {}]",
+        skipped.len(),
+        skipped.join("; ")
+    );
+    if joined.is_empty() {
+        note
+    } else {
+        format!("{note}\n{joined}")
+    }
 }
 
 // ── get_blast_radius ──────────────────────────────────────────────────────────
@@ -3588,11 +3613,12 @@ pub fn get_lang_status_global(
     let raw = collect_global(repos, repo, |store, _repo_name, _single| {
         get_lang_status_raw(store, file)
     });
-    if raw.is_empty() {
-        UNKNOWN_LANG_JSON.to_string()
-    } else {
-        // collect_global joins results with "\n"; take only the first JSON line.
-        raw.lines().next().unwrap_or("").to_string()
+    // collect_global joins results with "\n" and may lead with a `[note: ...]`
+    // skipped-repo line (#893 B2). This surface is parsed as JSON by the
+    // extension, so take the first JSON line rather than the first line.
+    match raw.lines().find(|l| l.starts_with('{')) {
+        Some(json) => json.to_string(),
+        None => UNKNOWN_LANG_JSON.to_string(),
     }
 }
 
@@ -3612,7 +3638,7 @@ pub fn search_symbol(store: &SqliteStore, name: &str, exact: bool) -> String {
     // repos), but stripping "in rust" from "knapsack in rust" prevents the
     // FTS from matching unrelated files that contain "rust" as a token.
     let (stripped, lang_filter) = infer_language_from_query(name);
-    let raw = search_symbol_raw(store, stripped.as_str(), lang_filter, exact);
+    let (_, raw) = search_symbol_raw(store, stripped.as_str(), lang_filter, exact);
     let content = if raw.is_empty() {
         format!("No symbols matching '{name}' found in the graph.")
     } else {
@@ -3688,12 +3714,16 @@ fn infer_language_from_query(query: &str) -> (String, Option<&'static str>) {
     (query.to_owned(), None)
 }
 
+/// Returns `(total matches, rendered lines)`. The rendered list is capped at
+/// `MAX_SEARCH_RESULTS`, the count is not: a caller ranking repos against each
+/// other needs to tell a 200-match repo from a 60-match one, which the capped
+/// line count cannot express (#893 B3).
 fn search_symbol_raw(
     store: &SqliteStore,
     name: &str,
     lang_filter: Option<&str>,
     exact: bool,
-) -> String {
+) -> (usize, String) {
     // Cap results: prevents self-DoS from wildcard queries (e.g. "a") and limits
     // accidental bulk exfiltration. The store LIKE query has no SQL LIMIT yet —
     // this Rust-side cap is the guard until that is added at the store layer.
@@ -3703,7 +3733,7 @@ fn search_symbol_raw(
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("search_symbol error: {e}");
-            return String::new();
+            return (0, String::new());
         }
     };
 
@@ -3733,7 +3763,7 @@ fn search_symbol_raw(
             )
         })
         .collect();
-    lines.join("\n")
+    (nodes.len(), lines.join("\n"))
 }
 
 /// Global variant of `search_symbol`.
@@ -3755,10 +3785,15 @@ pub fn search_symbol_global(
     let (stripped, lang_filter) = infer_language_from_query(name);
     let search_term = stripped.as_str();
 
+    // #893 B2: repos the fan-out could not open. Surfaced in the payload, not
+    // only as a stderr warning, so a partial cross-repo answer is never read as
+    // a complete one. Stays empty on the single-repo path.
+    let mut skipped: Vec<String> = Vec::new();
+
     let raw = if repo.is_some() {
         // Single-repo path: SEC + stale filtering handled by collect_global.
         collect_global(repos, repo, |store, repo_name, single| {
-            let result = search_symbol_raw(store, search_term, lang_filter, exact);
+            let (_, result) = search_symbol_raw(store, search_term, lang_filter, exact);
             if result.is_empty() || single {
                 result
             } else {
@@ -3782,13 +3817,13 @@ pub fn search_symbol_global(
         candidates.retain(|(_, db)| db.exists());
         let single = candidates.len() == 1;
 
-        let mut parts: Vec<(usize, String)> = Vec::new();
+        let mut parts: Vec<(usize, &str, String)> = Vec::new();
         for (repo_name, db_path) in &candidates {
             match SqliteStore::open_read_only(db_path) {
                 Ok(store) => {
-                    let result = search_symbol_raw(&store, search_term, lang_filter, exact);
+                    let (count, result) =
+                        search_symbol_raw(&store, search_term, lang_filter, exact);
                     if !result.is_empty() {
-                        let count = result.lines().count();
                         let text = if single {
                             result
                         } else {
@@ -3798,17 +3833,24 @@ pub fn search_symbol_global(
                                 .collect::<Vec<_>>()
                                 .join("\n")
                         };
-                        parts.push((count, text));
+                        parts.push((count, repo_name, text));
                     }
                 }
-                Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
+                Err(e) => {
+                    tracing::warn!("failed to open {}: {e}", db_path.display());
+                    skipped.push(format!("{repo_name} ({e})"));
+                }
             }
         }
-        // Most matches first — most relevant repo surfaces at the top.
-        parts.sort_by_key(|b| std::cmp::Reverse(b.0));
+        // Most matches first — most relevant repo surfaces at the top, and
+        // survives the output cap, which truncates from the end. Repo name
+        // breaks ties: without it equal counts keep `HashMap` iteration order,
+        // so the same registry answered differently on each run (#893 B3).
+        parts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        skipped.sort();
         parts
             .into_iter()
-            .map(|(_, text)| text)
+            .map(|(_, _, text)| text)
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -3817,6 +3859,17 @@ pub fn search_symbol_global(
         format!("No symbols matching '{name}' found in the graph.")
     } else {
         raw
+    };
+    // Leading, not trailing: `sanitize_for_mcp` truncates from the end, which is
+    // exactly the large-fan-out case where this note matters most.
+    let content = if skipped.is_empty() {
+        content
+    } else {
+        format!(
+            "[note: this cross-repo answer is partial: {} registered repo(s) could not be opened and were skipped: {}]\n{content}",
+            skipped.len(),
+            skipped.join("; ")
+        )
     };
     sanitize_for_mcp(&content)
 }
@@ -4278,7 +4331,7 @@ pub fn get_graph_stats_global(repos: &HashMap<String, PathBuf>, repo: Option<&st
     let mut total_nodes: u64 = 0;
     let mut total_edges: u64 = 0;
     // DEBT(cloud-launch): counts must be filtered to caller's EdgeFilter scope before SSE ships
-    collect_global(repos, repo, |store, _repo_name, _single| {
+    let skipped_note = collect_global(repos, repo, |store, _repo_name, _single| {
         total_nodes += match store.node_count() {
             Ok(n) => n,
             Err(e) => {
@@ -4295,7 +4348,15 @@ pub fn get_graph_stats_global(repos: &HashMap<String, PathBuf>, repo: Option<&st
         };
         String::new() // accumulation done via captured mutables; return value unused
     });
-    format!("nodes: {total_nodes}\nedges: {total_edges}")
+    let stats = format!("nodes: {total_nodes}\nedges: {total_edges}");
+    // #893 B2: the closure contributes no text, so `collect_global`'s return is
+    // either empty or the skipped-repo note. Without this the totals read as
+    // complete while silently missing every repo that failed to open.
+    if skipped_note.is_empty() {
+        stats
+    } else {
+        format!("{skipped_note}\n{stats}")
+    }
 }
 
 /// Return per-language node counts for the current repo graph.
@@ -8749,6 +8810,216 @@ mod tests {
         );
     }
 
+    // ── #893 B2/B3: global fan-out disclosure + ordering ─────────────────────
+
+    /// Build a file-backed store under `root` holding `n` nodes whose names all
+    /// match the search term "Widget".
+    fn seed_fanout_repo(root: &std::path::Path, n: usize) -> PathBuf {
+        use travsr_core::{Node, VName};
+        let db_path = root.join("graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            for i in 0..n {
+                store
+                    .put_node(&Node::new(
+                        VName::new(
+                            "",
+                            "",
+                            &format!("src/widget_{i}.rs"),
+                            "rust",
+                            &format!("struct:Widget{i}"),
+                        ),
+                        "struct",
+                    ))
+                    .unwrap();
+            }
+        }
+        db_path
+    }
+
+    #[test]
+    fn search_symbol_global_fanout_ranks_by_match_count_and_is_deterministic() {
+        // #893 B3: identical input must produce an identical answer, and the
+        // documented "most matches first" order must be real. `alpha` and
+        // `bravo` tie deliberately: without an explicit tiebreak their relative
+        // order falls out of `HashMap` iteration, which varies per map.
+        let alpha_dir = tempfile::tempdir().unwrap();
+        let bravo_dir = tempfile::tempdir().unwrap();
+        let charlie_dir = tempfile::tempdir().unwrap();
+        let alpha = seed_fanout_repo(alpha_dir.path(), 5);
+        let bravo = seed_fanout_repo(bravo_dir.path(), 5);
+        let charlie = seed_fanout_repo(charlie_dir.path(), 9);
+
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..16 {
+            // Fresh map each round: `HashMap` randomises per instance, so this
+            // is the in-process equivalent of re-running the MCP server.
+            let repos: HashMap<String, PathBuf> = [
+                ("alpha".to_string(), alpha.clone()),
+                ("bravo".to_string(), bravo.clone()),
+                ("charlie".to_string(), charlie.clone()),
+            ]
+            .into();
+            seen.push(search_symbol_global(&repos, "Widget", None, false));
+        }
+        let distinct = {
+            let mut u: Vec<&String> = seen.iter().collect();
+            u.sort();
+            u.dedup();
+            u.len()
+        };
+        let first = &seen[0];
+        assert_eq!(
+            distinct, 1,
+            "fan-out must be deterministic across identical calls, got {distinct} distinct outputs"
+        );
+        let pos = |repo: &str| first.find(&format!("[{repo}]")).unwrap_or(usize::MAX);
+        assert!(
+            pos("charlie") < pos("alpha") && pos("charlie") < pos("bravo"),
+            "most matches first: charlie (9) must precede alpha/bravo (5 each), got: {first}"
+        );
+        assert!(
+            pos("alpha") < pos("bravo"),
+            "equal counts must break deterministically by repo name, got: {first}"
+        );
+    }
+
+    #[test]
+    fn search_symbol_global_fanout_keeps_highest_matching_repo_under_output_cap() {
+        // #893 B3, reproducing the registry measured in the issue: searching
+        // "Server" matched 228 nodes in kubernetes, 120 in travsr and 70 in
+        // AFNetworking. Every one of those renders exactly MAX_SEARCH_RESULTS
+        // lines, so ranking on the *rendered* line count scored all three at 50
+        // — a dead tie that `HashMap` order then broke arbitrarily, after which
+        // the 4 096-byte output cap kept only the winner. kubernetes, the
+        // strongest repo by a factor of three, was the one that vanished.
+        //
+        // Names are chosen so alphabetical order *opposes* match order: if the
+        // ranking silently degraded to the name tiebreak, `zzz-most` would sort
+        // last and this would fail rather than pass by luck.
+        let most_dir = tempfile::tempdir().unwrap();
+        let mid_dir = tempfile::tempdir().unwrap();
+        let least_dir = tempfile::tempdir().unwrap();
+        let most = seed_fanout_repo(most_dir.path(), 228);
+        let mid = seed_fanout_repo(mid_dir.path(), 120);
+        let least = seed_fanout_repo(least_dir.path(), 70);
+
+        for _ in 0..16 {
+            let repos: HashMap<String, PathBuf> = [
+                ("aaa-least".to_string(), least.clone()),
+                ("mmm-mid".to_string(), mid.clone()),
+                ("zzz-most".to_string(), most.clone()),
+            ]
+            .into();
+            let result = search_symbol_global(&repos, "Widget", None, false);
+            assert!(
+                result.contains("[zzz-most]"),
+                "the highest-matching repo must survive the output cap, got: {result}"
+            );
+            let pos = |repo: &str| result.find(&format!("[{repo}]")).unwrap_or(usize::MAX);
+            assert!(
+                pos("zzz-most") < pos("mmm-mid") && pos("mmm-mid") < pos("aaa-least"),
+                "ranking must follow true match count (228 > 120 > 70), got: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_symbol_global_fanout_discloses_repos_it_cannot_open() {
+        // #893 B2: a repo the fan-out cannot open was only reported through a
+        // `tracing::warn` on stderr; the MCP payload looked like a complete
+        // answer. The response must name what it skipped.
+        let good_dir = tempfile::tempdir().unwrap();
+        let bad_dir = tempfile::tempdir().unwrap();
+        let good = seed_fanout_repo(good_dir.path(), 3);
+        let bad = bad_dir.path().join("graph.db");
+        // Not a SQLite database: the read-only open path rejects it.
+        std::fs::write(&bad, b"this is not a sqlite database").unwrap();
+
+        let repos: HashMap<String, PathBuf> =
+            [("goodrepo".to_string(), good), ("badrepo".to_string(), bad)].into();
+        let result = search_symbol_global(&repos, "Widget", None, false);
+        assert!(
+            result.contains("struct:Widget0"),
+            "the readable repo must still answer, got: {result}"
+        );
+        assert!(
+            result.contains("badrepo"),
+            "the skipped repo must be named in the payload, got: {result}"
+        );
+    }
+
+    #[test]
+    fn collect_global_fanout_discloses_repos_it_cannot_open() {
+        // #893 B2: `collect_global` is the shared fan-out behind every global
+        // tool except search_symbol. A repo it could not open was reported only
+        // by a `tracing::warn` on stderr, so get_repo_map / get_blast_radius /
+        // get_graph_stats all returned confidently partial cross-repo answers.
+        let good_dir = tempfile::tempdir().unwrap();
+        let bad_dir = tempfile::tempdir().unwrap();
+        let good = seed_fanout_repo(good_dir.path(), 3);
+        let bad = bad_dir.path().join("graph.db");
+        // Not a SQLite database: the read-only open path rejects it.
+        std::fs::write(&bad, b"this is not a sqlite database").unwrap();
+
+        let repos: HashMap<String, PathBuf> =
+            [("goodrepo".to_string(), good), ("badrepo".to_string(), bad)].into();
+
+        let map = get_repo_map_global(&repos, None);
+        assert!(
+            map.contains("this cross-repo answer is partial"),
+            "get_repo_map_global must disclose the skipped repo, got: {map}"
+        );
+        assert!(
+            map.contains("badrepo"),
+            "the skipped repo must be named in the payload, got: {map}"
+        );
+        assert!(
+            map.contains("[goodrepo]"),
+            "the readable repo must still answer, got: {map}"
+        );
+
+        // The summing tool is the sharpest case: its totals are wrong, not
+        // merely incomplete, when a repo is skipped.
+        let stats = get_graph_stats_global(&repos, None);
+        assert!(
+            stats.contains("badrepo"),
+            "get_graph_stats_global must disclose the skipped repo, got: {stats}"
+        );
+
+        // get_lang_status_global is parsed as JSON by the extension: the note
+        // must not become the line it returns.
+        let lang = get_lang_status_global(&repos, "src/widget_0.rs", None);
+        assert!(
+            lang.starts_with('{'),
+            "get_lang_status_global must stay JSON, got: {lang}"
+        );
+    }
+
+    #[test]
+    fn collect_global_adds_no_note_when_every_repo_opens() {
+        // The disclosure must be invisible unless something was actually
+        // skipped: the no-skips payload stays byte-identical to pre-#893.
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let repos: HashMap<String, PathBuf> = [
+            ("alpha".to_string(), seed_fanout_repo(a_dir.path(), 3)),
+            ("bravo".to_string(), seed_fanout_repo(b_dir.path(), 3)),
+        ]
+        .into();
+
+        let map = get_repo_map_global(&repos, None);
+        assert!(
+            !map.contains("cross-repo answer is partial"),
+            "no repo was skipped, so no note may appear, got: {map}"
+        );
+        let stats = get_graph_stats_global(&repos, None);
+        assert_eq!(
+            stats, "nodes: 6\nedges: 0",
+            "no-skips get_graph_stats_global payload must be unchanged, got: {stats}"
+        );
+    }
+
     // ── search_symbol / get_callers path:line tests ───────────────────────────
 
     #[test]
@@ -8920,7 +9191,7 @@ mod tests {
         store.put_node(&ts_node).unwrap();
 
         // "auth handler typescript" should return only the TypeScript node.
-        let result = search_symbol_raw(&store, "auth", Some("typescript"), false);
+        let (_, result) = search_symbol_raw(&store, "auth", Some("typescript"), false);
         assert!(
             result.contains("src/auth.ts"),
             "expected typescript node: {result}"
@@ -8946,7 +9217,7 @@ mod tests {
         store.put_node(&rs_node).unwrap();
         store.put_node(&ts_node).unwrap();
 
-        let result = search_symbol_raw(&store, "auth", None, false);
+        let (_, result) = search_symbol_raw(&store, "auth", None, false);
         assert!(
             result.contains("auth.rs"),
             "rust node must appear: {result}"
