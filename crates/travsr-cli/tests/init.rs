@@ -501,3 +501,272 @@ fn ref_edge_count(db_path: &std::path::Path) -> usize {
         .filter(|(_, _, kind, _)| kind.starts_with("ref/"))
         .count()
 }
+
+// ── #893: `travsr init` must fence `.travsr/` off from git ────────────────────
+
+/// `git` that is expected to fail, returning combined output for assertions.
+fn git_try(dir: &std::path::Path, args: &[&str]) -> (bool, String) {
+    let out = StdCommand::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap_or_else(|_| panic!("git {args:?} failed to spawn"));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), combined)
+}
+
+/// `travsr init` with `HOME` pointed at an empty directory, so the `connect`
+/// step detects no AI tool and writes no `.gitignore` block of its own. Without
+/// this the assertions below would depend on what the developer running the
+/// suite happens to have installed.
+fn travsr_init_isolated(dir: &std::path::Path, home: &std::path::Path) -> String {
+    let out = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
+        .env("HOME", home)
+        .current_dir(dir)
+        .arg("init")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// #893 A1: the issue's repro, verbatim. `travsr init` writes `.travsrignore`
+/// but used to say nothing about `.gitignore`, so the next `git add -A` committed
+/// `graph.db` and its WAL. The WAL changes on every read, which leaves the
+/// working tree permanently dirty and makes `git revert` — and every other
+/// operation that needs a clean tree — refuse to run, forever.
+#[test]
+fn init_gitignores_travsr_dir_so_revert_keeps_working() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c1"]);
+
+    travsr_init_isolated(tmp.path(), home.path());
+
+    std::fs::write(
+        tmp.path().join("b.ts"),
+        "export function b() { return 2; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c2"]);
+
+    // The direct symptom: git must not be holding the graph.
+    let (_, tracked) = git_try(tmp.path(), &["ls-files", "--", ".travsr"]);
+    assert!(
+        tracked.trim().is_empty(),
+        "`git add -A` after `travsr init` must not stage anything under .travsr/, got:\n{tracked}"
+    );
+
+    // The consequence the issue reports: with the graph committed, the WAL keeps
+    // the tree dirty and this aborts with "local changes would be overwritten".
+    let (ok, out) = git_try(tmp.path(), &["revert", "--no-edit", "HEAD"]);
+    assert!(
+        ok,
+        "git revert must still work after `travsr init`, got:\n{out}"
+    );
+}
+
+/// #893 A1, the other half: a `.gitignore` entry has no effect on a path git
+/// already tracks, so for a repo that committed `.travsr/` before this scaffold
+/// existed the entry alone fixes nothing. `travsr init` must say so and name the
+/// command that recovers, rather than reporting success over a repo that is
+/// still deadlocked. It must not untrack the files itself — that rewrites the
+/// user's index, which init has no mandate to do.
+#[test]
+fn init_reports_an_already_tracked_travsr_dir_instead_of_untracking_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c1"]);
+    travsr_init_isolated(tmp.path(), home.path());
+
+    // The state a pre-fix repo is already in.
+    git(tmp.path(), &["add", "-f", ".travsr"]);
+    git(tmp.path(), &["commit", "-q", "-m", "oops"]);
+
+    let combined = travsr_init_isolated(tmp.path(), home.path());
+    assert!(
+        combined.contains("git rm -r --cached .travsr"),
+        "init over a repo that already tracks .travsr/ must name the recovery command, got:\n{combined}"
+    );
+
+    let (_, tracked) = git_try(tmp.path(), &["ls-files", "--", ".travsr"]);
+    assert!(
+        !tracked.trim().is_empty(),
+        "init must not rewrite the user's index on their behalf"
+    );
+}
+
+/// #893 A1: the entry is appended once. `git check-ignore` reports an already
+/// *tracked* path as not-ignored regardless of the rules in force, so an
+/// idempotency guard that forgets `--no-index` appends a duplicate on every
+/// re-init of exactly the repos this fix exists to help.
+#[test]
+fn init_appends_the_gitignore_entry_only_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c1"]);
+
+    travsr_init_isolated(tmp.path(), home.path());
+    git(tmp.path(), &["add", "-f", ".travsr"]);
+    travsr_init_isolated(tmp.path(), home.path());
+    travsr_init_isolated(tmp.path(), home.path());
+
+    let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+    assert_eq!(
+        gi.lines().filter(|l| l.trim() == "/.travsr/").count(),
+        1,
+        "repeated `travsr init` must not stack duplicate entries, got:\n{gi}"
+    );
+}
+
+// ── #893: `git reset --hard` must not be papered over by the next commit ──────
+
+/// #893 A2: git fires no hook for `git reset --hard`, so with no daemon running
+/// the graph keeps the discarded commit's files. `travsr status` did notice
+/// (`last_commit` != HEAD) — but the next unrelated commit reindexed only its
+/// own diff and then stamped `last_commit` to HEAD, so the two agreed again, the
+/// drift note vanished, and the ghost stayed. `travsr ask` answered with it at
+/// `confidence: exact`.
+#[test]
+fn hook_run_after_reset_hard_prunes_the_discarded_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+
+    // The issue's A2 repro writes this itself. Keep it, so this test isolates
+    // the reset defect instead of also depending on the A1 scaffold above: with
+    // `.travsr/` committed, the `git reset --hard` below deletes the graph and
+    // the failure is a missing database rather than a ghost node.
+    std::fs::write(tmp.path().join(".gitignore"), ".travsr/\n").unwrap();
+    std::fs::write(
+        tmp.path().join("keep.ts"),
+        "export function keep() { return 1; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c1"]);
+    travsr_init_isolated(tmp.path(), home.path());
+
+    let before = StdCommand::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let before = String::from_utf8_lossy(&before.stdout).trim().to_string();
+
+    std::fs::write(
+        tmp.path().join("gone.ts"),
+        "export function gone() { return 2; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c2"]);
+
+    git(tmp.path(), &["reset", "--hard", "-q", &before]);
+    assert!(
+        !tmp.path().join("gone.ts").exists(),
+        "precondition: the reset removed the file from disk"
+    );
+
+    // The unrelated commit that used to silence the still-true drift note.
+    std::fs::write(
+        tmp.path().join("other.ts"),
+        "export function other() { return 3; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c3"]);
+    Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
+        .env("HOME", home.path())
+        .current_dir(tmp.path())
+        .args(["hook-run", "--from-hook"])
+        .assert()
+        .success();
+
+    // The issue's own measurement.
+    let out = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
+        .env("HOME", home.path())
+        .current_dir(tmp.path())
+        .arg("fsck")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let fsck = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !fsck.contains("gone.ts"),
+        "the file the reset discarded must not survive as a ghost, got:\n{fsck}"
+    );
+
+    // And the commit that *did* reconcile is still allowed to claim freshness,
+    // so `travsr status` does not nag after every commit.
+    let store = SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+    let head = StdCommand::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        store.get_meta("last_commit").unwrap().unwrap_or_default(),
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "a reconciled tree must still stamp HEAD"
+    );
+
+    // The fast path must survive: a commit on top of an ancestor marker still
+    // reindexes only its own diff, so this fix costs nothing on the common path.
+    std::fs::write(
+        tmp.path().join("more.ts"),
+        "export function more() { return 4; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c4"]);
+    assert!(travsr_daemon::commit_is_ancestor_of_head(
+        tmp.path(),
+        &SqliteStore::open(&tmp.path().join(".travsr/graph.db"))
+            .unwrap()
+            .get_meta("last_commit")
+            .unwrap()
+            .unwrap_or_default()
+    ));
+}
