@@ -210,9 +210,12 @@ from the current git root.
 
 ## MCP Tools
 
-All tool responses are wrapped in a `<travsr-data>` envelope and sanitized
-before being returned, so returned content is safe to pass directly into LLM
-context (control characters stripped, prompt-injection vectors neutralised).
+All tool responses are wrapped in a `<travsr-data>` envelope and structurally
+sanitized before being returned: control characters are stripped, `<` and `>`
+are escaped so the envelope cannot be forged, and the payload is truncated to a
+byte ceiling. That is a structural guarantee, not a semantic one. File paths,
+documentation headings and source comments are author-controlled text, so treat
+returned content as untrusted data rather than as instructions.
 
 In global mode, tools that accept a `file` or `symbol` argument also accept
 an optional `repo` parameter to target a specific registered repo. Omitting
