@@ -3,7 +3,7 @@ use crate::dispatcher::Dispatcher;
 use crate::plugins::response_to_output;
 use crate::registry::register_builtins;
 use crate::resolver::PluginResolver;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use travsr_core::Language;
 use travsr_error::IndexError;
@@ -535,8 +535,10 @@ impl PluginIndexer {
             NativeTypescript,
             /// Python: run in-process for same reason as NativeRust.
             NativePython,
-            /// All other languages: spawn a sidecar subprocess.
-            Sidecar(crate::resolver::PluginSpec),
+            /// All other languages: spawn a sidecar subprocess, once per
+            /// directory to hand it as `InvokeRequest.root` (#724 Finding 5).
+            /// Always at least one entry.
+            Sidecar(crate::resolver::PluginSpec, Vec<PathBuf>),
         }
 
         struct WorkItem {
@@ -680,9 +682,23 @@ impl PluginIndexer {
                 Some(spec) => {
                     tracing::debug!(lang = %lang, program = %spec.program, "Phase B: resolved spec");
                     let files = lang_files(&lang);
+                    // #724 Finding 5: a build-system-driven analyzer indexes the
+                    // directory it is handed, so a project whose manifest sits
+                    // below the repo root fails outright ("No build tool detected
+                    // in workspace"). Hand it the build roots instead, one invoke
+                    // each. Languages with no manifest list keep getting a single
+                    // invoke at the repo root.
+                    let mut invoke_roots = build_roots(
+                        repo_root,
+                        files.as_deref().unwrap_or(&[]),
+                        crate::phase_b::catalog::build_manifests(lang.as_str()),
+                    );
+                    if invoke_roots.is_empty() {
+                        invoke_roots.push(repo_root.to_path_buf());
+                    }
                     work_items.push(WorkItem {
                         lang,
-                        work: LangWork::Sidecar(spec),
+                        work: LangWork::Sidecar(spec, invoke_roots),
                         files,
                     });
                 }
@@ -734,7 +750,7 @@ impl PluginIndexer {
                         // call `phase_b_native_*` in-process with no ceiling, and
                         // a surface that quotes one for them states a limit that
                         // does not exist.
-                        let is_sidecar = matches!(item.work, LangWork::Sidecar(_));
+                        let is_sidecar = matches!(item.work, LangWork::Sidecar(..));
                         let _mark = LivenessMark::new(liveness, &lang, is_sidecar);
                         let result = match item.work {
                             LangWork::Dart => {
@@ -1118,136 +1134,138 @@ impl PluginIndexer {
                                     version_mismatch: None,
                                 }
                             }
-                            LangWork::Sidecar(spec) => {
-                                // #388: both the spawn handshake and the invoke
-                                // round-trip are now watchdog-guarded inside the
-                                // transport (HANDSHAKE_TIMEOUT_SECS / INVOKE_TIMEOUT_SECS),
-                                // so a wedged plugin is killed and surfaced as a
-                                // crash instead of hanging this scoped thread — no
-                                // bespoke timeout needed here.
-                                let req = travsr_plugin_protocol::InvokeRequest {
-                                    // Strip the Windows `\\?\` verbatim prefix ONCE here,
-                                    // for every sidecar: the daemon's repo_root is
-                                    // canonicalized (extended-length) on Windows, and
-                                    // analyzers that build a URI / working-directory from
-                                    // it (scip-dotnet, sbt, KLS) choke on the prefix. This
-                                    // is the systemic counterpart to the per-wrapper strips
-                                    // (kotlin K7, scala S7, csharp) — belt and suspenders.
-                                    root: crate::sandbox::toolchain::strip_windows_verbatim(
-                                        repo_root.to_path_buf(),
-                                    ),
-                                    corpus: corpus.to_string(),
-                                    scratch: std::path::PathBuf::default(),
-                                    // P6 (#329): forward pre-walked file list so the
-                                    // sidecar skips its own directory walk.
-                                    files: item.files,
+                            LangWork::Sidecar(spec, invoke_roots) => {
+                                // #724 Finding 5: one invoke per build root, in
+                                // sequence. Sibling projects are separate builds,
+                                // so each gets its own analyzer run, and each
+                                // reports paths relative to its own root. The
+                                // per-root outcomes fold into one result here so
+                                // the merge below still sees one entry per
+                                // language.
+                                let mut acc = LangResult {
+                                    lang: lang.clone(),
+                                    nodes: Vec::new(),
+                                    edges: Vec::new(),
+                                    refs: Vec::new(),
+                                    unresolved_calls: Vec::new(),
+                                    positional_refs: Vec::new(),
+                                    ran: false,
+                                    skipped_no_analyzer: false,
+                                    crashed: false,
+                                    version_mismatch: None,
                                 };
-                                match crate::transport::Sidecar::spawn(&spec, repo_root) {
-                                    Ok(sidecar) => {
-                                        let result = match crate::transport::Transport::invoke_phase_b(
-                                            &sidecar, req,
-                                        ) {
-                                            Ok(resp) => {
-                                                tracing::debug!(
-                                                    lang = %lang,
-                                                    nodes = resp.nodes.len(),
-                                                    edges = resp.edges.len(),
-                                                    refs = resp.refs.len(),
-                                                    unresolved_calls = resp.unresolved_calls.len(),
-                                                    "Phase B: invoke complete"
-                                                );
-                                                LangResult {
-                                                    lang,
-                                                    nodes: resp.nodes,
-                                                    edges: resp.edges,
-                                                    refs: resp.refs,
-                                                    unresolved_calls: resp.unresolved_calls,
-                                                    positional_refs: Vec::new(),
-                                                    ran: true,
-                                                    skipped_no_analyzer: false,
-                                                    crashed: false,
-                                                    version_mismatch: None,
-                                                }
-                                            }
-                                            Err(travsr_error::IndexError::PhaseNotSupported) => {
-                                                tracing::debug!(
-                                                    lang = %lang,
-                                                    "Phase B: PhaseNotSupported (sidecar declined)"
-                                                );
-                                                LangResult {
-                                                    lang,
-                                                    nodes: Vec::new(),
-                                                    edges: Vec::new(),
-                                                    refs: Vec::new(),
-                                                    unresolved_calls: Vec::new(),
-                                                    positional_refs: Vec::new(),
-                                                    ran: false,
-                                                    skipped_no_analyzer: true,
-                                                    crashed: false,
-                                                    version_mismatch: None,
-                                                }
-                                            }
-                                            // H4: version mismatch is actionable — surface it
-                                            // separately from generic crashes so the user knows
-                                            // to run `travsr lang install <lang>` to upgrade.
-                                            Err(travsr_error::IndexError::ProtocolVersionMismatch {
-                                                expected,
-                                                got,
-                                            }) => {
-                                                tracing::warn!(
-                                                    lang = %lang,
-                                                    expected,
-                                                    got,
-                                                    "Phase B: protocol version mismatch; run `travsr lang install {lang}` to upgrade"
-                                                );
-                                                LangResult {
-                                                    lang,
-                                                    nodes: Vec::new(),
-                                                    edges: Vec::new(),
-                                                    refs: Vec::new(),
-                                                    unresolved_calls: Vec::new(),
-                                                    positional_refs: Vec::new(),
-                                                    ran: false,
-                                                    skipped_no_analyzer: false,
-                                                    crashed: false,
-                                                    version_mismatch: Some((expected, got)),
-                                                }
-                                            }
+                                let mut declined = 0usize;
+                                for invoke_root in &invoke_roots {
+                                    // What this root reports paths relative to.
+                                    // Empty when it IS the repo root, which is
+                                    // every language that drives no build system.
+                                    let path_prefix = invoke_root
+                                        .strip_prefix(repo_root)
+                                        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                                        .unwrap_or_default();
+                                    // Only this root's own sources: the others are
+                                    // covered by their own invoke, and naming them
+                                    // here would index them twice.
+                                    let under = format!("{path_prefix}/");
+                                    let files = item.files.as_ref().map(|all| {
+                                        all.iter()
+                                            .filter(|p| {
+                                                path_prefix.is_empty() || p.starts_with(&under)
+                                            })
+                                            .cloned()
+                                            .collect()
+                                    });
+                                    // #388: both the spawn handshake and the invoke
+                                    // round-trip are now watchdog-guarded inside the
+                                    // transport (HANDSHAKE_TIMEOUT_SECS / INVOKE_TIMEOUT_SECS),
+                                    // so a wedged plugin is killed and surfaced as a
+                                    // crash instead of hanging this scoped thread. The
+                                    // ceiling is per invoke, so N roots cost up to N
+                                    // times the single-root budget.
+                                    let req = travsr_plugin_protocol::InvokeRequest {
+                                        // Strip the Windows `\\?\` verbatim prefix ONCE here,
+                                        // for every sidecar: the daemon's repo_root is
+                                        // canonicalized (extended-length) on Windows, and
+                                        // analyzers that build a URI / working-directory from
+                                        // it (scip-dotnet, sbt, KLS) choke on the prefix. This
+                                        // is the systemic counterpart to the per-wrapper strips
+                                        // (kotlin K7, scala S7, csharp) — belt and suspenders.
+                                        root: crate::sandbox::toolchain::strip_windows_verbatim(
+                                            invoke_root.clone(),
+                                        ),
+                                        corpus: corpus.to_string(),
+                                        scratch: std::path::PathBuf::default(),
+                                        // P6 (#329): forward pre-walked file list so the
+                                        // sidecar skips its own directory walk.
+                                        files,
+                                    };
+                                    // The sandbox is still anchored at the repo
+                                    // root (ADR-017): a build root is inside it by
+                                    // construction, so no grant widens here.
+                                    let sidecar =
+                                        match crate::transport::Sidecar::spawn(&spec, repo_root) {
+                                            Ok(sidecar) => sidecar,
                                             Err(e) => {
-                                                tracing::warn!("Phase B {lang}: {e}");
-                                                LangResult {
-                                                    lang,
-                                                    nodes: Vec::new(),
-                                                    edges: Vec::new(),
-                                                    refs: Vec::new(),
-                                                    unresolved_calls: Vec::new(),
-                                                    positional_refs: Vec::new(),
-                                                    ran: false,
-                                                    skipped_no_analyzer: false,
-                                                    crashed: true,
-                                                    version_mismatch: None,
-                                                }
+                                                // Resolver confirmed the binary exists — spawn failure is a crash.
+                                                tracing::warn!("Phase B sidecar spawn {lang}: {e}");
+                                                acc.crashed = true;
+                                                continue;
                                             }
                                         };
-                                        result
-                                    }
-                                    Err(e) => {
-                                        // Resolver confirmed the binary exists — spawn failure is a crash.
-                                        tracing::warn!("Phase B sidecar spawn {lang}: {e}");
-                                        LangResult {
-                                            lang,
-                                            nodes: Vec::new(),
-                                            edges: Vec::new(),
-                                            refs: Vec::new(),
-                                            unresolved_calls: Vec::new(),
-                                            positional_refs: Vec::new(),
-                                            ran: false,
-                                            skipped_no_analyzer: false,
-                                            crashed: true,
-                                            version_mismatch: None,
+                                    match crate::transport::Transport::invoke_phase_b(&sidecar, req)
+                                    {
+                                        Ok(mut resp) => {
+                                            if !path_prefix.is_empty() {
+                                                rebase_to_repo_root(&mut resp, &path_prefix);
+                                            }
+                                            tracing::debug!(
+                                                lang = %lang,
+                                                root = %invoke_root.display(),
+                                                nodes = resp.nodes.len(),
+                                                edges = resp.edges.len(),
+                                                refs = resp.refs.len(),
+                                                unresolved_calls = resp.unresolved_calls.len(),
+                                                "Phase B: invoke complete"
+                                            );
+                                            acc.ran = true;
+                                            acc.nodes.extend(resp.nodes);
+                                            acc.edges.extend(resp.edges);
+                                            acc.refs.extend(resp.refs);
+                                            acc.unresolved_calls.extend(resp.unresolved_calls);
+                                        }
+                                        Err(travsr_error::IndexError::PhaseNotSupported) => {
+                                            declined += 1;
+                                            tracing::debug!(
+                                                lang = %lang,
+                                                "Phase B: PhaseNotSupported (sidecar declined)"
+                                            );
+                                        }
+                                        // H4: version mismatch is actionable — surface it
+                                        // separately from generic crashes so the user knows
+                                        // to run `travsr lang install <lang>` to upgrade.
+                                        Err(travsr_error::IndexError::ProtocolVersionMismatch {
+                                            expected,
+                                            got,
+                                        }) => {
+                                            tracing::warn!(
+                                                lang = %lang,
+                                                expected,
+                                                got,
+                                                "Phase B: protocol version mismatch; run `travsr lang install {lang}` to upgrade"
+                                            );
+                                            acc.version_mismatch.get_or_insert((expected, got));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Phase B {lang}: {e}");
+                                            acc.crashed = true;
                                         }
                                     }
                                 }
+                                // "No analyzer" only when EVERY root declined: one
+                                // root answering proves the sidecar implements
+                                // Phase B for this language.
+                                acc.skipped_no_analyzer = declined == invoke_roots.len();
+                                acc
                             }
                         };
                         // No explicit `finish` here: `_mark` runs it on the way
@@ -1289,6 +1307,13 @@ impl PluginIndexer {
         let mut all_positional_refs: Vec<travsr_core::LsifPositionalRef> = Vec::new();
 
         for r in lang_results {
+            // #724 Finding 5: with N build roots one can fail while another
+            // succeeds, so `crashed` is recorded outside the `else` ladder and a
+            // partial run reports as both ran and crashed rather than clean
+            // (#877). One root behaves exactly as before: never both.
+            if r.crashed {
+                outcome.crashed.push(r.lang.clone());
+            }
             if r.ran {
                 // #712: Phase B only invokes languages present in the repo, so a
                 // clean run that yields nothing means the analyzer indexed
@@ -1320,8 +1345,6 @@ impl PluginIndexer {
                 outcome.version_mismatch.push((r.lang, expected, got));
             } else if r.skipped_no_analyzer {
                 outcome.skipped_no_analyzer.push(r.lang);
-            } else if r.crashed {
-                outcome.crashed.push(r.lang);
             }
             all_nodes.extend(r.nodes);
             all_edges.extend(r.edges);
@@ -1397,6 +1420,93 @@ impl PluginIndexer {
     ) -> (Vec<travsr_core::Node>, Vec<travsr_core::Edge>) {
         travsr_indexer::Indexer::with_corpus(&self.corpus).resolve_workspace_deps(markers)
     }
+}
+
+/// Re-express a sidecar response's paths against the repo root.
+///
+/// A sidecar invoked at a nested build root reports paths relative to THAT
+/// directory, so `src/main/java/App.java` names a file the graph knows as
+/// `screengrab/src/main/java/App.java` and unifies with no Phase A node.
+/// Prefixing restores the repo-root-relative form every other producer emits.
+///
+/// A node's id is derived from its VName, so correcting the path changes the id:
+/// every id in the response that pointed at a rewritten node is remapped with
+/// it, keeping the batch internally consistent.
+fn rebase_to_repo_root(resp: &mut travsr_plugin_protocol::InvokeResponse, prefix: &str) {
+    let mut remap: HashMap<travsr_core::NodeId, travsr_core::NodeId> = HashMap::new();
+    for node in &mut resp.nodes {
+        let before = node.id;
+        node.vname.path = format!("{prefix}/{}", node.vname.path);
+        node.id = node.vname.id();
+        remap.insert(before, node.id);
+    }
+    for edge in &mut resp.edges {
+        if let Some(id) = remap.get(&edge.src) {
+            edge.src = *id;
+        }
+        if let Some(id) = remap.get(&edge.dst) {
+            edge.dst = *id;
+        }
+    }
+    for scip_ref in &mut resp.refs {
+        scip_ref.caller_path = format!("{prefix}/{}", scip_ref.caller_path);
+        if let Some(id) = remap.get(&scip_ref.callee_id) {
+            scip_ref.callee_id = *id;
+        }
+    }
+    for call in &mut resp.unresolved_calls {
+        if let Some(id) = remap.get(&call.src) {
+            call.src = *id;
+        }
+    }
+}
+
+/// The directories a build-system-driven analyzer should be invoked in: every
+/// directory at or below `repo_root` that holds one of `manifests`, is an
+/// ancestor of one of `files` (repo-root-relative paths), and is not itself
+/// inside another such directory.
+///
+/// Outermost wins, so a multi-module build is handed its aggregator manifest
+/// once rather than once per module: invoking `a/module1` as well as `a` would
+/// index the same sources twice. Sibling projects with no manifest above them
+/// (`a/pom.xml` and `b/pom.xml`) are genuinely separate builds, so both are
+/// returned and the caller invokes the analyzer once per root.
+///
+/// Empty when `manifests` is empty (the language does not drive a build), when
+/// there is no pre-walked file list, or when nothing qualifies; the caller then
+/// falls back to the repo root, which is the behaviour that shipped.
+fn build_roots(repo_root: &Path, files: &[String], manifests: &[&str]) -> Vec<PathBuf> {
+    if manifests.is_empty() {
+        return Vec::new();
+    }
+    let mut walked: HashSet<PathBuf> = HashSet::new();
+    let mut found: Vec<PathBuf> = Vec::new();
+    for rel in files {
+        let mut dir = repo_root.join(rel);
+        // First `pop` drops the file name; the walk then stops once it steps
+        // above `repo_root`, so discovery never leaves the indexed repo.
+        while dir.pop() && dir.starts_with(repo_root) {
+            // Every ancestor of an already-walked directory is walked too, so
+            // this bounds the whole scan to one manifest probe per directory.
+            if !walked.insert(dir.clone()) {
+                break;
+            }
+            if manifests.iter().any(|m| dir.join(m).is_file()) {
+                found.push(dir.clone());
+            }
+        }
+    }
+    // Sorting puts every ancestor immediately before the directories it
+    // contains, so one pass keeps the outermost of each nest and drops the
+    // rest. It also makes the invoke order deterministic.
+    found.sort();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for dir in found {
+        if !roots.iter().any(|root| dir.starts_with(root)) {
+            roots.push(dir);
+        }
+    }
+    roots
 }
 
 /// Locate the repo whose `.travsr/config.toml` governs `abs_path`, by walking
@@ -1476,6 +1586,58 @@ mod tests {
         for lang in ["java", "rust", "dart", "go"] {
             assert_eq!(classify_empty_output(lang, false, false), EmptyOutput::Fine);
         }
+    }
+
+    /// #724 Finding 5: the directory a build-driven analyzer is handed.
+    #[test]
+    fn build_roots_are_the_outermost_manifest_directories_above_the_source_files() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let java = ["pom.xml"];
+        let no_roots: Vec<std::path::PathBuf> = Vec::new();
+
+        // No manifest anywhere: the caller falls back to the repo root.
+        std::fs::create_dir_all(root.join("screengrab/src/main/java")).expect("mkdir");
+        let files = vec!["screengrab/src/main/java/App.java".to_string()];
+        assert_eq!(build_roots(root, &files, &java), no_roots);
+
+        // Manifest one level down: that directory, not the repo root.
+        std::fs::write(root.join("screengrab/pom.xml"), "").expect("write");
+        assert_eq!(
+            build_roots(root, &files, &java),
+            vec![root.join("screengrab")]
+        );
+
+        // A module manifest below it does not add a second root: the aggregator
+        // drives its own modules, so invoking both would index them twice.
+        std::fs::write(root.join("screengrab/src/pom.xml"), "").expect("write");
+        assert_eq!(
+            build_roots(root, &files, &java),
+            vec![root.join("screengrab")]
+        );
+
+        // A language with no manifest list is never rebased.
+        assert_eq!(build_roots(root, &files, &[]), no_roots);
+
+        // Siblings with nothing above them are separate builds: one root each.
+        std::fs::create_dir_all(root.join("a/src")).expect("mkdir");
+        std::fs::create_dir_all(root.join("b/src")).expect("mkdir");
+        std::fs::write(root.join("a/pom.xml"), "").expect("write");
+        std::fs::write(root.join("b/pom.xml"), "").expect("write");
+        let siblings = vec!["a/src/App.java".to_string(), "b/src/App.java".to_string()];
+        assert_eq!(
+            build_roots(root, &siblings, &java),
+            vec![root.join("a"), root.join("b")]
+        );
+
+        // A manifest at the repo root subsumes both siblings again.
+        std::fs::write(root.join("pom.xml"), "").expect("write");
+        assert_eq!(
+            build_roots(root, &siblings, &java),
+            vec![root.to_path_buf()]
+        );
     }
 
     use super::*;

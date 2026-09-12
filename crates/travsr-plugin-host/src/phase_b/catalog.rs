@@ -912,6 +912,30 @@ pub fn lookup(language: &str) -> Option<&'static PhaseBEntry> {
     CATALOG.iter().find(|e| e.language == language)
 }
 
+/// Filenames that mark a directory as a workspace this language's analyzer can
+/// index (#724 Finding 5).
+///
+/// A build-system-driven analyzer autoindexes the directory it is handed:
+/// scip-java exits with "No build tool detected in workspace" when that
+/// directory holds no Maven or Gradle manifest, which is every repo whose
+/// project lives one level down. Phase B uses this list to hand the analyzer
+/// the nearest directory that does have a manifest instead.
+///
+/// Empty for analyzers that do not drive a build system; those keep being
+/// invoked at the repo root.
+pub fn build_manifests(language: &str) -> &'static [&'static str] {
+    match language {
+        "java" => &[
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+        ],
+        _ => &[],
+    }
+}
+
 // ── RFC-025 SidecarSpec impls ───────────────────────────────────────────────
 //
 // The Phase B family joins the embed sidecar under the one shared version
