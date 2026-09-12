@@ -358,12 +358,20 @@ fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
 ///
 /// `zero_nodes` is likewise excluded: an analyzer that ran and found nothing is a
 /// valid answer, not missing coverage.
+///
+/// #878 adds `emitter_missing` / `emitter_failed`: the TypeScript LSIF pass was
+/// due but `travsr-lsif-ts` never ran, so the language kept only its tree-sitter
+/// call edges (a fraction of the compiler-derived set) under a marker that read
+/// complete. `travsr status` downgrades to `partial (incomplete: ...)` for the
+/// same classes.
 fn phase_b_unanalyzed_note(store: &SqliteStore) -> Option<String> {
     const CLASSES: &[&str] = &[
         "crashed",
         "skipped_no_analyzer",
         "needs_approval",
         "needs_consent",
+        "emitter_missing",
+        "emitter_failed",
     ];
     let warnings = store.get_meta("phase_b_warnings").ok().flatten()?;
     let mut langs: Vec<&str> = Vec::new();
@@ -384,10 +392,13 @@ fn phase_b_unanalyzed_note(store: &SqliteStore) -> Option<String> {
     if langs.is_empty() {
         return None;
     }
+    // "or not all of them": the #878 classes leave a language with some call
+    // edges (native) but not the compiler-derived rest, so "no call edges" alone
+    // would overstate the gap while a short answer is still not authoritative.
     Some(format!(
-        "[note: no call edges were produced for {} on the last semantic analysis run, \
-         so an empty result here is not authoritative for {}. Run `travsr status` for the \
-         reason and the fix.]",
+        "[note: no call edges, or not all of them, were produced for {} on the last \
+         semantic analysis run, so an empty or short result here is not authoritative \
+         for {}. Run `travsr status` for the reason and the fix.]",
         langs.join(", "),
         if langs.len() == 1 {
             "that language"
@@ -680,26 +691,50 @@ pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
 /// not on whether the run that produced them finished. Callers append a one-line
 /// caveat (they do not abstain — a partial answer is still useful) so the note is
 /// attached to exactly the answers that might be incomplete.
-fn phase_b_lang_crashed(store: &SqliteStore, lang: &str) -> bool {
-    store
-        .get_meta("phase_b_warnings")
-        .ok()
-        .flatten()
-        .is_some_and(|warnings| {
-            warnings.split(',').any(|entry| {
-                let mut parts = entry.splitn(3, ':');
-                parts.next() == Some("crashed") && parts.next() == Some(lang)
+/// The `phase_b_warnings` classes that leave a language with *partial* call-edge
+/// coverage under a completion marker that reads current: a crash (#715), and
+/// the TypeScript LSIF pass skipping while the native pass ran (#878). Every
+/// other class either means the language produced nothing at all (already
+/// handled by the empty-result gates) or is not a coverage statement.
+const PARTIAL_COVERAGE_CLASSES: &[&str] = &["crashed", "emitter_missing", "emitter_failed"];
+
+/// Which partial-coverage class, if any, the last Phase B run recorded for
+/// `lang`. Matches a whole `class:lang` entry, never a prefix.
+fn phase_b_lang_incomplete(store: &SqliteStore, lang: &str) -> Option<&'static str> {
+    let warnings = store.get_meta("phase_b_warnings").ok().flatten()?;
+    warnings.split(',').find_map(|entry| {
+        let mut parts = entry.splitn(3, ':');
+        let class = parts.next()?;
+        (parts.next() == Some(lang))
+            .then(|| {
+                PARTIAL_COVERAGE_CLASSES
+                    .iter()
+                    .copied()
+                    .find(|c| *c == class)
             })
-        })
+            .flatten()
+    })
 }
 
 /// The one-line caveat appended to a get_callers / find_references answer when
-/// [`phase_b_lang_crashed`] holds for the target language.
-fn crash_caveat(lang: &str) -> String {
+/// [`phase_b_lang_incomplete`] holds for the target language. The `crashed`
+/// wording is unchanged from #715; the #878 classes name the skipped analyzer.
+fn incomplete_caveat(lang: &str, class: &str) -> String {
+    let cause = match class {
+        "emitter_missing" => {
+            "the TypeScript analyzer (travsr-lsif-ts) could not be started on its last run"
+        }
+        "emitter_failed" => "the TypeScript analyzer (travsr-lsif-ts) failed on its last run",
+        _ => "crashed on its last run",
+    };
+    let subject = if class == "crashed" {
+        format!("semantic analysis for '{lang}' {cause}")
+    } else {
+        format!("semantic analysis for '{lang}' is incomplete: {cause}")
+    };
     format!(
-        "note: semantic analysis for '{lang}' crashed on its last run, so these \
-         results may be incomplete. Run `travsr status` for detail or `travsr init \
-         --semantic --force` to rebuild."
+        "note: {subject}, so these results may be incomplete. Run `travsr status` for \
+         detail or `travsr init --semantic --force` to rebuild."
     )
 }
 
@@ -912,11 +947,14 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     if lines.iter().any(|l| l.ends_with(HEURISTIC_SIGIL_ROW)) {
         lines.push(HEURISTIC_LEGEND.to_string());
     }
-    // #715: a crash in this language's last Phase B run leaves partial coverage
-    // while the marker reads complete, so this list may be missing callers in the
-    // un-indexed files. Attach the caveat to the confident (non-empty) answer.
-    if !lines.is_empty() && phase_b_lang_crashed(store, &seed.vname.language) {
-        lines.push(crash_caveat(&seed.vname.language));
+    // #715 / #878: a crash, or a skipped LSIF pass, in this language's last
+    // Phase B run leaves partial coverage while the marker reads complete, so
+    // this list may be missing callers. Attach the caveat to the confident
+    // (non-empty) answer.
+    if !lines.is_empty() {
+        if let Some(class) = phase_b_lang_incomplete(store, &seed.vname.language) {
+            lines.push(incomplete_caveat(&seed.vname.language, class));
+        }
     }
     lines.join("\n")
 }
@@ -1677,11 +1715,12 @@ pub fn find_references_structured(
             out.total = Some(total);
             out.truncated = total > MAX_REFERENCE_SITES;
             out.references = sites.into_iter().take(MAX_REFERENCE_SITES).collect();
-            // #715 parity with the text path: a crashed last Phase B run leaves
-            // partial coverage under a complete marker, so even a non-empty site
-            // list may be short. Surface the same caveat instead of `note: None`.
-            if phase_b_lang_crashed(store, &target.vname.language) {
-                out.note = Some(crash_caveat(&target.vname.language));
+            // #715 / #878 parity with the text path: a crashed last Phase B run,
+            // or a skipped LSIF pass, leaves partial coverage under a complete
+            // marker, so even a non-empty site list may be short. Surface the
+            // same caveat instead of `note: None`.
+            if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
+                out.note = Some(incomplete_caveat(&target.vname.language, class));
             }
         }
         _ => {
@@ -1829,10 +1868,11 @@ fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String 
             if total > shown {
                 lines.push(format!("[truncated: showing {shown} of {total} sites]"));
             }
-            // #715: a crashed last run leaves partial coverage under a complete
-            // marker, so this occurrence list may be short.
-            if phase_b_lang_crashed(store, &target.vname.language) {
-                lines.push(crash_caveat(&target.vname.language));
+            // #715 / #878: a crashed last run, or a skipped LSIF pass, leaves
+            // partial coverage under a complete marker, so this occurrence list
+            // may be short.
+            if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
+                lines.push(incomplete_caveat(&target.vname.language, class));
             }
             lines.join("\n")
         }
@@ -1871,16 +1911,23 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // ref/call edges exist for this node. #299 M1: three very different
         // situations reach here and must not read identically.
         let lang = &target.vname.language;
-        // #715: a crashed last Phase B run for this language leaves partial
-        // coverage under a marker that reads complete, so a zero here is not a
-        // definitive zero regardless of the per-file / language-wide coverage
-        // gates below — those key on whether occurrences exist, not on whether the
-        // run finished. Soften first so a crash is never reported as a clean zero.
-        if phase_b_lang_crashed(store, lang) {
+        // #715 / #878: a crashed last Phase B run, or a skipped LSIF pass, for
+        // this language leaves partial coverage under a marker that reads
+        // complete, so a zero here is not a definitive zero regardless of the
+        // per-file / language-wide coverage gates below — those key on whether
+        // occurrences exist, not on whether the run finished. Soften first so
+        // neither is ever reported as a clean zero.
+        if let Some(class) = phase_b_lang_incomplete(store, lang) {
+            let cause = match class {
+                "crashed" => format!("Semantic analysis for '{lang}' crashed on its last run"),
+                _ => format!(
+                    "The TypeScript analyzer (travsr-lsif-ts) did not run for '{lang}' \
+                     on the last semantic analysis run"
+                ),
+            };
             return format!(
-                "{header}\n0 recorded reference(s), not a definitive zero. Semantic \
-                 analysis for '{lang}' crashed on its last run, so its occurrence \
-                 coverage is partial. Run `travsr status` for detail, `travsr init \
+                "{header}\n0 recorded reference(s), not a definitive zero. {cause}, so its \
+                 occurrence coverage is partial. Run `travsr status` for detail, `travsr init \
                  --semantic --force` to rebuild, or `find_pattern` for a textual search."
             );
         }
@@ -1983,10 +2030,11 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         "{total} caller definition(s) (exact occurrence lines unavailable for this language, showing caller definitions):"
     ));
     lines.extend(sites.into_iter().take(MAX_REFERENCE_SITES));
-    // #715: these structural caller definitions can also be short if the
-    // language's last Phase B run crashed before indexing every file.
-    if phase_b_lang_crashed(store, &target.vname.language) {
-        lines.push(crash_caveat(&target.vname.language));
+    // #715 / #878: these structural caller definitions can also be short if the
+    // language's last Phase B run crashed before indexing every file, or if its
+    // LSIF pass never ran.
+    if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
+        lines.push(incomplete_caveat(&target.vname.language, class));
     }
     lines.join("\n")
 }
@@ -8166,7 +8214,7 @@ mod tests {
     /// The `phase_b_warnings` parser matches a whole `crashed:<lang>` entry, not a
     /// prefix or a different warning class for the same language.
     #[test]
-    fn phase_b_lang_crashed_matches_exact_class_and_lang() {
+    fn phase_b_lang_incomplete_matches_exact_class_and_lang() {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store
             .set_meta(
@@ -8174,14 +8222,18 @@ mod tests {
                 "skipped_no_analyzer:php,crashed:objectivec",
             )
             .unwrap();
-        assert!(phase_b_lang_crashed(&store, "objectivec"));
-        // A different warning class for the same language is not a crash.
-        assert!(!phase_b_lang_crashed(&store, "php"));
+        assert_eq!(
+            phase_b_lang_incomplete(&store, "objectivec"),
+            Some("crashed")
+        );
+        // A different warning class for the same language is not partial
+        // coverage (a language that never ran has the empty-result gates).
+        assert_eq!(phase_b_lang_incomplete(&store, "php"), None);
         // Not a substring match: `objc` must not match `objectivec`.
-        assert!(!phase_b_lang_crashed(&store, "objc"));
-        // No warnings at all → false.
+        assert_eq!(phase_b_lang_incomplete(&store, "objc"), None);
+        // No warnings at all → None.
         store.set_meta("phase_b_warnings", "").unwrap();
-        assert!(!phase_b_lang_crashed(&store, "objectivec"));
+        assert_eq!(phase_b_lang_incomplete(&store, "objectivec"), None);
     }
 
     /// #715: get_callers must attach the incompleteness caveat when the target
@@ -8225,6 +8277,56 @@ mod tests {
         assert!(
             crashed.contains("semantic analysis for 'rust' crashed on its last run"),
             "a crashed language must carry the incompleteness caveat: {crashed}"
+        );
+    }
+
+    /// #878: a TypeScript index whose LSIF pass was skipped has SOME callers
+    /// (from the native pass), which is exactly the confident-looking answer
+    /// that must carry a caveat. The crashed wording stays reserved for crashes.
+    #[test]
+    fn get_callers_caveats_a_language_whose_lsif_pass_was_skipped() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("c", "", "src/svc.ts", "typescript", "method:charge"),
+            "method",
+        );
+        let caller = Node::new(
+            VName::new("c", "", "src/main.ts", "typescript", "fn:process"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+
+        store
+            .set_meta("phase_b_warnings", "emitter_missing:typescript")
+            .unwrap();
+        let out = get_callers_raw(&store, "charge", None);
+        assert!(out.contains("fn:process"), "caller still listed: {out}");
+        assert!(
+            out.contains("is incomplete")
+                && out.contains("travsr-lsif-ts")
+                && out.contains("may be incomplete"),
+            "a skipped LSIF pass must carry the incompleteness caveat: {out}"
+        );
+        assert!(
+            !out.contains("crashed on its last run"),
+            "a skipped emitter is not a crash: {out}"
+        );
+
+        // The class match is exact: another language's skip says nothing here.
+        store
+            .set_meta("phase_b_warnings", "emitter_missing:go")
+            .unwrap();
+        let out = get_callers_raw(&store, "charge", None);
+        assert!(!out.contains("may be incomplete"), "no caveat: {out}");
+        assert_eq!(phase_b_lang_incomplete(&store, "typescript"), None);
+        assert_eq!(
+            phase_b_lang_incomplete(&store, "go"),
+            Some("emitter_missing")
         );
     }
 
@@ -16229,6 +16331,24 @@ mod issue_755_tests {
         assert!(note.contains("objectivec"), "got: {note}");
     }
 
+    /// #878: so is a TypeScript LSIF pass that never ran. The language kept its
+    /// tree-sitter call edges, so an answer here is short rather than empty,
+    /// and the note must not claim there are no call edges at all.
+    #[test]
+    fn a_skipped_lsif_emitter_produces_a_per_query_note() {
+        for warn in ["emitter_missing:typescript", "emitter_failed:typescript"] {
+            let store = with_warnings(warn);
+            let note =
+                phase_b_degraded_note(&store).unwrap_or_else(|| panic!("{warn} must be surfaced"));
+            assert!(note.contains("typescript"), "got: {note}");
+            assert!(
+                note.contains("or not all of them") && note.contains("short result"),
+                "a partial language must be described as partial, not empty; got: {note}"
+            );
+            assert!(note.contains("not authoritative"), "got: {note}");
+        }
+    }
+
     /// So are the two "waiting on the user" states.
     #[test]
     fn pending_approval_and_consent_produce_a_per_query_note() {
@@ -16368,8 +16488,10 @@ mod issue_755_tests {
         );
         store.put_node(&n).unwrap();
         let out = get_callers(&store, "describe", None);
+        // #878 widened the wording to "no call edges, or not all of them", so
+        // pin the language attribution and the verdict rather than one phrase.
         assert!(
-            out.contains("no call edges were produced for php"),
+            out.contains("were produced for php") && out.contains("not authoritative"),
             "an empty caller list must say why; got: {out}"
         );
     }

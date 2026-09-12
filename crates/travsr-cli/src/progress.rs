@@ -528,6 +528,29 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                     pal.dim("ℹ"),
                 );
             }
+            // #878: the line above is true (the native pass ran) but incomplete
+            // when the TypeScript LSIF pass was skipped: the language then lacks
+            // most of its cross-file call edges. Say so right here, at default
+            // verbosity, rather than only in a RUST_LOG warning.
+            if let Some(skip) = &report.lsif_skipped {
+                use travsr_daemon::LsifSkipReason;
+                let (what, fix) = match skip.reason {
+                    LsifSkipReason::EmitterMissing => (
+                        "could not be started",
+                        "set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr so it sits beside the binary), then re-run `travsr init --semantic --force`",
+                    ),
+                    LsifSkipReason::EmitterFailed => (
+                        "failed",
+                        "fix the emitter (its error is above), then re-run `travsr init --semantic --force`",
+                    ),
+                };
+                println!(
+                    "  {} typescript semantic analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) {what}, so cross-file call and reference edges are missing",
+                    pal.orange("⚠"),
+                );
+                println!("    {}", skip.detail);
+                println!("    {fix}");
+            }
             if !report.produced_no_nodes.is_empty() {
                 let langs = report.produced_no_nodes.join(", ");
                 println!(

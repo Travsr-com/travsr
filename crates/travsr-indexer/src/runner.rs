@@ -192,11 +192,17 @@ fn run_with_drain_capped(
 ///
 /// Resolution order:
 /// 1. `TRAVSR_LSIF_TS` env var — absolute path to the JS entry point (tests / custom installs).
+///    An override that points at a missing file is NOT silently skipped here:
+///    [`run_lsif_emitter_impl`] rejects it up front with an [`EmitterNotFound`]
+///    that names the variable (#878), so a stale override never falls through to
+///    a different emitter, or to the bare-PATH fallback, without saying so.
 /// 2. Sibling of `current_exe` named `travsr-lsif-ts` — npm global install layout where
 ///    both binaries land in the same `bin/` directory.
 /// 3. Walk up from `current_exe` directory looking for
 ///    `packages/travsr-lsif-ts/dist/index.js` — monorepo / `cargo build` dev layout.
-/// 4. `travsr-lsif-ts` on PATH — legacy fallback.
+/// 4. `travsr-lsif-ts` on PATH — legacy fallback. Steps 2 and 3 are anchored on
+///    `current_exe`, so a binary copied out of its build or install layout lands
+///    here (#878); whether the spawn then succeeds depends on PATH alone.
 ///
 /// Returns `(program, prefix_args)` where the full command is
 /// `program [prefix_args...] --project <tsconfig>`.
@@ -299,6 +305,24 @@ pub fn emitter_missing(err: &anyhow::Error) -> bool {
 }
 
 fn run_lsif_emitter_impl(tsconfig: &Path, root: Option<&Path>) -> anyhow::Result<String> {
+    // #878: an explicit override is authoritative. `resolve_lsif_emitter` used
+    // to ignore a `TRAVSR_LSIF_TS` that named a missing file and fall through to
+    // discovery, so the user who had set it saw either a different emitter run
+    // or a not-found error telling them to "check TRAVSR_LSIF_TS", which they
+    // had. Name the actual problem instead. Empty counts as unset, so
+    // `TRAVSR_LSIF_TS= travsr ...` still means "discover".
+    if let Some(p) = std::env::var_os("TRAVSR_LSIF_TS").filter(|v| !v.is_empty()) {
+        let p = std::path::PathBuf::from(p);
+        if !p.is_file() {
+            return Err(anyhow::Error::new(EmitterNotFound).context(format!(
+                "could not run travsr-lsif-ts for {}: TRAVSR_LSIF_TS is set to {} \
+                 but no such file exists; point it at the emitter's dist/index.js \
+                 or unset it to use the bundled emitter",
+                tsconfig.display(),
+                p.display()
+            )));
+        }
+    }
     let (program, prefix_args) = resolve_lsif_emitter();
     let mut command = std::process::Command::new(&program);
     command.args(&prefix_args).arg("--project").arg(tsconfig);
@@ -310,9 +334,12 @@ fn run_lsif_emitter_impl(tsconfig: &Path, root: Option<&Path>) -> anyhow::Result
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| {
+            // Name what was tried: a bare `travsr-lsif-ts` here means discovery
+            // fell through to PATH, which is the relocated-binary signature (#878).
             anyhow::Error::new(EmitterNotFound).context(format!(
                 "could not run travsr-lsif-ts for {} \
-                 (emitter not found: {e}; check TRAVSR_LSIF_TS or reinstall travsr)",
+                 (emitter not found, tried `{program}`: {e}; set TRAVSR_LSIF_TS to the \
+                 emitter's dist/index.js or reinstall travsr)",
                 tsconfig.display()
             ))
         })?;
@@ -687,6 +714,53 @@ mod tests {
         assert_eq!(program, "node");
         assert_eq!(args.len(), 1);
         std::env::remove_var("TRAVSR_LSIF_TS");
+    }
+
+    /// #878: an explicit override that names a missing file must be reported as
+    /// the emitter being unavailable, naming the variable and the path, rather
+    /// than silently falling through to discovery (which either ran a different
+    /// emitter than the one the user configured, or failed with advice to
+    /// "check TRAVSR_LSIF_TS" that they had already followed).
+    #[test]
+    fn override_pointing_at_a_missing_file_is_an_emitter_not_found_error() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist").join("index.js");
+        let _guard = EnvGuard::set("TRAVSR_LSIF_TS", missing.to_str().unwrap());
+        let tsconfig = dir.path().join("tsconfig.json");
+        std::fs::write(&tsconfig, "{}").unwrap();
+
+        let err =
+            run_lsif_emitter(&tsconfig).expect_err("a missing override must not run anything");
+        assert!(
+            emitter_missing(&err),
+            "must classify as not-found, not as a failed run: {err:#}"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("TRAVSR_LSIF_TS"),
+            "must name the override: {msg}"
+        );
+        assert!(msg.contains("does-not-exist"), "must name the path: {msg}");
+    }
+
+    /// An empty `TRAVSR_LSIF_TS` means "unset": discovery proceeds, and whatever
+    /// happens next is never blamed on the override.
+    #[test]
+    fn empty_override_is_treated_as_unset() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::set("TRAVSR_LSIF_TS", "");
+        let (program, _) = resolve_lsif_emitter();
+        assert!(!program.is_empty(), "discovery must still yield a program");
+        let dir = tempfile::tempdir().unwrap();
+        let tsconfig = dir.path().join("tsconfig.json");
+        std::fs::write(&tsconfig, "{\"files\":[]}").unwrap();
+        if let Err(e) = run_lsif_emitter(&tsconfig) {
+            assert!(
+                !format!("{e:#}").contains("TRAVSR_LSIF_TS is set to"),
+                "an empty override must not be reported as a bad override: {e:#}"
+            );
+        }
     }
 
     #[test]

@@ -93,7 +93,13 @@ impl Plugin for TypeScriptPlugin {
                     }
                     Err(e) => tracing::warn!("ts lsif ingest: {e}"),
                 },
-                Err(e) => tracing::debug!("ts lsif emitter not available: {e}"),
+                // #878: a failure to start is "not available"; a run that failed
+                // is a fault and must be visible at default verbosity (matches
+                // the JS pass below and the host's own fan-out arm).
+                Err(e) if travsr_indexer::emitter_missing(&e) => {
+                    tracing::debug!("ts lsif emitter not available: {e}")
+                }
+                Err(e) => tracing::warn!("ts lsif emitter failed: {e:#}"),
             }
         }
 
