@@ -8875,9 +8875,9 @@ mod tests {
                         VName::new(
                             "",
                             "",
-                            &format!("src/widget_{i}.rs"),
+                            format!("src/widget_{i}.rs"),
                             "rust",
-                            &format!("struct:Widget{i}"),
+                            format!("struct:Widget{i}"),
                         ),
                         "struct",
                     ))
