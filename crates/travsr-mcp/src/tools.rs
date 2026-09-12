@@ -283,6 +283,14 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
     }
 }
 
+/// Files considered when scoping a pending-reference count. Beyond this the
+/// report is advisory anyway, and the cap is what keeps the group-by bounded.
+///
+/// Shared by [`live_overlay_note`] and `find_references`' zero gate on purpose:
+/// the note and the answer it decorates must describe the same file set, or
+/// they can contradict each other (#895).
+const PENDING_FILE_CAP: usize = 64;
+
 /// RFC-027 section 10: tell a reader that this answer includes un-ratified
 /// edges, and where the remaining gaps are.
 ///
@@ -310,10 +318,6 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
 /// overlay is in play at all, which is true of the whole graph the answer was
 /// drawn from, not of any one file in it.
 fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
-    /// Files considered when scoping the pending half. Beyond this the note is
-    /// advisory anyway, and the cap is what keeps the group-by bounded.
-    const PENDING_FILE_CAP: usize = 64;
-
     let live = store.count_edges_with_provenance("live").ok().unwrap_or(0);
     let pending: u64 = store
         .pending_ref_counts_by_file(PENDING_FILE_CAP)
@@ -1997,6 +2001,37 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                  `.dart_tool/package_config.json`), so cross-package references \
                  are not indexed. Run `dart pub get` and re-run `travsr init`, or \
                  use `find_pattern` for a textual search."
+            );
+        }
+        // #895: the overlay may hold references in this very file that nothing
+        // has resolved yet. `live_overlay_note` appends that count to whatever
+        // we return here, scoped to the files the answer names — so asserting a
+        // confident zero produces two sentences about one file that cannot both
+        // be true ("recorded no uses" beside "11 references ... detected but
+        // not resolved"). A pending row *is* a detected use, so soften on the
+        // same set the note reports over and the pair stays consistent.
+        //
+        // Dogfooded: `travsr references collect_global` said zero while all 11
+        // call sites sat pending in `travsr-mcp/src/tools.rs`; they resolved
+        // verbatim once Phase B caught up.
+        let pending_here = store
+            .pending_ref_counts_by_file(PENDING_FILE_CAP)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(path, _)| path == &target.vname.path)
+            .map(|(_, n)| n)
+            .unwrap_or(0);
+        if pending_here > 0 {
+            return format!(
+                "{header}\n0 recorded reference(s), not a definitive zero. \
+                 {pending_here} reference{} in '{}' {} detected but not yet \
+                 resolved, so uses of this symbol may be among them. They \
+                 resolve deterministically at the next commit; run `travsr init \
+                 --semantic` to resolve them now, or use `find_pattern` for a \
+                 textual search.",
+                if pending_here == 1 { "" } else { "s" },
+                target.vname.path,
+                if pending_here == 1 { "is" } else { "are" },
             );
         }
         // Coverage is effectively complete for this language and this symbol has
@@ -14951,6 +14986,67 @@ mod snippet_tests {
         assert!(
             !out.contains("not a definitive zero"),
             "should not soften when the file was analysed: {out}"
+        );
+    }
+
+    /// Dogfooded on this repo (#895): `travsr references collect_global`
+    /// answered `0 reference(s). The index recorded no uses of this symbol.`
+    /// and then appended `[note: live overlay active: 11 references in the
+    /// files above detected but not resolved.]`. Both sentences described the
+    /// same file and could not both be true: the overlay had already detected
+    /// 11 uses the resolver declined to place.
+    ///
+    /// The zero is only definitive once nothing is still pending in the file
+    /// the answer names, which is exactly the scope `live_overlay_note` reports
+    /// its pending half over. Gating on the same set is what keeps the answer
+    /// and the note from contradicting each other.
+    #[test]
+    fn find_references_softens_zero_when_target_file_has_pending_refs() {
+        use travsr_core::{Node, VName};
+        use travsr_store::RefResolution;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:caller"),
+            "function",
+        );
+        let callee = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:callee"),
+            "function",
+        );
+        let unused = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:unused"),
+            "function",
+        )
+        .with_line(20);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&unused).unwrap();
+        // The file is analysed, so every other softening gate stays shut.
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 5, None)])
+            .unwrap();
+        // ...but one reference in it is detected and unresolved.
+        store
+            .upsert_ref_resolution_states(&[RefResolution {
+                src: caller.id,
+                ref_line: 7,
+                ref_col: 9,
+                name: "unused".to_string(),
+                state: "pending",
+                resolved_dst: None,
+            }])
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            !out.contains("recorded no uses"),
+            "a pending reference in the target's own file makes a confident \
+             zero unsupportable: {out}"
+        );
+        assert!(
+            out.contains("not a definitive zero"),
+            "should soften while a reference in the file is unresolved: {out}"
         );
     }
 
