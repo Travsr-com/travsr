@@ -11606,6 +11606,46 @@ fn parse_symbol_tokens(symbols_arg: &str) -> Vec<SymbolToken<'_>> {
 /// (no partial symbol output) once the token budget is exhausted — except the
 /// first resolved symbol is always included so a single large `Full` definition
 /// never returns empty.
+/// Appended to a snippet header when the source file changed after the index
+/// recorded the symbol's line span.
+const STALE_SPAN_MARKER: &str =
+    " [stale: file edited since indexing, this span may not be this symbol]";
+
+/// Has `path` changed on disk since the indexer last hashed it?
+///
+/// `files.sha256` exists for exactly this comparison (the batch writer calls it
+/// "needed for SHA256 delta detection"), so this reuses that column rather than
+/// adding a second freshness signal. The encoding matches the writer's
+/// lowercase `{:02x}` hex (`travsr-daemon::hex_encode`).
+///
+/// Why this matters (#895): `snippet_for_node_capped` reads the *current* file
+/// at the *stored* line. An uncommitted edit that inserts or deletes lines
+/// shifts every symbol below it, so the extractor returns a well-formed span of
+/// unrelated code under the requested name, with nothing to distrust. Dogfooded:
+/// 6 of 9 symbols in one file came back wrong, split exactly at the edit point.
+///
+/// `false` when no hash is recorded: an index predating the `files` table, or a
+/// path the indexer never hashed. Absence of evidence is not drift, and marking
+/// every symbol of such a repo would be noise.
+fn file_drifted_since_index(store: &SqliteStore, repo_root: &std::path::Path, path: &str) -> bool {
+    let Ok(Some(indexed)) = store.get_file_hash(path) else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(repo_root.join(path)) else {
+        // Unreadable is already handled by the snippet reader returning None.
+        return false;
+    };
+    use sha2::{Digest, Sha256};
+    let actual = Sha256::digest(&bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+    actual != indexed
+}
+
 fn get_snippets_body(
     store: &SqliteStore,
     symbols_arg: &str,
@@ -11694,14 +11734,21 @@ fn get_snippets_body(
     let mut parts: Vec<String> = Vec::new();
     let mut tokens_used: usize = 0;
     let mut n_with_snippet: usize = 0;
+    // One hash per file, not per symbol: a request routinely names several
+    // symbols from the same file (that is how #895 was found).
+    let mut drift_cache: HashMap<String, bool> = HashMap::new();
 
     for node in &resolved {
+        let drifted = *drift_cache
+            .entry(node.vname.path.clone())
+            .or_insert_with(|| file_drifted_since_index(store, &repo_root, &node.vname.path));
         let header = format!(
-            "{} ({}) \u{2014} {} [package: {}]",
+            "{} ({}) \u{2014} {} [package: {}]{}",
             display_label(node),
             node.kind,
             node.vname.path,
-            node.package
+            node.package,
+            if drifted { STALE_SPAN_MARKER } else { "" }
         );
         let skeleton = |n: &CoreNode| skeleton_for_node_inner(n, &repo_root).map(|s| s.render());
 
@@ -12097,6 +12144,63 @@ mod snippet_tests {
             result.contains("0 with snippets"),
             "snippet count must be 0: {result}"
         );
+    }
+
+    /// Dogfooded on this repo (#895): `get_snippets` returned the wrong
+    /// function body for 6 of 9 symbols in one file. The index held each symbol
+    /// at its pre-edit line; an uncommitted edit had shifted everything below
+    /// it by +35; `snippet_for_node_capped` read the *current* file at the
+    /// *stored* line and returned a plausible span of unrelated code under the
+    /// requested name. Every symbol above the edit point was correct and every
+    /// symbol below it was wrong, which is what identified line drift as the
+    /// cause rather than name-prefix collision.
+    ///
+    /// A wrong snippet is worse than a missing one: nothing in the output let a
+    /// reader distrust it. `files.sha256` already exists for delta detection, so
+    /// the drift is detectable without new storage.
+    #[test]
+    fn get_snippets_discloses_a_span_whose_file_changed_since_indexing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.ts");
+        let original = "function hello() {\n  return 'hi';\n}\n";
+        std::fs::write(&src, original).unwrap();
+
+        let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
+        let mut store = make_store_with_meta(&[node], dir.path());
+        // The hash the indexer would have recorded for the file as indexed.
+        store
+            .put_file_hash("lib.ts", &sha256_hex_for_test(original.as_bytes()))
+            .unwrap();
+
+        let fresh = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        assert!(
+            !fresh.contains("stale:"),
+            "an unmodified file must not be flagged: {fresh}"
+        );
+
+        // Two lines inserted above the symbol, no reindex: fn:hello is still
+        // recorded at 1..3 but now lives at 3..5, so the stored span no longer
+        // covers it.
+        std::fs::write(&src, format!("// added\n// added\n{original}")).unwrap();
+
+        let drifted = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        assert!(
+            drifted.contains("stale:"),
+            "a file edited since indexing must be disclosed, not answered \
+             silently from the stale span: {drifted}"
+        );
+    }
+
+    /// Mirrors `travsr-daemon`'s `hex_encode`: lowercase `{:02x}` over sha256.
+    fn sha256_hex_for_test(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .fold(String::with_capacity(64), |mut s, b| {
+                use std::fmt::Write;
+                let _ = write!(s, "{b:02x}");
+                s
+            })
     }
 
     #[test]
