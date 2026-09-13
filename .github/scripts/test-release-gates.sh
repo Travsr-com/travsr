@@ -144,7 +144,24 @@ assert_contains "gates verdict depends on channel"    "$(job_needs gates)" "chan
 # A skipped gate skips its dependants unless the condition carries a status
 # function (actions/runner#491). The verdict must run so it can say no.
 assert_contains "gates verdict runs even when a gate was skipped" "$(job_if gates)" "!cancelled()"
-assert_contains "gates verdict runs release-gates.sh" "$verdict" "release-gates.sh"
+# The four gate jobs are checked for this above; the verdict must not be
+# re-conditioned on the event either. That variant fails closed (publish is
+# skipped), so it is a coverage gap rather than a bypass, but it is the same
+# edit #871 was made of.
+assert_not_contains "gates verdict runs on both release paths (no event_name in its condition)" "$(job_if gates)" "github.event_name"
+# The policy has to actually run and its exit status has to be the job's.
+# A substring test for the script name would be satisfied by
+# `run: echo skipping release-gates.sh`, and `|| true`, `; exit 0` or
+# `continue-on-error: true` would each turn a red verdict into a green job.
+# So: exactly one `run:` line in the job, equal to the bare invocation, and
+# no continue-on-error anywhere in the job.
+verdict_runs="$(printf '%s\n' "$verdict" | awk '/^      [ -] run:/ { sub(/^      [ -] run:[[:space:]]*/, ""); print }')"
+if [[ "$verdict_runs" == "bash .github/scripts/release-gates.sh" ]]; then
+    ok "gates verdict runs the policy script with nothing appended, as its only run step"
+else
+    fail "gates verdict must have exactly one run line, 'bash .github/scripts/release-gates.sh'; got: ${verdict_runs:-<none>}"
+fi
+assert_not_contains "gates verdict does not swallow its own exit status" "$verdict" "continue-on-error"
 # Full key/value pairs, whitespace-normalised. Checking only that the key
 # exists would accept `GATE_ACCURACY: ${{ needs['gate-fuzz'].result }}`, which
 # reads fuzz's result twice and lets a red accuracy gate publish.
