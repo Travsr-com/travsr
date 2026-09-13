@@ -823,6 +823,19 @@ pub struct RefSite {
     /// deserializes, reading as "nothing to flag" exactly as it did then.
     #[serde(default)]
     pub heuristic: bool,
+    /// True when at least one edge behind this site carries
+    /// `provenance = 'live'`: resolved from an uncommitted edit by the RFC-027
+    /// live lane, correct as far as the resolver could tell but not yet
+    /// ratified by Phase B.
+    ///
+    /// Deliberately a second flag rather than a value of [`Self::heuristic`]:
+    /// the two caveats are different and must not be conflated. A heuristic
+    /// site was matched by name and may be wholly fabricated; a live site *was*
+    /// resolved and is merely un-ratified. `#[serde(default)]` keeps the wire
+    /// format compatible with an index written before this shipped, matching
+    /// how `heuristic` itself was added.
+    #[serde(default)]
+    pub live: bool,
 }
 
 /// Human-readable label for a node in `graph` / reference output.

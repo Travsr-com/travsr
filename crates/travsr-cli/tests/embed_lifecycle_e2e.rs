@@ -196,6 +196,9 @@ fn model_switch_lifecycle_end_to_end() {
         .unwrap()
         .current_dir(repo.path())
         .arg("init")
+        // #893: keep this tempdir out of the developer's real
+        // ~/.travsr/registry.json.
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
         .assert()
         .success();
 

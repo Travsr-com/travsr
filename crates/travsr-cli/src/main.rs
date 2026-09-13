@@ -1379,8 +1379,27 @@ async fn run(cli: Cli) -> Result<()> {
             // The daemon does not need this. Its watcher sees the same
             // deletions and reconciles them, which is why the gap only shows up
             // without one. Verified both ways before choosing where to fix it.
-            let whole_tree = matches!(event.as_deref(), Some("post-checkout") | Some("post-merge"));
-            let dirty = if from_hook && whole_tree {
+            //
+            // #893: a `git reset --hard` (also `commit --amend`, `rebase`) fires
+            // no hook at all, so the same divergence is discovered one commit
+            // late — by `post-commit`, whose diff describes only the new commit.
+            // Reindexing that delta leaves the reset-away files as ghosts *and*
+            // stamps `last_commit` to HEAD, which erases the drift note
+            // `travsr status` was printing while the graph was still wrong.
+            // The stored marker not being an ancestor of HEAD is exactly the
+            // "the tree moved without a commit describing it" condition above,
+            // so take the same recovery rather than inventing a second one.
+            let whole_tree = from_hook
+                && (matches!(event.as_deref(), Some("post-checkout") | Some("post-merge"))
+                    || !travsr_daemon::commit_is_ancestor_of_head(
+                        &repo_root,
+                        &store
+                            .get_meta("last_commit")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default(),
+                    ));
+            let dirty = if whole_tree {
                 let (dirty, files) = travsr_daemon::reconcile_tracked_tree(&repo_root, &mut store)?;
                 tracing::debug!(
                     event = event.as_deref().unwrap_or(""),

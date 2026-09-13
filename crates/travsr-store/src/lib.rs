@@ -1495,6 +1495,17 @@ impl SqliteStore {
                 current == latest,
                 "schema v{current} ≠ expected v{latest}, pending migrations; reopen writable"
             );
+            // C1 (#893): the recorded version does not describe the table shape.
+            // `nodes.body_hash` is added by an open-time step rather than by a
+            // numbered migration (see [`Self::ensure_body_hash_column`]), so a
+            // database an older build stamped at `latest` can still carry the
+            // pre-#813 narrow table, and the number-only check above admits it.
+            // Fail here instead of hitting `no such column` at query time: every
+            // caller falls back to a writable `open()`, which adds the column.
+            anyhow::ensure!(
+                store.column_exists("nodes", "body_hash")?,
+                "schema v{current} but nodes.body_hash is missing; reopen writable"
+            );
             Ok(store)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -3759,15 +3770,41 @@ impl SqliteStore {
             .take(languages.len())
             .collect::<Vec<_>>()
             .join(",");
+        // #895: the occurrence rows go first, while their `edges` row still
+        // says 'live' and can still be joined. Afterwards the provenance is
+        // unrecoverable, and an orphaned `edge_sites` row is worse than no row
+        // at all: `reference_sites`' LEFT JOIN yields NULL for both flags, so a
+        // guess this very sweep decided to discard would render as ratified
+        // fact with no caveat. Both deletes run in one transaction so they
+        // cannot half-apply.
+        //
+        // Rows Phase B re-derived are NOT lost here: ratification relabels that
+        // `(src, dst, kind)` row's provenance in place, so it no longer matches
+        // `provenance = 'live'` and its sites are kept.
+        let sites_sql = format!(
+            "DELETE FROM edge_sites WHERE (src, dst, kind) IN \
+             (SELECT src, dst, kind FROM edges WHERE provenance = 'live' \
+              AND src IN (SELECT id FROM nodes WHERE language IN ({placeholders})))"
+        );
         let sql = format!(
             "DELETE FROM edges WHERE provenance = 'live' \
              AND src IN (SELECT id FROM nodes WHERE language IN ({placeholders}))"
         );
-        self.conn
-            .execute(&sql, params_from_iter(languages.iter()))
-            .map(|n| n as u64)
-            .context("sweeping live edges for ratified languages")
-            .map_err(|e| StoreError::Database(e.to_string()))
+        (|| -> AnyResult<u64> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("sweep_live_edges_for_languages: begin")?;
+            tx.execute(&sites_sql, params_from_iter(languages.iter()))
+                .context("sweeping live edge_sites for ratified languages")?;
+            let n = tx
+                .execute(&sql, params_from_iter(languages.iter()))
+                .context("sweeping live edges for ratified languages")?;
+            tx.commit()
+                .context("sweep_live_edges_for_languages: commit")?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Scoped orphan sweep for the incremental path: drop edges *owned by*
@@ -5687,17 +5724,16 @@ LIMIT ?4",
                 // resolved fact. The MAX only decides the 60% that do join;
                 // the fail-open default for the rest is documented on
                 // `travsr_core::RefSite::heuristic`.
-                // `live` is deliberately NOT flagged here. `RefSite::heuristic`
-                // is a bool and renders as "matched by name, not resolved by
-                // type", which is false of a live edge: that edge IS resolved,
-                // it is only unratified, and `get_callers` says so in its own
-                // words. Flagging it here would caveat it with the wrong cause.
-                // The clause could not fire today in any case, since
-                // `put_edge_live` writes `edges` and never `edge_sites`, so a
-                // live edge has no occurrence row to join. Telling the two
-                // apart needs a variant on `RefSite` rather than a bool.
+                // `live` is flagged separately, never folded into `heuristic`
+                // (#895). The two caveats are opposites: a heuristic site was
+                // matched by leaf name and may be fabricated, while a live site
+                // WAS resolved and is only un-ratified. `RefSite` carries one
+                // flag each so a renderer can say which applies. This reads the
+                // `LEFT JOIN edges` already present for `heuristic`, so it costs
+                // no extra join and no new column.
                 "SELECT n.path AS path, es.line AS line, \
-                 MAX(es.kind = 'ref/call' AND e.provenance = 'tree-sitter') AS heuristic \
+                 MAX(es.kind = 'ref/call' AND e.provenance = 'tree-sitter') AS heuristic, \
+                 MAX(e.provenance = 'live') AS live \
                  FROM edge_sites es JOIN nodes n ON n.id = es.src \
                  LEFT JOIN edges e \
                    ON e.src = es.src AND e.dst = es.dst AND e.kind = es.kind \
@@ -5712,17 +5748,19 @@ LIMIT ?4",
                 let line: i64 = row.get(1)?;
                 // NULL when no contributing row had an edge to read.
                 let heuristic: Option<i64> = row.get(2)?;
-                Ok((path, line, heuristic))
+                let live: Option<i64> = row.get(3)?;
+                Ok((path, line, heuristic, live))
             })
             .context("executing reference_sites query")?;
         let mut out = Vec::new();
         for row in rows {
-            let (path, line, heuristic) = row.context("decoding reference_sites row")?;
+            let (path, line, heuristic, live) = row.context("decoding reference_sites row")?;
             out.push(travsr_core::RefSite {
                 path,
                 // Clamp defensively — stored lines are already 1-based u32.
                 line: u32::try_from(line).unwrap_or(0),
                 heuristic: heuristic.unwrap_or(0) != 0,
+                live: live.unwrap_or(0) != 0,
             });
         }
         tracing::debug!(sites_returned = out.len());
@@ -11705,17 +11743,20 @@ mod tests {
                 travsr_core::RefSite {
                     path: "a.rs".into(),
                     line: 2,
-                    heuristic: false
+                    heuristic: false,
+                    live: false
                 },
                 travsr_core::RefSite {
                     path: "a.rs".into(),
                     line: 10,
-                    heuristic: false
+                    heuristic: false,
+                    live: false
                 },
                 travsr_core::RefSite {
                     path: "b.rs".into(),
                     line: 3,
-                    heuristic: false
+                    heuristic: false,
+                    live: false
                 },
             ]
         );
@@ -11827,7 +11868,8 @@ mod tests {
             vec![travsr_core::RefSite {
                 path: "user.rs".into(),
                 line: 14,
-                heuristic: false
+                heuristic: false,
+                live: false
             }]
         );
     }
@@ -12066,7 +12108,8 @@ mod tests {
             vec![travsr_core::RefSite {
                 path: "a.rs".into(),
                 line: 5,
-                heuristic: false
+                heuristic: false,
+                live: false
             }]
         );
     }
@@ -12210,7 +12253,8 @@ mod tests {
             vec![travsr_core::RefSite {
                 path: "b.rs".into(),
                 line: 9,
-                heuristic: false
+                heuristic: false,
+                live: false
             }]
         );
     }
@@ -12259,7 +12303,8 @@ mod tests {
             vec![travsr_core::RefSite {
                 path: "b.rs".into(),
                 line: 9,
-                heuristic: false
+                heuristic: false,
+                live: false
             }],
             "owned a.rs:3 site must be purged, inbound b.rs:9 site must survive"
         );
@@ -12353,7 +12398,8 @@ mod tests {
             vec![travsr_core::RefSite {
                 path: "a.rs".into(),
                 line: 5,
-                heuristic: false
+                heuristic: false,
+                live: false
             }],
             "a preserved definition's occurrence is remapped onto its current line"
         );
@@ -12542,7 +12588,8 @@ mod tests {
             vec![travsr_core::RefSite {
                 path: "a.rs".into(),
                 line: 8,
-                heuristic: false
+                heuristic: false,
+                live: false
             }],
             "the preserved definition's occurrence must be remapped to its current line"
         );
@@ -15829,6 +15876,54 @@ mod tests {
             body_hash(node_id_to_i64(unstamped.id)),
             None,
             "a file with no source must leave body_hash NULL (preservation forgone)"
+        );
+    }
+
+    #[test]
+    fn read_only_open_rejects_current_version_database_missing_body_hash() {
+        // C1 (#893): `nodes.body_hash` is added by an open-time step rather than
+        // by a numbered migration, so a database a pre-RFC-027-#813 build stamped
+        // at the current schema version still carries the narrow `nodes` table.
+        // A read-only open that compares only the version number admits it, and
+        // any query touching `body_hash` then fails with `no such column`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        drop(SqliteStore::open(&db).unwrap());
+
+        // Reproduce the older table shape on an otherwise current database.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch("ALTER TABLE nodes DROP COLUMN body_hash")
+                .unwrap();
+        }
+        let probe = SqliteStore::open_read_only(&db);
+        // Guard the repro itself: the version must still read as current, which
+        // is precisely why a number-only check lets the narrow table through.
+        if let Ok(s) = &probe {
+            assert_eq!(
+                s.schema_version().unwrap(),
+                sqlite_migration_runner().latest_version(),
+                "repro must leave the version stamped at the current value"
+            );
+        }
+        let err = probe
+            .err()
+            .expect("read-only open must reject a database whose nodes table lacks body_hash");
+        assert!(
+            format!("{err}").contains("body_hash"),
+            "the error must name the missing column, got: {err}"
+        );
+
+        // The writable open is the heal path the read-only failure falls back to.
+        let healed = SqliteStore::open(&db).unwrap();
+        assert!(
+            healed.column_exists("nodes", "body_hash").unwrap(),
+            "a writable open must add the missing column"
+        );
+        drop(healed);
+        assert!(
+            SqliteStore::open_read_only(&db).is_ok(),
+            "the healed database must open read-only again"
         );
     }
 

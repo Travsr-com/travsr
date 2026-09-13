@@ -29,7 +29,8 @@ use travsr_retrieval::compute_kcore;
 use travsr_store::{BatchWriteCounts, FileGraph, SqliteStore, Store};
 
 pub use hook::{
-    changed_files_from_git, install_hook, tracked_files_from_git, try_dispatch_to_daemon,
+    changed_files_from_git, commit_is_ancestor_of_head, install_hook, tracked_files_from_git,
+    try_dispatch_to_daemon,
 };
 
 /// Set the process-level opt-in flag that allows `rust-analyzer` to run
@@ -91,6 +92,12 @@ pub struct InitStats {
     pub files_skipped_ignored: u64,
     /// Whether `.travsrignore` was freshly created on this run (first `travsr init`).
     pub travsrignore_scaffolded: bool,
+    /// #893: whether a `/.travsr/` entry was appended to `.gitignore` on this run.
+    pub gitignore_scaffolded: bool,
+    /// #893: git already tracks files under `.travsr/`, so the `.gitignore`
+    /// entry is inert and the user needs `git rm -r --cached .travsr` before
+    /// `git revert`/`git merge` will run again. Surfaced, never auto-fixed.
+    pub travsr_dir_tracked: bool,
     /// Net change in node count. `i64` to allow negative values if nodes are
     /// removed in the future (e.g. delete-by-file support); currently always >= 0.
     pub nodes_written: i64,
@@ -581,6 +588,82 @@ fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
     std::fs::write(&path, DEFAULT_TRAVSRIGNORE)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
+}
+
+/// Appended to `.gitignore` by [`scaffold_gitignore`].
+///
+/// Leading `/` anchors the rule to the repo root, the same reason `connect.rs`
+/// anchors every entry it generates: a slash-less pattern would also ignore a
+/// `.travsr` directory vendored at any depth. Trailing `/` matches the
+/// directory only.
+///
+/// The comment deliberately does not carry a `# travsr:` prefix: `connect.rs`
+/// finds its own managed block in this same file by substring-counting
+/// `# travsr:begin` / `# travsr:end`, and a sibling comment sharing that prefix
+/// is one careless edit to those markers away from being miscounted.
+const GITIGNORE_TRAVSR_ENTRY: &str =
+    "\n# travsr local code graph. Never commit it, the WAL file changes on every read.\n/.travsr/\n";
+
+/// Ensure git ignores `.travsr/`.
+///
+/// `init_repo` creates `.travsr/graph.db` plus its `-wal`/`-shm` sidecars and
+/// `init.lock` inside the repository. Untracked but un-ignored, the next
+/// `git add -A` commits them; the WAL then changes on every read, so the
+/// working tree is permanently dirty and `git revert` / `git merge` / `git
+/// rebase` refuse to run at all (#893). `travsr init` already takes
+/// responsibility for scaffolding `.travsrignore`, so the `.gitignore` entry
+/// belongs beside it rather than in a second owner.
+///
+/// Idempotency goes through `git check-ignore --no-index`, which answers "is a
+/// rule in effect" for every mechanism at once (repo `.gitignore`, nested
+/// `.gitignore`s, `.git/info/exclude`, the user's global excludes) instead of
+/// pattern-matching the file's text. `--no-index` is load-bearing: without it
+/// git reports an *already tracked* `.travsr/` as not-ignored no matter what
+/// rules exist, so every re-init on the repos this fix most needs to help would
+/// append a duplicate entry.
+///
+/// A git that cannot answer is treated as already-ignored, so init never
+/// appends blind to a user's `.gitignore`.
+///
+/// Returns whether an entry was appended.
+fn scaffold_gitignore(repo_root: &Path) -> anyhow::Result<bool> {
+    let ignored = std::process::Command::new("git")
+        .args(["check-ignore", "--no-index", "-q", ".travsr/"])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(true);
+    if ignored {
+        return Ok(false);
+    }
+    let path = repo_root.join(".gitignore");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    // The entry leads with a blank line, so an existing file whose last line has
+    // no terminator would otherwise gain the comment on the end of that line.
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(GITIGNORE_TRAVSR_ENTRY);
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
+/// Whether git already tracks anything under `.travsr/`.
+///
+/// A `.gitignore` entry has no effect on a path that is already in the index,
+/// so for a repo that committed `.travsr/` before this scaffold existed the
+/// entry alone changes nothing and the revert/merge deadlock survives. The
+/// caller reports that instead of claiming the problem is solved; untracking is
+/// left to the user because it rewrites their index, which `travsr init` has no
+/// mandate to do. Same call the `connect.rs` generated-file path makes for the
+/// same reason.
+fn travsr_dir_tracked(repo_root: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["ls-files", "--", ".travsr"])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// Top-level directory names that are well-known source roots, never dep/vendor dirs.
@@ -1482,6 +1565,15 @@ pub fn init_repo_with_progress(
         tracing::info!("wrote .travsrignore ({DEFAULT_TRAVSRIGNORE_RULE_COUNT} default rules)");
     }
 
+    // #893: and ensure git ignores the graph itself, for the same reason the
+    // walker reads `.travsrignore` before it starts — this is the run that
+    // created the files in question, so it is the run that must fence them off.
+    let gitignore_scaffolded = scaffold_gitignore(repo_root).unwrap_or(false);
+    if gitignore_scaffolded {
+        tracing::info!("added /.travsr/ to .gitignore");
+    }
+    let travsr_dir_tracked = travsr_dir_tracked(repo_root);
+
     let walker = WalkBuilder::new(repo_root)
         .hidden(false)
         .git_ignore(true)
@@ -2122,6 +2214,8 @@ pub fn init_repo_with_progress(
         files_skipped_unchanged,
         files_skipped_ignored,
         travsrignore_scaffolded: scaffolded,
+        gitignore_scaffolded,
+        travsr_dir_tracked,
         nodes_written: nodes_after - nodes_before,
         edges_written,
         total_nodes: nodes_after as u64,
@@ -7848,7 +7942,20 @@ mod tests {
     // this lock to prevent races on Windows and Linux multi-threaded test runs.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// #893: `init_repo` registers its repo root in `~/.travsr/registry.json`
+    /// unless this is set, so an unguarded test in this module appends its
+    /// `tempfile` tempdir to the developer's real registry and leaves the entry
+    /// there after the directory is deleted. Called from `git_init` — the
+    /// arrangement step every test that reaches `init_repo` already performs —
+    /// so one call covers the whole module. `set_var` is process-global and
+    /// every caller writes the same value, so this is safe under the parallel
+    /// test runner. Same pattern as `tests/semantic_marker.rs::disable_registry`.
+    fn disable_registry() {
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+    }
+
     fn git_init(dir: &std::path::Path) {
+        disable_registry();
         StdCommand::new("git")
             .args(["-c", "init.defaultBranch=main", "init", "-q"])
             .current_dir(dir)
@@ -8592,19 +8699,29 @@ mod tests {
         std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
 
         let home_tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home_tmp.path());
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
 
         let _ = init_repo(tmp.path()).unwrap();
 
         let registry_path = home_tmp.path().join(".travsr").join("registry.json");
+
+        // #893: restore HOME instead of removing it. With HOME unset,
+        // `travsr_store::registry::home_dir` falls back to `.`, so every later
+        // test in this binary that registers writes a `.travsr/registry.json`
+        // into the process's working directory. Leave TRAVSR_DISABLE_REGISTRY
+        // set: `git_init` sets it for the whole module and clearing it here
+        // reopens the leak for tests running in parallel with this one.
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
         assert!(
             !registry_path.exists(),
             "registry.json must not be created when TRAVSR_DISABLE_REGISTRY=1"
         );
-
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
-        std::env::remove_var("HOME");
     }
 
     #[test]
@@ -8623,9 +8740,7 @@ mod tests {
 
         std::fs::write(tmp.path().join("real.ts"), "export class Real {}").unwrap();
 
-        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         let stats = init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         assert_eq!(
             stats.files_indexed, 1,
@@ -9927,9 +10042,8 @@ mod tests {
     /// drives it. `init_repo` would defer Phase B to the daemon and never reach the
     /// inline path under test.
     fn init_semantic(root: &std::path::Path, force: bool) {
-        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        disable_registry();
         let r = init_repo_with_progress(root, None, true, force, &mut |_| {});
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
         r.expect("init_repo_with_progress(semantic = true)");
     }
 

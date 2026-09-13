@@ -205,7 +205,7 @@ fn extract_cargo_deps(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, V
     let root_doc: toml::Value = root_text.parse().context("parsing root Cargo.toml")?;
 
     // Collect all member Cargo.toml paths
-    let cargo_paths: Vec<PathBuf> = if let Some(members) = root_doc
+    let mut cargo_paths: Vec<PathBuf> = if let Some(members) = root_doc
         .get("workspace")
         .and_then(|w| w.get("members"))
         .and_then(|m| m.as_array())
@@ -237,8 +237,15 @@ fn extract_cargo_deps(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, V
             })
             .collect()
     } else {
-        vec![root_cargo]
+        vec![root_cargo.clone()]
     };
+
+    // A workspace root may also declare its own [package] (#893 C2). Without
+    // this the root package is never parsed, so it is emitted with an empty
+    // path and is indistinguishable from an external dependency.
+    if root_doc.get("package").is_some() && !cargo_paths.contains(&root_cargo) {
+        cargo_paths.push(root_cargo);
+    }
 
     // Parse each Cargo.toml: (pkg_name, rel_cargo_path, dep_names)
     let pkg_data: Vec<(String, String, Vec<String>)> = cargo_paths
@@ -1535,6 +1542,81 @@ fn run() {
             out.is_empty(),
             "expected no calls, got {:?}",
             out.iter().map(|u| &u.callee_sig).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Cargo dep anchoring (#893 C2) ─────────────────────────────────────────
+
+    /// Writes `Cargo.toml` files under a fresh temp dir and runs the extractor.
+    /// Returns (crate signature -> path) for every emitted `crate` node.
+    fn cargo_crate_paths(files: &[(&str, &str)]) -> HashMap<String, String> {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, body) in files {
+            let path = dir.path().join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, body).unwrap();
+        }
+        let (nodes, _edges) = extract_cargo_deps("c", dir.path()).unwrap();
+        nodes
+            .iter()
+            .filter(|n| n.kind == "crate")
+            .map(|n| (n.vname.signature.clone(), n.vname.path.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn cargo_deps_anchor_root_package_in_a_workspace_root() {
+        // A root Cargo.toml that declares BOTH [package] and [workspace] members
+        // must still anchor its own package to the root manifest (#893 C2).
+        let paths = cargo_crate_paths(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"rootpkg\"\n\n[workspace]\nmembers = [\"sub\"]\n\n[dependencies]\nclap = \"4\"\n",
+            ),
+            (
+                "sub/Cargo.toml",
+                "[package]\nname = \"subpkg\"\n\n[dependencies]\nrootpkg = { path = \"..\" }\n",
+            ),
+        ]);
+        assert_eq!(
+            paths.get("crate:rootpkg").map(String::as_str),
+            Some("Cargo.toml"),
+            "root package lost its manifest anchor; got {paths:?}"
+        );
+        assert_eq!(
+            paths.get("crate:subpkg").map(String::as_str),
+            Some("sub/Cargo.toml"),
+            "member package anchor regressed; got {paths:?}"
+        );
+        assert_eq!(
+            paths.get("crate:clap").map(String::as_str),
+            Some(""),
+            "external dependency must stay unanchored; got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_deps_virtual_workspace_emits_members_only() {
+        // A virtual workspace has no root [package], so no crate node may be
+        // anchored to the root manifest.
+        let paths = cargo_crate_paths(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n"),
+            ("a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("b/Cargo.toml", "[package]\nname = \"b\"\n"),
+        ]);
+        assert_eq!(
+            paths.get("crate:a").map(String::as_str),
+            Some("a/Cargo.toml")
+        );
+        assert_eq!(
+            paths.get("crate:b").map(String::as_str),
+            Some("b/Cargo.toml")
+        );
+        assert!(
+            !paths.values().any(|p| p == "Cargo.toml"),
+            "virtual workspace must not anchor anything to the root manifest; got {paths:?}"
         );
     }
 }

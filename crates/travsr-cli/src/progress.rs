@@ -617,6 +617,15 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
         );
     }
 
+    // #893: `.gitignore` is a tracked, user-authored file. RFC-026's rule that
+    // writes to those stay visible applies to this one too.
+    if stats.gitignore_scaffolded {
+        println!(
+            "  {} added /.travsr/ to .gitignore, the graph is local-only",
+            pal.dim("ℹ"),
+        );
+    }
+
     if !quiet {
         println!(
             "    {}",
