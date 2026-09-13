@@ -23,6 +23,21 @@ fn rerank_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Serializes tests that mutate the reranker's process-global env vars
+/// (`TRAVSR_NO_RERANK`, `TRAVSR_RERANK_MODEL_DIR`). The default harness runs
+/// test fns on parallel threads and `set_var`/`remove_var` are process-wide
+/// (RFC-021 F6), and `reranker()` reads `rerank_disabled()` live on every call
+/// rather than caching it, so an unsynchronised `remove_var` in one module can
+/// re-enable the reranker underneath another module's test.
+///
+/// `pub(crate)` for the same reason [`crate::seed::DOCS_ENV_LOCK`] is: `rerank.rs`
+/// and `seed.rs` compile into one test binary, so a lock private to this
+/// module's `tests` would serialize this module against itself while still
+/// racing the other. That is the exact flake DOCS_ENV_LOCK was introduced to
+/// close; this is the same fix for the rerank vars.
+#[cfg(test)]
+pub(crate) static RERANK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Candidates reranked per query. Bounds the forward-pass cost — the plan's
 /// K ≈ 20-40 window; default matches the RFC.
 pub(crate) fn rerank_topk() -> usize {
@@ -458,11 +473,6 @@ pub(crate) fn rerank(query: &str, candidates: &[&str]) -> Option<Vec<f32>> {
 mod tests {
     use super::*;
 
-    /// Serializes tests that mutate process-global env vars; the default test
-    /// harness runs test fns on parallel threads and `set_var`/`remove_var`
-    /// are process-wide (RFC-021 F6).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn rerank_topk_default_is_thirty() {
         std::env::remove_var("TRAVSR_RERANK_TOPK");
@@ -477,7 +487,7 @@ mod tests {
 
     #[test]
     fn no_model_configured_is_none_not_panic() {
-        let _guard = ENV_LOCK
+        let _guard = RERANK_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("TRAVSR_NO_RERANK");
@@ -500,7 +510,7 @@ mod tests {
 
     #[test]
     fn disabled_flag_short_circuits_even_with_model_dir() {
-        let _guard = ENV_LOCK
+        let _guard = RERANK_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("TRAVSR_NO_RERANK", "1");
@@ -513,7 +523,7 @@ mod tests {
 
     #[test]
     fn rerank_model_dir_prefers_env_override_verbatim() {
-        let _guard = ENV_LOCK
+        let _guard = RERANK_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("TRAVSR_RERANK_MODEL_DIR", "/custom/model/dir");
@@ -534,7 +544,7 @@ mod tests {
 
     #[test]
     fn rerank_status_off_when_disabled() {
-        let _guard = ENV_LOCK
+        let _guard = RERANK_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("TRAVSR_NO_RERANK", "1");
