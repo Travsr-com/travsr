@@ -463,7 +463,7 @@ jobs:
           echo "latest points at $REL_TAG and serves the matching install.sh"
 
       - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
@@ -841,7 +841,7 @@ jobs:
           echo "latest points at $REL_TAG and serves the matching install.sh"
 
       - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
@@ -872,7 +872,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
 
