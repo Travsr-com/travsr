@@ -11112,6 +11112,203 @@ mod tests {
         );
     }
 
+    /// RFC-027 section 7.3b: the editor asks for targets the instant it saves,
+    /// and the daemon's own watcher pass for that save has not run yet (a 500 ms
+    /// debounce plus the flush tick). Answering from the pre-save index leaves
+    /// the save's changed region unstashed, so the committed occurrences only a
+    /// language server can re-resolve are never offered as targets, and the
+    /// editor asks exactly once per save and never retries: those edges then
+    /// stay missing until the next commit.
+    ///
+    /// Against the shipped 1.1.0 daemon this was two leftover targets at save
+    /// time and nine ten seconds later, for the same save.
+    #[test]
+    fn a_target_request_folds_in_a_save_the_watcher_has_not_reached() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        // Two types with the same method names, so `save` and `new` are exactly
+        // the receiver-ambiguous references the lexical lane must refuse and the
+        // editor lane exists to answer.
+        std::fs::write(
+            tmp.path().join("src/store.rs"),
+            "pub struct Store {\n    rows: Vec<String>,\n}\n\nimpl Store {\n    pub fn new() -> Store {\n        Store { rows: Vec::new() }\n    }\n    pub fn save(&mut self, row: String) {\n        self.rows.push(row);\n    }\n    pub fn count(&self) -> usize {\n        self.rows.len()\n    }\n}\n\npub fn helper(tag: &str) -> String {\n    format!(\"[{}]\", tag)\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/cache.rs"),
+            "pub struct Cache {\n    hits: usize,\n}\n\nimpl Cache {\n    pub fn new() -> Cache {\n        Cache { hits: 0 }\n    }\n    pub fn save(&mut self, row: &str) {\n        self.hits += row.len();\n    }\n}\n",
+        )
+        .unwrap();
+        let service = tmp.path().join("src/main.rs");
+        // Nothing else in the file calls `run_service`: a caller of a changed
+        // definition is itself demoted out of the preserved set, and a save with
+        // nothing preserved is a whole-file re-derive, which stashes no changed
+        // region at all.
+        let before = "mod cache;\nmod store;\n\nuse cache::Cache;\nuse store::{helper, Store};\n\nfn run_service(name: &str) -> usize {\n    let mut store = Store::new();\n    store.save(helper(name));\n    let mut cache = Cache::new();\n    cache.save(name);\n    store.count()\n}\n\nfn run_cache(name: &str) -> usize {\n    let mut cache = Cache::new();\n    cache.save(name);\n    0\n}\n\nfn main() {}\n";
+        std::fs::write(&service, before).unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        // Commit and ratify, so `run_service`'s references exist as committed
+        // occurrences: the changed-definition enumeration a save stashes (#813
+        // P2) is captured from those rows, and they are what the editor lane is
+        // asked to re-resolve.
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let sha = git_commit_all(tmp.path(), "init");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", &sha).unwrap();
+        }
+        {
+            let store_mutex =
+                std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+            run_background_phase_b_inner(tmp.path(), &store_mutex);
+        }
+
+        // The save the watcher has not reached: a pure body edit, on disk only,
+        // with no reindex and nothing stashed on the editor plane.
+        let after = before.replace(
+            "    let mut store = Store::new();\n",
+            "    let mut store = Store::new();\n    let _tag = helper(name);\n",
+        );
+        assert_ne!(after, before, "the body edit must change the file");
+        std::fs::write(&service, &after).unwrap();
+
+        let store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
+        let sessions = std::sync::Mutex::new(EditorPlane::default());
+
+        let msg =
+            serde_json::to_string(&travsr_ipc::ControlMessage::RequestLiveResolutionTargets {
+                repo_root: tmp.path().to_string_lossy().into_owned(),
+                session: "w1".to_string(),
+                file: "src/main.rs".to_string(),
+                buffer_version: 1,
+            })
+            .unwrap();
+        let (resp, _shutdown) = handle_control_message(
+            &msg,
+            tmp.path(),
+            &store,
+            &read_store,
+            &cache,
+            &phase_b_scheduler,
+            &index_tx,
+            &sessions,
+        );
+        assert!(resp.ok, "the target request must succeed: {resp:?}");
+        let targets: travsr_ipc::message::LiveResolutionTargets =
+            serde_json::from_value(resp.result.expect("a target payload")).unwrap();
+        let names: Vec<&str> = targets.own.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"save"),
+            "the edited function's ambiguous `save` call must be an editor \
+             target the moment the file is saved, got {names:?}"
+        );
+
+        // And the save is genuinely folded in, not merely reported on: the index
+        // now holds the text the editor wrote, so the watcher pass that follows
+        // has nothing left to do.
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            file_matches_index(&s, tmp.path(), &service),
+            "the request must leave the index current with the saved file"
+        );
+    }
+
+    /// SEC-002: the targets request now indexes the file it is asked about, so
+    /// its caller-supplied `file` has to be validated before it is joined onto
+    /// the repo root.
+    ///
+    /// `reindex_files_reporting` falls back to the joined path when
+    /// `strip_prefix(repo_root)` fails, so an unguarded `../outside/secret.rs`
+    /// is parsed into the graph: the outside file becomes nodes, and a file row
+    /// appears under the escaping path. Reading such a path was harmless before
+    /// this request started writing.
+    #[test]
+    fn a_target_request_for_a_path_outside_the_repo_indexes_nothing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        git_init(&repo);
+        std::fs::write(
+            repo.join("inside.rs"),
+            "pub fn inside_the_repo() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            outside.join("secret.rs"),
+            "pub fn totally_outside_the_repo_marker() -> u32 {\n    42\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(&repo).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = repo.join(".travsr/graph.db");
+        let store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let before = store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .node_count()
+            .unwrap();
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
+        let sessions = std::sync::Mutex::new(EditorPlane::default());
+
+        let msg =
+            serde_json::to_string(&travsr_ipc::ControlMessage::RequestLiveResolutionTargets {
+                repo_root: repo.to_string_lossy().into_owned(),
+                session: "sec".to_string(),
+                file: "../outside/secret.rs".to_string(),
+                buffer_version: 1,
+            })
+            .unwrap();
+        let (resp, _shutdown) = handle_control_message(
+            &msg,
+            &repo,
+            &store,
+            &read_store,
+            &cache,
+            &phase_b_scheduler,
+            &index_tx,
+            &sessions,
+        );
+        assert!(
+            !resp.ok,
+            "an escaping file argument must be refused: {resp:?}"
+        );
+
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            s.get_file_hash("../outside/secret.rs").unwrap().is_none(),
+            "no file row may be recorded for a path outside the repo"
+        );
+        assert_eq!(
+            s.node_count().unwrap(),
+            before,
+            "no node from outside the repo may reach the graph"
+        );
+    }
+
     /// The lexical floor is native-only (section 8.3): the generic detector
     /// recovers no receiver type and builds no signature key, so there is
     /// nothing for it to match on and the save path must not parse the file to
@@ -14210,6 +14407,142 @@ fn enqueue_dirty_callers(
     }
 }
 
+/// Whether `path`'s bytes on disk are the ones already recorded in the index.
+///
+/// The same per-file hash test [`reindex_files_reporting`] applies internally,
+/// asked before the call so the caller can tell a save it still has to fold in
+/// from an event for one that is already in.
+fn file_matches_index(store: &SqliteStore, repo_root: &Path, path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let vname_path = path
+        .strip_prefix(repo_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    matches!(store.get_file_hash(&vname_path), Ok(Some(h)) if h == hex_encode(&hash_bytes(&bytes)))
+}
+
+/// Fold one saved file into the index and refresh its live overlay.
+///
+/// Both the watcher's Upsert and the editor's target request need this done:
+/// the request arrives the moment the editor saves, ahead of the watcher's
+/// 500 ms debounce, so whichever reaches the file first does the work and the
+/// other finds it already done.
+///
+/// Running twice for one save therefore has to be harmless, and the hash test
+/// is what makes it so. `reindex_files_reporting` is already hash-gated and
+/// no-ops on the second call, but the live lane below is not: re-resolving the
+/// file would re-record as `pending` the references the editor has meanwhile
+/// answered, and re-stashing would drop the changed region an in-flight report
+/// is still validated against.
+fn process_saved_file(
+    path: &Path,
+    repo_root: &Path,
+    store: &std::sync::Mutex<SqliteStore>,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
+    lsp_sessions: &std::sync::Mutex<EditorPlane>,
+) {
+    let batch = [path.to_path_buf()];
+    let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+    let already_indexed = file_matches_index(&s, repo_root, path);
+    match reindex_files_reporting(&batch, repo_root, &mut s) {
+        Ok((callers, changed_occ, changed_defs)) => {
+            if already_indexed {
+                // This save is already folded in, so the reindex above was a
+                // no-op (`callers` is empty) and the live lane has nothing new
+                // to say. Leaving the overlay and the stash alone is the point.
+                return;
+            }
+            // RFC-027 sections 6 and 7.3a: refresh this file's live
+            // overlay, and on an interface edit the overlay of the files
+            // that reference it.
+            //
+            // Only here, on the save path — the commit path arms a Phase
+            // B refresh that re-derives the same edges, so doing it
+            // there would be waste inside `git commit`'s latency.
+            //
+            // `callers` is non-empty exactly when a symbol other files
+            // reference vanished, which is the interface-edit signal
+            // (section 6.2). Their edges into this file were deleted by
+            // `reindex_replace`, so re-resolving them is what stops a
+            // rename from silently dropping every inbound live edge.
+            let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
+            // RFC-027 #813 (finding 2): on a scoped pure-body edit the
+            // store preserved every unchanged definition's committed
+            // edges, so the lexical lane must re-resolve only the changed
+            // region, otherwise it re-records a preserved definition's
+            // already-committed references as `pending` and the freshness
+            // count over-reports. `None` (no entry) means a whole-file
+            // re-derive, which resolves the file wholesale as before.
+            let saved_vname = path
+                .strip_prefix(repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let scope = changed_defs
+                .iter()
+                .find(|(f, _)| *f == saved_vname)
+                .map(|(_, set)| set);
+            live_resolve_file(&mut s, &corpus, repo_root, path, scope);
+            // RFC-027 sections 7.3c and 9.2: an abstention is recorded, not
+            // dropped. The lexical lane above records its own, but only for the
+            // references the native extractor hands it, and the extractor
+            // discards some by design (`NOISE_NAMES` drops `new`, `from`,
+            // `clone`). `Store::new()` therefore lost its committed edge to this
+            // save and appeared in no state at all: not resolved, not pending.
+            // The changed-occurrence set is exactly the occurrences whose
+            // committed edge this save dropped, so anything in it the lane did
+            // not re-resolve is precisely an unaccounted abstention.
+            let saved_occ: &[travsr_core::ChangedOccurrence] = changed_occ
+                .iter()
+                .find(|(f, _)| *f == saved_vname)
+                .map_or(&[], |(_, o)| o.as_slice());
+            match s.record_pending_changed_occurrences(saved_occ) {
+                Ok(n) if n > 0 => tracing::debug!(
+                    event = "live.pending.unresolved",
+                    path = %saved_vname,
+                    pending = n,
+                    "recorded abstentions for dropped committed references"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(error = %e, "live pending record failed"),
+            }
+            // Dependents were not reindexed by this event, so their whole
+            // file is re-resolved (no scope) exactly as before.
+            for dependent in callers.iter().take(LIVE_CLOSURE_FILE_CAP) {
+                let abs = repo_root.join(dependent);
+                if abs.as_path() != path && abs.is_file() {
+                    live_resolve_file(&mut s, &corpus, repo_root, &abs, None);
+                }
+            }
+            // RFC-027 #813 P2 / finding 2: stash this save's changed
+            // region so the editor target request that follows can both
+            // enumerate its committed occurrences and scope its native
+            // targets to the changed definitions. Release the store lock
+            // first, then take the plane lock, keeping the store->plane
+            // order the serve path also uses. One saved file per Upsert.
+            drop(s);
+            {
+                let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+                let occ = changed_occ
+                    .into_iter()
+                    .find(|(f, _)| f.as_str() == saved_vname.as_str())
+                    .map(|(_, o)| o)
+                    .unwrap_or_default();
+                let scope_owned = changed_defs
+                    .into_iter()
+                    .find(|(f, _)| f == &saved_vname)
+                    .map(|(_, set)| set);
+                plane.stash_changed_occurrences(saved_vname, occ, scope_owned);
+            }
+            enqueue_dirty_callers(callers, repo_root, index_tx)
+        }
+        Err(e) => tracing::warn!(path=%path.display(), err=%e, "watcher reindex failed"),
+    }
+}
+
 fn handle_watch_event(
     ev: watcher::WatchEvent,
     repo_root: &std::path::Path,
@@ -14223,72 +14556,7 @@ fn handle_watch_event(
 
     match ev {
         WatchEvent::Upsert(path) => {
-            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-            match reindex_files_reporting(std::slice::from_ref(&path), repo_root, &mut s) {
-                Ok((callers, changed_occ, changed_defs)) => {
-                    // RFC-027 sections 6 and 7.3a: refresh this file's live
-                    // overlay, and on an interface edit the overlay of the files
-                    // that reference it.
-                    //
-                    // Only here, on the save path — the commit path arms a Phase
-                    // B refresh that re-derives the same edges, so doing it
-                    // there would be waste inside `git commit`'s latency.
-                    //
-                    // `callers` is non-empty exactly when a symbol other files
-                    // reference vanished, which is the interface-edit signal
-                    // (section 6.2). Their edges into this file were deleted by
-                    // `reindex_replace`, so re-resolving them is what stops a
-                    // rename from silently dropping every inbound live edge.
-                    let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
-                    // RFC-027 #813 (finding 2): on a scoped pure-body edit the
-                    // store preserved every unchanged definition's committed
-                    // edges, so the lexical lane must re-resolve only the changed
-                    // region, otherwise it re-records a preserved definition's
-                    // already-committed references as `pending` and the freshness
-                    // count over-reports. `None` (no entry) means a whole-file
-                    // re-derive, which resolves the file wholesale as before.
-                    let saved_vname = path
-                        .strip_prefix(repo_root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    let scope = changed_defs
-                        .iter()
-                        .find(|(f, _)| *f == saved_vname)
-                        .map(|(_, set)| set);
-                    live_resolve_file(&mut s, &corpus, repo_root, &path, scope);
-                    // Dependents were not reindexed by this event, so their whole
-                    // file is re-resolved (no scope) exactly as before.
-                    for dependent in callers.iter().take(LIVE_CLOSURE_FILE_CAP) {
-                        let abs = repo_root.join(dependent);
-                        if abs != path && abs.is_file() {
-                            live_resolve_file(&mut s, &corpus, repo_root, &abs, None);
-                        }
-                    }
-                    // RFC-027 #813 P2 / finding 2: stash this save's changed
-                    // region so the editor target request that follows can both
-                    // enumerate its committed occurrences and scope its native
-                    // targets to the changed definitions. Release the store lock
-                    // first, then take the plane lock, keeping the store->plane
-                    // order the serve path also uses. One saved file per Upsert.
-                    drop(s);
-                    {
-                        let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
-                        let occ = changed_occ
-                            .into_iter()
-                            .find(|(f, _)| *f == saved_vname)
-                            .map(|(_, o)| o)
-                            .unwrap_or_default();
-                        let scope_owned = changed_defs
-                            .into_iter()
-                            .find(|(f, _)| f == &saved_vname)
-                            .map(|(_, set)| set);
-                        plane.stash_changed_occurrences(saved_vname, occ, scope_owned);
-                    }
-                    enqueue_dirty_callers(callers, repo_root, index_tx)
-                }
-                Err(e) => tracing::warn!(path=%path.display(), err=%e, "watcher reindex failed"),
-            }
+            process_saved_file(&path, repo_root, store, index_tx, lsp_sessions)
         }
         WatchEvent::Remove(path) => {
             let vname_path = path
@@ -14723,9 +14991,48 @@ fn handle_control_message(
                 );
             }
 
+            // SEC-002: `file` is caller-supplied and is joined onto the repo
+            // root below, so it is validated here, before anything reads or
+            // writes with it. The same guard the MCP tools apply to a `file`
+            // argument (`get_dependencies`), applied at the point the string
+            // enters rather than inside `process_saved_file`, whose other caller
+            // is the watcher and is handed paths from its own walk of the repo.
+            // It has to be here and not further down because this arm now both
+            // reads that path and indexes it: `reindex_files_reporting` falls
+            // back to the joined path when `strip_prefix(repo_root)` fails, so
+            // `../outside/secret.rs` would otherwise be parsed into the graph.
+            // Purely lexical, so unlike a canonicalizing containment test it
+            // cannot reject a legitimate request because the repo root is a
+            // symlink or is spelled non-canonically.
+            if let Err(reason) = travsr_mcp::validate_mcp_arg(&file) {
+                tracing::warn!(
+                    event = "live.targets.rejected",
+                    session = %session,
+                    "live resolution targets rejected an invalid file argument: {reason}"
+                );
+                return (
+                    ControlResponse::err("invalid file argument".to_string()),
+                    false,
+                );
+            }
+
+            let abs_path = repo_root.join(&file);
+            // RFC-027 §7.3b: the editor asks the instant it saves, and the
+            // watcher's 500 ms debounce means the daemon has not reparsed that
+            // save yet. Answering from the pre-save index describes the file as
+            // it was before the edit: the changed region is not stashed, so the
+            // references only a language server can resolve are never offered,
+            // and the editor asks exactly once per save and never retries. So
+            // fold the save in here rather than race the watcher for it; the
+            // pass that arrives second finds the work done (`process_saved_file`).
+            // Only for a file that is there to read: a deleted path is the
+            // watcher's Remove event to handle, not this request's.
+            if abs_path.is_file() {
+                process_saved_file(&abs_path, repo_root, store, index_tx, lsp_sessions);
+            }
+
             let s = store.lock().unwrap_or_else(|e| e.into_inner());
             let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
-            let abs_path = repo_root.join(&file);
             // RFC-027 #813 P2 / finding 2: serve this file's stashed changed
             // region (its committed occurrences to enumerate, and its changed-def
             // set to scope native targets), restarting the TTL from this request
