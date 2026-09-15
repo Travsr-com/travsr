@@ -186,6 +186,90 @@ pub(crate) fn print_questions(pal: Palette) {
     );
 }
 
+/// Crudest possible suffix strip, for [`suggest`] only.
+///
+/// "how do I get started" missed "how do I start using it on a repo?" on nothing
+/// but `started` against `start`, which is the single most likely way a new user
+/// phrases the catalogue's own first question. Deliberately not applied to
+/// [`match_question`]: that one asserts an answer over the reader's search, and
+/// widening what it accepts widens what it can hijack. This one only ranks
+/// suggestions on paths that already had nothing to offer.
+fn stem(word: &str) -> String {
+    // "es" is deliberately absent. Stripping it turned `languages` into
+    // `languag` while `language` stemmed to itself, so the two never met and
+    // "which languages does it support?" became unreachable from "what language".
+    // Plain "s" lands both on `language`. `boxes` becomes `boxe`, which is not a
+    // word but is the same token on both sides, and that is all this needs.
+    for suffix in ["ing", "ed", "s"] {
+        if let Some(base) = word.strip_suffix(suffix) {
+            if base.len() >= 3 {
+                return base.to_string();
+            }
+        }
+    }
+    word.to_string()
+}
+
+/// FAQ entries a question *might* be asking, ranked, for the paths where there
+/// is nothing to hijack.
+///
+/// [`match_question`] is deliberately strict because answering a meta question
+/// instead of running the user's code search is the worse failure. That
+/// trade-off only exists while there is a search to displace. On a repository
+/// with no index, and after a search that already found nothing, there is none:
+/// the strict miss leaves the reader with an error or an empty result, which is
+/// the outcome the strictness was protecting them from in the first place.
+///
+/// Measured before this existed: the catalogue answers "how do I start using it
+/// on a repo?" well, and "how do I get started" returned
+/// `not initialized; run travsr init` on a fresh clone. That is the first
+/// sentence a new user types, answered by the one error that tells them nothing
+/// they did not already know.
+///
+/// So this relaxes only the direction that was too strict: a catalogue question
+/// is a candidate when the reader's words overlap it at all, ranked by how much.
+/// Returns candidates to offer, never an answer to assert.
+pub(crate) fn suggest(query: &str) -> Vec<&'static Entry> {
+    // Shape gate, the same instinct as `match_question`'s: a symbol is not a
+    // question, and offering travsr's own FAQ under a failed symbol lookup is
+    // noise on every miss. Caught by the test for this: `Runner.run` splits into
+    // `runner` and `run`, which overlap the catalogue by accident.
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let identifier_shaped = |w: &str| {
+        w.contains('.')
+            || w.contains('_')
+            || w.contains("::")
+            || w.chars().skip(1).any(|c| c.is_uppercase())
+    };
+    if words.len() < 2 || words.iter().any(|w| identifier_shaped(w)) {
+        return Vec::new();
+    }
+
+    let asked: Vec<String> = distinctive_words(query).iter().map(|w| stem(w)).collect();
+    if asked.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(usize, &'static Entry)> = entries()
+        .iter()
+        .filter_map(|e| {
+            let want: Vec<String> = distinctive_words(&e.question)
+                .iter()
+                .map(|w| stem(w))
+                .collect();
+            let hits = want.iter().filter(|w| asked.contains(*w)).count();
+            // "travsr" is the implicit subject of every catalogue question, so a
+            // match on it alone says nothing about which one is meant.
+            let meaningful = want
+                .iter()
+                .filter(|w| *w != "travsr" && asked.contains(*w))
+                .count();
+            (meaningful > 0).then_some((hits, e))
+        })
+        .collect();
+    scored.sort_by_key(|(hits, _)| std::cmp::Reverse(*hits));
+    scored.into_iter().take(3).map(|(_, e)| e).collect()
+}
+
 /// The FAQ entry a free-form question is asking, if any.
 ///
 /// Matched by word overlap against the catalogue's own questions rather than a
@@ -371,7 +455,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{entries, wrap};
+    use super::{entries, match_question, stem, suggest, wrap};
 
     #[test]
     fn every_entry_is_a_question_with_an_answer() {
@@ -566,6 +650,72 @@ mod tests {
     /// both directions and stopped splitting on underscore. `install_hook` became
     /// "install" and matched the install entry; "how does the parser work"
     /// reduced to "work" and matched "how does it work?".
+    /// The measured failure this exists for: a new user's first sentence.
+    ///
+    /// The catalogue answers "how do I start using it on a repo?" well. Before
+    /// `suggest`, "how do I get started" on a fresh clone returned
+    /// `not initialized; run travsr init`, which is the one thing they already
+    /// knew. The miss was `started` against `start`, nothing more.
+    #[test]
+    fn the_first_question_a_new_user_asks_reaches_the_catalogue() {
+        for q in [
+            "how do I get started",
+            "getting started",
+            "how do I start using travsr",
+        ] {
+            let hits = suggest(q);
+            assert!(
+                hits.iter().any(|e| e.question.contains("start")),
+                "{q:?} must reach a getting-started entry, got {:?}",
+                hits.iter().map(|e| &e.question).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// `suggest` is offered where a search already failed, but it must still not
+    /// fire on something that is plainly a symbol lookup, or the suggestion line
+    /// becomes noise on every miss.
+    #[test]
+    fn suggest_stays_quiet_for_a_symbol_that_shares_no_words() {
+        for q in [
+            "PaymentService",
+            "charge",
+            "fn:handle_request",
+            "Runner.run",
+        ] {
+            assert!(
+                suggest(q).is_empty(),
+                "{q:?} is a symbol lookup, not a question about travsr"
+            );
+        }
+    }
+
+    /// The relaxation is confined to `suggest`. `match_question` asserts an
+    /// answer over the reader's search, so widening it widens what it hijacks:
+    /// the paraphrase that `suggest` now catches must still NOT be asserted.
+    #[test]
+    fn the_strict_matcher_is_not_loosened_by_the_suggester() {
+        assert!(
+            match_question("how do I get started").is_none(),
+            "the strict matcher must stay strict; only `suggest` relaxes"
+        );
+        assert!(
+            !suggest("how do I get started").is_empty(),
+            "and `suggest` is the one that relaxes"
+        );
+    }
+
+    #[test]
+    fn stemming_strips_only_what_leaves_a_real_word() {
+        assert_eq!(stem("started"), "start");
+        assert_eq!(stem("languages"), "language");
+        assert_eq!(stem("language"), "language");
+        assert_eq!(stem("installing"), "install");
+        // Too short to strip: the remainder would not be a word.
+        assert_eq!(stem("is"), "is");
+        assert_eq!(stem("les"), "les");
+    }
+
     #[test]
     fn code_searches_are_never_hijacked() {
         for q in [

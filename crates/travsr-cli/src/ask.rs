@@ -280,6 +280,30 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     let db_path = repo_root.join(".travsr/graph.db");
 
     if !db_path.exists() {
+        // Nothing to search here, so nothing a loose FAQ match could displace.
+        // `match_question` is strict on purpose, and on this path that strictness
+        // was costing the one question a new user actually asks: "how do I get
+        // started" reached this bail while the catalogue answers it under a
+        // different wording.
+        let hits = crate::faq::suggest(query_str);
+        if let Some(best) = hits.first() {
+            use std::io::IsTerminal as _;
+            let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
+            println!(
+                "{}",
+                pal.dim("This repository has no index yet, so there is nothing to search.")
+            );
+            println!();
+            crate::faq::print_entry(best, pal);
+            if hits.len() > 1 {
+                println!();
+                println!("{}", pal.dim("Related:"));
+                for e in &hits[1..] {
+                    println!("{}", pal.dim(&format!("  travsr ask \"{}\"", e.question)));
+                }
+            }
+            return Ok(());
+        }
         anyhow::bail!("not initialized; run `travsr init`");
     }
 
@@ -420,6 +444,25 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
                 println!("      {}", pal.dim(&s.why));
             }
             println!("\n{}", pal.dim("or `travsr ask --examples` for more"));
+        }
+
+        // The search already found nothing, so a loose FAQ match displaces
+        // nothing: the strictness in `match_question` exists to protect a real
+        // code search, and there is no longer one to protect. Offered as a
+        // question to ask, never asserted as the answer, because the reader may
+        // genuinely have meant a symbol this repo does not contain.
+        let meta = crate::faq::suggest(display_query);
+        if let Some(best) = meta.first() {
+            let pal = crate::progress::Palette::for_stream(std::io::stdout().is_terminal());
+            println!();
+            println!(
+                "{}",
+                pal.dim("if you meant travsr itself rather than this codebase:")
+            );
+            println!(
+                "{}",
+                pal.dim(&format!("  travsr ask \"{}\"", best.question))
+            );
         }
         // #376 §4.3: doc hits may appear below the abstain message, but never
         // convert it into a match — `payload.matched` stays false and no
