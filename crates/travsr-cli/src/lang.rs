@@ -20,6 +20,13 @@ pub enum LangCommand {
     // docs told agents to run `travsr lang status` and got an error.
     #[command(visible_alias = "status")]
     List {
+        /// Show only this language (e.g. `travsr lang status typescript`).
+        /// Omit to show every supported language.
+        //
+        // Optional positional rather than a new subcommand: `status` is already
+        // an alias of `list`, so `travsr lang status typescript` is the spelling
+        // users and docs reach for, and it exited 2 with "unexpected argument".
+        language: Option<String>,
         /// Output as a JSON array for programmatic / extension use.
         #[arg(long)]
         json: bool,
@@ -116,7 +123,7 @@ pub enum InstallStatus {
 
 pub fn run(cmd: LangCommand) -> Result<()> {
     match cmd {
-        LangCommand::List { json } => cmd_list(json),
+        LangCommand::List { language, json } => cmd_list(language.as_deref(), json),
         LangCommand::Install {
             language,
             reinstall,
@@ -185,7 +192,12 @@ fn unavailable_status(entry: &PhaseBEntry, target: &str) -> String {
 /// is guaranteed to exist on the machine. True when the entry declares no such
 /// hidden driver (nothing to check).
 fn bundled_analyzer_ready(entry: &PhaseBEntry) -> bool {
+    // Both halves are required and neither implies the other: node is the
+    // runtime, the emitter is the program it runs. Checking only node is what
+    // let `lang install typescript` answer "full cross-file analysis is on" in
+    // a repo where `travsr status` reported the analyzer could not be started.
     entry.runtime_driver.map_or(true, tool_available)
+        && travsr_indexer::bundled_lsif_emitter_available(entry.language)
 }
 
 /// Whether full cross-file semantic can actually run for `entry` on this machine:
@@ -401,7 +413,16 @@ fn json_arr(items: &[&str]) -> String {
     format!("[{}]", elems.join(","))
 }
 
-fn cmd_list(json: bool) -> Result<()> {
+fn cmd_list(language: Option<&str>, json: bool) -> Result<()> {
+    if let Some(lang) = language {
+        anyhow::ensure!(
+            lookup(lang).is_some(),
+            "unknown language '{lang}'. Run `travsr lang list` to see the supported languages"
+        );
+    }
+    // One predicate shared by the JSON and text renderings so a filtered view
+    // can never show a different set in the two formats.
+    let selected = |entry: &PhaseBEntry| language.map_or(true, |l| entry.language == l);
     let config = load_config();
 
     // Per-repo enablement (corpus trust gate): languages install globally, but
@@ -417,7 +438,7 @@ fn cmd_list(json: bool) -> Result<()> {
 
     if json {
         let mut entries: Vec<String> = Vec::new();
-        for entry in CATALOG {
+        for entry in CATALOG.iter().filter(|e| selected(e)) {
             let sandbox = match entry.sandbox {
                 SandboxRequirement::Standard => "Standard",
                 SandboxRequirement::NativeIpc => "NativeIpc",
@@ -504,7 +525,7 @@ fn cmd_list(json: bool) -> Result<()> {
     );
     println!("{}", "-".repeat(84));
 
-    for entry in CATALOG {
+    for entry in CATALOG.iter().filter(|e| selected(e)) {
         let registered = config
             .as_ref()
             .map(|c| c.is_registered(entry.language))
@@ -720,7 +741,17 @@ fn cmd_install(
         // (rust → rust-analyzer) is NOT bundled, so it falls through to the
         // install path below instead of short-circuiting to a false "active"
         // without ever fetching the analyzer.
-        bundled_analyzer_ready(entry)
+        // Deliberately NOT `bundled_analyzer_ready`, which also checks that the
+        // emitter resolves. That check belongs in the capability view and in the
+        // message below, not in this flag: `full_ready` drives
+        // `InstallStatus::WrapperOnly`, which exits 2 and is documented as
+        // "wrapper installed but underlying SCIP tool missing". A bundled
+        // analyzer has no second tool for the user to fetch, and the work
+        // `lang install` actually does here (register the language, grant this
+        // repo's corpus) has already succeeded, so turning an unbuilt emitter
+        // into a failed install would break enabling a language in any tree that
+        // has not built it yet.
+        entry.runtime_driver.map_or(true, tool_available)
     } else if wrapper_installed && (reinstall || !analyzer_command_present(entry)) {
         // UX-4: `--reinstall` must re-run the underlying SCIP tool install even when
         // it is already on PATH, not just the wrapper. Otherwise a user following the
@@ -879,7 +910,23 @@ fn cmd_install(
         return Ok(InstallStatus::FullyReady);
     }
 
-    if enabled_here {
+    // The claim is checked, not asserted. `lang install typescript` used to
+    // print "is active, full cross-file analysis is on" in the very repo where
+    // `travsr status` reported the analyzer could not be started, because
+    // nothing here had looked for the emitter. The registration itself did
+    // succeed, so this reports the analyzer state rather than failing the
+    // command, and the remedy is the install layout: a bundled analyzer is not
+    // a package the user fetches.
+    if entry.analyzer_bundled() && !travsr_indexer::bundled_lsif_emitter_available(entry.language) {
+        println!(
+            "'{language}' is set up for this repository, but the analyzer that ships with \
+             travsr ('{}') was not found next to the travsr binary, so full cross-file \
+             analysis stays off and basic analysis still runs.\n\
+             Reinstall travsr so the analyzer sits beside the binary, then re-run \
+             `travsr init --semantic --force`.",
+            entry.command
+        );
+    } else if enabled_here {
         println!("'{language}' is active, full cross-file analysis is on for this repository.");
     } else {
         println!("'{language}' is active, full cross-file analysis is on.");

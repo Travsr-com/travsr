@@ -532,20 +532,25 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
             // when the TypeScript LSIF pass was skipped: the language then lacks
             // most of its cross-file call edges. Say so right here, at default
             // verbosity, rather than only in a RUST_LOG warning.
-            if let Some(skip) = &report.lsif_skipped {
+            for skip in &report.lsif_skipped {
                 use travsr_daemon::LsifSkipReason;
+                let lang = &skip.language;
+                let analyzer = travsr_daemon::lsif_analyzer_name(lang);
                 let (what, fix) = match skip.reason {
+                    // EmitterMissing is TypeScript-only (rust and python record a
+                    // failure, never a plain absence), so its remedy is the
+                    // TypeScript one #878 wrote.
                     LsifSkipReason::EmitterMissing => (
                         "could not be started",
                         "set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr so it sits beside the binary), then re-run `travsr init --semantic --force`",
                     ),
                     LsifSkipReason::EmitterFailed => (
                         "failed",
-                        "fix the emitter (its error is above), then re-run `travsr init --semantic --force`",
+                        "fix the analyzer (its error is above), then re-run `travsr init --semantic --force`",
                     ),
                 };
                 println!(
-                    "  {} typescript semantic analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) {what}, so cross-file call and reference edges are missing",
+                    "  {} {lang} semantic analysis is incomplete: {analyzer} {what}, so cross-file call and reference edges are missing",
                     pal.orange("⚠"),
                 );
                 println!("    {}", skip.detail);

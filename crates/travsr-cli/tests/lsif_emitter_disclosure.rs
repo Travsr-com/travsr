@@ -427,3 +427,64 @@ fn relocated_binary_never_degrades_silently() {
         }
     }
 }
+
+// ── The bundled payload the release tarball ships ────────────────────────────
+
+/// A relocated binary with `travsr-lib/travsr-lsif-ts` beside it must use that
+/// bundle.
+///
+/// This is the layout every published artifact was missing. The tarball held
+/// one file and neither emitter is on npm, so on an installed binary discovery
+/// fell through to the bare-PATH rung and TypeScript, JavaScript and Python
+/// produced no cross-file edges while `lang list` reported them active. The
+/// relocated binary is the same one `relocated_binary_never_degrades_silently`
+/// uses, so the only difference here is the payload beside it.
+#[test]
+fn a_relocated_binary_uses_the_bundled_emitter() {
+    if !node_available() {
+        eprintln!("SKIP: node not available");
+        return;
+    }
+    let repo = seed_ts_repo();
+
+    let relocated_dir = tempfile::tempdir().unwrap();
+    let bin_dir = relocated_dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let relocated = bin_dir.join(in_place_binary().file_name().unwrap());
+    std::fs::copy(in_place_binary(), &relocated).unwrap();
+
+    // Without the payload the relocated binary is a disclosed skip, unless this
+    // machine has the emitter on PATH, in which case rung 4 legitimately finds
+    // one and there is no missing-emitter case left to set up.
+    if emitter_on_path() {
+        eprintln!("SKIP: an emitter on PATH answers before the bundle");
+        return;
+    }
+    let before = init_semantic(&relocated, repo.path(), &[]);
+    assert!(before.status.success(), "{}", text(&before));
+    assert!(
+        has_emitter_warning(&warnings(repo.path())),
+        "without travsr-lib the relocated binary must report a missing emitter, got {:?}",
+        warnings(repo.path())
+    );
+
+    // The bundle is an extensionless shebang script in the real payload, so it
+    // is spawned through `node`; the stub is written the same way and emits an
+    // empty but valid dump, which is what makes this assertion hold on CI.
+    let lib = bin_dir.join("travsr-lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("travsr-lsif-ts"), "process.exit(0);").unwrap();
+
+    let after = init_semantic(&relocated, repo.path(), &[]);
+    assert!(after.status.success(), "{}", text(&after));
+    let combined = text(&after);
+    assert!(
+        !combined.contains(INCOMPLETE_LINE),
+        "travsr-lib beside the binary must be found, not reported incomplete:\n{combined}"
+    );
+    assert!(
+        !has_emitter_warning(&warnings(repo.path())),
+        "travsr-lib beside the binary must clear the missing-emitter warning, got {:?}",
+        warnings(repo.path())
+    );
+}

@@ -316,7 +316,10 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         match redirect.command {
             "travsr lang list" => {
                 println!("{}", pal.dim(redirect.answer));
-                crate::lang::run(crate::lang::LangCommand::List { json: false })?;
+                crate::lang::run(crate::lang::LangCommand::List {
+                    language: None,
+                    json: false,
+                })?;
             }
             "travsr status" => {
                 println!("{}", pal.dim(redirect.answer));

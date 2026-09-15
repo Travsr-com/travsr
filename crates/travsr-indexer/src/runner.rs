@@ -197,7 +197,9 @@ fn run_with_drain_capped(
 ///    that names the variable (#878), so a stale override never falls through to
 ///    a different emitter, or to the bare-PATH fallback, without saying so.
 /// 2. Sibling of `current_exe` named `travsr-lsif-ts` — npm global install layout where
-///    both binaries land in the same `bin/` directory.
+///    both binaries land in the same `bin/` directory — or `travsr-lib/travsr-lsif-ts`
+///    beside it, which is the bundle the release tarball ships
+///    (scripts/bundle-emitters.sh).
 /// 3. Walk up from `current_exe` directory looking for
 ///    `packages/travsr-lsif-ts/dist/index.js` — monorepo / `cargo build` dev layout.
 /// 4. `travsr-lsif-ts` on PATH — legacy fallback. Steps 2 and 3 are anchored on
@@ -221,6 +223,22 @@ fn resolve_lsif_emitter() -> (String, Vec<String>) {
             let sibling = exe_dir.join("travsr-lsif-ts");
             if sibling.is_file() {
                 return (sibling.to_string_lossy().into_owned(), vec![]);
+            }
+
+            // 2b. Bundled payload from the release tarball
+            //     (scripts/bundle-emitters.sh), kept in its own directory so
+            //     the Python emitter's adjacent node_modules is not scattered
+            //     into a PATH dir. Both emitters ship there together.
+            //
+            //     Invoked through `node` rather than executed directly: the
+            //     bundle is an extensionless shebang script, which Windows
+            //     cannot spawn as a program. Step 1 resolves the same way.
+            let bundled = exe_dir.join("travsr-lib").join("travsr-lsif-ts");
+            if bundled.is_file() {
+                return (
+                    "node".to_string(),
+                    vec![bundled.to_string_lossy().into_owned()],
+                );
             }
 
             // 3. Walk up from exe_dir looking for the monorepo layout.
@@ -547,7 +565,9 @@ fn read_scip_output_capped(output: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
 ///
 /// Resolution order (identical to [`resolve_lsif_emitter`] for TypeScript):
 /// 1. `TRAVSR_LSIF_PY` env var — absolute path to the JS entry point.
-/// 2. Sibling of `current_exe` named `travsr-lsif-py` — npm global install layout.
+/// 2. Sibling of `current_exe` named `travsr-lsif-py` — npm global install layout —
+///    or `travsr-lib/travsr-lsif-py` beside it, the bundle the release tarball
+///    ships, with its native addons in `travsr-lib/node_modules`.
 /// 3. Walk up from `current_exe` to find `packages/travsr-lsif-py/dist/index.js`.
 /// 4. `travsr-lsif-py` on PATH — final fallback.
 ///
@@ -568,6 +588,23 @@ fn resolve_lsif_py_emitter() -> (String, Vec<String>) {
             let sibling = exe_dir.join("travsr-lsif-py");
             if sibling.is_file() {
                 return (sibling.to_string_lossy().into_owned(), vec![]);
+            }
+
+            // 2b. Bundled payload from the release tarball
+            //     (scripts/bundle-emitters.sh). It lives in its own directory
+            //     rather than directly beside the binary because the Python
+            //     emitter needs its native addons in an adjacent node_modules,
+            //     and an install into a PATH dir must not scatter those there.
+            //
+            //     Invoked through `node` for the same reason as the TypeScript
+            //     bundle: an extensionless shebang script is not spawnable on
+            //     Windows.
+            let bundled = exe_dir.join("travsr-lib").join("travsr-lsif-py");
+            if bundled.is_file() {
+                return (
+                    "node".to_string(),
+                    vec![bundled.to_string_lossy().into_owned()],
+                );
             }
 
             // 3. Walk up from exe_dir looking for the monorepo dev layout.
@@ -591,6 +628,49 @@ fn resolve_lsif_py_emitter() -> (String, Vec<String>) {
 
     // 4. PATH fallback.
     ("travsr-lsif-py".to_string(), vec![])
+}
+
+/// Whether the bundled Node emitter for `language` actually resolves on this
+/// machine.
+///
+/// `travsr lang install` and `lang list` used to answer "is node installed?" for
+/// the three bundled languages and then assert "full cross-file analysis is on",
+/// on the assumption that the emitter always ships beside the binary. It did
+/// not: no release from v0.9.0 to v1.1.0 contained one, so `lang install
+/// typescript` reported success in the same repo where `travsr status` reported
+/// the analyzer could not be started. This resolves it the way the runners do,
+/// so the claim is checked rather than assumed.
+pub fn bundled_lsif_emitter_available(language: &str) -> bool {
+    let (program, args) = if language == "python" {
+        resolve_lsif_py_emitter()
+    } else {
+        resolve_lsif_emitter()
+    };
+    // Rungs 1-3 hand back a concrete file, either as the program itself or as
+    // node's script argument. Rung 4 is the bare PATH name, which is only real
+    // if PATH has it.
+    match args.last() {
+        Some(script) => Path::new(script).is_file(),
+        None => Path::new(&program).is_file() || on_path(&program),
+    }
+}
+
+/// Whether a bare command name resolves to a file on PATH. Only used by
+/// [`bundled_lsif_emitter_available`] for the bare-name fallback rung.
+fn on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        // `.cmd`/`.exe` because the npm shim on Windows is not extensionless.
+        [
+            program,
+            &format!("{program}.cmd"),
+            &format!("{program}.exe"),
+        ]
+        .iter()
+        .any(|name| dir.join(name).is_file())
+    })
 }
 
 /// Run `travsr-lsif-py --root <root>` and return the LSIF JSON-Lines dump.
@@ -622,15 +702,26 @@ pub fn run_lsif_py_emitter(root: &Path) -> anyhow::Result<Option<String>> {
                 "travsr-lsif-py not found, Python LSIF enrichment skipped \
                  (native phase_b tree-sitter edges still active)"
             );
+            // Not recorded as a failure: an emitter that is not there is an
+            // install-layout question, which `travsr lang list` already reports
+            // as `partial` for python. Only an emitter that ran and broke is a
+            // failure to disclose.
             return Ok(None);
         }
     };
 
     let (exit_status, stdout_bytes, stderr) =
-        run_with_drain(child, lsif_node_timeout(), "travsr-lsif-py")?;
+        match run_with_drain(child, lsif_node_timeout(), "travsr-lsif-py") {
+            Ok(v) => v,
+            Err(e) => {
+                crate::sandbox::record_lsif_analyzer_failure("python");
+                return Err(e);
+            }
+        };
 
     if !exit_status.success() {
         let stderr_head = stderr.lines().take(5).collect::<Vec<_>>().join("\n");
+        crate::sandbox::record_lsif_analyzer_failure("python");
         anyhow::bail!("travsr-lsif-py exited with {exit_status}: {stderr_head}");
     }
 

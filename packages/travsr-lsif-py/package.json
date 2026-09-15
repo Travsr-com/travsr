@@ -12,11 +12,12 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "tree-sitter": "^0.25.0",
+    "tree-sitter": "^0.25.1",
     "tree-sitter-python": "^0.25.0"
   },
   "devDependencies": {
     "@types/node": "^25.8.0",
+    "esbuild": "0.24.0",
     "typescript": "^6.0.3"
   },
   "engines": {

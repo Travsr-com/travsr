@@ -166,6 +166,19 @@ export async function installBinary(
   cp.execFileSync("tar", ["-xzf", tmpTar, "-C", installDir, binName], {
     stdio: "ignore",
   });
+
+  // travsr-lib carries the bundled TypeScript, JavaScript and Python LSIF
+  // emitters, so an extension-managed install resolves them the same way a
+  // tarball install does; without it those languages fall back to structural
+  // edges only. Extracted separately and tolerantly: a DOWNLOAD_VERSION that
+  // predates the bundle has no such member, and tar fails hard on a missing one.
+  try {
+    cp.execFileSync("tar", ["-xzf", tmpTar, "-C", installDir, "travsr-lib"], {
+      stdio: "ignore",
+    });
+  } catch {
+    /* release without bundled emitters */
+  }
   try { fs.unlinkSync(tmpTar); } catch { /* ignore */ }
 
   if (process.platform !== "win32") fs.chmodSync(installPath, 0o755);

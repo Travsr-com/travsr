@@ -62,7 +62,7 @@ pub fn run(
         // `partial`; agree with it.
         let phase_b = match &stats.phase_b_report {
             None => "pending",
-            Some(r) if r.lsif_skipped.is_some() || !r.crashed.is_empty() => "partial",
+            Some(r) if !r.lsif_skipped.is_empty() || !r.crashed.is_empty() => "partial",
             Some(_) => "complete",
         };
         let summary = serde_json::json!({

@@ -201,7 +201,11 @@ pub struct PhaseBReport {
     /// started or failed. `typescript` still appears in `ran` (the native
     /// tree-sitter pass did run), so without this the run read as a clean
     /// success while the language was missing most of its `ref/call` edges.
-    pub lsif_skipped: Option<LsifSkip>,
+    /// One entry per language whose deep-analysis (LSIF) pass was due and
+    /// produced nothing. A `Vec` rather than the single TypeScript slot it
+    /// started as: rust and python reach this the same way, and a repo can be
+    /// missing more than one analyzer at once.
+    pub lsif_skipped: Vec<LsifSkip>,
 }
 
 /// #878: why the TypeScript LSIF pass produced no edges for a repo that asked
@@ -218,6 +222,11 @@ pub struct PhaseBReport {
 /// is disclosed today.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LsifSkip {
+    /// The language whose cross-file edges are missing, as
+    /// `Language::as_str()` spells it. Carried rather than assumed, because the
+    /// same two classes now describe rust-analyzer and travsr-lsif-py as well
+    /// as travsr-lsif-ts.
+    pub language: String,
     pub reason: LsifSkipReason,
     /// The underlying error, for the `init` summary. Not persisted: the meta
     /// entry carries only the class, so free text (which may contain the `,`
@@ -243,6 +252,22 @@ impl LsifSkip {
             LsifSkipReason::EmitterMissing => "emitter_missing",
             LsifSkipReason::EmitterFailed => "emitter_failed",
         }
+    }
+}
+
+/// The analyzer a language's cross-file edges come from, for the disclosure
+/// messages.
+///
+/// Exists because those messages named "the TypeScript analyzer
+/// (travsr-lsif-ts)" unconditionally, so reusing the same warning classes for
+/// rust and python would tell a Rust user to reinstall a TypeScript emitter.
+/// The renderers only have the language string from the meta key, so this takes
+/// `&str` rather than hanging off [`LsifSkip`].
+pub fn lsif_analyzer_name(language: &str) -> &'static str {
+    match language {
+        "rust" => "rust-analyzer",
+        "python" => "the Python analyzer (travsr-lsif-py)",
+        _ => "the TypeScript analyzer (travsr-lsif-ts)",
     }
 }
 
@@ -1958,6 +1983,7 @@ pub fn init_repo_with_progress(
             // skip on another repo doesn't produce a false degradation flag for
             // this repo's write_phase_b_results call.
             travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+            travsr_indexer::sandbox::reset_lsif_analyzer_failures();
             let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
             // #755 item 3: live per-language view of the fan-out, polled by the
             // heartbeat thread below so the progress line keeps ticking while
@@ -3340,8 +3366,12 @@ fn write_phase_b_results(
     // ran and failed). The native pass still ran, so `typescript` is in `ran`
     // and the marker advances; this is what keeps `travsr status` from reading
     // `complete` over an index missing most of the language's call edges.
-    if let Some(skip) = lsif_skip {
-        warnings.push(format!("{}:typescript", skip.warning_class()));
+    // The TypeScript skip arrives as an argument (its pass runs in this crate);
+    // rust and python are recorded by their own runners in travsr-indexer and
+    // drained here, so all three land in one place with one vocabulary.
+    let lsif_skips = collect_lsif_skips(lsif_skip);
+    for skip in &lsif_skips {
+        warnings.push(format!("{}:{}", skip.warning_class(), skip.language));
     }
     // E6: surface SCIP def-unification misses (orphaned twins). Positional
     // span-containment makes this near-zero; a non-zero rate means Phase A
@@ -3416,7 +3446,7 @@ fn write_phase_b_results(
         produced_no_nodes: pb_outcome.produced_no_nodes,
         produced_no_references: pb_outcome.produced_no_references,
         version_mismatch: pb_outcome.version_mismatch,
-        lsif_skipped: lsif_skip.cloned(),
+        lsif_skipped: lsif_skips,
     };
     (report, alias_map, dropped)
 }
@@ -5007,6 +5037,7 @@ fn run_background_phase_b_inner(
     let dart_present = present_languages.contains("dart");
     // R1: reset per-Phase-B skip latch before the run (same as init_repo_with_progress).
     travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+    travsr_indexer::sandbox::reset_lsif_analyzer_failures();
     let indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
     let inputs = travsr_plugin_host::PhaseBInputs {
         repo_root,
@@ -5147,7 +5178,11 @@ fn run_background_phase_b_inner(
         lsif_edges = lsif_edges.len(),
         // #878: `lsif_edges = 0` alone cannot distinguish "no tsconfig" from
         // "the emitter never ran"; the class says which.
-        lsif_skipped = report.lsif_skipped.as_ref().map(LsifSkip::warning_class),
+        lsif_skipped = ?report
+            .lsif_skipped
+            .iter()
+            .map(|s| format!("{}:{}", s.warning_class(), s.language))
+            .collect::<Vec<_>>(),
         crashed = report.crashed.len(),
         write_failures = report.write_failures,
         outcome = ?outcome,
@@ -5735,6 +5770,7 @@ fn run_lsif_pass_collect(
             return (
                 Vec::new(),
                 Some(LsifSkip {
+                    language: "typescript".to_string(),
                     reason,
                     detail: format!("{e:#}"),
                 }),
@@ -5752,12 +5788,36 @@ fn run_lsif_pass_collect(
             (
                 Vec::new(),
                 Some(LsifSkip {
+                    language: "typescript".to_string(),
                     reason: LsifSkipReason::EmitterFailed,
                     detail: format!("travsr-lsif-ts ran but its output could not be read: {e:#}"),
                 }),
             )
         }
     }
+}
+
+/// Merge the TypeScript LSIF skip with the rust/python analyzer failures
+/// recorded by their runners during this Phase B pass.
+///
+/// The two sources exist because the passes do: TypeScript's runs here in the
+/// daemon (so it is handed in), while rust-analyzer and travsr-lsif-py are
+/// invoked from travsr-indexer, which latches its failures for exactly this
+/// drain.
+fn collect_lsif_skips(ts_skip: Option<&LsifSkip>) -> Vec<LsifSkip> {
+    let mut out: Vec<LsifSkip> = ts_skip.into_iter().cloned().collect();
+    for language in travsr_indexer::sandbox::lsif_analyzer_failures() {
+        let detail = format!(
+            "{} ran and failed, so {language} kept only its structural call edges",
+            lsif_analyzer_name(language)
+        );
+        out.push(LsifSkip {
+            language: language.to_string(),
+            reason: LsifSkipReason::EmitterFailed,
+            detail,
+        });
+    }
+    out
 }
 
 /// Derive the canonical corpus for `repo_root` by reading `git remote get-url origin`.
@@ -8479,6 +8539,85 @@ mod tests {
         );
     }
 
+    /// A Phase B cycle whose deep-analysis pass produced nothing for a language
+    /// must record it under the same `emitter_missing:` / `emitter_failed:`
+    /// classes the TypeScript path uses, so `travsr status` downgrades
+    /// `semantic: complete` and names the analyzer.
+    ///
+    /// Before this, `run_ra_lsif` returning `Err` was logged and dropped: the
+    /// language kept only its tree-sitter heuristics while every surface
+    /// reported a clean success. An analyzer that is merely absent is NOT
+    /// recorded here; that is a capability question `lang list` answers.
+    #[test]
+    fn write_phase_b_results_records_rust_and_python_lsif_skips() {
+        travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+        travsr_indexer::sandbox::reset_lsif_analyzer_failures();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store =
+            travsr_store::SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+
+        // A clean cycle records nothing, so the warning can never be spurious.
+        write_phase_b_results(
+            &mut store,
+            "test",
+            vec![],
+            vec![],
+            vec![],
+            travsr_plugin_host::PhaseBOutcome::default(),
+            (0, 0),
+            None,
+        );
+        assert_eq!(
+            store
+                .get_meta("phase_b_warnings")
+                .unwrap()
+                .unwrap_or_default(),
+            "",
+            "a cycle whose analyzers all ran must not be flagged"
+        );
+
+        travsr_indexer::sandbox::record_lsif_analyzer_failure("rust");
+        travsr_indexer::sandbox::record_lsif_analyzer_failure("python");
+        let (report, _, _) = write_phase_b_results(
+            &mut store,
+            "test",
+            vec![],
+            vec![],
+            vec![],
+            travsr_plugin_host::PhaseBOutcome::default(),
+            (0, 0),
+            None,
+        );
+
+        let warnings = store
+            .get_meta("phase_b_warnings")
+            .unwrap()
+            .unwrap_or_default();
+        let classes: Vec<&str> = warnings.split(',').collect();
+        assert!(
+            classes.contains(&"emitter_failed:rust"),
+            "a failed rust-analyzer must be disclosed, got {warnings:?}"
+        );
+        assert!(
+            classes.contains(&"emitter_failed:python"),
+            "a travsr-lsif-py that ran and broke must be disclosed, got {warnings:?}"
+        );
+        // The report drives the `init` summary, so it must carry both too.
+        let reported: Vec<&str> = report
+            .lsif_skipped
+            .iter()
+            .map(|s| s.language.as_str())
+            .collect();
+        assert!(
+            reported.contains(&"rust") && reported.contains(&"python"),
+            "the init summary must see both skips, got {reported:?}"
+        );
+
+        travsr_indexer::sandbox::reset_lsif_analyzer_failures();
+    }
+
     /// #738: the `rust_lsif_degraded` flag must reflect surviving edges, not just
     /// "did rust-analyzer run". A cycle that parsed positional refs but resolved
     /// zero of them (the Windows path-mismatch signature) must record
@@ -8490,6 +8629,7 @@ mod tests {
         // The flag is gated on `!ra_lsif_sandbox_was_skipped()`; reset the
         // process-global latch so a prior run cannot force `sandbox_unavailable`.
         travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+        travsr_indexer::sandbox::reset_lsif_analyzer_failures();
 
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
@@ -8505,6 +8645,7 @@ mod tests {
 
         let run = |store: &mut travsr_store::SqliteStore, stats: (usize, usize)| {
             travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+            travsr_indexer::sandbox::reset_lsif_analyzer_failures();
             write_phase_b_results(
                 store,
                 "test",
