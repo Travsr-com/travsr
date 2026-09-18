@@ -708,10 +708,29 @@ pub async fn download_and_install_wrapper(
     Ok(dest)
 }
 
+/// Fetches `<binary_name>-share.tar.gz` and its published `.sha256`, and returns
+/// the bytes only if they match.
+///
+/// `base` is a parameter rather than a read of `TRAVSR_LANG_RELEASES_BASE` for
+/// the same reason as [`fetch_and_verify_binary`]: the URL shape stays testable
+/// without mutating process-global state.
+async fn fetch_share_tarball(base: &str, version: &str, binary_name: &str) -> Result<Vec<u8>> {
+    let asset = share_asset_name(binary_name);
+    let url = format!("{base}/download/{version}/{asset}");
+    let client = download_http_client()?;
+
+    fetch_verified(&client, &url, &asset, SIZE_LIMIT, Integrity::Sidecar).await
+}
+
+fn share_asset_name(binary_name: &str) -> String {
+    format!("{binary_name}-share.tar.gz")
+}
+
 /// Downloads `<binary_name>-share.tar.gz` from the same travsr-lang release and
 /// extracts it into `~/.travsr/share/<binary_name>/`. Used for sidecars that
 /// spawn an external script (e.g. dart's emit.dart) rather than a compiled binary.
 /// The tarball is platform-independent (source + metadata only, no binaries).
+/// Verified against its published `.sha256` before any entry is written.
 pub async fn install_share_assets(version: &str, binary_name: &str) -> Result<()> {
     if std::env::var(SKIP_DOWNLOAD_ENV).is_ok() {
         return Ok(());
@@ -720,25 +739,8 @@ pub async fn install_share_assets(version: &str, binary_name: &str) -> Result<()
     let base =
         std::env::var(RELEASES_BASE_ENV).unwrap_or_else(|_| DEFAULT_RELEASES_BASE.to_string());
 
-    let asset = format!("{binary_name}-share.tar.gz");
-    let url = format!("{base}/download/{version}/{asset}");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building HTTP client")?;
-
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .context("fetching share assets")?;
-    if !resp.status().is_success() {
-        bail!("share asset download failed ({}): {url}", resp.status());
-    }
-
-    let bytes = resp.bytes().await.context("reading share asset body")?;
+    let asset = share_asset_name(binary_name);
+    let bytes = fetch_share_tarball(&base, version, binary_name).await?;
 
     // Extract into ~/.travsr/share/<binary_name>/
     let home =
@@ -1918,7 +1920,8 @@ mod extraction_tests {
 #[cfg(test)]
 mod download_tests {
     use super::{
-        fetch_and_verify_binary, fetch_verified, hex_encode_sha256, Integrity, SIZE_LIMIT,
+        fetch_and_verify_binary, fetch_share_tarball, fetch_verified, hex_encode_sha256, Integrity,
+        SIZE_LIMIT,
     };
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
@@ -2309,6 +2312,91 @@ mod download_tests {
         assert!(
             err.contains("exceeds the download size limit"),
             "a lengthless oversize body must be refused mid-stream: {err}"
+        );
+    }
+
+    // ── the share tarball (#410 M1) ──────────────────────────────────────────
+    //
+    // The share tarball is unpacked into ~/.travsr/share and run by the
+    // emitter, so it needs the same anchor as the wrapper binary published
+    // beside it under the same tag.
+
+    fn share_path() -> String {
+        format!("/download/{VERSION}/{BIN}-share.tar.gz")
+    }
+
+    fn share_sha_path() -> String {
+        format!("{}.sha256", share_path())
+    }
+
+    fn share_sha_line(body: &[u8]) -> Vec<u8> {
+        format!("{}  {BIN}-share.tar.gz\n", hex_encode_sha256(body)).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_share_tarball_matching_its_published_sha256_is_returned() {
+        let body = b"\x1f\x8b a plausible share tarball".to_vec();
+        let base = serve(vec![
+            route(&share_path(), 200, body.clone()),
+            route(&share_sha_path(), 200, share_sha_line(&body)),
+        ]);
+
+        let got = fetch_share_tarball(&base, VERSION, BIN).await.unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[tokio::test]
+    async fn a_share_tarball_swapped_after_publication_is_refused() {
+        // The failure has to happen here, before any entry is written: the
+        // extractor's traversal and mode guards bound what a hostile archive
+        // can do, they do not decide whether it should be unpacked at all.
+        let published = b"the tarball that was published".to_vec();
+        let swapped = b"the tarball that was served instead".to_vec();
+        let base = serve(vec![
+            route(&share_path(), 200, swapped),
+            route(&share_sha_path(), 200, share_sha_line(&published)),
+        ]);
+
+        let err = fetch_share_tarball(&base, VERSION, BIN)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SHA256 mismatch"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_share_tarball_without_a_sidecar_is_not_extracted_unverified() {
+        let body = b"plausible tarball".to_vec();
+        let base = serve(vec![route(&share_path(), 200, body)]);
+
+        let err = fetch_share_tarball(&base, VERSION, BIN)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sha256 sidecar"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_share_tarball_is_refused_before_its_body_is_read() {
+        let body = b"x".to_vec();
+        let base = serve(vec![
+            Route {
+                path: share_path(),
+                status: 200,
+                body: body.clone(),
+                advertised_len: Some(SIZE_LIMIT + 1),
+                omit_content_length: false,
+            },
+            route(&share_sha_path(), 200, share_sha_line(&body)),
+        ]);
+
+        let err = fetch_share_tarball(&base, VERSION, BIN)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("{} bytes > {SIZE_LIMIT}", SIZE_LIMIT + 1)),
+            "unexpected error: {err}"
         );
     }
 }
