@@ -3647,6 +3647,36 @@ pub fn get_blast_radius_global(
     sanitize_for_mcp(&raw)
 }
 
+/// How many rows a brief lists before it stops and says how many it skipped.
+///
+/// Ranked, so the head is the load-bearing part of the answer. 60 covers every
+/// component of a normal repository outright and still fits a monorepo's
+/// interesting head: kubernetes resolves 3379 components, and the 60 most
+/// depended-upon are the architecture a reader is asking about.
+const LIST_CAP: usize = 60;
+
+/// How many components get their own detail block. Lower than `LIST_CAP`
+/// because each block is several lines, not one.
+const DETAIL_CAP: usize = 20;
+
+/// Trim to the last complete line that fits, and say what was dropped.
+///
+/// The byte limit alone cut mid-row — a kubernetes brief ended on
+/// `... | depends on 0 | 5 f`. A half-written fact is worse than an absent one:
+/// it reads as data. Leaves a margin for the notice it appends.
+fn trim_to_whole_lines(body: &str, limit: usize) -> String {
+    if body.len() <= limit {
+        return body.to_string();
+    }
+    const NOTICE: &str =
+        "\n[brief truncated to fit the token budget; raise token_budget for the rest]\n";
+    let room = limit.saturating_sub(NOTICE.len());
+    let cut = body[..body.len().min(room)]
+        .rfind('\n')
+        .map_or(0, |i| i + 1);
+    format!("{}{NOTICE}", &body[..cut])
+}
+
 /// Byte cap for a brief, from a caller's token budget.
 ///
 /// `sanitize_for_mcp` caps at 4 KiB, which silently cut an architecture brief
@@ -4045,8 +4075,25 @@ pub fn get_architecture_brief(
     let mut ranked: Vec<&String> = names.iter().collect();
     ranked.sort_by(|a, b| dependents(b).cmp(&dependents(a)).then_with(|| a.cmp(b)));
 
-    out.push_str("## Components, by how many others depend on them\n");
-    for c in &ranked {
+    // Every list below is capped and discloses its remainder. Unbounded, the
+    // byte limit did the cutting instead: on kubernetes (3379 components) the
+    // brief emitted 346 of them, ended mid-line, and dropped its last two
+    // sections with no indication they had ever existed. A ranked head plus an
+    // honest count is a usable answer; a silent tenth of one is not.
+    let omitted = |shown: usize, total: usize, what: &str| -> String {
+        if total > shown {
+            format!("- ... and {} more {what}, ranked lower\n", total - shown)
+        } else {
+            String::new()
+        }
+    };
+
+    out.push_str(&format!(
+        "## Components, by how many others depend on them ({} of {})\n",
+        ranked.len().min(LIST_CAP),
+        ranked.len()
+    ));
+    for c in ranked.iter().take(LIST_CAP) {
         let deps = weight.keys().filter(|(a, _)| a == *c).count();
         out.push_str(&format!(
             "- {} | layer {} | {} dependent{} | depends on {} | {} files | {} symbols\n",
@@ -4060,15 +4107,26 @@ pub fn get_architecture_brief(
         ));
     }
 
-    out.push_str("\n## Dependency edges (weight = distinct file pairs crossing)\n");
+    out.push_str(&omitted(LIST_CAP, ranked.len(), "components"));
+
     let mut ws: Vec<(&(String, String), &usize)> = weight.iter().collect();
     ws.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-    for ((a, b), w) in ws {
+    out.push_str(&format!(
+        "\n## Dependency edges, heaviest first ({} of {}; weight = distinct file pairs crossing)\n",
+        ws.len().min(LIST_CAP),
+        ws.len()
+    ));
+    for ((a, b), w) in ws.iter().take(LIST_CAP) {
         out.push_str(&format!("- {a} -> {b} ({w})\n"));
     }
+    out.push_str(&omitted(LIST_CAP, ws.len(), "edges"));
 
-    out.push_str("\n## What each component owns\n");
-    for c in &ranked {
+    out.push_str(&format!(
+        "\n## What each component owns ({} of {})\n",
+        ranked.len().min(DETAIL_CAP),
+        ranked.len()
+    ));
+    for c in ranked.iter().take(DETAIL_CAP) {
         out.push_str(&format!("### {c}\n"));
         if let Some(es) = entries.get(*c) {
             for e in es.iter().take(2) {
@@ -4105,6 +4163,8 @@ pub fn get_architecture_brief(
         }
     }
 
+    out.push_str(&omitted(DETAIL_CAP, ranked.len(), "components detailed"));
+
     if let Some(note) = phase_b_degraded_note(store) {
         out.push_str(&format!("\n## Freshness\n{note}\n"));
     }
@@ -4115,9 +4175,10 @@ pub fn get_architecture_brief(
            use and undercount where analysis is incomplete\n\
          - nothing here states WHY a dependency exists\n",
     );
+    let limit = brief_byte_limit(token_budget);
     wrap_envelope(&sanitize_mcp_body_with_limit(
-        &out,
-        brief_byte_limit(token_budget),
+        &trim_to_whole_lines(&out, limit),
+        limit,
     ))
 }
 
@@ -4553,9 +4614,10 @@ pub fn get_subsystem_brief(
          - Phase B coverage varies by language; absence is unknown, never no\n\
          - nothing here states WHY a call exists; read the source for that\n",
     );
+    let limit = brief_byte_limit(token_budget);
     wrap_envelope(&sanitize_mcp_body_with_limit(
-        &out,
-        brief_byte_limit(token_budget),
+        &trim_to_whole_lines(&out, limit),
+        limit,
     ))
 }
 
@@ -12252,6 +12314,75 @@ mod tests {
             );
             assert!(sub.contains(comp), "subsystem brief names {comp}:\n{sub}");
         }
+    }
+
+    #[test]
+    fn architecture_brief_caps_its_lists_and_says_what_it_dropped() {
+        // Unbounded, the byte limit did the cutting: on kubernetes the brief
+        // emitted 346 of 3379 components, ended mid-row on `| depends on 0 | 5 f`,
+        // and lost its last two sections with no sign they had existed. A ranked
+        // head with an honest count is an answer; a silent tenth of one is not.
+        use travsr_core::EdgeKind;
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let hub = make_node("crates/hub/src/lib.rs", "fn:hub");
+        nodes.push(hub.clone());
+        for i in 0..(LIST_CAP + 25) {
+            let n = make_node(&format!("crates/c{i}/src/lib.rs"), &format!("fn:f{i}"));
+            edges.push((n.id, hub.id, EdgeKind::RefCall));
+            nodes.push(n);
+        }
+        let store = make_store(&nodes, &edges);
+        let out = get_architecture_brief(&store, "", 30_000);
+
+        let listed = out
+            .lines()
+            .filter(|l| l.starts_with("- ") && l.contains("| layer "))
+            .count();
+        assert_eq!(
+            listed, LIST_CAP,
+            "the component list must stop at the cap, not run to the byte limit:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("({LIST_CAP} of {})", nodes.len())),
+            "the heading must say how many of how many:\n{out}"
+        );
+        let hidden = nodes.len() - LIST_CAP;
+        assert!(
+            out.contains(&format!("and {hidden} more components, ranked lower")),
+            "the remainder must be disclosed, not dropped silently:\n{out}"
+        );
+        // Every section must survive; losing the tail is what the byte limit did.
+        for section in [
+            "## Shape",
+            "## Components, by how many others depend on them",
+            "## What each component owns",
+            "## What this brief cannot tell you",
+        ] {
+            assert!(out.contains(section), "section {section} missing:\n{out}");
+        }
+    }
+
+    #[test]
+    fn a_brief_is_never_cut_mid_line() {
+        // `... | depends on 0 | 5 f` was a half-written fact presented as data.
+        let long = (0..400)
+            .map(|i| format!("- row {i} with enough text to cross the limit somewhere\n"))
+            .collect::<String>();
+        let out = trim_to_whole_lines(&long, 900);
+        assert!(out.len() <= 900, "must respect the limit: {}", out.len());
+        assert!(
+            out.contains("brief truncated"),
+            "must say it was truncated:\n{out}"
+        );
+        for line in out.lines().filter(|l| l.starts_with("- row")) {
+            assert!(
+                line.ends_with("somewhere"),
+                "every surviving row must be whole, got: {line:?}"
+            );
+        }
+        // A body that fits is returned untouched.
+        assert_eq!(trim_to_whole_lines("- a\n- b\n", 900), "- a\n- b\n");
     }
 
     #[test]
