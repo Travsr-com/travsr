@@ -458,7 +458,7 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_execution_path",
-                "description": "Find the lowest-cost path from a source symbol to a sink symbol through the code graph. Answers explicitly when the symbols do not resolve or resolve but are disconnected ('no path found'), so an empty-looking result is never ambiguous.",
+                "description": "Find the lowest-cost path from a source symbol to a sink symbol through the code graph. Returns the path itself first, then, under a separate heading, the nodes near that path but not on it, so the two are never confused. Answers explicitly when the symbols do not resolve or resolve but are disconnected ('no path found'), so an empty-looking result is never ambiguous.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1108,7 +1108,7 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_execution_path",
-                "description": "Find the lowest-cost path from a source symbol to a sink symbol through the code graph. Supply `repo` to scope to a single codebase; scoped queries answer explicitly when the symbols do not resolve or are disconnected ('no path found').",
+                "description": "Find the lowest-cost path from a source symbol to a sink symbol through the code graph. Returns the path itself first, then, under a separate heading, the nodes near that path but not on it. Supply `repo` to scope to a single codebase; scoped queries answer explicitly when the symbols do not resolve or are disconnected ('no path found').",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

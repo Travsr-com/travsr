@@ -4871,18 +4871,50 @@ fn get_execution_path_body(
         return String::new();
     }
 
-    let lines: Vec<String> = path
+    // `pcst_path` returns the route first, in traversal order, and then the
+    // lambda-corridor context (its own comment: "Route nodes first, in traversal
+    // order (source -> ... -> sink)", "The route must LEAD the result"). Both
+    // halves were rendered identically, so a caller could not tell where the
+    // path ended and the neighbourhood began: the first lines were a real call
+    // chain and the rest were nodes merely near it, presented as if they were
+    // the same thing. The sink terminates the route, and the guard above has
+    // already established it is present.
+    let route_end = path
         .iter()
-        .map(|n| {
-            format!(
-                "{} ({}) \u{2014} {}",
-                display_label(n),
-                n.kind,
-                n.vname.path
-            )
-        })
-        .collect();
-    lines.join("\n")
+        .position(|n| n.id == snk.id)
+        .map_or(path.len(), |i| i + 1);
+    let render = |n: &travsr_core::Node| {
+        format!(
+            "{} ({}) \u{2014} {}",
+            display_label(n),
+            n.kind,
+            n.vname.path
+        )
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "path ({} step{}, source to sink):\n",
+        route_end,
+        if route_end == 1 { "" } else { "s" }
+    ));
+    for n in &path[..route_end] {
+        out.push_str(&render(n));
+        out.push('\n');
+    }
+    let corridor = &path[route_end..];
+    if !corridor.is_empty() {
+        out.push_str(&format!(
+            "\nnearby context ({} node{}, within the corridor around that path, NOT on it):\n",
+            corridor.len(),
+            if corridor.len() == 1 { "" } else { "s" }
+        ));
+        for n in corridor {
+            out.push_str(&render(n));
+            out.push('\n');
+        }
+    }
+    out.trim_end().to_string()
 }
 
 /// Global variant of `get_execution_path` — searches one named repo or all registered repos.
@@ -14600,6 +14632,64 @@ mod snippet_tests {
             !result.contains("no path found") && !result.contains("could not resolve"),
             "successful path must carry no diagnostics; got: {result}"
         );
+    }
+
+    /// `pcst_path` returns the route first and then the lambda corridor around
+    /// it. Both halves were rendered identically, so a caller could not tell
+    /// where the call chain ended and the merely-nearby nodes began: the tool
+    /// existed to answer "how does A reach B" and its answer was
+    /// indistinguishable from "what is near A".
+    #[test]
+    fn get_execution_path_separates_the_route_from_the_corridor() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let mk = |path: &str, sig: &str| {
+            Node::new(VName::new("t", "", path, "typescript", sig), "function")
+        };
+        let a = mk("src/a.ts", "fn:alpha");
+        let b = mk("src/b.ts", "fn:beta");
+        let c = mk("src/c.ts", "fn:gamma");
+        // Hangs off the route, so it can only reach the corridor.
+        let off = mk("src/d.ts", "fn:delta");
+        for n in [&a, &b, &c, &off] {
+            store.put_node(n).unwrap();
+        }
+        for (src, dst) in [(a.id, b.id), (b.id, c.id), (b.id, off.id)] {
+            store
+                .put_edge(&Edge::new(src, dst, EdgeKind::RefCall))
+                .unwrap();
+        }
+
+        let result = get_execution_path(&store, "alpha", "gamma");
+        let path_at = result
+            .find("path (")
+            .unwrap_or_else(|| panic!("a successful result must label its path; got: {result}"));
+        let sink_at = result
+            .find("fn:gamma")
+            .unwrap_or_else(|| panic!("the sink must appear; got: {result}"));
+
+        match result.find("nearby context") {
+            Some(ctx_at) => {
+                assert!(
+                    ctx_at > path_at,
+                    "context must follow the path, never lead it; got: {result}"
+                );
+                assert!(
+                    sink_at < ctx_at,
+                    "the sink terminates the path and must not fall in the corridor; got: {result}"
+                );
+                assert!(
+                    result[ctx_at..].contains("fn:delta"),
+                    "an off-route neighbour belongs in the corridor; got: {result}"
+                );
+            }
+            // A corridor is not guaranteed for every graph; when there is none,
+            // the path section must still be labelled and hold the sink.
+            None => assert!(
+                sink_at > path_at,
+                "sink must be inside the path; got: {result}"
+            ),
+        }
     }
 
     // ── #377 truncation signals ───────────────────────────────────────────────
