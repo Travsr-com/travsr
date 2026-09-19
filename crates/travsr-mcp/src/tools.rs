@@ -3704,6 +3704,16 @@ pub fn get_subsystem_brief(
 ) -> String {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
+    for (name, value) in [("entry", entry), ("component", component)] {
+        if value.is_empty() {
+            continue;
+        }
+        if let Err(reason) = validate_mcp_arg(value) {
+            tracing::warn!("get_subsystem_brief rejected invalid {name}: {reason}");
+            return sanitize_for_mcp(&format!("invalid {name}: {reason}"));
+        }
+    }
+
     let nodes = match store.all_nodes() {
         Ok(n) => n,
         Err(e) => {
@@ -3721,31 +3731,66 @@ pub fn get_subsystem_brief(
 
     let mut by_id: HashMap<travsr_core::NodeId, &travsr_core::Node> = HashMap::new();
     for n in &nodes {
-        if n.vname.path.is_empty() || n.test_role.is_test() {
+        // `is_structural_noise` also excludes file and doc-chunk nodes. Without
+        // it, a raw SCIP module descriptor outranks every real symbol and gets
+        // reported as its component's entry point.
+        if n.vname.path.is_empty()
+            || n.test_role.is_test()
+            || travsr_core::noise::is_structural_noise(n)
+        {
             continue;
         }
         by_id.insert(n.id, n);
     }
 
-    // Reach counts every reference arriving at a symbol, across all edge kinds.
+    // Reach and calls must describe the SAME universe. Counting reach over every
+    // edge while filtering calls let the brief say "nothing in the graph calls
+    // it" and print a non-zero reach two lines later, both as fact.
     let mut reach: HashMap<travsr_core::NodeId, usize> = HashMap::new();
     let mut calls: HashMap<travsr_core::NodeId, Vec<travsr_core::NodeId>> = HashMap::new();
+    let mut any_call_edge = false;
+    let mut any_call_past_filter = false;
     for (src, dst, kind, prov) in &edges {
-        if !provenance_allowed(provenance, prov) {
+        let is_call = kind == "ref/call";
+        if is_call {
+            any_call_edge = true;
+            if provenance_allowed(provenance, prov) {
+                any_call_past_filter = true;
+            }
+        }
+        if !provenance_allowed(provenance, prov)
+            || !by_id.contains_key(src)
+            || !by_id.contains_key(dst)
+        {
             continue;
         }
         *reach.entry(*dst).or_insert(0) += 1;
-        if kind == "ref/call" && src != dst && by_id.contains_key(src) && by_id.contains_key(dst) {
+        if kind == "ref/call" && src != dst {
             calls.entry(*src).or_default().push(*dst);
         }
     }
 
     if calls.is_empty() {
-        return sanitize_for_mcp(
-            "no call edges in this index, so there is no flow to trace. Semantic analysis \
-             (Phase B) produces them: run `travsr lang install <language>` then `travsr init \
-             --semantic` in this repo. `travsr status` reports the current state.",
-        );
+        // Three different causes, three different answers. Collapsing them told a
+        // user with a complete semantic index to install a toolchain they already
+        // had, which is worse than saying nothing.
+        return sanitize_for_mcp(&if !any_call_edge {
+            "no call edges in this index, so there is no flow to trace. Full cross-file \
+             analysis produces them: run `travsr lang install <language>` then `travsr init \
+             --semantic` in this repo. `travsr status` reports the current state."
+                .to_string()
+        } else if !any_call_past_filter {
+            format!(
+                "no call edges matched provenance '{provenance}', though this index does have \
+                 a call graph. Use 'ratified' for confirmed edges, '' for everything, or name \
+                 one provenance exactly (tree-sitter, lsif, scip, live)."
+            )
+        } else {
+            "every call edge in this index runs between symbols this view excludes (test code \
+             and structural noise), so there is no flow to show between the symbols that \
+             remain."
+                .to_string()
+        });
     }
 
     // Entry points per component: what something outside the component calls.
@@ -3826,7 +3871,17 @@ pub fn get_subsystem_brief(
         if hit.is_empty() {
             return sanitize_for_mcp(&format!("entry symbol '{entry}' is not in the graph"));
         }
-        hit.sort_by_key(|id| std::cmp::Reverse(reach.get(id).copied().unwrap_or(0)));
+        // Collected from a HashMap, so the order arriving here is arbitrary and a
+        // sort on reach alone leaves ties in whatever order the map yielded:
+        // identical queries returned different symbols across runs. Break ties on
+        // the path, which is unique per definition.
+        hit.sort_by(|a, b| {
+            reach
+                .get(b)
+                .unwrap_or(&0)
+                .cmp(reach.get(a).unwrap_or(&0))
+                .then_with(|| by_id[a].vname.path.cmp(&by_id[b].vname.path))
+        });
         hit.truncate(1);
         hit
     };
@@ -3867,10 +3922,18 @@ pub fn get_subsystem_brief(
             by_reach(&mut crosses);
             by_reach(&mut internal);
             internal.truncate(width);
+            // `seen` is global to the walk, so gating the record on it dropped a
+            // second call into an already-visited symbol. The spine is a tree and
+            // must stay one, but the contracts list is not: record every crossing,
+            // and only extend the frontier for a symbol not yet reached.
             for dst in crosses.into_iter().chain(internal) {
-                if seen.insert(dst) {
-                    kept.push((src, dst));
+                let crossing = subsystem_component_of(&by_id[&dst].vname.path) != here;
+                let first_visit = seen.insert(dst);
+                if first_visit {
                     next.push(dst);
+                }
+                if first_visit || crossing {
+                    kept.push((src, dst));
                 }
             }
         }
@@ -3911,7 +3974,13 @@ pub fn get_subsystem_brief(
         .filter(|(src, dsts)| !root_set.contains(src) && dsts.iter().any(|d| root_set.contains(d)))
         .map(|(src, _)| *src)
         .collect();
-    callers.sort_by_key(|id| std::cmp::Reverse(reach.get(id).copied().unwrap_or(0)));
+    callers.sort_by(|a, b| {
+        reach
+            .get(b)
+            .unwrap_or(&0)
+            .cmp(reach.get(a).unwrap_or(&0))
+            .then_with(|| by_id[a].vname.signature.cmp(&by_id[b].vname.signature))
+    });
     callers.truncate(8);
     if callers.is_empty() {
         out.push_str(
@@ -3969,6 +4038,10 @@ pub fn get_subsystem_brief(
         }
     }
 
+    let spine_edges = kept
+        .iter()
+        .filter(|(_, b)| levels.iter().flatten().any(|n| n == b))
+        .count();
     let comps: HashSet<String> = levels
         .iter()
         .flatten()
@@ -3977,10 +4050,25 @@ pub fn get_subsystem_brief(
     out.push_str(&format!(
         "\n## Shape\n- {} symbols, {} calls, {} components\n",
         levels.iter().map(|l| l.len()).sum::<usize>(),
-        kept.len(),
+        spine_edges,
         comps.len()
     ));
 
+    let degraded = phase_b_degraded_note(store);
+    if degraded.is_some() || kept.is_empty() {
+        out.push_str("\n## Freshness\n");
+    }
+    if let Some(note) = degraded {
+        out.push_str(&format!("{note}\n"));
+    }
+    if kept.is_empty() {
+        out.push_str(
+            "No outgoing calls resolved from this entry, so there is no flow \
+             to show. The symbol exists; its call edges do not, which means they are unresolved \
+             rather than absent. Check `travsr status` before reading this as \"it calls \
+             nothing\".\n",
+        );
+    }
     out.push_str(
         "\n## What this brief cannot tell you\n\
          - a missing call means the graph did not resolve it, not that it does not happen\n\
@@ -11620,6 +11708,91 @@ mod tests {
         assert!(
             out.contains("Calls that leave the component"),
             "crossings section must be present:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_is_deterministic_across_runs() {
+        // `hit` and `callers` were built from HashMaps and sorted on reach alone,
+        // so equal-reach candidates kept whatever order the map yielded and the
+        // same query returned different symbols across runs. CLAUDE.md requires
+        // the structural tier to be same-input-same-output.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/a/src/one.rs", "fn:dup");
+        let b = make_node("crates/b/src/two.rs", "fn:dup");
+        let c1 = make_node("crates/c/src/x.rs", "fn:c1");
+        let c2 = make_node("crates/c/src/y.rs", "fn:c2");
+        // Both `fn:dup` definitions get exactly one caller, so reach ties.
+        let edges = vec![
+            (c1.id, a.id, EdgeKind::RefCall),
+            (c2.id, b.id, EdgeKind::RefCall),
+        ];
+        let store = make_store(&[a, b, c1, c2], &edges);
+        let first = get_subsystem_brief(&store, "fn:dup", "", "", 3, 6);
+        for _ in 0..12 {
+            assert_eq!(
+                get_subsystem_brief(&store, "fn:dup", "", "", 3, 6),
+                first,
+                "identical queries must return identical briefs"
+            );
+        }
+    }
+
+    #[test]
+    fn subsystem_brief_reach_and_calls_describe_one_universe() {
+        // Reach counted every edge while calls counted only non-test ones, so the
+        // brief could say "nothing in the graph calls it" and print a non-zero
+        // reach two lines later, both as fact.
+        use travsr_core::EdgeKind;
+        let target = make_node("crates/a/src/lib.rs", "fn:target");
+        let real = make_node("crates/a/src/caller.rs", "fn:real_caller");
+        let mut test_caller = make_node("crates/a/tests/it.rs", "fn:test_caller");
+        test_caller.test_role = travsr_core::TestRole::EntryPoint;
+        let edges = vec![
+            (real.id, target.id, EdgeKind::RefCall),
+            (test_caller.id, target.id, EdgeKind::RefCall),
+        ];
+        let store = make_store(&[target, real, test_caller], &edges);
+        let out = get_subsystem_brief(&store, "fn:target", "", "", 3, 6);
+        assert!(
+            out.contains("real_caller"),
+            "the non-test caller must be listed:\n{out}"
+        );
+        assert!(
+            !out.contains("test_caller"),
+            "the test caller must be excluded:\n{out}"
+        );
+        // One caller survives exclusion, so reach must be 1 and not 2.
+        assert!(
+            out.contains("reach=1"),
+            "reach must count only what calls counts:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_distinguishes_a_bad_filter_from_a_missing_call_graph() {
+        // Routing an unrecognised provenance through the same empty-calls branch
+        // told users with a complete semantic index to install a toolchain they
+        // already had.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/a/src/lib.rs", "fn:a");
+        let b = make_node("crates/b/src/lib.rs", "fn:b");
+        let store = make_store(
+            &[a, b],
+            &[(
+                make_node("crates/a/src/lib.rs", "fn:a").id,
+                make_node("crates/b/src/lib.rs", "fn:b").id,
+                EdgeKind::RefCall,
+            )],
+        );
+        let out = get_subsystem_brief(&store, "fn:a", "", "nonsense-filter", 3, 6);
+        assert!(
+            out.contains("no call edges matched provenance"),
+            "must name the filter as the cause:\n{out}"
+        );
+        assert!(
+            !out.contains("lang install"),
+            "must not tell a user with a call graph to install an analyzer:\n{out}"
         );
     }
 
