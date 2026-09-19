@@ -3942,7 +3942,7 @@ pub fn get_architecture_brief(
 
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     let mut in_deg: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for ((a, b), _) in &weight {
+    for (a, b) in weight.keys() {
         adj.entry(a.clone()).or_default().push(b.clone());
         in_deg.entry(b.clone()).or_default().insert(a.clone());
     }
@@ -3956,7 +3956,7 @@ pub fn get_architecture_brief(
         }
     }
     let mut cond: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); sccs.len()];
-    for ((a, b), _) in &weight {
+    for (a, b) in weight.keys() {
         let (x, y) = (owner[a.as_str()], owner[b.as_str()]);
         if x != y {
             cond[x].insert(y);

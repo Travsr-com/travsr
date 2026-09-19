@@ -87,6 +87,13 @@ jobs:
       - name: Install bubblewrap (Linux sandbox enforcement tests)
         if: runner.os == 'Linux'
         run: |
+          # Refresh the index first. The runner image ships a cached package
+          # list, so once Ubuntu supersedes a version the cached entry points at
+          # a .deb that no longer exists and the install 404s:
+          #   Err: .../bubblewrap_0.9.0-1ubuntu0.1_amd64.deb  404  Not Found
+          # That is not a flake to retry, it is a stale index, and it fails
+          # every PR until the image is rebuilt.
+          sudo apt-get update
           sudo apt-get install -y bubblewrap
           # Ubuntu 24.04+ ships an AppArmor profile that blocks bwrap from creating
           # mount/user namespaces even with sudo. Unload the profile so our sandbox
