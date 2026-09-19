@@ -763,7 +763,14 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ("Run in the background", &["daemon", "mcp", "serve"]),
     (
         "Inspect and debug",
-        &["status", "daemon logs", "repos", "fsck", "index"],
+        &[
+            "status",
+            "daemon logs",
+            "repos",
+            "fsck",
+            "invariants",
+            "index",
+        ],
     ),
     ("Tune search", &["embed", "rerank", "synonym", "config"]),
 ];
