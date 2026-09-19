@@ -87,6 +87,10 @@ jobs:
       - name: Install bubblewrap (Linux sandbox enforcement tests)
         if: runner.os == 'Linux'
         run: |
+          # The runner image's package index goes stale when Ubuntu ships a new
+          # bubblewrap build and pulls the old .deb from the mirrors (404), so
+          # refresh it before installing.
+          sudo apt-get update
           sudo apt-get install -y bubblewrap
           # Ubuntu 24.04+ ships an AppArmor profile that blocks bwrap from creating
           # mount/user namespaces even with sudo. Unload the profile so our sandbox
