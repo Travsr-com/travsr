@@ -4344,7 +4344,7 @@ LIMIT ?4",
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line FROM nodes",
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line, test_role FROM nodes",
                 )
                 .context("preparing all_nodes query")?;
             let rows = stmt
@@ -4361,6 +4361,12 @@ LIMIT ?4",
                     let package: String = row.get(7)?;
                     let line: Option<i64> = row.get(8)?;
                     let end_line: Option<i64> = row.get(9)?;
+                    // Read the column rather than defaulting it. Leaving this at
+                    // `None` made `node.test_role` silently useless on this path,
+                    // so callers had to fall back to a per-node `store.test_role`
+                    // query (see travsr-mcp/src/query.rs) or, worse, filter on a
+                    // field that was never populated and get no filtering at all.
+                    let test_role = TestRole::from_i64(row.get::<_, i64>(10)?);
                     Ok(Node {
                         id,
                         vname,
@@ -4368,7 +4374,7 @@ LIMIT ?4",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
-                        test_role: TestRole::None,
+                        test_role,
                     })
                 })
                 .context("executing all_nodes query")?;
