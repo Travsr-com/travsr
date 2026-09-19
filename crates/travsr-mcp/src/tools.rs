@@ -3647,6 +3647,349 @@ pub fn get_blast_radius_global(
     sanitize_for_mcp(&raw)
 }
 
+// ── get_subsystem_brief ───────────────────────────────────────────────────────
+
+/// The component a file belongs to: the package directory where the repository
+/// has one, otherwise the containing directory. Deliberately not `repo_regions`:
+/// that rollup is tuned for retrieval breadth, while a reader reasoning about a
+/// subsystem thinks in crates and packages.
+fn subsystem_component_of(path: &str) -> String {
+    for root in [
+        "crates/",
+        "packages/",
+        "apps/",
+        "services/",
+        "cmd/",
+        "modules/",
+    ] {
+        if let Some(rest) = path.strip_prefix(root) {
+            if let Some(name) = rest.split('/').next() {
+                if !name.is_empty() {
+                    return format!("{root}{name}");
+                }
+            }
+        }
+    }
+    match path.rfind('/') {
+        Some(i) => path[..i].to_string(),
+        None => path.to_string(),
+    }
+}
+
+fn simple_symbol(sig: &str) -> &str {
+    match sig.find(':') {
+        Some(i) if sig[..i].chars().all(|c| c.is_ascii_lowercase() || c == '-') => &sig[i + 1..],
+        _ => sig,
+    }
+}
+
+/// What runs when control enters a symbol, as a fact packet rather than a
+/// document.
+///
+/// With neither `entry` nor `component`, it lists the subsystems it can see: a
+/// component's real entry points are the symbols something OUTSIDE it calls,
+/// which needs no naming convention and works in any language.
+///
+/// Callees are ranked by reach, but a call that LEAVES the component is never
+/// cut. Reach alone promotes widely-shared helpers and buried travsr-retrieval
+/// entirely when tracing get_context, whose whole job is PPR and knapsack. A
+/// cross-component call is a contract, and contracts are the point.
+pub fn get_subsystem_brief(
+    store: &SqliteStore,
+    entry: &str,
+    component: &str,
+    provenance: &str,
+    depth: u8,
+    width: usize,
+) -> String {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    let nodes = match store.all_nodes() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_subsystem_brief: all_nodes error: {e}");
+            return sanitize_for_mcp("");
+        }
+    };
+    let edges = match store.all_edges() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("get_subsystem_brief: all_edges error: {e}");
+            return sanitize_for_mcp("");
+        }
+    };
+
+    let mut by_id: HashMap<travsr_core::NodeId, &travsr_core::Node> = HashMap::new();
+    for n in &nodes {
+        if n.vname.path.is_empty() || n.test_role.is_test() {
+            continue;
+        }
+        by_id.insert(n.id, n);
+    }
+
+    // Reach counts every reference arriving at a symbol, across all edge kinds.
+    let mut reach: HashMap<travsr_core::NodeId, usize> = HashMap::new();
+    let mut calls: HashMap<travsr_core::NodeId, Vec<travsr_core::NodeId>> = HashMap::new();
+    for (src, dst, kind, prov) in &edges {
+        if !provenance_allowed(provenance, prov) {
+            continue;
+        }
+        *reach.entry(*dst).or_insert(0) += 1;
+        if kind == "ref/call" && src != dst && by_id.contains_key(src) && by_id.contains_key(dst) {
+            calls.entry(*src).or_default().push(*dst);
+        }
+    }
+
+    if calls.is_empty() {
+        return sanitize_for_mcp(
+            "no call edges in this index, so there is no flow to trace. Semantic analysis \
+             (Phase B) produces them: run `travsr lang install <language>` then `travsr init \
+             --semantic` in this repo. `travsr status` reports the current state.",
+        );
+    }
+
+    // Entry points per component: what something outside the component calls.
+    let mut external: BTreeMap<String, HashMap<travsr_core::NodeId, usize>> = BTreeMap::new();
+    for (src, dsts) in &calls {
+        let from = subsystem_component_of(&by_id[src].vname.path);
+        for dst in dsts {
+            let to = subsystem_component_of(&by_id[dst].vname.path);
+            if to == from {
+                continue;
+            }
+            *external.entry(to).or_default().entry(*dst).or_insert(0) += 1;
+        }
+    }
+
+    let ranked = |m: &HashMap<travsr_core::NodeId, usize>| -> Vec<(travsr_core::NodeId, usize)> {
+        let mut v: Vec<_> = m.iter().map(|(k, c)| (*k, *c)).collect();
+        v.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| {
+                by_id[&a.0]
+                    .vname
+                    .signature
+                    .cmp(&by_id[&b.0].vname.signature)
+            })
+        });
+        v
+    };
+
+    if entry.is_empty() && component.is_empty() {
+        let mut out = String::from("SUBSYSTEMS (components called from outside)\n\n");
+        let mut rows: Vec<_> = external.iter().collect();
+        rows.sort_by_key(|(_, m)| std::cmp::Reverse(m.values().sum::<usize>()));
+        for (comp, m) in rows {
+            let total: usize = m.values().sum();
+            out.push_str(&format!(
+                "{comp}  ({total} external calls, {} entry points)\n",
+                m.len()
+            ));
+            for (id, c) in ranked(m).into_iter().take(3) {
+                out.push_str(&format!(
+                    "    {}  <- {c} caller{}\n",
+                    simple_symbol(&by_id[&id].vname.signature),
+                    if c == 1 { "" } else { "s" }
+                ));
+            }
+        }
+        out.push_str("\nTake one with `component`, or a single symbol with `entry`.\n");
+        return sanitize_for_mcp(&out);
+    }
+
+    // Roots: a named symbol, or the component's most-called-into entry points.
+    let roots: Vec<travsr_core::NodeId> = if !component.is_empty() {
+        match external.get(component) {
+            Some(m) => ranked(m).into_iter().take(4).map(|(id, _)| id).collect(),
+            None => {
+                let known: Vec<&str> = external.keys().map(|s| s.as_str()).take(12).collect();
+                return sanitize_for_mcp(&format!(
+                    "no component '{component}' is called from outside. Components with entry \
+                     points: {}",
+                    known.join(", ")
+                ));
+            }
+        }
+    } else {
+        let want = simple_symbol(entry);
+        let mut hit: Vec<travsr_core::NodeId> = by_id
+            .values()
+            .filter(|n| n.vname.signature == entry)
+            .map(|n| n.id)
+            .collect();
+        if hit.is_empty() {
+            hit = by_id
+                .values()
+                .filter(|n| simple_symbol(&n.vname.signature) == want)
+                .map(|n| n.id)
+                .collect();
+        }
+        if hit.is_empty() {
+            return sanitize_for_mcp(&format!("entry symbol '{entry}' is not in the graph"));
+        }
+        hit.sort_by_key(|id| std::cmp::Reverse(reach.get(id).copied().unwrap_or(0)));
+        hit.truncate(1);
+        hit
+    };
+
+    // Walk outward, keeping every cross-component call and the widest-reaching
+    // same-component ones.
+    let mut levels: Vec<Vec<travsr_core::NodeId>> = vec![roots.clone()];
+    let mut seen: HashSet<travsr_core::NodeId> = roots.iter().copied().collect();
+    let mut kept: Vec<(travsr_core::NodeId, travsr_core::NodeId)> = Vec::new();
+    for d in 0..depth as usize {
+        let mut next = Vec::new();
+        for src in levels[d].clone() {
+            let here = subsystem_component_of(&by_id[&src].vname.path);
+            let mut crosses = Vec::new();
+            let mut internal = Vec::new();
+            let mut uniq: Vec<_> = calls.get(&src).cloned().unwrap_or_default();
+            uniq.sort();
+            uniq.dedup();
+            for dst in uniq {
+                if seen.contains(&dst) {
+                    continue;
+                }
+                if subsystem_component_of(&by_id[&dst].vname.path) == here {
+                    internal.push(dst);
+                } else {
+                    crosses.push(dst);
+                }
+            }
+            let by_reach = |v: &mut Vec<travsr_core::NodeId>| {
+                v.sort_by(|a, b| {
+                    reach
+                        .get(b)
+                        .unwrap_or(&0)
+                        .cmp(reach.get(a).unwrap_or(&0))
+                        .then_with(|| by_id[a].vname.signature.cmp(&by_id[b].vname.signature))
+                });
+            };
+            by_reach(&mut crosses);
+            by_reach(&mut internal);
+            internal.truncate(width);
+            for dst in crosses.into_iter().chain(internal) {
+                if seen.insert(dst) {
+                    kept.push((src, dst));
+                    next.push(dst);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        levels.push(next);
+    }
+
+    let label = |id: &travsr_core::NodeId| simple_symbol(&by_id[id].vname.signature);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "SUBSYSTEM BRIEF: {}\n",
+        if component.is_empty() {
+            label(&roots[0]).to_string()
+        } else {
+            component.to_string()
+        }
+    ));
+    out.push_str(&format!(
+        "provenance={} | snapshot of the code as indexed; not maintained\n\n",
+        if provenance.is_empty() {
+            "all"
+        } else {
+            provenance
+        }
+    ));
+
+    out.push_str("## Entry\n");
+    for r in &roots {
+        out.push_str(&format!("- {} - {}\n", label(r), by_id[r].vname.path));
+    }
+
+    out.push_str("\n## Called from\n");
+    let root_set: HashSet<_> = roots.iter().copied().collect();
+    let mut callers: Vec<travsr_core::NodeId> = calls
+        .iter()
+        .filter(|(src, dsts)| !root_set.contains(src) && dsts.iter().any(|d| root_set.contains(d)))
+        .map(|(src, _)| *src)
+        .collect();
+    callers.sort_by_key(|id| std::cmp::Reverse(reach.get(id).copied().unwrap_or(0)));
+    callers.truncate(8);
+    if callers.is_empty() {
+        out.push_str(
+            "- nothing in the graph calls it: a public entry reached from outside the indexed \
+             code, or unresolved\n",
+        );
+    }
+    for c in &callers {
+        out.push_str(&format!("- {} - {}\n", label(c), by_id[c].vname.path));
+    }
+
+    out.push_str(
+        "\n## Call spine, by depth from the entry\n(depth is calls from the entry, NOT elapsed \
+         order; reach = references arriving at that symbol)\n",
+    );
+    for (d, level) in levels.iter().enumerate() {
+        out.push_str(&format!("### depth {d}\n"));
+        for id in level {
+            out.push_str(&format!(
+                "- {} [{}] reach={} - {}\n",
+                label(id),
+                subsystem_component_of(&by_id[id].vname.path),
+                reach.get(id).copied().unwrap_or(0),
+                by_id[id].vname.path
+            ));
+        }
+    }
+
+    out.push_str("\n## Calls that leave the component (the contracts)\n");
+    let mut by_target: BTreeMap<String, Vec<(travsr_core::NodeId, travsr_core::NodeId)>> =
+        BTreeMap::new();
+    for (a, b) in &kept {
+        let (ca, cb) = (
+            subsystem_component_of(&by_id[a].vname.path),
+            subsystem_component_of(&by_id[b].vname.path),
+        );
+        if ca != cb {
+            by_target.entry(cb).or_default().push((*a, *b));
+        }
+    }
+    if by_target.is_empty() {
+        out.push_str("- none; control stays in one component for the traced depth\n");
+    }
+    let mut targets: Vec<_> = by_target.into_iter().collect();
+    targets.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    for (target, es) in targets {
+        out.push_str(&format!("### -> {target} ({})\n", es.len()));
+        for (a, b) in es {
+            out.push_str(&format!(
+                "- {} calls {} - {}\n",
+                label(&a),
+                label(&b),
+                by_id[&b].vname.path
+            ));
+        }
+    }
+
+    let comps: HashSet<String> = levels
+        .iter()
+        .flatten()
+        .map(|id| subsystem_component_of(&by_id[id].vname.path))
+        .collect();
+    out.push_str(&format!(
+        "\n## Shape\n- {} symbols, {} calls, {} components\n",
+        levels.iter().map(|l| l.len()).sum::<usize>(),
+        kept.len(),
+        comps.len()
+    ));
+
+    out.push_str(
+        "\n## What this brief cannot tell you\n\
+         - a missing call means the graph did not resolve it, not that it does not happen\n\
+         - Phase B coverage varies by language; absence is unknown, never no\n\
+         - nothing here states WHY a call exists; read the source for that\n",
+    );
+    sanitize_for_mcp(&out)
+}
+
 // ── get_lang_status ───────────────────────────────────────────────────────────
 
 /// Detect the language of `file` from its extension, then check whether Phase B
@@ -11243,6 +11586,60 @@ mod tests {
             edges.push((mcp_b, core_b, EdgeKind::RefCall));
         }
         make_store(&nodes, &edges)
+    }
+
+    #[test]
+    fn subsystem_brief_never_cuts_a_call_that_leaves_the_component() {
+        // Ranking callees by reach alone promotes widely-shared helpers and
+        // dropped travsr-retrieval entirely when tracing get_context, whose whole
+        // job is PPR and knapsack. A call that leaves the component is a contract
+        // between components and must survive any width limit.
+        use travsr_core::EdgeKind;
+        let entry = make_node("crates/a/src/lib.rs", "fn:entry");
+        let popular = make_node("crates/a/src/util.rs", "fn:popular");
+        let crosser = make_node("crates/b/src/lib.rs", "fn:crosser");
+        let noise = make_node("crates/a/src/noise.rs", "fn:noise");
+        // Give the same-component helpers more reach than the crossing call.
+        let mut edges = vec![
+            (entry.id, popular.id, EdgeKind::RefCall),
+            (entry.id, crosser.id, EdgeKind::RefCall),
+            (entry.id, noise.id, EdgeKind::RefCall),
+        ];
+        for extra in [&popular, &noise] {
+            edges.push((crosser.id, extra.id, EdgeKind::RefCall));
+        }
+        let store = make_store(&[entry, popular, crosser, noise], &edges);
+
+        // width = 1 keeps a single same-component callee, yet the crossing call
+        // must still be there.
+        let out = get_subsystem_brief(&store, "fn:entry", "", "", 3, 1);
+        assert!(
+            out.contains("crosser"),
+            "a cross-component call must survive width=1:\n{out}"
+        );
+        assert!(
+            out.contains("Calls that leave the component"),
+            "crossings section must be present:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_says_so_when_there_is_no_call_graph() {
+        // Without Phase B there are no ref/call edges, so there is no flow. Say
+        // that, rather than returning an empty document that reads as "nothing
+        // happens here".
+        let a = make_node("crates/a/src/lib.rs", "fn:a");
+        let b = make_node("crates/b/src/lib.rs", "fn:b");
+        let store = make_store(&[a, b], &[]);
+        let out = get_subsystem_brief(&store, "fn:a", "", "", 3, 6);
+        assert!(
+            out.contains("no call edges"),
+            "must disclose the missing call graph:\n{out}"
+        );
+        assert!(
+            out.contains("lang install"),
+            "must say how to get one:\n{out}"
+        );
     }
 
     #[test]
