@@ -2324,6 +2324,72 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Delete the entire graph: every node, edge and derived index row.
+    ///
+    /// `reconcile` cannot do this. It computes ghosts as paths **in the `files`
+    /// table** that are absent from the walk, so it only ever deletes nodes for
+    /// paths `files` tracks. Two node populations are invisible to it: paths an
+    /// older binary indexed but no longer records a hash for (a vendored tree),
+    /// and nodes whose VName path is not a file at all (external package nodes
+    /// carry `path = ""`). On a v2 fastlane index 104 192 of 125 193 nodes
+    /// survived a "full" purge routed through `reconcile` that way.
+    ///
+    /// The survivors are fatal rather than merely stale: a NodeId hashes
+    /// `SIGNATURE_FORMAT_VERSION`, so a rebuild re-emits the same VName tuple
+    /// under a different id, `ON CONFLICT(id)` never sees the old row, and
+    /// `idx_nodes_vname` aborts the whole write. Re-parsing a file does not save
+    /// it either — the per-path delete in [`Self::write_file_graphs_batch`] is
+    /// keyed on the *file's* path, which an external package node does not
+    /// share.
+    ///
+    /// Deliberately left alone:
+    /// - `files` — the caller clears it with [`Self::clear_file_hashes`], which
+    ///   is also what `--force` needs on its own.
+    /// - `node_tombstones` — the v17 CDC log. The delete trigger appends one row
+    ///   per node here, which is exactly how the embed sidecar learns to drop
+    ///   the matching `embed.db` vectors.
+    /// - `ref_resolution_state` — #811: a surviving `pending` row is the honest
+    ///   record of a reference Phase B could not resolve, and it has to outlive
+    ///   an `init --semantic --force` (see
+    ///   [`Self::reconcile_ref_resolution_states`], which is where rows whose
+    ///   `src` this purge removed are dropped, on evidence rather than by a
+    ///   wipe).
+    /// - `meta`, `sessions`, `fts_synonyms` — stamps and user config, not graph.
+    ///
+    /// Returns the number of nodes removed.
+    pub fn purge_graph(&mut self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting purge_graph transaction")?;
+            let count: i64 = tx
+                .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+                .context("counting nodes to purge")?;
+            // `nodes_fts` / `nodes_fts_words` are contentless FTS5 tables, which
+            // forbid `DELETE FROM`; `'delete-all'` is the supported way to empty
+            // one, and unlike a row-by-row retraction it needs no surviving
+            // `nodes_fts_map` row to read the old tokens back from.
+            // `nodes_words_vocab` is an fts5vocab view over `nodes_fts_words`
+            // and empties with it.
+            tx.execute_batch(
+                "DELETE FROM edges; \
+                 DELETE FROM edge_sites; \
+                 DELETE FROM symbol_aliases; \
+                 INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all'); \
+                 DELETE FROM nodes_fts_map; \
+                 INSERT INTO nodes_fts_words(nodes_fts_words) VALUES('delete-all'); \
+                 DELETE FROM nodes_fts_words_map; \
+                 DELETE FROM fts_vocab; \
+                 DELETE FROM nodes;",
+            )
+            .context("deleting graph tables")?;
+            tx.commit().context("committing purge_graph transaction")?;
+            Ok(count as u64)
+        })()
+        .map_err(|e| StoreError::Database(format!("{e:#}")))
+    }
+
     /// Write a batch of parsed file graphs in a single SQLite transaction.
     ///
     /// For each `FileGraph` in `batch`:
@@ -2691,7 +2757,7 @@ impl SqliteStore {
             tx.commit().context("committing batch write transaction")?;
             Ok(counts)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{e:#}")))
     }
 
     /// Delete all nodes (and their edges) whose VName path equals `path`.
