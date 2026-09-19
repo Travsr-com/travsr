@@ -4344,7 +4344,7 @@ LIMIT ?4",
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line FROM nodes",
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line, test_role FROM nodes",
                 )
                 .context("preparing all_nodes query")?;
             let rows = stmt
@@ -4361,6 +4361,12 @@ LIMIT ?4",
                     let package: String = row.get(7)?;
                     let line: Option<i64> = row.get(8)?;
                     let end_line: Option<i64> = row.get(9)?;
+                    // Read the column rather than defaulting it. Leaving this at
+                    // `None` made `node.test_role` silently useless on this path,
+                    // so callers had to fall back to a per-node `store.test_role`
+                    // query (see travsr-mcp/src/query.rs) or, worse, filter on a
+                    // field that was never populated and get no filtering at all.
+                    let test_role = TestRole::from_i64(row.get::<_, i64>(10)?);
                     Ok(Node {
                         id,
                         vname,
@@ -4368,7 +4374,7 @@ LIMIT ?4",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
-                        test_role: TestRole::None,
+                        test_role,
                     })
                 })
                 .context("executing all_nodes query")?;
@@ -4621,33 +4627,68 @@ LIMIT ?4",
     /// Both endpoints must carry a real path and differ. Used by the repo-map and
     /// graph-overview aggregations to build a directory-level dependency graph
     /// without any per-language logic at query time.
-    pub fn resolved_dep_pairs(&self) -> Result<Vec<(String, String)>, StoreError> {
+    /// `provenance` filters which edges may contribute a pair, with the same
+    /// grammar the MCP surface uses: `""` accepts everything, `"ratified"`
+    /// excludes the un-ratified live overlay, and any other value names one
+    /// provenance exactly. An unrecognised value therefore matches nothing and
+    /// yields an obviously empty graph, rather than silently returning
+    /// everything — a caller asking for ground truth must not be given guesses.
+    ///
+    /// EVERY edge behind a pair must pass: a pair is only as trustworthy as the
+    /// least trustworthy edge that produced it, so the two-hop arm filters both
+    /// its `depends` and its `resolves-to` edge.
+    pub fn resolved_dep_pairs(
+        &self,
+        provenance: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
         (|| -> AnyResult<Vec<(String, String)>> {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT DISTINCT src, dst FROM (
+            // Built as SQL rather than a bound parameter because the shape of the
+            // predicate differs per mode, not just its value. `provenance` is
+            // never interpolated: the exact-match arm binds it.
+            let (pred_e1, pred_e2, pred_e, bind_exact) = match provenance {
+                "" => ("", "", "", false),
+                "ratified" => (
+                    " AND e1.provenance <> 'live'",
+                    " AND e2.provenance <> 'live'",
+                    " AND e.provenance <> 'live'",
+                    false,
+                ),
+                _ => (
+                    " AND e1.provenance = ?1",
+                    " AND e2.provenance = ?1",
+                    " AND e.provenance = ?1",
+                    true,
+                ),
+            };
+            let sql = format!(
+                "SELECT DISTINCT src, dst FROM (
                          SELECT n1.path AS src, n2.path AS dst
                          FROM edges e1
                          JOIN nodes n1 ON n1.id = e1.src
                          JOIN edges e2 ON e2.src = e1.dst AND e2.kind = 'resolves-to'
                          JOIN nodes n2 ON n2.id = e2.dst
-                         WHERE e1.kind = 'depends'
+                         WHERE e1.kind = 'depends'{pred_e1}{pred_e2}
                          UNION ALL
                          SELECT ns.path AS src, nd.path AS dst
                          FROM edges e
                          JOIN nodes ns ON ns.id = e.src
                          JOIN nodes nd ON nd.id = e.dst
-                         WHERE e.kind IN ('resolves-to', 'ref/call')
+                         WHERE e.kind IN ('resolves-to', 'ref/call'){pred_e}
                      )
-                     WHERE src <> '' AND dst <> '' AND src <> dst",
-                )
+                     WHERE src <> '' AND dst <> '' AND src <> dst"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
                 .context("preparing resolved_dep_pairs query")?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .context("executing resolved_dep_pairs query")?;
+            let map_row =
+                |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+            let rows = if bind_exact {
+                stmt.query_map([provenance], map_row)
+            } else {
+                stmt.query_map([], map_row)
+            }
+            .context("executing resolved_dep_pairs query")?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row.context("decoding resolved_dep_pairs row")?);
@@ -16487,7 +16528,7 @@ mod tests {
             .put_edge(&Edge::new(a.id, a2.id, EdgeKind::RefCall))
             .unwrap();
 
-        let mut pairs = store.resolved_dep_pairs().unwrap();
+        let mut pairs = store.resolved_dep_pairs("").unwrap();
         pairs.sort();
         assert_eq!(
             pairs,
@@ -16496,6 +16537,67 @@ mod tests {
                 ("crates/x/a.rs".to_string(), "crates/z/z.rs".to_string()),
             ],
             "must return cross-file ref/call + resolves-to pairs, excluding same-file"
+        );
+    }
+
+    #[test]
+    fn resolved_dep_pairs_honours_the_provenance_filter() {
+        // The overview surface accepted a `provenance` argument and silently
+        // ignored it, so a caller asking for ratified ground truth was handed the
+        // un-ratified live overlay anyway. A bare-name guess in that overlay can
+        // invent a cross-component dependency, so this must stay pinned.
+        //
+        // Provenance is chosen by the WRITE method, not carried on the `Edge`:
+        // `put_edge` records tree-sitter, `put_edge_live` records live.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("", "", "crates/x/a.rs", "rust", "fn:a"),
+            "function",
+        );
+        let ratified = Node::new(
+            VName::new("", "", "crates/y/b.rs", "rust", "fn:b"),
+            "function",
+        );
+        let guessed = Node::new(
+            VName::new("", "", "crates/z/c.rs", "rust", "fn:c"),
+            "function",
+        );
+        for n in [&a, &ratified, &guessed] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(a.id, ratified.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge_live(&Edge::new(a.id, guessed.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let pair_to = |p: &str| ("crates/x/a.rs".to_string(), p.to_string());
+
+        let all = store.resolved_dep_pairs("").unwrap();
+        assert_eq!(all.len(), 2, "empty filter accepts every edge: {all:?}");
+
+        let ratified_only = store.resolved_dep_pairs("ratified").unwrap();
+        assert_eq!(
+            ratified_only,
+            vec![pair_to("crates/y/b.rs")],
+            "`ratified` must drop the live overlay pair"
+        );
+
+        let live_only = store.resolved_dep_pairs("live").unwrap();
+        assert_eq!(
+            live_only,
+            vec![pair_to("crates/z/c.rs")],
+            "an exact provenance names one kind"
+        );
+
+        // An unrecognised filter must return an obviously empty graph rather than
+        // everything: a typo from a caller that needed ground truth must not be
+        // answered with guesses.
+        let typo = store.resolved_dep_pairs("ratifed").unwrap();
+        assert!(
+            typo.is_empty(),
+            "unknown filter must match nothing: {typo:?}"
         );
     }
 

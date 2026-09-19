@@ -200,6 +200,15 @@ query.served is the exception to "it is in the log": a query slower than 200ms i
 The keys are identifiers and keep their spelling; the messages beside them are written for people and can be reworded at any time. That is why both exist: an alert or a jq filter built on event=phase_b.complete keeps working, where one that matched the message text would break the next time someone improved the wording.
 $ travsr daemon logs --lines 0 --json
 
+## can travsr check my architecture rules?
+> Write them down and it checks them against the graph on every run.
+- rules live in architecture-invariants.json at the repo root
+- a rule caps what a component may depend on, or what may use it
+- or asserts there are no cycles at all
+- it exits non-zero on a violation, so it works as a CI step
+A rule naming a component that no longer exists is reported as broken, not skipped. Renaming a crate would otherwise silently retire the rule protecting it, which is the one way a guard fails without anyone noticing. travsr checks its own rules this way: the dependency graph written into its CLAUDE.md had been missing two real edges, and nothing caught it.
+$ travsr invariants
+
 ## how do I tell if something is broken?
 > Three commands, in the order worth trying them.
 1. check the index first :: travsr status

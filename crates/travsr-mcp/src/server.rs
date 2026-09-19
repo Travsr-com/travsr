@@ -159,6 +159,30 @@ fn handle_tool_call(
             };
             tools::get_blast_radius(store, file, mode)
         }
+        "get_architecture_brief" => {
+            let provenance = args["provenance"].as_str().unwrap_or("ratified");
+            let token_budget = args["token_budget"].as_u64().unwrap_or(8_000) as usize;
+            tools::get_architecture_brief(store, provenance, token_budget)
+        }
+        "get_subsystem_brief" => {
+            let entry = args["entry"].as_str().unwrap_or("");
+            let component = args["component"].as_str().unwrap_or("");
+            // Default to ratified: an un-ratified bare-name guess can invent a
+            // call and place a component in a flow it has nothing to do with.
+            let provenance = args["provenance"].as_str().unwrap_or("ratified");
+            let depth = args["depth"].as_u64().unwrap_or(4).clamp(1, 8) as u8;
+            let width = args["width"].as_u64().unwrap_or(6).clamp(1, 32) as usize;
+            let token_budget = args["token_budget"].as_u64().unwrap_or(8_000) as usize;
+            tools::get_subsystem_brief(
+                store,
+                entry,
+                component,
+                provenance,
+                depth,
+                width,
+                token_budget,
+            )
+        }
         "get_lang_status" => {
             let file = args["file"].as_str().unwrap_or("");
             tools::get_lang_status(store, file)
@@ -419,6 +443,34 @@ pub fn tools_list() -> serde_json::Value {
                         "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (call/reference edges; needs full cross-file analysis to be built)." }
                     },
                     "required": ["file"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_architecture_brief",
+                "description": "Facts for explaining how a repository is put together: its components, which depends on which and how heavily, the layering from foundation to entry point, any dependency cycles, and what each component owns. Returns the facts to write an explanation from, not a written document. Language-agnostic: components are one per package where the repository has them and the containing directory otherwise.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "provenance": { "type": "string", "description": "'ratified' (default) excludes the un-ratified live overlay so a bare-name guess cannot invent a dependency; '' accepts everything; any other value names one provenance exactly." },
+                        "token_budget": { "type": "integer", "description": "Approximate size cap for the returned brief, in tokens (default 8000). A brief is meant to be read whole; raise it for a large repository." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_subsystem_brief",
+                "description": "Facts for explaining what runs when control enters a subsystem: the call spine by depth, every call that leaves the component, who calls in, and the shape. Call with no arguments to list the subsystems in this repo and their entry points, then pass one back as `component`, or name a single symbol as `entry`. Returns the facts to write an explanation from, not a written document. Requires semantic (full cross-file) analysis, since it walks call edges; it says so plainly if that analysis has not run.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "entry": { "type": "string", "description": "A single symbol to trace from, e.g. 'fn:get_context'. Omit to use `component`, or omit both to list what is available." },
+                        "component": { "type": "string", "description": "A component path from the listing, e.g. 'crates/travsr-retrieval'. Traced from the symbols most called from outside it." },
+                        "provenance": { "type": "string", "description": "'ratified' (default) excludes the un-ratified live overlay so a bare-name guess cannot invent a call; '' accepts everything; any other value names one provenance exactly." },
+                        "depth": { "type": "integer", "description": "How many calls from the entry to follow (default 4, max 8)." },
+                        "width": { "type": "integer", "description": "Same-component callees kept per function, ranked by reach (default 6). Calls that leave the component are never cut." },
+                        "token_budget": { "type": "integer", "description": "Approximate size cap for the returned brief, in tokens (default 8000). A brief is meant to be read whole; raise it for a large repository." }
+                    },
                     "additionalProperties": false
                 }
             },

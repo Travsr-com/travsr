@@ -17,6 +17,7 @@ mod graph;
 mod index;
 mod init;
 mod install;
+mod invariants;
 mod lang;
 mod logo;
 mod pattern;
@@ -318,6 +319,14 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: config::ConfigCommand,
+    },
+    /// Check declared architectural rules (architecture-invariants.json) against
+    /// the graph. Exits non-zero on a violation, so it works as a CI gate.
+    Invariants {
+        /// Which edges to trust: 'ratified' (default) excludes the un-ratified
+        /// live overlay so a bare-name guess cannot invent a dependency.
+        #[arg(long, default_value = "ratified")]
+        provenance: String,
     },
     /// Check graph integrity; optionally repair ghost nodes and orphan edges.
     Fsck {
@@ -1517,6 +1526,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Rerank { action } => rerank::run(action)?,
         Command::Embed { action } => embed::run(action)?,
         Command::Config { action } => config::run(action)?,
+        Command::Invariants { provenance } => invariants::run(&provenance)?,
         Command::Fsck { fix, json, force } => fsck::run(fix, json, force)?,
     }
     Ok(())
