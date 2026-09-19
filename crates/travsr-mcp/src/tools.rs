@@ -4246,34 +4246,31 @@ fn repo_region_dep_edges(
     edges
 }
 
-/// Transitive-dependent count per region: distinct regions that can reach `R`
-/// through the reverse dependency edges. Integer counts → deterministic.
+/// Direct-dependent count per region: distinct regions with an edge straight
+/// into `R`. Integer counts → deterministic.
+///
+/// Deliberately NOT transitive. Reverse reachability saturates on a funnel-
+/// shaped graph: everything reaches `travsr-mcp`, so every leaf hanging off it
+/// inherits its whole ancestor set and a one-consumer utility (`travsr-rerank`)
+/// outranks the product surface it serves. Direct in-degree keeps the ranking
+/// discriminating.
 fn repo_region_dependents(
     regions_universe: &std::collections::HashSet<String>,
     dep_edges: &std::collections::HashSet<(String, String)>,
 ) -> std::collections::HashMap<String, usize> {
     use std::collections::{HashMap, HashSet};
-    let mut rev: HashMap<&str, Vec<&str>> = HashMap::new();
+    // Callers guarantee src != dst, so no region can depend on itself.
+    let mut direct: HashMap<&str, HashSet<&str>> = HashMap::new();
     for (a, b) in dep_edges {
-        rev.entry(b.as_str()).or_default().push(a.as_str());
+        direct.entry(b.as_str()).or_default().insert(a.as_str());
     }
-    let mut dependents = HashMap::new();
-    for region in regions_universe {
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut stack: Vec<&str> = vec![region.as_str()];
-        while let Some(cur) = stack.pop() {
-            if let Some(ins) = rev.get(cur) {
-                for &a in ins {
-                    if seen.insert(a) {
-                        stack.push(a);
-                    }
-                }
-            }
-        }
-        seen.remove(region.as_str());
-        dependents.insert(region.clone(), seen.len());
-    }
-    dependents
+    regions_universe
+        .iter()
+        .map(|region| {
+            let n = direct.get(region.as_str()).map_or(0, |ins| ins.len());
+            (region.clone(), n)
+        })
+        .collect()
 }
 
 /// Build the agent cold-start orientation map: directory-level components ranked
