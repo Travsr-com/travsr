@@ -3863,7 +3863,11 @@ pub fn get_architecture_brief(
                 .or_default()
                 .insert(sig.clone());
         }
-        if is_entry_point_signature(&n.vname.signature) {
+        // Check the FILE's path, not the component's. Components roll up to the
+        // package root, so `crates/x/examples/bench.rs` lands in component
+        // `crates/x`, which is not a support directory: a benchmark example and
+        // a test harness were both reported as the package's entry point.
+        if is_entry_point_signature(&n.vname.signature) && !is_support_component(&n.vname.path) {
             entries
                 .entry(comp.clone())
                 .or_default()
