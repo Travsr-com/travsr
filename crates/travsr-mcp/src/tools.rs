@@ -3647,6 +3647,467 @@ pub fn get_blast_radius_global(
     sanitize_for_mcp(&raw)
 }
 
+/// Byte cap for a brief, from a caller's token budget.
+///
+/// `sanitize_for_mcp` caps at 4 KiB, which silently cut an architecture brief
+/// off mid-line and dropped its last section entirely. A brief is a fact packet
+/// meant to be read whole, so the caller sets the size, as `get_context` does.
+fn brief_byte_limit(token_budget: usize) -> usize {
+    token_budget
+        .saturating_mul(TOKEN_CHARS_PER_TOKEN)
+        .clamp(4_096, 512_000)
+}
+
+/// Directories that support the product rather than being it.
+///
+/// Language-agnostic by listing every convention the indexed languages use:
+/// `test`/`tests`/`spec`/`__tests__` (most), `testdata` (Go), `fixtures`,
+/// `bench`/`benches`, `examples`, `docs`, plus build and dependency caches.
+/// Matched per path segment, so a component named `contest` is not caught.
+fn is_support_component(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        matches!(
+            seg.to_ascii_lowercase().as_str(),
+            "test"
+                | "tests"
+                | "spec"
+                | "specs"
+                | "__tests__"
+                | "testdata"
+                | "fixture"
+                | "fixtures"
+                | "bench"
+                | "benches"
+                | "benchmark"
+                | "benchmarks"
+                | "fuzz"
+                | "example"
+                | "examples"
+                | "doc"
+                | "docs"
+                | "scripts"
+                | "vendor"
+                | "node_modules"
+                | "target"
+                | "build"
+                | "dist"
+                | ".github"
+                | ".claude"
+        )
+    })
+}
+
+/// Whether a signature names a type declaration, in any of the indexed languages.
+///
+/// The set is the canonical prefixes the analyzers normalise to, collected from
+/// their own capture tables: `struct` also carries C and C++ unions, `class`
+/// also carries Dart mixins, Kotlin objects, Scala traits and Objective-C
+/// protocols, and `type` also carries typedefs and C# delegates.
+fn is_type_signature(signature: &str) -> bool {
+    matches!(
+        signature.split(':').next().unwrap_or(""),
+        "struct" | "enum" | "class" | "interface" | "trait" | "type" | "protocol" | "actor"
+    )
+}
+
+/// Whether a signature names a program entry point.
+///
+/// `fn:main` covers the languages whose entry is a free function (Rust, Go, C,
+/// C++, Python, Dart); `method:X.main` covers the ones where it is a static
+/// method on a class (Java, Kotlin, C#, Scala). A language whose entry is a
+/// module-level side effect, such as Python's `__main__` guard or a JavaScript
+/// index module, has no symbol to find and is simply not reported.
+fn is_entry_point_signature(signature: &str) -> bool {
+    signature == "fn:main" || (signature.starts_with("method:") && signature.ends_with(".main"))
+}
+
+// ── get_architecture_brief ────────────────────────────────────────────────────
+
+/// Strongly connected components, iterative Tarjan.
+///
+/// Iterative rather than recursive because a monorepo can have hundreds of
+/// components and a deep chain would otherwise blow the stack.
+fn arch_sccs(
+    nodes: &[String],
+    adj: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<Vec<String>> {
+    use std::collections::{HashMap, HashSet};
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut low: HashMap<&str, usize> = HashMap::new();
+    let mut on_stack: HashSet<&str> = HashSet::new();
+    let mut stack: Vec<&str> = Vec::new();
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut counter = 0usize;
+
+    for root in nodes {
+        if index.contains_key(root.as_str()) {
+            continue;
+        }
+        let mut work: Vec<(&str, usize)> = vec![(root.as_str(), 0)];
+        while let Some(&mut (v, ref mut pi)) = work.last_mut() {
+            if *pi == 0 {
+                index.insert(v, counter);
+                low.insert(v, counter);
+                counter += 1;
+                stack.push(v);
+                on_stack.insert(v);
+            }
+            let kids = adj.get(v).map(|k| k.as_slice()).unwrap_or(&[]);
+            if *pi < kids.len() {
+                let w = kids[*pi].as_str();
+                *pi += 1;
+                if !index.contains_key(w) {
+                    work.push((w, 0));
+                } else if on_stack.contains(w) {
+                    let lv = low[v].min(index[w]);
+                    low.insert(v, lv);
+                }
+                continue;
+            }
+            if low[v] == index[v] {
+                let mut group = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack.remove(w);
+                    group.push(w.to_string());
+                    if w == v {
+                        break;
+                    }
+                }
+                group.sort();
+                out.push(group);
+            }
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                let lp = low[parent].min(low[v]);
+                low.insert(parent, lp);
+            }
+        }
+    }
+    out
+}
+
+/// The shape of a repository: its components, how they depend on each other,
+/// what each one owns, and where the cycles are.
+///
+/// Components are the SAME unit `get_subsystem_brief` uses. Three separate
+/// definitions of "component" across the generators is what made their outputs
+/// disagree with each other, so there is one rule and both tools share it.
+///
+/// Layering is the longest path to a component that depends on nothing
+/// internally, computed over the cycle condensation so a cycle cannot make it
+/// diverge.
+pub fn get_architecture_brief(
+    store: &SqliteStore,
+    provenance: &str,
+    token_budget: usize,
+) -> String {
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+    let nodes = match store.all_nodes() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_architecture_brief: all_nodes error: {e}");
+            return sanitize_for_mcp("");
+        }
+    };
+    let pairs = match store.resolved_dep_pairs(provenance) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("get_architecture_brief: resolved_dep_pairs error: {e}");
+            return sanitize_for_mcp("");
+        }
+    };
+
+    // Components and their contents.
+    let mut files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut symbols: BTreeMap<String, usize> = BTreeMap::new();
+    let mut entries: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut reach: HashMap<&str, usize> = HashMap::new();
+    let mut declared: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut member_of: BTreeMap<String, HashMap<String, usize>> = BTreeMap::new();
+
+    for n in &nodes {
+        if n.vname.path.is_empty()
+            || n.test_role.is_test()
+            || travsr_core::noise::is_structural_noise(n)
+        {
+            continue;
+        }
+        let comp = subsystem_component_of(&n.vname.path);
+        files
+            .entry(comp.clone())
+            .or_default()
+            .insert(n.vname.path.clone());
+        if n.kind != "file" && n.kind != "import" {
+            *symbols.entry(comp.clone()).or_insert(0) += 1;
+        }
+        let sig = simple_symbol(&n.vname.signature).to_string();
+        // Key on the SIGNATURE PREFIX, not `kind`. The prefix is the canonical
+        // form every analyzer normalises to; `kind` is the language's own word.
+        // A C union is stored kind="union" signature="struct:Name", a Dart mixin
+        // and a Kotlin object are both "class:", a typedef and a C# delegate are
+        // both "type:". Matching on `kind` silently found no types at all in C,
+        // C++, Dart, Kotlin, Objective-C and Swift.
+        if is_type_signature(&n.vname.signature) {
+            declared
+                .entry(comp.clone())
+                .or_default()
+                .insert(sig.clone());
+        }
+        if is_entry_point_signature(&n.vname.signature) {
+            entries
+                .entry(comp.clone())
+                .or_default()
+                .push(n.vname.path.clone());
+        }
+        // A type's usage lands on its members, not its declaration: `struct:VName`
+        // has one incoming reference while `method:VName.new` has hundreds. Fold
+        // `Type.member` into `Type` or the ranking is meaningless.
+        let base = sig.split('.').next().unwrap_or(&sig).to_string();
+        *member_of.entry(comp).or_default().entry(base).or_insert(0) += 0;
+        reach.entry(n.vname.signature.as_str()).or_insert(0);
+    }
+
+    let mut by_id: HashMap<travsr_core::NodeId, &travsr_core::Node> = HashMap::new();
+    for n in &nodes {
+        by_id.insert(n.id, n);
+    }
+    if let Ok(edges) = store.all_edges() {
+        for (_, dst, _, prov) in &edges {
+            if !provenance_allowed(provenance, prov) {
+                continue;
+            }
+            if let Some(n) = by_id.get(dst) {
+                if n.vname.path.is_empty() || n.test_role.is_test() {
+                    continue;
+                }
+                let comp = subsystem_component_of(&n.vname.path);
+                let sig = simple_symbol(&n.vname.signature);
+                let base = sig.split('.').next().unwrap_or(sig).to_string();
+                if let Some(m) = member_of.get_mut(&comp) {
+                    *m.entry(base).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    // Component-to-component edges, weighted by distinct crossing file pairs.
+    let mut weight: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for (src, dst) in &pairs {
+        let a = subsystem_component_of(src);
+        let b = subsystem_component_of(dst);
+        if a == b || !files.contains_key(&a) || !files.contains_key(&b) {
+            continue;
+        }
+        *weight.entry((a, b)).or_insert(0) += 1;
+    }
+
+    // Drop supporting directories, but only while that still leaves a graph. A
+    // library's only internal consumers can BE its tests and examples, and an
+    // empty diagram is worse than a noisy one.
+    let product: Vec<String> = files
+        .keys()
+        .filter(|c| !is_support_component(c))
+        .cloned()
+        .collect();
+    let product_edges = weight
+        .keys()
+        .filter(|(a, b)| !is_support_component(a) && !is_support_component(b))
+        .count();
+    let (names, view): (Vec<String>, &str) = if product.len() >= 2 && product_edges >= 1 {
+        weight.retain(|(a, b), _| !is_support_component(a) && !is_support_component(b));
+        (product, "tests, benchmarks and docs excluded")
+    } else {
+        (
+            files.keys().cloned().collect(),
+            "tests and examples included, because they carry the only dependencies here",
+        )
+    };
+    if names.is_empty() {
+        return sanitize_for_mcp("no components: this index has no indexed source files.");
+    }
+
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    let mut in_deg: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for ((a, b), _) in &weight {
+        adj.entry(a.clone()).or_default().push(b.clone());
+        in_deg.entry(b.clone()).or_default().insert(a.clone());
+    }
+
+    // Layer = longest path to a sink over the SCC condensation.
+    let sccs = arch_sccs(&names, &adj);
+    let mut owner: HashMap<&str, usize> = HashMap::new();
+    for (i, g) in sccs.iter().enumerate() {
+        for m in g {
+            owner.insert(m.as_str(), i);
+        }
+    }
+    let mut cond: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); sccs.len()];
+    for ((a, b), _) in &weight {
+        let (x, y) = (owner[a.as_str()], owner[b.as_str()]);
+        if x != y {
+            cond[x].insert(y);
+        }
+    }
+    let mut depth = vec![usize::MAX; sccs.len()];
+    for start in 0..sccs.len() {
+        if depth[start] != usize::MAX {
+            continue;
+        }
+        let mut order: Vec<usize> = Vec::new();
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut st = vec![start];
+        while let Some(i) = st.pop() {
+            if !seen.insert(i) {
+                continue;
+            }
+            order.push(i);
+            for &j in &cond[i] {
+                st.push(j);
+            }
+        }
+        // Deepest-first so a node is resolved after everything it points at.
+        for &i in order.iter().rev() {
+            let d = cond[i]
+                .iter()
+                .map(|&j| depth[j].saturating_add(1))
+                .filter(|d| *d != usize::MAX)
+                .max()
+                .unwrap_or(0);
+            if depth[i] == usize::MAX || d > depth[i] {
+                depth[i] = d;
+            }
+        }
+    }
+    let layer_of = |c: &str| depth[owner[c]];
+    let max_layer = names.iter().map(|n| layer_of(n)).max().unwrap_or(0);
+
+    let mut out = String::new();
+    out.push_str("ARCHITECTURE BRIEF\n");
+    out.push_str(&format!(
+        "provenance={} | components are one per package where the repo has them, else the \
+         containing directory | {} | snapshot of the code as indexed\n\n",
+        if provenance.is_empty() {
+            "all"
+        } else {
+            provenance
+        },
+        view
+    ));
+
+    let cycles: Vec<&Vec<String>> = sccs.iter().filter(|g| g.len() > 1).collect();
+    out.push_str(&format!(
+        "## Shape\n- {} component{}, {} edge{}, {} layer{}\n- {}\n\n",
+        names.len(),
+        if names.len() == 1 { "" } else { "s" },
+        weight.len(),
+        if weight.len() == 1 { "" } else { "s" },
+        max_layer + 1,
+        if max_layer == 0 { "" } else { "s" },
+        if cycles.is_empty() {
+            "acyclic".to_string()
+        } else {
+            format!("{} dependency cycle(s), listed below", cycles.len())
+        }
+    ));
+
+    if weight.is_empty() {
+        out.push_str(
+            "## No dependencies resolved\nTravsr recorded no cross-component edges here. That \
+             usually means full cross-file analysis has not run for this language, not that the \
+             components are independent. Read every \"depends on nothing\" below as unknown, \
+             never as none.\n\n",
+        );
+    }
+
+    if !cycles.is_empty() {
+        out.push_str("## Cycles\n");
+        for g in &cycles {
+            out.push_str(&format!("- {}\n", g.join(" <-> ")));
+        }
+        out.push('\n');
+    }
+
+    let dependents = |c: &str| in_deg.get(c).map(|s| s.len()).unwrap_or(0);
+    let mut ranked: Vec<&String> = names.iter().collect();
+    ranked.sort_by(|a, b| dependents(b).cmp(&dependents(a)).then_with(|| a.cmp(b)));
+
+    out.push_str("## Components, by how many others depend on them\n");
+    for c in &ranked {
+        let deps = weight.keys().filter(|(a, _)| a == *c).count();
+        out.push_str(&format!(
+            "- {} | layer {} | {} dependent{} | depends on {} | {} files | {} symbols\n",
+            c,
+            layer_of(c),
+            dependents(c),
+            if dependents(c) == 1 { "" } else { "s" },
+            deps,
+            files.get(*c).map(|f| f.len()).unwrap_or(0),
+            symbols.get(*c).copied().unwrap_or(0)
+        ));
+    }
+
+    out.push_str("\n## Dependency edges (weight = distinct file pairs crossing)\n");
+    let mut ws: Vec<(&(String, String), &usize)> = weight.iter().collect();
+    ws.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    for ((a, b), w) in ws {
+        out.push_str(&format!("- {a} -> {b} ({w})\n"));
+    }
+
+    out.push_str("\n## What each component owns\n");
+    for c in &ranked {
+        out.push_str(&format!("### {c}\n"));
+        if let Some(es) = entries.get(*c) {
+            for e in es.iter().take(2) {
+                out.push_str(&format!("- entry point: {e}\n"));
+            }
+        }
+        if let (Some(decl), Some(m)) = (declared.get(*c), member_of.get(*c)) {
+            let mut ts: Vec<(&String, usize)> = decl
+                .iter()
+                .map(|t| (t, m.get(t).copied().unwrap_or(0)))
+                .collect();
+            ts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            let shown: Vec<String> = ts
+                .iter()
+                .take(6)
+                .map(|(t, n)| format!("{t} ({n})"))
+                .collect();
+            if !shown.is_empty() {
+                out.push_str(&format!("- most referenced types: {}\n", shown.join(", ")));
+            }
+        }
+        let ins: Vec<&String> = in_deg
+            .get(*c)
+            .map(|s| s.iter().collect())
+            .unwrap_or_default();
+        if !ins.is_empty() {
+            out.push_str(&format!(
+                "- used by: {}\n",
+                ins.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    if let Some(note) = phase_b_degraded_note(store) {
+        out.push_str(&format!("\n## Freshness\n{note}\n"));
+    }
+    out.push_str(
+        "\n## What this brief cannot tell you\n\
+         - a missing edge means the graph did not resolve it, not that it does not exist\n\
+         - type counts are references reaching a type or one of its members, so they rank by \
+           use and undercount where analysis is incomplete\n\
+         - nothing here states WHY a dependency exists\n",
+    );
+    wrap_envelope(&sanitize_mcp_body_with_limit(
+        &out,
+        brief_byte_limit(token_budget),
+    ))
+}
+
 // ── get_subsystem_brief ───────────────────────────────────────────────────────
 
 /// The component a file belongs to: the package directory where the repository
@@ -3701,6 +4162,7 @@ pub fn get_subsystem_brief(
     provenance: &str,
     depth: u8,
     width: usize,
+    token_budget: usize,
 ) -> String {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -3838,7 +4300,10 @@ pub fn get_subsystem_brief(
             }
         }
         out.push_str("\nTake one with `component`, or a single symbol with `entry`.\n");
-        return sanitize_for_mcp(&out);
+        return wrap_envelope(&sanitize_mcp_body_with_limit(
+            &out,
+            brief_byte_limit(token_budget),
+        ));
     }
 
     // Roots: a named symbol, or the component's most-called-into entry points.
@@ -4075,7 +4540,10 @@ pub fn get_subsystem_brief(
          - Phase B coverage varies by language; absence is unknown, never no\n\
          - nothing here states WHY a call exists; read the source for that\n",
     );
-    sanitize_for_mcp(&out)
+    wrap_envelope(&sanitize_mcp_body_with_limit(
+        &out,
+        brief_byte_limit(token_budget),
+    ))
 }
 
 // ── get_lang_status ───────────────────────────────────────────────────────────
@@ -11700,7 +12168,7 @@ mod tests {
 
         // width = 1 keeps a single same-component callee, yet the crossing call
         // must still be there.
-        let out = get_subsystem_brief(&store, "fn:entry", "", "", 3, 1);
+        let out = get_subsystem_brief(&store, "fn:entry", "", "", 3, 1, 8_000);
         assert!(
             out.contains("crosser"),
             "a cross-component call must survive width=1:\n{out}"
@@ -11708,6 +12176,85 @@ mod tests {
         assert!(
             out.contains("Calls that leave the component"),
             "crossings section must be present:\n{out}"
+        );
+    }
+
+    #[test]
+    fn type_and_entry_detection_covers_every_indexed_language() {
+        // The analyzers keep each language's own word in `kind` and normalise the
+        // SIGNATURE PREFIX. Matching on `kind` found no types at all in C, C++,
+        // Dart, Kotlin, Objective-C or Swift, because a union is kind="union"
+        // signature="struct:", a mixin and a Kotlin object are both "class:", and
+        // a typedef and a C# delegate are both "type:".
+        for sig in [
+            "struct:CUnion",     // C / C++ union
+            "struct:RustStruct", // Rust, Go
+            "class:DartMixin",   // Dart mixin, Kotlin object, Scala trait
+            "protocol:ObjCProto",
+            "interface:TsInterface",
+            "type:CsDelegate", // typedef, using-alias, delegate
+            "enum:JavaEnum",
+            "trait:RustTrait",
+            "actor:SwiftActor",
+        ] {
+            assert!(is_type_signature(sig), "must be a type: {sig}");
+        }
+        for sig in [
+            "fn:helper",
+            "method:Store.open",
+            "field:VName.path",
+            "var:x",
+            "const:LIMIT",
+            "impl:Foo",
+            "macro:m",
+            "import:os",
+        ] {
+            assert!(!is_type_signature(sig), "must not be a type: {sig}");
+        }
+
+        // Entry points: a free function in Rust/Go/C/C++/Python/Dart, a static
+        // method on a class in Java/Kotlin/C#/Scala.
+        assert!(is_entry_point_signature("fn:main"));
+        assert!(is_entry_point_signature("method:App.main"));
+        assert!(!is_entry_point_signature("fn:main_worktree_root"));
+        assert!(!is_entry_point_signature("fn:domain"));
+        assert!(!is_entry_point_signature("method:App.maintain"));
+    }
+
+    #[test]
+    fn architecture_brief_components_match_the_subsystem_tool() {
+        // Three different definitions of "component" across the generators is
+        // what made their outputs disagree. Both tools must use one rule.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+        let arch = get_architecture_brief(&store, "", 8_000);
+        let sub = get_subsystem_brief(&store, "fn:a", "", "", 3, 6, 8_000);
+        for comp in ["crates/alpha", "crates/beta"] {
+            assert!(
+                arch.contains(comp),
+                "architecture brief names {comp}:\n{arch}"
+            );
+            assert!(sub.contains(comp), "subsystem brief names {comp}:\n{sub}");
+        }
+    }
+
+    #[test]
+    fn architecture_brief_discloses_an_empty_dependency_graph() {
+        // Asserting independence from an empty graph called a Go file that
+        // imports and calls another package "separately buildable".
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a, b], &[]);
+        let out = get_architecture_brief(&store, "", 8_000);
+        assert!(
+            out.contains("No dependencies resolved"),
+            "must disclose rather than assert independence:\n{out}"
+        );
+        assert!(
+            out.contains("never as none"),
+            "must say absence is unknown:\n{out}"
         );
     }
 
@@ -11728,10 +12275,10 @@ mod tests {
             (c2.id, b.id, EdgeKind::RefCall),
         ];
         let store = make_store(&[a, b, c1, c2], &edges);
-        let first = get_subsystem_brief(&store, "fn:dup", "", "", 3, 6);
+        let first = get_subsystem_brief(&store, "fn:dup", "", "", 3, 6, 8_000);
         for _ in 0..12 {
             assert_eq!(
-                get_subsystem_brief(&store, "fn:dup", "", "", 3, 6),
+                get_subsystem_brief(&store, "fn:dup", "", "", 3, 6, 8_000),
                 first,
                 "identical queries must return identical briefs"
             );
@@ -11753,7 +12300,7 @@ mod tests {
             (test_caller.id, target.id, EdgeKind::RefCall),
         ];
         let store = make_store(&[target, real, test_caller], &edges);
-        let out = get_subsystem_brief(&store, "fn:target", "", "", 3, 6);
+        let out = get_subsystem_brief(&store, "fn:target", "", "", 3, 6, 8_000);
         assert!(
             out.contains("real_caller"),
             "the non-test caller must be listed:\n{out}"
@@ -11785,7 +12332,7 @@ mod tests {
                 EdgeKind::RefCall,
             )],
         );
-        let out = get_subsystem_brief(&store, "fn:a", "", "nonsense-filter", 3, 6);
+        let out = get_subsystem_brief(&store, "fn:a", "", "nonsense-filter", 3, 6, 8_000);
         assert!(
             out.contains("no call edges matched provenance"),
             "must name the filter as the cause:\n{out}"
@@ -11804,7 +12351,7 @@ mod tests {
         let a = make_node("crates/a/src/lib.rs", "fn:a");
         let b = make_node("crates/b/src/lib.rs", "fn:b");
         let store = make_store(&[a, b], &[]);
-        let out = get_subsystem_brief(&store, "fn:a", "", "", 3, 6);
+        let out = get_subsystem_brief(&store, "fn:a", "", "", 3, 6, 8_000);
         assert!(
             out.contains("no call edges"),
             "must disclose the missing call graph:\n{out}"
