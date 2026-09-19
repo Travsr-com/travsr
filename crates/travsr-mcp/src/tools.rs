@@ -4334,7 +4334,8 @@ fn get_repo_map_raw(store: &SqliteStore, reserve_per_line: usize) -> String {
     // ── Spine: dependents from the RESOLVED graph (ref/call + resolves-to),
     // aggregated to regions. Language-agnostic — no import syntax is parsed. ──
     let known: HashSet<String> = region_symbols.keys().cloned().collect();
-    let pairs = store.resolved_dep_pairs().unwrap_or_default();
+    // The text repo map has no provenance argument, so it keeps seeing every edge.
+    let pairs = store.resolved_dep_pairs("").unwrap_or_default();
     let dep_edges = repo_region_dep_edges(&pairs, &regions, &known);
     let dependents = repo_region_dependents(&known, &dep_edges);
     let has_refcall = store.has_any_refcall_edges();
@@ -7351,7 +7352,7 @@ pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> Stri
                 return "{}".to_string();
             }
         }
-        return overview_graph(store, path_prefix);
+        return overview_graph(store, path_prefix, provenance);
     }
     // Only "" (all kinds) and "file" are valid kind_filter values.
     if !matches!(*kind_filter, "" | "file") {
@@ -7410,7 +7411,7 @@ fn file_label(path: &str) -> &str {
 }
 
 /// Entry point for `mode="overview"`. Routes by whether path_prefix is set.
-fn overview_graph(store: &SqliteStore, path_prefix: &str) -> String {
+fn overview_graph(store: &SqliteStore, path_prefix: &str, provenance: &str) -> String {
     let file_nodes = match store.nodes_by_kind("file") {
         Ok(n) => n,
         Err(e) => {
@@ -7422,7 +7423,7 @@ fn overview_graph(store: &SqliteStore, path_prefix: &str) -> String {
     // language-agnostic primitive the repo map uses. Replaces the old
     // depends+resolves-to-only `file_import_pairs`, which produced ~0 edges here
     // because top-level-dir buckets collapsed every intra-monorepo edge.
-    let pairs = match store.resolved_dep_pairs() {
+    let pairs = match store.resolved_dep_pairs(provenance) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("overview_graph: resolved_dep_pairs error: {e}");
@@ -8178,7 +8179,7 @@ pub fn get_graph_json_global(
             }
         }
         // Overview mode: run per-repo and merge package tiles
-        return get_graph_json_global_overview(repos, repo, path_prefix);
+        return get_graph_json_global_overview(repos, repo, path_prefix, provenance);
     }
     if !(query.is_empty() && *kind_filter == "file") {
         if let Err(reason) = validate_mcp_arg(query) {
@@ -8283,6 +8284,7 @@ fn get_graph_json_global_overview(
     repos: &HashMap<String, PathBuf>,
     repo: Option<&str>,
     path_prefix: &str,
+    provenance: &str,
 ) -> String {
     use std::collections::HashMap as HMap;
 
@@ -8306,7 +8308,7 @@ fn get_graph_json_global_overview(
         }
         match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
-                let raw = overview_graph(&store, path_prefix);
+                let raw = overview_graph(&store, path_prefix, provenance);
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
                     Err(_) => continue,
