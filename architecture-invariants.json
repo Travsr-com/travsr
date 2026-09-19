@@ -1,0 +1,34 @@
+{
+  "$comment": "Architectural rules checked against the graph by `node scripts/arch-doc.mjs check`. A rule naming a component that no longer exists is a violation, not a pass, so renaming a crate cannot silently disable the rule that protects it.",
+  "invariants": [
+    {
+      "name": "parsing stays pure",
+      "components": ["crates/travsr-analysis"],
+      "mayDependOn": ["crates/travsr-core"],
+      "because": "travsr-analysis depends on travsr-core and nothing else, so parsing can never reach storage, retrieval or the plugin host. Stated as an INVARIANT in CLAUDE.md and in the crate's own module docs."
+    },
+    {
+      "name": "one trust boundary",
+      "components": ["crates/travsr-plugin-protocol"],
+      "mayBeUsedBy": ["crates/travsr-plugin-host", "crates/travsr-plugin-sdk"],
+      "because": "travsr-plugin-host is the only crate in the indexer tier allowed to depend on the plugin wire format, which keeps the trust boundary in exactly one crate. travsr-plugin-sdk is the plugin authoring SDK and sits outside that tier. RFC-011, ADR-017."
+    },
+    {
+      "name": "the foundation depends on nothing internal",
+      "components": [
+        "crates/travsr-core",
+        "crates/travsr-config",
+        "crates/travsr-error",
+        "crates/travsr-ipc",
+        "crates/travsr-rerank"
+      ],
+      "mayDependOn": [],
+      "because": "core, config, error, ipc and rerank carry zero travsr-* dependencies, so every other crate can be read against a fixed base."
+    },
+    {
+      "name": "no dependency cycles",
+      "acyclic": true,
+      "because": "CLAUDE.md: no circular dependencies, ever."
+    }
+  ]
+}

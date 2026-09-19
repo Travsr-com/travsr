@@ -4182,6 +4182,205 @@ pub fn get_architecture_brief(
     ))
 }
 
+// ── architecture invariants ───────────────────────────────────────────────────
+
+/// A rule a repository's dependency graph must satisfy.
+///
+/// Deliberately three narrow shapes rather than a query language: these are the
+/// constraints projects actually write down in prose, and prose is exactly what
+/// drifts. CLAUDE.md's own dependency section had been missing two real edges.
+#[derive(serde::Deserialize)]
+struct Invariant {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    components: Vec<String>,
+    /// The only components this one may depend on. Empty list means "nothing".
+    #[serde(default, rename = "mayDependOn")]
+    may_depend_on: Option<Vec<String>>,
+    /// The only components allowed to depend on this one.
+    #[serde(default, rename = "mayBeUsedBy")]
+    may_be_used_by: Option<Vec<String>>,
+    #[serde(default)]
+    acyclic: bool,
+    #[serde(default)]
+    because: String,
+}
+
+#[derive(serde::Deserialize)]
+struct InvariantFile {
+    #[serde(default)]
+    invariants: Vec<Invariant>,
+}
+
+/// Components and the weighted edges between them, at the same granularity and
+/// with the same filters the briefs use.
+///
+/// `get_architecture_brief` gathers this alongside symbols, types and entry
+/// points it needs and this does not. The pieces that decide what a component
+/// IS — `subsystem_component_of`, `resolved_dep_pairs`, the noise and test
+/// filters — are shared, and `invariants_and_brief_agree_on_components` holds
+/// the two answers together.
+fn component_dependency_graph(
+    store: &SqliteStore,
+    provenance: &str,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeMap<(String, String), usize>,
+) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut components: BTreeSet<String> = BTreeSet::new();
+    if let Ok(nodes) = store.all_nodes() {
+        for n in &nodes {
+            if n.vname.path.is_empty()
+                || n.test_role.is_test()
+                || travsr_core::noise::is_structural_noise(n)
+            {
+                continue;
+            }
+            let comp = subsystem_component_of(&n.vname.path);
+            // The brief drops supporting directories; this must drop them too, or
+            // the two disagree about what a component is. Left in, the only cycle
+            // reported for this repository was `bench <-> packages/travsr-vscode`,
+            // which is two scratch trees, not an architecture violation.
+            if is_support_component(&comp) {
+                continue;
+            }
+            components.insert(comp);
+        }
+    }
+    let mut edges: BTreeMap<(String, String), usize> = BTreeMap::new();
+    if let Ok(pairs) = store.resolved_dep_pairs(provenance) {
+        for (src, dst) in &pairs {
+            let a = subsystem_component_of(src);
+            let b = subsystem_component_of(dst);
+            if a != b && components.contains(&a) && components.contains(&b) {
+                *edges.entry((a, b)).or_insert(0) += 1;
+            }
+        }
+    }
+    (components, edges)
+}
+
+/// Check declared architectural rules against the graph.
+///
+/// Plain text, not an MCP envelope: the one consumer is `travsr invariants`,
+/// which prints it to a terminal. Escaping `->` to `-&gt;` for a reader that
+/// does not exist would be the only effect.
+///
+/// Returns a report; the caller decides whether a violation is fatal. A rule
+/// naming a component the graph does not have FAILS rather than passing
+/// vacuously, because renaming a crate would otherwise silently retire the rule
+/// that exists to protect it, which is the one failure mode a guard must not
+/// have.
+pub fn check_architecture_invariants(
+    store: &SqliteStore,
+    rules_json: &str,
+    provenance: &str,
+) -> String {
+    let parsed: InvariantFile = match serde_json::from_str(rules_json) {
+        Ok(v) => v,
+        Err(e) => return format!("could not read the invariants file: {e}"),
+    };
+    if parsed.invariants.is_empty() {
+        return "no invariants declared.".to_string();
+    }
+
+    let (components, edges) = component_dependency_graph(store, provenance);
+    if components.is_empty() {
+        return "no components: this index has no indexed source files.".to_string();
+    }
+    let names: Vec<String> = components.iter().cloned().collect();
+    let mut adj: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (a, b) in edges.keys() {
+        adj.entry(a.clone()).or_default().push(b.clone());
+    }
+    let cycles: Vec<Vec<String>> = arch_sccs(&names, &adj)
+        .into_iter()
+        .filter(|g| g.len() > 1)
+        .collect();
+
+    let mut out = String::new();
+    let mut violations = 0usize;
+    for rule in &parsed.invariants {
+        let name = if rule.name.is_empty() {
+            "(unnamed rule)"
+        } else {
+            &rule.name
+        };
+        let mut broken: Vec<String> = Vec::new();
+
+        if rule.acyclic {
+            for g in &cycles {
+                broken.push(format!("cycle: {} -> {}", g.join(" -> "), g[0]));
+            }
+        }
+        for comp in &rule.components {
+            if !components.contains(comp) {
+                broken.push(format!(
+                    "rule names '{comp}', which is not a component in this graph (renamed or removed?)"
+                ));
+                continue;
+            }
+            if let Some(allowed) = &rule.may_depend_on {
+                for ((a, b), w) in &edges {
+                    if a == comp && !allowed.contains(b) {
+                        broken.push(format!(
+                            "'{comp}' depends on '{b}' ({w} file pair{}); allowed: {}",
+                            if *w == 1 { "" } else { "s" },
+                            if allowed.is_empty() {
+                                "nothing internal".to_string()
+                            } else {
+                                allowed.join(", ")
+                            }
+                        ));
+                    }
+                }
+            }
+            if let Some(allowed) = &rule.may_be_used_by {
+                for ((a, b), w) in &edges {
+                    if b == comp && !allowed.contains(a) {
+                        broken.push(format!(
+                            "'{a}' depends on '{comp}' ({w} file pair{}); allowed: {}",
+                            if *w == 1 { "" } else { "s" },
+                            allowed.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+
+        if broken.is_empty() {
+            out.push_str(&format!("holds    {name}\n"));
+        } else {
+            violations += 1;
+            out.push_str(&format!("VIOLATED {name}\n"));
+            for b in &broken {
+                out.push_str(&format!("           {b}\n"));
+            }
+            if !rule.because.is_empty() {
+                out.push_str(&format!("           why: {}\n", rule.because));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "\n{} of {} invariant{} hold, over {} components and {} edges ({provenance} edges).\n",
+        parsed.invariants.len() - violations,
+        parsed.invariants.len(),
+        if parsed.invariants.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+        components.len(),
+        edges.len()
+    ));
+    if violations > 0 {
+        out.push_str("VIOLATIONS FOUND\n");
+    }
+    out
+}
+
 // ── get_subsystem_brief ───────────────────────────────────────────────────────
 
 /// The component a file belongs to: the package directory where the repository
@@ -12314,6 +12513,69 @@ mod tests {
             );
             assert!(sub.contains(comp), "subsystem brief names {comp}:\n{sub}");
         }
+    }
+
+    #[test]
+    fn invariants_catch_a_broken_rule_and_a_renamed_component() {
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+
+        let rules = r#"{"invariants":[
+            {"name":"alpha is pure","components":["crates/alpha"],"mayDependOn":[],"because":"r1"},
+            {"name":"gone","components":["crates/removed"],"mayDependOn":[],"because":"r2"},
+            {"name":"beta is fine","components":["crates/beta"],"mayDependOn":[],"because":"r3"}
+        ]}"#;
+        let out = check_architecture_invariants(&store, rules, "");
+
+        assert!(out.contains("VIOLATED alpha is pure"), "{out}");
+        assert!(out.contains("depends on 'crates/beta'"), "{out}");
+        // A rule naming a component the graph lacks must FAIL. Passing it
+        // vacuously would let a rename silently retire the rule protecting it.
+        assert!(out.contains("VIOLATED gone"), "{out}");
+        assert!(out.contains("not a component in this graph"), "{out}");
+        assert!(out.contains("holds    beta is fine"), "{out}");
+        assert!(
+            out.contains("VIOLATIONS FOUND"),
+            "the caller keys its exit code on this:\n{out}"
+        );
+    }
+
+    #[test]
+    fn invariants_and_the_brief_agree_on_components() {
+        // They gather separately: the brief also needs symbols, types and entry
+        // points. Sharing `subsystem_component_of`, the noise/test filters and
+        // `is_support_component` is what keeps them describing one graph, and
+        // this holds them to it. Left unchecked, the invariant view counted
+        // supporting directories the brief drops and reported a cycle between
+        // two scratch trees as an architecture violation.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let t = make_node("crates/alpha/tests/it.rs", "fn:t");
+        let store = make_store(
+            &[a.clone(), b.clone(), t.clone()],
+            &[
+                (a.id, b.id, EdgeKind::RefCall),
+                (t.id, b.id, EdgeKind::RefCall),
+            ],
+        );
+
+        let (components, edges) = component_dependency_graph(&store, "");
+        let brief = get_architecture_brief(&store, "", 30_000);
+        for c in &components {
+            assert!(brief.contains(c.as_str()), "brief is missing {c}:\n{brief}");
+        }
+        // Compare the numbers, not a pluralised sentence: the brief writes
+        // "1 edge" and "2 edges", and this assertion should not care which.
+        assert!(
+            brief.contains(&format!("- {} component", components.len()))
+                && brief.contains(&format!(", {} edge", edges.len())),
+            "counts must disagree with neither: expected {} components / {} edges:\n{brief}",
+            components.len(),
+            edges.len()
+        );
     }
 
     #[test]
