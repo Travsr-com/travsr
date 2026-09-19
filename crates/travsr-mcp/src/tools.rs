@@ -3718,7 +3718,16 @@ fn is_type_signature(signature: &str) -> bool {
 /// module-level side effect, such as Python's `__main__` guard or a JavaScript
 /// index module, has no symbol to find and is simply not reported.
 fn is_entry_point_signature(signature: &str) -> bool {
-    signature == "fn:main" || (signature.starts_with("method:") && signature.ends_with(".main"))
+    if signature == "fn:main" {
+        return true;
+    }
+    // C# spells it `Main`; Java, Kotlin and Scala spell it `main`. Compare the
+    // member case-insensitively rather than listing both spellings. Verified
+    // against real csharp, java and scala indexes.
+    signature
+        .strip_prefix("method:")
+        .and_then(|m| m.rsplit('.').next())
+        .is_some_and(|member| member.eq_ignore_ascii_case("main"))
 }
 
 // ── get_architecture_brief ────────────────────────────────────────────────────
@@ -12216,6 +12225,7 @@ mod tests {
         // method on a class in Java/Kotlin/C#/Scala.
         assert!(is_entry_point_signature("fn:main"));
         assert!(is_entry_point_signature("method:App.main"));
+        assert!(is_entry_point_signature("method:Program.Main"));
         assert!(!is_entry_point_signature("fn:main_worktree_root"));
         assert!(!is_entry_point_signature("fn:domain"));
         assert!(!is_entry_point_signature("method:App.maintain"));
