@@ -863,7 +863,11 @@ pub fn fill_target_columns(lines: &[&str], targets: &mut [LiveResolutionTarget])
             continue;
         }
         if let Some(line) = lines.get((t.ref_line - 1) as usize) {
-            t.ref_col = word_boundary_col_utf16(line, &t.name);
+            // An Objective-C selector is spelled apart around its arguments
+            // (`initWithName:@"x" volume:1`); the message starts at its first
+            // keyword.
+            let first_keyword = t.name.split(':').next().unwrap_or(&t.name);
+            t.ref_col = word_boundary_col_utf16(line, first_keyword);
         }
     }
 }
@@ -1327,6 +1331,24 @@ mod tests {
         // word boundary at the dot, not inside `self`.
         assert_eq!(targets[0].ref_col, Some(9));
         assert_eq!(targets[1].ref_col, None);
+    }
+
+    #[test]
+    fn fill_target_columns_pins_an_objc_selector_at_its_first_keyword() {
+        // The source spells the selector apart (`initWithName:@"x" volume:1`),
+        // so the whole name never occurs; the message starts at its first
+        // keyword, which is where the editor must ask.
+        let content = "Dog *d = [[Dog alloc] initWithName:@\"Rex\" volume:0.8f];\n";
+        let mut targets = vec![LiveResolutionTarget {
+            ref_line: 1,
+            ref_col: None,
+            name: "initWithName:volume:".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        }];
+        let lines: Vec<&str> = content.lines().collect();
+        fill_target_columns(&lines, &mut targets);
+        assert_eq!(targets[0].ref_col, Some(22));
     }
 
     #[test]
