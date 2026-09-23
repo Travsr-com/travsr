@@ -7112,12 +7112,34 @@ LIMIT ?4",
 
             let mut out: Vec<String> = Vec::new();
             let mut seen = std::collections::HashSet::new();
+            // The files each candidate's imports resolve to: `depends` straight
+            // to a file (Go), or through an import node's `resolves-to`.
+            let mut imports = self
+                .conn
+                .prepare_cached(
+                    "SELECT DISTINCT t.path FROM nodes f \
+                     JOIN edges d ON d.src = f.id AND d.kind = 'depends' \
+                     JOIN nodes i ON i.id = d.dst \
+                     LEFT JOIN edges r ON r.src = i.id AND r.kind = 'resolves-to' \
+                     JOIN nodes t ON t.id = COALESCE(r.dst, i.id) AND t.kind = 'file' \
+                     WHERE f.corpus = ?1 AND f.path = ?2 AND f.kind = 'file'",
+                )
+                .context("dependents_pending_on_file: prepare imports")?;
             for row in rows {
                 let (dep_path, name) = row.context("decoding dependents_pending_on_file row")?;
-                if !leaves.contains(&name) {
+                if !leaves.contains(&name) || seen.contains(&dep_path) {
                     continue;
                 }
-                if seen.insert(dep_path.clone()) {
+                seen.insert(dep_path.clone());
+                // A file whose imports resolve depends on the saved file only by
+                // importing it; a shared leaf name elsewhere (a `.js` twin tagged
+                // `typescript`) is not one. With none resolved, the name decides.
+                let resolved: Vec<String> = imports
+                    .query_map(params![corpus, dep_path], |row| row.get(0))
+                    .context("dependents_pending_on_file: query imports")?
+                    .collect::<rusqlite::Result<_>>()
+                    .context("dependents_pending_on_file: collect imports")?;
+                if resolved.is_empty() || resolved.iter().any(|t| t == path) {
                     out.push(dep_path);
                     // Rows arrive in path order, so the cap can stop the scan
                     // instead of being applied after a full evaluation.
@@ -14566,6 +14588,63 @@ mod tests {
                 .unwrap(),
             vec!["dep.ts".to_string()],
             "`kind:Qual.Leaf` must match too"
+        );
+    }
+
+    /// A name match alone crossed projects: `.js` files are tagged
+    /// `typescript`, so saving `typescript/src/animal.ts` named
+    /// `javascript/src/main.js` a dependent though it imports only its own
+    /// `animal.js`. A file whose imports resolve must import the saved one; a
+    /// file with none resolved keeps the name match.
+    #[test]
+    fn a_dependent_that_resolves_its_imports_must_import_the_saved_file() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let file = |path: &str| live_node("c", path, "file", "file", 1);
+        let saved = file("typescript/src/animal.ts");
+        let def = live_node(
+            "c",
+            "typescript/src/animal.ts",
+            "method:Zoo.add",
+            "method",
+            3,
+        );
+        let js_animal = file("javascript/src/animal.js");
+        let mut nodes = vec![saved.clone(), def, js_animal.clone()];
+        let mut edges = Vec::new();
+        let mut pendings = Vec::new();
+        for (path, target) in [
+            ("javascript/src/main.js", Some(&js_animal)),
+            ("typescript/src/main.ts", Some(&saved)),
+            ("typescript/src/loose.ts", None),
+        ] {
+            let f = file(path);
+            let caller = live_node("c", path, "fn:run", "function", 2);
+            if let Some(target) = target {
+                let import = live_node("c", path, "import:./animal", "import", 1);
+                edges.push(Edge::new(f.id, import.id, EdgeKind::Depends));
+                edges.push(Edge::new(import.id, target.id, EdgeKind::ResolvesTo));
+                nodes.push(import);
+            }
+            pendings.push((path, caller.id));
+            nodes.push(f);
+            nodes.push(caller);
+        }
+        store
+            .write_phase_b_batch(&nodes, &edges, "tree-sitter")
+            .unwrap();
+        for (path, caller) in pendings {
+            store
+                .replace_ref_resolution_states("c", path, &[pending(caller, 4, "add")])
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .dependents_pending_on_file("c", "typescript/src/animal.ts", "typescript", 32)
+                .unwrap(),
+            vec![
+                "typescript/src/loose.ts".to_string(),
+                "typescript/src/main.ts".to_string()
+            ]
         );
     }
 
