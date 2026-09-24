@@ -4850,6 +4850,8 @@ const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
 ///   to (travsr-lang `fix/csharp-dotnet-root-sandbox-path`). If the oracle still
 ///   cannot run, the edges persist as `live` rather than ratifying — honest,
 ///   not wrong.
+/// - `kotlin` — kotlin-language-server, live and as the travsr-lang-kotlin
+///   oracle, 1.0000 (`11,0,0`) on the live-lane fixture.
 ///
 /// Deliberately absent:
 /// - `c`, `objectivec` — edges ratify correctly but scip-clang writes no
@@ -4860,10 +4862,8 @@ const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
 /// - `php` — the LSP lane *works* with a typed receiver (`run(Session $s)`) via
 ///   Intelephense, but the oracle scip-php needs Composer (absent here), so no
 ///   reading yet. Opt in once measured.
-/// - `scala`, `kotlin` — blocked by JVM build-toolchain setup, not the live
-///   lane: Scala's SemanticDB oracle needs `sbt compile`; Kotlin's KLS (its
-///   oracle *and* its live server) needs a working Gradle build, which the
-///   Gradle/Kotlin/JDK version matrix on this machine would not produce.
+/// - `scala` — blocked by JVM build-toolchain setup, not the live lane: its
+///   SemanticDB oracle needs `sbt compile`.
 ///
 /// Each entry is `(nodes.language, verified claims behind the decision)`.
 ///
@@ -4883,6 +4883,7 @@ const LIVE_LANE_SHIPPED: &[(&str, u64)] = &[
     ("cpp", 1),
     ("java", 3),
     ("csharp", 6),
+    ("kotlin", 11),
 ];
 
 /// Force-enable a language for measurement, bypassing the strict opt-in gate
@@ -10464,12 +10465,12 @@ mod tests {
             !live_lane_enabled_for(&store, "scala"),
             "an unmeasured non-shipped language must be disabled by the strict gate"
         );
-        assert!(!live_lane_enabled_for(&store, "kotlin"));
+        assert!(!live_lane_enabled_for(&store, "php"));
 
         // Force-enabling for measurement lifts the gate for exactly that language.
-        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "scala,kotlin");
+        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "scala,php");
         assert!(live_lane_enabled_for(&store, "scala"));
-        assert!(live_lane_enabled_for(&store, "kotlin"));
+        assert!(live_lane_enabled_for(&store, "php"));
         assert!(
             !live_lane_enabled_for(&store, "ruby"),
             "the force list is per-language, not a blanket override"
