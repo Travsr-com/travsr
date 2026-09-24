@@ -209,11 +209,12 @@ fn resolve_one(store: &SqliteStore, corpus: &str, file: &str, r: &LiveResolution
     // hostile report cannot make it write a kind it was never scoped to.
     let edge = live_edge_kind(&r.edge_kind)?;
     // The reference's enclosing definition is the edge's source. A reference at
-    // top level (no enclosing function) has no caller node to attach to.
+    // top level (a script) hangs from the file node, as Phase B attributes it.
     let src = store
         .enclosing_definition_at(corpus, file, r.ref_line)
         .ok()
-        .flatten()?;
+        .flatten()
+        .or_else(|| store.file_node_at(corpus, file).ok().flatten())?;
     // Section 7.5: the node the editor pointed at, restricted to the kinds valid
     // for this edge kind (a field ref lands on a `field` node, an implements
     // clause on an interface/trait, a call on a definition). The kind set is the
@@ -1727,8 +1728,33 @@ mod tests {
         );
     }
 
-    /// A reference at top level has no enclosing definition to hang an edge
-    /// from, so it abstains rather than attaching to an arbitrary node.
+    /// A top-level reference (a script's `zoo.add(dog)`) hangs from its file
+    /// node, as Phase B attributes script calls. Requiring an enclosing
+    /// definition dropped every resolution in a script.
+    #[test]
+    fn a_top_level_reference_hangs_from_its_file_node() {
+        let mut store = store_with(&[
+            ("src/main.ts", "file", "file", 1, 40),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/main.ts",
+            &[resolution(2, "save", "src/user.ts", 17)],
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            }
+        );
+    }
+
+    /// A reference in no definition span of a file with no file node has
+    /// nothing to hang an edge from, so it abstains rather than attaching to an
+    /// arbitrary node.
     #[test]
     fn a_reference_with_no_enclosing_definition_abstains() {
         let mut store = store_with(&[
