@@ -134,6 +134,14 @@ pub fn unify_all(
 
     for node in nodes {
         let scip_sym = travsr_indexer::scip_unifier::scip_symbol_from_sig(&node.vname.signature);
+        // scip-go defines the package (`…/pkg/`) in every file of it, while
+        // Phase A models a package once per directory (`go-pkg:`). The per-file
+        // def has no twin; kept, it orphans the file and every save of it
+        // becomes a whole-file purge.
+        if node.vname.language == "go" && scip_sym.ends_with('/') {
+            dropped.insert(node.id);
+            continue;
+        }
         // Primary: SCIP descriptor grammar (go/java/ruby/c#/c/c++/… + rust/ts/py
         // LSIF). Fallback: bespoke sidecars (kotlin/swift) whose signatures are
         // Phase-A-style (`fn:Container.name`, `swift::Container.name`) and never
@@ -250,6 +258,13 @@ pub fn unify_all(
             if let Some(c) = parsed.container {
                 let field = parsed.name.strip_suffix("_=").unwrap_or(parsed.name);
                 same_file.push(format!("field:{c}.{field}"));
+            }
+        }
+        // scip-go writes an interface method as a term (`Animal#Name.`), where
+        // Phase A wrote the method spec.
+        if node.vname.language == "go" && parsed.kind == "variable" {
+            if let Some(c) = parsed.container {
+                same_file.push(format!("method:{c}.{}", parsed.name));
             }
         }
         // A Scala `object` is a term (`Main.`); Phase A wrote it as the type
@@ -750,6 +765,69 @@ mod tests {
         assert!(out.dropped.contains(&local.id));
         assert!(!out.dropped.contains(&entry.id));
         assert!(out.misses.is_empty(), "{:?}", out.misses);
+    }
+
+    #[test]
+    fn a_go_package_def_is_dropped_from_every_file() {
+        // scip-go defines the package (`…/pkg/`) in every file of it. Phase A
+        // models a package once per directory (`go-pkg:`), so the per-file def
+        // has no twin; kept, it orphaned every file and made each save a
+        // whole-file purge.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let go = |path: &str, symbol: &str, line: u32| {
+            Node::new(
+                VName::new("c", "", path, "go", &format!("scip:{path}:{symbol}")),
+                "module",
+            )
+            .with_line(line)
+        };
+        let short = go("go/main.go", "scip-go gomod zoo . zoo/", 1);
+        let long = go(
+            "go/dog.go",
+            "scip-go gomod github.com/o/zoo . github.com/o/zoo/",
+            1,
+        );
+        let method = go("go/dog.go", "scip-go gomod zoo . zoo/Dog#Fetch().", 5);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(
+            &mut store,
+            "c",
+            &[short.clone(), long.clone(), method.clone()],
+            &mut refs,
+        );
+        assert!(out.dropped.contains(&short.id));
+        assert!(out.dropped.contains(&long.id));
+        assert!(!out.dropped.contains(&method.id));
+    }
+
+    #[test]
+    fn a_go_interface_method_term_unifies_onto_its_method_spec() {
+        // scip-go writes an interface method as a term (`Animal#Name.`), which
+        // parses as a field; Phase A models the spec as `method:Animal.Name`.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let spec = Node::new(
+            VName::new("c", "", "go/animal.go", "go", "method:Animal.Name"),
+            "method",
+        )
+        .with_line(4)
+        .with_end_line(4);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&spec), &[], "scip")
+            .unwrap();
+        let term = Node::new(
+            VName::new(
+                "c",
+                "",
+                "go/animal.go",
+                "go",
+                "scip:go/animal.go:scip-go gomod zoo . zoo/Animal#Name.",
+            ),
+            "function",
+        )
+        .with_line(4);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", std::slice::from_ref(&term), &mut refs);
+        assert_eq!(out.alias_map.get(&term.id), Some(&spec.id));
     }
 
     #[test]
