@@ -341,6 +341,37 @@ test('a CommonJS call reaches its method through a destructured require', () => 
   }
 });
 
+// A call through an interface (`a.describe()` with `a: Animal`) resolves to
+// the interface's method signature, which the definition pass never
+// registered, so the call emitted no reference.
+test('a call through an interface references its method signature', () => {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-iface-')));
+  try {
+    fs.writeFileSync(
+      path.join(repo, 'a.ts'),
+      'export interface Animal {\n  describe(): string;\n}\nexport function run(a: Animal) {\n  return a.describe();\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(repo, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { noEmit: true }, include: ['*.ts'] })
+    );
+    const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', path.join(repo, 'tsconfig.json')], {
+      encoding: 'utf-8',
+    });
+    assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+    const lines = result.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const set = lines.find((o) => o.label === 'resultSet' && o.travsr_vname?.signature === 'method:Animal.describe');
+    assert.ok(set, 'method:Animal.describe has a result set');
+    const refResult = lines.find((o) => o.label === 'textDocument/references' && o.outV === set.id);
+    const calls = lines.filter(
+      (o) => o.label === 'item' && o.property === 'references' && o.outV === refResult.inV && o.travsr_call === undefined
+    );
+    assert.strictEqual(calls.length, 1, 'a.describe() references the signature');
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 // `new Zoo()` is a constructor call. The emitter handled call expressions
 // only, so a class reached by `new` got a call edge solely through its import
 // specifier, and none once imports were marked as non-calls.

@@ -334,6 +334,13 @@ function computeTravsrVName(
   } else if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) {
     const className = findParentClassName(node) ?? '<anonymous>';
     signature = `method:${className}.${node.name.text}`;
+  } else if (
+    ts.isMethodSignature(node) &&
+    ts.isIdentifier(node.name) &&
+    ts.isInterfaceDeclaration(node.parent)
+  ) {
+    // An interface method: tree-sitter names it `method:Iface.name` too.
+    signature = `method:${node.parent.name.text}.${node.name.text}`;
   } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
     // Tree-sitter only indexes program-child declarators (`(program
     // (lexical_declaration (variable_declarator)))`). A local has no node, so
@@ -407,7 +414,10 @@ function resolveDeclarationSymbol(
   if (ts.isFunctionDeclaration(node) && node.name) {
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
-  if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) {
+  if (
+    (ts.isMethodDeclaration(node) || ts.isMethodSignature(node)) &&
+    ts.isIdentifier(node.name)
+  ) {
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
   if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
