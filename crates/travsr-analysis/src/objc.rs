@@ -40,6 +40,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (property_declaration (struct_declaration (struct_declarator (identifier) @field.name)))
 (instance_variable (struct_declaration (struct_declarator (pointer_declarator declarator: (identifier) @field.name))))
 (property_declaration (struct_declaration (struct_declarator (pointer_declarator declarator: (identifier) @field.name))))
+(type_definition declarator: (type_identifier) @typedef.name)
+(field_declaration declarator: (field_identifier) @field.name)
+(field_declaration declarator: (pointer_declarator declarator: (field_identifier) @field.name))
+(field_declaration declarator: (array_declarator declarator: (field_identifier) @field.name))
 (preproc_include path: (_) @import)
 (module_import (identifier) @import)
 "#,
@@ -47,6 +51,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("class.name", "class", "class"),
         ("impl.name", "impl", "impl"),
         ("protocol.name", "protocol", "protocol"),
+        ("typedef.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
         // #757: ivars (`@interface { int _x; }`) and `@property` declarations →
         // `field:Owner.name`, contained by the interface/implementation.
@@ -57,6 +62,9 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("class_implementation", "impl"),
         ("class_interface", "class"),
         ("protocol_declaration", "protocol"),
+        // A C struct's members, as in `c.rs`.
+        ("struct_specifier", "struct"),
+        ("union_specifier", "struct"),
     ],
     decl_kinds: &["function_definition"],
     type_refinements: &[],
@@ -679,5 +687,37 @@ mod tests {
                 .map(|n| &n.vname.signature)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_typedef_struct_and_its_fields_get_nodes() {
+        // A plain C header in a repo with Objective-C sources parses as
+        // Objective-C. `typedef struct { .. } Animal;` yielded only the file
+        // node, so scip-clang's defs for the type and its fields orphaned the
+        // header and every save of it purged the whole file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utils.h");
+        std::fs::write(
+            &path,
+            "typedef struct {\n    const char* name;\n    int age;\n} Animal;\n\
+             typedef struct {\n    Animal animals[16];\n    int count;\n} Zoo;\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "utils.h").unwrap();
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        for want in [
+            "type:Animal",
+            "field:Animal.name",
+            "field:Animal.age",
+            "type:Zoo",
+            "field:Zoo.animals",
+            "field:Zoo.count",
+        ] {
+            assert!(sigs.contains(&want), "missing {want}, got {sigs:?}");
+        }
     }
 }
