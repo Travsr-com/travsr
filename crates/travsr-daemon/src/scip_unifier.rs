@@ -838,7 +838,7 @@ mod tests {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let go = |path: &str, symbol: &str, line: u32| {
             Node::new(
-                VName::new("c", "", path, "go", &format!("scip:{path}:{symbol}")),
+                VName::new("c", "", path, "go", format!("scip:{path}:{symbol}")),
                 "module",
             )
             .with_line(line)
