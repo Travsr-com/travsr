@@ -252,6 +252,12 @@ pub fn unify_all(
                 same_file.push(format!("field:{c}.{field}"));
             }
         }
+        // A Scala `object` is a term (`Main.`); Phase A wrote it as the type
+        // node `class:Main` on the same line.
+        if node.vname.language == "scala" && parsed.kind == "variable" && parsed.container.is_none()
+        {
+            same_file.push(format!("class:{}", parsed.name));
+        }
         // A constructor with no declaration of its own (a Kotlin primary
         // constructor, an implicit JVM `<init>`, which Scala's sidecar kinds
         // `sym`) is defined on its class's line, and Phase A wrote only the
@@ -743,6 +749,47 @@ mod tests {
         assert_eq!(out.alias_map.get(&property.id), Some(&field.id));
         assert!(out.dropped.contains(&local.id));
         assert!(!out.dropped.contains(&entry.id));
+        assert!(out.misses.is_empty(), "{:?}", out.misses);
+    }
+
+    #[test]
+    fn scala_object_and_its_members_unify() {
+        // `object Main { def main(..) }`: SemanticDB owns the member by a term
+        // (`Main.main().`), not a type (`Main#`), so it parsed with no container
+        // and never met `method:Main.main`; the object itself (`Main.`) never met
+        // Phase A's `class:Main`. Both survived as orphans in the file.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let object = Node::new(
+            VName::new("c", "", "s/Main.scala", "scala", "class:Main"),
+            "object",
+        )
+        .with_line(1)
+        .with_end_line(15);
+        let main = Node::new(
+            VName::new("c", "", "s/Main.scala", "scala", "method:Main.main"),
+            "method",
+        )
+        .with_line(2)
+        .with_end_line(14);
+        store
+            .write_phase_b_batch(&[object.clone(), main.clone()], &[], "scip")
+            .unwrap();
+        let sdb = |sig: &str, kind: &str, line: u32| {
+            Node::new(VName::new("c", "", "s/Main.scala", "scala", sig), kind)
+                .with_line(line)
+                .with_end_line(line)
+        };
+        let sdb_object = sdb("sdb:_empty_/Main.", "object", 1);
+        let sdb_main = sdb("sdb:_empty_/Main.main().", "method", 2);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(
+            &mut store,
+            "c",
+            &[sdb_object.clone(), sdb_main.clone()],
+            &mut refs,
+        );
+        assert_eq!(out.alias_map.get(&sdb_object.id), Some(&object.id));
+        assert_eq!(out.alias_map.get(&sdb_main.id), Some(&main.id));
         assert!(out.misses.is_empty(), "{:?}", out.misses);
     }
 
