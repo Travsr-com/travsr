@@ -4403,8 +4403,10 @@ FROM nodes";
             if lang.is_some() {
                 sql.push_str("\n  AND language = ?2");
             }
+            // Ties break on the name, not the NodeId: the id hashes the corpus
+            // (the checkout's directory), so id order changed with it.
             sql.push_str(&format!(
-                "\nORDER BY rank ASC, id ASC\nLIMIT {NODE_NAME_SEARCH_LIMIT}"
+                "\nORDER BY rank ASC, path ASC, signature ASC, id ASC\nLIMIT {NODE_NAME_SEARCH_LIMIT}"
             ));
 
             let mut stmt = self.conn.prepare(&sql).context("preparing search query")?;
@@ -15233,6 +15235,37 @@ mod tests {
         let results = store.search_nodes_by_name("charge").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].vname.signature, "fn:charge");
+    }
+
+    /// Equal-rank matches must not be ordered by NodeId: it hashes the corpus,
+    /// which is the checkout's directory name (`local/<dir>`), so the same code
+    /// picked a different anchor for a tie in another directory (bench hit@1
+    /// 0.375 in two directories, 0.333 in a third).
+    #[test]
+    fn search_orders_equal_rank_matches_the_same_in_every_corpus() {
+        let order = |corpus: &str| {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            for (path, sig) in [("src/a.rs", "fn:make_token"), ("src/b.rs", "fn:token_at")] {
+                store
+                    .put_node(&Node::new(
+                        VName::new(corpus, "", path, "rust", sig),
+                        "function",
+                    ))
+                    .unwrap();
+            }
+            store
+                .search_nodes_by_name("token")
+                .unwrap()
+                .into_iter()
+                .map(|n| n.vname.signature)
+                .collect::<Vec<_>>()
+        };
+        let first = order("local/a");
+        for corpus in [
+            "local/b", "local/c", "local/d", "local/e", "local/f", "local/g",
+        ] {
+            assert_eq!(order(corpus), first, "{corpus}");
+        }
     }
 
     #[test]
