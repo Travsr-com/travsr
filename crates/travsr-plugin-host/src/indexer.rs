@@ -1222,11 +1222,14 @@ impl PluginIndexer {
                                         // sidecar skips its own directory walk.
                                         files,
                                     };
-                                    // The sandbox is still anchored at the repo
-                                    // root (ADR-017): a build root is inside it by
-                                    // construction, so no grant widens here.
+                                    // The sandbox is anchored at the root the
+                                    // analyzer runs in, a subtree of the repo, so
+                                    // a repo-write grant (scip-php's `index.scip`,
+                                    // sbt's `target/`) lands where the analyzer
+                                    // writes. At the repo root, `php/index.scip`
+                                    // was denied and the index silently empty.
                                     let sidecar =
-                                        match crate::transport::Sidecar::spawn(&spec, repo_root) {
+                                        match crate::transport::Sidecar::spawn(&spec, invoke_root) {
                                             Ok(sidecar) => sidecar,
                                             Err(e) => {
                                                 // Resolver confirmed the binary exists — spawn failure is a crash.
@@ -1651,6 +1654,27 @@ mod tests {
         assert_eq!(
             build_roots(root, &files, crate::phase_b::catalog::build_manifests("go")),
             vec![root.join("go")]
+        );
+    }
+
+    /// scip-php reads `composer.json` from the directory it runs in; invoked at
+    /// the repo root it failed on `<repo>/composer.json` for a `php/` project.
+    #[test]
+    fn php_is_invoked_at_its_composer_directory() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("php/src")).expect("mkdir");
+        std::fs::write(root.join("php/composer.json"), "{}").expect("write");
+        let files = vec!["php/src/main.php".to_string()];
+        assert_eq!(
+            build_roots(
+                root,
+                &files,
+                crate::phase_b::catalog::build_manifests("php")
+            ),
+            vec![root.join("php")]
         );
     }
 

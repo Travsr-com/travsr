@@ -934,6 +934,7 @@ pub fn build_manifests(language: &str) -> &'static [&'static str] {
         ],
         "scala" => &["build.sbt"],
         "go" => &["go.mod"],
+        "php" => &["composer.json"],
         _ => &[],
     }
 }
