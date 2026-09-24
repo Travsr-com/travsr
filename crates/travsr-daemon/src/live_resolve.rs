@@ -699,9 +699,15 @@ pub fn targets_needing_editor(
             if lexical_one(store, call, locally_bound).is_some() {
                 return None;
             }
-            // Only a method or field reference benefits from LSP disambiguation.
+            // A method or field reference benefits from LSP disambiguation, and
+            // so does a bare call the lexical lane refused because several
+            // same-language definitions carry its name. One with none has no
+            // target the provider could land on, so it is not sent.
             let is_field = call.callee_sig.starts_with("field:");
-            if !(call.is_method_call || is_field) {
+            if !(call.is_method_call
+                || is_field
+                || has_several_definitions(store, call, locally_bound))
+            {
                 return None;
             }
             // No line means no position for the editor to query (older
@@ -734,6 +740,33 @@ pub fn targets_needing_editor(
         })
         .collect();
     drop_same_position_collisions(targets)
+}
+
+/// True for a bare call, not bound locally, whose name two or more
+/// definitions of a valid target kind carry in the caller's language: the
+/// ambiguity the lexical lane abstains on, and the editor can settle.
+fn has_several_definitions(
+    store: &SqliteStore,
+    call: &UnresolvedCall,
+    locally_bound: &std::collections::HashSet<String>,
+) -> bool {
+    if locally_bound.contains(travsr_core::ident::leaf_of(&call.callee_sig)) {
+        return false;
+    }
+    let Some(src) = store.get_node(call.src).ok().flatten() else {
+        return false;
+    };
+    let kinds = target_kinds(lexical_edge_kind(call));
+    candidate_signatures(call).iter().any(|sig| {
+        store.lookup_nodes_exact(sig, None).is_ok_and(|found| {
+            found
+                .iter()
+                .filter(|n| kinds.contains(&n.kind.as_str()))
+                .filter(|n| n.vname.language == src.vname.language)
+                .count()
+                >= 2
+        })
+    })
 }
 
 /// RFC-027 daemon-driven positions, IsImplementation half: the `extends` /
@@ -2994,6 +3027,23 @@ mod tests {
         let src = node_id("src/order.ts", "fn:placeOrder");
         let bare = call(src, "fn:nowhere", 21);
         assert!(targets_needing_editor(&store, &[], &[bare], &no_locals()).is_empty());
+    }
+
+    /// A bare call the lexical lane refuses because two same-language
+    /// definitions carry the name (`new Zoo()` with a `.js` twin tagged
+    /// `typescript`) is exactly what the editor settles, so it is sent.
+    #[test]
+    fn an_ambiguous_bare_call_is_sent_to_the_editor() {
+        let store = store_with(&[
+            ("src/main.ts", "fn:run", "function", 1, 30),
+            ("src/animal.ts", "class:Zoo", "class", 3, 20),
+            ("js/animal.js", "class:Zoo", "class", 3, 20),
+        ]);
+        let src = node_id("src/main.ts", "fn:run");
+        let bare = call(src, "class:Zoo", 5);
+        let targets = targets_needing_editor(&store, &[], &[bare], &no_locals());
+        let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["Zoo"]);
     }
 
     /// RFC-027 section 12: the editor lane records what it claimed, so the
