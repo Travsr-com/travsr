@@ -20,6 +20,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (type_alias . (type_identifier) @typedef.name)
 (function_signature    name: (identifier) @fn.name)
 (class_body (class_member (declaration (initialized_identifier_list (initialized_identifier name: (identifier) @field.name)))))
+(class_body (class_member (declaration (getter_signature name: (identifier) @field.name))))
 (import_or_export)     @import
 "#,
     capture_kinds: &[
@@ -111,6 +112,22 @@ mod tests {
             Some(4),
             "method span must reach the body brace"
         );
+    }
+
+    #[test]
+    fn an_abstract_getter_is_a_field() {
+        // The Dart analysis server defines `Animal.name` for `String get name;`;
+        // with no Phase A twin it stayed an orphan in the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.dart");
+        std::fs::write(&path, "abstract class Animal {\n  String get name;\n}\n").unwrap();
+        let out = parse("corp", &path, "a.dart").unwrap();
+        let name = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "field:Animal.name")
+            .expect("field:Animal.name");
+        assert_eq!(name.line, Some(2));
     }
 
     #[test]
