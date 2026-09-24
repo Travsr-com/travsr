@@ -339,9 +339,31 @@ pub fn parse_with_config(
     // Collapse duplicates to the first occurrence in document order (query
     // matches arrive in start-position order) so the invariant holds and the
     // anchor line stays the definition, not a later write.
+    //
+    // A wider span beats a narrower one, though: a Swift protocol requirement
+    // (`func describe()`, one line) and its extension default (a body) share
+    // `method:Animal.describe`, and the node must span the body a call resolves
+    // to. Every #780 repeat is a same-width site, so ties still keep the first.
     {
-        let mut seen_ids = std::collections::HashSet::new();
-        nodes.retain(|n| seen_ids.insert(n.id));
+        let width = |n: &Node| {
+            n.end_line
+                .zip(n.line)
+                .map_or(0, |(e, l)| e.saturating_sub(l))
+        };
+        let mut widest: std::collections::HashMap<travsr_core::NodeId, usize> =
+            std::collections::HashMap::new();
+        for (i, n) in nodes.iter().enumerate() {
+            let best = widest.entry(n.id).or_insert(i);
+            if width(n) > width(&nodes[*best]) {
+                *best = i;
+            }
+        }
+        let mut i = 0;
+        nodes.retain(|n| {
+            let keep = widest.get(&n.id) == Some(&i);
+            i += 1;
+            keep
+        });
     }
 
     // #780: language-specific expansion the shared capture pipeline cannot

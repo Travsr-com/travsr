@@ -19,6 +19,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (protocol_declaration name: (type_identifier) @protocol.name)
 (typealias_declaration name: (type_identifier) @typealias.name)
 (function_declaration name: (simple_identifier) @fn.name)
+(protocol_function_declaration name: (simple_identifier) @fn.name)
 (init_declaration "init" @init.name)
 (import_declaration)  @import
 (class_body (property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name)))
@@ -102,6 +103,54 @@ mod tests {
         assert_eq!(by_sig.get("actor:A"), Some(&"actor"));
         assert_eq!(by_sig.get("extension:X"), Some(&"extension"));
         assert_eq!(by_sig.get("class:P"), Some(&"protocol"));
+    }
+
+    #[test]
+    fn protocol_requirement_is_a_method_of_the_protocol() {
+        // `func speak() -> String` inside `protocol Animal` has no body. With no
+        // node, an editor answer landing on it (dynamic dispatch through the
+        // protocol) mapped to nothing and was refused.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.swift");
+        std::fs::write(&path, "protocol Animal {\n    func speak() -> String\n}\n").unwrap();
+        let out = parse("corp", &path, "a.swift").unwrap();
+        let speak = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:Animal.speak")
+            .unwrap_or_else(|| {
+                panic!(
+                    "got {:?}",
+                    out.nodes
+                        .iter()
+                        .map(|n| &n.vname.signature)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!((speak.line, speak.end_line), (Some(2), Some(2)));
+    }
+
+    #[test]
+    fn a_protocol_default_keeps_its_body_span_over_the_requirement() {
+        // `func describe()` required in the protocol and implemented in its
+        // extension share `method:Animal.describe`. The node must span the
+        // default's body, where a call resolves; the requirement's one line took
+        // over and the editor's answer on the body mapped to nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.swift");
+        std::fs::write(
+            &path,
+            "protocol Animal {\n    func describe() -> String\n}\n\nextension Animal {\n    func describe() -> String {\n        return \"\"\n    }\n}\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "a.swift").unwrap();
+        let describe: Vec<_> = out
+            .nodes
+            .iter()
+            .filter(|n| n.vname.signature == "method:Animal.describe")
+            .map(|n| (n.line, n.end_line))
+            .collect();
+        assert_eq!(describe, vec![(Some(6), Some(8))]);
     }
 
     #[test]
