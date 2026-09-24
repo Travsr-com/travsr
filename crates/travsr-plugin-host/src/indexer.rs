@@ -924,9 +924,25 @@ impl PluginIndexer {
                                 // tree-sitter node id, so it reconciles without an alias
                                 // pass, and write_scip_attributed_batch records edge_sites.
                                 let mut refs: Vec<travsr_core::ScipRef> = Vec::new();
-                                let tsconfig = repo_root.join("tsconfig.json");
-                                if tsconfig.exists() {
-                                    match travsr_indexer::run_lsif_emitter(&tsconfig) {
+                                // Every project's own tsconfig, not only a root one:
+                                // `typescript/tsconfig.json` (or a CommonJS
+                                // `javascript/tsconfig.json` whose `module` settings
+                                // the synthesized pass below lacks) one level down
+                                // was never read. Nested projects under a root
+                                // tsconfig collapse onto it, as build roots do.
+                                let mut ts_roots = build_roots(
+                                    repo_root,
+                                    item.files.as_deref().unwrap_or(&[]),
+                                    TSCONFIG,
+                                );
+                                if ts_roots.is_empty() && repo_root.join("tsconfig.json").exists() {
+                                    ts_roots.push(repo_root.to_path_buf());
+                                }
+                                for ts_root in &ts_roots {
+                                    let tsconfig = ts_root.join("tsconfig.json");
+                                    match travsr_indexer::run_lsif_emitter_with_root(
+                                        &tsconfig, repo_root,
+                                    ) {
                                         Ok(dump) => {
                                             match travsr_indexer::ingest_lsif_g2(&dump, corpus) {
                                                 Ok(g2) => {
@@ -1468,6 +1484,9 @@ fn rebase_to_repo_root(resp: &mut travsr_plugin_protocol::InvokeResponse, prefix
     }
 }
 
+/// The manifest that makes a directory a TypeScript/JavaScript project root.
+const TSCONFIG: &[&str] = &["tsconfig.json"];
+
 /// The directories a build-system-driven analyzer should be invoked in: every
 /// directory at or below `repo_root` that holds one of `manifests`, is an
 /// ancestor of one of `files` (repo-root-relative paths), and is not itself
@@ -1614,6 +1633,47 @@ mod tests {
                 crate::phase_b::catalog::build_manifests("scala")
             ),
             vec![root.join("scala")]
+        );
+    }
+
+    /// A Go module one level down is handed its own directory: scip-go invoked
+    /// at the repo root emitted an empty index for `go/go.mod`, and status
+    /// blamed a missing Go toolchain.
+    #[test]
+    fn go_is_invoked_at_its_module_directory() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("go")).expect("mkdir");
+        std::fs::write(root.join("go/go.mod"), "module x\n").expect("write");
+        let files = vec!["go/main.go".to_string()];
+        assert_eq!(
+            build_roots(root, &files, crate::phase_b::catalog::build_manifests("go")),
+            vec![root.join("go")]
+        );
+    }
+
+    /// Each TypeScript/JavaScript project is handed its own tsconfig: a
+    /// `typescript/tsconfig.json` or a CommonJS `javascript/tsconfig.json` one
+    /// level down was never read, so neither project got LSIF references.
+    #[test]
+    fn each_tsconfig_directory_is_a_typescript_root() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for d in ["typescript", "javascript"] {
+            std::fs::create_dir_all(root.join(d).join("src")).expect("mkdir");
+            std::fs::write(root.join(d).join("tsconfig.json"), "{}").expect("write");
+        }
+        let files = vec![
+            "typescript/src/main.ts".to_string(),
+            "javascript/src/main.js".to_string(),
+        ];
+        assert_eq!(
+            build_roots(root, &files, TSCONFIG),
+            vec![root.join("javascript"), root.join("typescript")]
         );
     }
 
