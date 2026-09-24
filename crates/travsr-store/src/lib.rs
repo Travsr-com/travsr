@@ -7376,6 +7376,20 @@ LIMIT ?4",
         self.enclosing_node_at(corpus, path, line, ENCLOSING_DEFINITION_KINDS)
     }
 
+    /// The file node of `(corpus, path)`: the source Phase B gives a reference
+    /// at top level, outside every definition (`file_node_for_attribution`).
+    pub fn file_node_at(&self, corpus: &str, path: &str) -> Result<Option<NodeId>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id FROM nodes WHERE corpus = ?1 AND path = ?2 AND kind = 'file' LIMIT 1",
+                params![corpus, path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|id| id.map(i64_to_node_id))
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// The tightest node whose span contains `line`, restricted to `kinds`.
     ///
     /// Generalizes [`Self::enclosing_definition_at`] so a caller can supply its
