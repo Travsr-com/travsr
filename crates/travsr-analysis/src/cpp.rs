@@ -19,6 +19,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (alias_declaration name: (type_identifier) @using.name)
 (function_declarator declarator: (identifier) @fn.name)
 (function_declarator declarator: (field_identifier) @fn.name)
+(function_declarator declarator: (qualified_identifier name: (identifier) @member.name))
+(function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (identifier) @member.name)))
 (field_declaration declarator: (field_identifier) @field.name)
 (preproc_def name: (identifier) @macro.name)
 (preproc_function_def name: (identifier) @macro.name)
@@ -32,6 +34,9 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("namespace.name", "namespace", "namespace"),
         ("using.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
+        // An out-of-line member definition (`void Zoo::add(..) {..}`) is a method
+        // of the class its scope names; `qualified_member` builds `Zoo.add`.
+        ("member.name", "method", "method"),
         // #757: data members → `field:Owner.name`. A method's declarator is a
         // `function_declarator` (captured as `fn.name` above), so only true data
         // members reach this capture.
@@ -51,9 +56,23 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     decl_kinds: &["function_definition"],
     type_refinements: &[],
     post_parse: None,
-    name_hook: None,
+    name_hook: Some(qualified_member),
     get_grammar: || tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
 };
+
+/// The `Class.member` name of an out-of-line member definition: its scope's
+/// last segment (`ns::Zoo::add` names `Zoo`, `Box<T>::get` names `Box`), the
+/// single named type Phase A qualifies an in-class declaration by.
+fn qualified_member(cap: tree_sitter::Node, sig_prefix: &str, source: &[u8]) -> Option<String> {
+    if sig_prefix != "method" {
+        return None;
+    }
+    let scope = cap.parent()?.child_by_field_name("scope")?;
+    let scope = scope.utf8_text(source).ok()?;
+    let class = scope.rsplit("::").next()?.split('<').next()?.trim();
+    let name = cap.utf8_text(source).ok()?;
+    (!class.is_empty()).then(|| format!("{class}.{name}"))
+}
 
 /// Whether a `.h` header is C++ rather than C.
 ///
@@ -203,6 +222,40 @@ mod tests {
         let kinds: Vec<&str> = out.nodes.iter().map(|n| n.kind.as_str()).collect();
         assert!(kinds.contains(&"class"));
         assert!(kinds.contains(&"namespace"));
+    }
+
+    #[test]
+    fn out_of_line_definition_is_a_method_of_its_class() {
+        // `void Zoo::add(..) {..}` in the `.cpp` defines the member the header
+        // declares. With no node, clangd's answer (it resolves a call to the
+        // definition) mapped to nothing: 6/6 resolved, 0 kept.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("animal.cpp");
+        std::fs::write(
+            &path,
+            "void Zoo::add(int a) {\n  push(a);\n}\nDog::Dog(int n) : Animal(n) {}\nvoid ns::Zoo::run() {}\nvoid free_fn() {}\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "animal.cpp").unwrap();
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        for want in [
+            "method:Zoo.add",
+            "method:Dog.Dog",
+            "method:Zoo.run",
+            "fn:free_fn",
+        ] {
+            assert!(sigs.contains(&want), "missing {want}, got {sigs:?}");
+        }
+        let add = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:Zoo.add")
+            .unwrap();
+        assert_eq!((add.line, add.end_line), (Some(1), Some(3)));
     }
 
     #[test]
