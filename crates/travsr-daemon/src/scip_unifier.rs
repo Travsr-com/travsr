@@ -215,6 +215,13 @@ pub fn unify_all(
         } else {
             parsed
         };
+        // scip-php names a property with its `$` sigil; Phase A does not.
+        let parsed = match parsed.name.strip_prefix('$') {
+            Some(name) if node.vname.language == "php" => {
+                travsr_indexer::scip_unifier::ScipName { name, ..parsed }
+            }
+            _ => parsed,
+        };
         // No definition line means line-proximity matching is meaningless —
         // unwrapping to 0 would let any same-named node on lines 1..=5 of the
         // file match wrongly. Skip instead.
@@ -828,6 +835,36 @@ mod tests {
         let mut refs: Vec<ScipRef> = Vec::new();
         let out = unify_all(&mut store, "c", std::slice::from_ref(&term), &mut refs);
         assert_eq!(out.alias_map.get(&term.id), Some(&spec.id));
+    }
+
+    #[test]
+    fn a_php_property_unifies_without_its_sigil() {
+        // scip-php names a property with its `$` (`Animal#$name.`); Phase A
+        // writes `field:Animal.name`.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let field = Node::new(
+            VName::new("c", "", "php/src/Animal.php", "php", "field:Animal.name"),
+            "field",
+        )
+        .with_line(4)
+        .with_end_line(4);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&field), &[], "scip")
+            .unwrap();
+        let property = Node::new(
+            VName::new(
+                "c",
+                "",
+                "php/src/Animal.php",
+                "php",
+                "scip:src/Animal.php:scip-php composer t/p 0 Animal#$name.",
+            ),
+            "definition",
+        )
+        .with_line(4);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", std::slice::from_ref(&property), &mut refs);
+        assert_eq!(out.alias_map.get(&property.id), Some(&field.id));
     }
 
     #[test]
