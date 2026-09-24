@@ -421,7 +421,14 @@ function resolveRefTarget(
 ): SymbolInfo | undefined {
   const raw = checker.getSymbolAtLocation(node);
   const resolved = resolveAlias(raw, checker);
-  return resolved ? symbolInfos.get(resolved) : undefined;
+  if (!resolved) return undefined;
+  const info = symbolInfos.get(resolved);
+  if (info) return info;
+  // A CommonJS export reaches its members through a transient copy of the
+  // symbol; the declaration's own name still holds the pass-1 symbol.
+  const name = resolved.valueDeclaration && ts.getNameOfDeclaration(resolved.valueDeclaration);
+  const declared = name && checker.getSymbolAtLocation(name);
+  return declared ? symbolInfos.get(declared) : undefined;
 }
 
 /** Follow alias chain; returns undefined if input is undefined. */

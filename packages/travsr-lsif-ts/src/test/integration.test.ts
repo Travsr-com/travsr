@@ -290,6 +290,41 @@ test('--root keeps a subdirectory project tsconfig resolving its own include', (
   }
 });
 
+// A CommonJS method reached through `module.exports = { Zoo }` and a
+// destructured `require` resolves to a transient symbol, not the one the
+// definition pass registered. The call must still reference the method: a
+// CommonJS script produced no references at all.
+test('a CommonJS call reaches its method through a destructured require', () => {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-cjs-')));
+  try {
+    fs.writeFileSync(
+      path.join(repo, 'zoo.js'),
+      'class Zoo {\n  add(a) { return a; }\n}\nmodule.exports = { Zoo };\n'
+    );
+    fs.writeFileSync(
+      path.join(repo, 'main.js'),
+      "const { Zoo } = require('./zoo');\nconst zoo = new Zoo();\nzoo.add(1);\n"
+    );
+    fs.writeFileSync(
+      path.join(repo, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { allowJs: true, checkJs: false, module: 'commonjs', noEmit: true }, include: ['*.js'] })
+    );
+    const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', path.join(repo, 'tsconfig.json')], {
+      encoding: 'utf-8',
+    });
+    assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+    const lines = result.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const mainDoc = lines.find((o) => o.label === 'document' && String(o.uri).endsWith('/main.js'));
+    assert.ok(mainDoc, 'main.js is a document');
+    const calls = lines.filter(
+      (o) => o.label === 'item' && o.property === 'references' && o.document === mainDoc.id && o.travsr_call === undefined
+    );
+    assert.ok(calls.length > 0, 'zoo.add(1) must reference Zoo.add');
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 // ── issue #833 follow-up: extensionless ESM imports must resolve cross-file ──
 //
 // The synthesized JS tsconfig uses `moduleResolution: "bundler"` (see
