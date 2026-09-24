@@ -3050,9 +3050,14 @@ impl SqliteStore {
 
             // The NodeIds this parse produced. Computed up front so the
             // pure-body-edit test and the preserved set are known before any
-            // delete.
-            let new_ids: std::collections::HashSet<i64> =
-                nodes.iter().map(|n| node_id_to_i64(n.id)).collect();
+            // delete. Only this file's own, as `old_ids` reads them: a node the
+            // parse stores under another path (Go's per-directory package) is
+            // not one of them.
+            let new_ids: std::collections::HashSet<i64> = nodes
+                .iter()
+                .filter(|n| n.vname.path == path)
+                .map(|n| node_id_to_i64(n.id))
+                .collect();
 
             // RFC-027 #813 Mechanism A: the set of definitions whose committed
             // owned edges/sites survive this reparse untouched.
@@ -13073,6 +13078,47 @@ mod tests {
 
         assert_eq!(edge_provenance(&store, a.id, x.id).as_deref(), Some("lsif"));
         assert_eq!(edge_provenance(&store, a.id, y.id), None);
+    }
+
+    /// A parse can emit a node stored under another path: Go's package node
+    /// lives at the directory so every file of the package shares it. It is not
+    /// one of this file's nodes, so it must not make a body edit look like a
+    /// changed symbol set (every Go save purged the whole file, 8/8 -> 0/8).
+    #[test]
+    fn reindex_replace_keeps_an_edge_when_the_parse_also_emits_a_directory_node() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "go/main.go", "go", sig),
+                "function",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        let main = mk("fn:main", 1, 3);
+        let x = mk("fn:x", 5, 6);
+        let pkg = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "go", "go", "go-pkg:go/main"),
+            "go-pkg",
+        );
+        let nodes = vec![main.clone(), x.clone(), pkg];
+        let v1 = "func main() {\n  x()\n}\n\nfunc x() {\n}\n";
+        store
+            .reindex_replace("c", "go/main.go", &nodes, &[], "h1", Some(v1))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(main.id, x.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let v2 = "func main() {\n  x() // tweak\n}\n\nfunc x() {\n}\n";
+        store
+            .reindex_replace("c", "go/main.go", &nodes, &[], "h2", Some(v2))
+            .unwrap();
+
+        assert_eq!(
+            edge_provenance(&store, main.id, x.id).as_deref(),
+            Some("lsif")
+        );
     }
 
     /// I0, scripts: a top-level call hangs from the file node, which has no
