@@ -188,8 +188,8 @@ function visitDef(node: ts.Node, ctx: DefCtx): void {
 // ── Pass-2 visitor (module-level — one function object, no per-file allocation) ──
 
 function visitRef(node: ts.Node, ctx: RefCtx): void {
-  // ── RefCall: call expressions ────────────────────────────────────────────
-  if (ts.isCallExpression(node)) {
+  // ── RefCall: call expressions, and `new` as a call to the class ──────────
+  if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
     const info = resolveRefTarget(node.expression, ctx.checker, ctx.symbolInfos);
     if (info) {
       const rangeId = ctx.emitter.emitRange(ctx.sf, node.expression);
@@ -212,7 +212,7 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
     if (info) {
       const rangeId = ctx.emitter.emitRange(ctx.sf, node.name);
       ctx.emitter.emitEdge('next', rangeId, info.resultSetId);
-      ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references');
+      ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references', false);
       ctx.refRangeIds.push(rangeId);
     }
   }
@@ -267,7 +267,13 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
             const baseInfo = ctx.symbolInfos.get(resolved)!;
             const rangeId = ctx.emitter.emitRange(ctx.sf, member.name);
             ctx.emitter.emitEdge('next', rangeId, baseInfo.resultSetId);
-            ctx.emitter.emitItem(baseInfo.referenceResultId, [rangeId], ctx.docId, 'references');
+            ctx.emitter.emitItem(
+              baseInfo.referenceResultId,
+              [rangeId],
+              ctx.docId,
+              'references',
+              false
+            );
             ctx.refRangeIds.push(rangeId);
           }
         }

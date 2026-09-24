@@ -290,6 +290,22 @@ test('--root keeps a subdirectory project tsconfig resolving its own include', (
   }
 });
 
+// An import specifier or an override names a symbol without calling it. Its
+// reference item says so (`travsr_call: false`), so the ingest records the
+// occurrence without a call edge; a call's item stays unmarked.
+test('import and override reference items are marked as non-calls', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+  const lines = result.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const refItems = lines.filter((o) => o.label === 'item' && o.property === 'references');
+  const marked = refItems.filter((o) => o.travsr_call === false);
+  const unmarked = refItems.filter((o) => o.travsr_call === undefined);
+  assert.ok(marked.length > 0, 'imports in the fixture must be marked as non-calls');
+  assert.ok(unmarked.length > 0, 'calls in the fixture must stay unmarked');
+});
+
 // A CommonJS method reached through `module.exports = { Zoo }` and a
 // destructured `require` resolves to a transient symbol, not the one the
 // definition pass registered. The call must still reference the method: a
@@ -320,6 +336,34 @@ test('a CommonJS call reaches its method through a destructured require', () => 
       (o) => o.label === 'item' && o.property === 'references' && o.document === mainDoc.id && o.travsr_call === undefined
     );
     assert.ok(calls.length > 0, 'zoo.add(1) must reference Zoo.add');
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// `new Zoo()` is a constructor call. The emitter handled call expressions
+// only, so a class reached by `new` got a call edge solely through its import
+// specifier, and none once imports were marked as non-calls.
+test('a new expression is a call reference to its class', () => {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-new-')));
+  try {
+    fs.writeFileSync(path.join(repo, 'zoo.ts'), 'export class Zoo {}\n');
+    fs.writeFileSync(path.join(repo, 'main.ts'), "import { Zoo } from './zoo';\nconst zoo = new Zoo();\n");
+    fs.writeFileSync(
+      path.join(repo, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { noEmit: true }, include: ['*.ts'] })
+    );
+    const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', path.join(repo, 'tsconfig.json')], {
+      encoding: 'utf-8',
+    });
+    assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+    const lines = result.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const mainDoc = lines.find((o) => o.label === 'document' && String(o.uri).endsWith('/main.ts'));
+    const ranges = new Map(lines.filter((o) => o.label === 'range').map((o) => [o.id, o]));
+    const callLines = lines
+      .filter((o) => o.label === 'item' && o.property === 'references' && o.document === mainDoc.id && o.travsr_call === undefined)
+      .flatMap((o) => o.inVs.map((v: number) => ranges.get(v).start.line));
+    assert.deepStrictEqual(callLines, [1], 'new Zoo() on line 1 is the one call');
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }
