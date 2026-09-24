@@ -77,10 +77,11 @@ pub struct PhaseBOutcome {
     /// Their external tooling is never spawned. User-actionable: re-run
     /// `travsr lang install <lang>` inside the repo, which auto-grants trust.
     pub skipped_untrusted_corpus: Vec<String>,
-    /// Languages that require a `compile_commands.json` at the repo root
-    /// (scip-clang, for `c`/`cpp`) but don't have one. Without this gate the
-    /// scip-clang invoke hangs with no compilation database until the 300s
-    /// invoke timeout, then reports as `crashed`. User-actionable: generate a
+    /// Languages that require a `compile_commands.json` at the repo root or in
+    /// a directory above their sources (scip-clang, for `c`/`cpp`) but don't
+    /// have one. Without this gate the scip-clang invoke hangs with no
+    /// compilation database until the 300s invoke timeout, then reports as
+    /// `crashed`. User-actionable: generate a
     /// compile_commands.json (e.g. via `bear` or CMake's
     /// `CMAKE_EXPORT_COMPILE_COMMANDS`).
     pub skipped_no_compdb: Vec<String>,
@@ -661,15 +662,27 @@ impl PluginIndexer {
                 continue;
             }
 
-            // L5a: scip-clang (c/cpp) requires a compile_commands.json at the repo
-            // root (`--compdb-path` in its catalog args). Without one it hangs
-            // with no compilation database until the invoke timeout fires and the
-            // whole batch reports `crashed`, blocking phase_b_commit forever.
-            // Detect the dependency from the catalog entry rather than hardcoding
-            // language names, so any future scip-clang-based language is covered.
+            // L5a: scip-clang (c/cpp) requires a compile_commands.json in the
+            // directory it runs in (`--compdb-path` in its catalog args). Without
+            // one it hangs with no compilation database until the invoke timeout
+            // fires and the whole batch reports `crashed`, blocking
+            // phase_b_commit forever. Detect the dependency from the catalog
+            // entry rather than hardcoding language names, so any future
+            // scip-clang-based language is covered. The compdb may sit at the
+            // repo root or below it: any build root found for the sources counts
+            // (the root probe also covers a call with no path list).
+            let files = lang_files(&lang);
             let needs_compdb = crate::phase_b::catalog::lookup(lang.as_str())
                 .is_some_and(|entry| entry.command == "scip-clang");
-            if needs_compdb && !inputs.repo_root.join("compile_commands.json").exists() {
+            if needs_compdb
+                && !repo_root.join("compile_commands.json").exists()
+                && build_roots(
+                    repo_root,
+                    files.as_deref().unwrap_or(&[]),
+                    crate::phase_b::catalog::build_manifests(lang.as_str()),
+                )
+                .is_empty()
+            {
                 tracing::debug!(
                     lang = %lang,
                     "Phase B skipped, scip-clang requires compile_commands.json"
@@ -681,7 +694,6 @@ impl PluginIndexer {
             match resolver.resolve(&lang) {
                 Some(spec) => {
                     tracing::debug!(lang = %lang, program = %spec.program, "Phase B: resolved spec");
-                    let files = lang_files(&lang);
                     // #724 Finding 5: a build-system-driven analyzer indexes the
                     // directory it is handed, so a project whose manifest sits
                     // below the repo root fails outright ("No build tool detected
@@ -1676,6 +1688,27 @@ mod tests {
             ),
             vec![root.join("php")]
         );
+    }
+
+    /// scip-clang reads the compile_commands.json of the directory it runs in;
+    /// a `c/` project with its own compdb was skipped because only the repo
+    /// root was probed. The outermost compdb wins over a build-dir copy, and a
+    /// repo with no compdb anywhere has no root, which is what skips it.
+    #[test]
+    fn c_is_invoked_at_its_compile_commands_directory() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let files = vec!["c/src/main.c".to_string()];
+        let c = crate::phase_b::catalog::build_manifests("c");
+        std::fs::create_dir_all(root.join("c/src")).expect("mkdir");
+        std::fs::create_dir_all(root.join("c/build")).expect("mkdir");
+        assert!(build_roots(root, &files, c).is_empty());
+
+        std::fs::write(root.join("c/compile_commands.json"), "[]").expect("write");
+        std::fs::write(root.join("c/build/compile_commands.json"), "[]").expect("write");
+        assert_eq!(build_roots(root, &files, c), vec![root.join("c")]);
     }
 
     /// Each TypeScript/JavaScript project is handed its own tsconfig: a
