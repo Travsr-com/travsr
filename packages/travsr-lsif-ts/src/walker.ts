@@ -76,7 +76,15 @@ export function walk(tsconfigPath: string, emitter: Emitter, rootDir?: string): 
   // before handing the config to the TS compiler. Hard error, no fallback.
   sanitizeTsconfig(configFile.config, basePath);
 
-  const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, basePath);
+  // The config's own relative paths (`include`, `rootDir`) resolve against
+  // its own directory. `--root` only moves emitted paths and the containment
+  // root: read against the repo root, a project tsconfig one level down
+  // matched nothing and emitted no documents.
+  const parsed = ts.parseJsonConfigFileContent(
+    configFile.config,
+    ts.sys,
+    path.dirname(tsconfigPath)
+  );
 
   // SEC-003 — Check 2: every resolved file must be inside the project root.
   // Uses realpathSync to follow symlinks. Catches malicious globs and files[].

@@ -257,6 +257,39 @@ test('--root makes VName paths repo-relative for a synthesized out-of-repo tscon
   }
 });
 
+// A project's own tsconfig one directory down (`typescript/tsconfig.json` with
+// `include: ["src/**/*.ts"]`), run with `--root <repo>` so its paths come out
+// repo-relative. The config must still resolve against its own directory: read
+// against the repo root, the include matched nothing and the project emitted no
+// documents at all.
+test('--root keeps a subdirectory project tsconfig resolving its own include', () => {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-tsrepo-')));
+  try {
+    const proj = path.join(repo, 'typescript');
+    fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(proj, 'src', 'math.ts'), 'export function add(a: number, b: number) { return a + b; }\n');
+    fs.writeFileSync(path.join(proj, 'src', 'main.ts'), "import { add } from './math';\nadd(1, 2);\n");
+    fs.writeFileSync(
+      path.join(proj, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { module: 'commonjs', rootDir: 'src' }, include: ['src/**/*.ts'] })
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [EMITTER_BIN, '--project', path.join(proj, 'tsconfig.json'), '--root', repo],
+      { encoding: 'utf-8' }
+    );
+    assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+    const sigs = parseVertices(result.stdout)
+      .map((v) => v['travsr_vname'] as { path?: string; signature?: string } | undefined)
+      .filter((vn): vn is { path: string; signature: string } => vn !== undefined && typeof vn.path === 'string')
+      .map((vn) => `${vn.path}#${vn.signature}`);
+    assert.ok(sigs.includes('typescript/src/math.ts#fn:add'), `expected a repo-relative add in ${JSON.stringify(sigs)}`);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 // ── issue #833 follow-up: extensionless ESM imports must resolve cross-file ──
 //
 // The synthesized JS tsconfig uses `moduleResolution: "bundler"` (see
