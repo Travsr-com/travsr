@@ -698,11 +698,12 @@ impl PluginIndexer {
             let files = lang_files(&lang);
             let needs_compdb = crate::phase_b::catalog::lookup(lang.as_str())
                 .is_some_and(|entry| entry.command == "scip-clang");
+            let sources = root_sources(files.as_deref().unwrap_or(&[]));
             if needs_compdb
                 && !repo_root.join("compile_commands.json").exists()
                 && build_roots(
                     repo_root,
-                    files.as_deref().unwrap_or(&[]),
+                    &sources,
                     crate::phase_b::catalog::build_manifests(lang.as_str()),
                 )
                 .is_empty()
@@ -726,7 +727,7 @@ impl PluginIndexer {
                     // invoke at the repo root.
                     let mut invoke_roots = build_roots(
                         repo_root,
-                        files.as_deref().unwrap_or(&[]),
+                        &sources,
                         crate::phase_b::catalog::build_manifests(lang.as_str()),
                     );
                     if invoke_roots.is_empty() {
@@ -1585,6 +1586,18 @@ const TSCONFIG: &[&str] = &["tsconfig.json"];
 /// Empty when `manifests` is empty (the language does not drive a build), when
 /// there is no pre-walked file list, or when nothing qualifies; the caller then
 /// falls back to the repo root, which is the behaviour that shipped.
+/// The files that may mark a build root. A `.h` is language `c` by extension,
+/// but a header alone does not make its directory a C project: headers in a
+/// `cpp/` or `objc/` project made those C roots, and the c analyzer then ran on
+/// their compilation databases until it timed out.
+fn root_sources(files: &[String]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| !f.ends_with(".h"))
+        .cloned()
+        .collect()
+}
+
 fn build_roots(repo_root: &Path, files: &[String], manifests: &[&str]) -> Vec<PathBuf> {
     if manifests.is_empty() {
         return Vec::new();
@@ -1778,6 +1791,33 @@ mod tests {
         std::fs::write(root.join("c/compile_commands.json"), "[]").expect("write");
         std::fs::write(root.join("c/build/compile_commands.json"), "[]").expect("write");
         assert_eq!(build_roots(root, &files, c), vec![root.join("c")]);
+    }
+
+    /// A `.h` is language `c` by extension, so headers in `cpp/` and `objc/`
+    /// made those directories C build roots too, and the c sidecar ran on the
+    /// Objective-C compilation database until the invoke timeout (`crashed:c`).
+    /// A header alone does not mark a C project.
+    #[test]
+    fn a_header_alone_does_not_make_a_c_build_root() {
+        use super::{build_roots, root_sources};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for d in ["c/src", "objc/App"] {
+            std::fs::create_dir_all(root.join(d)).expect("mkdir");
+        }
+        for f in ["c/compile_commands.json", "objc/compile_commands.json"] {
+            std::fs::write(root.join(f), "[]").expect("write");
+        }
+        let files = vec!["c/src/main.c".to_string(), "objc/App/Animal.h".to_string()];
+        assert_eq!(
+            build_roots(
+                root,
+                &root_sources(&files),
+                crate::phase_b::catalog::build_manifests("c")
+            ),
+            vec![root.join("c")]
+        );
     }
 
     /// Each TypeScript/JavaScript project is handed its own tsconfig: a
