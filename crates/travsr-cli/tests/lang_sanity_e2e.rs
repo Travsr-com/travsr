@@ -395,7 +395,12 @@ fn typescript_constructs_resolve_end_to_end() {
                 gap: None,
             },
             Probe {
-                symbol: "speak",
+                // Queried by full signature, as the C++ override probe is:
+                // `speak` is genuinely ambiguous between `Speaker.speak` (the
+                // abstract declaration, which now has its own node) and
+                // `Greeter.speak` (the implementation), and travsr correctly
+                // asks for a hint rather than guessing.
+                symbol: "method:Greeter.speak",
                 site: "main.ts:6",
                 construct: "class method implementing an abstract base",
                 gap: None,
