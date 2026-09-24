@@ -3073,7 +3073,12 @@ impl SqliteStore {
             // still correct and re-deriving them is pure waste. Any doubt keeps
             // the set empty and the code below purges the whole file, exactly as
             // before this change.
-            let mut preserved: std::collections::HashSet<i64> = match content {
+            // `edited`: definitions whose stored body hash provably differs from
+            // the current one (I0 keeps their still-called edges, below).
+            let (mut preserved, edited): (
+                std::collections::HashSet<i64>,
+                std::collections::HashSet<i64>,
+            ) = match content {
                 Some(text) if old_ids == new_ids => {
                     // Body hashes stored for this file's definitions at their last
                     // (re)resolution, and the hashes the current text produces.
@@ -3099,14 +3104,22 @@ impl SqliteStore {
                             .iter()
                             .filter_map(|n| n.line.map(|l| (node_id_to_i64(n.id), l, n.end_line))),
                     );
-                    stored
+                    let (same, differ): (Vec<_>, Vec<_>) = stored
                         .iter()
-                        .filter(|(id, hash)| current.get(*id) == Some(*hash))
-                        .map(|(id, _)| *id)
-                        .collect()
+                        .filter(|(id, _)| current.contains_key(*id))
+                        .partition(|(id, hash)| current.get(*id) == Some(*hash));
+                    (
+                        same.into_iter().map(|(id, _)| *id).collect(),
+                        differ.into_iter().map(|(id, _)| *id).collect(),
+                    )
                 }
-                _ => std::collections::HashSet::new(),
+                _ => Default::default(),
             };
+            // A type-level definition's edit invalidates the whole file (rule 1
+            // below), so no edge of it is kept either.
+            let type_level_edit = nodes.iter().any(|n| {
+                TYPE_LEVEL_KINDS.contains(&n.kind.as_str()) && edited.contains(&node_id_to_i64(n.id))
+            });
 
             // RFC-027 #813 (finding 1): a byte-identical body proves the
             // definition's own text is unchanged, NOT that the *types* its
@@ -3290,6 +3303,113 @@ impl SqliteStore {
                 rows
             };
 
+            // I0: an EDITED definition's committed edge whose callee's name still
+            // appears in its new body is kept. The whole-set purge left a
+            // language with no live lane (or no editor) with fewer edges than
+            // before the edit until the next commit (Kotlin 8/8 -> 0/8 on a
+            // comment). Same precondition as Mechanism A: a pure body edit. Only
+            // committed truth (`scip`/`lsif`) is kept; tree-sitter edges are
+            // re-derived by this parse and live edges by the lane. A call the edit
+            // removed loses its name, and so its edge.
+            let kept: Vec<(i64, i64, String)> = match content {
+                Some(text) if old_ids == new_ids && !type_level_edit => {
+                    let lines: Vec<&str> = text.lines().collect();
+                    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+                    let mut words: HashMap<i64, std::collections::HashSet<&str>> = nodes
+                        .iter()
+                        .filter(|n| edited.contains(&node_id_to_i64(n.id)))
+                        .filter_map(|n| {
+                            let start = n.line? as usize;
+                            let end = n.end_line.unwrap_or(n.line?) as usize;
+                            let body = lines.get(start.checked_sub(1)?..end.min(lines.len()))?;
+                            let set = body
+                                .iter()
+                                .flat_map(|l| l.split(|c: char| !is_word(c)))
+                                .filter(|w| !w.is_empty())
+                                .collect();
+                            Some((node_id_to_i64(n.id), set))
+                        })
+                        .collect();
+                    // A script's top-level calls hang from the file node, which
+                    // has no body hash. Its "body" is the lines outside every
+                    // definition, so a name now used only inside a function does
+                    // not keep a top-level edge.
+                    if let Some(file) = nodes.iter().find(|n| n.kind == "file") {
+                        // Only a body masks its lines; a global, field or
+                        // import is itself a top-level statement (`let zoo =
+                        // Zoo()`), so it must not hide the call it holds.
+                        let spans: Vec<(usize, usize)> = nodes
+                            .iter()
+                            .filter(|n| {
+                                !matches!(
+                                    n.kind.as_str(),
+                                    "file" | "variable" | "field" | "import" | "constant"
+                                )
+                            })
+                            .filter_map(|n| {
+                                Some((n.line? as usize, n.end_line.unwrap_or(n.line?) as usize))
+                            })
+                            .collect();
+                        let top_level = lines
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| !spans.iter().any(|(a, b)| (*a..=*b).contains(&(i + 1))))
+                            .flat_map(|(_, l)| l.split(|c: char| !is_word(c)))
+                            .filter(|w| !w.is_empty())
+                            .collect();
+                        words.insert(node_id_to_i64(file.id), top_level);
+                    }
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT e.src, e.dst, e.kind, d.signature FROM edges e \
+                             JOIN nodes d ON d.id = e.dst \
+                             WHERE e.src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2) \
+                               AND e.kind LIKE 'ref/%' AND e.provenance IN ('scip', 'lsif')",
+                        )
+                        .context("preparing kept-edge candidates")?;
+                    let rows: Vec<(i64, i64, String, String)> = stmt
+                        .query_map(params![corpus, path], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                        })
+                        .context("executing kept-edge candidates")?
+                        .collect::<rusqlite::Result<_>>()
+                        .context("collecting kept-edge candidates")?;
+                    // Rule 2's dependency, applied to the edited: a definition
+                    // referencing another edited one may resolve through a type
+                    // that edit changed (`make().run()` after `make`'s return
+                    // type moved), so it keeps nothing.
+                    let through_edited: std::collections::HashSet<i64> = rows
+                        .iter()
+                        .filter(|(src, dst, _, _)| src != dst && edited.contains(dst))
+                        .map(|(src, _, _, _)| *src)
+                        .collect();
+                    rows.into_iter()
+                        .filter(|(src, _, _, _)| !through_edited.contains(src))
+                        .filter(|(src, _, _, sig)| {
+                            // An Objective-C selector is spelled apart; its first
+                            // keyword is the word that appears.
+                            let leaf = travsr_core::ident::leaf_of(sig);
+                            let leaf = leaf.split(':').next().unwrap_or(leaf);
+                            words.get(src).is_some_and(|w| w.contains(leaf))
+                        })
+                        .map(|(src, dst, kind, _)| (src, dst, kind))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            tx.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS _kept_edges(src INTEGER, dst INTEGER, kind TEXT); \
+                 DELETE FROM _kept_edges;",
+            )
+            .context("creating _kept_edges temp table")?;
+            for (src, dst, kind) in &kept {
+                tx.execute(
+                    "INSERT INTO _kept_edges(src, dst, kind) VALUES(?1, ?2, ?3)",
+                    params![src, dst, kind],
+                )
+                .context("inserting kept edge")?;
+            }
+
             // RFC-027 #813: hold the preserved definitions in a temp table so the
             // owned-edge and owned-site deletes can exclude them without a bound
             // parameter per id (a hot utility can have thousands). Always present
@@ -3349,7 +3469,10 @@ impl SqliteStore {
             tx.execute(
                 "DELETE FROM edges \
                  WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2) \
-                   AND src NOT IN (SELECT id FROM _preserved_src)",
+                   AND src NOT IN (SELECT id FROM _preserved_src) \
+                   AND NOT EXISTS (SELECT 1 FROM _kept_edges k \
+                                   WHERE k.src = edges.src AND k.dst = edges.dst \
+                                     AND k.kind = edges.kind)",
                 params![corpus, path],
             )
             .context("deleting owned edges for reindex_replace")?;
@@ -12919,6 +13042,103 @@ mod tests {
         );
     }
 
+    /// I0: an edited definition's committed edge survives the save while the
+    /// callee's name still appears in its body. Dropping them all left a
+    /// language with no live lane (or no editor) with fewer edges than before
+    /// the edit, until the next commit. A call the edit removed still loses its
+    /// edge (the test above).
+    #[test]
+    fn reindex_replace_keeps_an_edited_definitions_edge_while_it_still_calls() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "a.rs", "rust", sig),
+                "function",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        let a = mk("fn:a", 1, 3);
+        let x = mk("fn:x", 5, 6);
+        let y = mk("fn:y", 8, 9);
+        let nodes = vec![a.clone(), x.clone(), y.clone()];
+        let v1 = "fn a() {\n  x(); y();\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
+        store
+            .reindex_replace("c", "a.rs", &nodes, &[], "h1", Some(v1))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(a.id, x.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(a.id, y.id, EdgeKind::RefCall))
+            .unwrap();
+
+        // v2: a's body changes (a comment added, `y()` removed), `x()` stays.
+        let v2 = "fn a() {\n  x(); // tweak\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
+        store
+            .reindex_replace("c", "a.rs", &nodes, &[], "h2", Some(v2))
+            .unwrap();
+
+        assert_eq!(edge_provenance(&store, a.id, x.id).as_deref(), Some("lsif"));
+        assert_eq!(edge_provenance(&store, a.id, y.id), None);
+    }
+
+    /// I0, scripts: a top-level call hangs from the file node, which has no
+    /// body hash, so its committed edges were always purged on save (Ruby
+    /// `main.rb` 8/8 -> 0/8). They are kept while the callee's name still
+    /// appears on a top-level line; a name now used only inside a function does
+    /// not count.
+    #[test]
+    fn reindex_replace_keeps_a_scripts_edge_while_it_still_calls_at_top_level() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let file = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "main.rb", "ruby", "file"),
+            "file",
+        );
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "main.rb", "ruby", sig),
+                "method",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        let helper = mk("method:Object.helper", 4, 6);
+        let x = mk("method:X.x", 8, 8);
+        let y = mk("method:Y.y", 9, 9);
+        // A global on the top-level call's own line (`zoo = x()`) is a
+        // statement, not a body, so it must not hide the call.
+        let global = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "main.rb", "ruby", "var:zoo"),
+            "variable",
+        )
+        .with_line(1)
+        .with_end_line(1);
+        let nodes = vec![file.clone(), helper.clone(), x.clone(), y.clone(), global];
+        let v1 = "zoo = x()\ny()\n\ndef helper\n  1\nend\n\ndef x; end\ndef y; end\n";
+        store
+            .reindex_replace("c", "main.rb", &nodes, &[], "h1", Some(v1))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(file.id, x.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(file.id, y.id, EdgeKind::RefCall))
+            .unwrap();
+
+        // v2: the top-level `y()` moves inside `helper`; `x()` stays top level.
+        let v2 = "zoo = x() # edited\n\n\ndef helper\n  y()\nend\n\ndef x; end\ndef y; end\n";
+        store
+            .reindex_replace("c", "main.rb", &nodes, &[], "h2", Some(v2))
+            .unwrap();
+
+        assert_eq!(
+            edge_provenance(&store, file.id, x.id).as_deref(),
+            Some("lsif")
+        );
+        assert_eq!(edge_provenance(&store, file.id, y.id), None);
+    }
+
     /// RFC-027 #813 P2: on a body edit, `reindex_replace` captures the CHANGED
     /// definition's committed occurrences (for the live lane to enumerate as
     /// editor targets) and NOT the preserved definitions', carrying each
@@ -13754,9 +13974,10 @@ mod tests {
                 .unwrap();
 
             for (i, h) in hs.iter().enumerate() {
-                // A caller keeps its committed edge iff its own body is unchanged
-                // AND the callee it resolves through is unchanged.
-                let preserved = !make_mutated && !edited[i];
+                // A caller keeps its committed edge iff the callee it resolves
+                // through is unchanged. Its own body edit alone no longer drops
+                // it (I0): every edited body here still calls `make().run()`.
+                let preserved = !make_mutated;
                 let expected = if preserved { Some("lsif") } else { None };
                 assert_eq!(
                     edge_provenance(&store, h.id, xrun.id).as_deref(),
