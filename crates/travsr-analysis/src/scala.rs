@@ -15,9 +15,11 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (object_definition name: (_) @object.name)
 (trait_definition name: (_) @trait.name)
 (function_definition name: (_) @fn.name)
+(function_declaration name: (_) @fn.name)
 (type_definition name: (type_identifier) @typedef.name)
 (template_body (val_definition pattern: (identifier) @field.name))
 (template_body (var_definition pattern: (identifier) @field.name))
+(class_definition class_parameters: (class_parameters (class_parameter name: (identifier) @field.name)))
 (import_declaration) @import
 (function_definition
   (annotation name: (type_identifier) @_sa)
@@ -86,6 +88,54 @@ mod tests {
             .collect();
         spans.sort_unstable();
         assert_eq!(spans, vec![(2, 3), (4, 5)]);
+    }
+
+    #[test]
+    fn an_abstract_def_gets_a_method_node() {
+        // SemanticDB defines `Animal#name().`; with no Phase A twin the abstract
+        // member stayed an orphan in the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.scala");
+        std::fs::write(
+            &path,
+            "trait Animal {\n  def name: String\n  def speak(): String\n}\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "a.scala").unwrap();
+        let mut sigs: Vec<(&str, Option<u32>)> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "method")
+            .map(|n| (n.vname.signature.as_str(), n.line))
+            .collect();
+        sigs.sort_unstable();
+        assert_eq!(
+            sigs,
+            vec![
+                ("method:Animal.name", Some(2)),
+                ("method:Animal.speak", Some(3))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_class_parameter_is_a_field() {
+        // `class Dog(val name: String)`: SemanticDB defines `Dog#name.`, and with
+        // no Phase A twin a use of it pointed at an orphan.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.scala");
+        std::fs::write(
+            &path,
+            "class Dog(val name: String) {\n  def fetch = name\n}\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "d.scala").unwrap();
+        let field = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "field:Dog.name")
+            .expect("field:Dog.name");
+        assert_eq!(field.line, Some(1));
     }
 
     #[test]
