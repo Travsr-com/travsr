@@ -38,6 +38,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (function_definition declarator: (function_declarator declarator: (identifier) @fn.name))
 (instance_variable (struct_declaration (struct_declarator (identifier) @field.name)))
 (property_declaration (struct_declaration (struct_declarator (identifier) @field.name)))
+(instance_variable (struct_declaration (struct_declarator (pointer_declarator declarator: (identifier) @field.name))))
+(property_declaration (struct_declaration (struct_declarator (pointer_declarator declarator: (identifier) @field.name))))
 (preproc_include path: (_) @import)
 (module_import (identifier) @import)
 "#,
@@ -435,6 +437,32 @@ mod selector_tests {
         );
         assert!(
             sigs.contains(&"method:Foo.tasks".to_string()),
+            "got {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn a_pointer_typed_property_is_a_field() {
+        // `NSString *name` wraps the name in a pointer declarator, so the
+        // property query missed it and scip-clang's `Animal#name.` had no twin.
+        let sigs = signatures(
+            "@interface Animal : NSObject {\n\
+             \x20   NSString *_tag;\n\
+             }\n\
+             @property (nonatomic, copy) NSString *name;\n\
+             @property (nonatomic) int age;\n\
+             @end\n",
+        );
+        assert!(
+            sigs.contains(&"field:Animal.name".to_string()),
+            "got {sigs:?}"
+        );
+        assert!(
+            sigs.contains(&"field:Animal.age".to_string()),
+            "got {sigs:?}"
+        );
+        assert!(
+            sigs.contains(&"field:Animal._tag".to_string()),
             "got {sigs:?}"
         );
     }
