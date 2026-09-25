@@ -23,6 +23,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (init_declaration "init" @init.name)
 (import_declaration)  @import
 (class_body (property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name)))
+(source_file (property_declaration name: (pattern bound_identifier: (simple_identifier) @global.name)))
 (enum_class_body (property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name)))
 (function_declaration
   (modifiers (attribute (user_type (type_identifier) @_swa)))
@@ -58,6 +59,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         // now maps `Type.name` field references onto `field:Type.name`
         // (candidate_signatures, #757).
         ("var.name", "field", "field"),
+        // A script's top-level `let`/`var` is a global (`var:zoo`), matching the
+        // Swift emitter's `swift::zoo` definition so it unifies instead of
+        // orphaning.
+        ("global.name", "variable", "var"),
     ],
     method_containers: &[
         ("class_declaration", "class"),
@@ -151,6 +156,28 @@ mod tests {
             .map(|n| (n.line, n.end_line))
             .collect();
         assert_eq!(describe, vec![(Some(6), Some(8))]);
+    }
+
+    #[test]
+    fn a_top_level_variable_is_a_var_node() {
+        // A script's `let zoo = Zoo()` is a global the Swift emitter defines
+        // (`swift::zoo`). With no Phase A twin it survived as an orphan, and the
+        // file's node set never matched a fresh parse, so every save purged its
+        // committed edges.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.swift");
+        std::fs::write(&path, "let zoo = Zoo()\nclass C {\n  var n = 1\n}\n").unwrap();
+        let out = parse("corp", &path, "main.swift").unwrap();
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(sigs.contains(&"var:zoo"), "got {sigs:?}");
+        assert!(
+            sigs.contains(&"field:C.n"),
+            "a property stays a field, got {sigs:?}"
+        );
     }
 
     #[test]

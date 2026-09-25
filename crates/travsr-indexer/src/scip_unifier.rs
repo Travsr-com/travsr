@@ -60,7 +60,20 @@ pub fn scip_name_kind(symbol: &str) -> Option<ScipName<'_>> {
 pub fn semanticdb_name_kind(symbol: &str) -> Option<ScipName<'_>> {
     // `sdb_vname` packs signatures as `sdb:{symbol}`. Strip it so a symbol with
     // no package path (`sdb:Foo#`) does not carry the prefix into the name.
-    descriptor_chain_kind(symbol.strip_prefix("sdb:").unwrap_or(symbol))
+    let mut parsed = descriptor_chain_kind(symbol.strip_prefix("sdb:").unwrap_or(symbol))?;
+    // A Scala `object` owns its members by a term (`Main.main().`), not a type
+    // (`Main#`), so the chain split found no container and named the member
+    // `Main.main`, which never meets `method:Main.main`.
+    if parsed.container.is_none() {
+        if let Some((owner, name)) = parsed.name.rsplit_once('.') {
+            let owner = owner.rsplit('.').next().unwrap_or(owner);
+            if !owner.is_empty() && !name.is_empty() {
+                parsed.container = Some(owner);
+                parsed.name = name;
+            }
+        }
+    }
+    Some(parsed)
 }
 
 /// Parse a bare SCIP/SemanticDB descriptor chain, the part after any metadata
