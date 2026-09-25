@@ -33,6 +33,8 @@ const QUERIES: &str = r"
 (function_declaration name: (identifier) @fn.name)
 (function_signature name: (identifier) @fn.name)
 (method_definition name: (property_identifier) @method.name)
+(method_signature name: (property_identifier) @method.name)
+(abstract_method_signature name: (property_identifier) @method.name)
 (public_field_definition name: (property_identifier) @field.name)
 (property_signature name: (property_identifier) @field.name)
 (program (lexical_declaration (variable_declarator) @topvar))
@@ -257,9 +259,15 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     // Anonymous containers (class expressions, object-literal methods) have
                     // no named class to bind to — parent the method to the file instead of
                     // emitting a class:<anonymous> node that nothing else ever creates.
-                    let parent_class = find_parent_class_name(capture.node, source.as_slice());
-                    let (class_name, container_id) = match &parent_class {
-                        Some(name) => {
+                    // An interface method signature (`describe(): string;`) is a
+                    // method of its interface, contained as `field.name` is.
+                    let parent = find_parent_type(capture.node, source.as_slice());
+                    let (class_name, container_id) = match &parent {
+                        Some(("interface", name)) => (
+                            name.as_str(),
+                            emit::interface_node(corpus, vname_path, name).id,
+                        ),
+                        Some((_, name)) => {
                             (name.as_str(), emit::class_node(corpus, vname_path, name).id)
                         }
                         None => ("<anonymous>", file_id),
@@ -539,24 +547,6 @@ fn has_napi_package_json(abs_path: &std::path::Path) -> bool {
     false
 }
 
-fn find_parent_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    let mut current = node.parent()?;
-    loop {
-        if matches!(
-            current.kind(),
-            "class_declaration" | "class" | "abstract_class_declaration"
-        ) {
-            let name = (0..current.child_count())
-                .filter_map(|i| current.child(i as u32))
-                .find(|child| child.kind() == "type_identifier")
-                .and_then(|n| n.utf8_text(source).ok())
-                .map(str::to_string);
-            return name;
-        }
-        current = current.parent()?;
-    }
-}
-
 /// #757: resolve the enclosing named type for a field/member capture, returning
 /// its signature prefix (`"class"` or `"interface"`) and name. Walks up to the
 /// first `class`/`interface` declaration; returns `None` for members of an
@@ -619,6 +609,45 @@ mod tests {
     /// qualified by the `describe` chain, and #479's evaluator classifies it.
     /// Before this, Phase A emitted no node for a callback body at all, so the
     /// only categorization available was the whole-file path rule.
+    #[test]
+    fn interface_and_abstract_method_signatures_are_methods_of_their_type() {
+        // `describe(): string;` in an interface and `abstract speak(): string;`
+        // have no body. With no node, tsserver's answer (it resolves
+        // `a.describe()` on an `Animal` to the interface signature) mapped to
+        // nothing and was refused.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.ts");
+        std::fs::write(
+            &path,
+            "interface Animal {\n  describe(): string;\n}\nabstract class Base {\n  abstract speak(): string;\n}\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "a.ts").unwrap();
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(sigs.contains(&"method:Animal.describe"), "got {sigs:?}");
+        assert!(sigs.contains(&"method:Base.speak"), "got {sigs:?}");
+        let iface = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "interface:Animal")
+            .unwrap();
+        let describe = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:Animal.describe")
+            .unwrap();
+        assert!(
+            out.edges
+                .iter()
+                .any(|e| e.src == iface.id && e.dst == describe.id),
+            "contained by the interface node"
+        );
+    }
+
     #[test]
     fn bdd_callbacks_become_nodes_with_a_test_role() {
         use travsr_core::TestRole::{EntryPoint, Support};
