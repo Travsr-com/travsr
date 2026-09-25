@@ -211,18 +211,20 @@ fn extract_file_edges(
                 let occ_line = cap.node.start_position().row.saturating_add(1) as u32;
                 let occ_col = cap.node.start_position().column as u32;
 
-                let Some((caller_fn, caller_class)) =
-                    find_enclosing_fn_py(cap.node, source.as_slice())
-                else {
-                    continue;
-                };
-
-                let caller_id = match &caller_class {
-                    Some(c) => {
-                        py_vname(corpus, vname_path, &format!("method:{c}.{caller_fn}")).id()
-                    }
-                    None => py_vname(corpus, vname_path, &format!("fn:{caller_fn}")).id(),
-                };
+                // A call in no function (a script, module-level code) hangs from
+                // the file node, as Phase B attributes script calls.
+                let (caller_id, caller_class) =
+                    match find_enclosing_fn_py(cap.node, source.as_slice()) {
+                        Some((caller_fn, Some(c))) => (
+                            py_vname(corpus, vname_path, &format!("method:{c}.{caller_fn}")).id(),
+                            Some(c),
+                        ),
+                        Some((caller_fn, None)) => (
+                            py_vname(corpus, vname_path, &format!("fn:{caller_fn}")).id(),
+                            None,
+                        ),
+                        None => (py_vname(corpus, vname_path, "file").id(), None),
+                    };
 
                 // E4: emit an UnresolvedCall (fail-closed, resolved against the
                 // real node table by the daemon) instead of a same-file leaf
@@ -609,6 +611,33 @@ mod tests {
     /// RFC-027 live IsImplementation lane: `class Dog(Animal, Mixin)` bases come
     /// back as unresolved references, one per base, carrying the base name and
     /// the line it is written on.
+    #[test]
+    fn a_top_level_call_is_attributed_to_the_file() {
+        // Module-level code (`if __name__ == "__main__": main()`) sits in no
+        // function; Phase B hangs it on the `file` node.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.py");
+        std::fs::write(
+            &path,
+            "def main():\n    pass\n\nif __name__ == '__main__':\n    main()\n",
+        )
+        .unwrap();
+        let files = vec![(path, "src/main.py".to_string())];
+        let (_nodes, _edges, unresolved) =
+            extract_native_phase_b("c", dir.path(), Some(&files)).unwrap();
+        let file_id = py_vname("c", "src/main.py", "file").id();
+        assert!(
+            unresolved
+                .iter()
+                .any(|u| u.src == file_id && u.callee_sig.ends_with(":main")),
+            "got {:?}",
+            unresolved
+                .iter()
+                .map(|u| (&u.callee_sig, u.src == file_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn class_bases_come_back_as_inheritance_refs() {
         let dir = tempfile::tempdir().unwrap();

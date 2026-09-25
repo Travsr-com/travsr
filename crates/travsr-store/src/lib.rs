@@ -7056,6 +7056,13 @@ LIMIT ?4",
     /// name shared by an unrelated symbol) is recall-neutral: the editor resolves
     /// the real position and the daemon maps it fail-closed, so a spurious file
     /// costs a round trip, never a wrong edge.
+    ///
+    /// The one exclusion needs positive evidence: a name match is dropped only
+    /// when a file the candidate's imports resolve to defines that leaf and
+    /// none resolves to the saved file. A `.js` file tagged `typescript` that
+    /// imports its own `animal.js` is not a dependent of `animal.ts`. An import
+    /// that defines no such leaf (a barrel, a `super::` sibling) or one that
+    /// does not resolve leaves the name match in charge.
     pub fn dependents_pending_on_file(
         &self,
         corpus: &str,
@@ -7112,10 +7119,55 @@ LIMIT ?4",
 
             let mut out: Vec<String> = Vec::new();
             let mut seen = std::collections::HashSet::new();
+            // The definitions in the files each candidate's imports resolve to:
+            // `depends` straight to a file (Go), or through an import node's
+            // `resolves-to`.
+            let mut imports = self
+                .conn
+                .prepare_cached(
+                    "SELECT DISTINCT t.path, n.signature FROM nodes f \
+                     JOIN edges d ON d.src = f.id AND d.kind = 'depends' \
+                     JOIN nodes i ON i.id = d.dst \
+                     LEFT JOIN edges r ON r.src = i.id AND r.kind = 'resolves-to' \
+                     JOIN nodes t ON t.id = COALESCE(r.dst, i.id) AND t.kind = 'file' \
+                     JOIN nodes n ON n.corpus = t.corpus AND n.path = t.path \
+                     WHERE f.corpus = ?1 AND f.path = ?2 AND f.kind = 'file'",
+                )
+                .context("dependents_pending_on_file: prepare imports")?;
+            // (candidate, imports the saved file, leaves its imports define),
+            // for the candidate the path-ordered scan is on.
+            let mut bound: Option<(String, bool, std::collections::HashSet<String>)> = None;
             for row in rows {
                 let (dep_path, name) = row.context("decoding dependents_pending_on_file row")?;
-                if !leaves.contains(&name) {
+                if !leaves.contains(&name) || seen.contains(&dep_path) {
                     continue;
+                }
+                if bound.as_ref().map_or(true, |(p, _, _)| *p != dep_path) {
+                    let mut imports_saved = false;
+                    let mut defined = std::collections::HashSet::new();
+                    for r in imports
+                        .query_map(params![corpus, dep_path], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .context("dependents_pending_on_file: query imports")?
+                    {
+                        let (target, sig) = r.context("dependents_pending_on_file: imports row")?;
+                        imports_saved |= target == path;
+                        if sig.contains(':') {
+                            defined.insert(travsr_core::ident::leaf_of(&sig).to_string());
+                        }
+                    }
+                    bound = Some((dep_path.clone(), imports_saved, defined));
+                }
+                // A name the candidate's own imports define is bound there (a
+                // `.js` twin tagged `typescript` importing its own `animal.js`),
+                // unless it imports the saved file too. An import that defines
+                // no such leaf (a barrel, a `super::` sibling) is no evidence,
+                // and neither is an unresolved one, so the name match decides.
+                if let Some((_, imports_saved, defined)) = &bound {
+                    if !*imports_saved && defined.contains(&name) {
+                        continue;
+                    }
                 }
                 if seen.insert(dep_path.clone()) {
                     out.push(dep_path);
@@ -7344,6 +7396,20 @@ LIMIT ?4",
         line: u32,
     ) -> Result<Option<NodeId>, StoreError> {
         self.enclosing_node_at(corpus, path, line, ENCLOSING_DEFINITION_KINDS)
+    }
+
+    /// The file node of `(corpus, path)`: the source Phase B gives a reference
+    /// at top level, outside every definition (`file_node_for_attribution`).
+    pub fn file_node_at(&self, corpus: &str, path: &str) -> Result<Option<NodeId>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id FROM nodes WHERE corpus = ?1 AND path = ?2 AND kind = 'file' LIMIT 1",
+                params![corpus, path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|id| id.map(i64_to_node_id))
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// The tightest node whose span contains `line`, restricted to `kinds`.
@@ -14566,6 +14632,104 @@ mod tests {
                 .unwrap(),
             vec!["dep.ts".to_string()],
             "`kind:Qual.Leaf` must match too"
+        );
+    }
+
+    /// A name match alone crossed projects: `.js` files are tagged
+    /// `typescript`, so saving `typescript/src/animal.ts` named
+    /// `javascript/src/main.js` a dependent though it imports only its own
+    /// `animal.js`, which defines the same leaf. A file whose imports define
+    /// the name and do not reach the saved file is not a dependent; a file
+    /// with none resolved keeps the name match.
+    #[test]
+    fn a_dependent_whose_imports_define_the_name_elsewhere_is_dropped() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let file = |path: &str| live_node("c", path, "file", "file", 1);
+        let saved = file("typescript/src/animal.ts");
+        let def = live_node(
+            "c",
+            "typescript/src/animal.ts",
+            "method:Zoo.add",
+            "method",
+            3,
+        );
+        let js_animal = file("javascript/src/animal.js");
+        let js_def = live_node(
+            "c",
+            "javascript/src/animal.js",
+            "method:Zoo.add",
+            "method",
+            3,
+        );
+        let mut nodes = vec![saved.clone(), def, js_animal.clone(), js_def];
+        let mut edges = Vec::new();
+        let mut pendings = Vec::new();
+        for (path, target) in [
+            ("javascript/src/main.js", Some(&js_animal)),
+            ("typescript/src/main.ts", Some(&saved)),
+            ("typescript/src/loose.ts", None),
+        ] {
+            let f = file(path);
+            let caller = live_node("c", path, "fn:run", "function", 2);
+            if let Some(target) = target {
+                let import = live_node("c", path, "import:./animal", "import", 1);
+                edges.push(Edge::new(f.id, import.id, EdgeKind::Depends));
+                edges.push(Edge::new(import.id, target.id, EdgeKind::ResolvesTo));
+                nodes.push(import);
+            }
+            pendings.push((path, caller.id));
+            nodes.push(f);
+            nodes.push(caller);
+        }
+        store
+            .write_phase_b_batch(&nodes, &edges, "tree-sitter")
+            .unwrap();
+        for (path, caller) in pendings {
+            store
+                .replace_ref_resolution_states("c", path, &[pending(caller, 4, "add")])
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .dependents_pending_on_file("c", "typescript/src/animal.ts", "typescript", 32)
+                .unwrap(),
+            vec![
+                "typescript/src/loose.ts".to_string(),
+                "typescript/src/main.ts".to_string()
+            ]
+        );
+    }
+
+    /// A barrel (`./models` -> `models/index.ts`, re-exporting `./zoo`) is an
+    /// import that resolves to a file other than the saved one. It defines
+    /// none of the pending leaves, so it is no evidence the name is bound
+    /// elsewhere and the name match still decides.
+    #[test]
+    fn barrel_reexport_dependent_is_kept() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let file = |path: &str| live_node("c", path, "file", "file", 1);
+        let saved = file("src/models/zoo.ts");
+        let def = live_node("c", "src/models/zoo.ts", "method:Zoo.add", "method", 3);
+        let barrel = file("src/models/index.ts");
+        let main = file("src/main.ts");
+        let caller = live_node("c", "src/main.ts", "fn:run", "function", 2);
+        let import = live_node("c", "src/main.ts", "import:./models", "import", 1);
+        let edges = vec![
+            Edge::new(main.id, import.id, EdgeKind::Depends),
+            Edge::new(import.id, barrel.id, EdgeKind::ResolvesTo),
+        ];
+        let nodes = vec![saved, def, barrel, main, caller.clone(), import];
+        store
+            .write_phase_b_batch(&nodes, &edges, "tree-sitter")
+            .unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/main.ts", &[pending(caller.id, 4, "add")])
+            .unwrap();
+        assert_eq!(
+            store
+                .dependents_pending_on_file("c", "src/models/zoo.ts", "typescript", 32)
+                .unwrap(),
+            vec!["src/main.ts".to_string()]
         );
     }
 
