@@ -866,7 +866,7 @@ pub fn fill_target_columns(lines: &[&str], targets: &mut [LiveResolutionTarget])
             // An Objective-C selector is spelled apart around its arguments
             // (`initWithName:@"x" volume:1`); the message starts at its first
             // keyword.
-            let first_keyword = t.name.split(':').next().unwrap_or(&t.name);
+            let first_keyword = travsr_core::ident::selector_head(&t.name);
             t.ref_col = word_boundary_col_utf16(line, first_keyword);
         }
     }
