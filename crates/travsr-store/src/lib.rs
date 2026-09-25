@@ -3050,9 +3050,14 @@ impl SqliteStore {
 
             // The NodeIds this parse produced. Computed up front so the
             // pure-body-edit test and the preserved set are known before any
-            // delete.
-            let new_ids: std::collections::HashSet<i64> =
-                nodes.iter().map(|n| node_id_to_i64(n.id)).collect();
+            // delete. Only this file's own, as `old_ids` reads them: a node the
+            // parse stores under another path (Go's per-directory package) is
+            // not one of them.
+            let new_ids: std::collections::HashSet<i64> = nodes
+                .iter()
+                .filter(|n| n.vname.path == path)
+                .map(|n| node_id_to_i64(n.id))
+                .collect();
 
             // RFC-027 #813 Mechanism A: the set of definitions whose committed
             // owned edges/sites survive this reparse untouched.
@@ -4398,8 +4403,10 @@ FROM nodes";
             if lang.is_some() {
                 sql.push_str("\n  AND language = ?2");
             }
+            // Ties break on the name, not the NodeId: the id hashes the corpus
+            // (the checkout's directory), so id order changed with it.
             sql.push_str(&format!(
-                "\nORDER BY rank ASC, id ASC\nLIMIT {NODE_NAME_SEARCH_LIMIT}"
+                "\nORDER BY rank ASC, path ASC, signature ASC, id ASC\nLIMIT {NODE_NAME_SEARCH_LIMIT}"
             ));
 
             let mut stmt = self.conn.prepare(&sql).context("preparing search query")?;
@@ -13075,6 +13082,47 @@ mod tests {
         assert_eq!(edge_provenance(&store, a.id, y.id), None);
     }
 
+    /// A parse can emit a node stored under another path: Go's package node
+    /// lives at the directory so every file of the package shares it. It is not
+    /// one of this file's nodes, so it must not make a body edit look like a
+    /// changed symbol set (every Go save purged the whole file, 8/8 -> 0/8).
+    #[test]
+    fn reindex_replace_keeps_an_edge_when_the_parse_also_emits_a_directory_node() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "go/main.go", "go", sig),
+                "function",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        let main = mk("fn:main", 1, 3);
+        let x = mk("fn:x", 5, 6);
+        let pkg = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "go", "go", "go-pkg:go/main"),
+            "go-pkg",
+        );
+        let nodes = vec![main.clone(), x.clone(), pkg];
+        let v1 = "func main() {\n  x()\n}\n\nfunc x() {\n}\n";
+        store
+            .reindex_replace("c", "go/main.go", &nodes, &[], "h1", Some(v1))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(main.id, x.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let v2 = "func main() {\n  x() // tweak\n}\n\nfunc x() {\n}\n";
+        store
+            .reindex_replace("c", "go/main.go", &nodes, &[], "h2", Some(v2))
+            .unwrap();
+
+        assert_eq!(
+            edge_provenance(&store, main.id, x.id).as_deref(),
+            Some("lsif")
+        );
+    }
+
     /// I0, scripts: a top-level call hangs from the file node, which has no
     /// body hash, so its committed edges were always purged on save (Ruby
     /// `main.rb` 8/8 -> 0/8). They are kept while the callee's name still
@@ -15187,6 +15235,37 @@ mod tests {
         let results = store.search_nodes_by_name("charge").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].vname.signature, "fn:charge");
+    }
+
+    /// Equal-rank matches must not be ordered by NodeId: it hashes the corpus,
+    /// which is the checkout's directory name (`local/<dir>`), so the same code
+    /// picked a different anchor for a tie in another directory (bench hit@1
+    /// 0.375 in two directories, 0.333 in a third).
+    #[test]
+    fn search_orders_equal_rank_matches_the_same_in_every_corpus() {
+        let order = |corpus: &str| {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            for (path, sig) in [("src/a.rs", "fn:make_token"), ("src/b.rs", "fn:token_at")] {
+                store
+                    .put_node(&Node::new(
+                        VName::new(corpus, "", path, "rust", sig),
+                        "function",
+                    ))
+                    .unwrap();
+            }
+            store
+                .search_nodes_by_name("token")
+                .unwrap()
+                .into_iter()
+                .map(|n| n.vname.signature)
+                .collect::<Vec<_>>()
+        };
+        let first = order("local/a");
+        for corpus in [
+            "local/b", "local/c", "local/d", "local/e", "local/f", "local/g",
+        ] {
+            assert_eq!(order(corpus), first, "{corpus}");
+        }
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (alias_declaration name: (type_identifier) @using.name)
 (function_declarator declarator: (identifier) @fn.name)
 (function_declarator declarator: (field_identifier) @fn.name)
+(function_declarator declarator: (destructor_name) @fn.name)
 (function_declarator declarator: (qualified_identifier name: (identifier) @member.name))
 (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (identifier) @member.name)))
 (field_declaration declarator: (field_identifier) @field.name)
@@ -222,6 +223,34 @@ mod tests {
         let kinds: Vec<&str> = out.nodes.iter().map(|n| n.kind.as_str()).collect();
         assert!(kinds.contains(&"class"));
         assert!(kinds.contains(&"namespace"));
+    }
+
+    #[test]
+    fn a_destructor_declaration_is_a_method_of_its_class() {
+        // scip-clang defines `Animal#~Animal().` on the declaration line; with
+        // no Phase A twin it orphaned the header, so every save of it purged
+        // the whole file instead of keeping its edges.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("animal.hpp");
+        std::fs::write(
+            &path,
+            "class Animal {\npublic:\n    virtual ~Animal() = default;\n};\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "animal.hpp").unwrap();
+        let dtor = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:Animal.~Animal");
+        assert_eq!(
+            dtor.map(|n| n.line),
+            Some(Some(3)),
+            "got {:?}",
+            out.nodes
+                .iter()
+                .map(|n| &n.vname.signature)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

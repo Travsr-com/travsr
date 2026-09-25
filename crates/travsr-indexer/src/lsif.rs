@@ -85,6 +85,9 @@ struct RefItem {
     caller_doc_id: u64,
     /// `inVs` — range vertex ids of the individual occurrences.
     range_ids: Vec<u64>,
+    /// `false` when travsr-lsif-ts marked the item `travsr_call: false`: it
+    /// names the symbol without calling it (an import specifier, an override).
+    is_call: bool,
 }
 
 fn parse_graph(dump: impl std::io::BufRead, corpus: &str) -> anyhow::Result<LsifGraph> {
@@ -191,6 +194,7 @@ fn parse_graph(dump: impl std::io::BufRead, corpus: &str) -> anyhow::Result<Lsif
                     ref_result_id,
                     caller_doc_id,
                     range_ids,
+                    is_call: obj["travsr_call"].as_bool().unwrap_or(true),
                 });
             }
 
@@ -223,7 +227,7 @@ pub fn ingest_raw_from_reader(
 
     let mut edges = Vec::new();
 
-    for item in &graph.ref_items {
+    for item in graph.ref_items.iter().filter(|item| item.is_call) {
         let caller_path = match graph.doc_paths.get(&item.caller_doc_id) {
             Some(p) => p,
             None => continue,
@@ -328,9 +332,9 @@ pub fn ingest_g2_from_reader(
                 caller_line,
                 callee_id,
                 // Our bundled LSIF emitters (travsr-lsif-ts / -py) emit occurrence
-                // ranges only for call expressions and imports, so these are
-                // already call-scoped — flag as calls to preserve their edges.
-                is_call: true,
+                // ranges for call expressions, and mark the rest (imports,
+                // overrides) `travsr_call: false`.
+                is_call: item.is_call,
                 // RFC-027 #813 P2: this streaming graph parse carries no source
                 // text, so the range's UTF-16 start character cannot be converted
                 // to the byte column the occurrence store keeps. Leave it None
@@ -484,6 +488,24 @@ mod tests {
         let callee_id = VName::new("", "", "svc.ts", "typescript", "fn:charge").id();
         assert_eq!(edges[0].src, caller_id);
         assert_eq!(edges[0].dst, callee_id);
+    }
+
+    #[test]
+    fn a_reference_marked_as_a_non_call_makes_no_call() {
+        // travsr-lsif-ts marks an import specifier or an override
+        // `travsr_call: false`: it names the symbol without calling it. The
+        // occurrence is still recorded; no `ref/call` comes from it.
+        let dump = minimal_dump("svc.ts", "class:Charge", "caller.ts").replace(
+            r#""property":"references"}"#,
+            r#""property":"references","travsr_call":false}"#,
+        );
+        let g2 = ingest_g2(&dump, "").unwrap();
+        assert_eq!(g2.refs.len(), 1, "the occurrence is kept");
+        assert!(!g2.refs[0].is_call);
+        assert!(
+            ingest_raw(&dump, "").unwrap().is_empty(),
+            "no file-level call edge"
+        );
     }
 
     #[test]

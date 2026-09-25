@@ -77,10 +77,11 @@ pub struct PhaseBOutcome {
     /// Their external tooling is never spawned. User-actionable: re-run
     /// `travsr lang install <lang>` inside the repo, which auto-grants trust.
     pub skipped_untrusted_corpus: Vec<String>,
-    /// Languages that require a `compile_commands.json` at the repo root
-    /// (scip-clang, for `c`/`cpp`) but don't have one. Without this gate the
-    /// scip-clang invoke hangs with no compilation database until the 300s
-    /// invoke timeout, then reports as `crashed`. User-actionable: generate a
+    /// Languages that require a `compile_commands.json` at the repo root or in
+    /// a directory above their sources (scip-clang, for `c`/`cpp`) but don't
+    /// have one. Without this gate the scip-clang invoke hangs with no
+    /// compilation database until the 300s invoke timeout, then reports as
+    /// `crashed`. User-actionable: generate a
     /// compile_commands.json (e.g. via `bear` or CMake's
     /// `CMAKE_EXPORT_COMPILE_COMMANDS`).
     pub skipped_no_compdb: Vec<String>,
@@ -661,15 +662,28 @@ impl PluginIndexer {
                 continue;
             }
 
-            // L5a: scip-clang (c/cpp) requires a compile_commands.json at the repo
-            // root (`--compdb-path` in its catalog args). Without one it hangs
-            // with no compilation database until the invoke timeout fires and the
-            // whole batch reports `crashed`, blocking phase_b_commit forever.
-            // Detect the dependency from the catalog entry rather than hardcoding
-            // language names, so any future scip-clang-based language is covered.
+            // L5a: scip-clang (c/cpp) requires a compile_commands.json in the
+            // directory it runs in (`--compdb-path` in its catalog args). Without
+            // one it hangs with no compilation database until the invoke timeout
+            // fires and the whole batch reports `crashed`, blocking
+            // phase_b_commit forever. Detect the dependency from the catalog
+            // entry rather than hardcoding language names, so any future
+            // scip-clang-based language is covered. The compdb may sit at the
+            // repo root or below it: any build root found for the sources counts
+            // (the root probe also covers a call with no path list).
+            let files = lang_files(&lang);
             let needs_compdb = crate::phase_b::catalog::lookup(lang.as_str())
                 .is_some_and(|entry| entry.command == "scip-clang");
-            if needs_compdb && !inputs.repo_root.join("compile_commands.json").exists() {
+            let sources = root_sources(files.as_deref().unwrap_or(&[]));
+            if needs_compdb
+                && !repo_root.join("compile_commands.json").exists()
+                && build_roots(
+                    repo_root,
+                    &sources,
+                    crate::phase_b::catalog::build_manifests(lang.as_str()),
+                )
+                .is_empty()
+            {
                 tracing::debug!(
                     lang = %lang,
                     "Phase B skipped, scip-clang requires compile_commands.json"
@@ -681,7 +695,6 @@ impl PluginIndexer {
             match resolver.resolve(&lang) {
                 Some(spec) => {
                     tracing::debug!(lang = %lang, program = %spec.program, "Phase B: resolved spec");
-                    let files = lang_files(&lang);
                     // #724 Finding 5: a build-system-driven analyzer indexes the
                     // directory it is handed, so a project whose manifest sits
                     // below the repo root fails outright ("No build tool detected
@@ -690,7 +703,7 @@ impl PluginIndexer {
                     // invoke at the repo root.
                     let mut invoke_roots = build_roots(
                         repo_root,
-                        files.as_deref().unwrap_or(&[]),
+                        &sources,
                         crate::phase_b::catalog::build_manifests(lang.as_str()),
                     );
                     if invoke_roots.is_empty() {
@@ -924,9 +937,25 @@ impl PluginIndexer {
                                 // tree-sitter node id, so it reconciles without an alias
                                 // pass, and write_scip_attributed_batch records edge_sites.
                                 let mut refs: Vec<travsr_core::ScipRef> = Vec::new();
-                                let tsconfig = repo_root.join("tsconfig.json");
-                                if tsconfig.exists() {
-                                    match travsr_indexer::run_lsif_emitter(&tsconfig) {
+                                // Every project's own tsconfig, not only a root one:
+                                // `typescript/tsconfig.json` (or a CommonJS
+                                // `javascript/tsconfig.json` whose `module` settings
+                                // the synthesized pass below lacks) one level down
+                                // was never read. Nested projects under a root
+                                // tsconfig collapse onto it, as build roots do.
+                                let mut ts_roots = build_roots(
+                                    repo_root,
+                                    item.files.as_deref().unwrap_or(&[]),
+                                    TSCONFIG,
+                                );
+                                if ts_roots.is_empty() && repo_root.join("tsconfig.json").exists() {
+                                    ts_roots.push(repo_root.to_path_buf());
+                                }
+                                for ts_root in &ts_roots {
+                                    let tsconfig = ts_root.join("tsconfig.json");
+                                    match travsr_indexer::run_lsif_emitter_with_root(
+                                        &tsconfig, repo_root,
+                                    ) {
                                         Ok(dump) => {
                                             match travsr_indexer::ingest_lsif_g2(&dump, corpus) {
                                                 Ok(g2) => {
@@ -1206,11 +1235,14 @@ impl PluginIndexer {
                                         // sidecar skips its own directory walk.
                                         files,
                                     };
-                                    // The sandbox is still anchored at the repo
-                                    // root (ADR-017): a build root is inside it by
-                                    // construction, so no grant widens here.
+                                    // The sandbox is anchored at the root the
+                                    // analyzer runs in, a subtree of the repo, so
+                                    // a repo-write grant (scip-php's `index.scip`,
+                                    // sbt's `target/`) lands where the analyzer
+                                    // writes. At the repo root, `php/index.scip`
+                                    // was denied and the index silently empty.
                                     let sidecar =
-                                        match crate::transport::Sidecar::spawn(&spec, repo_root) {
+                                        match crate::transport::Sidecar::spawn(&spec, invoke_root) {
                                             Ok(sidecar) => sidecar,
                                             Err(e) => {
                                                 // Resolver confirmed the binary exists — spawn failure is a crash.
@@ -1468,6 +1500,9 @@ fn rebase_to_repo_root(resp: &mut travsr_plugin_protocol::InvokeResponse, prefix
     }
 }
 
+/// The manifest that makes a directory a TypeScript/JavaScript project root.
+const TSCONFIG: &[&str] = &["tsconfig.json"];
+
 /// The directories a build-system-driven analyzer should be invoked in: every
 /// directory at or below `repo_root` that holds one of `manifests`, is an
 /// ancestor of one of `files` (repo-root-relative paths), and is not itself
@@ -1482,6 +1517,18 @@ fn rebase_to_repo_root(resp: &mut travsr_plugin_protocol::InvokeResponse, prefix
 /// Empty when `manifests` is empty (the language does not drive a build), when
 /// there is no pre-walked file list, or when nothing qualifies; the caller then
 /// falls back to the repo root, which is the behaviour that shipped.
+/// The files that may mark a build root. A `.h` is language `c` by extension,
+/// but a header alone does not make its directory a C project: headers in a
+/// `cpp/` or `objc/` project made those C roots, and the c analyzer then ran on
+/// their compilation databases until it timed out.
+fn root_sources(files: &[String]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| !f.ends_with(".h"))
+        .cloned()
+        .collect()
+}
+
 fn build_roots(repo_root: &Path, files: &[String], manifests: &[&str]) -> Vec<PathBuf> {
     if manifests.is_empty() {
         return Vec::new();
@@ -1614,6 +1661,116 @@ mod tests {
                 crate::phase_b::catalog::build_manifests("scala")
             ),
             vec![root.join("scala")]
+        );
+    }
+
+    /// A Go module one level down is handed its own directory: scip-go invoked
+    /// at the repo root emitted an empty index for `go/go.mod`, and status
+    /// blamed a missing Go toolchain.
+    #[test]
+    fn go_is_invoked_at_its_module_directory() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("go")).expect("mkdir");
+        std::fs::write(root.join("go/go.mod"), "module x\n").expect("write");
+        let files = vec!["go/main.go".to_string()];
+        assert_eq!(
+            build_roots(root, &files, crate::phase_b::catalog::build_manifests("go")),
+            vec![root.join("go")]
+        );
+    }
+
+    /// scip-php reads `composer.json` from the directory it runs in; invoked at
+    /// the repo root it failed on `<repo>/composer.json` for a `php/` project.
+    #[test]
+    fn php_is_invoked_at_its_composer_directory() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("php/src")).expect("mkdir");
+        std::fs::write(root.join("php/composer.json"), "{}").expect("write");
+        let files = vec!["php/src/main.php".to_string()];
+        assert_eq!(
+            build_roots(
+                root,
+                &files,
+                crate::phase_b::catalog::build_manifests("php")
+            ),
+            vec![root.join("php")]
+        );
+    }
+
+    /// scip-clang reads the compile_commands.json of the directory it runs in;
+    /// a `c/` project with its own compdb was skipped because only the repo
+    /// root was probed. The outermost compdb wins over a build-dir copy, and a
+    /// repo with no compdb anywhere has no root, which is what skips it.
+    #[test]
+    fn c_is_invoked_at_its_compile_commands_directory() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let files = vec!["c/src/main.c".to_string()];
+        let c = crate::phase_b::catalog::build_manifests("c");
+        std::fs::create_dir_all(root.join("c/src")).expect("mkdir");
+        std::fs::create_dir_all(root.join("c/build")).expect("mkdir");
+        assert!(build_roots(root, &files, c).is_empty());
+
+        std::fs::write(root.join("c/compile_commands.json"), "[]").expect("write");
+        std::fs::write(root.join("c/build/compile_commands.json"), "[]").expect("write");
+        assert_eq!(build_roots(root, &files, c), vec![root.join("c")]);
+    }
+
+    /// A `.h` is language `c` by extension, so headers in `cpp/` and `objc/`
+    /// made those directories C build roots too, and the c sidecar ran on the
+    /// Objective-C compilation database until the invoke timeout (`crashed:c`).
+    /// A header alone does not mark a C project.
+    #[test]
+    fn a_header_alone_does_not_make_a_c_build_root() {
+        use super::{build_roots, root_sources};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for d in ["c/src", "objc/App"] {
+            std::fs::create_dir_all(root.join(d)).expect("mkdir");
+        }
+        for f in ["c/compile_commands.json", "objc/compile_commands.json"] {
+            std::fs::write(root.join(f), "[]").expect("write");
+        }
+        let files = vec!["c/src/main.c".to_string(), "objc/App/Animal.h".to_string()];
+        assert_eq!(
+            build_roots(
+                root,
+                &root_sources(&files),
+                crate::phase_b::catalog::build_manifests("c")
+            ),
+            vec![root.join("c")]
+        );
+    }
+
+    /// Each TypeScript/JavaScript project is handed its own tsconfig: a
+    /// `typescript/tsconfig.json` or a CommonJS `javascript/tsconfig.json` one
+    /// level down was never read, so neither project got LSIF references.
+    #[test]
+    fn each_tsconfig_directory_is_a_typescript_root() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for d in ["typescript", "javascript"] {
+            std::fs::create_dir_all(root.join(d).join("src")).expect("mkdir");
+            std::fs::write(root.join(d).join("tsconfig.json"), "{}").expect("write");
+        }
+        let files = vec![
+            "typescript/src/main.ts".to_string(),
+            "javascript/src/main.js".to_string(),
+        ];
+        assert_eq!(
+            build_roots(root, &files, TSCONFIG),
+            vec![root.join("javascript"), root.join("typescript")]
         );
     }
 

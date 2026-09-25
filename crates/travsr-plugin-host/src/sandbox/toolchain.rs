@@ -221,8 +221,9 @@ pub fn toolchain_access(language: &str) -> ToolchainAccess {
         // caches, no network. System headers (/usr, /Library/Developer, /opt/homebrew)
         // are already readable via the base macOS sandbox profile and equivalent
         // bwrap binds on Linux. The only sandbox requirement is a writable scratch
-        // dir, which is now injected via InvokeRequest::scratch.
-        "c" | "cpp" => ToolchainAccess::default(),
+        // dir, which is now injected via InvokeRequest::scratch. On macOS it
+        // also needs SDKROOT to find libc++ (see `clang_access_for`).
+        "c" | "cpp" => clang_access_for(xcode_sdk_path()),
         _ => ToolchainAccess::default(),
     }
 }
@@ -927,7 +928,7 @@ fn ruby_access() -> ToolchainAccess {
 /// exfiltration, not reads of shared system directories.
 fn objc_access() -> ToolchainAccess {
     let mut read_paths = vec![PathBuf::from("/Library")];
-    if let Some(sdk) = run_cmd_stdout("xcrun", &["--show-sdk-path"]).map(PathBuf::from) {
+    if let Some(sdk) = xcode_sdk_path() {
         tracing::debug!(path = %sdk.display(), exists = sdk.exists(), "objc_access: Xcode SDK grant (read)");
         read_paths.push(sdk);
     }
@@ -936,6 +937,27 @@ fn objc_access() -> ToolchainAccess {
         write_paths: vec![],
         exec_paths: vec![],
         env: vec![],
+    }
+}
+
+/// The active Apple SDK (`xcrun --show-sdk-path`); `None` off macOS.
+fn xcode_sdk_path() -> Option<PathBuf> {
+    run_cmd_stdout("xcrun", &["--show-sdk-path"]).map(PathBuf::from)
+}
+
+/// scip-clang finds libc++ and the SDK headers only through `SDKROOT` on
+/// macOS; without it every expression involving a std type is dropped. The
+/// sandbox clears the env, so pass the SDK in, and grant it read for when a
+/// full Xcode puts it under `/Applications`.
+fn clang_access_for(sdk: Option<PathBuf>) -> ToolchainAccess {
+    let Some(sdk) = sdk else {
+        return ToolchainAccess::default();
+    };
+    ToolchainAccess {
+        env: vec![("SDKROOT".to_string(), sdk.to_string_lossy().into_owned())],
+        read_paths: vec![sdk],
+        write_paths: vec![],
+        exec_paths: vec![],
     }
 }
 
@@ -1326,6 +1348,21 @@ mod tests {
         assert!(well_known_dotnet_roots()
             .iter()
             .any(|p| p.ends_with("opt/homebrew/opt/dotnet/libexec")));
+    }
+
+    #[test]
+    fn clang_gets_the_sdk_as_sdkroot() {
+        let sdk = PathBuf::from("/Applications/Xcode.app/SDKs/MacOSX.sdk");
+        let access = super::clang_access_for(Some(sdk.clone()));
+        assert_eq!(access.read_paths, vec![sdk]);
+        assert_eq!(
+            access.env,
+            vec![(
+                "SDKROOT".to_string(),
+                "/Applications/Xcode.app/SDKs/MacOSX.sdk".to_string()
+            )]
+        );
+        assert!(super::clang_access_for(None).env.is_empty());
     }
 
     #[test]

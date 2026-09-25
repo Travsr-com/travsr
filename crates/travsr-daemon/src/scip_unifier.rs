@@ -132,8 +132,41 @@ pub fn unify_all(
     // rather than counted as a failure or kept as an edge-stealing orphan.
     let indexed_paths = store.phase_a_indexed_paths(corpus).unwrap_or_default();
 
+    // scip-clang puts the fields of `typedef struct { .. } Animal;` under an
+    // anonymous type, while Phase A qualifies them by the typedef. The type
+    // names defined in each file are the containers such a field can have.
+    let mut clang_types: HashMap<&str, Vec<&str>> = HashMap::new();
+    for node in nodes.iter().filter(|n| is_clang(&n.vname.language)) {
+        let sym = travsr_indexer::scip_unifier::scip_symbol_from_sig(&node.vname.signature);
+        if let Some(p) = travsr_indexer::scip_unifier::scip_name_kind(sym) {
+            if p.kind == "class" && !p.name.starts_with(ANONYMOUS_TYPE) {
+                clang_types
+                    .entry(&node.vname.path)
+                    .or_default()
+                    .push(p.name);
+            }
+        }
+    }
+
     for node in nodes {
         let scip_sym = travsr_indexer::scip_unifier::scip_symbol_from_sig(&node.vname.signature);
+        // scip-go defines the package (`…/pkg/`) in every file of it, while
+        // Phase A models a package once per directory (`go-pkg:`). The per-file
+        // def has no twin; kept, it orphans the file and every save of it
+        // becomes a whole-file purge.
+        if node.vname.language == "go" && scip_sym.ends_with('/') {
+            dropped.insert(node.id);
+            continue;
+        }
+        // scip-clang defines a per-file namespace (`<file>/src/main.c`/) in
+        // every file, which Phase A has no twin for, as with Go's package.
+        if is_clang(&node.vname.language)
+            && scip_sym.ends_with("`/")
+            && scip_sym.contains("`<file>/")
+        {
+            dropped.insert(node.id);
+            continue;
+        }
         // Primary: SCIP descriptor grammar (go/java/ruby/c#/c/c++/… + rust/ts/py
         // LSIF). Fallback: bespoke sidecars (kotlin/swift) whose signatures are
         // Phase-A-style (`fn:Container.name`, `swift::Container.name`) and never
@@ -181,6 +214,14 @@ pub fn unify_all(
             dropped.insert(node.id);
             continue;
         }
+        // An anonymous C/C++ type has no name, so Phase A can give it no node.
+        if is_clang(&node.vname.language)
+            && parsed.kind == "class"
+            && parsed.name.starts_with(ANONYMOUS_TYPE)
+        {
+            dropped.insert(node.id);
+            continue;
+        }
         // #780: a SCIP def in a file the tree-sitter parser never indexed
         // (gitignored vendored code that scip-ruby indexes anyway) has no twin
         // and none can exist — it is not a reconciliation failure. Exclude it
@@ -206,6 +247,13 @@ pub fn unify_all(
             }
         } else {
             parsed
+        };
+        // scip-php names a property with its `$` sigil; Phase A does not.
+        let parsed = match parsed.name.strip_prefix('$') {
+            Some(name) if node.vname.language == "php" => {
+                travsr_indexer::scip_unifier::ScipName { name, ..parsed }
+            }
+            _ => parsed,
         };
         // No definition line means line-proximity matching is meaningless —
         // unwrapping to 0 would let any same-named node on lines 1..=5 of the
@@ -250,6 +298,27 @@ pub fn unify_all(
             if let Some(c) = parsed.container {
                 let field = parsed.name.strip_suffix("_=").unwrap_or(parsed.name);
                 same_file.push(format!("field:{c}.{field}"));
+            }
+        }
+        // scip-go writes an interface method as a term (`Animal#Name.`), where
+        // Phase A wrote the method spec.
+        if node.vname.language == "go" && parsed.kind == "variable" {
+            if let Some(c) = parsed.container {
+                same_file.push(format!("method:{c}.{}", parsed.name));
+            }
+        }
+        if is_clang(&node.vname.language)
+            && parsed.kind == "variable"
+            && parsed
+                .container
+                .is_some_and(|c| c.starts_with(ANONYMOUS_TYPE))
+        {
+            for t in clang_types
+                .get(node.vname.path.as_str())
+                .into_iter()
+                .flatten()
+            {
+                same_file.push(format!("field:{t}.{}", parsed.name));
             }
         }
         // A Scala `object` is a term (`Main.`); Phase A wrote it as the type
@@ -515,6 +584,14 @@ pub fn unify_all(
     }
 }
 
+/// scip-clang's name for an unnamed struct, union or enum.
+const ANONYMOUS_TYPE: &str = "$anonymous_type_";
+
+/// The languages scip-clang indexes.
+fn is_clang(language: &str) -> bool {
+    matches!(language, "c" | "cpp" | "objectivec")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,6 +827,174 @@ mod tests {
         assert!(out.dropped.contains(&local.id));
         assert!(!out.dropped.contains(&entry.id));
         assert!(out.misses.is_empty(), "{:?}", out.misses);
+    }
+
+    #[test]
+    fn a_go_package_def_is_dropped_from_every_file() {
+        // scip-go defines the package (`…/pkg/`) in every file of it. Phase A
+        // models a package once per directory (`go-pkg:`), so the per-file def
+        // has no twin; kept, it orphaned every file and made each save a
+        // whole-file purge.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let go = |path: &str, symbol: &str, line: u32| {
+            Node::new(
+                VName::new("c", "", path, "go", format!("scip:{path}:{symbol}")),
+                "module",
+            )
+            .with_line(line)
+        };
+        let short = go("go/main.go", "scip-go gomod zoo . zoo/", 1);
+        let long = go(
+            "go/dog.go",
+            "scip-go gomod github.com/o/zoo . github.com/o/zoo/",
+            1,
+        );
+        let method = go("go/dog.go", "scip-go gomod zoo . zoo/Dog#Fetch().", 5);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(
+            &mut store,
+            "c",
+            &[short.clone(), long.clone(), method.clone()],
+            &mut refs,
+        );
+        assert!(out.dropped.contains(&short.id));
+        assert!(out.dropped.contains(&long.id));
+        assert!(!out.dropped.contains(&method.id));
+    }
+
+    #[test]
+    fn a_clang_file_namespace_def_is_dropped_from_every_file() {
+        // scip-clang defines a per-file namespace (`<file>/src/main.c`/) in
+        // every C-family file. Phase A has no twin for it, so it orphaned every
+        // file and made each save a whole-file purge. A real namespace stays.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let clang = |path: &str, lang: &str, symbol: &str| {
+            Node::new(
+                VName::new("c", "", path, lang, format!("scip:{path}:{symbol}")),
+                "definition",
+            )
+            .with_line(1)
+        };
+        let c = clang("c/src/main.c", "c", "cxx . . $ `<file>/src/main.c`/");
+        let cpp = clang("cpp/src/dog.h", "cpp", "cxx . . $ `<file>/src/dog.h`/");
+        let ns = clang("cpp/src/zoo.h", "cpp", "cxx . . $ zoo/");
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(
+            &mut store,
+            "c",
+            &[c.clone(), cpp.clone(), ns.clone()],
+            &mut refs,
+        );
+        assert!(out.dropped.contains(&c.id));
+        assert!(out.dropped.contains(&cpp.id));
+        assert!(!out.dropped.contains(&ns.id));
+    }
+
+    #[test]
+    fn an_anonymous_typedef_struct_unifies_its_fields_onto_the_typedef() {
+        // `typedef struct { int age; } Animal;`: scip-clang defines the struct
+        // as `$anonymous_type_<hash>_0#` and its fields under it, while Phase A
+        // names the fields by the typedef (`field:Animal.age`). The anonymous
+        // type itself has no name Phase A could give a node, so it is dropped.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let path = "c/src/utils.h";
+        let phase_a = |sig: &str, kind: &str, line: u32| {
+            Node::new(VName::new("c", "", path, "c", sig), kind)
+                .with_line(line)
+                .with_end_line(line)
+        };
+        let ty = phase_a("type:Animal", "typedef", 6);
+        let age = phase_a("field:Animal.age", "field", 5);
+        store
+            .write_phase_b_batch(&[ty.clone(), age.clone()], &[], "tree-sitter")
+            .unwrap();
+        let scip = |symbol: &str, line: u32| {
+            Node::new(
+                VName::new(
+                    "c",
+                    "",
+                    path,
+                    "c",
+                    format!("scip:src/utils.h:cxx . . $ {symbol}"),
+                ),
+                "definition",
+            )
+            .with_line(line)
+        };
+        let anon = scip("$anonymous_type_ff1e22b05cf4cd3e_0#", 3);
+        let anon_age = scip("$anonymous_type_ff1e22b05cf4cd3e_0#age.", 5);
+        let typedef = scip("Animal#", 6);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(
+            &mut store,
+            "c",
+            &[anon.clone(), anon_age.clone(), typedef.clone()],
+            &mut refs,
+        );
+        assert!(out.dropped.contains(&anon.id));
+        assert_eq!(out.alias_map.get(&anon_age.id), Some(&age.id));
+        assert_eq!(out.alias_map.get(&typedef.id), Some(&ty.id));
+        assert!(out.misses.is_empty(), "{:?}", out.misses);
+    }
+
+    #[test]
+    fn a_go_interface_method_term_unifies_onto_its_method_spec() {
+        // scip-go writes an interface method as a term (`Animal#Name.`), which
+        // parses as a field; Phase A models the spec as `method:Animal.Name`.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let spec = Node::new(
+            VName::new("c", "", "go/animal.go", "go", "method:Animal.Name"),
+            "method",
+        )
+        .with_line(4)
+        .with_end_line(4);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&spec), &[], "scip")
+            .unwrap();
+        let term = Node::new(
+            VName::new(
+                "c",
+                "",
+                "go/animal.go",
+                "go",
+                "scip:go/animal.go:scip-go gomod zoo . zoo/Animal#Name.",
+            ),
+            "function",
+        )
+        .with_line(4);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", std::slice::from_ref(&term), &mut refs);
+        assert_eq!(out.alias_map.get(&term.id), Some(&spec.id));
+    }
+
+    #[test]
+    fn a_php_property_unifies_without_its_sigil() {
+        // scip-php names a property with its `$` (`Animal#$name.`); Phase A
+        // writes `field:Animal.name`.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let field = Node::new(
+            VName::new("c", "", "php/src/Animal.php", "php", "field:Animal.name"),
+            "field",
+        )
+        .with_line(4)
+        .with_end_line(4);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&field), &[], "scip")
+            .unwrap();
+        let property = Node::new(
+            VName::new(
+                "c",
+                "",
+                "php/src/Animal.php",
+                "php",
+                "scip:src/Animal.php:scip-php composer t/p 0 Animal#$name.",
+            ),
+            "definition",
+        )
+        .with_line(4);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", std::slice::from_ref(&property), &mut refs);
+        assert_eq!(out.alias_map.get(&property.id), Some(&field.id));
     }
 
     #[test]

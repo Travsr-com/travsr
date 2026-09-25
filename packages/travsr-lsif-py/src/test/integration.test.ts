@@ -316,6 +316,61 @@ test('a module imported both plainly and by name keeps resolving its attributes'
   );
 });
 
+test('a method inherited from an imported base class resolves on a typed local', () => {
+  // Dog(Animal) does not define describe(); Animal does.  `d = Dog()` then
+  // `d.describe()` must resolve through Dog's base to animal.py.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-lsif-py-inherit-'));
+  fs.writeFileSync(path.join(tmp, '__init__.py'), '');
+  fs.writeFileSync(
+    path.join(tmp, 'animal.py'),
+    'class Animal:\n    def describe(self):\n        return 1\n'
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'dog.py'),
+    'from .animal import Animal\n\n\nclass Dog(Animal):\n    pass\n'
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'main.py'),
+    'from .dog import Dog\n\n\ndef main():\n    d = Dog()\n    return d.describe()\n'
+  );
+
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--root', tmp], { encoding: 'utf-8' });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+
+  const all = parseAll(result.stdout);
+  const mainDoc = all.find(
+    (o) => o['label'] === 'document' && String(o['uri']).endsWith('main.py')
+  );
+  assert.ok(mainDoc, 'main.py must be in the dump');
+
+  // range id -> resultSet it was linked to.
+  const target = new Map<unknown, unknown>();
+  for (const o of all) {
+    if (o['label'] === 'next') target.set(o['outV'], o['inV']);
+  }
+  const vname = new Map<unknown, string>();
+  for (const o of all) {
+    if (o['label'] === 'resultSet') vname.set(o['id'], JSON.stringify(o['travsr_vname']));
+  }
+
+  const resolvedFromMain = all
+    .filter(
+      (o) =>
+        o['label'] === 'item' &&
+        o['property'] === 'references' &&
+        o['document'] === mainDoc['id']
+    )
+    .flatMap((o) => o['inVs'] as unknown[])
+    .map((rangeId) => vname.get(target.get(rangeId)));
+
+  assert.ok(
+    resolvedFromMain.includes(
+      JSON.stringify({ path: 'animal.py', signature: 'method:Animal.describe' })
+    ),
+    `d.describe() must resolve to animal.py, got ${JSON.stringify(resolvedFromMain)}`
+  );
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function parseAll(stdout: string): Record<string, unknown>[] {
