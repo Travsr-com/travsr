@@ -972,14 +972,22 @@ impl RefReconcileReport {
 /// [`SqliteStore::reconcile_ref_resolution_states`] share one statement.
 fn clear_resolved_pending_refs_on(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
     conn.execute(
-        "DELETE FROM ref_resolution_state \
-         WHERE state = 'pending' \
-           AND EXISTS (SELECT 1 FROM edge_sites s \
-                       WHERE s.src = ref_resolution_state.src \
-                         AND s.line = ref_resolution_state.ref_line)",
+        &format!(
+            "DELETE FROM ref_resolution_state AS r \
+             WHERE r.state = 'pending' AND EXISTS ({SITE_FOR_REF})"
+        ),
         [],
     )
 }
+
+/// RFC-027: an `edge_sites` row for the reference `r` itself: same enclosing
+/// `src`, same line, and a target whose [`travsr_core::ident::leaf_of`] is
+/// `r.name`. Keying on `(src, line)` alone let another reference on that line
+/// (the field read in `x.bar.foo()`, a second call) stand in for this one.
+const SITE_FOR_REF: &str = "SELECT 1 FROM edge_sites s JOIN nodes d ON d.id = s.dst \
+     WHERE s.src = r.src AND s.line = r.ref_line \
+       AND (substr(d.signature, instr(d.signature, ':') + 1) = r.name \
+            OR substr(d.signature, -length(r.name) - 1) = '.' || r.name)";
 
 /// RFC-027 section 9.2: the `DELETE` behind
 /// [`SqliteStore::purge_orphan_ref_resolution_states`]; see
@@ -6835,11 +6843,11 @@ LIMIT ?4",
             let mut stmt = self
                 .conn
                 .prepare(
-                    // Per claim: does Phase B have any site at this line, and does
-                    // one of them name the same target?
-                    "SELECT \
-                       EXISTS (SELECT 1 FROM edge_sites s \
-                               WHERE s.src = r.src AND s.line = r.ref_line) AS has_site, \
+                    // Per claim: does Phase B have a site for this reference at
+                    // this line, and does one name the same target?
+                    &format!(
+                        "SELECT \
+                       EXISTS ({SITE_FOR_REF}) AS has_site, \
                        EXISTS (SELECT 1 FROM edge_sites s \
                                WHERE s.src = r.src AND s.line = r.ref_line \
                                  AND s.dst = r.resolved_dst \
@@ -6847,7 +6855,8 @@ LIMIT ?4",
                                              WHERE e.src = r.src \
                                                AND e.dst = r.resolved_dst)) AS matches \
                      FROM ref_resolution_state r \
-                     WHERE r.state = 'resolved' AND r.resolved_dst IS NOT NULL",
+                     WHERE r.state = 'resolved' AND r.resolved_dst IS NOT NULL"
+                    ),
                 )
                 .context("live_precision_sample: prepare")?;
             let rows = stmt
@@ -6887,10 +6896,9 @@ LIMIT ?4",
         (|| -> AnyResult<std::collections::BTreeMap<String, LivePrecision>> {
             let mut stmt = self
                 .conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT n.language, \
-                       EXISTS (SELECT 1 FROM edge_sites s \
-                               WHERE s.src = r.src AND s.line = r.ref_line) AS has_site, \
+                       EXISTS ({SITE_FOR_REF}) AS has_site, \
                        EXISTS (SELECT 1 FROM edge_sites s \
                                WHERE s.src = r.src AND s.line = r.ref_line \
                                  AND s.dst = r.resolved_dst \
@@ -6899,8 +6907,8 @@ LIMIT ?4",
                                                AND e.dst = r.resolved_dst)) AS matches \
                      FROM ref_resolution_state r \
                      JOIN nodes n ON n.id = r.src \
-                     WHERE r.state = 'resolved' AND r.resolved_dst IS NOT NULL",
-                )
+                     WHERE r.state = 'resolved' AND r.resolved_dst IS NOT NULL"
+                ))
                 .context("live_precision_sample_by_language: prepare")?;
             let rows = stmt
                 .query_map([], |row| {
@@ -13838,9 +13846,9 @@ mod tests {
                 "c",
                 "src/a.ts",
                 &[
-                    pending(caller.id, 3, "one"),
-                    pending(caller.id, 4, "two"),
-                    pending(caller.id, 5, "three"),
+                    pending(caller.id, 3, "callee"),
+                    pending(caller.id, 4, "callee"),
+                    pending(caller.id, 5, "callee"),
                 ],
             )
             .unwrap();
@@ -13859,6 +13867,58 @@ mod tests {
             2,
             "the two references Phase B said nothing about must stay pending"
         );
+    }
+
+    /// A site Phase B recorded for a *different* reference on the same line
+    /// (the field read in `x.bar.foo()`, or a second call) says nothing about
+    /// this one, so it must neither clear its pending row nor score its claim.
+    #[test]
+    fn another_reference_on_the_line_neither_clears_nor_scores_a_claim() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = live_node("c", "src/a.ts", "fn:caller", "function", 1);
+        let foo = live_node("c", "src/b.ts", "fn:foo", "function", 1);
+        let bar = live_node("c", "src/b.ts", "field:T.bar", "field", 30);
+        for n in [&caller, &foo, &bar] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(caller.id, bar.id, EdgeKind::RefField))
+            .unwrap();
+        store
+            .record_field_sites(&[(caller.id, bar.id, 5, None)])
+            .unwrap();
+
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 5, "foo")])
+            .unwrap();
+        assert_eq!(store.clear_resolved_pending_refs().unwrap(), 0);
+        assert_eq!(store.pending_ref_count().unwrap(), 1);
+
+        let claim = RefResolution {
+            state: "resolved",
+            resolved_dst: Some(foo.id),
+            ..pending(caller.id, 5, "foo")
+        };
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[claim])
+            .unwrap();
+        let sample = store.live_precision_sample().unwrap();
+        assert_eq!(
+            (sample.unverifiable, sample.disagree),
+            (1, 0),
+            "Phase B said nothing about `foo` here: {sample:?}"
+        );
+        let by_lang = store.live_precision_sample_by_language().unwrap();
+        assert_eq!(by_lang["typescript"].unverifiable, 1);
+
+        // Once Phase B records `foo` itself at that line, the pending row clears.
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 5, "foo")])
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, foo.id, 5, None)])
+            .unwrap();
+        assert_eq!(store.clear_resolved_pending_refs().unwrap(), 1);
     }
 
     /// `resolved_ref_count` tallies the live overlay's settled references, the

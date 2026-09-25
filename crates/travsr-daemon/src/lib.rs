@@ -2500,6 +2500,39 @@ fn lsif_covered_keys(
         .collect()
 }
 
+/// #810: narrow same-named bare-call candidates to the one the caller means:
+/// (1) a definition in the caller's own file, else (2) one in a file the caller
+/// imports (`depends → import → resolves-to → file`). Only ever narrows; an
+/// unbroken tie is returned unchanged for the CO-A1 uniqueness gate to drop.
+/// `resolves-to` exists only for relative imports (TS/JS `./` `../`, Rust
+/// `self::` `super::`, Python specifiers that map to an indexed file), so a
+/// call through an alias, a package specifier or `crate::` stays a tie.
+fn scope_bare_call<'a>(
+    caller_path: &str,
+    imported_files: &std::collections::HashSet<(String, String)>,
+    candidates: Vec<(travsr_core::NodeId, &'a str, &'a str)>,
+) -> Vec<(travsr_core::NodeId, &'a str, &'a str)> {
+    let same_file: Vec<_> = candidates
+        .iter()
+        .filter(|(_, path, _)| *path == caller_path)
+        .copied()
+        .collect();
+    if !same_file.is_empty() {
+        return same_file;
+    }
+    let imported: Vec<_> = candidates
+        .iter()
+        .filter(|(_, path, _)| {
+            imported_files.contains(&(caller_path.to_string(), (*path).to_string()))
+        })
+        .copied()
+        .collect();
+    if !imported.is_empty() {
+        return imported;
+    }
+    candidates
+}
+
 /// Write the result of one Phase B (SCIP) pass into `store`, returning a
 /// [`PhaseBReport`].
 ///
@@ -2758,6 +2791,9 @@ fn resolve_unresolved_calls(
         .into_iter()
         .map(|n| (n.id, n.vname.language))
         .collect();
+    // #810: (caller file, imported file) pairs, for scoping duplicated bare
+    // names. Loaded on the first such call only.
+    let mut imported_files: Option<std::collections::HashSet<(String, String)>> = None;
 
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
     let mut sites: Vec<SiteRow> = Vec::new();
@@ -2985,13 +3021,31 @@ fn resolve_unresolved_calls(
         } else {
             matches
         };
+        let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
+        // Bare `foo()` only: method, associated (`method:`) and `new` (`class:`)
+        // calls keep their existing resolution.
+        let bare_fn = !u.is_method_call && u.callee_sig.starts_with("fn:");
+        let filtered = if u.hint_crate.is_none() && bare_fn && filtered.len() > 1 {
+            let imported_files = imported_files.get_or_insert_with(|| {
+                store
+                    .file_import_pairs()
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("resolve_unresolved_calls: import pair lookup failed: {e}");
+                        Vec::new()
+                    })
+                    .into_iter()
+                    .collect()
+            });
+            scope_bare_call(caller_path, imported_files, filtered)
+        } else {
+            filtered
+        };
         // CO-A1: bare calls with no crate hint resolve to ALL same-named functions
         // across all crates → false edges that flood get_callers / blast_radius.
         // Only emit a RefCall when the match is unambiguous (exactly one candidate).
         if u.hint_crate.is_none() && filtered.len() != 1 {
             continue;
         }
-        let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
         for (dst, path, _lang) in filtered {
             // #521 F1/F2: never emit an edge the caller's own crate could not
             // possibly reach.
@@ -8217,6 +8271,77 @@ mod tests {
             "same-language call must resolve: {edges2:?}"
         );
         assert_eq!(edges2[0].dst, py_helper.id);
+    }
+
+    #[test]
+    fn duplicated_bare_name_resolves_to_same_file_definition_810() {
+        // #810: a name defined in two packages used to hit the CO-A1 gate and
+        // drop every call, even to a module-private helper in the caller's file.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let ts = "ts/src/security.ts";
+        let caller = Node::new(
+            VName::new("", "", ts, "typescript", "fn:resolveRoot"),
+            "function",
+        );
+        let ts_def = Node::new(
+            VName::new("", "", ts, "typescript", "fn:safeRealpath"),
+            "function",
+        );
+        let py_def = Node::new(
+            VName::new(
+                "",
+                "",
+                "py/src/security.ts",
+                "typescript",
+                "fn:safeRealpath",
+            ),
+            "function",
+        );
+        for n in [&caller, &ts_def, &py_def] {
+            store.put_node(n).unwrap();
+        }
+        let call = |src| travsr_core::UnresolvedCall {
+            src,
+            callee_sig: "fn:safeRealpath".to_string(),
+            alt_callee_sig: None,
+            hint_crate: None,
+            caller_line: 7,
+            caller_col: None,
+            is_method_call: false,
+            recv_type: None,
+        };
+        let none = std::collections::HashSet::new();
+
+        let (edges, sites) = resolve_unresolved_calls(&store, &[call(caller.id)], &[], &[], &none);
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        assert_eq!(edges[0].dst, ts_def.id);
+        assert_eq!(sites.len(), 1);
+
+        // A caller in neither file, importing neither, is still ambiguous: dropped.
+        let other = Node::new(
+            VName::new("", "", "app/main.ts", "typescript", "fn:run"),
+            "function",
+        );
+        store.put_node(&other).unwrap();
+        let (edges, _) = resolve_unresolved_calls(&store, &[call(other.id)], &[], &[], &none);
+        assert!(edges.is_empty(), "{edges:?}");
+    }
+
+    #[test]
+    fn scope_bare_call_prefers_imported_file_and_leaves_ties_810() {
+        let cands = vec![
+            (travsr_core::NodeId(1), "ts/src/security.ts", "typescript"),
+            (travsr_core::NodeId(2), "py/src/security.ts", "typescript"),
+        ];
+        let caller = "ts/src/walker.ts";
+        let imports: std::collections::HashSet<(String, String)> =
+            [(caller.to_string(), "ts/src/security.ts".to_string())].into();
+        let out = scope_bare_call(caller, &imports, cands.clone());
+        assert_eq!(out, vec![cands[0]]);
+
+        let out = scope_bare_call(caller, &std::collections::HashSet::new(), cands.clone());
+        assert_eq!(out, cands, "no same-file or import match must not narrow");
     }
 
     // ── #449 regression: full Phase A + Phase B pipeline for Swift ──────────
