@@ -254,18 +254,20 @@ fn extract_file_edges(
                 let occ_line = cap.node.start_position().row.saturating_add(1) as u32;
                 let occ_col = cap.node.start_position().column as u32;
 
-                let Some((caller_fn, caller_class)) =
-                    find_enclosing_fn_ts(cap.node, source.as_slice())
-                else {
-                    continue;
-                };
-
-                let caller_id = match &caller_class {
-                    Some(c) => {
-                        ts_vname(corpus, vname_path, &format!("method:{c}.{caller_fn}")).id()
-                    }
-                    None => ts_vname(corpus, vname_path, &format!("fn:{caller_fn}")).id(),
-                };
+                // A call in no function (a script, module-level code) hangs from
+                // the file node, as Phase B attributes script calls.
+                let (caller_id, caller_class) =
+                    match find_enclosing_fn_ts(cap.node, source.as_slice()) {
+                        Some((caller_fn, Some(c))) => (
+                            ts_vname(corpus, vname_path, &format!("method:{c}.{caller_fn}")).id(),
+                            Some(c),
+                        ),
+                        Some((caller_fn, None)) => (
+                            ts_vname(corpus, vname_path, &format!("fn:{caller_fn}")).id(),
+                            None,
+                        ),
+                        None => (ts_vname(corpus, vname_path, "file").id(), None),
+                    };
 
                 // E4: emit an UnresolvedCall (fail-closed, resolved against the
                 // real node table by the daemon) instead of a same-file leaf
@@ -876,6 +878,29 @@ class App {
         );
         assert_eq!(refs.len(), 2, "exactly the two clauses, no more: {refs:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_top_level_call_is_attributed_to_the_file() {
+        // A script's calls sit in no function. Phase B hangs them on the
+        // `file` node; skipping them left a script with no live targets.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.ts");
+        std::fs::write(&path, "const zoo = new Zoo();\nzoo.announceAll();\n").unwrap();
+        let files = vec![(path, "src/main.ts".to_string())];
+        let (_nodes, _edges, unresolved) =
+            extract_native_phase_b("c", dir.path(), Some(&files)).unwrap();
+        let file_id = ts_vname("c", "src/main.ts", "file").id();
+        assert!(
+            unresolved
+                .iter()
+                .any(|u| u.src == file_id && u.callee_sig.ends_with("announceAll")),
+            "got {:?}",
+            unresolved
+                .iter()
+                .map(|u| (&u.callee_sig, u.src == file_id))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
