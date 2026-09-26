@@ -4923,10 +4923,11 @@ const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
 ///   oracle, 1.0000 (`11,0,0`) on the live-lane fixture.
 /// - `php` — Intelephense live, scip-php as the oracle, 1.0000 (`6,0,0`) on the
 ///   live-lane fixture once it has a `composer.json` and `composer install` ran.
+/// - `c`, `objectivec` — clangd live, travsr-lang v0.6.0 as the oracle,
+///   1.0000 (`12,0,0` and `4,0,0`) on the live-lane fixture. The earlier
+///   `0,0,2` unverifiable reading (no matching `edge_sites`) no longer reproduces.
 ///
 /// Deliberately absent:
-/// - `c`, `objectivec` — edges ratify correctly but scip-clang writes no
-///   matching `edge_sites`, so the meter reads `0,0,2` unverifiable (§10 item 4).
 /// - `ruby` — the LSP lane is fundamentally weak: an untyped receiver
 ///   (`def run(s); s.start; end`) gives ruby-lsp nothing to resolve, so it
 ///   abstains. This is the §8.4 dynamic-language limit, not an install gap.
@@ -4953,6 +4954,8 @@ const LIVE_LANE_SHIPPED: &[(&str, u64)] = &[
     ("csharp", 6),
     ("kotlin", 11),
     ("php", 6),
+    ("c", 12),
+    ("objectivec", 4),
 ];
 
 /// Force-enable a language for measurement, bypassing the strict opt-in gate
@@ -10674,7 +10677,7 @@ mod tests {
         assert!(live_lane_enabled_for(&store, "scala"));
         assert!(live_lane_enabled_for(&store, "ruby"));
         assert!(
-            !live_lane_enabled_for(&store, "c"),
+            !live_lane_enabled_for(&store, "lua"),
             "the force list is per-language, not a blanket override"
         );
         std::env::remove_var("TRAVSR_LIVE_LANE_MEASURE");
