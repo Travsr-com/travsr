@@ -70,8 +70,8 @@ identity is the GitHub Actions OIDC token issued for this repository's
 
 ```sh
 # Install cosign: https://docs.sigstore.dev/cosign/system_config/installation/
-# Works the same for any channel: stable (1.2.0), rc (1.2.0-rc.1), or beta (1.2.0-beta.1).
-VERSION=1.2.0
+# Works the same for any channel: stable (1.2.1), rc (1.2.1-rc.1), or beta (1.2.1-beta.1).
+VERSION=1.2.1
 TARGET=x86_64-unknown-linux-gnu
 
 # Download tarball and bundle from the GitHub release
