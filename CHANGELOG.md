@@ -4,6 +4,39 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v1.2.0 - 2026-09-26
+
+> Install with `npm i -g @travsr.com/travsr` or
+> `curl -fsSL https://travsr.com/install.sh | sh`.
+>
+> A fresh build from `master`, carrying everything merged since `v1.1.1`.
+> Ships alongside VS Code extension 0.12.1, which offers this release when no
+> `travsr` binary resolves.
+
+### Added
+
+- **`travsr guard`, a PreToolUse handler that redirects a search to the graph (#916).** Wired into `.claude/settings.json` by `init --guard[=strict]` or `connect --guard[=strict]`, it runs at the moment an agent reaches for text search and either names the Travsr call that answers the same question (advisory) or refuses and names it (strict). It ships inside the binary rather than as a hand-written script, is fail-open by construction (no index, an unreadable payload, a missed deadline, or anything it does not recognise all let the call through), and strict mode is bounded so an agent that queries the graph and still needs to grep can never be blocked twice for the same symbol in a session. A follow-up closed a real gap where advisory mode could still emit the host's auto-approve decision for a whole-file read it had no standing to vouch for (out-of-repo paths, `.env`, lockfiles); advisory now only ever adds context, never a decision.
+- **`travsr invariants`, a command that checks declared architecture rules on every commit.** It reads `architecture-invariants.json` from the repository root and evaluates dependency and cycle rules against the graph, exiting non-zero on a violation so it works as a CI gate. A rule naming a component the graph no longer has is reported as VIOLATED rather than skipped, and an unrecognised `--provenance` filter is now rejected instead of silently matching zero edges and reporting a green gate.
+- **`get_architecture_brief` and `get_subsystem_brief`, two new MCP tools.** The first returns components, weighted dependency edges, layering and cycles for the whole repository; the second walks the call graph from one entry point and returns who calls in, the spine by depth, and every call that crosses the component boundary. Both share one definition of "component" and one type-detection rule, so they and `get_repo_map` cannot disagree with each other the way three separate implementations used to. Both take a `token_budget` and disclose how many items a capped list dropped rather than truncating mid-line.
+- **The Android SDK is granted to Java and Kotlin analyzers, but only for repositories that build with the Android Gradle Plugin (#904).** Previously an AGP build failed with "SDK location not found" and the analyzer produced no symbols with no explanation; now the SDK is read from `ANDROID_HOME`, `ANDROID_SDK_ROOT`, or the IDE's default install location (never from repository content such as `local.properties`, to avoid a repo naming an arbitrary path), and the grant is skipped entirely for a plain Gradle or Maven build so it costs nothing on machines that never touch it. Sidecar diagnostics that used to be logged and dropped now persist and print in `travsr init` and `travsr status`, so a degraded analyzer run says why.
+
+### Fixed
+
+- **`find_references` returned nothing for a duplicated bare name (#810).** A TypeScript or Python function whose name is defined more than once, including a module-private helper called only in its own file, was dropped entirely by the uniqueness gate. A bare call now narrows its candidates to the definition in the caller's own file, then to one in a file the caller imports, before that gate applies.
+- **Several Phase B cross-file resolution bugs that produced wrong edges.** A trait or impl that only encloses a required method's definition is no longer treated as its callee (`self.name()` stopped resolving to `trait:Animal`). Scala `var` accessors and Kotlin properties now unify onto the same field Phase A already recorded, instead of being counted as orphan methods. JVM and Kotlin constructors are recognized and unified with their class instead of being silently dropped. A reference to a parameter type, supertype, or generic argument is no longer flagged `is_call: true` in languages whose emitters mark every occurrence that way. Cross-file unification is now scoped to the definition's own language family, so a Scala definition with no Scala counterpart can no longer alias onto an unrelated Ruby method. The Scala analyzer now runs at its `build.sbt` root instead of the repository root, so paths in a `scala/` subdirectory resolve correctly.
+- **Two index rebuild bugs that could leave a corrupted or permanently unrecoverable graph (#918).** Rebuilding an older-format index used to fail outright with a UNIQUE constraint violation, because the purge could only see paths the `files` table still tracked; a full purge now clears the graph outright over every table the live schema declares. A rebuild that failed after the purge used to leave the database readable as "up to date, 0 nodes" forever, with no way to recover; the format-skew check now also looks at whether any file hash survived, so the next `travsr init` heals it with no user action required.
+- **`get_execution_path` conflated the call chain with its surrounding neighborhood.** The route and the corridor around it are now rendered and labeled separately, and the header counts hops instead of nodes spanned.
+- **`get_repo_map` and `get_graph_json`'s overview ranked components by transitive reverse reachability**, which saturates on a funnel-shaped graph (a component with one consumer could outrank one with fifteen). Both now rank by distinct regions with a direct edge in.
+- **The graph overview ignored its own `--provenance` filter**, so a caller asking for ratified ground truth was handed the unratified live overlay anyway.
+
+### Release and CI
+
+- Several test flakes and CI-only failures fixed: a guard timeout test that raced its own deadline instead of forcing it, a plugin-host version-probe test that inherited a real subprocess's timing instead of testing the decision logic directly, and a clippy warning from a discarded loop binding.
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v1.1.1...v1.2.0
+
+---
+
 ## v1.1.1 - 2026-09-20
 
 > Install with `npm i -g @travsr.com/travsr` or
