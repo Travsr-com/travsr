@@ -3058,9 +3058,14 @@ impl SqliteStore {
 
             // The NodeIds this parse produced. Computed up front so the
             // pure-body-edit test and the preserved set are known before any
-            // delete.
-            let new_ids: std::collections::HashSet<i64> =
-                nodes.iter().map(|n| node_id_to_i64(n.id)).collect();
+            // delete. Only this file's own, as `old_ids` reads them: a node the
+            // parse stores under another path (Go's per-directory package) is
+            // not one of them.
+            let new_ids: std::collections::HashSet<i64> = nodes
+                .iter()
+                .filter(|n| n.vname.path == path)
+                .map(|n| node_id_to_i64(n.id))
+                .collect();
 
             // RFC-027 #813 Mechanism A: the set of definitions whose committed
             // owned edges/sites survive this reparse untouched.
@@ -3073,7 +3078,12 @@ impl SqliteStore {
             // still correct and re-deriving them is pure waste. Any doubt keeps
             // the set empty and the code below purges the whole file, exactly as
             // before this change.
-            let mut preserved: std::collections::HashSet<i64> = match content {
+            // `edited`: definitions whose stored body hash provably differs from
+            // the current one (I0 keeps their still-called edges, below).
+            let (mut preserved, edited): (
+                std::collections::HashSet<i64>,
+                std::collections::HashSet<i64>,
+            ) = match content {
                 Some(text) if old_ids == new_ids => {
                     // Body hashes stored for this file's definitions at their last
                     // (re)resolution, and the hashes the current text produces.
@@ -3099,14 +3109,22 @@ impl SqliteStore {
                             .iter()
                             .filter_map(|n| n.line.map(|l| (node_id_to_i64(n.id), l, n.end_line))),
                     );
-                    stored
+                    let (same, differ): (Vec<_>, Vec<_>) = stored
                         .iter()
-                        .filter(|(id, hash)| current.get(*id) == Some(*hash))
-                        .map(|(id, _)| *id)
-                        .collect()
+                        .filter(|(id, _)| current.contains_key(*id))
+                        .partition(|(id, hash)| current.get(*id) == Some(*hash));
+                    (
+                        same.into_iter().map(|(id, _)| *id).collect(),
+                        differ.into_iter().map(|(id, _)| *id).collect(),
+                    )
                 }
-                _ => std::collections::HashSet::new(),
+                _ => Default::default(),
             };
+            // A type-level definition's edit invalidates the whole file (rule 1
+            // below), so no edge of it is kept either.
+            let type_level_edit = nodes.iter().any(|n| {
+                TYPE_LEVEL_KINDS.contains(&n.kind.as_str()) && edited.contains(&node_id_to_i64(n.id))
+            });
 
             // RFC-027 #813 (finding 1): a byte-identical body proves the
             // definition's own text is unchanged, NOT that the *types* its
@@ -3290,6 +3308,113 @@ impl SqliteStore {
                 rows
             };
 
+            // I0: an EDITED definition's committed edge whose callee's name still
+            // appears in its new body is kept. The whole-set purge left a
+            // language with no live lane (or no editor) with fewer edges than
+            // before the edit until the next commit (Kotlin 8/8 -> 0/8 on a
+            // comment). Same precondition as Mechanism A: a pure body edit. Only
+            // committed truth (`scip`/`lsif`) is kept; tree-sitter edges are
+            // re-derived by this parse and live edges by the lane. A call the edit
+            // removed loses its name, and so its edge.
+            let kept: Vec<(i64, i64, String)> = match content {
+                Some(text) if old_ids == new_ids && !type_level_edit => {
+                    let lines: Vec<&str> = text.lines().collect();
+                    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+                    let mut words: HashMap<i64, std::collections::HashSet<&str>> = nodes
+                        .iter()
+                        .filter(|n| edited.contains(&node_id_to_i64(n.id)))
+                        .filter_map(|n| {
+                            let start = n.line? as usize;
+                            let end = n.end_line.unwrap_or(n.line?) as usize;
+                            let body = lines.get(start.checked_sub(1)?..end.min(lines.len()))?;
+                            let set = body
+                                .iter()
+                                .flat_map(|l| l.split(|c: char| !is_word(c)))
+                                .filter(|w| !w.is_empty())
+                                .collect();
+                            Some((node_id_to_i64(n.id), set))
+                        })
+                        .collect();
+                    // A script's top-level calls hang from the file node, which
+                    // has no body hash. Its "body" is the lines outside every
+                    // definition, so a name now used only inside a function does
+                    // not keep a top-level edge.
+                    if let Some(file) = nodes.iter().find(|n| n.kind == "file") {
+                        // Only a body masks its lines; a global, field or
+                        // import is itself a top-level statement (`let zoo =
+                        // Zoo()`), so it must not hide the call it holds.
+                        let spans: Vec<(usize, usize)> = nodes
+                            .iter()
+                            .filter(|n| {
+                                !matches!(
+                                    n.kind.as_str(),
+                                    "file" | "variable" | "field" | "import" | "constant"
+                                )
+                            })
+                            .filter_map(|n| {
+                                Some((n.line? as usize, n.end_line.unwrap_or(n.line?) as usize))
+                            })
+                            .collect();
+                        let top_level = lines
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| !spans.iter().any(|(a, b)| (*a..=*b).contains(&(i + 1))))
+                            .flat_map(|(_, l)| l.split(|c: char| !is_word(c)))
+                            .filter(|w| !w.is_empty())
+                            .collect();
+                        words.insert(node_id_to_i64(file.id), top_level);
+                    }
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT e.src, e.dst, e.kind, d.signature FROM edges e \
+                             JOIN nodes d ON d.id = e.dst \
+                             WHERE e.src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2) \
+                               AND e.kind LIKE 'ref/%' AND e.provenance IN ('scip', 'lsif')",
+                        )
+                        .context("preparing kept-edge candidates")?;
+                    let rows: Vec<(i64, i64, String, String)> = stmt
+                        .query_map(params![corpus, path], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                        })
+                        .context("executing kept-edge candidates")?
+                        .collect::<rusqlite::Result<_>>()
+                        .context("collecting kept-edge candidates")?;
+                    // Rule 2's dependency, applied to the edited: a definition
+                    // referencing another edited one may resolve through a type
+                    // that edit changed (`make().run()` after `make`'s return
+                    // type moved), so it keeps nothing.
+                    let through_edited: std::collections::HashSet<i64> = rows
+                        .iter()
+                        .filter(|(src, dst, _, _)| src != dst && edited.contains(dst))
+                        .map(|(src, _, _, _)| *src)
+                        .collect();
+                    rows.into_iter()
+                        .filter(|(src, _, _, _)| !through_edited.contains(src))
+                        .filter(|(src, _, _, sig)| {
+                            // An Objective-C selector is spelled apart; its first
+                            // keyword is the word that appears.
+                            let leaf = travsr_core::ident::leaf_of(sig);
+                            let leaf = leaf.split(':').next().unwrap_or(leaf);
+                            words.get(src).is_some_and(|w| w.contains(leaf))
+                        })
+                        .map(|(src, dst, kind, _)| (src, dst, kind))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            tx.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS _kept_edges(src INTEGER, dst INTEGER, kind TEXT); \
+                 DELETE FROM _kept_edges;",
+            )
+            .context("creating _kept_edges temp table")?;
+            for (src, dst, kind) in &kept {
+                tx.execute(
+                    "INSERT INTO _kept_edges(src, dst, kind) VALUES(?1, ?2, ?3)",
+                    params![src, dst, kind],
+                )
+                .context("inserting kept edge")?;
+            }
+
             // RFC-027 #813: hold the preserved definitions in a temp table so the
             // owned-edge and owned-site deletes can exclude them without a bound
             // parameter per id (a hot utility can have thousands). Always present
@@ -3349,7 +3474,10 @@ impl SqliteStore {
             tx.execute(
                 "DELETE FROM edges \
                  WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2) \
-                   AND src NOT IN (SELECT id FROM _preserved_src)",
+                   AND src NOT IN (SELECT id FROM _preserved_src) \
+                   AND NOT EXISTS (SELECT 1 FROM _kept_edges k \
+                                   WHERE k.src = edges.src AND k.dst = edges.dst \
+                                     AND k.kind = edges.kind)",
                 params![corpus, path],
             )
             .context("deleting owned edges for reindex_replace")?;
@@ -4283,8 +4411,10 @@ FROM nodes";
             if lang.is_some() {
                 sql.push_str("\n  AND language = ?2");
             }
+            // Ties break on the name, not the NodeId: the id hashes the corpus
+            // (the checkout's directory), so id order changed with it.
             sql.push_str(&format!(
-                "\nORDER BY rank ASC, id ASC\nLIMIT {NODE_NAME_SEARCH_LIMIT}"
+                "\nORDER BY rank ASC, path ASC, signature ASC, id ASC\nLIMIT {NODE_NAME_SEARCH_LIMIT}"
             ));
 
             let mut stmt = self.conn.prepare(&sql).context("preparing search query")?;
@@ -7120,12 +7250,34 @@ LIMIT ?4",
 
             let mut out: Vec<String> = Vec::new();
             let mut seen = std::collections::HashSet::new();
+            // The files each candidate's imports resolve to: `depends` straight
+            // to a file (Go), or through an import node's `resolves-to`.
+            let mut imports = self
+                .conn
+                .prepare_cached(
+                    "SELECT DISTINCT t.path FROM nodes f \
+                     JOIN edges d ON d.src = f.id AND d.kind = 'depends' \
+                     JOIN nodes i ON i.id = d.dst \
+                     LEFT JOIN edges r ON r.src = i.id AND r.kind = 'resolves-to' \
+                     JOIN nodes t ON t.id = COALESCE(r.dst, i.id) AND t.kind = 'file' \
+                     WHERE f.corpus = ?1 AND f.path = ?2 AND f.kind = 'file'",
+                )
+                .context("dependents_pending_on_file: prepare imports")?;
             for row in rows {
                 let (dep_path, name) = row.context("decoding dependents_pending_on_file row")?;
-                if !leaves.contains(&name) {
+                if !leaves.contains(&name) || seen.contains(&dep_path) {
                     continue;
                 }
-                if seen.insert(dep_path.clone()) {
+                seen.insert(dep_path.clone());
+                // A file whose imports resolve depends on the saved file only by
+                // importing it; a shared leaf name elsewhere (a `.js` twin tagged
+                // `typescript`) is not one. With none resolved, the name decides.
+                let resolved: Vec<String> = imports
+                    .query_map(params![corpus, dep_path], |row| row.get(0))
+                    .context("dependents_pending_on_file: query imports")?
+                    .collect::<rusqlite::Result<_>>()
+                    .context("dependents_pending_on_file: collect imports")?;
+                if resolved.is_empty() || resolved.iter().any(|t| t == path) {
                     out.push(dep_path);
                     // Rows arrive in path order, so the cap can stop the scan
                     // instead of being applied after a full evaluation.
@@ -7352,6 +7504,20 @@ LIMIT ?4",
         line: u32,
     ) -> Result<Option<NodeId>, StoreError> {
         self.enclosing_node_at(corpus, path, line, ENCLOSING_DEFINITION_KINDS)
+    }
+
+    /// The file node of `(corpus, path)`: the source Phase B gives a reference
+    /// at top level, outside every definition (`file_node_for_attribution`).
+    pub fn file_node_at(&self, corpus: &str, path: &str) -> Result<Option<NodeId>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id FROM nodes WHERE corpus = ?1 AND path = ?2 AND kind = 'file' LIMIT 1",
+                params![corpus, path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|id| id.map(i64_to_node_id))
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// The tightest node whose span contains `line`, restricted to `kinds`.
@@ -12883,6 +13049,144 @@ mod tests {
         );
     }
 
+    /// I0: an edited definition's committed edge survives the save while the
+    /// callee's name still appears in its body. Dropping them all left a
+    /// language with no live lane (or no editor) with fewer edges than before
+    /// the edit, until the next commit. A call the edit removed still loses its
+    /// edge (the test above).
+    #[test]
+    fn reindex_replace_keeps_an_edited_definitions_edge_while_it_still_calls() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "a.rs", "rust", sig),
+                "function",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        let a = mk("fn:a", 1, 3);
+        let x = mk("fn:x", 5, 6);
+        let y = mk("fn:y", 8, 9);
+        let nodes = vec![a.clone(), x.clone(), y.clone()];
+        let v1 = "fn a() {\n  x(); y();\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
+        store
+            .reindex_replace("c", "a.rs", &nodes, &[], "h1", Some(v1))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(a.id, x.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(a.id, y.id, EdgeKind::RefCall))
+            .unwrap();
+
+        // v2: a's body changes (a comment added, `y()` removed), `x()` stays.
+        let v2 = "fn a() {\n  x(); // tweak\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
+        store
+            .reindex_replace("c", "a.rs", &nodes, &[], "h2", Some(v2))
+            .unwrap();
+
+        assert_eq!(edge_provenance(&store, a.id, x.id).as_deref(), Some("lsif"));
+        assert_eq!(edge_provenance(&store, a.id, y.id), None);
+    }
+
+    /// A parse can emit a node stored under another path: Go's package node
+    /// lives at the directory so every file of the package shares it. It is not
+    /// one of this file's nodes, so it must not make a body edit look like a
+    /// changed symbol set (every Go save purged the whole file, 8/8 -> 0/8).
+    #[test]
+    fn reindex_replace_keeps_an_edge_when_the_parse_also_emits_a_directory_node() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "go/main.go", "go", sig),
+                "function",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        let main = mk("fn:main", 1, 3);
+        let x = mk("fn:x", 5, 6);
+        let pkg = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "go", "go", "go-pkg:go/main"),
+            "go-pkg",
+        );
+        let nodes = vec![main.clone(), x.clone(), pkg];
+        let v1 = "func main() {\n  x()\n}\n\nfunc x() {\n}\n";
+        store
+            .reindex_replace("c", "go/main.go", &nodes, &[], "h1", Some(v1))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(main.id, x.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let v2 = "func main() {\n  x() // tweak\n}\n\nfunc x() {\n}\n";
+        store
+            .reindex_replace("c", "go/main.go", &nodes, &[], "h2", Some(v2))
+            .unwrap();
+
+        assert_eq!(
+            edge_provenance(&store, main.id, x.id).as_deref(),
+            Some("lsif")
+        );
+    }
+
+    /// I0, scripts: a top-level call hangs from the file node, which has no
+    /// body hash, so its committed edges were always purged on save (Ruby
+    /// `main.rb` 8/8 -> 0/8). They are kept while the callee's name still
+    /// appears on a top-level line; a name now used only inside a function does
+    /// not count.
+    #[test]
+    fn reindex_replace_keeps_a_scripts_edge_while_it_still_calls_at_top_level() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let file = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "main.rb", "ruby", "file"),
+            "file",
+        );
+        let mk = |sig: &str, line: u32, end: u32| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "main.rb", "ruby", sig),
+                "method",
+            )
+            .with_line(line)
+            .with_end_line(end)
+        };
+        let helper = mk("method:Object.helper", 4, 6);
+        let x = mk("method:X.x", 8, 8);
+        let y = mk("method:Y.y", 9, 9);
+        // A global on the top-level call's own line (`zoo = x()`) is a
+        // statement, not a body, so it must not hide the call.
+        let global = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "main.rb", "ruby", "var:zoo"),
+            "variable",
+        )
+        .with_line(1)
+        .with_end_line(1);
+        let nodes = vec![file.clone(), helper.clone(), x.clone(), y.clone(), global];
+        let v1 = "zoo = x()\ny()\n\ndef helper\n  1\nend\n\ndef x; end\ndef y; end\n";
+        store
+            .reindex_replace("c", "main.rb", &nodes, &[], "h1", Some(v1))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(file.id, x.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge_lsif(&Edge::new(file.id, y.id, EdgeKind::RefCall))
+            .unwrap();
+
+        // v2: the top-level `y()` moves inside `helper`; `x()` stays top level.
+        let v2 = "zoo = x() # edited\n\n\ndef helper\n  y()\nend\n\ndef x; end\ndef y; end\n";
+        store
+            .reindex_replace("c", "main.rb", &nodes, &[], "h2", Some(v2))
+            .unwrap();
+
+        assert_eq!(
+            edge_provenance(&store, file.id, x.id).as_deref(),
+            Some("lsif")
+        );
+        assert_eq!(edge_provenance(&store, file.id, y.id), None);
+    }
+
     /// RFC-027 #813 P2: on a body edit, `reindex_replace` captures the CHANGED
     /// definition's committed occurrences (for the live lane to enumerate as
     /// editor targets) and NOT the preserved definitions', carrying each
@@ -13718,9 +14022,10 @@ mod tests {
                 .unwrap();
 
             for (i, h) in hs.iter().enumerate() {
-                // A caller keeps its committed edge iff its own body is unchanged
-                // AND the callee it resolves through is unchanged.
-                let preserved = !make_mutated && !edited[i];
+                // A caller keeps its committed edge iff the callee it resolves
+                // through is unchanged. Its own body edit alone no longer drops
+                // it (I0): every edited body here still calls `make().run()`.
+                let preserved = !make_mutated;
                 let expected = if preserved { Some("lsif") } else { None };
                 assert_eq!(
                     edge_provenance(&store, h.id, xrun.id).as_deref(),
@@ -14629,6 +14934,63 @@ mod tests {
         );
     }
 
+    /// A name match alone crossed projects: `.js` files are tagged
+    /// `typescript`, so saving `typescript/src/animal.ts` named
+    /// `javascript/src/main.js` a dependent though it imports only its own
+    /// `animal.js`. A file whose imports resolve must import the saved one; a
+    /// file with none resolved keeps the name match.
+    #[test]
+    fn a_dependent_that_resolves_its_imports_must_import_the_saved_file() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let file = |path: &str| live_node("c", path, "file", "file", 1);
+        let saved = file("typescript/src/animal.ts");
+        let def = live_node(
+            "c",
+            "typescript/src/animal.ts",
+            "method:Zoo.add",
+            "method",
+            3,
+        );
+        let js_animal = file("javascript/src/animal.js");
+        let mut nodes = vec![saved.clone(), def, js_animal.clone()];
+        let mut edges = Vec::new();
+        let mut pendings = Vec::new();
+        for (path, target) in [
+            ("javascript/src/main.js", Some(&js_animal)),
+            ("typescript/src/main.ts", Some(&saved)),
+            ("typescript/src/loose.ts", None),
+        ] {
+            let f = file(path);
+            let caller = live_node("c", path, "fn:run", "function", 2);
+            if let Some(target) = target {
+                let import = live_node("c", path, "import:./animal", "import", 1);
+                edges.push(Edge::new(f.id, import.id, EdgeKind::Depends));
+                edges.push(Edge::new(import.id, target.id, EdgeKind::ResolvesTo));
+                nodes.push(import);
+            }
+            pendings.push((path, caller.id));
+            nodes.push(f);
+            nodes.push(caller);
+        }
+        store
+            .write_phase_b_batch(&nodes, &edges, "tree-sitter")
+            .unwrap();
+        for (path, caller) in pendings {
+            store
+                .replace_ref_resolution_states("c", path, &[pending(caller, 4, "add")])
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .dependents_pending_on_file("c", "typescript/src/animal.ts", "typescript", 32)
+                .unwrap(),
+            vec![
+                "typescript/src/loose.ts".to_string(),
+                "typescript/src/main.ts".to_string()
+            ]
+        );
+    }
+
     /// Finding 4: the meter is cumulative, so a claim it has scored has to be
     /// retired or every later commit counts it again.
     #[test]
@@ -14933,6 +15295,37 @@ mod tests {
         let results = store.search_nodes_by_name("charge").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].vname.signature, "fn:charge");
+    }
+
+    /// Equal-rank matches must not be ordered by NodeId: it hashes the corpus,
+    /// which is the checkout's directory name (`local/<dir>`), so the same code
+    /// picked a different anchor for a tie in another directory (bench hit@1
+    /// 0.375 in two directories, 0.333 in a third).
+    #[test]
+    fn search_orders_equal_rank_matches_the_same_in_every_corpus() {
+        let order = |corpus: &str| {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            for (path, sig) in [("src/a.rs", "fn:make_token"), ("src/b.rs", "fn:token_at")] {
+                store
+                    .put_node(&Node::new(
+                        VName::new(corpus, "", path, "rust", sig),
+                        "function",
+                    ))
+                    .unwrap();
+            }
+            store
+                .search_nodes_by_name("token")
+                .unwrap()
+                .into_iter()
+                .map(|n| n.vname.signature)
+                .collect::<Vec<_>>()
+        };
+        let first = order("local/a");
+        for corpus in [
+            "local/b", "local/c", "local/d", "local/e", "local/f", "local/g",
+        ] {
+            assert_eq!(order(corpus), first, "{corpus}");
+        }
     }
 
     #[test]

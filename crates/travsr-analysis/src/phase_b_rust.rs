@@ -435,18 +435,18 @@ fn extract_file_call_edges(
                             // in another file, so a path-bound guessed id orphaned.
                             // Emit an UnresolvedCall with the precise qualified sig and
                             // let the daemon match `fn:{Type}.{method}` across all files.
-                            if !NOISE_NAMES.contains(&callee_name) {
-                                unresolved.push(UnresolvedCall {
-                                    src: caller_id,
-                                    callee_sig: format!("method:{qual}.{callee_name}"),
-                                    alt_callee_sig: None,
-                                    hint_crate: None,
-                                    caller_line: occ_line,
-                                    caller_col: Some(occ_col),
-                                    is_method_call: false,
-                                    recv_type: None,
-                                });
-                            }
+                            // No NOISE_NAMES filter here: the type makes even `new` or
+                            // `from` precise, and `Box::new` names no repo node.
+                            unresolved.push(UnresolvedCall {
+                                src: caller_id,
+                                callee_sig: format!("method:{qual}.{callee_name}"),
+                                alt_callee_sig: None,
+                                hint_crate: None,
+                                caller_line: occ_line,
+                                caller_col: Some(occ_col),
+                                is_method_call: false,
+                                recv_type: None,
+                            });
                         }
                         Some(ref qual) => {
                             // Lowercase qualifier → likely a crate/module path; emit UnresolvedCall
@@ -1274,6 +1274,24 @@ mod tests {
             at(offset).1,
             (offset - lit[..offset].rfind('\n').unwrap() - 1) as u32
         );
+    }
+
+    #[test]
+    fn type_qualified_constructor_is_emitted_despite_its_noise_leaf() {
+        // `new` is noise as a bare or method-call leaf, but `Dog::new()` names
+        // its type, so `method:Dog.new` is precise. Dropping it lost every
+        // constructor call mid-edit. `Box::new` still names no repo node.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.rs");
+        std::fs::write(
+            &path,
+            "fn main() {\n    let d = Dog::new();\n    let b = Box::new(1);\n}\n",
+        )
+        .unwrap();
+        let files = vec![(path, "src/main.rs".to_string())];
+        let (_, _, unresolved, _) = extract_native_phase_b("c", dir.path(), Some(&files)).unwrap();
+        let sigs: Vec<&str> = unresolved.iter().map(|u| u.callee_sig.as_str()).collect();
+        assert!(sigs.contains(&"method:Dog.new"), "got {sigs:?}");
     }
 
     #[test]

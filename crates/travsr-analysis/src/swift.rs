@@ -19,9 +19,11 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (protocol_declaration name: (type_identifier) @protocol.name)
 (typealias_declaration name: (type_identifier) @typealias.name)
 (function_declaration name: (simple_identifier) @fn.name)
+(protocol_function_declaration name: (simple_identifier) @fn.name)
 (init_declaration "init" @init.name)
 (import_declaration)  @import
 (class_body (property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name)))
+(source_file (property_declaration name: (pattern bound_identifier: (simple_identifier) @global.name)))
 (enum_class_body (property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name)))
 (function_declaration
   (modifiers (attribute (user_type (type_identifier) @_swa)))
@@ -57,6 +59,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         // now maps `Type.name` field references onto `field:Type.name`
         // (candidate_signatures, #757).
         ("var.name", "field", "field"),
+        // A script's top-level `let`/`var` is a global (`var:zoo`), matching the
+        // Swift emitter's `swift::zoo` definition so it unifies instead of
+        // orphaning.
+        ("global.name", "variable", "var"),
     ],
     method_containers: &[
         ("class_declaration", "class"),
@@ -102,6 +108,76 @@ mod tests {
         assert_eq!(by_sig.get("actor:A"), Some(&"actor"));
         assert_eq!(by_sig.get("extension:X"), Some(&"extension"));
         assert_eq!(by_sig.get("class:P"), Some(&"protocol"));
+    }
+
+    #[test]
+    fn protocol_requirement_is_a_method_of_the_protocol() {
+        // `func speak() -> String` inside `protocol Animal` has no body. With no
+        // node, an editor answer landing on it (dynamic dispatch through the
+        // protocol) mapped to nothing and was refused.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.swift");
+        std::fs::write(&path, "protocol Animal {\n    func speak() -> String\n}\n").unwrap();
+        let out = parse("corp", &path, "a.swift").unwrap();
+        let speak = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:Animal.speak")
+            .unwrap_or_else(|| {
+                panic!(
+                    "got {:?}",
+                    out.nodes
+                        .iter()
+                        .map(|n| &n.vname.signature)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!((speak.line, speak.end_line), (Some(2), Some(2)));
+    }
+
+    #[test]
+    fn a_protocol_default_keeps_its_body_span_over_the_requirement() {
+        // `func describe()` required in the protocol and implemented in its
+        // extension share `method:Animal.describe`. The node must span the
+        // default's body, where a call resolves; the requirement's one line took
+        // over and the editor's answer on the body mapped to nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.swift");
+        std::fs::write(
+            &path,
+            "protocol Animal {\n    func describe() -> String\n}\n\nextension Animal {\n    func describe() -> String {\n        return \"\"\n    }\n}\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "a.swift").unwrap();
+        let describe: Vec<_> = out
+            .nodes
+            .iter()
+            .filter(|n| n.vname.signature == "method:Animal.describe")
+            .map(|n| (n.line, n.end_line))
+            .collect();
+        assert_eq!(describe, vec![(Some(6), Some(8))]);
+    }
+
+    #[test]
+    fn a_top_level_variable_is_a_var_node() {
+        // A script's `let zoo = Zoo()` is a global the Swift emitter defines
+        // (`swift::zoo`). With no Phase A twin it survived as an orphan, and the
+        // file's node set never matched a fresh parse, so every save purged its
+        // committed edges.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.swift");
+        std::fs::write(&path, "let zoo = Zoo()\nclass C {\n  var n = 1\n}\n").unwrap();
+        let out = parse("corp", &path, "main.swift").unwrap();
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(sigs.contains(&"var:zoo"), "got {sigs:?}");
+        assert!(
+            sigs.contains(&"field:C.n"),
+            "a property stays a field, got {sigs:?}"
+        );
     }
 
     #[test]

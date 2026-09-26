@@ -141,6 +141,33 @@ export function walk(rootDir: string, emitter: Emitter): void {
     emitter.emitContains(docId, defRangeIds);
   }
 
+  // ── Class bases: `class Dog(Animal)` → Animal, resolved per file so an
+  // inherited `d.describe()` can walk up to the defining class in Pass 2.
+  const classBases = new Map<string, LocalType[]>();
+  for (const absPath of pyFiles) {
+    const relPath = toRelPath(absPath, repoRoot);
+    const source = safeReadFile(absPath);
+    if (source === null) continue;
+    const tree = py.parse(source);
+    if (tree === null) continue;
+    const fileDir = path.dirname(relPath).replace(/\\/g, '/');
+    const importTable = buildImportTable(tree.rootNode, fileDir, defMap);
+    for (const top of namedChildren(tree.rootNode)) {
+      const cls = top.type === 'decorated_definition' ? top.lastNamedChild : top;
+      if (cls?.type !== 'class_definition') continue;
+      const name = cls.childForFieldName('name')?.text;
+      const supers = cls.childForFieldName('superclasses');
+      if (!name || !supers) continue;
+      const bases: LocalType[] = [];
+      for (const arg of namedChildren(supers)) {
+        if (arg.type !== 'identifier') continue;
+        const base = resolveClassName(arg.text, importTable, defMap, relPath);
+        if (base) bases.push(base);
+      }
+      classBases.set(`${relPath}:class:${name}`, bases);
+    }
+  }
+
   // ── Pass 2: references ─────────────────────────────────────────────────────
   for (const absPath of pyFiles) {
     const relPath = toRelPath(absPath, repoRoot);
@@ -167,7 +194,8 @@ export function walk(rootDir: string, emitter: Emitter): void {
       refRangeIds,
       relPath,
       null,
-      localTypes
+      localTypes,
+      classBases
     );
     emitter.emitContains(docId, refRangeIds);
   }
@@ -499,6 +527,7 @@ function visitRefs(
   relPath: string,
   enclosingClass: string | null,
   localTypes: Map<string, LocalType>,
+  classBases: Map<string, LocalType[]>,
   depth = 0
 ): void {
   // PY-H2: bail out before the JS call stack overflows on deeply nested ASTs.
@@ -513,7 +542,8 @@ function visitRefs(
         defMap,
         relPath,
         enclosingClass,
-        localTypes
+        localTypes,
+        classBases
       );
       if (info) {
         const rangeId = emitter.emitRange(funcNode);
@@ -541,6 +571,7 @@ function visitRefs(
       relPath,
       nextClass,
       localTypes,
+      classBases,
       depth + 1
     );
   }
@@ -602,7 +633,8 @@ function resolveCallTarget(
   defMap: DefMap,
   relPath: string,
   enclosingClass: string | null,
-  localTypes: Map<string, LocalType>
+  localTypes: Map<string, LocalType>,
+  classBases: Map<string, LocalType[]>
 ): SymbolInfo | undefined {
   if (funcNode.type === 'identifier') {
     // foo() — simple direct call: look up the name in the import table.
@@ -638,7 +670,8 @@ function resolveCallTarget(
     // #299 P1: `self.method()` inside a class body resolves to the enclosing
     // class's method.
     if (objNode.text === 'self' && enclosingClass) {
-      const info = defMap.get(`${relPath}:method:${enclosingClass}.${attrNode.text}`);
+      const self = { relpath: relPath, className: enclosingClass };
+      const info = lookupMethod(self, attrNode.text, defMap, classBases);
       if (info) return info;
     }
 
@@ -646,13 +679,34 @@ function resolveCallTarget(
     // to that class's method.
     const lt = localTypes.get(objNode.text);
     if (lt) {
-      const info = defMap.get(`${lt.relpath}:method:${lt.className}.${attrNode.text}`);
+      const info = lookupMethod(lt, attrNode.text, defMap, classBases);
       if (info) return info;
     }
 
     return undefined;
   }
 
+  return undefined;
+}
+
+/** `cls.method`, or the first base class (breadth-first) that defines it. */
+function lookupMethod(
+  cls: LocalType,
+  method: string,
+  defMap: DefMap,
+  classBases: Map<string, LocalType[]>
+): SymbolInfo | undefined {
+  const queue = [cls];
+  const seen = new Set<string>();
+  for (let i = 0; i < queue.length && i < 32; i++) {
+    const c = queue[i];
+    const key = `${c.relpath}:class:${c.className}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const info = defMap.get(`${c.relpath}:method:${c.className}.${method}`);
+    if (info) return info;
+    queue.push(...(classBases.get(key) ?? []));
+  }
   return undefined;
 }
 

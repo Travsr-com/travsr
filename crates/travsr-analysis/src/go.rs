@@ -60,6 +60,9 @@ const _: () = {
 //   @field.name  — field_identifier of a named struct field; a separate
 //                  pattern from @class.name so embedded/anonymous fields
 //                  (no `name:` field) simply fail to match, no special-casing
+//   @iface.owner — type_spec name that owns an interface method spec
+//   @iface.method — field_identifier of that method spec (embedded
+//                  interfaces have no name and fail to match, as fields do)
 const QUERIES: &str = r#"
 (function_declaration name: (identifier) @fn.name)
 (method_declaration
@@ -114,6 +117,11 @@ const QUERIES: &str = r#"
     type: (struct_type
       (field_declaration_list
         (field_declaration name: (field_identifier) @field.name)))))
+(type_declaration
+  (type_spec
+    name: (type_identifier) @iface.owner
+    type: (interface_type
+      (method_elem name: (field_identifier) @iface.method))))
 "#;
 
 /// Parse `abs_path` and emit graph records using `vname_path` as the stable
@@ -394,6 +402,27 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     .with_line(line)
                     .with_end_line(line);
                 output.edges.push(emit::defines_edge(class_id, node.id));
+                output.nodes.push(node);
+            }
+            "iface.owner" => {
+                let Some(iface) = find_cap_text(m, "iface.owner") else {
+                    continue;
+                };
+                let Some(method) = m.captures.iter().find(|c| {
+                    capture_names.get(c.index as usize).map(|s| s.as_str()) == Some("iface.method")
+                }) else {
+                    continue;
+                };
+                let Ok(method_name) = method.node.utf8_text(source.as_slice()) else {
+                    continue;
+                };
+                let iface = strip_generics(&iface).to_owned();
+                let iface_id = go_iface_node(corpus, vname_path, &iface).id;
+                let line = method.node.start_position().row as u32 + 1;
+                let node = go_method_node(corpus, vname_path, &iface, method_name)
+                    .with_line(line)
+                    .with_end_line(method.node.end_position().row as u32 + 1);
+                output.edges.push(emit::defines_edge(iface_id, node.id));
                 output.nodes.push(node);
             }
             _ => {}
@@ -777,6 +806,21 @@ mod tests {
                 .any(|n| n.vname.signature == "interface:Doer" && n.kind == "interface"),
             "expected interface:Doer"
         );
+    }
+
+    #[test]
+    fn interface_method_spec_gets_a_method_node() {
+        // scip-go defines `Doer#Do().`; with no Phase A twin it stayed an
+        // orphan in the file, and a call through the interface pointed at it.
+        let out = parse("", &handler_path(), "handler.go").unwrap();
+        let node = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:Doer.Do")
+            .expect("expected method:Doer.Do");
+        assert_eq!((node.kind.as_str(), node.line), ("method", Some(9)));
+        let iface = go_iface_node("", "handler.go", "Doer").id;
+        assert!(out.edges.iter().any(|e| e.src == iface && e.dst == node.id));
     }
 
     #[test]

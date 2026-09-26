@@ -933,6 +933,9 @@ pub fn build_manifests(language: &str) -> &'static [&'static str] {
             "settings.gradle.kts",
         ],
         "scala" => &["build.sbt"],
+        "go" => &["go.mod"],
+        "php" => &["composer.json"],
+        "c" | "cpp" => &["compile_commands.json"],
         _ => &[],
     }
 }

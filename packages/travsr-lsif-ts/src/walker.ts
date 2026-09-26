@@ -76,7 +76,15 @@ export function walk(tsconfigPath: string, emitter: Emitter, rootDir?: string): 
   // before handing the config to the TS compiler. Hard error, no fallback.
   sanitizeTsconfig(configFile.config, basePath);
 
-  const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, basePath);
+  // The config's own relative paths (`include`, `rootDir`) resolve against
+  // its own directory. `--root` only moves emitted paths and the containment
+  // root: read against the repo root, a project tsconfig one level down
+  // matched nothing and emitted no documents.
+  const parsed = ts.parseJsonConfigFileContent(
+    configFile.config,
+    ts.sys,
+    path.dirname(tsconfigPath)
+  );
 
   // SEC-003 — Check 2: every resolved file must be inside the project root.
   // Uses realpathSync to follow symlinks. Catches malicious globs and files[].
@@ -180,8 +188,8 @@ function visitDef(node: ts.Node, ctx: DefCtx): void {
 // ── Pass-2 visitor (module-level — one function object, no per-file allocation) ──
 
 function visitRef(node: ts.Node, ctx: RefCtx): void {
-  // ── RefCall: call expressions ────────────────────────────────────────────
-  if (ts.isCallExpression(node)) {
+  // ── RefCall: call expressions, and `new` as a call to the class ──────────
+  if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
     const info = resolveRefTarget(node.expression, ctx.checker, ctx.symbolInfos);
     if (info) {
       const rangeId = ctx.emitter.emitRange(ctx.sf, node.expression);
@@ -204,7 +212,7 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
     if (info) {
       const rangeId = ctx.emitter.emitRange(ctx.sf, node.name);
       ctx.emitter.emitEdge('next', rangeId, info.resultSetId);
-      ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references');
+      ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references', false);
       ctx.refRangeIds.push(rangeId);
     }
   }
@@ -259,7 +267,13 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
             const baseInfo = ctx.symbolInfos.get(resolved)!;
             const rangeId = ctx.emitter.emitRange(ctx.sf, member.name);
             ctx.emitter.emitEdge('next', rangeId, baseInfo.resultSetId);
-            ctx.emitter.emitItem(baseInfo.referenceResultId, [rangeId], ctx.docId, 'references');
+            ctx.emitter.emitItem(
+              baseInfo.referenceResultId,
+              [rangeId],
+              ctx.docId,
+              'references',
+              false
+            );
             ctx.refRangeIds.push(rangeId);
           }
         }
@@ -320,6 +334,13 @@ function computeTravsrVName(
   } else if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) {
     const className = findParentClassName(node) ?? '<anonymous>';
     signature = `method:${className}.${node.name.text}`;
+  } else if (
+    ts.isMethodSignature(node) &&
+    ts.isIdentifier(node.name) &&
+    ts.isInterfaceDeclaration(node.parent)
+  ) {
+    // An interface method: tree-sitter names it `method:Iface.name` too.
+    signature = `method:${node.parent.name.text}.${node.name.text}`;
   } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
     // Tree-sitter only indexes program-child declarators (`(program
     // (lexical_declaration (variable_declarator)))`). A local has no node, so
@@ -393,7 +414,10 @@ function resolveDeclarationSymbol(
   if (ts.isFunctionDeclaration(node) && node.name) {
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
-  if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) {
+  if (
+    (ts.isMethodDeclaration(node) || ts.isMethodSignature(node)) &&
+    ts.isIdentifier(node.name)
+  ) {
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
   if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
@@ -413,7 +437,14 @@ function resolveRefTarget(
 ): SymbolInfo | undefined {
   const raw = checker.getSymbolAtLocation(node);
   const resolved = resolveAlias(raw, checker);
-  return resolved ? symbolInfos.get(resolved) : undefined;
+  if (!resolved) return undefined;
+  const info = symbolInfos.get(resolved);
+  if (info) return info;
+  // A CommonJS export reaches its members through a transient copy of the
+  // symbol; the declaration's own name still holds the pass-1 symbol.
+  const name = resolved.valueDeclaration && ts.getNameOfDeclaration(resolved.valueDeclaration);
+  const declared = name && checker.getSymbolAtLocation(name);
+  return declared ? symbolInfos.get(declared) : undefined;
 }
 
 /** Follow alias chain; returns undefined if input is undefined. */

@@ -257,6 +257,149 @@ test('--root makes VName paths repo-relative for a synthesized out-of-repo tscon
   }
 });
 
+// A project's own tsconfig one directory down (`typescript/tsconfig.json` with
+// `include: ["src/**/*.ts"]`), run with `--root <repo>` so its paths come out
+// repo-relative. The config must still resolve against its own directory: read
+// against the repo root, the include matched nothing and the project emitted no
+// documents at all.
+test('--root keeps a subdirectory project tsconfig resolving its own include', () => {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-tsrepo-')));
+  try {
+    const proj = path.join(repo, 'typescript');
+    fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(proj, 'src', 'math.ts'), 'export function add(a: number, b: number) { return a + b; }\n');
+    fs.writeFileSync(path.join(proj, 'src', 'main.ts'), "import { add } from './math';\nadd(1, 2);\n");
+    fs.writeFileSync(
+      path.join(proj, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { module: 'commonjs', rootDir: 'src' }, include: ['src/**/*.ts'] })
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [EMITTER_BIN, '--project', path.join(proj, 'tsconfig.json'), '--root', repo],
+      { encoding: 'utf-8' }
+    );
+    assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+    const sigs = parseVertices(result.stdout)
+      .map((v) => v['travsr_vname'] as { path?: string; signature?: string } | undefined)
+      .filter((vn): vn is { path: string; signature: string } => vn !== undefined && typeof vn.path === 'string')
+      .map((vn) => `${vn.path}#${vn.signature}`);
+    assert.ok(sigs.includes('typescript/src/math.ts#fn:add'), `expected a repo-relative add in ${JSON.stringify(sigs)}`);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// An import specifier or an override names a symbol without calling it. Its
+// reference item says so (`travsr_call: false`), so the ingest records the
+// occurrence without a call edge; a call's item stays unmarked.
+test('import and override reference items are marked as non-calls', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+  const lines = result.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const refItems = lines.filter((o) => o.label === 'item' && o.property === 'references');
+  const marked = refItems.filter((o) => o.travsr_call === false);
+  const unmarked = refItems.filter((o) => o.travsr_call === undefined);
+  assert.ok(marked.length > 0, 'imports in the fixture must be marked as non-calls');
+  assert.ok(unmarked.length > 0, 'calls in the fixture must stay unmarked');
+});
+
+// A CommonJS method reached through `module.exports = { Zoo }` and a
+// destructured `require` resolves to a transient symbol, not the one the
+// definition pass registered. The call must still reference the method: a
+// CommonJS script produced no references at all.
+test('a CommonJS call reaches its method through a destructured require', () => {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-cjs-')));
+  try {
+    fs.writeFileSync(
+      path.join(repo, 'zoo.js'),
+      'class Zoo {\n  add(a) { return a; }\n}\nmodule.exports = { Zoo };\n'
+    );
+    fs.writeFileSync(
+      path.join(repo, 'main.js'),
+      "const { Zoo } = require('./zoo');\nconst zoo = new Zoo();\nzoo.add(1);\n"
+    );
+    fs.writeFileSync(
+      path.join(repo, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { allowJs: true, checkJs: false, module: 'commonjs', noEmit: true }, include: ['*.js'] })
+    );
+    const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', path.join(repo, 'tsconfig.json')], {
+      encoding: 'utf-8',
+    });
+    assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+    const lines = result.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const mainDoc = lines.find((o) => o.label === 'document' && String(o.uri).endsWith('/main.js'));
+    assert.ok(mainDoc, 'main.js is a document');
+    const calls = lines.filter(
+      (o) => o.label === 'item' && o.property === 'references' && o.document === mainDoc.id && o.travsr_call === undefined
+    );
+    assert.ok(calls.length > 0, 'zoo.add(1) must reference Zoo.add');
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// A call through an interface (`a.describe()` with `a: Animal`) resolves to
+// the interface's method signature, which the definition pass never
+// registered, so the call emitted no reference.
+test('a call through an interface references its method signature', () => {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-iface-')));
+  try {
+    fs.writeFileSync(
+      path.join(repo, 'a.ts'),
+      'export interface Animal {\n  describe(): string;\n}\nexport function run(a: Animal) {\n  return a.describe();\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(repo, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { noEmit: true }, include: ['*.ts'] })
+    );
+    const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', path.join(repo, 'tsconfig.json')], {
+      encoding: 'utf-8',
+    });
+    assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+    const lines = result.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const set = lines.find((o) => o.label === 'resultSet' && o.travsr_vname?.signature === 'method:Animal.describe');
+    assert.ok(set, 'method:Animal.describe has a result set');
+    const refResult = lines.find((o) => o.label === 'textDocument/references' && o.outV === set.id);
+    const calls = lines.filter(
+      (o) => o.label === 'item' && o.property === 'references' && o.outV === refResult.inV && o.travsr_call === undefined
+    );
+    assert.strictEqual(calls.length, 1, 'a.describe() references the signature');
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// `new Zoo()` is a constructor call. The emitter handled call expressions
+// only, so a class reached by `new` got a call edge solely through its import
+// specifier, and none once imports were marked as non-calls.
+test('a new expression is a call reference to its class', () => {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-new-')));
+  try {
+    fs.writeFileSync(path.join(repo, 'zoo.ts'), 'export class Zoo {}\n');
+    fs.writeFileSync(path.join(repo, 'main.ts'), "import { Zoo } from './zoo';\nconst zoo = new Zoo();\n");
+    fs.writeFileSync(
+      path.join(repo, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { noEmit: true }, include: ['*.ts'] })
+    );
+    const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', path.join(repo, 'tsconfig.json')], {
+      encoding: 'utf-8',
+    });
+    assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+    const lines = result.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const mainDoc = lines.find((o) => o.label === 'document' && String(o.uri).endsWith('/main.ts'));
+    const ranges = new Map(lines.filter((o) => o.label === 'range').map((o) => [o.id, o]));
+    const callLines = lines
+      .filter((o) => o.label === 'item' && o.property === 'references' && o.document === mainDoc.id && o.travsr_call === undefined)
+      .flatMap((o) => o.inVs.map((v: number) => ranges.get(v).start.line));
+    assert.deepStrictEqual(callLines, [1], 'new Zoo() on line 1 is the one call');
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 // ── issue #833 follow-up: extensionless ESM imports must resolve cross-file ──
 //
 // The synthesized JS tsconfig uses `moduleResolution: "bundler"` (see
