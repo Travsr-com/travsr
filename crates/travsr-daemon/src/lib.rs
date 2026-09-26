@@ -4994,7 +4994,7 @@ fn live_lane_measure_forced(language: &str) -> bool {
 /// The two directions deliberately use different evidence bars, and the
 /// asymmetry is the point rather than an oversight. Enabling is a **human**
 /// decision, recorded in git next to the reading that earned it: each
-/// [`LIVE_LANE_SHIPPED`] entry carries its verified-claim count as data (1 to 6
+/// [`LIVE_LANE_SHIPPED`] entry carries its verified-claim count as data (1 to 12
 /// today), so a reviewer can see the evidence and refuse it. Disabling is
 /// **automatic** and irreversible-feeling to a user who cannot see why their
 /// lane went quiet, so it needs a bar noise cannot cross on its own, which is
