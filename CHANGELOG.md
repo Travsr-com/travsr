@@ -4,6 +4,39 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v1.2.1 - 2026-09-27
+
+> Install with `npm i -g @travsr.com/travsr` or
+> `curl -fsSL https://travsr.com/install.sh | sh`.
+>
+> A fresh build from `master`, carrying everything merged since `v1.2.0`.
+> Ships alongside VS Code extension 0.12.1, which offers this release when no
+> `travsr` binary resolves.
+
+### Added
+
+- **The live lane now covers C, Objective-C, PHP, and Kotlin.** An edit in one of these languages resolves through the live editor server (clangd, Intelephense, kotlin-language-server) between commits instead of waiting for the next one, the same live resolution TypeScript, JavaScript, Python, Rust, Go, Java, Scala, Ruby, C# and Swift already had. Measured against each language's oracle on the live-lane fixture: C and Objective-C score every claim `agree` with clangd live, PHP scores precision 1.0 over 6 verified claims with Intelephense, and Kotlin scores precision 1.0 over 11 verified claims with kotlin-language-server.
+
+### Fixed
+
+- **Several languages purged a file's committed edges on every save, because a real definition had no Phase A node to unify onto.** A Dart abstract getter, a Scala abstract `def` or constructor parameter, an Objective-C pointer-typed property or ivar, a Go interface method spec, a TypeScript interface or abstract method signature, a Swift protocol requirement, and a Swift script's top-level variables all stayed orphans, so the file's node set never matched a fresh parse and the whole file's edges were dropped and never rebuilt until the next commit. Each now gets the node its analyzer's definition unifies onto.
+- **C, C++, Go, and Scala had the same failure from the other direction: a definition the analyzer emits with no Phase A twin at all.** scip-clang's per-file namespace definition and scip-go's per-file package definition are now dropped the same way Kotlin's locals already were, an anonymous C `typedef struct` unifies its members onto the same-file field, a C++ destructor is now `method:Animal.~Animal`, and a Scala object's members (owned by a term, not a type) now split correctly so the object and its members both resolve.
+- **A C/C++ project below the repository root, or one whose only build marker is `compile_commands.json`, was skipped entirely**, the same class of bug that go.mod and composer.json already had fixes for. A header-only directory (`.h` files are language `c` by extension) no longer counts as a C build root, so scip-clang stopped running against an Objective-C compilation database until timeout. On macOS, `SDKROOT` is now passed into the sandbox, so scip-clang finds libc++ headers and no longer drops every expression touching a standard type.
+- **A PHP or Go project below the repository root was skipped**, or ran against the wrong `composer.json`, the same way a nested TypeScript project's `tsconfig.json` was read against the repo root instead of its own directory, and `--root` now only moves emitted paths rather than the file used to resolve the config.
+- **A save on a file with no live lane, or no editor attached, lost more edges than the edit itself removed** (Kotlin, Ruby, Scala and C# all went 8 of 8 to 0 of 8 on a one-line comment change), because the store kept only what the live lane re-derived instead of keeping a committed edge whose callee name still appears in the edited body.
+- **A top-level reference in a script-style file (`main.swift`, `main.php`) was resolved by the live editor and then silently dropped**, because the live lane attributed it to an enclosing definition the way Phase B does, but a top-level reference has none. It now hangs from the file node instead, the same fallback Phase B already uses.
+- **An ambiguous bare call (two same-language definitions sharing a name) was neither resolved nor sent to the editor**, so it was lost in both lanes instead of at least being asked about.
+- **A rename could mark an unrelated file's pending reference as resolved**, because the dependent-matching rule crossed language-tagged file extensions (a saved TypeScript `.ts` file could satisfy a plain JavaScript `.js` file's pending reference by name alone). A candidate whose own imports resolve now has to actually import the saved file.
+- **Retrieval tie-breaking depended on which directory the repository was checked out into.** Equal-rank name-search matches broke ties on `NodeId`, which hashes the corpus, and the corpus is the checkout's own directory name; ties now break on path and signature instead, so the same query returns the same answer in every checkout.
+- TypeScript: a `new` expression is now a call reference in its own right rather than only being reachable through an import specifier; a CommonJS member reached through `module.exports` or a destructured `require` now resolves by retrying the lookup at its declaration's name.
+- Python: a method inherited from a base class (`class Dog(Animal)`, `dog.describe()` resolving to `Animal.describe`) is now found by walking the recorded base classes breadth first.
+- Java: a constructor call (`new Zoo()`) is now captured as a live target, the same way PHP's already was. Objective-C: a keyword message (`initWithName:volume:`) is now captured and named by its whole selector instead of one target per keyword, none of which matched the method node.
+- Rust: a type-qualified call whose leaf is a generic noise name (`Dog::new()`) is no longer dropped by the same filter that correctly drops a bare `new` or `Box::new()`, which has no repo-local target to name.
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v1.2.0...v1.2.1
+
+---
+
 ## v1.2.0 - 2026-09-26
 
 > Install with `npm i -g @travsr.com/travsr` or
