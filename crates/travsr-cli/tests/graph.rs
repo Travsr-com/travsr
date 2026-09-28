@@ -52,6 +52,8 @@ fn init_repo() -> tempfile::TempDir {
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         .assert()
         .success();
@@ -88,6 +90,8 @@ fn ambiguous_repo(n: usize) -> tempfile::TempDir {
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         .assert()
         .success();
@@ -283,6 +287,8 @@ fn test_graph_cli_ambiguous_file_name() {
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         .assert()
         .success();
@@ -386,6 +392,8 @@ fn test_graph_cli_still_ambiguous_path() {
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         .assert()
         .success();
@@ -430,6 +438,8 @@ fn test_graph_cli_same_file_struct_vs_impl_resolves_by_signature() {
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1")
         .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         .assert()
         .success();
@@ -491,6 +501,8 @@ fn test_graph_cli_mixed_signature_ambiguity_names_both_hatches() {
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1")
         .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         .assert()
         .success();

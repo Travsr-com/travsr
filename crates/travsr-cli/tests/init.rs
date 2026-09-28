@@ -25,6 +25,9 @@ fn travsr_init(dir: &std::path::Path) -> assert_cmd::assert::Assert {
     Command::cargo_bin("travsr")
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
+        // init installs language tools and starts a daemon; tests want neither.
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .current_dir(dir)
         .arg("init")
         .assert()
@@ -69,6 +72,8 @@ fn init_fails_outside_git_repo() {
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         .output()
         .unwrap();
@@ -340,6 +345,8 @@ fn travsr_init_semantic(dir: &std::path::Path, force: bool) {
     let mut cmd = Command::cargo_bin("travsr").unwrap();
     cmd.env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(dir)
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .args(["init", "--semantic"]);
     if force {
         cmd.arg("--force");
@@ -529,6 +536,8 @@ fn travsr_init_isolated(dir: &std::path::Path, home: &std::path::Path) -> String
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .env("HOME", home)
         .current_dir(dir)
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         .assert()
         .success()
@@ -785,6 +794,8 @@ fn allow_unsandboxed_lsif_is_recorded_for_the_daemon() {
         .env("TRAVSR_DISABLE_REGISTRY", "1")
         .env("TRAVSR_LANG_TOML", &lang_toml)
         .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .args(["init", "--allow-unsandboxed-lsif"])
         .assert()
         .success();
@@ -797,4 +808,98 @@ fn allow_unsandboxed_lsif_is_recorded_for_the_daemon() {
         .filter_map(|c| c["language"].as_str())
         .collect();
     assert_eq!(granted, ["rust"]);
+}
+
+fn ts_repo() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function helper() { return 1 }\nexport function main() { return helper() }\n",
+    )
+    .unwrap();
+    tmp
+}
+
+#[test]
+fn init_json_is_one_object_and_never_reads_stdin() {
+    let tmp = ts_repo();
+    let out = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("TRAVSR_LANG_TOML", tmp.path().join("lang.toml"))
+        .current_dir(tmp.path())
+        .args(["init", "--json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is one JSON object");
+    // Existing keys stay for scripts and the VS Code extension.
+    for key in ["files_indexed", "nodes_written", "phase_b", "db_path"] {
+        assert!(v.get(key).is_some(), "missing {key}");
+    }
+    let ts = v["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["language"] == "typescript")
+        .expect("typescript listed");
+    assert!(ts["state"].is_string());
+    assert!(["installed", "skipped"].contains(&v["search_ranking"].as_str().unwrap()));
+    assert_eq!(v["keeping_fresh"], "not_started", "CI is set");
+}
+
+/// Stops the repo's daemon when dropped, so a failed assert never leaks one.
+struct StopDaemon<'a>(&'a std::path::Path);
+impl Drop for StopDaemon<'_> {
+    fn drop(&mut self) {
+        let _ = Command::cargo_bin("travsr")
+            .unwrap()
+            .env("TRAVSR_DISABLE_REGISTRY", "1")
+            .current_dir(self.0)
+            .args(["daemon", "stop"])
+            .output();
+    }
+}
+
+#[test]
+fn init_outside_ci_keeps_a_daemon_running_without_a_terminal() {
+    let tmp = ts_repo();
+    let _stop = StopDaemon(tmp.path());
+    let out = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env_remove("CI")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("TRAVSR_LANG_TOML", tmp.path().join("lang.toml"))
+        .current_dir(tmp.path())
+        .args(["init", "--json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["keeping_fresh"], "started");
+    let status = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .current_dir(tmp.path())
+        .args(["daemon", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("daemon: running"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
 }

@@ -2,6 +2,7 @@
 use anyhow::Context as _;
 
 use crate::repo::find_git_root_for_write;
+use travsr_plugin_host::phase_b::status::Readiness;
 
 // One parameter per `travsr init` flag, the same shape `graph::run` uses. A
 // struct would only move the list somewhere else: clap already owns the
@@ -11,7 +12,6 @@ pub fn run(
     quiet: bool,
     json: bool,
     jobs: Option<usize>,
-    semantic: bool,
     force: bool,
     allow_unsandboxed_lsif: bool,
     no_connect: bool,
@@ -37,17 +37,53 @@ pub fn run(
         }
     }
 
+    let db_path = repo_root.join(".travsr/graph.db");
+    // The key the Phase B trust gate checks, from this worktree rather than cwd,
+    // so a linked worktree trusts itself and not the main one.
+    let corpus = travsr_daemon::detect_corpus(
+        &repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.clone()),
+    );
+
+    // Get the language tools this repo needs. Gated on readiness so a re-run
+    // with everything in place makes no network call.
+    let languages = crate::lang::detect_languages_in(&repo_root);
+    grant_unsandboxed_where_needed(&languages);
+    let skip_downloads = std::env::var_os("TRAVSR_SKIP_DOWNLOAD").is_some();
+    let mut offline = false;
+    if !skip_downloads {
+        let states = readiness_of(&repo_root, &corpus, &languages, &stored_warnings(&db_path));
+        let to_set_up = languages_to_set_up(&states);
+        if !to_set_up.is_empty() {
+            offline = crate::lang::install_selected(&to_set_up, true, true, Some(&corpus));
+        }
+    }
+    let search_ranking = if travsr_mcp::rerank_model_installed() {
+        "installed"
+    } else if skip_downloads || offline {
+        "skipped"
+    } else {
+        match travsr_mcp::install_rerank_model() {
+            Ok(_) => "installed",
+            Err(e) => {
+                eprintln!("warning: could not get search ranking: {e:#}");
+                "failed"
+            }
+        }
+    };
+    if offline {
+        eprintln!("warning: no network. Run `travsr init` again when online to finish setting up.");
+    }
+
     // Live progress so a long indexing run is not mistaken for a hang (#293).
     // Renders to stderr; the summary below stays on stdout.
     let mut progress = crate::progress::ProgressReporter::new(quiet, json);
-    let stats =
-        travsr_daemon::init_repo_with_progress(&repo_root, jobs, semantic, force, &mut |ev| {
-            progress.update(ev)
-        })?;
+    let stats = travsr_daemon::init_repo_with_progress(&repo_root, jobs, true, force, &mut |ev| {
+        progress.update(ev)
+    })?;
     let elapsed = progress.elapsed();
     progress.finish();
-
-    let db_path = repo_root.join(".travsr/graph.db");
 
     // #893: a `.gitignore` entry cannot un-track a path git already holds, so on
     // a repo that committed `.travsr/` before this existed, `init_repo`'s
@@ -64,6 +100,28 @@ pub fn run(
         );
     }
 
+    // Keep the index fresh in the background: file watching, git hooks, and
+    // Phase B for later commits. `CI` is the one opt-out, so a CI step or a test
+    // never leaves a process behind; a terminal is not required, because agents
+    // and editors run init without one.
+    use crate::daemon_client::SpawnOutcome;
+    let keeping_fresh = if std::env::var_os("CI").is_some() {
+        if crate::daemon_client::daemon_lock_held(&repo_root) {
+            "running"
+        } else {
+            "not_started"
+        }
+    } else {
+        // Race-free: spawns only if no daemon holds the lock, so a re-`init` over
+        // an already-running daemon never forks a doomed child.
+        let exe = std::env::current_exe().context("finding current exe path")?;
+        match crate::daemon_client::spawn_background_daemon(&repo_root, &exe, false) {
+            SpawnOutcome::AlreadyRunning => "running",
+            SpawnOutcome::Started | SpawnOutcome::Starting => "started",
+            _ => "not_started",
+        }
+    };
+
     if json {
         // Machine-readable summary on stdout for CI; progress went to stderr.
         // #878: a CI consumer reads this field instead of the human summary, so
@@ -75,6 +133,7 @@ pub fn run(
             Some(r) if !r.lsif_skipped.is_empty() || !r.crashed.is_empty() => "partial",
             Some(_) => "complete",
         };
+        let states = readiness_of(&repo_root, &corpus, &languages, &stored_warnings(&db_path));
         let summary = serde_json::json!({
             "files_indexed": stats.files_indexed,
             "nodes_written": stats.nodes_written,
@@ -87,6 +146,9 @@ pub fn run(
             // UX-023: expose the ghost sweep in JSON too, not just the human summary.
             "ghosts_pruned": stats.ghosts_pruned,
             "ghost_prune_aborted": stats.ghost_prune_aborted,
+            "languages": states.iter().map(|(l, r)| language_json(l, r)).collect::<Vec<_>>(),
+            "search_ranking": search_ranking,
+            "keeping_fresh": keeping_fresh,
         });
         println!("{summary}");
         // stdout carries the machine-readable summary, so the connect report goes
@@ -101,31 +163,9 @@ pub fn run(
         return Ok(());
     }
 
-    // Always start the daemon after init in interactive terminals so file
-    // watching, git hooks, Phase B, and post-Phase-B embedding all work
-    // without a manual `travsr daemon start`.
-    // Guard with is_terminal so we never spawn a background process in CI,
-    // piped contexts, or integration tests (where it would race the DB lock).
-    use crate::daemon_client::SpawnOutcome;
-    use std::io::IsTerminal as _;
-    // Whether a daemon is (or is coming) up after init. This decides the Phase B
-    // summary wording: a running daemon auto-arms Phase B on startup and indexes
-    // semantic call edges in the background, so "commit-gated" would be wrong.
-    let daemon_running = if std::io::stdout().is_terminal() {
-        // Race-free: spawns only if no daemon holds the lock, so a re-`init` over
-        // an already-running daemon never forks a doomed child.
-        let exe = std::env::current_exe().context("finding current exe path")?;
-        matches!(
-            crate::daemon_client::spawn_background_daemon(&repo_root, &exe, false),
-            SpawnOutcome::Started | SpawnOutcome::Starting | SpawnOutcome::AlreadyRunning
-        )
-    } else {
-        // Non-interactive (CI / piped): we never spawn, but a daemon started
-        // earlier may already be running and will pick up the pending Phase B.
-        crate::daemon_client::daemon_lock_held(&repo_root)
-    };
-
-    crate::progress::print_summary(&stats, elapsed, quiet, daemon_running);
+    // A running daemon auto-arms Phase B on startup and indexes semantic call
+    // edges in the background, so the summary must not call them commit-gated.
+    crate::progress::print_summary(&stats, elapsed, quiet, keeping_fresh != "not_started");
 
     // UX-007: a no-op re-run (nothing changed) should not reprint the setup
     // nudges — they are advice for a fresh index, not chatter for every `init`.
@@ -142,10 +182,6 @@ pub fn run(
                  `travsr status` will show freshness after your first commit"
             );
         }
-
-        // Non-fatal: detection errors must not fail `travsr init`.
-        let _ = hint_lang_detect(&repo_root);
-        hint_embed_missing();
     }
 
     maybe_connect(
@@ -181,86 +217,120 @@ fn maybe_connect(
     let _ = crate::connect::run(repo_root, &opts);
 }
 
-/// Print a tip when no embed backend is active so users know about semantic search.
-fn hint_embed_missing() {
-    if travsr_plugin_host::active_backend_id().is_none() {
-        println!(
-            "tip: semantic search is not set up; run `travsr embed init` for natural-language queries"
-        );
+/// Languages `travsr init` can set up itself; the rest need the user.
+fn languages_to_set_up(states: &[(String, Readiness)]) -> Vec<&str> {
+    states
+        .iter()
+        .filter(|(_, r)| *r == Readiness::SettingUp)
+        .map(|(l, _)| l.as_str())
+        .collect()
+}
+
+fn readiness_of(
+    repo_root: &std::path::Path,
+    corpus: &str,
+    languages: &[String],
+    warnings: &str,
+) -> Vec<(String, Readiness)> {
+    use travsr_plugin_host::phase_b::status::{gather, readiness};
+    let lang_toml = travsr_plugin_host::trust::LangToml::from_disk();
+    let resolver = travsr_plugin_host::resolver::CatalogResolver::new();
+    languages
+        .iter()
+        .filter_map(|l| {
+            let entry = travsr_plugin_host::phase_b::lookup(l)?;
+            let cap = gather(entry, repo_root, corpus, &lang_toml, &resolver, warnings);
+            Some((l.clone(), readiness(&cap)))
+        })
+        .collect()
+}
+
+/// The last run's `phase_b_warnings`, or empty before the first run.
+fn stored_warnings(db_path: &std::path::Path) -> String {
+    if !db_path.exists() {
+        return String::new();
+    }
+    travsr_store::SqliteStore::open(db_path)
+        .ok()
+        .and_then(|s| s.get_meta("phase_b_warnings").ok().flatten())
+        .unwrap_or_default()
+}
+
+fn language_json(language: &str, r: &Readiness) -> serde_json::Value {
+    let mut o = serde_json::json!({ "language": language, "state": r.tag() });
+    match r {
+        Readiness::NeedsToolchain { needs } => o["needs"] = needs.as_str().into(),
+        Readiness::Unsupported { os } => o["os"] = os.as_str().into(),
+        _ => {}
+    }
+    if let Some(fix) = r.fix() {
+        o["fix"] = fix.into();
+    }
+    o
+}
+
+/// Record the unsandboxed grants init makes for the user (not printed): Rust
+/// where the OS offers no sandbox, and on Windows the languages whose build
+/// tools cannot run inside its isolation.
+fn grant_unsandboxed_where_needed(languages: &[String]) {
+    use travsr_indexer::sandbox::{build_sandboxed_command, SandboxConfig, SandboxStatus};
+    let no_sandbox = matches!(
+        build_sandboxed_command("true", &[], &SandboxConfig::default()).1,
+        SandboxStatus::Unavailable { .. }
+    );
+    for lang in languages {
+        let needed = (lang == "rust" && no_sandbox)
+            || (cfg!(windows)
+                && travsr_plugin_host::phase_b::lookup(lang)
+                    .is_some_and(|e| e.windows_sandbox_unsupported()));
+        if needed {
+            let _ = crate::lang::grant_unsandboxed_from_init(lang);
+        }
     }
 }
 
-/// After indexing, scan for supported languages and name the exact
-/// per-language install command if any are present but not yet registered.
-/// On a TTY, offer to run the interactive `travsr lang detect` flow inline
-/// (#449: call/reference indexing for these languages needs the sidecar, and
-/// the generic tip was too easy to miss).
-fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
-    use std::io::IsTerminal as _;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // UX-001/UX-013: only nudge for languages that genuinely still need setup —
-    // built-in languages (rust/typescript/python/dart) are excluded, so we never
-    // tell a user their already-working semantic support is "not set up".
-    let unregistered = crate::lang::languages_needing_setup(repo_root);
-    if unregistered.is_empty() {
-        return Ok(());
+    #[test]
+    fn only_languages_init_can_fix_are_set_up() {
+        let states = vec![
+            ("go".to_string(), Readiness::SettingUp),
+            ("python".to_string(), Readiness::Ready),
+            (
+                "java".to_string(),
+                Readiness::NeedsToolchain {
+                    needs: "JDK".into(),
+                },
+            ),
+            (
+                "swift".to_string(),
+                Readiness::Unsupported { os: "linux".into() },
+            ),
+            ("ruby".to_string(), Readiness::Failed),
+            ("rust".to_string(), Readiness::SettingUp),
+        ];
+        assert_eq!(languages_to_set_up(&states), ["go", "rust"]);
+        assert!(languages_to_set_up(&[]).is_empty());
     }
 
-    // #588: split what can be set up here from what has no build for this
-    // platform. Offering `travsr lang install <lang>` for the second group was
-    // the reported bug — the command was printed, the prompt was shown, and
-    // every accepted language ended in a 404 from an asset that never existed.
-    let (offerable, unavailable): (Vec<_>, Vec<_>) = unregistered.iter().partition(|l| {
-        travsr_plugin_host::phase_b::catalog::lookup(l)
-            .map(|e| crate::lang::wrapper_unavailable_target(e).is_none())
-            .unwrap_or(true)
-    });
-
-    if !offerable.is_empty() {
-        println!(
-            "tip: {} found in this repo, full cross-file analysis is not set up yet:",
-            offerable
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        for lang in &offerable {
-            println!("       travsr lang install {lang}");
-        }
+    #[test]
+    fn a_refused_connection_is_a_network_error() {
+        // Port 9 (discard) is closed on a dev machine and CI: connect is refused.
+        let err = crate::lang::run_async(async {
+            reqwest::Client::new()
+                .get("http://127.0.0.1:9/")
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap_err()
+        .context("downloading wrapper binary");
+        assert!(crate::lang::is_network_error(&err));
+        assert!(!crate::lang::is_network_error(&anyhow::anyhow!(
+            "'go' is not installed on your machine"
+        )));
     }
-
-    if !unavailable.is_empty() {
-        // Stated, not silently dropped: basic analysis did cover these files, and
-        // the user should know which part is missing and why — in plain words.
-        println!(
-            "note: {} found in this repo, but no analyzer is available for {} yet, \
-             basic analysis covers them, full cross-file analysis does not.",
-            unavailable
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-            travsr_plugin_host::phase_b::status::os_label(),
-        );
-    }
-
-    if offerable.is_empty() {
-        return Ok(());
-    }
-
-    if std::io::stdin().is_terminal() {
-        use std::io::Write as _;
-        print!("Set up now? [y/N]: ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if answer.trim().eq_ignore_ascii_case("y") {
-            // Interactive (the user just answered "y" at a terminal): let detect
-            // run its own per-language prompt rather than force-installing all.
-            return crate::lang::run(crate::lang::LangCommand::Detect { yes: false });
-        }
-    }
-
-    Ok(())
 }

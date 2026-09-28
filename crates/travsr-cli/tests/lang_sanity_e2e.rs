@@ -98,6 +98,8 @@ fn indexed_repo(lang: &str) -> tempfile::TempDir {
     // *cannot* produce semantic data: ADR-017 Rule 3 gates external tooling on a
     // per-corpus trust grant, and a repo nobody has enabled yet has none.
     let out = Command::new(travsr())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .args(["init", "--semantic"])
         .current_dir(root)
         // #893: without this, `travsr init` appends this tempdir to the
@@ -142,6 +144,8 @@ fn indexed_repo(lang: &str) -> tempfile::TempDir {
 
     // Re-index now that the sidecar is allowed to run at all.
     let out = Command::new(travsr())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .args(["init", "--semantic"])
         .current_dir(root)
         // #893: same reason as the first pass above.

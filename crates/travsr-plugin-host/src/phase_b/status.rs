@@ -192,6 +192,36 @@ pub enum Readiness {
     Failed,
 }
 
+impl Readiness {
+    /// Stable machine tag for `--json` and MCP. Never reworded.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Readiness::Ready => "ready",
+            Readiness::SettingUp => "setting_up",
+            Readiness::NeedsToolchain { .. } => "needs_toolchain",
+            Readiness::Unsupported { .. } => "unsupported_os",
+            Readiness::Failed => "failed",
+        }
+    }
+
+    /// The one next action, in plain words; `None` when there is nothing to do.
+    pub fn fix(&self) -> Option<String> {
+        match self {
+            Readiness::Ready | Readiness::Unsupported { .. } => None,
+            Readiness::SettingUp => Some("Run `travsr init` to finish tracing calls.".into()),
+            Readiness::NeedsToolchain { needs } if needs == "compile_commands.json" => Some(
+                "Generate compile_commands.json with your build, then run `travsr init`.".into(),
+            ),
+            Readiness::NeedsToolchain { needs } => {
+                Some(format!("Install {needs}, then run `travsr init`."))
+            }
+            Readiness::Failed => {
+                Some("Calls could not be traced. See `travsr status` for why.".into())
+            }
+        }
+    }
+}
+
 /// Inputs to [`readiness`], gathered by [`gather`]. Plain facts so the ladder
 /// is tested without disk, PATH or processes (same shape as [`Capability`]).
 pub struct RepoCapability<'a> {
@@ -623,6 +653,56 @@ mod tests {
         ];
         for (name, cap, want) in cases {
             assert_eq!(readiness(&cap), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn readiness_tags_and_fixes_are_plain() {
+        let needs = |s: &str| Readiness::NeedsToolchain { needs: s.into() };
+        let cases = [
+            (Readiness::Ready, "ready", None),
+            (
+                Readiness::SettingUp,
+                "setting_up",
+                Some("Run `travsr init` to finish tracing calls."),
+            ),
+            (
+                needs("Go toolchain"),
+                "needs_toolchain",
+                Some("Install Go toolchain, then run `travsr init`."),
+            ),
+            (
+                needs("compile_commands.json"),
+                "needs_toolchain",
+                Some("Generate compile_commands.json with your build, then run `travsr init`."),
+            ),
+            (
+                Readiness::Unsupported {
+                    os: "windows".into(),
+                },
+                "unsupported_os",
+                None,
+            ),
+            (
+                Readiness::Failed,
+                "failed",
+                Some("Calls could not be traced. See `travsr status` for why."),
+            ),
+        ];
+        for (r, tag, fix) in cases {
+            assert_eq!(r.tag(), tag);
+            assert_eq!(r.fix().as_deref(), fix, "{tag}");
+            // Section 3.0: no internal vocabulary, no placeholders.
+            let text = r.fix().unwrap_or_default().to_lowercase();
+            for banned in [
+                "phase", "semantic", "lsif", "scip", "sidecar", "analyzer", "corpus", "sandbox",
+                "daemon", "node", "edge", "<",
+            ] {
+                assert!(
+                    !text.contains(banned),
+                    "{tag}: {text:?} contains {banned:?}"
+                );
+            }
         }
     }
 

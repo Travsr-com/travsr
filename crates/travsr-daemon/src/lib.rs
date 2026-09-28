@@ -6057,7 +6057,7 @@ fn collect_lsif_skips(ts_skip: Option<&LsifSkip>) -> Vec<LsifSkip> {
 
 /// Derive the canonical corpus for `repo_root` by reading `git remote get-url origin`.
 /// Falls back to `local/<basename>` if no remote is configured or git fails.
-fn detect_corpus(repo_root: &Path) -> String {
+pub fn detect_corpus(repo_root: &Path) -> String {
     let output = std::process::Command::new("git")
         .args([
             "-C",

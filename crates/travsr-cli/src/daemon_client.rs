@@ -6,6 +6,8 @@
 //! protocol version skew, transport error, malformed payload) falls back to
 //! [`open_read_store`], which itself prefers the read-only fast path.
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
@@ -82,9 +84,13 @@ pub(crate) fn spawn_background_daemon(repo_root: &Path, exe: &Path, verbose: boo
 
     // Re-exec ourselves as the long-lived foreground worker (which re-acquires the
     // lock — the last-line-of-defense guard for the tight spawn race).
+    // Its own process group, like CREATE_NEW_PROCESS_GROUP below: Ctrl-C, a
+    // closed terminal or a harness killing init's group must not take the
+    // daemon with it.
     #[cfg(unix)]
     let spawned: std::io::Result<()> = std::process::Command::new(exe)
         .args(["daemon", "start", "--foreground"])
+        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

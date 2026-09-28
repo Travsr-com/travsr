@@ -60,10 +60,9 @@ enum Command {
         /// Number of parallel parse workers (default: available CPU cores).
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
-        /// Build full cross-file analysis (call edges) synchronously before returning.
-        /// By default it runs in the background via the daemon.
-        /// Use this in CI or scripts that query call edges immediately after init.
-        #[arg(long)]
+        /// No effect: init always traces calls before returning. Kept so
+        /// existing scripts and the VS Code extension keep working.
+        #[arg(long, hide = true)]
         semantic: bool,
         /// Force a full rebuild, bypassing the incremental "up to date" skip.
         /// Re-parses every file even when nothing changed on disk — use it after
@@ -80,7 +79,7 @@ enum Command {
         /// This flag cannot be set by repository contents (.env, Cargo.toml,
         /// tsconfig, etc.). It is remembered in ~/.travsr/lang.toml, so later
         /// runs and background updates keep Rust's full analysis.
-        #[arg(long, visible_alias = "allow-unsandboxed")]
+        #[arg(long, alias = "allow-unsandboxed", hide = true)]
         allow_unsandboxed_lsif: bool,
         /// Skip auto-detecting AI coding tools and wiring them to Travsr.
         #[arg(long)]
@@ -879,7 +878,7 @@ async fn run(cli: Cli) -> Result<()> {
             quiet,
             json,
             jobs,
-            semantic,
+            semantic: _,
             force,
             allow_unsandboxed_lsif,
             no_connect,
@@ -888,7 +887,6 @@ async fn run(cli: Cli) -> Result<()> {
             quiet,
             json,
             jobs,
-            semantic,
             force,
             allow_unsandboxed_lsif,
             no_connect,

@@ -67,6 +67,8 @@ fn in_place_binary() -> PathBuf {
 fn run(bin: &Path, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(bin);
     cmd.env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .env_remove("TRAVSR_LSIF_TS")
         .env_remove("RUST_LOG")
         .current_dir(dir)

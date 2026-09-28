@@ -195,6 +195,8 @@ fn model_switch_lifecycle_end_to_end() {
     Command::cargo_bin("travsr")
         .unwrap()
         .current_dir(repo.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         // #893: keep this tempdir out of the developer's real
         // ~/.travsr/registry.json.

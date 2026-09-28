@@ -668,7 +668,7 @@ fn cmd_install(
                     run_async(crate::install::fetch_latest_version())
                 })?;
 
-                println!("Installing {bin} {version}...");
+                eprintln!("Installing {bin} {version}...");
 
                 // Clone into owned values so the async move block is 'static
                 // (run_async requires 'static due to thread spawn semantics).
@@ -679,7 +679,7 @@ fn cmd_install(
                 })
                 .context("downloading wrapper binary")?;
 
-                println!("{bin} installed to {}", path.display());
+                eprintln!("{bin} installed to {}", path.display());
 
                 if entry.has_share_assets {
                     let sv = version.clone();
@@ -687,8 +687,8 @@ fn cmd_install(
                     match run_async(
                         async move { crate::install::install_share_assets(&sv, &sb).await },
                     ) {
-                        Ok(()) => println!("{bin} emitter files installed"),
-                        Err(e) => println!("warning: could not install {bin} share assets: {e:#}"),
+                        Ok(()) => eprintln!("{bin} emitter files installed"),
+                        Err(e) => eprintln!("warning: could not install {bin} share assets: {e:#}"),
                     }
                 }
 
@@ -783,7 +783,7 @@ fn cmd_install(
     // "add ~/.travsr/bin to your PATH" block back to back when both were fresh
     // downloads, telling the user the same thing twice in a row.
     if !crate::install::path_contains_travsr_bin() {
-        println!("\n{}", crate::install::path_hint());
+        eprintln!("\n{}", crate::install::path_hint());
     }
 
     // The success line at the end of this function carries the repo-scope
@@ -800,7 +800,7 @@ fn cmd_install(
         // whole story here, there is nothing else to add.
         if let ScipInstall::Command(cmd_args) = entry.scip_install {
             if !tool_available(cmd_args[0]) {
-                println!(
+                eprintln!(
                     "'{}' is not installed on your machine. Install it, then run \
                      `travsr lang install {language}` again.",
                     cmd_args[0]
@@ -816,7 +816,7 @@ fn cmd_install(
             let attempted_auto =
                 yes || (!no_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin()));
             if !attempted_auto {
-                println!(
+                eprintln!(
                     "'{language}' isn't fully set up yet: its analyzer '{}' isn't installed.\n\
                      Install it, or re-run `travsr lang install {language} --yes` to let travsr do it:\n\t{}\n\
                      Basic analysis still runs until then.",
@@ -832,7 +832,7 @@ fn cmd_install(
         // present is not the whole story, so don't claim it's "active".
         if let Some(driver) = entry.runtime_driver {
             if !tool_available(driver) {
-                println!(
+                eprintln!(
                     "'{driver}' is not installed on your machine. Install it, then run \
                      `travsr lang install {language}` again."
                 );
@@ -843,18 +843,18 @@ fn cmd_install(
         // just a pointer to where the tool comes from — one line, not the
         // generic paragraph below.
         if matches!(entry.scip_install, ScipInstall::Manual) && !tool_available(entry.command) {
-            print!(
+            eprint!(
                 "'{}' is not installed. Install it, then run `travsr lang install {language}` again.",
                 entry.command
             );
             if entry.underlying_tool_hint.is_empty() {
-                println!();
+                eprintln!();
             } else {
-                println!("\n\t{}", entry.underlying_tool_hint);
+                eprintln!("\n\t{}", entry.underlying_tool_hint);
             }
             return Ok(InstallStatus::WrapperOnly);
         }
-        println!(
+        eprintln!(
             "'{language}' isn't fully set up yet: its analyzer '{}' is not installed.\n\
              Full cross-file analysis stays off until it is; basic analysis still runs.\n\
              After it installs, run `travsr init` in your repository.",
@@ -867,7 +867,7 @@ fn cmd_install(
     // isolation here, so full analysis stays off until the user grants the one-time
     // permission. Say that honestly instead of claiming "active".
     if windows_unsandboxed && !config.has_unsandboxed_consent(language) {
-        println!(
+        eprintln!(
             "'{language}' analyzer is installed. One more step: its build tools can't run \
              inside Travsr's isolation on Windows, so full analysis needs your permission \
              to run them with your own privileges.\n\
@@ -885,7 +885,7 @@ fn cmd_install(
     // command, and the remedy is the install layout: a bundled analyzer is not
     // a package the user fetches.
     if entry.analyzer_bundled() && !travsr_indexer::bundled_lsif_emitter_available(entry.language) {
-        println!(
+        eprintln!(
             "'{language}' is set up for this repository, but the analyzer that ships with \
              travsr ('{}') was not found next to the travsr binary, so full cross-file \
              analysis stays off and basic analysis still runs.\n\
@@ -894,9 +894,9 @@ fn cmd_install(
             entry.command
         );
     } else if enabled_here {
-        println!("'{language}' is active, full cross-file analysis is on for this repository.");
+        eprintln!("'{language}' is active, full cross-file analysis is on for this repository.");
     } else {
-        println!("'{language}' is active, full cross-file analysis is on.");
+        eprintln!("'{language}' is active, full cross-file analysis is on.");
     }
     Ok(InstallStatus::FullyReady)
 }
@@ -936,7 +936,7 @@ fn run_pkg_command(
 
     let do_run = if interactive {
         use std::io::Write as _;
-        print!(
+        eprint!(
             "'{}' is not installed.\nInstall via: {}\nRun it now? [Y/n]: ",
             entry.command,
             cmd_args.join(" ")
@@ -946,7 +946,7 @@ fn run_pkg_command(
         std::io::stdin().read_line(&mut answer)?;
         answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("y")
     } else if yes {
-        println!("Auto-installing: {}", cmd_args.join(" "));
+        eprintln!("Auto-installing: {}", cmd_args.join(" "));
         true
     } else {
         // Non-interactive without --yes: stay silent. install()'s `!full_ready`
@@ -970,7 +970,7 @@ fn run_pkg_command(
         // missing-analyzer path. Aborting via `?` here is what made `go` the lone
         // language that skipped that summary (it errored out mid-flow instead).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!(
+            eprintln!(
                 "'{}' is not installed, so '{}' can't be set up automatically.\n\
                  Install it manually, then re-run:\n\t{}",
                 cmd_args[0],
@@ -985,9 +985,9 @@ fn run_pkg_command(
     };
     let status = child.wait()?;
     if status.success() {
-        println!("{} installed.", entry.command);
+        eprintln!("{} installed.", entry.command);
     } else {
-        println!(
+        eprintln!(
             "Install command exited with {status}.\nRun manually: {}",
             cmd_args.join(" ")
         );
@@ -1119,13 +1119,13 @@ fn install_scip_tool(
                 // Driver present but the tool is still missing (declined or the
                 // command failed): fall through to the download rather than
                 // leaving semantic analysis off.
-                println!(
+                eprintln!(
                     "'{}' still isn't available via {driver}. Downloading a \
                      ready-to-run {} from its official releases instead.",
                     entry.command, entry.command
                 );
             } else {
-                println!(
+                eprintln!(
                     "'{driver}' isn't installed, so '{}' can't be added that way. \
                      Downloading a ready-to-run {} from its official releases instead.",
                     entry.command, entry.command
@@ -1206,7 +1206,7 @@ fn install_scip_github_binary(
     let target = match crate::install::current_target() {
         Ok(t) => t,
         Err(e) => {
-            println!(
+            eprintln!(
                 "Cannot determine your platform ({e}).\n\
                  Install '{}' manually:\n\t{}",
                 entry.command, entry.underlying_tool_hint
@@ -1240,7 +1240,7 @@ fn install_scip_github_binary(
     let asset_name = match (spec.asset_fn)(&tag, target) {
         Some(a) => a,
         None => {
-            println!(
+            eprintln!(
                 "'{}' does not have a pre-built binary for your platform ({target}).\n\
                  Install it manually:\n\t{}",
                 entry.command, entry.underlying_tool_hint
@@ -1249,7 +1249,7 @@ fn install_scip_github_binary(
         }
     };
 
-    println!("Downloading {} {} ...", spec.install_name, tag);
+    eprintln!("Downloading {} {} ...", spec.install_name, tag);
 
     let repo2 = spec.repo.to_string();
     let tag2 = tag.clone();
@@ -1264,7 +1264,7 @@ fn install_scip_github_binary(
         crate::install::download_scip_binary(&repo2, &tag2, &asset2, &name2, verify, expected).await
     }) {
         Ok(path) => {
-            println!("{} installed to {}", spec.install_name, path.display());
+            eprintln!("{} installed to {}", spec.install_name, path.display());
             // UX-4: some SCIP launchers (scip-java's coursier wrapper) report the
             // `0.0.0` "unset" sentinel from `--version`, so `travsr status` can only
             // show a real version via the `<bin>.version` fallback file. Nothing was
@@ -1294,7 +1294,7 @@ fn install_scip_github_binary(
             }
         }
         Err(e) => {
-            println!(
+            eprintln!(
                 "Download failed: {e:#}\n\
                  Install '{}' manually:\n\t{}",
                 entry.command, entry.underlying_tool_hint
@@ -1321,7 +1321,7 @@ fn install_gz_github_binary(
     let target = match crate::install::current_target() {
         Ok(t) => t,
         Err(e) => {
-            println!(
+            eprintln!(
                 "Cannot determine your platform ({e}).\n\
                  Install '{}' manually:\n\t{}",
                 entry.command, entry.underlying_tool_hint
@@ -1343,7 +1343,7 @@ fn install_gz_github_binary(
     let asset_name = match (spec.asset_fn)(&tag, target) {
         Some(a) => a,
         None => {
-            println!(
+            eprintln!(
                 "'{}' has no pre-built binary for your platform ({target}).\n\
                  Install it manually:\n\t{}",
                 entry.command, entry.underlying_tool_hint
@@ -1356,7 +1356,7 @@ fn install_gz_github_binary(
     let expected = match (spec.sha256_fn)(&tag, target) {
         Some(h) => h.to_string(),
         None => {
-            println!(
+            eprintln!(
                 "'{}' {tag} for {target} has no verified checksum on record, so it \
                  will not be downloaded automatically.\n\
                  Install it manually:\n\t{}",
@@ -1366,7 +1366,7 @@ fn install_gz_github_binary(
         }
     };
 
-    println!("Downloading {} {} ...", spec.install_name, tag);
+    eprintln!("Downloading {} {} ...", spec.install_name, tag);
 
     let repo = spec.repo.to_string();
     let tag2 = tag.clone();
@@ -1378,7 +1378,7 @@ fn install_gz_github_binary(
         crate::install::download_ra_binary(&repo, &tag2, &asset2, &name2, &target2, &expected).await
     }) {
         Ok(path) => {
-            println!("{} installed to {}", spec.install_name, path.display());
+            eprintln!("{} installed to {}", spec.install_name, path.display());
             // Record the resolved release tag next to the binary — rust-analyzer
             // uses date-based tags that don't parse as semver, so this is what
             // `travsr status` reads back rather than a `--version` probe.
@@ -1389,7 +1389,7 @@ fn install_gz_github_binary(
             }
         }
         Err(e) => {
-            println!(
+            eprintln!(
                 "Download failed: {e:#}\n\
                  Install '{}' manually:\n\t{}",
                 entry.command, entry.underlying_tool_hint
@@ -1424,7 +1424,7 @@ fn install_zip_binary(
     )?;
 
     let asset_name = (spec.asset_fn)(&tag);
-    println!("Downloading {} {} ...", spec.install_name, tag);
+    eprintln!("Downloading {} {} ...", spec.install_name, tag);
 
     let repo2 = spec.repo.to_string();
     let tag2 = tag.clone();
@@ -1444,7 +1444,7 @@ fn install_zip_binary(
     }) {
         Ok(p) => p,
         Err(e) => {
-            println!(
+            eprintln!(
                 "Download failed: {e:#}\nInstall '{}' manually:\n\t{}",
                 entry.command, entry.underlying_tool_hint
             );
@@ -1490,7 +1490,7 @@ fn install_zip_binary(
             .context("chmod +x wrapper")?;
     }
 
-    println!("{} installed to {}", spec.install_name, wrapper.display());
+    eprintln!("{} installed to {}", spec.install_name, wrapper.display());
 
     Ok(())
 }
@@ -1580,6 +1580,7 @@ fn cmd_detect(yes: bool) -> Result<()> {
             &installable,
             /*no_interactive*/ true,
             /*yes*/ true,
+            None,
         );
         return Ok(());
     }
@@ -1623,27 +1624,52 @@ fn cmd_detect(yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    install_selected(&selected, /*no_interactive*/ false, /*yes*/ false);
+    install_selected(
+        &selected, /*no_interactive*/ false, /*yes*/ false, None,
+    );
     Ok(())
 }
 
 /// Install each detected language in turn, reporting per-language outcome without
-/// aborting the batch on a single failure. Shared by the interactive selection and
-/// the `--yes` path so both install exactly the same way — only the interactivity
-/// of each underlying `cmd_install` differs.
-fn install_selected(selected: &[&str], no_interactive: bool, yes: bool) {
-    println!();
+/// aborting the batch on a single failure. Shared by the interactive selection, the
+/// `--yes` path and `travsr init`, so all install exactly the same way — only the
+/// interactivity of each underlying `cmd_install` differs. `corpus` is the repo to
+/// enable; `None` derives it from the current directory.
+///
+/// Stops at the first network failure, since every later download would wait out
+/// the same timeout; returns true when it did.
+pub(crate) fn install_selected(
+    selected: &[&str],
+    no_interactive: bool,
+    yes: bool,
+    corpus: Option<&str>,
+) -> bool {
+    eprintln!();
     for lang in selected {
-        println!("{lang}:");
-        match cmd_install(lang, false, no_interactive, None, false, yes, None) {
+        eprintln!("{lang}:");
+        match cmd_install(lang, false, no_interactive, corpus, false, yes, None) {
             Ok(InstallStatus::FullyReady) => {}
             Ok(InstallStatus::WrapperOnly) => {
-                println!("  {lang}: analyzer not installed yet, full analysis stays off")
+                eprintln!("  {lang}: analyzer not installed yet, full analysis stays off")
             }
-            Err(e) => eprintln!("  error: {e:#}"),
+            Err(e) => {
+                eprintln!("  error: {e:#}");
+                if is_network_error(&e) {
+                    return true;
+                }
+            }
         }
-        println!();
+        eprintln!();
     }
+    false
+}
+
+/// Whether `e` failed to reach the network at all (refused, unresolvable, timed
+/// out), as opposed to a server or install error.
+pub(crate) fn is_network_error(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<reqwest::Error>())
+        .any(|r| r.is_connect() || r.is_timeout())
 }
 
 // ── add (legacy alias for install) ──────────────────────────────────────────
@@ -1827,28 +1853,6 @@ pub(crate) fn detect_languages_in(dir: &std::path::Path) -> Vec<String> {
         .iter()
         .filter(|e| found.contains(e.language))
         .map(|e| e.language.to_string())
-        .collect()
-}
-
-/// Languages detected in `repo_root` that genuinely still need a
-/// `travsr lang install` step for semantic (call/reference) indexing.
-///
-/// UX-001/UX-013: built-in languages (rust, typescript, python, dart) ship in
-/// the binary and their semantic analysis already works, so they must never
-/// appear in the `init` "not set up" nudge — otherwise the summary reports a
-/// language as both *enabled* and *not set up* in the same breath. This returns
-/// only detected languages that are non-built-in and not yet registered.
-pub(crate) fn languages_needing_setup(repo_root: &std::path::Path) -> Vec<String> {
-    let config = load_config();
-    detect_languages_in(repo_root)
-        .into_iter()
-        .filter(|l| {
-            // Skip built-ins — they work without registration.
-            if lookup(l).map(|e| e.builtin).unwrap_or(false) {
-                return false;
-            }
-            config.as_ref().map(|c| !c.is_registered(l)).unwrap_or(true)
-        })
         .collect()
 }
 

@@ -352,7 +352,7 @@ pub fn advise_installed_sidecar(spec: &dyn SidecarSpec, bin_path: &Path, reinsta
         return;
     };
     if latest > installed {
-        println!("  newer {install_name} v{latest} available - run: {reinstall_remedy}");
+        eprintln!("  newer {install_name} v{latest} available - run: {reinstall_remedy}");
     }
 }
 
