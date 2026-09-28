@@ -766,11 +766,42 @@ fn load_lang_config() -> Option<LangConfigFile> {
     toml::from_str(&content).ok()
 }
 
+/// Whether `language` has a recorded unsandboxed grant in lang.toml. Unlike the
+/// process-level opt-in, this reaches the daemon, which never sees `init`'s flags.
+pub(crate) fn persisted_unsandboxed_consent(language: &str) -> bool {
+    load_lang_config().is_some_and(|c| c.has_unsandboxed_consent(language))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_rust_consent_reaches_every_process() {
+        // The daemon is a separate process from `travsr init`, so only what is
+        // on disk reaches it.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("lang.toml");
+        std::fs::write(
+            &toml,
+            "[[unsandboxed_consent]]\nlanguage = \"rust\"\ngranted_by = \"travsr init\"\n\
+             granted_date = \"2026-09-29\"\n",
+        )
+        .unwrap();
+        std::env::set_var("TRAVSR_LANG_TOML", &toml);
+        let rust = persisted_unsandboxed_consent("rust");
+        let go = persisted_unsandboxed_consent("go");
+        std::env::set_var("TRAVSR_LANG_TOML", dir.path().join("absent.toml"));
+        let none = persisted_unsandboxed_consent("rust");
+        std::env::remove_var("TRAVSR_LANG_TOML");
+        assert!(rust, "rust grant on disk");
+        assert!(!go, "grant is per language");
+        assert!(!none, "no file, no grant");
+    }
 
     // ── Windows-unsandboxed decision ──────────────────────────────────────────
     // Pure and host-independent, so both platforms' behaviour is proven on Linux CI.

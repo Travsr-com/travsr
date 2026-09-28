@@ -1749,6 +1749,17 @@ fn cmd_allow_unsandboxed(
     Ok(())
 }
 
+/// Record an unsandboxed grant made by `travsr init`, so the daemon, a separate
+/// process that never sees init's flags, honours it too.
+pub(crate) fn grant_unsandboxed_from_init(language: &str) -> Result<()> {
+    let mut config = load_config().unwrap_or_default();
+    if !config.has_unsandboxed_consent(language) {
+        config.grant_unsandboxed_consent(language, "travsr init");
+        save_config(&config)?;
+    }
+    Ok(())
+}
+
 /// Confirm an unsandboxed grant. `--yes` records it non-interactively; otherwise
 /// an interactive terminal is prompted `[y/N]`. With no terminal and no `--yes`
 /// the grant is refused rather than recorded silently, since it relaxes isolation.

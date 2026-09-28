@@ -31,6 +31,11 @@ pub fn run(
     // `travsr lang allow-unsandboxed` grant is the primary path; this covers a
     // one-shot `travsr init`.
     travsr_plugin_host::resolver::set_allow_unsandboxed(allow_unsandboxed_lsif);
+    if allow_unsandboxed_lsif {
+        if let Err(e) = crate::lang::grant_unsandboxed_from_init("rust") {
+            eprintln!("warning: could not save the Rust setting for later runs: {e:#}");
+        }
+    }
 
     // Live progress so a long indexing run is not mistaken for a hang (#293).
     // Renders to stderr; the summary below stays on stdout.

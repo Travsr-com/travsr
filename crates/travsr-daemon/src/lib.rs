@@ -45,14 +45,10 @@ pub use hook::{
 /// The **long-lived daemon** (git-hook / file-watcher incremental reindex path)
 /// is a separate process that never calls this setter, so
 /// `ALLOW_UNSANDBOXED_BY_CLI` stays `false` on every daemon-triggered reindex.
-/// This is intentional: the daemon always fails closed unless the operator sets
-/// `TRAVSR_ALLOW_UNSANDBOXED_LSIF=1` in the daemon's process environment — a
-/// deliberate, auditable, per-environment decision that cannot be silently
-/// inherited from a one-time `init` invocation.
-///
-/// If you need the daemon to run RA unconfined, set
-/// `TRAVSR_ALLOW_UNSANDBOXED_LSIF=1` in the environment where the daemon is
-/// launched (e.g. your shell profile or systemd unit file).
+/// The daemon runs RA unconfined only when `TRAVSR_ALLOW_UNSANDBOXED_LSIF=1` is
+/// in its environment, or when a `rust` entry is recorded under
+/// `unsandboxed_consent` in lang.toml, which `init --allow-unsandboxed-lsif`
+/// writes. Either way the sandbox must be unavailable first.
 pub fn set_allow_unsandboxed_lsif(val: bool) {
     travsr_indexer::sandbox::set_cli_allow_unsandboxed(val);
 }

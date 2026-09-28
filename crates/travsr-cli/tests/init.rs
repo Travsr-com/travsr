@@ -770,3 +770,31 @@ fn hook_run_after_reset_hard_prunes_the_discarded_file() {
             .unwrap_or_default()
     ));
 }
+
+#[test]
+fn allow_unsandboxed_lsif_is_recorded_for_the_daemon() {
+    // The daemon is a separate process and never sees init's flags, so the
+    // grant must land in lang.toml, where the daemon reads it.
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(tmp.path().join("lib.rs"), "fn a() {}\n").unwrap();
+    let lang_toml = tmp.path().join("lang.toml");
+
+    Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("TRAVSR_LANG_TOML", &lang_toml)
+        .current_dir(tmp.path())
+        .args(["init", "--allow-unsandboxed-lsif"])
+        .assert()
+        .success();
+
+    let toml: toml::Value = toml::from_str(&std::fs::read_to_string(&lang_toml).unwrap()).unwrap();
+    let granted: Vec<&str> = toml["unsandboxed_consent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["language"].as_str())
+        .collect();
+    assert_eq!(granted, ["rust"]);
+}

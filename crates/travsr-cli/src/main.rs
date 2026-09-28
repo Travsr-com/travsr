@@ -78,7 +78,8 @@ enum Command {
         ///
         /// Only set this when you fully trust the repository being indexed.
         /// This flag cannot be set by repository contents (.env, Cargo.toml,
-        /// tsconfig, etc.) — it must be an explicit, per-invocation decision.
+        /// tsconfig, etc.). It is remembered in ~/.travsr/lang.toml, so later
+        /// runs and background updates keep Rust's full analysis.
         #[arg(long, visible_alias = "allow-unsandboxed")]
         allow_unsandboxed_lsif: bool,
         /// Skip auto-detecting AI coding tools and wiring them to Travsr.
