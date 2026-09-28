@@ -6094,10 +6094,6 @@ fn get_execution_path_with_filter(
     )
 }
 
-/// Shared search body. `diagnose` controls whether the empty outcomes are
-/// explained (#620): single-repo callers pass `true` so an agent never gets a
-/// silent blank; the multi-repo aggregator passes `false` because a repo
-/// without the symbols is normal, not an error.
 /// How one `get_execution_path` endpoint name resolved, after access filtering.
 ///
 /// #779: the distinction that was missing. The old code took the first hit from
@@ -6141,7 +6137,10 @@ fn resolve_endpoint(
     let visible = |n: &CoreNode| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()));
     let mut candidates = match resolve_reference_targets(store, name, None) {
         RefTarget::Unique(n) => vec![n],
-        RefTarget::Ambiguous(list) => list,
+        // A path needs one node per endpoint, and each arity of an Objective-C
+        // method family has its own full selector that resolves uniquely, so a
+        // family is answered like any other ambiguity: list it, never pick.
+        RefTarget::Ambiguous(list) | RefTarget::Family(list) => list,
         RefTarget::None => Vec::new(),
     };
     candidates.retain(visible);
@@ -6169,8 +6168,8 @@ fn resolve_endpoint(
 ///
 /// So a signature is advertised as re-runnable only when it appears once. When
 /// it does not, the caller is pointed at the tools that do carry a path lever:
-/// `find_references` takes a `path` hint, and the `graph` CLI takes `--path`.
-/// `get_callers` deliberately is not named, it has no `path` argument either.
+/// `find_references` and `get_callers` take a `path` hint (#719), and the
+/// `graph` CLI takes `--path`.
 fn ambiguous_endpoint_message(which: &str, name: &str, candidates: &[CoreNode]) -> String {
     let limit = crate::AMBIGUOUS_DISPLAY_LIMIT;
     let count = candidates.len();
@@ -6218,10 +6217,10 @@ fn ambiguous_endpoint_message(which: &str, name: &str, candidates: &[CoreNode]) 
             .map(|n| n.vname.path.as_str())
             .filter(|p| !p.is_empty());
         let lever = match example {
-            Some(path) => {
-                format!("find_references (`path` hint) or `travsr graph {name} --path {path}`")
-            }
-            None => "find_references (`path` hint)".to_string(),
+            Some(path) => format!(
+                "find_references or get_callers (`path` hint), or `travsr graph {name} --path {path}`"
+            ),
+            None => "find_references or get_callers (`path` hint)".to_string(),
         };
         format!(
             "{head} A signature listed once below resolves uniquely on a re-run; one \
@@ -6244,6 +6243,10 @@ fn ambiguous_endpoint_message(which: &str, name: &str, candidates: &[CoreNode]) 
     out
 }
 
+/// Shared search body. `diagnose` controls whether the empty outcomes are
+/// explained (#620): single-repo callers pass `true` so an agent never gets a
+/// silent blank; the multi-repo aggregator passes `false` because a repo
+/// without the symbols is normal, not an error.
 fn get_execution_path_body(
     store: &SqliteStore,
     source: &str,
@@ -16715,9 +16718,9 @@ mod snippet_tests {
              is; got: {result}"
         );
         assert!(
-            !result.contains("get_callers"),
-            "get_callers has no `path` argument either, so naming it would \
-             repeat the dead end; got: {result}"
+            result.contains("get_callers"),
+            "get_callers takes a `path` hint (#719), so it is a lever that works \
+             and must be named; got: {result}"
         );
     }
 
@@ -16869,6 +16872,47 @@ mod snippet_tests {
         assert!(
             result.contains("ambiguous") && result.contains("sink"),
             "an ambiguous sink must be named as the sink; got: {result}"
+        );
+    }
+
+    /// An Objective-C selector family (`RefTarget::Family`) is one method at
+    /// several arities. A path needs one node per endpoint, so the bare head is
+    /// listed like any ambiguity, and since every arity has its own full
+    /// selector the signature hatch is real: re-running with one finds the path.
+    #[test]
+    fn get_execution_path_lists_a_selector_family_and_its_full_selectors_resolve() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let objc = |sig: &str| {
+            Node::new(
+                VName::new("c", "", "AFSecurityPolicy.m", "objectivec", sig),
+                "method",
+            )
+        };
+        let short = objc("method:AFSecurityPolicy.policyWithPinningMode:");
+        let long = objc("method:AFSecurityPolicy.policyWithPinningMode:withPinnedCertificates:");
+        let sink = objc("method:AFSecurityPolicy.validate");
+        for n in [&short, &long, &sink] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(long.id, sink.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let result = get_execution_path(&store, "policyWithPinningMode", "validate");
+        assert!(
+            result.contains("ambiguous") && result.contains("which each resolve uniquely"),
+            "a family is listed with the signature hatch, never guessed; got: {result}"
+        );
+
+        let pinned = get_execution_path(
+            &store,
+            "method:AFSecurityPolicy.policyWithPinningMode:withPinnedCertificates:",
+            "validate",
+        );
+        assert!(
+            pinned.contains("path (1 step"),
+            "the full selector the list offers must resolve and find the path; got: {pinned}"
         );
     }
 
