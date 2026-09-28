@@ -6145,8 +6145,21 @@ fn resolve_endpoint(
         // match: fall back to the substring search the tool used before #779.
         // Its hits go through the same filter-then-count below, so a partial
         // name resolves only when exactly one visible node matches it.
+        //
+        // That search also matches file paths, so only symbols whose own
+        // signature contains the name are kept: a file or import node, or any
+        // node merely sitting in a matching file, is not an endpoint, and
+        // listing one offered a "signature" whose re-run was another list.
         RefTarget::None => match store.search_nodes_by_name(name) {
-            Ok(hits) => hits,
+            Ok(hits) => {
+                let needle = name.to_lowercase();
+                hits.into_iter()
+                    .filter(|n| {
+                        repo_map_is_symbol_kind(&n.kind)
+                            && n.vname.signature.to_lowercase().contains(&needle)
+                    })
+                    .collect()
+            }
             Err(e) => {
                 tracing::warn!("get_execution_path partial-name search error: {e}");
                 Vec::new()
@@ -6293,14 +6306,21 @@ fn get_execution_path_body(
     // "I found none". Only the endpoint that is actually ambiguous is reported;
     // if both are, the source is named first so the caller has one thing to fix.
     //
-    // Not gated on `diagnose`: that flag keeps a repo WITHOUT the names silent
-    // in a multi-repo aggregate (#620), and a repo with several of them is not
-    // that case. Gating it dropped the repo's answer entirely.
+    // In a multi-repo aggregate (`!diagnose`) a repo that lacks either name
+    // stays silent (#620), so ambiguity is reported there only when the other
+    // endpoint exists in this repo too: a repo with several `main`s and no
+    // sink can never answer. Dropping it whenever `!diagnose` was the opposite
+    // mistake, silencing a repo that could.
+    let present = |r: &EndpointResolution| !matches!(r, EndpointResolution::None);
     if let EndpointResolution::Ambiguous(candidates) = &src_res {
-        return ambiguous_endpoint_message("source", source, candidates);
+        if diagnose || present(&sink_res) {
+            return ambiguous_endpoint_message("source", source, candidates);
+        }
     }
     if let EndpointResolution::Ambiguous(candidates) = &sink_res {
-        return ambiguous_endpoint_message("sink", sink, candidates);
+        if diagnose || present(&src_res) {
+            return ambiguous_endpoint_message("sink", sink, candidates);
+        }
     }
 
     let (src_node, sink_node) = (src_res.into_unique(), sink_res.into_unique());
@@ -17000,6 +17020,46 @@ mod snippet_tests {
         assert!(
             missing.is_empty(),
             "a repo without the name stays silent in an aggregate (#620); got: {missing:?}"
+        );
+        // Ambiguous source, absent sink: this repo can never answer, so its
+        // candidate list is noise in an aggregate (#620), not an answer.
+        let cannot_answer =
+            get_execution_path_body(&store, "Runner.run", "Nope.none", &OpenFilter, false);
+        assert!(
+            cannot_answer.is_empty(),
+            "a repo lacking the other endpoint stays silent in an aggregate; got: {cannot_answer:?}"
+        );
+    }
+
+    /// The substring fallback matches paths as well as signatures, so without a
+    /// filter a name that only appears in a file path listed that file's file
+    /// and import nodes, and offered them as signatures that "each resolve
+    /// uniquely" when re-running with one returned another list.
+    #[test]
+    fn get_execution_path_partial_fallback_lists_symbols_only() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let at = |sig: &str, kind: &str| {
+            Node::new(
+                VName::new("t", "", "strategies/leastConnection.go", "go", sig),
+                kind,
+            )
+        };
+        for n in [
+            at("file", "file"),
+            at("import:errors", "import"),
+            at("fn:selectServer", "function"),
+        ] {
+            store.put_node(&n).unwrap();
+        }
+        let result = get_execution_path(&store, "leastConnection", "selectServer");
+        assert!(
+            result.contains("could not resolve source"),
+            "a name found only in a path is not a symbol; got: {result}"
+        );
+        assert!(
+            !result.contains("import:errors") && !result.contains("(file)"),
+            "file and import nodes are never endpoint candidates; got: {result}"
         );
     }
 
