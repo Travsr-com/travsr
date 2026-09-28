@@ -41,7 +41,7 @@ import {
 import {
   registerParityCommands,
   refreshOpenPanels,
-  stripEnvelope,
+  envelopeBody,
   probeLangListContract,
   contractSkewMessage,
 } from "./commands";
@@ -1004,9 +1004,7 @@ interface FileListOpts {
 export function parseEnvelope(raw: string): string[] {
   // Every caller counts the lines as results, so drop what is not one: a note
   // the server appends after `</travsr-data>`, and the `~ =` legend.
-  const end = raw.lastIndexOf("</travsr-data>");
-  const body = end < 0 ? raw : raw.slice(0, end + "</travsr-data>".length);
-  return stripEnvelope(body)
+  return envelopeBody(raw)
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith("~ = "));

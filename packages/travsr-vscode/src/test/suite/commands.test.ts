@@ -6,6 +6,7 @@ import {
   parseGraphSymbols,
   parseSynonymList,
   parseExecutionPath,
+  describeNoPath,
   parseReposList,
   parseAvailableLanguages,
   buildStatsView,
@@ -81,11 +82,37 @@ suite("VSCODE-247: parseExecutionPath", () => {
     assert.strictEqual(data.edges[0].source, "fn:a");
     assert.strictEqual(data.edges[0].target, "fn:b");
   });
-  test("tolerates lines without the `(kind), path` shape", () => {
-    const data = parseExecutionPath("just-a-signature");
-    assert.strictEqual(data.nodes.length, 1);
-    assert.strictEqual(data.nodes[0].id, "just-a-signature");
-    assert.strictEqual(data.edges.length, 0);
+  test("takes the route only: no header, corridor, envelope or trailing note", () => {
+    // Real get_execution_path output shape (tools.rs), with the note the server
+    // appends after the envelope while semantic analysis is behind.
+    const raw =
+      "<travsr-data>\n" +
+      "path (1 step, source to sink):\n" +
+      "fn:a (function) — src/a.ts\n" +
+      "fn:b (function) — src/b.ts\n" +
+      "\n" +
+      "nearby context (1 node, within the corridor around that path, NOT on it):\n" +
+      "fn:c (function) — src/c.ts\n" +
+      "</travsr-data>\n" +
+      "[note: call-graph index incomplete; call edges may be missing.]";
+    const data = parseExecutionPath(raw);
+    assert.deepStrictEqual(data.nodes.map((n) => n.id), ["fn:a", "fn:b"]);
+    assert.strictEqual(data.edges.length, 1);
+  });
+  test("a no-path answer is not a node", () => {
+    const raw =
+      "<travsr-data>\nno path found: 'fn:a' and 'fn:b' both resolved, but no connecting call chain was found within traversal limits.\n</travsr-data>\n[note: x]";
+    assert.strictEqual(parseExecutionPath(raw).nodes.length, 0);
+    assert.ok(describeNoPath(raw, "a", "b").startsWith("no path found: 'fn:a' and 'fn:b'"));
+  });
+  test("a pending index says so instead of 'no path'", () => {
+    const raw =
+      '{"status":"pending","message":"Semantic call-edge index has not finished."}';
+    assert.strictEqual(parseExecutionPath(raw).nodes.length, 0);
+    assert.strictEqual(describeNoPath(raw, "a", "b"), "Semantic call-edge index has not finished.");
+  });
+  test("an empty answer falls back to naming both ends", () => {
+    assert.strictEqual(describeNoPath("", "a", "b"), "No path found from a to b.");
   });
   test("empty input yields empty graph", () => {
     const data = parseExecutionPath("<travsr-data></travsr-data>");
