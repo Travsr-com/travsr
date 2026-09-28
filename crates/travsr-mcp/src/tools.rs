@@ -6135,6 +6135,9 @@ fn resolve_endpoint(
     filter: &dyn EdgeFilter,
 ) -> EndpointResolution {
     let visible = |n: &CoreNode| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()));
+    // Set when the partial-name fallback hit the search limit, so its survivors
+    // are a sample, not every match.
+    let mut truncated = false;
     let mut candidates = match resolve_reference_targets(store, name, None) {
         RefTarget::Unique(n) => vec![n],
         // A path needs one node per endpoint, and each arity of an Objective-C
@@ -6152,6 +6155,7 @@ fn resolve_endpoint(
         // listing one offered a "signature" whose re-run was another list.
         RefTarget::None => match store.search_nodes_by_name(name) {
             Ok(hits) => {
+                truncated = hits.len() >= travsr_store::NODE_NAME_SEARCH_LIMIT;
                 let needle = name.to_lowercase();
                 hits.into_iter()
                     .filter(|n| {
@@ -6167,6 +6171,12 @@ fn resolve_endpoint(
         },
     };
     candidates.retain(visible);
+    // A path-only hit ranks the same as a signature hit, so a truncated search
+    // can keep one symbol out of dozens that match (kubernetes: `wrappers`
+    // kept 1 of 31). That survivor is a guess, so it is not resolved.
+    if truncated && candidates.len() == 1 {
+        return EndpointResolution::None;
+    }
     match candidates.len() {
         0 => EndpointResolution::None,
         1 => EndpointResolution::Unique(candidates.remove(0)),
@@ -17060,6 +17070,44 @@ mod snippet_tests {
         assert!(
             !result.contains("import:errors") && !result.contains("(file)"),
             "file and import nodes are never endpoint candidates; got: {result}"
+        );
+    }
+
+    /// The substring search stops at `NODE_NAME_SEARCH_LIMIT` rows, and a
+    /// path-only hit ranks the same as a signature hit, so a directory-like
+    /// query can fill the limit with path hits. Filtering then leaves one
+    /// symbol out of many (kubernetes: `wrappers` kept 1 of 31), which must
+    /// not become a silent unique endpoint.
+    #[test]
+    fn get_execution_path_truncated_partial_search_never_guesses() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let func =
+            |path: &str, sig: &str| Node::new(VName::new("t", "", path, "go", sig), "function");
+        // Path-only hits for `kuberuntime` that fill the search limit.
+        for i in 0..travsr_store::NODE_NAME_SEARCH_LIMIT {
+            store
+                .put_node(&func(
+                    &format!("a_kuberuntime/f{i:03}.go"),
+                    &format!("fn:f{i}"),
+                ))
+                .unwrap();
+        }
+        // One real match inside the limit, one past it.
+        let inside = func("a_kuberuntime/a.go", "fn:newKuberuntimeManager");
+        let outside = func("zz/k.go", "fn:kuberuntimeVersion");
+        let sink = func("zz/t.go", "fn:target");
+        for n in [&inside, &outside, &sink] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(inside.id, sink.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let result = get_execution_path(&store, "kuberuntime", "target");
+        assert!(
+            !result.contains("path (") && !result.contains("no path found"),
+            "a survivor of a truncated search is a guess, never an endpoint; got: {result}"
         );
     }
 
