@@ -299,10 +299,18 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "travsr.showBlastRadius",
-      async (file: string, files?: string[]) => {
+      async (fileArg?: string, files?: string[]) => {
         // files is pre-fetched when called from the code lens (arguments: [file, files]).
         // When called from the hover card markdown link only [file] is encoded in the URI,
         // so re-fetch here to avoid passing undefined to buildFileListHtml.
+        // From the command palette there is no argument: use the active file.
+        const editor = vscode.window.activeTextEditor;
+        const file =
+          fileArg ?? (editor ? vscode.workspace.asRelativePath(editor.document.uri, false) : "");
+        if (!file) {
+          void vscode.window.showInformationMessage("Open a file to check blast radius.");
+          return;
+        }
         const panel = vscode.window.createWebviewPanel(
           "travsrBlastRadius",
           `Blast radius, ${file}`,
@@ -412,7 +420,20 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "travsr.showCallers",
-      async (symbol: string) => {
+      async (symbolArg?: string) => {
+        // From the command palette there is no argument: ask, seeded from the
+        // word under the cursor (the same prompt Show Execution Path uses).
+        let symbol = symbolArg;
+        if (!symbol) {
+          const editor = vscode.window.activeTextEditor;
+          symbol = await vscode.window.showInputBox({
+            prompt: "Symbol",
+            value: editor
+              ? editor.document.getText(editor.document.getWordRangeAtPosition(editor.selection.active))
+              : "",
+          });
+          if (!symbol) return;
+        }
         const raw = await proxy.callTool("get_callers", { symbol });
         const lines = parseEnvelope(raw);
         const panel = vscode.window.createWebviewPanel(
@@ -981,7 +1002,14 @@ interface FileListOpts {
 
 /** Strip the `<travsr-data>…</travsr-data>` MCP envelope and return trimmed non-empty lines. */
 export function parseEnvelope(raw: string): string[] {
-  return stripEnvelope(raw).split("\n").map((l) => l.trim()).filter(Boolean);
+  // Every caller counts the lines as results, so drop what is not one: a note
+  // the server appends after `</travsr-data>`, and the `~ =` legend.
+  const end = raw.lastIndexOf("</travsr-data>");
+  const body = end < 0 ? raw : raw.slice(0, end + "</travsr-data>".length);
+  return stripEnvelope(body)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("~ = "));
 }
 
 export function buildFileListHtml(
