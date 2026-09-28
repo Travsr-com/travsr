@@ -14,9 +14,11 @@ mod faq;
 mod fsck;
 mod git_bounded;
 mod graph;
+mod guard;
 mod index;
 mod init;
 mod install;
+mod invariants;
 mod lang;
 mod logo;
 mod pattern;
@@ -82,6 +84,35 @@ enum Command {
         /// Skip auto-detecting AI coding tools and wiring them to Travsr.
         #[arg(long)]
         no_connect: bool,
+        /// Install the Claude Code PreToolUse guard, which intercepts Grep,
+        /// Glob, Read and shell grep/rg/find/ag/ack/`ls -R` and points the
+        /// agent at the Travsr call that answers the same question.
+        ///
+        /// `--guard` is advisory: it never blocks, it attaches the replacement
+        /// call. `--guard=strict` denies a read the graph can answer, naming
+        /// the call that replaces it, and allows everything else.
+        ///
+        /// Off unless asked for. The level is stored in .travsr/config.toml;
+        /// TRAVSR_GUARD=off turns it off for one command, and
+        /// `travsr connect --remove` takes the hook back out.
+        ///
+        /// Claude Code only: no other host has a pre-tool contract to hook.
+        #[arg(
+            long,
+            value_name = "MODE",
+            // The guard is installed by the connect pass, so `--no-connect`
+            // would silently discard it. An error beats a flag that does
+            // nothing.
+            conflicts_with = "no_connect",
+            num_args = 0..=1,
+            // `--guard=strict`, or a bare `--guard`. Requiring the `=` is what
+            // keeps `travsr connect --guard --print` from reading `--print`
+            // as the level.
+            require_equals = true,
+            default_missing_value = "advisory",
+            value_enum
+        )]
+        guard: Option<guard::GuardMode>,
     },
     /// Detect AI coding tools and wire them to the Travsr MCP server + rules.
     Connect {
@@ -107,6 +138,48 @@ enum Command {
         /// nudged toward the graph rather than left to choose.
         #[arg(long)]
         rules: bool,
+        /// Install the Claude Code PreToolUse guard at this level: `--guard`
+        /// for advisory (never blocks, names the Travsr call the agent should
+        /// have made) or `--guard=strict` to deny reads the graph can answer.
+        ///
+        /// The level is stored in .travsr/config.toml, so `travsr guard` and
+        /// the installed hook always agree on it. `--remove` takes both back
+        /// out; TRAVSR_GUARD=off is the per-command escape hatch.
+        #[arg(
+            long,
+            value_name = "MODE",
+            num_args = 0..=1,
+            // `--guard=strict`, or a bare `--guard`. Requiring the `=` is what
+            // keeps `travsr connect --guard --print` from reading `--print`
+            // as the level.
+            require_equals = true,
+            default_missing_value = "advisory",
+            value_enum
+        )]
+        guard: Option<guard::GuardMode>,
+    },
+    /// Claude Code PreToolUse hook handler: reads a hook payload on stdin and
+    /// writes a permission decision on stdout.
+    ///
+    /// Not meant to be run by hand. `travsr init --guard` registers it in
+    /// .claude/settings.json; it then runs on every Grep, Glob, Read and Bash
+    /// call and, depending on `guard.mode`, either attaches the Travsr call
+    /// that answers the same question (advisory) or denies the read and names
+    /// it (strict). It never blocks a call it cannot replace: a missing, stale
+    /// or unreadable index, an unrecognised command, its own failure or a
+    /// missed deadline all let the call through.
+    ///
+    /// TRAVSR_GUARD=off disables it for one command.
+    Guard {
+        /// Print, on stderr, the one-line reason behind the decision.
+        ///
+        /// "The guard is installed and nothing is blocked" has a dozen
+        /// causes that look identical from outside: the mode is off, the
+        /// index is stale, the symbol is unknown, the command was not
+        /// recognised. This says which. stdout is unchanged, so it is safe
+        /// to leave on in a hook.
+        #[arg(long)]
+        explain: bool,
     },
     /// Start the Travsr daemon (git hook + file watcher + MCP server).
     Daemon {
@@ -319,6 +392,14 @@ enum Command {
         #[command(subcommand)]
         action: config::ConfigCommand,
     },
+    /// Check declared architectural rules (architecture-invariants.json) against
+    /// the graph. Exits non-zero on a violation, so it works as a CI gate.
+    Invariants {
+        /// Which edges to trust: 'ratified' (default) excludes the un-ratified
+        /// live overlay so a bare-name guess cannot invent a dependency.
+        #[arg(long, default_value = "ratified")]
+        provenance: String,
+    },
     /// Check graph integrity; optionally repair ghost nodes and orphan edges.
     Fsck {
         /// Delete ghost nodes and sweep orphan edges (default: report only).
@@ -461,6 +542,26 @@ fn print_refused_reports(v: &serde_json::Value) {
 /// Everything else about the entry point is unchanged: same current-thread
 /// flavor, same async body (now `async_main`), same panic/exit behavior —
 /// `Builder::build()` failure panics just as the macro's expansion does.
+/// #777: what `travsr mcp` says when it is run in a terminal.
+///
+/// Separate from the call site so a test can assert the wording without faking
+/// a TTY, which is not portable.
+///
+/// Names the transport, why nothing happened, and both ways forward. The
+/// reported experience was a process that "appears frozen" with nothing on
+/// screen to act on, so an error that only said "not a tty" would reproduce the
+/// same dead end more quickly.
+fn mcp_tty_message() -> String {
+    "travsr mcp speaks JSON-RPC over stdin and is meant to be launched by an MCP \
+     client, not run directly.\n\
+     stdin is a terminal here, so there is no client to talk to and the server \
+     would wait forever for a request that never arrives.\n\
+     \n\
+     To connect it to your editor or agent: travsr connect\n\
+     To drive the protocol by hand: TRAVSR_MCP_ALLOW_TTY=1 travsr mcp"
+        .to_string()
+}
+
 fn main() {
     let max_blocking =
         (4 * travsr_plugin_host::resource_limits::effective_cpu_count()).clamp(8, 64);
@@ -547,7 +648,7 @@ async fn async_main() {
         _ => None,
     };
     // Held for the process lifetime: dropping the guard closes the log.
-    let _log_guard = if is_daemon {
+    let log_guard = if is_daemon {
         None
     } else {
         init_tracing(global_log_dir.as_deref())
@@ -560,6 +661,14 @@ async fn async_main() {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
 
+    // And flush the log the same way, for the same reason the daemon's fatal
+    // exits do: every arm below is `std::process::exit`, which runs no
+    // destructors, so a guard left to drop at end of scope never drops and the
+    // tail of the file is lost with the unjoined writer thread. That was
+    // always true here; it starts mattering now that this file follows a level
+    // the user set and is therefore worth reading to the end.
+    drop(log_guard);
+
     match result {
         Ok(()) => std::process::exit(0),
         Err(e) => {
@@ -569,6 +678,35 @@ async fn async_main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Filter for the rolling `daemon.log.*` file written by `travsr mcp --global`.
+///
+/// Separate from the stderr filter on purpose: stderr belongs to whoever ran the
+/// command and defaults to `error`, while the file is the durable artifact
+/// `travsr daemon logs` reads afterwards and follows the `log.level` setting the
+/// Health panel writes. Resolved at global scope (no repo), since this process
+/// serves every registered repo at once.
+///
+/// Deliberately does NOT consult `RUST_LOG`, and that asymmetry with the daemon
+/// is the point. This process is spawned by an MCP client, so its environment is
+/// the editor's, not something a person chose for it: honouring `RUST_LOG` here
+/// let an inherited `RUST_LOG=error` empty the durable log, and the exact form
+/// the CLI's own troubleshooting text prints,
+/// `RUST_LOG=travsr_plugin_host=debug travsr init ...`, carries no bare level
+/// and so disabled every other target in the file. That is the same class of
+/// accident this whole change exists to remove, and the layer was an
+/// unconditional `info` before precisely so the file stayed worth reading.
+/// `RUST_LOG` still governs stderr, which is the caller's own channel.
+fn file_log_filter() -> (tracing_subscriber::EnvFilter, String, &'static str) {
+    let (level, source) = travsr_config::resolve_log_level_setting(None);
+    let directive = travsr_daemon::filter_directive_for(&level);
+    let filter = tracing_subscriber::EnvFilter::try_new(&directive).unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(travsr_daemon::filter_directive_for(
+            travsr_config::DEFAULT_LOG_LEVEL,
+        ))
+    });
+    (filter, level, source.label())
 }
 
 /// Initialise the global tracing subscriber.
@@ -624,7 +762,14 @@ fn init_tracing(
                 travsr_daemon::logfile::LOG_PREFIX,
             ));
 
-        // The file gets INFO so the log is worth reading, matching the daemon.
+        // The file gets `log.level` (default info) so the log is worth reading,
+        // matching the daemon — this writer produces the same `daemon.log.*`
+        // files, in the global home, and `travsr daemon logs --global` reads
+        // them with the same reader, so one setting has to govern both or the
+        // control in the Health panel would be true of one file and not the
+        // other. Global scope: this process serves every registered repo, so no
+        // single repo's `config.toml` is the right layer to consult.
+        //
         // stderr keeps the caller's filter, which defaults to error: a stdio
         // MCP client should not have its terminal filled with our internals.
         //
@@ -634,6 +779,7 @@ fn init_tracing(
         // directly, and `travsr daemon logs` renders it back for people rather
         // than making them read JSON. `with_current_span` is on because the
         // repo tag that `--repo` filters by lives in a span, not in the event.
+        let (file_filter, file_level, file_level_from) = file_log_filter();
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
@@ -642,7 +788,7 @@ fn init_tracing(
                     .with_span_list(false)
                     .with_writer(writer)
                     .with_ansi(false)
-                    .with_filter(tracing_subscriber::EnvFilter::new("info")),
+                    .with_filter(file_filter),
             )
             .with(
                 tracing_subscriber::fmt::layer()
@@ -650,6 +796,20 @@ fn init_tracing(
                     .with_filter(env_filter),
             )
             .init();
+        // The same self-describing first line the daemon writes, for the same
+        // reason and on the same exempt target: this file is now governed by a
+        // setting, so it has to say which one, and it has to say it at any
+        // level. Without this the durable log the panel points people at was
+        // the one file that could not answer "why is this empty".
+        tracing::info!(
+            target: travsr_daemon::SESSION_LOG_TARGET,
+            event = "mcp.session.start",
+            version = env!("CARGO_PKG_VERSION"),
+            pid = std::process::id(),
+            log_level = %file_level,
+            log_level_from = file_level_from,
+            "global stdio MCP server starting"
+        );
         Some(guard)
     }
 
@@ -722,6 +882,7 @@ async fn run(cli: Cli) -> Result<()> {
             force,
             allow_unsandboxed_lsif,
             no_connect,
+            guard,
         } => init::run(
             quiet,
             json,
@@ -730,13 +891,18 @@ async fn run(cli: Cli) -> Result<()> {
             force,
             allow_unsandboxed_lsif,
             no_connect,
+            guard,
         )?,
+        // Before anything that prints: stdout is the hook's decision channel,
+        // the same way `travsr mcp --stdio`'s is the protocol channel.
+        Command::Guard { explain } => guard::run(explain)?,
         Command::Connect {
             tool,
             print,
             remove,
             commit,
             rules,
+            guard,
         } => {
             let cwd = std::env::current_dir()?;
             // Write command: `connect` creates files in the resolved root, so it
@@ -753,6 +919,7 @@ async fn run(cli: Cli) -> Result<()> {
                     remove,
                     commit,
                     rules,
+                    guard,
                     report: connect::Report::Stdout,
                 },
             )?;
@@ -1190,6 +1357,25 @@ async fn run(cli: Cli) -> Result<()> {
             global,
             db,
         } => {
+            // #777: `travsr mcp` speaks JSON-RPC over stdin, so on a terminal it
+            // blocks on a request that is never typed and looks frozen: no
+            // output, no prompt, no hint anything is wrong. It is only ever
+            // meant to be spawned as a subprocess by an MCP client.
+            //
+            // Guard on stdin, not stdout. A client that pipes stdin while
+            // leaving stderr on the terminal is a normal working setup, so
+            // testing stdout would refuse a legitimate launch. stdin being a
+            // terminal is what makes the server unusable, because there is no
+            // client on the other end to send a request.
+            //
+            // TRAVSR_MCP_ALLOW_TTY keeps the escape hatch for driving the
+            // protocol by hand, which is a real debugging workflow this would
+            // otherwise remove.
+            if std::io::IsTerminal::is_terminal(&std::io::stdin())
+                && std::env::var_os("TRAVSR_MCP_ALLOW_TTY").is_none()
+            {
+                anyhow::bail!(mcp_tty_message());
+            }
             if global {
                 travsr_mcp::serve_stdio_global()?;
             } else {
@@ -1340,8 +1526,27 @@ async fn run(cli: Cli) -> Result<()> {
             // The daemon does not need this. Its watcher sees the same
             // deletions and reconciles them, which is why the gap only shows up
             // without one. Verified both ways before choosing where to fix it.
-            let whole_tree = matches!(event.as_deref(), Some("post-checkout") | Some("post-merge"));
-            let dirty = if from_hook && whole_tree {
+            //
+            // #893: a `git reset --hard` (also `commit --amend`, `rebase`) fires
+            // no hook at all, so the same divergence is discovered one commit
+            // late — by `post-commit`, whose diff describes only the new commit.
+            // Reindexing that delta leaves the reset-away files as ghosts *and*
+            // stamps `last_commit` to HEAD, which erases the drift note
+            // `travsr status` was printing while the graph was still wrong.
+            // The stored marker not being an ancestor of HEAD is exactly the
+            // "the tree moved without a commit describing it" condition above,
+            // so take the same recovery rather than inventing a second one.
+            let whole_tree = from_hook
+                && (matches!(event.as_deref(), Some("post-checkout") | Some("post-merge"))
+                    || !travsr_daemon::commit_is_ancestor_of_head(
+                        &repo_root,
+                        &store
+                            .get_meta("last_commit")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default(),
+                    ));
+            let dirty = if whole_tree {
                 let (dirty, files) = travsr_daemon::reconcile_tracked_tree(&repo_root, &mut store)?;
                 tracing::debug!(
                     event = event.as_deref().unwrap_or(""),
@@ -1400,6 +1605,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Rerank { action } => rerank::run(action)?,
         Command::Embed { action } => embed::run(action)?,
         Command::Config { action } => config::run(action)?,
+        Command::Invariants { provenance } => invariants::run(&provenance)?,
         Command::Fsck { fix, json, force } => fsck::run(fix, json, force)?,
     }
     Ok(())
@@ -2245,6 +2451,29 @@ pub(crate) fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, dela
 
 #[cfg(test)]
 mod tests {
+
+    /// #777: running `travsr mcp` in a terminal must explain itself, not hang.
+    ///
+    /// Asserts the message rather than the TTY branch: faking a terminal on
+    /// stdin is not portable, and the branch itself is one `is_terminal` call.
+    /// What can regress silently is the wording, and the whole point of the
+    /// issue is that the user was left with nothing to act on.
+    #[test]
+    fn mcp_tty_message_says_what_to_do_next() {
+        let m = super::mcp_tty_message();
+        assert!(
+            m.contains("travsr connect"),
+            "must name the way to wire it up: {m}"
+        );
+        assert!(
+            m.contains("TRAVSR_MCP_ALLOW_TTY"),
+            "must name the override, or hand-driving the protocol becomes impossible: {m}"
+        );
+        assert!(
+            m.contains("stdin"),
+            "must say which stream is the problem: {m}"
+        );
+    }
     use super::*;
 
     /// RFC-025 §5.5 honesty test (b): a declared floor may never sit above what

@@ -24,6 +24,10 @@ fn init_test_repo(tmp: &Path) {
     Command::new(cargo_bin("travsr"))
         .arg("init")
         .current_dir(tmp)
+        // #893: without this, `travsr init` appends this tempdir to the
+        // developer's real ~/.travsr/registry.json and leaves the entry there
+        // after `tempfile` deletes the directory.
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -564,6 +568,8 @@ fn mcp_get_context_result_is_not_an_error_for_empty_graph() {
     std::process::Command::new(cargo_bin("travsr"))
         .arg("init")
         .current_dir(tmp.path())
+        // #893: keep this tempdir out of the developer's real registry.
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

@@ -17,7 +17,7 @@
 //! env (e.g. java → `~/.gradle`, `~/.m2`, `JAVA_HOME`).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Extra sandbox grants a language's Phase B analyzer needs beyond the repo +
@@ -85,9 +85,14 @@ impl RepoWrite {
 }
 
 /// The exact repo-relative subpaths `language`'s Phase B analyzer must write,
-/// keeping the rest of the repo root read-only. Empty for every language except
-/// scala: `sbt compile` writes build outputs to `target/` and `project/target/`
-/// inside the project (sbt's layout has no out-of-tree build option), and
+/// keeping the rest of the repo root read-only. Empty for every language whose
+/// analyzer writes only outside the repo; non-empty for the ones that drive the
+/// project's own build tool (scala, java, kotlin, csharp) and for php, whose
+/// analyzer hardcodes its output path.
+///
+/// scala: `sbt compile` writes build outputs to `target/` inside the project
+/// (sbt's layout has no out-of-tree build option): at the root, under
+/// `project/`, and once per platform in an sbt-crossproject tree. And
 /// SemanticDB is enabled via a settings file (`.travsr-semanticdb.sbt`) the
 /// wrapper drops alongside `build.sbt`. Narrowing to these subpaths — rather than
 /// the whole repo root — means a hostile `build.sbt` executed by sbt during
@@ -99,27 +104,113 @@ pub fn repo_write_subpaths(language: &str) -> &'static [RepoWrite] {
         "scala" => &[
             RepoWrite::Dir("target"),
             RepoWrite::Dir("project/target"),
+            // sbt's meta-build of the meta-build. Present in a real crossproject
+            // tree and written by the same `sbt compile`.
+            RepoWrite::Dir("project/project/target"),
+            // #832 moved the scala sidecar to sbt-crossproject support on the
+            // read side (`find_semanticdb_files` walks `target/` at any depth,
+            // and its own test asserts `jvm/target` and `native/target`), but
+            // this grant stayed on the single-module layout. A crossproject
+            // build writes SemanticDB per platform: on the pinned
+            // scala-parser-combinators fixture all 150 `.semanticdb` files land
+            // under js/jvm/native and NONE under the granted `target/`. On macOS
+            // scala runs under the `Elevated` policy, which skips sandbox-exec
+            // entirely, so the mismatch is invisible there; on Linux the repo
+            // root is a `--ro-bind` and those writes take EROFS.
+            RepoWrite::Dir("js/target"),
+            RepoWrite::Dir("jvm/target"),
+            RepoWrite::Dir("native/target"),
             RepoWrite::File(".travsr-semanticdb.sbt"),
         ],
+        // scip-php has no `--output`: it hardcodes `index.scip` relative to its
+        // working directory, which has to be the repo for it to find
+        // composer.json at all. Without this grant the sidecar's write is denied
+        // and `file_put_contents` returns false with a zero exit status, i.e. a
+        // silent empty index rather than a reported failure. The sidecar moves
+        // the file into scratch and removes it, so nothing survives the run.
+        "php" => &[RepoWrite::File("index.scip")],
+        // These three drive the project's own build tool, which writes its
+        // output into the project. Same trade scala already makes, same shape
+        // of grant, and without it their Phase B is dead on Linux: the repo root
+        // is a `--ro-bind`, so javac and the compiler plugin take EROFS and the
+        // language indexes to nothing. All three are `RequiresElevated`, which
+        // on macOS skips the sandbox entirely, which is why this was invisible.
+        //
+        // Verified on Linux for java/maven (bwrap, arm64): with `target/` bound
+        // over a read-only root, writing new files, deleting files inside it and
+        // deleting its CONTENTS all succeed, and a write outside the grant is
+        // still denied. Only removing the `target` directory itself fails, and
+        // the java sidecar passes `-Dmaven.clean.failOnError=false` so `clean`
+        // degrades that to a warning: contents are still cleared, javac still
+        // runs, BUILD SUCCESS. Gradle needs no equivalent flag because scip-java
+        // drives it through `scipCompileAll` and never runs `clean`.
+        //
+        // kotlin and csharp were measured the same way, on the same host.
+        // csharp needed nothing beyond `obj/` and `bin/`: `dotnet build` writes
+        // its assembly and succeeds. kotlin needed one directory that guessing
+        // would have missed, and did miss: the Kotlin Gradle Plugin opens a
+        // build session under `<project>/.kotlin/sessions/`, so without it
+        // `compileKotlin` dies with
+        // `FileSystemException: .kotlin/sessions/....salive: Read-only file
+        // system` while every other grant is in place. With it, the same build
+        // compiles. `.kotlin` is deliberately NOT on java's list: a pure java
+        // gradle build never loads that plugin, and a mixed java/kotlin repo
+        // that turns out to need it is one line, added when it is observed
+        // rather than guessed at now.
+        "java" => &[
+            RepoWrite::Dir("target"),
+            RepoWrite::Dir("build"),
+            RepoWrite::Dir(".gradle"),
+        ],
+        "kotlin" => &[
+            RepoWrite::Dir("build"),
+            RepoWrite::Dir(".gradle"),
+            RepoWrite::Dir(".kotlin"),
+        ],
+        "csharp" => &[RepoWrite::Dir("obj"), RepoWrite::Dir("bin")],
         _ => &[],
     }
 }
 
-/// Whether `language`'s analyzer needs any repo-root write grant at all. Derived
-/// from [`repo_write_subpaths`]; the Windows AppContainer path uses this coarse
-/// bool (scala is `WindowsSandbox::Unsupported` there and never reaches it).
-pub fn needs_repo_write(language: &str) -> bool {
-    !repo_write_subpaths(language).is_empty()
+/// Whether any existing component of `root`/`subpath` is a symlink.
+///
+/// Checked component by component, not just at the leaf: a link anywhere on the
+/// path (`target` -> `/`, then `target/x`) escapes the repo just as well. A
+/// component that does not exist yet is fine, since it is created as a real
+/// dir/file immediately after and the result is re-stat'd before it is granted.
+///
+/// Shared by every platform that materialises a repo-write grant: the host
+/// creates the path as the user, UNSANDBOXED, so a repo shipping php's
+/// `index.scip` as a link to `~/.ssh/authorized_keys` would otherwise get that
+/// target created and then handed to the sandbox writable.
+pub fn grant_path_has_symlink(root: &std::path::Path, subpath: &str) -> bool {
+    let mut p = root.to_path_buf();
+    for component in std::path::Path::new(subpath).components() {
+        p.push(component);
+        match std::fs::symlink_metadata(&p) {
+            Ok(md) => {
+                if md.file_type().is_symlink() {
+                    return true;
+                }
+            }
+            // Does not exist yet: nothing to follow.
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
-/// Compute the toolchain grants for a language's Phase B analyzer.
-/// Empty for languages with no out-of-repo toolchain needs.
-pub fn toolchain_access(language: &str) -> ToolchainAccess {
+/// Compute the toolchain grants for a language's Phase B analyzer about to
+/// run against `repo_root`. Empty for languages with no out-of-repo toolchain
+/// needs. Only the JVM arms look at the repo (#904: whether it is an Android
+/// build decides whether the SDK is granted); nothing under it is ever read as
+/// a path to grant.
+pub fn toolchain_access(language: &str, repo_root: &Path) -> ToolchainAccess {
     match language {
         "go" => go_access(),
         "dart" => dart_access(),
-        "java" => java_access(),
-        "kotlin" => kotlin_access(),
+        "java" => java_access(repo_root),
+        "kotlin" => kotlin_access(repo_root),
         "scala" => scala_access(),
         "php" => php_access(),
         "csharp" => csharp_access(),
@@ -133,8 +224,9 @@ pub fn toolchain_access(language: &str) -> ToolchainAccess {
         // caches, no network. System headers (/usr, /Library/Developer, /opt/homebrew)
         // are already readable via the base macOS sandbox profile and equivalent
         // bwrap binds on Linux. The only sandbox requirement is a writable scratch
-        // dir, which is now injected via InvokeRequest::scratch.
-        "c" | "cpp" => ToolchainAccess::default(),
+        // dir, which is now injected via InvokeRequest::scratch. On macOS it
+        // also needs SDKROOT to find libc++ (see `clang_access_for`).
+        "c" | "cpp" => clang_access_for(xcode_sdk_path()),
         _ => ToolchainAccess::default(),
     }
 }
@@ -286,8 +378,25 @@ fn dart_access() -> ToolchainAccess {
     }
 }
 
+/// The user's home directory, on every platform this ships to.
+///
+/// `HOME` alone is not enough. Windows sets `USERPROFILE` and normally leaves
+/// `HOME` unset, so this returned `None` there and every caller below silently
+/// dropped its grant: the NuGet package cache, `~/.gradle`, `~/.m2`, the
+/// Coursier and Composer caches, `~/.dotnet`. Each toolchain that depends on one
+/// was therefore missing a read path it needs on Windows, which reads as "the
+/// analyzer produced nothing" rather than as a configuration error.
+///
+/// This is not a widening of the sandbox policy: every one of those paths is
+/// already granted by deliberate design on macOS and Linux, and each is a
+/// well-known subdirectory of the invoking user's own home. Honouring the
+/// variable Windows actually sets makes the platforms agree rather than giving
+/// Windows anything the others do not have. `phase_b_dart` in `travsr-analysis`
+/// already reads the pair this way.
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// Resolve the JDK installation dir (`JAVA_HOME`): the env var if set, else
@@ -323,16 +432,159 @@ fn tool_bin_dir(tool: &str) -> Option<PathBuf> {
         .or_else(|| exe.parent().map(|p| p.to_path_buf()))
 }
 
+/// The Android SDK an Android Gradle Plugin build reads, when one is installed
+/// (#904): `ANDROID_HOME`, then the deprecated `ANDROID_SDK_ROOT`, then the
+/// IDE's default install location for the machine where Android Studio manages
+/// the SDK and nothing names it in the environment.
+///
+/// AGP itself consults `sdk.dir` in the project's `local.properties` first.
+/// That source is deliberately NOT read here: the file is repo content, and
+/// the build this sandbox confines is repo code with network access, so a
+/// directory it names would turn into a read grant chosen by the repo
+/// (`sdk.dir=/Users/victim` binds the whole home directory). The environment
+/// and the IDE default are the user's own, like `JAVA_HOME`. A repo whose
+/// `local.properties` points somewhere else fails inside the sandbox with
+/// AGP's own message, which the java sidecar turns into a diagnostic naming
+/// `ANDROID_HOME`.
+fn android_sdk_root() -> Option<PathBuf> {
+    let from_env = ["ANDROID_HOME", "ANDROID_SDK_ROOT"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let default = if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Android").join("Sdk"))
+    } else if cfg!(target_os = "macos") {
+        home().map(|h| h.join("Library").join("Android").join("sdk"))
+    } else {
+        home().map(|h| h.join("Android").join("Sdk"))
+    };
+    first_android_sdk(from_env.chain(default))
+}
+
+/// The first candidate that is an Android SDK, in order, as the directory to
+/// grant. The environment is the user's own, but it is still checked for the
+/// SDK's shape rather than mere existence: a stale `ANDROID_HOME` left
+/// pointing at a directory that is no longer an SDK would otherwise become a
+/// read grant on whatever is there now. `platforms/` or `platform-tools/` is
+/// what every SDK install carries (`sdkmanager` creates them; `android.jar`
+/// lives under the first). A symlinked root (`~/Android/Sdk -> /data/sdk`, a
+/// common way to keep the SDK on another disk) is resolved and the target is
+/// granted, since the sandbox layers bind real paths; the shape check runs on
+/// the resolved directory.
+fn first_android_sdk(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find_map(|p| android_sdk_at(&p))
+}
+
+fn android_sdk_at(root: &Path) -> Option<PathBuf> {
+    let real = strip_windows_verbatim(std::fs::canonicalize(root).ok()?);
+    let is_sdk =
+        real.is_dir() && (real.join("platforms").is_dir() || real.join("platform-tools").is_dir());
+    is_sdk.then_some(real)
+}
+
+/// Whether the repository at `root` builds with the Android Gradle Plugin,
+/// which is the only build that needs the SDK grant (#904). Without this gate
+/// every Java and Kotlin repo on a machine with Android Studio installed would
+/// pay for a grant it never uses, and on Windows that grant is an ACL walk of
+/// the whole SDK per repo (33.6s measured on a 595 MB SDK, minutes on a full
+/// one with the NDK and system images).
+///
+/// Repo content decides only WHETHER the user's own SDK path is granted,
+/// never WHICH path, so this reads nothing as a path. The AGP plugin id
+/// (`com.android.application`, `com.android.library`, ...) appears in the
+/// module build file that applies it, in the root build file that declares
+/// it, or only in `gradle/libs.versions.toml` when a version catalog names it
+/// (`alias(libs.plugins.android.application)` in the build files carries no
+/// literal). Build files are looked for a few levels down so `android/app/`
+/// (Flutter, React Native) is seen. A `local.properties` next to the settings
+/// file is Android Studio's own marker and counts too; its content is not
+/// read.
+fn repo_uses_android_gradle_plugin(root: &Path) -> bool {
+    const MARKER: &str = "com.android";
+    if root.join("local.properties").is_file() {
+        return true;
+    }
+    if file_mentions(&root.join("gradle").join("libs.versions.toml"), MARKER) {
+        return true;
+    }
+    gradle_build_files(root, 3).any(|f| file_mentions(&f, MARKER))
+}
+
+/// Gradle settings and build files under `root`, at most `depth` directory
+/// levels down. Skips the directories that never hold a module's build file
+/// and can be enormous (`build`, `.gradle`, `node_modules`, hidden dirs).
+fn gradle_build_files(root: &Path, depth: usize) -> impl Iterator<Item = PathBuf> {
+    const NAMES: [&str; 4] = [
+        "settings.gradle",
+        "settings.gradle.kts",
+        "build.gradle",
+        "build.gradle.kts",
+    ];
+    let mut found = Vec::new();
+    let mut pending: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, level)) = pending.pop() {
+        for name in NAMES {
+            let f = dir.join(name);
+            if f.is_file() {
+                found.push(f);
+            }
+        }
+        if level == depth {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || matches!(name.as_ref(), "build" | "node_modules") {
+                continue;
+            }
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                pending.push((entry.path(), level + 1));
+            }
+        }
+    }
+    found.into_iter()
+}
+
+/// Whether `file` contains `needle`. A build file is a few KB; the read is
+/// capped so a repo cannot make this expensive.
+fn file_mentions(file: &Path, needle: &str) -> bool {
+    const MAX_BYTES: u64 = 1024 * 1024;
+    let Ok(f) = std::fs::File::open(file) else {
+        return false;
+    };
+    let mut text = String::new();
+    use std::io::Read as _;
+    if f.take(MAX_BYTES).read_to_string(&mut text).is_err() {
+        return false;
+    }
+    text.contains(needle)
+}
+
 /// `scip-java index` drives Gradle (and Maven) to resolve dependencies. Needs:
 ///   - `JAVA_HOME`       (read) — JDK installation dir
 ///   - `~/.gradle`       (read+write) — Gradle daemon, caches, wrapper downloads
 ///   - `~/.m2`           (read) — Maven local repository
 ///   - `HOME` + `GRADLE_USER_HOME` env vars so Gradle finds its home
+///   - the Android SDK   (read) + `ANDROID_HOME`, when one is installed AND
+///     the repo builds with the Android Gradle Plugin (#904): an AGP build
+///     cannot configure without `platforms/android-NN/android.jar`, and the
+///     cleared sandbox env used to drop the variable that names the SDK even
+///     when the user had set it. `~/.android` (ADB key, debug keystore) is NOT
+///     granted: indexing only compiles, AGP treats its analytics and keystore
+///     state as best-effort, and no failure without the grant has been measured.
 ///
 /// Also the base grant set for `kotlin_access`: kotlin-language-server drives
 /// the same Gradle/Maven classpath resolution under the hood, even though it
 /// isn't scip-java itself (see `kotlin_access` for what it additionally needs).
-fn java_access() -> ToolchainAccess {
+///
+/// `repo_root` is the repository the analyzer is about to run against; it
+/// decides whether the SDK grant applies (`repo_uses_android_gradle_plugin`).
+fn java_access(repo_root: &Path) -> ToolchainAccess {
     let mut read_paths = Vec::new();
     let mut write_paths = Vec::new();
     let mut env = Vec::new();
@@ -371,6 +623,24 @@ fn java_access() -> ToolchainAccess {
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
     }
 
+    // #904: Android SDK, read-only, plus the variable AGP reads to find it.
+    // Only for a repo that builds with AGP, and only when an SDK is installed:
+    // a repo that is not Android never needs it (and on Windows would pay an
+    // ACL walk of the SDK for nothing), and an Android repo without an SDK
+    // gets AGP's own "SDK location not found", which the java sidecar turns
+    // into a diagnostic naming the SDK.
+    if let Some(sdk) = repo_uses_android_gradle_plugin(repo_root)
+        .then(android_sdk_root)
+        .flatten()
+    {
+        tracing::debug!(path = %sdk.display(), "java_access: Android SDK grant (read)");
+        read_paths.push(sdk.clone());
+        env.push((
+            "ANDROID_HOME".to_string(),
+            sdk.to_string_lossy().into_owned(),
+        ));
+    }
+
     // G5: scip-java (and kotlin-language-server) drive Gradle/Maven, which invoke
     // `java`. Grant execute on JAVA_HOME/bin so the sandbox can run it; the JDK
     // root is already in read_paths. Gradle/Maven caches stay read-only.
@@ -398,8 +668,8 @@ fn java_access() -> ToolchainAccess {
 /// image load: the wrapper spawned (it lives in the granted `~/.travsr/bin`),
 /// but the launcher it execs, and the jars under `server/lib` it reads, were
 /// both unreachable — 0 nodes, 0 edges, no error surfaced.
-fn kotlin_access() -> ToolchainAccess {
-    let mut access = java_access();
+fn kotlin_access(repo_root: &Path) -> ToolchainAccess {
+    let mut access = java_access(repo_root);
     if let Some(h) = home() {
         let kls = h.join(".travsr").join("kls");
         tracing::debug!(path = %kls.display(), exists = kls.exists(), "kotlin_access: KLS install dir grant (read+execute)");
@@ -551,41 +821,139 @@ fn php_access() -> ToolchainAccess {
 /// Resolve the dotnet install root that holds `host/`, `sdk/`, `shared/` — the
 /// value `DOTNET_ROOT` must point at, and the dir the sandbox must grant read +
 /// execute so scip-dotnet's apphost can load the runtime and shell out to
-/// `dotnet`. Uses `tool_path` (PATHEXT-aware, so `dotnet.exe` resolves on
-/// Windows — the old `dir.join("dotnet")` PATH scan never matched there, leaving
-/// Windows with no DOTNET_ROOT and no exec grant). Only accepts a root that
-/// actually carries an SDK/host, and falls back to the per-user
-/// `~/.dotnet` when `dotnet` on PATH is a runtime-only host.
+/// `dotnet`.
+///
+/// Tries a `dotnet` launcher — `tool_path` first (PATHEXT-aware, so `dotnet.exe`
+/// resolves on Windows), then the well-known installs a minimal-PATH daemon
+/// omits — and maps the first one carrying a real SDK to its root. **The
+/// non-PATH launchers are the load-bearing part**: a daemon launched from a GUI
+/// or a login shell without `/opt/homebrew/bin` on PATH left `tool_path` finding
+/// nothing, so no `DOTNET_ROOT` was injected and no exec grant issued, and
+/// scip-dotnet failed to launch — the C# lane then produced no reference edges.
+/// When no launcher is reachable at all, the well-known SDK roots are probed
+/// directly (this also covers the per-user `~/.dotnet` when `dotnet` on PATH is a
+/// runtime-only host).
 fn dotnet_sdk_root() -> Option<PathBuf> {
-    let exe = travsr_core::exec::tool_path("dotnet")?;
+    if let Some(root) = dotnet_launcher_candidates()
+        .into_iter()
+        .filter(|p| p.is_file())
+        .find_map(|exe| dotnet_sdk_root_from_binary(&exe))
+    {
+        return Some(root);
+    }
+    well_known_dotnet_roots()
+        .into_iter()
+        .find(|d| d.join("sdk").is_dir())
+}
+
+/// `dotnet` launcher locations to try, PATH-resolved first, then the well-known
+/// installs a sandboxed or GUI-launched daemon's PATH omits: Homebrew's
+/// version-independent `opt/` symlink (Apple silicon and Intel), the official
+/// installer directory (where `dotnet` sits directly in the SDK root), the
+/// Windows machine-wide install, and a user-local `~/.dotnet`.
+fn dotnet_launcher_candidates() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(p) = travsr_core::exec::tool_path("dotnet") {
+        out.push(p);
+    }
+    out.extend(
+        [
+            "/opt/homebrew/opt/dotnet/bin/dotnet",
+            "/usr/local/opt/dotnet/bin/dotnet",
+            "/usr/local/share/dotnet/dotnet",
+            "/usr/share/dotnet/dotnet",
+        ]
+        .into_iter()
+        .map(PathBuf::from),
+    );
+    out.extend(
+        windows_dotnet_roots()
+            .into_iter()
+            .map(|r| r.join("dotnet.exe")),
+    );
+    if let Some(h) = home() {
+        out.push(h.join(".dotnet").join("dotnet"));
+    }
+    out
+}
+
+/// The machine-wide dotnet install directories on Windows.
+///
+/// Without these the minimal-PATH case this whole fallback targets was covered
+/// on Windows only when the user happened to have a per-user `~/.dotnet`, even
+/// though [`dotnet_sdk_root_from_binary`] already reasons about
+/// `C:\Program Files\dotnet` carrying an SDK-less `host/`. `ProgramFiles` /
+/// `ProgramFiles(x86)` are honoured so a non-default system drive or a 32-bit
+/// install still resolves; the literal paths are the fallback for when the
+/// variables are unset. The `sdk/` requirement at both call sites is what keeps
+/// a runtime-only root from being chosen.
+///
+/// Empty on non-Windows, where these paths do not exist and probing them would
+/// only cost a stat.
+fn windows_dotnet_roots() -> Vec<PathBuf> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(base) = std::env::var(var) {
+            out.push(PathBuf::from(base).join("dotnet"));
+        }
+    }
+    for literal in [r"C:\Program Files\dotnet", r"C:\Program Files (x86)\dotnet"] {
+        let p = PathBuf::from(literal);
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The SDK-bearing root a `dotnet` launcher belongs to, or `None` if it carries
+/// no `sdk/`.
+///
+/// Requires an actual `sdk/` (not just `host/`): scip-dotnet runs `dotnet
+/// restore`/build, so a runtime-only host root is useless (`C:\Program
+/// Files\dotnet` carries `host/` even when SDK-less, so a `host/` check would
+/// wrongly pick it over a real SDK elsewhere). Two layouts:
+///   - **Standard** (Windows / dotnet-install / Linux tarball / Program Files):
+///     `dotnet(.exe)` sits directly in the root holding `host/ sdk/ shared/`.
+///   - **Homebrew macOS:** `…/Cellar/dotnet/<ver>/bin/dotnet` → `…/libexec`.
+fn dotnet_sdk_root_from_binary(exe: &std::path::Path) -> Option<PathBuf> {
     // canonicalize resolves symlinks (Homebrew's `bin/dotnet` shim) but adds the
     // `\\?\` verbatim prefix on Windows — strip it, or dotnet chokes on a
     // `\\?\`-prefixed DOTNET_ROOT / exec-grant path.
-    let real = strip_windows_verbatim(std::fs::canonicalize(&exe).unwrap_or(exe));
+    let real =
+        strip_windows_verbatim(std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf()));
     let dir = real.parent()?;
-    // Require an actual `sdk/` (not just `host/`): scip-dotnet runs `dotnet
-    // restore`/build, so a runtime-only host root is useless. `C:\Program
-    // Files\dotnet` carries `host/` even when SDK-less, so a `host/` check would
-    // wrongly pick it over a real SDK elsewhere.
-    // Standard layout (Windows / dotnet-install / Linux tarball / Program Files):
-    // `dotnet(.exe)` sits directly in the root holding host/ sdk/ shared/.
     if dir.join("sdk").is_dir() {
         return Some(dir.to_path_buf());
     }
-    // Homebrew macOS: …/Cellar/dotnet/<ver>/bin/dotnet → …/libexec holds the SDK.
     if let Some(libexec) = dir.parent().map(|p| p.join("libexec")) {
         if libexec.join("sdk").is_dir() {
             return Some(libexec);
         }
     }
-    // `dotnet` on PATH is a runtime-only host (no SDK): fall back to the per-user
-    // dotnet-install default that actually carries an SDK.
-    if let Some(d) = home().map(|h| h.join(".dotnet")) {
-        if d.join("sdk").is_dir() {
-            return Some(d);
-        }
-    }
     None
+}
+
+/// SDK roots to probe directly when no `dotnet` launcher is reachable, plus the
+/// per-user dotnet-install default. Filtered by an actual `sdk/` at the call site.
+fn well_known_dotnet_roots() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = [
+        "/opt/homebrew/opt/dotnet/libexec",
+        "/usr/local/opt/dotnet/libexec",
+        "/usr/local/share/dotnet",
+        "/usr/share/dotnet",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+    out.extend(windows_dotnet_roots());
+    if let Some(h) = home() {
+        out.push(h.join(".dotnet"));
+    }
+    out
 }
 
 /// `scip-dotnet` resolves NuGet packages. Needs:
@@ -724,7 +1092,7 @@ fn ruby_access() -> ToolchainAccess {
 /// exfiltration, not reads of shared system directories.
 fn objc_access() -> ToolchainAccess {
     let mut read_paths = vec![PathBuf::from("/Library")];
-    if let Some(sdk) = run_cmd_stdout("xcrun", &["--show-sdk-path"]).map(PathBuf::from) {
+    if let Some(sdk) = xcode_sdk_path() {
         tracing::debug!(path = %sdk.display(), exists = sdk.exists(), "objc_access: Xcode SDK grant (read)");
         read_paths.push(sdk);
     }
@@ -733,6 +1101,27 @@ fn objc_access() -> ToolchainAccess {
         write_paths: vec![],
         exec_paths: vec![],
         env: vec![],
+    }
+}
+
+/// The active Apple SDK (`xcrun --show-sdk-path`); `None` off macOS.
+fn xcode_sdk_path() -> Option<PathBuf> {
+    run_cmd_stdout("xcrun", &["--show-sdk-path"]).map(PathBuf::from)
+}
+
+/// scip-clang finds libc++ and the SDK headers only through `SDKROOT` on
+/// macOS; without it every expression involving a std type is dropped. The
+/// sandbox clears the env, so pass the SDK in, and grant it read for when a
+/// full Xcode puts it under `/Applications`.
+fn clang_access_for(sdk: Option<PathBuf>) -> ToolchainAccess {
+    let Some(sdk) = sdk else {
+        return ToolchainAccess::default();
+    };
+    ToolchainAccess {
+        env: vec![("SDKROOT".to_string(), sdk.to_string_lossy().into_owned())],
+        read_paths: vec![sdk],
+        write_paths: vec![],
+        exec_paths: vec![],
     }
 }
 
@@ -1017,8 +1406,128 @@ fn go_access() -> ToolchainAccess {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_windows_verbatim;
+    use super::{
+        dotnet_launcher_candidates, dotnet_sdk_root_from_binary, strip_windows_verbatim,
+        well_known_dotnet_roots,
+    };
     use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "travsr-toolchain-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// The repo-write grant guard: every platform that materialises a grant
+    /// calls this before creating the path as the user, so a link anywhere on
+    /// it must be refused, not just at the leaf.
+    #[test]
+    fn grant_path_symlink_guard_rejects_a_link_at_any_component() {
+        use super::grant_path_has_symlink;
+        let root = scratch("grantlink");
+
+        // A path that does not exist yet is fine: it gets created as a real
+        // file or directory immediately after, then re-stat'd.
+        assert!(!grant_path_has_symlink(&root, "index.scip"));
+
+        // A real file and a real nested directory are both fine.
+        std::fs::write(root.join("real.scip"), b"").expect("write file");
+        std::fs::create_dir_all(root.join("jvm/target")).expect("create dirs");
+        assert!(!grant_path_has_symlink(&root, "real.scip"));
+        assert!(!grant_path_has_symlink(&root, "jvm/target"));
+
+        #[cfg(unix)]
+        {
+            let outside = root.join("outside.txt");
+            std::fs::write(&outside, b"secret").expect("write outside");
+
+            // Leaf is a link.
+            std::os::unix::fs::symlink(&outside, root.join("linked.scip")).expect("symlink");
+            assert!(grant_path_has_symlink(&root, "linked.scip"));
+
+            // An intermediate component is a link: the leaf below it is a real
+            // directory, so a leaf-only check would pass this.
+            let elsewhere = root.join("elsewhere");
+            std::fs::create_dir_all(elsewhere.join("target")).expect("create elsewhere");
+            std::os::unix::fs::symlink(&elsewhere, root.join("js")).expect("symlink dir");
+            assert!(grant_path_has_symlink(&root, "js/target"));
+        }
+    }
+
+    /// Homebrew layout: `<root>/bin/dotnet` with the SDK under `<root>/libexec`.
+    /// This is the install a minimal-PATH daemon could not resolve before the fix.
+    #[test]
+    fn dotnet_root_resolves_homebrew_layout() {
+        let root = scratch("dn-brew");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("libexec/sdk")).unwrap();
+        std::fs::write(root.join("bin/dotnet"), b"#!/bin/sh\n").unwrap();
+
+        let got = dotnet_sdk_root_from_binary(&root.join("bin/dotnet")).unwrap();
+        // `dotnet_sdk_root_from_binary` strips the Windows `\\?\` verbatim prefix
+        // `canonicalize` adds; strip `want` the same way (a no-op off Windows).
+        assert_eq!(
+            got,
+            strip_windows_verbatim(std::fs::canonicalize(root.join("libexec")).unwrap())
+        );
+    }
+
+    /// Standard layout: `dotnet` sits directly in the SDK root beside `sdk/`.
+    #[test]
+    fn dotnet_root_resolves_standard_layout() {
+        let root = scratch("dn-std");
+        std::fs::create_dir_all(root.join("sdk")).unwrap();
+        std::fs::write(root.join("dotnet"), b"#!/bin/sh\n").unwrap();
+
+        let got = dotnet_sdk_root_from_binary(&root.join("dotnet")).unwrap();
+        // Strip the `\\?\` prefix from `want` to match the function (see above).
+        assert_eq!(
+            got,
+            strip_windows_verbatim(std::fs::canonicalize(&root).unwrap())
+        );
+    }
+
+    /// A runtime-only host (no `sdk/`) is rejected: scip-dotnet needs the SDK to
+    /// restore/build, so a runtime root is worse than falling through.
+    #[test]
+    fn dotnet_root_rejects_runtime_only_host() {
+        let root = scratch("dn-runtime");
+        std::fs::create_dir_all(root.join("host")).unwrap();
+        std::fs::write(root.join("dotnet"), b"#!/bin/sh\n").unwrap();
+        assert!(dotnet_sdk_root_from_binary(&root.join("dotnet")).is_none());
+    }
+
+    /// The Homebrew fallbacks a sandboxed / GUI-launched PATH omits are in the
+    /// search, both as launcher candidates and as direct-root candidates.
+    #[test]
+    fn dotnet_candidates_cover_the_sandbox_path_gap() {
+        assert!(dotnet_launcher_candidates()
+            .iter()
+            .any(|p| p.ends_with("opt/homebrew/opt/dotnet/bin/dotnet")));
+        assert!(well_known_dotnet_roots()
+            .iter()
+            .any(|p| p.ends_with("opt/homebrew/opt/dotnet/libexec")));
+    }
+
+    #[test]
+    fn clang_gets_the_sdk_as_sdkroot() {
+        let sdk = PathBuf::from("/Applications/Xcode.app/SDKs/MacOSX.sdk");
+        let access = super::clang_access_for(Some(sdk.clone()));
+        assert_eq!(access.read_paths, vec![sdk]);
+        assert_eq!(
+            access.env,
+            vec![(
+                "SDKROOT".to_string(),
+                "/Applications/Xcode.app/SDKs/MacOSX.sdk".to_string()
+            )]
+        );
+        assert!(super::clang_access_for(None).env.is_empty());
+    }
 
     #[test]
     fn strips_drive_verbatim_prefix() {
@@ -1046,5 +1555,159 @@ mod tests {
             strip_windows_verbatim(PathBuf::from("/home/user/repo")),
             PathBuf::from("/home/user/repo")
         );
+    }
+}
+
+#[cfg(test)]
+mod android_sdk_tests {
+    use super::{android_sdk_at, first_android_sdk, repo_uses_android_gradle_plugin};
+    use std::path::{Path, PathBuf};
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, text).expect("write");
+    }
+
+    // The environment names the SDK in order (`ANDROID_HOME` before the
+    // deprecated `ANDROID_SDK_ROOT`, the IDE default last) and the first one
+    // that is an SDK wins. Existence alone is not enough: a stale variable
+    // left pointing at a directory that is no longer an SDK grants nothing,
+    // so the sandbox never binds an arbitrary user directory on its account
+    // (#904 review). Candidates are passed in, so this holds without touching
+    // the process environment.
+    #[test]
+    fn first_candidate_that_is_an_sdk_wins() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("missing");
+        let not_an_sdk = tmp.path().join("not-an-sdk");
+        std::fs::create_dir_all(&not_an_sdk).expect("mkdir");
+        let sdk = tmp.path().join("sdk");
+        std::fs::create_dir_all(sdk.join("platforms").join("android-36")).expect("mkdir");
+        let later_sdk = tmp.path().join("later-sdk");
+        std::fs::create_dir_all(later_sdk.join("platform-tools")).expect("mkdir");
+        let real =
+            |p: &Path| super::strip_windows_verbatim(std::fs::canonicalize(p).expect("canon"));
+
+        assert_eq!(
+            first_android_sdk([
+                missing.clone(),
+                not_an_sdk.clone(),
+                sdk.clone(),
+                later_sdk.clone()
+            ]),
+            Some(real(&sdk)),
+            "the first candidate that is an SDK, not the first that exists"
+        );
+        assert_eq!(
+            first_android_sdk([later_sdk.clone(), sdk.clone()]),
+            Some(real(&later_sdk)),
+            "order is precedence"
+        );
+        assert_eq!(first_android_sdk([missing, not_an_sdk]), None);
+        assert_eq!(first_android_sdk(Vec::<PathBuf>::new()), None);
+    }
+
+    // Either marker directory identifies an SDK (`sdkmanager` creates both,
+    // but a platforms-only or platform-tools-only install is still one); a
+    // plain directory, a file, or nothing at all does not.
+    #[test]
+    fn an_sdk_is_recognised_by_its_marker_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        assert_eq!(android_sdk_at(root), None);
+        std::fs::write(root.join("platforms"), "").expect("write");
+        assert_eq!(
+            android_sdk_at(root),
+            None,
+            "a file named platforms is not a directory"
+        );
+        std::fs::remove_file(root.join("platforms")).expect("rm");
+        std::fs::create_dir_all(root.join("platform-tools")).expect("mkdir");
+        assert!(android_sdk_at(root).is_some());
+        assert_eq!(android_sdk_at(&root.join("platform-tools")), None);
+        assert_eq!(android_sdk_at(&root.join("nope")), None);
+    }
+
+    // A symlinked root (the SDK kept on another disk) is resolved and the
+    // target is what gets granted; the shape check runs on the target.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_sdk_root_resolves_to_its_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sdk = tmp.path().join("sdk");
+        std::fs::create_dir_all(sdk.join("platforms")).expect("mkdir");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&sdk, &link).expect("symlink");
+        let target = std::fs::canonicalize(&sdk).expect("canon");
+        assert_eq!(android_sdk_at(&link), Some(target.clone()));
+        assert_eq!(android_sdk_at(&sdk), Some(target));
+        let dangling = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &dangling).expect("symlink");
+        assert_eq!(android_sdk_at(&dangling), None);
+    }
+
+    // The SDK is granted only to a repo that builds with AGP: the plugin id in
+    // a module or root build file, in the version catalog when the build files
+    // only alias it, a nested `android/app` layout, or Android Studio's
+    // `local.properties` next to the settings file. A plain Gradle or Maven
+    // repo gets no grant, and nothing is read as a path.
+    #[test]
+    fn only_an_android_gradle_build_gets_the_sdk_grant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        // Plain Java Gradle repo: no grant.
+        write(
+            &root.join("settings.gradle.kts"),
+            "rootProject.name = \"plain\"\n",
+        );
+        write(&root.join("build.gradle.kts"), "plugins { id(\"java\") }\n");
+        assert!(!repo_uses_android_gradle_plugin(root));
+
+        // The module applies AGP.
+        write(
+            &root.join("app").join("build.gradle.kts"),
+            "plugins { id(\"com.android.application\") }\n",
+        );
+        assert!(repo_uses_android_gradle_plugin(root));
+        std::fs::remove_dir_all(root.join("app")).expect("rm");
+        assert!(!repo_uses_android_gradle_plugin(root));
+
+        // Version catalog only: the build files carry `alias(libs.plugins...)`.
+        write(
+            &root.join("gradle").join("libs.versions.toml"),
+            "[plugins]\nandroid-application = { id = \"com.android.application\", version = \"9.3.2\" }\n",
+        );
+        assert!(repo_uses_android_gradle_plugin(root));
+        std::fs::remove_dir_all(root.join("gradle")).expect("rm");
+        assert!(!repo_uses_android_gradle_plugin(root));
+
+        // Flutter / React Native: the Android build lives under `android/`.
+        write(
+            &root.join("android").join("app").join("build.gradle"),
+            "apply plugin: 'com.android.application'\n",
+        );
+        assert!(repo_uses_android_gradle_plugin(root));
+        std::fs::remove_dir_all(root.join("android")).expect("rm");
+
+        // Too deep to be a module layout, and a `build/` output dir is skipped.
+        write(
+            &root
+                .join("a")
+                .join("b")
+                .join("c")
+                .join("d")
+                .join("build.gradle"),
+            "apply plugin: 'com.android.library'\n",
+        );
+        write(
+            &root.join("build").join("build.gradle"),
+            "apply plugin: 'com.android.library'\n",
+        );
+        assert!(!repo_uses_android_gradle_plugin(root));
+
+        // Android Studio's marker file; its content is never read.
+        write(&root.join("local.properties"), "sdk.dir=/nowhere\n");
+        assert!(repo_uses_android_gradle_plugin(root));
     }
 }

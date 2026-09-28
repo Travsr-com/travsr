@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde_json::{json, Value};
 
+use crate::guard::GuardMode;
+
 const MD_BEGIN: &str = "<!-- travsr:begin -->";
 const MD_END: &str = "<!-- travsr:end -->";
 const GI_BEGIN: &str =
@@ -61,6 +63,13 @@ pub struct ConnectOpts {
     /// token cost, and it is not needed for the tools to work. MCP already
     /// hands the model every tool name and description.
     pub rules: bool,
+    /// Install the Claude Code `PreToolUse` guard at this enforcement level,
+    /// and persist it as `guard.mode` (#916). `None` leaves both alone: a plain
+    /// `travsr init` must neither install the hook nor remove one an earlier
+    /// `--guard` run put there.
+    ///
+    /// Ignored on a remove run, which always strips the hook.
+    pub guard: Option<crate::guard::GuardMode>,
     /// Where the report goes. Never affects what is written.
     pub report: Report,
 }
@@ -73,6 +82,7 @@ impl ConnectOpts {
             remove: false,
             commit: false,
             rules: false,
+            guard: None,
             report: Report::Stdout,
         }
     }
@@ -205,6 +215,248 @@ fn zed_instruction_file(repo: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// The PreToolUse guard (#916).
+// ---------------------------------------------------------------------------
+
+/// Which tools fire the guard.
+///
+/// A pipe-separated list of exact tool names, which the host documents as
+/// matching each of them exactly. `Bash` is unavoidably broad (every shell
+/// command reaches the guard), which is why `guard::shell` refuses to recognise
+/// anything but a single read-only search invocation.
+///
+/// The travsr MCP tools are here so the guard can *see* that the agent has
+/// queried the graph; that observation is what releases the strict-mode valve
+/// for a symbol the graph came back empty on. That half is a regex, since the
+/// server name inside an MCP tool id is whatever the client's config called it.
+const GUARD_MATCHER: &str = "Grep|Glob|Read|Bash|mcp__.*__(get_callers|find_references|get_context|search_symbol|get_graph_json|get_dependencies|get_blast_radius)";
+
+/// The hook handler `.claude/settings.json` gets.
+///
+/// Exec form (`command` plus `args`) rather than one shell string, because the
+/// command is an absolute path whenever `travsr` is not on `PATH`, and quoting
+/// a Windows path with a space in it correctly for both `cmd` and a POSIX shell
+/// is a problem this avoids having.
+///
+/// The timeout is the guard's own deadline with room to spare. It is a second
+/// line of defence, not the mechanism: the guard enforces
+/// `guard::GUARD_DEADLINE` itself and exits, so this only matters when the
+/// process cannot start at all.
+fn guard_handler(cmd: &McpCommand) -> Value {
+    json!({
+        "type": "command",
+        "command": cmd.command,
+        "args": ["guard"],
+        "timeout": 5,
+        "statusMessage": "travsr guard",
+    })
+}
+
+/// Whether a hook handler object is one travsr installed.
+///
+/// Identified by what it runs, not by a marker field: `.claude/settings.json`
+/// is validated by the host, and an unknown key added purely so this function
+/// had something to look for would be travsr's own invention riding in the
+/// user's file. Both the exec form written here and a shell-form `travsr guard`
+/// someone wrote by hand are recognised, so neither gets duplicated.
+fn is_guard_handler(handler: &Value) -> bool {
+    /// `travsr`, `travsr.exe`, `/usr/local/bin/travsr`, `"C:\x\travsr.exe"`.
+    fn is_travsr(command: &str) -> bool {
+        command
+            .trim_matches('"')
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(".exe")
+            == "travsr"
+    }
+
+    let Some(obj) = handler.as_object() else {
+        return false;
+    };
+    let command = obj
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match obj.get("args").and_then(Value::as_array) {
+        Some(args) => is_travsr(command) && args.first().and_then(Value::as_str) == Some("guard"),
+        // Shell form: the whole invocation is in `command`.
+        None => {
+            let mut words = command.split_whitespace();
+            words.next().is_some_and(is_travsr) && words.next() == Some("guard")
+        }
+    }
+}
+
+/// Upsert the travsr `PreToolUse` handler into `.claude/settings.json`.
+///
+/// Every other key, every other hook event, and every other `PreToolUse` group
+/// is preserved: the file is parsed, one entry is added or refreshed, and the
+/// whole thing is written back. A file that is not strict JSON is skipped
+/// rather than replaced, the same rule `merge_json_server` follows: a
+/// `settings.json` with a trailing comma in it is still the user's
+/// configuration, and clobbering it would lose more than this feature is worth.
+///
+/// Idempotent in both directions: a re-run over a file that already holds our
+/// handler refreshes it in place (so a changed binary path or matcher lands)
+/// and reports `Unchanged` when there is nothing to change.
+fn merge_json_hook(path: &Path, matcher: &str, handler: &Value) -> Result<Outcome> {
+    let mut root: Value = if path.exists() {
+        let text = std::fs::read_to_string(path)?;
+        if text.trim().is_empty() {
+            json!({})
+        } else {
+            match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(Outcome::Skipped(
+                        "existing file is not strict JSON (left untouched)".into(),
+                    ))
+                }
+            }
+        }
+    } else {
+        json!({})
+    };
+
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(Outcome::Skipped("top level is not a JSON object".into()));
+    };
+    let hooks = obj.entry("hooks".to_string()).or_insert_with(|| json!({}));
+    let Some(hooks) = hooks.as_object_mut() else {
+        return Ok(Outcome::Skipped("`hooks` is not a JSON object".into()));
+    };
+    let events = hooks
+        .entry("PreToolUse".to_string())
+        .or_insert_with(|| json!([]));
+    let Some(groups) = events.as_array_mut() else {
+        return Ok(Outcome::Skipped(
+            "`hooks.PreToolUse` is not an array".into(),
+        ));
+    };
+
+    // Refresh ours wherever it already is, so the user's own ordering survives.
+    let mut found = false;
+    let mut changed = false;
+    for group in groups.iter_mut() {
+        let Some(list) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        if !list.iter().any(is_guard_handler) {
+            continue;
+        }
+        found = true;
+        for entry in list.iter_mut() {
+            if is_guard_handler(entry) && entry != handler {
+                *entry = handler.clone();
+                changed = true;
+            }
+        }
+        // Only when ours is the sole handler in the group: a group shared with
+        // another hook has a matcher the user chose for both, and widening it
+        // to ours would start firing theirs on Read and Glob.
+        let alone = group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|l| l.len() == 1);
+        if alone && group.get("matcher").and_then(Value::as_str) != Some(matcher) {
+            if let Some(g) = group.as_object_mut() {
+                g.insert("matcher".into(), Value::String(matcher.to_string()));
+                changed = true;
+            }
+        }
+        break;
+    }
+    if !found {
+        groups.push(json!({ "matcher": matcher, "hooks": [handler] }));
+        changed = true;
+    }
+    if !changed {
+        return Ok(Outcome::Unchanged);
+    }
+
+    let pretty = serde_json::to_string_pretty(&root)? + "\n";
+    write_atomic(path, &pretty)?;
+    Ok(Outcome::Written)
+}
+
+/// Strip the travsr handler and nothing else.
+///
+/// Empty containers are pruned on the way out (a group left with no handlers,
+/// a `PreToolUse` left with no groups, a `hooks` left with no events), because
+/// each of those is a husk travsr created and the user did not. The file itself
+/// is never deleted: it is theirs, and settings they can still read beat a
+/// missing file they have to wonder about.
+fn remove_json_hook(path: &Path) -> Result<Outcome> {
+    if !path.exists() {
+        return Ok(Outcome::Absent);
+    }
+    let text = std::fs::read_to_string(path)?;
+    if text.trim().is_empty() {
+        return Ok(Outcome::Absent);
+    }
+    let mut root: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Ok(Outcome::Skipped("not strict JSON (left untouched)".into())),
+    };
+
+    let Some(groups) = root
+        .as_object_mut()
+        .and_then(|o| o.get_mut("hooks"))
+        .and_then(|h| h.as_object_mut())
+        .and_then(|h| h.get_mut("PreToolUse"))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(Outcome::Absent);
+    };
+
+    let present = groups.iter().any(|g| {
+        g.get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|l| l.iter().any(is_guard_handler))
+    });
+    if !present {
+        return Ok(Outcome::Absent);
+    }
+    for group in groups.iter_mut() {
+        if let Some(list) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+            list.retain(|h| !is_guard_handler(h));
+        }
+    }
+    // A group that had handlers and now has none was ours alone. One that never
+    // declared a `hooks` array is not ours to judge, so it stays.
+    groups.retain(|g| {
+        g.get("hooks")
+            .and_then(Value::as_array)
+            .map_or(true, |l| !l.is_empty())
+    });
+
+    // Prune the husks, innermost first.
+    if let Some(hooks) = root
+        .as_object_mut()
+        .and_then(|o| o.get_mut("hooks"))
+        .and_then(Value::as_object_mut)
+    {
+        if hooks
+            .get("PreToolUse")
+            .and_then(Value::as_array)
+            .is_some_and(|g| g.is_empty())
+        {
+            hooks.remove("PreToolUse");
+        }
+        if hooks.is_empty() {
+            if let Some(o) = root.as_object_mut() {
+                o.remove("hooks");
+            }
+        }
+    }
+
+    let pretty = serde_json::to_string_pretty(&root)? + "\n";
+    write_atomic(path, &pretty)?;
+    Ok(Outcome::Removed)
+}
+
+// ---------------------------------------------------------------------------
 // Tools.
 // ---------------------------------------------------------------------------
 
@@ -235,9 +487,24 @@ enum Detection {
 /// A planned write. `JsonServer` upserts one server under `top_key`; `ManagedMd`
 /// maintains a balanced block in a shared file; `Owned` fully owns a travsr file.
 enum Content {
-    JsonServer { top_key: &'static str, entry: Value },
-    ManagedMd { body: String },
-    Owned { text: String },
+    JsonServer {
+        top_key: &'static str,
+        entry: Value,
+    },
+    /// One `PreToolUse` entry in `.claude/settings.json` (#916). Separate from
+    /// `JsonServer` because the shape is an array of matcher groups rather than
+    /// a map keyed by server name, so "is our entry already there" is a scan,
+    /// not a lookup, and removal has to leave the surrounding groups standing.
+    JsonHook {
+        matcher: &'static str,
+        handler: Value,
+    },
+    ManagedMd {
+        body: String,
+    },
+    Owned {
+        text: String,
+    },
 }
 
 impl Content {
@@ -247,7 +514,7 @@ impl Content {
     /// agent re-reads every turn. They have different costs, so `connect` treats
     /// them differently and this is the line between them.
     fn is_guidance(&self) -> bool {
-        !matches!(self, Content::JsonServer { .. })
+        matches!(self, Content::ManagedMd { .. } | Content::Owned { .. })
     }
 }
 
@@ -400,26 +667,50 @@ impl Tool {
     }
 
     /// Project files to write when auto-detected.
-    fn plan(&self, repo: &Path, cmd: &McpCommand) -> Vec<Planned> {
+    fn plan(&self, repo: &Path, cmd: &McpCommand, guard: Option<GuardMode>) -> Vec<Planned> {
         let flat = json!({ "command": cmd.command, "args": cmd.args });
         match self {
-            Tool::ClaudeCode => vec![
-                Planned {
-                    path: repo.join(".mcp.json"),
-                    content: Content::JsonServer {
-                        top_key: "mcpServers",
-                        entry: flat,
+            Tool::ClaudeCode => {
+                let mut planned = vec![
+                    Planned {
+                        path: repo.join(".mcp.json"),
+                        content: Content::JsonServer {
+                            top_key: "mcpServers",
+                            entry: flat,
+                        },
+                        gitignore: true,
                     },
-                    gitignore: true,
-                },
-                Planned {
-                    path: repo.join("CLAUDE.md"),
-                    content: Content::ManagedMd {
-                        body: markdown_rules(),
+                    Planned {
+                        path: repo.join("CLAUDE.md"),
+                        content: Content::ManagedMd {
+                            body: markdown_rules(),
+                        },
+                        gitignore: false,
                     },
-                    gitignore: false,
-                },
-            ],
+                ];
+                // #916: Claude Code is the only host here with a pre-tool
+                // contract, so it is the only one that gets enforcement. The
+                // others keep the wiring and the prose, which is the portable
+                // half of the same problem (#252).
+                if guard.is_some() {
+                    planned.push(Planned {
+                        path: repo.join(".claude/settings.json"),
+                        content: Content::JsonHook {
+                            matcher: GUARD_MATCHER,
+                            handler: guard_handler(cmd),
+                        },
+                        // Shared, user-owned and committed, the same class as
+                        // `.gemini/settings.json` and `.zed/settings.json`. It
+                        // carries no server definition, so the RCE-on-clone
+                        // reason to git-ignore a generated file does not apply:
+                        // the worst a cloner inherits is a hook that runs a
+                        // binary they have to have installed anyway, and which
+                        // does nothing at all without `.travsr/config.toml`.
+                        gitignore: false,
+                    });
+                }
+                planned
+            }
             Tool::Cursor => vec![
                 Planned {
                     path: repo.join(".cursor/mcp.json"),
@@ -550,6 +841,27 @@ impl Tool {
         }
     }
 
+    /// A follow-up step a tool needs after its server file is written but before
+    /// the server actually loads. Distinct from `note`: `note` marks a rules-only
+    /// adapter whose MCP config lives in a global file travsr does not write,
+    /// whereas this is for a tool travsr *does* wire, that still gates the server
+    /// behind a user action.
+    ///
+    /// Claude Code will not load a project-scoped `.mcp.json` until it is approved
+    /// once (`enabledMcpjsonServers`). Writing the file reports `ok`, but the
+    /// travsr tools stay inert until that approval, so a bare `ok` reads as done
+    /// when it is not (#829).
+    fn approval_hint(&self) -> Option<&'static str> {
+        match self {
+            Tool::ClaudeCode => Some(
+                "  note: Claude Code loads a project .mcp.json only after a one-time \
+                 approval. If the travsr tools are not available, restart Claude Code \
+                 and accept the trust prompt, or run /mcp to enable the travsr server.",
+            ),
+            _ => None,
+        }
+    }
+
     /// Snippet printed when only a global marker is present.
     fn snippet(&self, repo: &Path, cmd: &McpCommand) -> String {
         let server = indent(&mcp_servers_json(cmd));
@@ -567,6 +879,19 @@ impl Tool {
             Tool::Windsurf => format!(
                 "  add to ~/.codeium/windsurf/mcp_config.json:\n{server}\n  \
                  and create {}/.windsurf/rules/travsr.md with the Travsr guidance",
+                repo.display()
+            ),
+            // Both destinations, because which one the user picks is what
+            // decides whether an approval is pending: a project `.mcp.json` is
+            // gated behind the one-time trust prompt `approval_hint` names
+            // (#829), a user-scoped entry is not. The generic arm below hands
+            // over JSON without saying where it goes, so it cannot carry either
+            // claim without asserting a scope the user has not chosen yet.
+            Tool::ClaudeCode => format!(
+                "  add to {}/.mcp.json (project scope, loads only after a one-time \
+                 approval: restart Claude Code and accept the trust prompt, or run \
+                 /mcp to enable the travsr server), or under `mcpServers` in \
+                 ~/.claude.json (user scope, no approval):\n{server}",
                 repo.display()
             ),
             _ => format!("  MCP server config:\n{server}"),
@@ -836,6 +1161,13 @@ fn execute(p: &Planned, remove: bool, refuse_new: bool) -> Result<Outcome> {
                 merge_json_server(&p.path, top_key, entry, refuse_new)
             }
         }
+        Content::JsonHook { matcher, handler } => {
+            if remove {
+                remove_json_hook(&p.path)
+            } else {
+                merge_json_hook(&p.path, matcher, handler)
+            }
+        }
         Content::ManagedMd { body } => {
             if remove {
                 remove_block(&p.path, MD_BEGIN, MD_END)
@@ -991,7 +1323,9 @@ fn shared_md_paths(
         if !matches!(tool.detect(repo, home), Detection::Auto) {
             continue;
         }
-        for planned in tool.plan(repo, cmd) {
+        // `None`: the only shared blocks are markdown ones, and the guard is
+        // not one, so planning it here would change nothing but the cost.
+        for planned in tool.plan(repo, cmd, None) {
             if matches!(planned.content, Content::ManagedMd { .. }) {
                 claims.entry(planned.path).or_default().push(tool.id());
             }
@@ -1039,6 +1373,21 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         ($($arg:tt)*) => { eprintln!($($arg)*) };
     }
 
+    // #916: a remove run always plans the guard so there is something to strip,
+    // whether or not this invocation asked for one. A write run plans it only
+    // when `--guard` was passed, so a plain `travsr init` neither installs the
+    // hook nor disturbs one an earlier `--guard` run left behind.
+    let guard_to_plan = if opts.remove {
+        Some(GuardMode::Advisory)
+    } else {
+        opts.guard
+    };
+    // What to store. A remove run stores nothing and clears instead, so the
+    // placeholder above never reaches `.travsr/config.toml`.
+    let guard_persist = if opts.remove { None } else { opts.guard };
+    // Whether the hook entry actually reached `.claude/settings.json`.
+    let mut guard_wired = false;
+
     let mut detected = false;
     // Paths to add to the .gitignore block, and paths to drop from it. Kept
     // apart because a remove run must subtract exactly what it unwired and leave
@@ -1066,7 +1415,9 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         let planned: Vec<String> = Tool::ALL
             .iter()
             .filter(|t| matches!(t.detect(repo_root, home.as_deref()), Detection::Auto))
-            .flat_map(|t| t.plan(repo_root, &cmd))
+            // `None`: this filters to `gitignore: true` paths, which carry a
+            // server definition. The guard's file never is one.
+            .flat_map(|t| t.plan(repo_root, &cmd, None))
             .filter(|p| p.gitignore)
             .filter_map(|p| rel(repo_root, &p.path))
             .collect();
@@ -1097,7 +1448,8 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
             .unwrap_or(false),
         // A file travsr owns outright: it exists only because we wrote it.
         Content::Owned { .. } => p.path.exists(),
-        Content::JsonServer { .. } => false,
+        // Neither is guidance, so `wanted` never consults this for them.
+        Content::JsonServer { .. } | Content::JsonHook { .. } => false,
     };
     let wanted =
         |p: &Planned| opts.remove || opts.rules || !p.content.is_guidance() || already_written(p);
@@ -1112,7 +1464,7 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
             Detection::Auto => {
                 detected = true;
                 say!("{} ({verb}):", tool.id());
-                let full = tool.plan(repo_root, &cmd);
+                let full = tool.plan(repo_root, &cmd, guard_to_plan);
                 let full_len = full.len();
                 let kept: Vec<Planned> = full.into_iter().filter(&wanted).collect();
                 // Codex, Antigravity and Windsurf read their MCP config from a
@@ -1131,6 +1483,11 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                 } else if skipped_guidance && !opts.remove {
                     say!("  (agent guidance not written; pass --rules to include it)");
                 }
+                // Whether this tool's MCP server file ended the run carrying our
+                // entry, which is the only state `approval_hint` below is true
+                // advice for. Stays false under `--dry-run`, which `continue`s
+                // before `execute` ever runs.
+                let mut wired = false;
                 for planned in kept {
                     let disp = rel(repo_root, &planned.path)
                         .unwrap_or_else(|| planned.path.display().to_string());
@@ -1182,6 +1539,16 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                                 }
                                 other => say!("  {} {disp}", label(other)),
                             }
+                            if matches!(planned.content, Content::JsonServer { .. })
+                                && server_in_place(&outcome)
+                            {
+                                wired = true;
+                            }
+                            if matches!(planned.content, Content::JsonHook { .. })
+                                && matches!(outcome, Outcome::Written | Outcome::Unchanged)
+                            {
+                                guard_wired = true;
+                            }
                             if planned.gitignore {
                                 if let Some(r) = rel(repo_root, &planned.path) {
                                     if opts.remove {
@@ -1214,6 +1581,17 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                     if let Some(note) = tool.note(&cmd) {
                         say!("{note}");
                     }
+                    // #829: naming the still-pending approval where a bare `ok`
+                    // otherwise reads as done. Only once the server file is in
+                    // place, which covers both outcomes the PR wants (`wrote`
+                    // and `ok`). After a skip, a per-file error or a `--dry-run`
+                    // there is nothing to approve and the hint would send the
+                    // user at the wrong fix.
+                    if wired {
+                        if let Some(hint) = tool.approval_hint() {
+                            say!("{hint}");
+                        }
+                    }
                 }
             }
             Detection::Print => {
@@ -1223,6 +1601,69 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
             }
             Detection::None => {}
         }
+    }
+
+    // #916: the enforcement level is stored config, not something the hook
+    // entry carries. That is what keeps `travsr guard` and the installed hook
+    // from ever disagreeing (the hook only names a binary), and it is why
+    // `travsr config set guard.mode strict` is a complete way to change the
+    // policy without touching `.claude/settings.json` at all.
+    //
+    // Written whether or not Claude Code was detected: the policy is the
+    // user's answer to "how hard should the guard push", and a repo they have
+    // not opened Claude Code in yet is not a reason to discard it.
+    if !opts.dry_run {
+        if let Some(mode) = guard_persist {
+            match travsr_config::set(
+                "guard.mode",
+                mode.as_str(),
+                travsr_config::Scope::Repo(repo_root.to_path_buf()),
+            ) {
+                Ok(()) => say!(
+                    "  wrote .travsr/config.toml (guard.mode = {})",
+                    mode.as_str()
+                ),
+                // Non-fatal, like every other write here, but not silent: the
+                // hook is installed and inert without this, which is the one
+                // outcome a user would not guess at.
+                Err(e) => warn!(
+                    "warning: could not record guard.mode in .travsr/config.toml ({e}). \
+                     The hook is installed but will do nothing until it is set; run \
+                     `travsr config set guard.mode {} --repo`.",
+                    mode.as_str()
+                ),
+            }
+        } else if opts.remove
+            // Scoped to the tool that owns the guard. `--tool cursor --remove`
+            // unwires Cursor; clearing the Claude Code enforcement level on the
+            // way past would be a change to something the run never touched.
+            && matches!(opts.only.as_deref(), None | Some("claude-code"))
+        {
+            // Remove takes travsr's own policy with it. Leaving `strict` behind
+            // after the hook is gone is a setting that does nothing, waiting to
+            // surprise whoever re-installs the hook later.
+            if travsr_config::unset(
+                "guard.mode",
+                travsr_config::Scope::Repo(repo_root.to_path_buf()),
+            )
+            .unwrap_or(false)
+            {
+                say!("  removed .travsr/config.toml (guard.mode)");
+            }
+        }
+    }
+
+    // #916: `--guard` asked for enforcement and got none. The mode is stored
+    // either way (above), so the hook lands the moment Claude Code is
+    // installed and `travsr connect` runs again, but saying nothing here
+    // would leave "I ran init --guard=strict" and "nothing is enforced"
+    // looking like the same state.
+    if guard_persist.is_some() && !guard_wired && !opts.dry_run {
+        say!(
+            "  note: the PreToolUse guard is a Claude Code feature and Claude Code was \
+             not detected here, so no hook was installed. guard.mode is recorded; \
+             re-run `travsr connect` once it is."
+        );
     }
 
     if !detected {
@@ -1279,6 +1720,19 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether a server config file ended the run actually carrying our entry: the
+/// `wrote` and `ok` pair, and nothing else.
+///
+/// #829: `approval_hint` names a step the user takes *after* travsr wired the
+/// server, so it is only true advice for these two outcomes. `Skipped` (existing
+/// file is not strict JSON, top level is not a JSON object, or the file is
+/// tracked and `--commit` was not passed) and a per-file `Err` leave nothing to
+/// approve; `Removed` and `Absent` only arise on a remove run, which suppresses
+/// the hint anyway.
+fn server_in_place(o: &Outcome) -> bool {
+    matches!(o, Outcome::Written | Outcome::Unchanged)
 }
 
 fn label(o: &Outcome) -> &'static str {
@@ -1482,7 +1936,7 @@ mod tests {
             (Tool::Zed, "context_servers", false),
         ];
         for (tool, top_key, needs_type) in expected {
-            let plan = tool.plan(repo, &cmd());
+            let plan = tool.plan(repo, &cmd(), None);
             let (key, entry) = plan
                 .iter()
                 .find_map(|p| match &p.content {
@@ -1557,7 +2011,7 @@ mod tests {
     fn copilot_entry_has_stdio_type() {
         let dir = tempdir().unwrap();
         let repo = dir.path();
-        let planned = Tool::VsCodeCopilot.plan(repo, &cmd());
+        let planned = Tool::VsCodeCopilot.plan(repo, &cmd(), None);
         let json_plan = planned
             .iter()
             .find_map(|p| match &p.content {
@@ -1573,7 +2027,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = dir.path();
         for tool in Tool::ALL {
-            for p in tool.plan(repo, &cmd()) {
+            for p in tool.plan(repo, &cmd(), None) {
                 // A file is git-ignored exactly when it carries the server
                 // definition (the RCE-on-clone vector). Every rules file, and
                 // Zed's shared settings.json, stays committable.
@@ -1774,7 +2228,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = dir.path();
         for tool in Tool::ALL {
-            let plan = tool.plan(repo, &cmd());
+            let plan = tool.plan(repo, &cmd(), None);
             let has_rules = plan
                 .iter()
                 .any(|p| matches!(p.content, Content::ManagedMd { .. } | Content::Owned { .. }));
@@ -1798,7 +2252,7 @@ mod tests {
         let mut rules_only = Vec::new();
         for tool in Tool::ALL {
             let writes_server = tool
-                .plan(repo, &cmd())
+                .plan(repo, &cmd(), None)
                 .iter()
                 .any(|p| matches!(p.content, Content::JsonServer { .. }));
             if writes_server {
@@ -1820,6 +2274,69 @@ mod tests {
             rules_only.len() >= 3,
             "expected Antigravity, Codex and Windsurf to be rules-only, got {rules_only:?}"
         );
+    }
+
+    /// #829: writing `.mcp.json` reports `ok`, but Claude Code will not load a
+    /// project server until it is approved once. The report must name that step,
+    /// or the wiring looks done while it is inert.
+    #[test]
+    fn claude_code_names_the_one_time_approval_step() {
+        let hint = Tool::ClaudeCode
+            .approval_hint()
+            .expect("claude-code writes a project .mcp.json and needs an approval hint");
+        assert!(
+            hint.contains("approval") && hint.contains("/mcp"),
+            "hint should name the approval and how to grant it: {hint}"
+        );
+        // The hint is Claude Code specific; a rules-only tool must not carry it.
+        assert!(Tool::Codex.approval_hint().is_none());
+    }
+
+    /// #829 review: the hint is advice about a file that exists. Every outcome
+    /// that leaves the server config without our entry must not carry it, or
+    /// `skipped .mcp.json: not strict JSON (left untouched)` is followed by
+    /// "restart Claude Code and accept the trust prompt", which is the wrong fix.
+    #[test]
+    fn the_approval_hint_follows_only_a_server_that_landed() {
+        assert!(server_in_place(&Outcome::Written), "wrote");
+        assert!(server_in_place(&Outcome::Unchanged), "ok");
+        for left_unwired in [
+            Outcome::Skipped("existing file is not strict JSON (left untouched)".into()),
+            Outcome::Skipped("top level is not a JSON object".into()),
+            Outcome::Removed,
+            Outcome::Absent,
+        ] {
+            assert!(
+                !server_in_place(&left_unwired),
+                "nothing to approve after `{}`",
+                label(&left_unwired)
+            );
+        }
+    }
+
+    /// #829 review follow-up: when Claude Code is known only from `~/.claude`,
+    /// the printed snippet is the whole of the guidance, and the generic arm
+    /// handed over JSON without saying where to put it. The two destinations
+    /// differ in exactly the thing #829 is about, so naming one without the
+    /// other would either hide the pending trust prompt or invent one that
+    /// never appears.
+    #[test]
+    fn the_claude_code_snippet_names_both_destinations_and_their_approval() {
+        let dir = tempdir().unwrap();
+        let snippet = Tool::ClaudeCode.snippet(dir.path(), &cmd());
+        assert!(snippet.contains(".mcp.json"), "project scope: {snippet}");
+        assert!(snippet.contains("~/.claude.json"), "user scope: {snippet}");
+        assert!(
+            snippet.contains("one-time approval") && snippet.contains("run /mcp"),
+            "project scope must name the pending approval: {snippet}"
+        );
+        assert!(
+            snippet.contains("no approval"),
+            "user scope must say it needs none: {snippet}"
+        );
+        // A tool whose snippet names no destination must not claim either.
+        let generic = Tool::Cursor.snippet(dir.path(), &cmd());
+        assert!(!generic.contains("approval"), "{generic}");
     }
 
     #[test]
@@ -1994,6 +2511,7 @@ mod tests {
             remove: false,
             commit: false,
             rules: false,
+            guard: None,
             report: Report::Silent,
         };
         run(repo, &opts).expect("connect");
@@ -2026,6 +2544,7 @@ mod tests {
             remove: false,
             commit: false,
             rules,
+            guard: None,
             report: Report::Silent,
         };
 
@@ -2064,6 +2583,7 @@ mod tests {
                 remove: false,
                 commit: false,
                 rules: false,
+                guard: None,
                 report: Report::Silent,
             },
         )
@@ -2090,6 +2610,7 @@ mod tests {
             remove: false,
             commit: false,
             rules: true,
+            guard: None,
             report: Report::Silent,
         };
         run(repo, &opts).expect("connect");
@@ -2117,6 +2638,7 @@ mod tests {
             remove,
             commit: false,
             rules,
+            guard: None,
             report: Report::Silent,
         };
         run(repo, &with_rules(true, false)).expect("connect --rules");
@@ -2203,5 +2725,419 @@ mod tests {
     fn cursor_mdc_has_always_apply_frontmatter() {
         assert!(cursor_mdc().starts_with("---\n"));
         assert!(cursor_mdc().contains("alwaysApply: true"));
+    }
+
+    // ── The PreToolUse guard (#916) ──────────────────────────────────────
+
+    fn hook() -> Value {
+        guard_handler(&cmd())
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Every travsr handler in the file, flattened across groups.
+    fn guard_entries(root: &Value) -> Vec<Value> {
+        root["hooks"]["PreToolUse"]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter_map(|g| g["hooks"].as_array())
+                    .flatten()
+                    .filter(|h| is_guard_handler(h))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A settings file with keys, hooks and a PreToolUse group the user owns.
+    fn user_settings(dir: &Path) -> PathBuf {
+        let path = dir.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "theme": "dark",
+                "permissions": { "allow": ["Bash(npm test)"] },
+                "hooks": {
+                    "PostToolUse": [
+                        { "matcher": "Edit",
+                          "hooks": [{ "type": "command", "command": "fmt.sh" }] }
+                    ],
+                    "PreToolUse": [
+                        { "matcher": "Write",
+                          "hooks": [{ "type": "command", "command": "check.sh" }] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn a_guard_handler_is_recognised_by_what_it_runs() {
+        assert!(is_guard_handler(&json!({
+            "type": "command", "command": "travsr", "args": ["guard"]
+        })));
+        assert!(is_guard_handler(&json!({
+            "type": "command", "command": "/home/u/.travsr/bin/travsr", "args": ["guard"]
+        })));
+        assert!(is_guard_handler(&json!({
+            "type": "command", "command": "C:\\t\\travsr.exe", "args": ["guard"]
+        })));
+        // Shell form, which someone may have written by hand. Recognising it is
+        // what keeps a `connect --guard` from adding a second, duplicate entry
+        // beside it.
+        assert!(is_guard_handler(&json!({
+            "type": "command", "command": "travsr guard"
+        })));
+    }
+
+    #[test]
+    fn another_tools_handler_is_never_mistaken_for_ours() {
+        for other in [
+            json!({ "type": "command", "command": "travsr", "args": ["status"] }),
+            json!({ "type": "command", "command": "travsr" }),
+            json!({ "type": "command", "command": "my-travsr-wrapper", "args": ["guard"] }),
+            json!({ "type": "command", "command": "guard" }),
+            json!({ "type": "command", "command": "some-other-guard.sh" }),
+            json!({ "type": "http", "url": "https://example.test" }),
+            json!("not an object"),
+        ] {
+            assert!(!is_guard_handler(&other), "{other} is not travsr's");
+        }
+    }
+
+    #[test]
+    fn the_hook_merges_without_disturbing_anything_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = user_settings(dir.path());
+        let before = read_json(&path);
+
+        assert!(matches!(
+            merge_json_hook(&path, GUARD_MATCHER, &hook()).unwrap(),
+            Outcome::Written
+        ));
+
+        let after = read_json(&path);
+        assert_eq!(guard_entries(&after).len(), 1);
+        assert_eq!(after["theme"], before["theme"]);
+        assert_eq!(after["permissions"], before["permissions"]);
+        assert_eq!(
+            after["hooks"]["PostToolUse"],
+            before["hooks"]["PostToolUse"]
+        );
+        // The user's own PreToolUse group survives, at its own matcher, with
+        // travsr not joined to it.
+        let theirs = after["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["matcher"] == "Write")
+            .expect("the user's group must still be there");
+        assert_eq!(theirs["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(theirs["hooks"][0]["command"], "check.sh");
+    }
+
+    #[test]
+    fn merging_the_hook_twice_adds_nothing_the_second_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = user_settings(dir.path());
+        merge_json_hook(&path, GUARD_MATCHER, &hook()).unwrap();
+        let once = std::fs::read_to_string(&path).unwrap();
+
+        assert!(matches!(
+            merge_json_hook(&path, GUARD_MATCHER, &hook()).unwrap(),
+            Outcome::Unchanged
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            once,
+            "an idempotent merge must not even rewrite the bytes"
+        );
+        assert_eq!(guard_entries(&read_json(&path)).len(), 1);
+    }
+
+    /// The binary moves (a PATH install after a first run from a build dir), or
+    /// the matcher gains a tool. The entry has to follow, in place, rather than
+    /// gaining a second copy beside the stale one.
+    #[test]
+    fn an_existing_entry_is_refreshed_rather_than_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = user_settings(dir.path());
+        let stale = json!({
+            "type": "command",
+            "command": "/old/path/to/travsr",
+            "args": ["guard"],
+            "timeout": 5
+        });
+        merge_json_hook(&path, "Grep", &stale).unwrap();
+        assert_eq!(guard_entries(&read_json(&path)).len(), 1);
+
+        assert!(matches!(
+            merge_json_hook(&path, GUARD_MATCHER, &hook()).unwrap(),
+            Outcome::Written
+        ));
+        let after = read_json(&path);
+        let entries = guard_entries(&after);
+        assert_eq!(entries.len(), 1, "refreshed, not duplicated; {after}");
+        assert_eq!(entries[0], hook());
+        assert!(
+            after["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|g| g["matcher"] == GUARD_MATCHER),
+            "and the matcher moved with it; {after}"
+        );
+    }
+
+    /// A user who put our hook in a group beside their own has chosen that
+    /// matcher for both. Widening it to ours would start firing theirs on every
+    /// Read and Glob, which is a change to their configuration, not ours.
+    #[test]
+    fn a_matcher_shared_with_another_hook_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [
+                    { "type": "command", "command": "travsr", "args": ["guard"] },
+                    { "type": "command", "command": "audit.sh" }
+                ] } ] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        merge_json_hook(&path, GUARD_MATCHER, &hook()).unwrap();
+        let after = read_json(&path);
+        assert_eq!(
+            after["hooks"]["PreToolUse"][0]["matcher"], "Bash",
+            "the user's shared matcher must not be widened; {after}"
+        );
+        assert_eq!(
+            guard_entries(&after).len(),
+            1,
+            "and still exactly one of ours"
+        );
+    }
+
+    #[test]
+    fn the_hook_creates_a_settings_file_when_there_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        assert!(matches!(
+            merge_json_hook(&path, GUARD_MATCHER, &hook()).unwrap(),
+            Outcome::Written
+        ));
+        assert_eq!(guard_entries(&read_json(&path)).len(), 1);
+    }
+
+    /// Same rule as `merge_json_server`: a config that does not parse is still
+    /// the user's, and replacing it with one that does would lose more than the
+    /// guard is worth.
+    #[test]
+    fn a_settings_file_that_is_not_strict_json_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let broken = "{ \"theme\": \"dark\", }\n";
+        std::fs::write(&path, broken).unwrap();
+
+        assert!(matches!(
+            merge_json_hook(&path, GUARD_MATCHER, &hook()).unwrap(),
+            Outcome::Skipped(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+    }
+
+    #[test]
+    fn a_hooks_key_of_the_wrong_shape_is_skipped_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for bad in [
+            json!({ "hooks": "please" }),
+            json!({ "hooks": { "PreToolUse": { "matcher": "Bash" } } }),
+        ] {
+            let text = serde_json::to_string_pretty(&bad).unwrap();
+            std::fs::write(&path, &text).unwrap();
+            assert!(
+                matches!(
+                    merge_json_hook(&path, GUARD_MATCHER, &hook()).unwrap(),
+                    Outcome::Skipped(_)
+                ),
+                "{bad} must be skipped"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn removing_the_hook_leaves_every_other_setting_standing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = user_settings(dir.path());
+        let before = read_json(&path);
+        merge_json_hook(&path, GUARD_MATCHER, &hook()).unwrap();
+
+        assert!(matches!(remove_json_hook(&path).unwrap(), Outcome::Removed));
+        let after = read_json(&path);
+        assert!(guard_entries(&after).is_empty());
+        assert_eq!(after["theme"], before["theme"]);
+        assert_eq!(after["permissions"], before["permissions"]);
+        assert_eq!(
+            after["hooks"]["PostToolUse"],
+            before["hooks"]["PostToolUse"]
+        );
+        assert_eq!(after["hooks"]["PreToolUse"], before["hooks"]["PreToolUse"]);
+    }
+
+    #[test]
+    fn removing_the_hook_is_idempotent_and_keeps_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = user_settings(dir.path());
+        merge_json_hook(&path, GUARD_MATCHER, &hook()).unwrap();
+        remove_json_hook(&path).unwrap();
+        let once = std::fs::read_to_string(&path).unwrap();
+
+        assert!(matches!(remove_json_hook(&path).unwrap(), Outcome::Absent));
+        assert!(path.is_file(), "the file is the user's, not ours to delete");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), once);
+    }
+
+    /// `hooks` existed only because travsr put it there, so it goes too,
+    /// but the rest of the file, and the file itself, stay.
+    #[test]
+    fn removal_prunes_only_the_containers_travsr_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\n  \"theme\": \"dark\"\n}\n").unwrap();
+
+        merge_json_hook(&path, GUARD_MATCHER, &hook()).unwrap();
+        assert!(read_json(&path)["hooks"].is_object());
+
+        remove_json_hook(&path).unwrap();
+        let after = read_json(&path);
+        assert_eq!(after["theme"], "dark");
+        assert!(
+            after.get("hooks").is_none(),
+            "an empty `hooks` husk is ours, not theirs; {after}"
+        );
+    }
+
+    #[test]
+    fn removing_from_a_file_that_never_had_the_hook_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = user_settings(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(matches!(remove_json_hook(&path).unwrap(), Outcome::Absent));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn removing_a_hook_travsr_never_wrote_is_absent_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join(".claude/settings.json");
+        assert!(matches!(
+            remove_json_hook(&missing).unwrap(),
+            Outcome::Absent
+        ));
+        assert!(!missing.exists(), "removal must not create the file");
+    }
+
+    /// The guard is enforcement wiring, not per-turn prose, so it must not be
+    /// filtered out by the `--rules` opt-in the guidance files sit behind.
+    #[test]
+    fn the_guard_is_not_treated_as_always_on_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let planned = Tool::ClaudeCode.plan(dir.path(), &cmd(), Some(GuardMode::Strict));
+        let guard = planned
+            .iter()
+            .find(|p| matches!(p.content, Content::JsonHook { .. }))
+            .expect("--guard must plan the hook");
+        assert!(
+            !guard.content.is_guidance(),
+            "the hook is read once at startup, not re-read every turn"
+        );
+        assert!(
+            !guard.gitignore,
+            ".claude/settings.json is shared and committed"
+        );
+    }
+
+    #[test]
+    fn no_tool_but_claude_code_is_given_a_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        for tool in Tool::ALL {
+            let planned = tool.plan(dir.path(), &cmd(), Some(GuardMode::Strict));
+            let has_hook = planned
+                .iter()
+                .any(|p| matches!(p.content, Content::JsonHook { .. }));
+            assert_eq!(
+                has_hook,
+                tool.id() == "claude-code",
+                "{}: only Claude Code has a pre-tool contract to hook",
+                tool.id()
+            );
+        }
+    }
+
+    #[test]
+    fn without_the_flag_no_tool_plans_a_guard_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        for tool in Tool::ALL {
+            assert!(
+                !tool
+                    .plan(dir.path(), &cmd(), None)
+                    .iter()
+                    .any(|p| matches!(p.content, Content::JsonHook { .. })),
+                "{}: the guard is opt-in",
+                tool.id()
+            );
+        }
+    }
+
+    /// The matcher has to fire on everything the guard inspects, or the guard
+    /// is installed and silently never consulted for half its match set.
+    #[test]
+    fn the_matcher_covers_every_tool_the_guard_inspects() {
+        for tool in ["Grep", "Glob", "Read", "Bash"] {
+            assert!(
+                GUARD_MATCHER.contains(tool),
+                "the guard decides about {tool} but the matcher never fires on it"
+            );
+        }
+        // And on the travsr MCP tools, which is what feeds the strict-mode
+        // release valve. Pinned against what the server actually serves, so a
+        // rename there fails here rather than silently closing the valve.
+        let served: Vec<String> = travsr_mcp::stdio_tools_list()["tools"]
+            .as_array()
+            .expect("tools/list has a tools array")
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let named: Vec<&str> = GUARD_MATCHER
+            .rsplit_once("mcp__.*__(")
+            .and_then(|(_, rest)| rest.strip_suffix(')'))
+            .expect("the matcher names the travsr tools in one alternation")
+            .split('|')
+            .collect();
+        assert!(named.len() >= 4, "too few tools matched: {named:?}");
+        for name in named {
+            assert!(
+                served.contains(&name.to_string()),
+                "the matcher watches for `{name}`, which travsr mcp --stdio does \
+                 not serve"
+            );
+        }
     }
 }

@@ -15,6 +15,7 @@ import * as path from "path";
 import {
   candidateSocketPaths,
   detachSession,
+  reportLiveResolution,
   reportLspDiagnostics,
   SESSION_ID,
 } from "../../daemonIpc";
@@ -194,14 +195,17 @@ suite("daemonIpc: #698 review P1", () => {
       path.join(__dirname, "..", "..", "daemonIpc.js"),
       "utf8"
     );
-    const reports = src.split('op: "report-lsp-diagnostics"').length - 1;
+    // Counts every `op:` this client can send, not one hardcoded op, so a new
+    // message type is covered the day it is added rather than silently
+    // exempted. RFC-027's report-live-resolution is why this generalized.
+    const ops = src.split(/\bop:\s*"/).length - 1;
     const roots = src.split("repo_root:").length - 1;
 
-    assert.ok(reports >= 2, "both report and detach send this op");
+    assert.ok(ops >= 3, `expected report, detach and live-resolution ops, saw ${ops}`);
     assert.strictEqual(
       roots,
-      reports,
-      "every send of that op must name its repo, detach included"
+      ops,
+      "every send must name its repo, detach and live resolution included"
     );
   });
 
@@ -221,5 +225,68 @@ suite("daemonIpc: #698 review P1", () => {
       body.includes("Promise.all"),
       "candidates are tried concurrently, or each pays a connect timeout"
     );
+  });
+});
+
+suite("daemonIpc: live resolution (RFC-027)", function () {
+  // Real sockets, so a hang shows up as a failure rather than as a pass.
+  this.timeout(10_000);
+
+  const RESOLUTIONS = [
+    {
+      ref_line: 42,
+      ref_col: 8,
+      name: "save",
+      target_path: "src/user.ts",
+      target_line: 17,
+      buffer_version: 9,
+      edge_kind: "ref/call",
+    },
+  ];
+
+  // The daemon parses this line with a hand-written serde contract test
+  // (travsr-ipc/src/message.rs). Neither side shares a serializer, so the wire
+  // tag and field names are the contract and both tests must agree.
+  test("sends the wire shape the daemon parses", async () => {
+    if (process.platform === "win32") return;
+    const root = tempRepo();
+    const sockPath = path.join(root, ".travsr", "daemon-live-res.sock");
+
+    const received: string[] = [];
+    const server = net.createServer((c) => {
+      c.on("data", (b) => received.push(b.toString("utf8")));
+    });
+    await new Promise<void>((r) => server.listen(sockPath, r));
+
+    try {
+      const ok = await reportLiveResolution(root, "src/order.ts", RESOLUTIONS);
+      assert.strictEqual(ok, true, "a listening daemon must accept the report");
+      await new Promise((r) => setTimeout(r, 100));
+
+      const line = received.join("");
+      assert.ok(line.endsWith("\n"), "control protocol is line-delimited");
+      const parsed = JSON.parse(line);
+      assert.strictEqual(parsed.op, "report-live-resolution");
+      assert.strictEqual(parsed.repo_root, root, "the daemon drops a report for another repo");
+      assert.strictEqual(parsed.session, SESSION_ID);
+      assert.strictEqual(parsed.file, "src/order.ts");
+      assert.deepStrictEqual(parsed.resolutions, RESOLUTIONS);
+      // A live edge's lifetime is bounded by commit ratification, not a lease,
+      // so a ttl here would be a second expiry mechanism with no consumer.
+      assert.strictEqual(parsed.ttl_secs, undefined, "live reports carry no lease");
+    } finally {
+      server.close();
+    }
+  });
+
+  // The property that matters is "never rejects". The boolean is deliberately
+  // not asserted: discovery enumerates a per-user namespace, so an unrelated
+  // daemon on the same machine can accept the bytes (and then drop the report
+  // by repo), which would make an assertion on it pass or fail with the
+  // developer's environment rather than with the code.
+  test("a missing daemon is silent, never a throw", async () => {
+    const root = tempRepo();
+    const ok = await reportLiveResolution(root, "src/order.ts", RESOLUTIONS);
+    assert.strictEqual(typeof ok, "boolean", "must resolve, never reject");
   });
 });

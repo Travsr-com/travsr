@@ -243,10 +243,109 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
     match (phase_b, last) {
         (None, Some(_)) => Some(PENDING.to_string()),
         (Some(pb), Some(lc)) if pb != lc => Some(PENDING.to_string()),
-        _ if dirty => Some(STALE.to_string()),
+        _ if dirty => {
+            // #583 set this flag on any mid-edit reindex, on the pre-live-lane
+            // premise that the dropped call edges are simply gone. The live
+            // overlay may have recovered them, so report the truth in three
+            // cases rather than a blanket "degraded, run init":
+            //   - no overlay ran (no resolution rows): the edges are genuinely
+            //     missing, so the stale note stands.
+            //   - some references are still pending: name that a few call edges
+            //     may be missing until commit, without the heavy "run init".
+            //   - nothing pending, but some resolved: the overlay recovered the
+            //     edits it detected. The counts are repo-wide and phase_b_dirty
+            //     is a single flag, so this cannot prove every dropped edge came
+            //     back (a headless generic-language edit leaves no rows to count,
+            //     yet feeds the same flag as an editor-resolved file). So it
+            //     still warns lightly that a few edges may be missing until the
+            //     commit, rather than falling through to "results current".
+            let resolved = store.resolved_ref_count().unwrap_or(0);
+            let pending = store.pending_ref_count().unwrap_or(0);
+            if resolved == 0 && pending == 0 {
+                Some(STALE.to_string())
+            } else if pending == 0 {
+                Some(
+                    "[note: a background re-index dropped some call edges; \
+                     uncommitted edits were re-resolved where detected, but a few \
+                     edges may still be missing until the next commit.]"
+                        .to_string(),
+                )
+            } else {
+                Some(format!(
+                    "[note: {pending} reference(s) in uncommitted edits are not \
+                     yet resolved, so a few call edges may be missing until the \
+                     next commit; other results are current.]"
+                ))
+            }
+        }
         // Current index, but not every language in it was analyzed.
         _ => phase_b_unanalyzed_note(store),
     }
+}
+
+/// Files considered when scoping a pending-reference count. Beyond this the
+/// report is advisory anyway, and the cap is what keeps the group-by bounded.
+///
+/// Shared by [`live_overlay_note`] and `find_references`' zero gate on purpose:
+/// the note and the answer it decorates must describe the same file set, or
+/// they can contradict each other (#895).
+const PENDING_FILE_CAP: usize = 64;
+
+/// RFC-027 section 10: tell a reader that this answer includes un-ratified
+/// edges, and where the remaining gaps are.
+///
+/// Two numbers, because they mean opposite things and an agent needs both:
+/// `live` edges are references the overlay *did* resolve ahead of the commit
+/// (extra freshness, not yet confirmed), while `pending` references are ones
+/// nothing could resolve (a known gap, deliberately not guessed at). Reporting
+/// only a count of live edges would read as pure upside and hide the abstentions
+/// that are the other half of a fail-closed lane.
+///
+/// `None` when the overlay is empty and nothing is pending, which is the state
+/// of any repo with no uncommitted edits — so the note never fires on a clean
+/// tree and costs a reader nothing.
+///
+/// `answer` is the rendered response this note will decorate. The **pending**
+/// half is scoped to the files that answer actually names, which is what makes
+/// it actionable rather than ambient: an agent asking "who calls `foo`" was
+/// previously told how many references are pending everywhere in the repo,
+/// which reads as though they relate to the answer it just got. Matching by
+/// substring rather than by parsing keeps this independent of each tool's output
+/// format, and the file set it tests against is capped, which also bounds a
+/// query that runs on every prose call.
+///
+/// The **live** half stays repo-wide and says so: it reports that an un-ratified
+/// overlay is in play at all, which is true of the whole graph the answer was
+/// drawn from, not of any one file in it.
+fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
+    let live = store.count_edges_with_provenance("live").ok().unwrap_or(0);
+    let pending: u64 = store
+        .pending_ref_counts_by_file(PENDING_FILE_CAP)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(path, _)| answer.contains(path.as_str()))
+        .map(|(_, n)| n)
+        .sum();
+    if live == 0 && pending == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if live > 0 {
+        parts.push(format!(
+            "{live} edge{} resolved from uncommitted edits and not yet ratified (repo-wide)",
+            if live == 1 { "" } else { "s" }
+        ));
+    }
+    if pending > 0 {
+        parts.push(format!(
+            "{pending} reference{} in the files above detected but not resolved",
+            if pending == 1 { "" } else { "s" }
+        ));
+    }
+    Some(format!(
+        "[note: live overlay active: {}. These resolve deterministically at the next commit; filter to provenance != live for ratified truth only.]",
+        parts.join("; ")
+    ))
 }
 
 /// Languages whose Phase B never produced call/ref edges on the last run, per
@@ -263,12 +362,20 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
 ///
 /// `zero_nodes` is likewise excluded: an analyzer that ran and found nothing is a
 /// valid answer, not missing coverage.
+///
+/// #878 adds `emitter_missing` / `emitter_failed`: the TypeScript LSIF pass was
+/// due but `travsr-lsif-ts` never ran, so the language kept only its tree-sitter
+/// call edges (a fraction of the compiler-derived set) under a marker that read
+/// complete. `travsr status` downgrades to `partial (incomplete: ...)` for the
+/// same classes.
 fn phase_b_unanalyzed_note(store: &SqliteStore) -> Option<String> {
     const CLASSES: &[&str] = &[
         "crashed",
         "skipped_no_analyzer",
         "needs_approval",
         "needs_consent",
+        "emitter_missing",
+        "emitter_failed",
     ];
     let warnings = store.get_meta("phase_b_warnings").ok().flatten()?;
     let mut langs: Vec<&str> = Vec::new();
@@ -289,10 +396,13 @@ fn phase_b_unanalyzed_note(store: &SqliteStore) -> Option<String> {
     if langs.is_empty() {
         return None;
     }
+    // "or not all of them": the #878 classes leave a language with some call
+    // edges (native) but not the compiler-derived rest, so "no call edges" alone
+    // would overstate the gap while a short answer is still not authoritative.
     Some(format!(
-        "[note: no call edges were produced for {} on the last semantic analysis run, \
-         so an empty result here is not authoritative for {}. Run `travsr status` for the \
-         reason and the fix.]",
+        "[note: no call edges, or not all of them, were produced for {} on the last \
+         semantic analysis run, so an empty or short result here is not authoritative \
+         for {}. Run `travsr status` for the reason and the fix.]",
         langs.join(", "),
         if langs.len() == 1 {
             "that language"
@@ -418,14 +528,16 @@ fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> S
         .ok()
         .flatten()
         .unwrap_or_default();
-    let mut out = body;
-    for note in [
+    // Computed against the answer as it stands, before any note is appended:
+    // `live_overlay_note` scopes its pending half to the files this answer
+    // names, and a note already appended is not part of the answer.
+    let notes = [
         phase_b_degraded_note(store),
+        live_overlay_note(store, &body),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    ];
+    let mut out = body;
+    for note in notes.into_iter().flatten() {
         if out.is_empty() {
             out = note;
         } else {
@@ -445,9 +557,17 @@ fn with_phase_b_note(store: &SqliteStore, body: String) -> String {
 }
 
 /// #661 WS-D: append the index/HEAD mismatch note (#645) **only** — no Phase-B
-/// note — to a deterministic `path:line` tool's response. `find_references`,
-/// `get_dependencies` and `get_graph_json` assert `path:line` but do not depend
-/// on Phase B, so they carry the head-drift signal without the Phase-B one.
+/// note — to a deterministic `path:line` tool's response. `get_dependencies`
+/// and `get_graph_json` read `depends`/`resolves-to`, which Phase A emits, so
+/// they carry the head-drift signal without the Phase-B one.
+///
+/// `find_references` was on that list and should not have been. It serves
+/// `edge_sites` rows of kind `ref/call`, and on this repo's own index 7445 of
+/// the 8211 `ref/call` edges are Phase B's (`provenance = 'scip'`) against 766
+/// from tree-sitter. A watcher reindex drops a file's call edges without moving
+/// HEAD (#583), so the head note stays silent while the answer loses ~90% of
+/// its evidence, and a `0 reference(s)` reads as fact. It uses
+/// [`with_phase_b_note`] instead.
 ///
 /// `head` is split out as a parameter (the same injectable seam as
 /// [`append_read_notes`]) so the composition is deterministically testable
@@ -480,7 +600,11 @@ fn with_head_note(store: &SqliteStore, body: String) -> String {
 /// (#617) and the index/HEAD mismatch note (#645), each already carried in the
 /// `signals` array the global aggregator merges. `head` is injectable for the
 /// same testability reason as [`append_head_note`].
-fn read_note_signals(store: &SqliteStore, head: Option<&str>) -> Vec<serde_json::Value> {
+fn read_note_signals(
+    store: &SqliteStore,
+    head: Option<&str>,
+    answer: &str,
+) -> Vec<serde_json::Value> {
     let stored = store
         .get_meta("last_commit")
         .ok()
@@ -488,6 +612,11 @@ fn read_note_signals(store: &SqliteStore, head: Option<&str>) -> Vec<serde_json:
         .unwrap_or_default();
     [
         phase_b_degraded_note(store),
+        // RFC-027 section 10: the same live-overlay note the prose tools get,
+        // so a renderer or agent reading JSON is told just as plainly that this
+        // answer includes un-ratified edges, and scoped against the same kind of
+        // evidence (here the serialized nodes, which carry the file paths).
+        live_overlay_note(store, answer),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
     ]
     .into_iter()
@@ -509,11 +638,22 @@ fn read_note_signals(store: &SqliteStore, head: Option<&str>) -> Vec<serde_json:
 /// DefinesBinding callers. The precedence policy in #47 will refine this further.
 ///
 /// Empty string when nothing is found.
-pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
+///
+/// `path` is the same optional hint `find_references` takes, with the same
+/// meaning: a filename, relative path, directory prefix or path fragment that
+/// picks one definition of an overloaded name. Without it an ambiguous symbol
+/// can only be refused, and on this repo 11% of leaf names are ambiguous.
+pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> String {
     // SEC-002: validate before forwarding to store queries.
     if let Err(reason) = validate_mcp_arg(symbol) {
         tracing::warn!("get_callers rejected invalid arg: {reason}");
         return String::new();
+    }
+    if let Some(p) = path {
+        if let Err(reason) = validate_mcp_arg(p) {
+            tracing::warn!("get_callers rejected invalid path arg: {reason}");
+            return String::new();
+        }
     }
     // Phase B deferred: a HEAD commit exists but phase_b_commit hasn't been
     // stamped yet, meaning Phase B was deferred to the daemon background
@@ -525,9 +665,19 @@ pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
         return phase_b_pending_json("Semantic call-edge index");
     }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
+    // Use the larger find-output limit, not the 4 KiB scalar cap: this tool
+    // enumerates one row per call site exactly as `find_references` does, and
+    // the scalar cap was cutting ~80% of a hub symbol's callers off mid-line
+    // with no notice (192 callers of `open_in_memory` arrived as 38 rows).
     // #617: append the staleness note (marker behind HEAD / dirty flag) so an
     // empty caller list is never mistaken for an authoritative "no callers".
-    with_phase_b_note(store, sanitize_for_mcp(&get_callers_raw(store, symbol)))
+    with_phase_b_note(
+        store,
+        wrap_envelope(&sanitize_mcp_body_with_limit(
+            &get_callers_raw(store, symbol, path),
+            FIND_OUTPUT_LIMIT,
+        )),
+    )
 }
 
 /// Raw (unsanitized) variant used by global aggregation.
@@ -545,52 +695,244 @@ pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
 /// not on whether the run that produced them finished. Callers append a one-line
 /// caveat (they do not abstain — a partial answer is still useful) so the note is
 /// attached to exactly the answers that might be incomplete.
-fn phase_b_lang_crashed(store: &SqliteStore, lang: &str) -> bool {
-    store
-        .get_meta("phase_b_warnings")
-        .ok()
-        .flatten()
-        .is_some_and(|warnings| {
-            warnings.split(',').any(|entry| {
-                let mut parts = entry.splitn(3, ':');
-                parts.next() == Some("crashed") && parts.next() == Some(lang)
+/// The `phase_b_warnings` classes that leave a language with *partial* call-edge
+/// coverage under a completion marker that reads current: a crash (#715), and
+/// the TypeScript LSIF pass skipping while the native pass ran (#878). Every
+/// other class either means the language produced nothing at all (already
+/// handled by the empty-result gates) or is not a coverage statement.
+const PARTIAL_COVERAGE_CLASSES: &[&str] = &["crashed", "emitter_missing", "emitter_failed"];
+
+/// Which partial-coverage class, if any, the last Phase B run recorded for
+/// `lang`. Matches a whole `class:lang` entry, never a prefix.
+fn phase_b_lang_incomplete(store: &SqliteStore, lang: &str) -> Option<&'static str> {
+    let warnings = store.get_meta("phase_b_warnings").ok().flatten()?;
+    warnings.split(',').find_map(|entry| {
+        let mut parts = entry.splitn(3, ':');
+        let class = parts.next()?;
+        (parts.next() == Some(lang))
+            .then(|| {
+                PARTIAL_COVERAGE_CLASSES
+                    .iter()
+                    .copied()
+                    .find(|c| *c == class)
             })
-        })
+            .flatten()
+    })
+}
+
+/// #864: recorded evidence that Phase B did not analyse all of `lang` in this
+/// repo, as a reason phrase for the softened `find_references` zero, or `None`
+/// when the last run was complete for it.
+///
+/// Every source here is a fact Phase B writes about its own run, never an
+/// inference from how the graph turned out. That is the whole point: the
+/// occurrence ratio conflates "never analysed" with "analysed, calls nothing"
+/// and so can never read complete, while each of these is rewritten empty by a
+/// healthy run and therefore lets a definitive zero through.
+///
+/// `crashed:` is deliberately absent — the caller checks it first and has its
+/// own wording with a `--force` rebuild hint. The classes here are every OTHER
+/// `phase_b_warnings` class travsr-daemon writes: whenever the daemon records
+/// that a language's Phase B did not complete, its zero is softened rather than
+/// asserted. This is intentionally broader than [`phase_b_unanalyzed_note`]'s
+/// banner set (which lists only the "no call edges at all" classes): a language
+/// skipped for no compile database, an untrusted corpus, or a mismatched
+/// analyzer version really was not analysed, so the gate and the banner can
+/// name different sets without disagreeing about whether the zero is definitive.
+///
+/// Scope is the TARGET's language only, never the repo's other languages, so at
+/// most one language is ever named. A repo-wide reading would be more literal —
+/// a caller can in principle live in any language — but it re-creates the very
+/// failure this gate was written to avoid: a polyglot repo carries permanent
+/// warnings for languages it cannot analyse (this one has `skipped_no_compdb`
+/// for c and cpp, and no compile database is coming), so every zero in the repo
+/// would hedge and the hedge would stop meaning anything.
+///
+/// The residual gap is a caller in a different, unanalysed language. Measured on
+/// this repo: 25 of 17690 `ref/call` occurrences cross a language boundary
+/// (0.14%), and all 25 have an EMPTY source language — the file-attribution
+/// fallback, not a second analysed language. No analysed-language pair is
+/// affected, so the narrow gate costs nothing real today. Revisit if a genuine
+/// cross-language provider lands.
+///
+/// Targets in the empty language never arrive here: `language_has_edge_sites("")`
+/// is false by construction, so they return at the #299 branch above.
+fn phase_b_incomplete_reason(store: &SqliteStore, lang: &str) -> Option<String> {
+    // Rust-specific: rust-analyzer never ran, or ran and lost every ref.
+    if lang == "rust" {
+        match store
+            .get_meta("rust_lsif_degraded")
+            .ok()
+            .flatten()
+            .as_deref()
+        {
+            Some("sandbox_unavailable") => {
+                return Some("Rust analysis did not run (no OS sandbox)".to_string())
+            }
+            Some("all_refs_dropped") => {
+                return Some("no Rust reference resolved to an indexed symbol".to_string())
+            }
+            _ => {}
+        }
+    }
+    // Per-language classes: the analyzer was missing, skipped, or is waiting on
+    // a one-time approval, so this language has no call edges from that run.
+    // The full set travsr-daemon writes as `<class>:{lang}`, minus the three
+    // (`crashed`, `emitter_missing`, `emitter_failed`) the caller softens ahead
+    // of this gate. Any daemon class not accounted for in one of the two places
+    // would let its language keep the definitive zero, so this list tracks the
+    // daemon's, not `phase_b_unanalyzed_note`'s narrower banner set.
+    const CLASSES: &[(&str, &str)] = &[
+        ("skipped_no_analyzer", "no analyzer is installed"),
+        ("needs_approval", "its analyzer is waiting on approval"),
+        ("needs_consent", "its analyzer is waiting on consent"),
+        ("skipped_no_compdb", "it has no compilation database"),
+        ("zero_nodes", "its analyzer produced no symbols"),
+        (
+            "no_references",
+            "no reference resolved to an indexed symbol",
+        ),
+        ("version_mismatch", "its analyzer is a mismatched version"),
+        ("skipped_unregistered", "its analyzer is not registered"),
+        (
+            "untrusted_corpus",
+            "this corpus is not trusted for analysis",
+        ),
+    ];
+    if let Some(warnings) = store.get_meta("phase_b_warnings").ok().flatten() {
+        for entry in warnings.split(',') {
+            let mut parts = entry.trim().splitn(3, ':');
+            let (Some(class), Some(entry_lang)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if entry_lang != lang {
+                continue;
+            }
+            if let Some((_, why)) = CLASSES.iter().find(|(c, _)| *c == class) {
+                return Some(format!("'{lang}' was not analysed, {why}"));
+            }
+        }
+    }
+    // Repo-wide (#583): a mid-edit reindex dropped call edges without moving
+    // HEAD. Cleared to "0" by the next Phase B run, so this does not latch.
+    if store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1") {
+        return Some("a re-index dropped call edges and they are not rebuilt yet".to_string());
+    }
+    None
 }
 
 /// The one-line caveat appended to a get_callers / find_references answer when
-/// [`phase_b_lang_crashed`] holds for the target language.
-fn crash_caveat(lang: &str) -> String {
+/// [`phase_b_lang_incomplete`] holds for the target language. The `crashed`
+/// wording is unchanged from #715; the #878 classes name the skipped analyzer.
+fn incomplete_caveat(lang: &str, class: &str) -> String {
+    let cause = match class {
+        "emitter_missing" => {
+            "the TypeScript analyzer (travsr-lsif-ts) could not be started on its last run"
+        }
+        "emitter_failed" => "the TypeScript analyzer (travsr-lsif-ts) failed on its last run",
+        _ => "crashed on its last run",
+    };
+    let subject = if class == "crashed" {
+        format!("semantic analysis for '{lang}' {cause}")
+    } else {
+        format!("semantic analysis for '{lang}' is incomplete: {cause}")
+    };
     format!(
-        "note: semantic analysis for '{lang}' crashed on its last run, so these \
-         results may be incomplete. Run `travsr status` for detail or `travsr init \
-         --semantic --force` to rebuild."
+        "note: {subject}, so these results may be incomplete. Run `travsr status` for \
+         detail or `travsr init --semantic --force` to rebuild."
     )
 }
 
-fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
+fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> String {
     use travsr_core::EdgeKind;
 
-    let nodes = match store.search_nodes_by_name(symbol) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!("get_callers search error: {e}");
-            return String::new();
+    // Resolve the name through the same ladder `find_references` and `travsr
+    // graph` use, so two distinct definitions that share a name are never
+    // collapsed to whichever one the FTS ranking happened to put first. That
+    // silent pick reported one definition's callers under the other's name, and
+    // a reader concluded the unreported definition had none.
+    //
+    // Only an *exact* resolution (full signature, exact simple name, selector
+    // head, dotted member) reaches this guard, so the partial matching the tool
+    // schema documents is untouched: a partial query resolves to `None` here and
+    // falls through to the same name search as before.
+    let seeds: Vec<CoreNode> = match resolve_reference_targets(store, symbol, path) {
+        RefTarget::Unique(n) => vec![n],
+        // A selector family is one Objective-C method spelled at several
+        // arities, not rival definitions, and no `path` could choose between
+        // them. Union their callers, as `find_references` unions their sites.
+        RefTarget::Family(nodes) => nodes,
+        RefTarget::Ambiguous(nodes) => {
+            return ambiguous_definitions_message(
+                symbol,
+                &nodes,
+                "Re-run with a `path` hint to pick one of:",
+            )
+        }
+        RefTarget::None => {
+            // #647 parity with `find_references`: a `path` hint that filtered
+            // out every definition must not fall through to a partial name
+            // search that ignores the hint, which would answer about a symbol
+            // somewhere else entirely.
+            if let Some(hint) = path {
+                match resolve_reference_targets(store, symbol, None) {
+                    RefTarget::Unique(n) => return path_miss_message(symbol, hint, &[n]),
+                    RefTarget::Ambiguous(nodes) | RefTarget::Family(nodes) => {
+                        return path_miss_message(symbol, hint, &nodes)
+                    }
+                    RefTarget::None => {}
+                }
+            }
+            let partial = match store.search_nodes_by_name(symbol) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("get_callers search error: {e}");
+                    return String::new();
+                }
+            };
+            // The `path` hint has to survive this fallback too. It used to be
+            // dropped here and the first FTS row won, so a hint naming one file
+            // was answered from a same-named symbol somewhere else entirely —
+            // the confident-wrong answer #647 removed from the exact tiers,
+            // still reachable through this one. Scoping here keeps the
+            // documented partial matching and makes the hint mean the same
+            // thing on every tier.
+            match path {
+                None => partial.into_iter().take(1).collect(),
+                Some(hint) => {
+                    let scoped: Vec<CoreNode> = partial
+                        .iter()
+                        .filter(|n| path_hint_matches(&n.vname.path, hint))
+                        .take(1)
+                        .cloned()
+                        .collect();
+                    // A hint that matches none of them says so, rather than
+                    // widening silently back to the whole repo (#647) or
+                    // answering an empty list that reads as "no callers".
+                    if scoped.is_empty() && !partial.is_empty() {
+                        return path_miss_message(symbol, hint, &partial);
+                    }
+                    scoped
+                }
+            }
         }
     };
 
-    let seed = match nodes.first() {
+    let seed = match seeds.first() {
         Some(n) => n,
         None => return String::new(),
     };
 
-    let edges = match store.iter_edges_to(seed.id) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!("get_callers edge query error: {e}");
-            return String::new();
+    let mut edges = Vec::new();
+    for node in &seeds {
+        match store.iter_edges_to(node.id) {
+            Ok(e) => edges.extend(e),
+            Err(e) => {
+                tracing::warn!("get_callers edge query error: {e}");
+                return String::new();
+            }
         }
-    };
+    }
 
     let relevant: Vec<_> = edges
         .iter()
@@ -610,12 +952,21 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
 
     // #399: resolve exact call-site `path:line`s for true call edges. A RefCall
     // edge is deduplicated by `(src,dst,kind)`, so one edge can stand for several
-    // calls from the same caller — we re-scan the caller's source span for the
-    // callee's name to recover each site. Requires `repo_root` (stored in meta by
-    // init); absent (older indexes) or unresolvable → fall back to the caller's
-    // definition line, never worse than before.
+    // calls from the same caller — the recorded `edge_sites` occurrences recover
+    // each site. Only when a language feeds no occurrence rows do we re-scan the
+    // caller's source span for the callee's name, which requires `repo_root`
+    // (stored in meta by init); absent (older indexes) or unresolvable → fall
+    // back to the caller's definition line, never worse than before.
     let repo_root = resolve_repo_root(store);
-    let callee_name = simple_name(&seed.vname.signature);
+    // One name per seed, not the first seed's name for every edge. A selector
+    // family is several arities of ONE method, and the textual fallback below
+    // searches the caller's span for the callee's own spelling, so keying every
+    // family member on arity [0]'s name scans for text that member never uses.
+    // Identical to the old behaviour for a `Unique` target, which is one seed.
+    let callee_names: std::collections::HashMap<travsr_core::NodeId, String> = seeds
+        .iter()
+        .map(|n| (n.id, simple_name(&n.vname.signature)))
+        .collect();
     const MAX_SITES_PER_CALLER: usize = 50;
 
     let mut lines: Vec<String> = Vec::new();
@@ -623,42 +974,169 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         let Some(src_node) = node_map.get(&edge.src) else {
             continue;
         };
-        // True call edge: try to expand into exact call-site lines.
+        // Mark an edge a reader must not take at face value. Two cases: an
+        // un-ratified `live` overlay edge (RFC-027 section 10), and a ref/call
+        // edge resolved by leaf-name matching rather than by type.
+        let live = provenance_marker(edge);
+        // True call edge: expand into exact call-site lines.
+        //
+        // The recorded occurrences (the rows `find_references` also reads) are
+        // the trusted set. The textual re-scan runs only when a language feeds
+        // no occurrence rows at all, because it matches the callee's name
+        // anywhere in the caller's span: a comment, a string, or the callee's
+        // own `const f = (…)` declaration. Preferring the rows removed 3127
+        // phantom sites across 1081 edges on this repo.
+        //
+        // Known gap, deliberately left open: the gate is per (src,dst) EDGE, so
+        // an emitter that records SOME of an edge's calls but not all of them
+        // under-reports. scip-dotnet emits nothing for a generic invocation, so
+        // a C# caller invoking one callee once generically and once not shows a
+        // single site. Running the scan alongside the rows to recover that
+        // costs a source read per call edge in every language and puts comment
+        // and string mentions back in the output as extra marked lines, which
+        // is a worse trade than the one narrow shape it recovers. Closing it
+        // properly means fixing the emitter's occurrence coverage.
         if tag == "[call]" {
-            if let Some(root) = &repo_root {
-                let sites = call_site_lines(src_node, root, &callee_name, MAX_SITES_PER_CALLER);
-                if !sites.is_empty() {
-                    for line in sites {
-                        lines.push(format!(
-                            "{tag} {} ({}) \u{2014} {}:{}",
-                            display_label(src_node),
-                            src_node.kind,
-                            src_node.vname.path,
-                            line
-                        ));
-                    }
-                    continue;
+            let recorded = store
+                .edge_call_site_lines(edge.src, edge.dst, MAX_SITES_PER_CALLER)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("get_callers occurrence lookup error: {e}");
+                    Vec::new()
+                });
+            let sites: Vec<u32> = if recorded.is_empty() {
+                match repo_root.as_ref() {
+                    Some(root) => match callee_names.get(&edge.dst) {
+                        Some(name) => call_site_lines(src_node, root, name, MAX_SITES_PER_CALLER),
+                        None => Vec::new(),
+                    },
+                    None => Vec::new(),
                 }
+            } else {
+                recorded
+            };
+            if !sites.is_empty() {
+                for line in sites {
+                    lines.push(format!(
+                        "{tag} {} ({}) \u{2014} {}:{}{live}",
+                        display_label(src_node),
+                        src_node.kind,
+                        src_node.vname.path,
+                        line
+                    ));
+                }
+                continue;
             }
         }
         // Structural edge, or a call edge with no resolvable site / no repo_root:
         // report the node's definition line as before.
         let loc = src_node.line.map(|l| format!(":{l}")).unwrap_or_default();
         lines.push(format!(
-            "{tag} {} ({}) \u{2014} {}{}",
+            "{tag} {} ({}) \u{2014} {}{}{live}",
             display_label(src_node),
             src_node.kind,
             src_node.vname.path,
             loc
         ));
     }
-    // #715: a crash in this language's last Phase B run leaves partial coverage
-    // while the marker reads complete, so this list may be missing callers in the
-    // un-indexed files. Attach the caveat to the confident (non-empty) answer.
-    if !lines.is_empty() && phase_b_lang_crashed(store, &seed.vname.language) {
-        lines.push(crash_caveat(&seed.vname.language));
+    // Cap the rows here rather than letting the byte limit cut one in half, and
+    // say how many were left out. A hub symbol has thousands of call sites and
+    // no reader can act on all of them; what a reader cannot survive is a list
+    // that stops without saying it stopped.
+    let total = lines.len();
+    if total > MAX_CALLER_ROWS {
+        lines.truncate(MAX_CALLER_ROWS);
+        lines.push(format!("[showing {MAX_CALLER_ROWS} of {total} callers]"));
+    }
+    // The sigil is the last thing appended to a row, so the rows that survived
+    // the cap are what decide whether the legend is worth a line.
+    if lines.iter().any(|l| l.ends_with(HEURISTIC_SIGIL_ROW)) {
+        lines.push(HEURISTIC_LEGEND.to_string());
+    }
+    // #715 / #878: a crash, or a skipped LSIF pass, in this language's last
+    // Phase B run leaves partial coverage while the marker reads complete, so
+    // this list may be missing callers. Attach the caveat to the confident
+    // (non-empty) answer.
+    if !lines.is_empty() {
+        if let Some(class) = phase_b_lang_incomplete(store, &seed.vname.language) {
+            lines.push(incomplete_caveat(&seed.vname.language, class));
+        }
     }
     lines.join("\n")
+}
+
+/// Cap on the caller rows `get_callers` returns, mirroring
+/// [`MAX_REFERENCE_SITES`] for the tool that enumerates the same shape of row.
+const MAX_CALLER_ROWS: usize = 500;
+
+/// The suffix marking an edge whose confidence differs from the default.
+///
+/// Empty for a type-resolved, ratified edge, so the common case reads exactly
+/// as it did before. Two cases are called out:
+///
+/// * `live` (RFC-027 section 10): resolved but not yet ratified, precise
+///   enough to act on, and honest that the commit-gated pipeline has not
+///   confirmed it. Consumers needing ground truth filter it out; consumers
+///   ignoring provenance simply see a fresher graph.
+/// * `tree-sitter` on a `ref/call` edge: produced by `resolve_unresolved_calls`
+///   matching a bare callee name against the graph, not by a compiler resolving
+///   a type. Ratified, and still capable of being wrong. Its uniqueness gate
+///   ("exactly one same-named candidate") is evidence about the *index*, not
+///   about the call: a local binding the Phase A parser does not model (a JS
+///   `const f = () => …`) leaves the only same-named node in an unrelated
+///   package as the unique winner, and the edge is written as fact. The gate is
+///   also skipped entirely when the call carries a crate hint, which fans out to
+///   every path-matching candidate.
+///
+/// The old comment here asserted that "every other provenance is ratified" and
+/// stopped there, which conflated ratified with correct. Restricted to
+/// `RefCall`: Phase A's `defines/binding` and `depends` edges are also
+/// `tree-sitter` and are structural facts from the AST, not name guesses.
+fn provenance_marker(edge: &travsr_core::Edge) -> &'static str {
+    match edge.provenance.as_deref() {
+        Some("live") => LIVE_MARKER,
+        Some("tree-sitter") if edge.kind == travsr_core::EdgeKind::RefCall => HEURISTIC_SIGIL_ROW,
+        _ => "",
+    }
+}
+
+/// The name-matched-edge caveat, spelled out per site by `find_references` (via
+/// `RefSite::heuristic`), where one occurrence line carries it at most once.
+const HEURISTIC_MARKER: &str = " [heuristic: matched by name, not resolved by type]";
+
+/// The un-ratified-overlay marker, shared by `provenance_marker` (get_callers)
+/// and `site_marker` (find_references) so the two tools cannot describe the same
+/// edge in two different words. That constraint is stated in
+/// `travsr-store::reference_sites`.
+const LIVE_MARKER: &str = " [live: resolved from your uncommitted edit, not yet ratified]";
+
+/// The same caveat on a `get_callers` row: one character, plus one legend line
+/// at the end of the answer.
+///
+/// [`HEURISTIC_MARKER`] is 49 bytes on a ~70-byte row, and on a Phase-A-only
+/// language (Go, Java, C#, Ruby, PHP) essentially every call edge is
+/// name-matched, so the caveat itself was pushing callers out of the response.
+/// The CLI tree already made this trade for the same reason
+/// (`travsr-cli`'s `HEURISTIC_SIGIL`); the legend repeats its wording verbatim
+/// so the two surfaces cannot describe the same edge in two different words.
+const HEURISTIC_SIGIL_ROW: &str = " ~";
+
+/// Printed once, after the rows, and only when a marked row was actually
+/// rendered: a legend for a mark that is not on screen is noise.
+const HEURISTIC_LEGEND: &str = "~ = matched by name, not resolved by type";
+
+/// The marker for one occurrence site, empty unless it carries a caveat.
+///
+/// `live` is checked first: an un-ratified site is the stronger statement about
+/// how much to trust the row, and the two flags are independent rather than
+/// exclusive (#895). A site can be both, in which case the live caveat wins.
+fn site_marker(site: &travsr_core::RefSite) -> &'static str {
+    if site.live {
+        LIVE_MARKER
+    } else if site.heuristic {
+        HEURISTIC_MARKER
+    } else {
+        ""
+    }
 }
 
 /// Extract the bare symbol name from a stored signature for textual call-site
@@ -667,9 +1145,20 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
 /// `fn:SqliteStore.iter_edges_to` → `iter_edges_to`,
 /// `fn:crate::repo::find_git_root` → `find_git_root`.
 fn simple_name(signature: &str) -> String {
-    // rsplit(':') drops the `kind:` prefix and yields the last `::` component;
-    // then split off any `.`/`#` method/scope qualifier.
-    let after_kind = signature.rsplit(':').next().unwrap_or(signature);
+    // An Objective-C selector spells its own colons inside the name
+    // (`method:Foo.setWidth:height:`), so the `rsplit(':')` below would eat the
+    // whole thing and return "". A stored selector always ends in `:`, which no
+    // other language's signature does, so split only the `kind:` prefix there
+    // and keep the rest.
+    let after_kind = if signature.ends_with(':') {
+        signature
+            .split_once(':')
+            .map_or(signature, |(_, rest)| rest)
+    } else {
+        // rsplit(':') drops the `kind:` prefix and yields the last `::` component;
+        // then split off any `.`/`#` method/scope qualifier.
+        signature.rsplit(':').next().unwrap_or(signature)
+    };
     after_kind
         .rsplit(['.', '#'])
         .next()
@@ -757,20 +1246,29 @@ pub fn get_dependencies_global(
             .and_then(|db| repo_head_from_registry_path(db));
         append_head_note(store, result, head.as_deref())
     });
-    // SEC-001: sanitize the fully-aggregated string once.
-    sanitize_for_mcp(&raw)
+    // SEC-001: sanitize the fully-aggregated string once, with the same
+    // row-enumerating limit the single-repo path uses: an aggregate over N
+    // repos is the last place a 4 KiB cap belongs.
+    wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT))
 }
 
 /// Global variant of `get_callers` — searches one named repo or all registered repos.
 pub fn get_callers_global(
     repos: &HashMap<String, PathBuf>,
     symbol: &str,
+    path: Option<&str>,
     repo: Option<&str>,
 ) -> String {
     // SEC-002: validate before registry + store queries.
     if let Err(reason) = validate_mcp_arg(symbol) {
         tracing::warn!("get_callers_global rejected invalid arg: {reason}");
         return String::new();
+    }
+    if let Some(p) = path {
+        if let Err(reason) = validate_mcp_arg(p) {
+            tracing::warn!("get_callers_global rejected invalid path arg: {reason}");
+            return String::new();
+        }
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
         // #617 + #645: per-repo notes — each store carries its own Phase B
@@ -779,7 +1277,8 @@ pub fn get_callers_global(
         let head = repos
             .get(repo_name)
             .and_then(|db| repo_head_from_registry_path(db));
-        let result = append_read_notes(store, get_callers_raw(store, symbol), head.as_deref());
+        let raw = get_callers_raw(store, symbol, path);
+        let result = append_read_notes(store, raw, head.as_deref());
         if result.is_empty() || single {
             result
         } else {
@@ -801,11 +1300,11 @@ pub fn get_callers_global(
 /// the spirit of `MAX_SITES_PER_CALLER` but is per-symbol, not per-caller.
 const MAX_REFERENCE_SITES: usize = 500;
 
-/// Byte cap for `find_references` / `find_pattern` output. The default scalar
-/// cap (`sanitize_for_mcp`, 4 KiB) would truncate a capped 500-site list
-/// mid-line and drop the truncation notice — the same trap `get_snippets`
-/// avoids. These tools enumerate up to `MAX_*` rows, so they wrap with this
-/// larger limit instead (still well under the 1 MiB MCP hard ceiling).
+/// Byte cap for `find_references` / `find_pattern` / `get_callers` output. The
+/// default scalar cap (`sanitize_for_mcp`, 4 KiB) would truncate a capped
+/// 500-row list mid-line and drop the truncation notice, the same trap
+/// `get_snippets` avoids. These tools enumerate up to `MAX_*` rows, so they wrap
+/// with this larger limit instead (still well under the 1 MiB MCP hard ceiling).
 const FIND_OUTPUT_LIMIT: usize = 512_000;
 
 /// Resolution outcome for a `find_references` symbol argument.
@@ -815,6 +1314,15 @@ pub(crate) enum RefTarget {
     /// Multiple definitions and no disambiguating `path` — return the list so the
     /// caller can re-query with a `path` hint (never silently pick `[0]`).
     Ambiguous(Vec<CoreNode>),
+    /// One Objective-C method family reached by its selector head: every
+    /// arity of `policyWithPinningMode:` when the query was
+    /// `policyWithPinningMode`. Distinct from [`Self::Ambiguous`] on purpose:
+    /// these are not rival definitions a `path` hint could choose between, they
+    /// are the same method spelled at different arities in one class, and the
+    /// head is the only thing a developer can type for them. References are the
+    /// union over the family; a caller who wants one arity types the full
+    /// selector, which resolves uniquely.
+    Family(Vec<CoreNode>),
     /// No definition matched the name.
     None,
 }
@@ -887,6 +1395,31 @@ fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -
                 .collect(),
             Err(e) => {
                 tracing::warn!("resolve_symbol_nodes search '{symbol}': {e}");
+                Vec::new()
+            }
+        };
+    }
+
+    // Tier 2b: Objective-C selector head. Phase A stores the whole selector
+    // (`method:AFSecurityPolicy.policyWithPinningMode:withPinnedCertificates:`)
+    // so selectors sharing a leading keyword stay distinct nodes, but the
+    // leading keyword is the only part a developer types. Match on it, and only
+    // once the exact tiers above have found nothing, so this can never widen a
+    // name that already resolves. `selector_head` returns a non-selector leaf
+    // unchanged, so a plain name reaching here still matches nothing new.
+    if candidates.is_empty() && !symbol.contains(':') {
+        candidates = match store.search_nodes_by_name(symbol) {
+            Ok(nodes) => nodes
+                .into_iter()
+                .filter(|n| {
+                    n.kind != "file"
+                        && n.kind != "import"
+                        && travsr_core::ident::selector_head(&simple_name(&n.vname.signature))
+                            == symbol
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("resolve_symbol_nodes selector head '{symbol}': {e}");
                 Vec::new()
             }
         };
@@ -976,6 +1509,14 @@ pub(crate) fn resolve_reference_targets(
         }
     }
 
+    // An Objective-C selector family reached by its head is one method, not
+    // rival definitions, see `RefTarget::Family`. Same class, same head, and
+    // every member an actual multi-part selector; two classes that both declare
+    // a `policyWithPinningMode:` are still genuinely ambiguous and fall through.
+    if candidates.len() > 1 && is_selector_family(&candidates, symbol) {
+        return RefTarget::Family(candidates);
+    }
+
     match candidates.len() {
         0 => RefTarget::None,
         1 => candidates
@@ -986,14 +1527,53 @@ pub(crate) fn resolve_reference_targets(
     }
 }
 
-/// #647: message for a `path` hint that matched no definition of a symbol that
-/// does resolve elsewhere. Shows where the symbol actually lives so the answer
-/// is never mistaken for a real "0 references".
-fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
-    let mut out = format!(
-        "'{symbol}' resolves, but no definition is under path '{hint}'. It is defined at:\n"
-    );
-    for n in defs.iter().take(MAX_REFERENCE_SITES) {
+/// Whether every candidate is a multi-part Objective-C selector of ONE class
+/// whose leading keyword is `head`: the [`RefTarget::Family`] test.
+///
+/// Three things must agree, and all three are load-bearing:
+///
+/// * the language is Objective-C. Nothing else spells a method name with
+///   embedded colons, and the test used to run for every language on nothing
+///   but `leaf.ends_with(':')`.
+/// * the container name. Without it two different methods union.
+/// * the container's PATH. The container is only a `String` cut out of the
+///   signature, so name equality alone merged two classes that happen to share
+///   a name (a vendored pod duplicated under two paths, a category, a name
+///   colliding across two static libs) into one family, and `get_callers` then
+///   presented two methods' callers as one method's. Two same-named classes in
+///   two files are real ambiguity a `path` hint resolves.
+fn is_selector_family(candidates: &[CoreNode], head: &str) -> bool {
+    let container_of = |sig: &str| -> Option<String> {
+        let body = sig.split_once(':').map_or(sig, |(_, rest)| rest);
+        body.rsplit_once('.').map(|(c, _)| c.to_string())
+    };
+    let first = match container_of(&candidates[0].vname.signature) {
+        Some(c) => c,
+        None => return false,
+    };
+    let path = candidates[0].vname.path.as_str();
+    candidates.iter().all(|n| {
+        let leaf = simple_name(&n.vname.signature);
+        n.vname.language == travsr_core::Language::ObjectiveC.as_str()
+            && n.vname.path == path
+            && leaf.ends_with(':')
+            && travsr_core::ident::selector_head(&leaf) == head
+            && container_of(&n.vname.signature).as_deref() == Some(first.as_str())
+    })
+}
+
+/// The refusal every surface returns for [`RefTarget::Ambiguous`]: the count, an
+/// `advice` sentence naming the escape hatch that surface actually offers, then
+/// one line per rival definition.
+///
+/// Shared so `find_references` and `get_callers` cannot drift into describing
+/// the same ambiguity differently, which is how `get_callers` came to describe
+/// it not at all.
+fn ambiguous_definitions_message(symbol: &str, nodes: &[CoreNode], advice: &str) -> String {
+    let total = nodes.len();
+    let shown = total.min(MAX_AMBIGUOUS_DEFINITIONS);
+    let mut out = format!("'{symbol}' is ambiguous, {total} definitions. {advice}\n");
+    for n in nodes.iter().take(shown) {
         let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
         out.push_str(&format!(
             "  {} ({}) \u{2014} {}{}\n",
@@ -1002,6 +1582,44 @@ fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
             n.vname.path,
             loc
         ));
+    }
+    if total > shown {
+        out.push_str(&format!("[showing {shown} of {total} definitions]\n"));
+    }
+    out.trim_end().to_string()
+}
+
+/// Cap on the definition lines [`ambiguous_definitions_message`] lists.
+///
+/// Both tools now wrap with [`FIND_OUTPUT_LIMIT`], but this list stays short on
+/// its own account: `get_callers` used to wrap with `sanitize_for_mcp`'s 4 KiB
+/// scalar cap, which cut a 37-definition refusal off mid-line and dropped no
+/// notice saying so. 25 lines are all a reader can act on, and the elided count
+/// is stated rather than implied. Deliberately not `MAX_REFERENCE_SITES`: a
+/// reader cannot act on 500 rival definitions anyway, they need the `path` hint.
+const MAX_AMBIGUOUS_DEFINITIONS: usize = 25;
+
+/// #647: message for a `path` hint that matched no definition of a symbol that
+/// does resolve elsewhere. Shows where the symbol actually lives so the answer
+/// is never mistaken for a real "0 references".
+fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
+    let total = defs.len();
+    let shown = total.min(MAX_AMBIGUOUS_DEFINITIONS);
+    let mut out = format!(
+        "'{symbol}' resolves, but no definition is under path '{hint}'. It is defined at:\n"
+    );
+    for n in defs.iter().take(shown) {
+        let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+        out.push_str(&format!(
+            "  {} ({}) \u{2014} {}{}\n",
+            display_label(n),
+            n.kind,
+            n.vname.path,
+            loc
+        ));
+    }
+    if total > shown {
+        out.push_str(&format!("[showing {shown} of {total} definitions]\n"));
     }
     out.push_str("Re-run without `path`, or with a `path` hint that matches one of these.");
     out
@@ -1053,7 +1671,7 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
     // path:line answers and intentionally carry no note.
     let body =
         sanitize_mcp_body_with_limit(&find_references_raw(store, symbol, path), FIND_OUTPUT_LIMIT);
-    wrap_envelope(&with_head_note(store, body))
+    wrap_envelope(&with_phase_b_note(store, body))
 }
 
 /// One resolved definition site, for the structured `find_references` result.
@@ -1158,6 +1776,20 @@ pub fn find_references_structured(
 
     let target = match resolve_reference_targets(store, symbol, path) {
         RefTarget::Unique(n) => n,
+        // One method family reached by its selector head: report every arity as
+        // a candidate and the union of their occurrence sites, rather than a
+        // "pick one" the caller cannot act on.
+        RefTarget::Family(nodes) => {
+            out.status = "resolved";
+            out.candidates = nodes.iter().map(ResolvedSymbol::from_node).collect();
+            out.resolved_to = nodes.first().map(ResolvedSymbol::from_node);
+            let sites = family_reference_sites(store, &nodes);
+            let total = sites.len();
+            out.total = Some(total);
+            out.truncated = total > MAX_REFERENCE_SITES;
+            out.references = sites.into_iter().take(MAX_REFERENCE_SITES).collect();
+            return out;
+        }
         RefTarget::Ambiguous(nodes) => {
             out.status = "ambiguous";
             out.note = Some(format!(
@@ -1174,7 +1806,7 @@ pub fn find_references_structured(
             if let Some(hint) = path {
                 let elsewhere = match resolve_reference_targets(store, symbol, None) {
                     RefTarget::Unique(n) => vec![n],
-                    RefTarget::Ambiguous(nodes) => nodes,
+                    RefTarget::Ambiguous(nodes) | RefTarget::Family(nodes) => nodes,
                     RefTarget::None => Vec::new(),
                 };
                 if !elsewhere.is_empty() {
@@ -1200,11 +1832,12 @@ pub fn find_references_structured(
             out.total = Some(total);
             out.truncated = total > MAX_REFERENCE_SITES;
             out.references = sites.into_iter().take(MAX_REFERENCE_SITES).collect();
-            // #715 parity with the text path: a crashed last Phase B run leaves
-            // partial coverage under a complete marker, so even a non-empty site
-            // list may be short. Surface the same caveat instead of `note: None`.
-            if phase_b_lang_crashed(store, &target.vname.language) {
-                out.note = Some(crash_caveat(&target.vname.language));
+            // #715 / #878 parity with the text path: a crashed last Phase B run,
+            // or a skipped LSIF pass, leaves partial coverage under a complete
+            // marker, so even a non-empty site list may be short. Surface the
+            // same caveat instead of `note: None`.
+            if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
+                out.note = Some(incomplete_caveat(&target.vname.language, class));
             }
         }
         _ => {
@@ -1227,6 +1860,7 @@ pub fn find_references_structured(
 fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> String {
     let target = match resolve_reference_targets(store, symbol, path) {
         RefTarget::Unique(n) => n,
+        RefTarget::Family(nodes) => return references_body_for_family(store, &nodes),
         RefTarget::None => {
             // #647: a `path` hint that filtered out every real definition must
             // not read as a definitive "0 references" — that is the exact
@@ -1237,32 +1871,93 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
             if let Some(hint) = path {
                 match resolve_reference_targets(store, symbol, None) {
                     RefTarget::Unique(n) => return path_miss_message(symbol, hint, &[n]),
-                    RefTarget::Ambiguous(nodes) => return path_miss_message(symbol, hint, &nodes),
+                    RefTarget::Ambiguous(nodes) | RefTarget::Family(nodes) => {
+                        return path_miss_message(symbol, hint, &nodes)
+                    }
                     RefTarget::None => {}
                 }
             }
             return String::new();
         }
         RefTarget::Ambiguous(nodes) => {
-            let mut out = format!(
-                "'{symbol}' is ambiguous, {} definitions. Re-run with a `path` hint to pick one:\n",
-                nodes.len()
-            );
-            for n in nodes.iter().take(MAX_REFERENCE_SITES) {
-                let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
-                out.push_str(&format!(
-                    "  {} ({}) \u{2014} {}{}\n",
-                    display_label(n),
-                    n.kind,
-                    n.vname.path,
-                    loc
-                ));
-            }
-            return out.trim_end().to_string();
+            return ambiguous_definitions_message(
+                symbol,
+                &nodes,
+                "Re-run with a `path` hint to pick one:",
+            )
         }
     };
 
     references_body_for_target(store, &target)
+}
+
+/// Union of the occurrence sites of every member of a selector family,
+/// deduplicated by `path:line` and ordered the same way `reference_sites` orders
+/// one node's sites. Two arities of one selector can be used on the same source
+/// line (`[self policyWithPinningMode:m withPinnedCertificates:c]` is one line
+/// carrying both heads), so the dedup is load-bearing, not defensive.
+fn family_reference_sites(store: &SqliteStore, family: &[CoreNode]) -> Vec<travsr_core::RefSite> {
+    let mut sites: Vec<travsr_core::RefSite> = Vec::new();
+    for n in family {
+        match store.reference_sites(n.id) {
+            Ok(s) => sites.extend(s),
+            Err(e) => tracing::warn!("family_reference_sites {}: {e}", n.vname.signature),
+        }
+    }
+    sites.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    // Dedup on `path:line` only: `a` is the later duplicate about to be
+    // dropped, so fold its flag into the survivor rather than letting a
+    // differing `heuristic` split one site into two rows.
+    sites.dedup_by(|a, b| {
+        let same = a.path == b.path && a.line == b.line;
+        if same {
+            b.heuristic |= a.heuristic;
+            // #895: same fold, or a family query silently drops the live caveat
+            // that the single-target query would have shown.
+            b.live |= a.live;
+        }
+        same
+    });
+    sites
+}
+
+/// Render the reference body for a selector family: which arities the head
+/// reached, then the union of their occurrence sites.
+fn references_body_for_family(store: &SqliteStore, family: &[CoreNode]) -> String {
+    let mut lines = Vec::new();
+    let head = format!(
+        "resolved: {} selector(s) of one method family:",
+        family.len()
+    );
+    lines.push(head);
+    for n in family {
+        let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+        lines.push(format!(
+            "  {} ({}) \u{2014} {}{}",
+            display_label(n),
+            n.kind,
+            n.vname.path,
+            loc
+        ));
+    }
+
+    let sites = family_reference_sites(store, family);
+    if sites.is_empty() {
+        // Defer to the single-target renderer for the honest degraded/zero
+        // caveat rather than restating it: with no sites the family's first
+        // member carries exactly the same answer.
+        return references_body_for_target(store, &family[0]);
+    }
+    let total = sites.len();
+    let shown = total.min(MAX_REFERENCE_SITES);
+    lines.push(format!("{total} reference(s):"));
+    for s in sites.into_iter().take(MAX_REFERENCE_SITES) {
+        lines.push(format!("{}:{}{}", s.path, s.line, site_marker(&s)));
+    }
+    if total > shown {
+        lines.push(format!("[truncated: showing {shown} of {total} sites]"));
+    }
+    lines.join("\n")
 }
 
 /// Render the reference body for an already-resolved target: the `resolved:`
@@ -1288,15 +1983,16 @@ fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String 
             lines.push(header);
             lines.push(format!("{total} reference(s):"));
             for s in sites.into_iter().take(MAX_REFERENCE_SITES) {
-                lines.push(format!("{}:{}", s.path, s.line));
+                lines.push(format!("{}:{}{}", s.path, s.line, site_marker(&s)));
             }
             if total > shown {
                 lines.push(format!("[truncated: showing {shown} of {total} sites]"));
             }
-            // #715: a crashed last run leaves partial coverage under a complete
-            // marker, so this occurrence list may be short.
-            if phase_b_lang_crashed(store, &target.vname.language) {
-                lines.push(crash_caveat(&target.vname.language));
+            // #715 / #878: a crashed last run, or a skipped LSIF pass, leaves
+            // partial coverage under a complete marker, so this occurrence list
+            // may be short.
+            if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
+                lines.push(incomplete_caveat(&target.vname.language, class));
             }
             lines.join("\n")
         }
@@ -1335,16 +2031,23 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // ref/call edges exist for this node. #299 M1: three very different
         // situations reach here and must not read identically.
         let lang = &target.vname.language;
-        // #715: a crashed last Phase B run for this language leaves partial
-        // coverage under a marker that reads complete, so a zero here is not a
-        // definitive zero regardless of the per-file / language-wide coverage
-        // gates below — those key on whether occurrences exist, not on whether the
-        // run finished. Soften first so a crash is never reported as a clean zero.
-        if phase_b_lang_crashed(store, lang) {
+        // #715 / #878: a crashed last Phase B run, or a skipped LSIF pass, for
+        // this language leaves partial coverage under a marker that reads
+        // complete, so a zero here is not a definitive zero regardless of the
+        // per-file / language-wide coverage gates below — those key on whether
+        // occurrences exist, not on whether the run finished. Soften first so
+        // neither is ever reported as a clean zero.
+        if let Some(class) = phase_b_lang_incomplete(store, lang) {
+            let cause = match class {
+                "crashed" => format!("Semantic analysis for '{lang}' crashed on its last run"),
+                _ => format!(
+                    "The TypeScript analyzer (travsr-lsif-ts) did not run for '{lang}' \
+                     on the last semantic analysis run"
+                ),
+            };
             return format!(
-                "{header}\n0 recorded reference(s), not a definitive zero. Semantic \
-                 analysis for '{lang}' crashed on its last run, so its occurrence \
-                 coverage is partial. Run `travsr status` for detail, `travsr init \
+                "{header}\n0 recorded reference(s), not a definitive zero. {cause}, so its \
+                 occurrence coverage is partial. Run `travsr status` for detail, `travsr init \
                  --semantic --force` to rebuild, or `find_pattern` for a textual search."
             );
         }
@@ -1398,7 +2101,7 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
             );
         }
         // WS-3 (C3): a Dart index built without resolved dependencies drops
-        // every cross-package reference, so "no recorded uses" would be a
+        // every cross-package reference, so "recorded no uses" would be a
         // confident zero the index cannot support even when the file itself was
         // analysed. Soften it, mirroring the partial-coverage case above.
         if target.vname.language == "dart"
@@ -1416,14 +2119,80 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                  use `find_pattern` for a textual search."
             );
         }
-        // Coverage is effectively complete for this language and this symbol has
-        // neither occurrence rows nor ref/call edges: a genuine zero. (If the
-        // same name is also defined elsewhere, bare calls to it are left
-        // unindexed to avoid mis-targeting — precision over recall.)
+        // #895: the overlay may hold references in this very file that nothing
+        // has resolved yet. `live_overlay_note` appends that count to whatever
+        // we return here, scoped to the files the answer names — so asserting a
+        // confident zero produces two sentences about one file that cannot both
+        // be true ("recorded no uses" beside "11 references ... detected but
+        // not resolved"). A pending row *is* a detected use, so soften on the
+        // same set the note reports over and the pair stays consistent.
+        //
+        // Dogfooded: `travsr references collect_global` said zero while all 11
+        // call sites sat pending in `travsr-mcp/src/tools.rs`; they resolved
+        // verbatim once Phase B caught up.
+        let pending_here = store
+            .pending_ref_counts_by_file(PENDING_FILE_CAP)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(path, _)| path == &target.vname.path)
+            .map(|(_, n)| n)
+            .unwrap_or(0);
+        if pending_here > 0 {
+            return format!(
+                "{header}\n0 recorded reference(s), not a definitive zero. \
+                 {pending_here} reference{} in '{}' {} detected but not yet \
+                 resolved, so uses of this symbol may be among them. They \
+                 resolve deterministically at the next commit; run `travsr init \
+                 --semantic` to resolve them now, or use `find_pattern` for a \
+                 textual search.",
+                if pending_here == 1 { "" } else { "s" },
+                target.vname.path,
+                if pending_here == 1 { "is" } else { "are" },
+            );
+        }
+        // The target's own file being analysed is necessary but not sufficient.
+        // A reference lives in whatever file *uses* the symbol, so a repo-wide
+        // "no uses anywhere" claim needs the analysis that would have recorded
+        // that use to have actually run, not just the one file the definition
+        // sits in.
+        //
+        // The gate is a recorded fact, not `language_occurrence_coverage`. #551
+        // rejected that ratio as a proxy for "was THIS file analysed"; it fails
+        // the repo-wide question too, for a different reason. The ratio counts
+        // files holding a `ref/call` occurrence, which cannot distinguish "never
+        // analysed" from "analysed, calls nothing", so it never reaches complete
+        // on a real repo — 208 of 239 real `.rs` files here, and every denominator
+        // we tried (all paths, callable-bearing paths, `files` rows) leaves a
+        // remainder of fixtures and call-free modules. Gating on it would make
+        // the definitive zero below unreachable, so every zero would print a
+        // hedge, which trains a reader to discount all of them.
+        //
+        // These markers are written by Phase B itself and rewritten empty on a
+        // healthy run, so a complete analysis still earns the definitive zero.
+        if let Some(reason) = phase_b_incomplete_reason(store, lang) {
+            return format!(
+                "{header}\n0 reference(s) recorded, but not a definitive zero: {reason}. \
+                 Run `travsr status`, or `find_pattern` for a textual search."
+            );
+        }
+        // Analysis for this language ran to completion and this symbol has
+        // neither occurrence rows nor ref/call edges: a genuine zero.
+        //
+        // The caveat names the recall limits that still exist. #864's repro was a
+        // uniquely-named constant used once inside a Rust format capture
+        // (`"{CONST} default rules"`), which no provider recorded; that gap is now
+        // closed in the extractor rather than described here (travsr-analysis
+        // recovers inline captures). What remains is the ambiguous bare call left
+        // unindexed by design, and analyzers that emit no occurrence for certain
+        // call shapes (scip-dotnet, for one, emits nothing for a generic
+        // invocation). Kept to one sentence on purpose: a paragraph of hedging
+        // would teach a reader to discount every zero, which is the same signal
+        // loss the gates above exist to prevent.
         return format!(
-            "{header}\n0 reference(s). This symbol has no recorded uses. If this \
-             name is also defined elsewhere, bare calls to it are left unindexed \
-             to avoid mis-targeting; use `find_pattern` for a textual search."
+            "{header}\n0 reference(s). No uses recorded. Bare calls to a name defined \
+             in more than one place are left unindexed to avoid mis-targeting, and \
+             some analyzers emit no occurrence for certain call shapes; use \
+             `find_pattern` to be sure."
         );
     }
     let callers = store.get_nodes(&caller_ids).unwrap_or_default();
@@ -1443,10 +2212,11 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         "{total} caller definition(s) (exact occurrence lines unavailable for this language, showing caller definitions):"
     ));
     lines.extend(sites.into_iter().take(MAX_REFERENCE_SITES));
-    // #715: these structural caller definitions can also be short if the
-    // language's last Phase B run crashed before indexing every file.
-    if phase_b_lang_crashed(store, &target.vname.language) {
-        lines.push(crash_caveat(&target.vname.language));
+    // #715 / #878: these structural caller definitions can also be short if the
+    // language's last Phase B run crashed before indexing every file, or if its
+    // LSIF pass never ran.
+    if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
+        lines.push(incomplete_caveat(&target.vname.language, class));
     }
     lines.join("\n")
 }
@@ -1502,7 +2272,11 @@ fn resolve_repo_root(store: &SqliteStore) -> Option<PathBuf> {
     store.resolve_repo_root()
 }
 
-/// Graph-scoped textual search: `git grep` confined to a bounded file set.
+/// Textual search: `git grep` over the repo's text files, minus the paths the
+/// walker hard-skips, the paths an ignore file excludes, and known-binary
+/// formats. Deliberately WIDER than the graph's own file set: a shell script, a
+/// Makefile or a lockfile is a legitimate answer to a textual query, and an
+/// extension allowlist reported "no matches" for all of them.
 ///
 /// `scope` selects the search set:
 ///   - `None` → whole repository (tracked files).
@@ -2185,7 +2959,7 @@ fn run_git_grep(
         tracing::warn!("find_pattern re-included pass failed: {detail}");
     }
 
-    // Two filters, both closing the same gap from the other direction: git can
+    // Three filters, all closing the same gap from the other direction: git can
     // see files the walker refuses to index, so a match from one of them would
     // be a file `find_references` can never corroborate.
     //
@@ -2201,7 +2975,87 @@ fn run_git_grep(
     //    matcher the walker applies (`add_custom_ignore_filename`) keeps both
     //    tools on one set of files. Pass-2 paths are whitelisted by
     //    construction, so this half only ever drops pass-1 lines.
+    // 3. Neither of those covers a generated `index.scip` sitting at the repo
+    //    root: it is in no skip dir and no ignore file, and `git grep -I` does
+    //    not help — git's binary heuristic only looks for a NUL byte in the
+    //    first 8000 bytes and this protobuf has none, so git classifies it as
+    //    text and emits raw binary as "matches". `BINARY_EXTS` names the
+    //    formats that produce garbage rather than an answer.
     //
+    //    This is a DENYLIST on purpose. It used to route through
+    //    `travsr_core::is_indexable_path`, an extension ALLOWLIST built for the
+    //    parser walk, which silently dropped every match in a `.sh`, `.sql`,
+    //    `Dockerfile`, `Makefile`, `.lock`, `.txt` or any extensionless file —
+    //    including this repo's own CI gate scripts — and reported a bare "no
+    //    matches" indistinguishable from real absence. find_pattern is a
+    //    textual search, not a parse: anything git will show as text is a
+    //    legitimate answer, so only known-binary formats are removed. `-I`
+    //    above still catches everything with a NUL byte.
+
+    // Extensions whose contents are bytes, not text. `.lsif` is deliberately
+    // absent: LSIF is line-delimited JSON, and a text format belongs in a
+    // textual search.
+    //
+    // Not exhaustive, and it does not have to be: `-I` above already drops
+    // anything with a NUL byte in its first 8 KB. This list only has to cover
+    // the formats git misclassifies as text, so it grows one entry at a time as
+    // one shows up. `pyc`, `pack`, `idx`, `node`, `safetensors` and `parquet`
+    // are here for that reason.
+    const BINARY_EXTS: &[&str] = &[
+        "scip",
+        "db",
+        "sqlite",
+        "onnx",
+        "safetensors",
+        "parquet",
+        "bin",
+        "wasm",
+        "so",
+        "dylib",
+        "dll",
+        "exe",
+        "node",
+        "a",
+        "o",
+        "rlib",
+        "class",
+        "jar",
+        "pyc",
+        "pack",
+        "idx",
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "webp",
+        "ico",
+        "pdf",
+        "zip",
+        "gz",
+        "tgz",
+        "bz2",
+        "xz",
+        "zst",
+        "tar",
+        "woff",
+        "woff2",
+        "ttf",
+        "otf",
+        "mp4",
+        "mov",
+        "mp3",
+        "wav",
+    ];
+    let is_binary_ext = |path: &str| {
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| {
+                let e = e.to_ascii_lowercase();
+                BINARY_EXTS.contains(&e.as_str())
+            })
+    };
+
     // Each grep line is `path:line:col:text`, so the path is the prefix before
     // the first ':'.
     let travsrignore = build_travsrignore_matcher(repo_root);
@@ -2216,6 +3070,9 @@ fn run_git_grep(
                 .components()
                 .any(|c| SKIP_DIRS.iter().any(|skip| c.as_os_str() == *skip));
             if in_skip_dir {
+                return false;
+            }
+            if is_binary_ext(path) {
                 return false;
             }
             match &travsrignore {
@@ -2292,14 +3149,53 @@ pub fn find_pattern_global(
     wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT))
 }
 
+/// Resolve one named registry entry to its live graph.db path.
+///
+/// Mirrors `collect_global`'s stale-entry filter for the single-repo case, for
+/// callers that need to open the store themselves.
+///
+/// Validates with `validate_mcp_repo_key_arg`, not the shared `validate_mcp_arg`:
+/// every registry key is an absolute repo root, which `validate_mcp_arg` rejects
+/// outright, so a caller could never name a real repo. Same reasoning and same
+/// exact-key-equality use as `observability::resolve_single_repo` (#636) - see
+/// that validator's doc for why the relaxed guard set is safe here.
+fn resolve_repo_db_path<'a>(
+    repos: &'a HashMap<String, PathBuf>,
+    name: &str,
+) -> Option<&'a PathBuf> {
+    // SEC-002: validate repo arg before registry lookup.
+    if let Err(reason) = crate::sanitize::validate_mcp_repo_key_arg(name) {
+        tracing::warn!("get_context_global rejected invalid repo arg: {reason}");
+        return None;
+    }
+    match repos.get(name) {
+        Some(db_path) if db_path.exists() => Some(db_path),
+        Some(db_path) => {
+            tracing::debug!("skipping stale registry entry: {}", db_path.display());
+            None
+        }
+        None => {
+            tracing::warn!("repo '{name}' not found in registry");
+            None
+        }
+    }
+}
+
 fn collect_global(
     repos: &HashMap<String, PathBuf>,
     target_repo: Option<&str>,
     mut f: impl FnMut(&SqliteStore, &str, bool) -> String,
 ) -> String {
     // SEC-002: validate repo arg before registry lookup.
+    //
+    // `validate_mcp_repo_key_arg`, not the shared `validate_mcp_arg`: every
+    // registry key is an absolute repo root, which `validate_mcp_arg` rejects
+    // outright, so every tool routed through here answered an empty result for
+    // any real repo named by `repo`. Same reasoning as `resolve_repo_db_path`
+    // and `observability::resolve_single_repo` (#636) - the value is only ever
+    // compared for exact `HashMap` key equality, never opened as a path.
     if let Some(name) = target_repo {
-        if let Err(reason) = validate_mcp_arg(name) {
+        if let Err(reason) = crate::sanitize::validate_mcp_repo_key_arg(name) {
             tracing::warn!("collect_global rejected invalid repo arg: {reason}");
             return String::new();
         }
@@ -2332,6 +3228,11 @@ fn collect_global(
 
     let single = candidates.len() == 1;
     let mut parts: Vec<String> = Vec::new();
+    // #893 B2: repos this fan-out could not open. Every caller below inherits
+    // the disclosure, so a partial cross-repo answer is never read as a
+    // complete one. Same note wording as `search_symbol_global`, which runs its
+    // own fan-out and cannot route through here.
+    let mut skipped: Vec<String> = Vec::new();
 
     for (repo_name, db_path) in candidates {
         match SqliteStore::open_read_only(db_path) {
@@ -2341,11 +3242,31 @@ fn collect_global(
                     parts.push(result);
                 }
             }
-            Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
+            Err(e) => {
+                tracing::warn!("failed to open {}: {e}", db_path.display());
+                skipped.push(format!("{repo_name} ({e})"));
+            }
         }
     }
 
-    parts.join("\n")
+    let joined = parts.join("\n");
+    if skipped.is_empty() {
+        return joined;
+    }
+    skipped.sort();
+    // Leading, not trailing: every caller sanitizes downstream and truncation
+    // runs from the end, which is exactly the large-fan-out case where this
+    // note matters most.
+    let note = format!(
+        "[note: this cross-repo answer is partial: {} registered repo(s) could not be opened and were skipped: {}]",
+        skipped.len(),
+        skipped.join("; ")
+    );
+    if joined.is_empty() {
+        note
+    } else {
+        format!("{note}\n{joined}")
+    }
 }
 
 // ── get_blast_radius ──────────────────────────────────────────────────────────
@@ -2726,6 +3647,1313 @@ pub fn get_blast_radius_global(
     sanitize_for_mcp(&raw)
 }
 
+/// How many rows a brief lists before it stops and says how many it skipped.
+///
+/// Ranked, so the head is the load-bearing part of the answer. 60 covers every
+/// component of a normal repository outright and still fits a monorepo's
+/// interesting head: kubernetes resolves 3379 components, and the 60 most
+/// depended-upon are the architecture a reader is asking about.
+const LIST_CAP: usize = 60;
+
+/// How many components get their own detail block. Lower than `LIST_CAP`
+/// because each block is several lines, not one.
+const DETAIL_CAP: usize = 20;
+
+/// Sanitize a brief, then cut it back to the last whole line that fits, and say
+/// what was dropped.
+///
+/// The byte limit alone cut mid-row — a kubernetes brief ended on
+/// `... | depends on 0 | 5 f`. A half-written fact is worse than an absent one:
+/// it reads as data.
+///
+/// ORDER MATTERS, and getting it wrong is what made a first attempt at this look
+/// like it worked. `sanitize_mcp_body_with_limit` escapes `<` and `>` into
+/// four-byte entities and truncates AFTER that, so a body trimmed to whole lines
+/// first comes back over the limit and is cut at a raw byte boundary anyway. An
+/// architecture brief is full of `->` and a subsystem brief of `<-`, so both
+/// still ended mid-row, and the subsystem listing ended on its own truncation
+/// notice: `[brief trun`. Escape first, trim second, and the body is both inside
+/// the limit and made of whole lines.
+fn render_brief(body: &str, limit: usize) -> String {
+    const NOTICE: &str =
+        "\n[brief truncated to fit the token budget; raise token_budget for the rest]\n";
+    // Escaping can quadruple a run of angle brackets, so give the sanitizer room
+    // to escape everything that could still fit; the trim below is what enforces
+    // `limit` on the result.
+    let escaped = sanitize_mcp_body_with_limit(body, limit.saturating_mul(4));
+    if escaped.len() <= limit {
+        return escaped;
+    }
+    let mut end = escaped.len().min(limit.saturating_sub(NOTICE.len()));
+    // `end` is a byte offset into escaped UTF-8; walk it back to a boundary
+    // before slicing, or a multi-byte identifier panics the tool.
+    while end > 0 && !escaped.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = escaped[..end].rfind('\n').map_or(0, |i| i + 1);
+    format!("{}{NOTICE}", &escaped[..cut])
+}
+
+/// Byte cap for a brief, from a caller's token budget.
+///
+/// `sanitize_for_mcp` caps at 4 KiB, which silently cut an architecture brief
+/// off mid-line and dropped its last section entirely. A brief is a fact packet
+/// meant to be read whole, so the caller sets the size, as `get_context` does.
+fn brief_byte_limit(token_budget: usize) -> usize {
+    token_budget
+        .saturating_mul(TOKEN_CHARS_PER_TOKEN)
+        .clamp(4_096, 512_000)
+}
+
+/// Directories that support the product rather than being it.
+///
+/// Language-agnostic by listing every convention the indexed languages use:
+/// `test`/`tests`/`spec`/`__tests__` (most), `testdata` (Go), `fixtures`,
+/// `bench`/`benches`, `examples`, `docs`, plus build and dependency caches.
+/// Matched per path segment, so a component named `contest` is not caught.
+fn is_support_component(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        matches!(
+            seg.to_ascii_lowercase().as_str(),
+            "test"
+                | "tests"
+                | "spec"
+                | "specs"
+                | "__tests__"
+                | "testdata"
+                | "fixture"
+                | "fixtures"
+                | "bench"
+                | "benches"
+                | "benchmark"
+                | "benchmarks"
+                | "fuzz"
+                | "example"
+                | "examples"
+                | "doc"
+                | "docs"
+                | "scripts"
+                | "vendor"
+                | "node_modules"
+                | "target"
+                | "build"
+                | "dist"
+                | ".github"
+                | ".claude"
+        )
+    })
+}
+
+/// Whether a node puts its directory on the architecture map.
+///
+/// Reuses the two rules `get_repo_map` already applies rather than inventing a
+/// third, because a third definition of "component" is what made the earlier
+/// generators disagree:
+///
+/// - [`repo_map_is_symbol_kind`] — a component is a directory that owns code.
+///   Without it, `kind = "file"` nodes carried every path that holds no symbols
+///   at all into the map: `is_structural_noise` drops doc chunks but keeps the
+///   file node beside them, so `CLAUDE.md`, `Cargo.toml`, `README.md` and nine
+///   more root-level files each became their own component, "1 files, 0
+///   symbols". On this repository that was 12 of the 39 reported components.
+/// - [`repo_map_is_local_path`] — a synthetic angle-bracket pseudo-path
+///   (`<cgo_synthetic>/main.go`) is not a directory and cannot be a component,
+///   which `get_repo_map_excludes_synthetic_pseudo_paths` already pins for the
+///   repo map.
+fn is_component_member(n: &travsr_core::Node) -> bool {
+    repo_map_is_local_path(&n.vname.path)
+        && repo_map_is_symbol_kind(&n.kind)
+        && !n.test_role.is_test()
+        && !travsr_core::noise::is_structural_noise(n)
+}
+
+/// Whether a signature names a type declaration, in any of the indexed languages.
+///
+/// The set is the canonical prefixes the analyzers normalise to, collected from
+/// their own capture tables: `struct` also carries C and C++ unions, `class`
+/// also carries Dart mixins, Kotlin objects, Scala traits and Objective-C
+/// protocols, and `type` also carries typedefs and C# delegates.
+fn is_type_signature(signature: &str) -> bool {
+    matches!(
+        signature.split(':').next().unwrap_or(""),
+        "struct" | "enum" | "class" | "interface" | "trait" | "type" | "protocol" | "actor"
+    )
+}
+
+/// Whether a signature names a program entry point.
+///
+/// `fn:main` covers the languages whose entry is a free function (Rust, Go, C,
+/// C++, Python, Dart); `method:X.main` covers the ones where it is a static
+/// method on a class (Java, Kotlin, C#, Scala). A language whose entry is a
+/// module-level side effect, such as Python's `__main__` guard or a JavaScript
+/// index module, has no symbol to find and is simply not reported.
+fn is_entry_point_signature(signature: &str) -> bool {
+    if signature == "fn:main" {
+        return true;
+    }
+    // C# spells it `Main`; Java, Kotlin and Scala spell it `main`. Compare the
+    // member case-insensitively rather than listing both spellings. Verified
+    // against real csharp, java and scala indexes.
+    signature
+        .strip_prefix("method:")
+        .and_then(|m| m.rsplit('.').next())
+        .is_some_and(|member| member.eq_ignore_ascii_case("main"))
+}
+
+// ── get_architecture_brief ────────────────────────────────────────────────────
+
+/// Strongly connected components, iterative Tarjan.
+///
+/// Iterative rather than recursive because a monorepo can have hundreds of
+/// components and a deep chain would otherwise blow the stack.
+fn arch_sccs(
+    nodes: &[String],
+    adj: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<Vec<String>> {
+    use std::collections::{HashMap, HashSet};
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut low: HashMap<&str, usize> = HashMap::new();
+    let mut on_stack: HashSet<&str> = HashSet::new();
+    let mut stack: Vec<&str> = Vec::new();
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut counter = 0usize;
+
+    for root in nodes {
+        if index.contains_key(root.as_str()) {
+            continue;
+        }
+        let mut work: Vec<(&str, usize)> = vec![(root.as_str(), 0)];
+        while let Some(&mut (v, ref mut pi)) = work.last_mut() {
+            if *pi == 0 {
+                index.insert(v, counter);
+                low.insert(v, counter);
+                counter += 1;
+                stack.push(v);
+                on_stack.insert(v);
+            }
+            let kids = adj.get(v).map(|k| k.as_slice()).unwrap_or(&[]);
+            if *pi < kids.len() {
+                let w = kids[*pi].as_str();
+                *pi += 1;
+                if !index.contains_key(w) {
+                    work.push((w, 0));
+                } else if on_stack.contains(w) {
+                    let lv = low[v].min(index[w]);
+                    low.insert(v, lv);
+                }
+                continue;
+            }
+            if low[v] == index[v] {
+                let mut group = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack.remove(w);
+                    group.push(w.to_string());
+                    if w == v {
+                        break;
+                    }
+                }
+                group.sort();
+                out.push(group);
+            }
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                let lp = low[parent].min(low[v]);
+                low.insert(parent, lp);
+            }
+        }
+    }
+    out
+}
+
+/// The shape of a repository: its components, how they depend on each other,
+/// what each one owns, and where the cycles are.
+///
+/// Components are the SAME unit `get_subsystem_brief` uses. Three separate
+/// definitions of "component" across the generators is what made their outputs
+/// disagree with each other, so there is one rule and both tools share it.
+///
+/// Layering is the longest path to a component that depends on nothing
+/// internally, computed over the cycle condensation so a cycle cannot make it
+/// diverge.
+pub fn get_architecture_brief(
+    store: &SqliteStore,
+    provenance: &str,
+    token_budget: usize,
+) -> String {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    // An unknown filter matches no edge, which the brief would otherwise report
+    // as analysis that has not run.
+    if !PROVENANCE_FILTERS.contains(&provenance) {
+        return sanitize_for_mcp(&format!(
+            "unknown provenance '{provenance}'. Use 'ratified' for confirmed edges, '' for \
+             everything, or name one provenance exactly (tree-sitter, lsif, scip, live)."
+        ));
+    }
+
+    let nodes = match store.all_nodes() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_architecture_brief: all_nodes error: {e}");
+            return sanitize_for_mcp("");
+        }
+    };
+    let pairs = match store.resolved_dep_pairs(provenance) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("get_architecture_brief: resolved_dep_pairs error: {e}");
+            return sanitize_for_mcp("");
+        }
+    };
+
+    // Components and their contents.
+    let mut files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut symbols: BTreeMap<String, usize> = BTreeMap::new();
+    let mut entries: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut declared: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut member_of: BTreeMap<String, HashMap<String, usize>> = BTreeMap::new();
+
+    for n in &nodes {
+        if !is_component_member(n) {
+            continue;
+        }
+        let comp = subsystem_component_of(&n.vname.path);
+        files
+            .entry(comp.clone())
+            .or_default()
+            .insert(n.vname.path.clone());
+        *symbols.entry(comp.clone()).or_insert(0) += 1;
+        let sig = simple_symbol(&n.vname.signature).to_string();
+        // Key on the SIGNATURE PREFIX, not `kind`. The prefix is the canonical
+        // form every analyzer normalises to; `kind` is the language's own word.
+        // A C union is stored kind="union" signature="struct:Name", a Dart mixin
+        // and a Kotlin object are both "class:", a typedef and a C# delegate are
+        // both "type:". Matching on `kind` silently found no types at all in C,
+        // C++, Dart, Kotlin, Objective-C and Swift.
+        if is_type_signature(&n.vname.signature) {
+            declared
+                .entry(comp.clone())
+                .or_default()
+                .insert(sig.clone());
+        }
+        // Check the FILE's path, not the component's. Components roll up to the
+        // package root, so `crates/x/examples/bench.rs` lands in component
+        // `crates/x`, which is not a support directory: a benchmark example and
+        // a test harness were both reported as the package's entry point.
+        if is_entry_point_signature(&n.vname.signature) && !is_support_component(&n.vname.path) {
+            entries
+                .entry(comp.clone())
+                .or_default()
+                .push(n.vname.path.clone());
+        }
+        // A type's usage lands on its members, not its declaration: `struct:VName`
+        // has one incoming reference while `method:VName.new` has hundreds. Fold
+        // `Type.member` into `Type` or the ranking is meaningless.
+        let base = sig.split('.').next().unwrap_or(&sig).to_string();
+        member_of.entry(comp).or_default().entry(base).or_insert(0);
+    }
+
+    let mut by_id: HashMap<travsr_core::NodeId, &travsr_core::Node> = HashMap::new();
+    for n in &nodes {
+        by_id.insert(n.id, n);
+    }
+    if let Ok(edges) = store.all_edges() {
+        for (_, dst, kind, prov) in &edges {
+            // References only. `defines/binding` runs from a type to each of its
+            // members, so counting it ranked types by how many members they have.
+            if !matches!(
+                kind.as_str(),
+                "ref/call"
+                    | "ref/field"
+                    | "ref/imports"
+                    | "is-implementation"
+                    | "overrides"
+                    | "ffi/call"
+            ) || !provenance_allowed(provenance, prov)
+            {
+                continue;
+            }
+            if let Some(n) = by_id.get(dst) {
+                if !is_component_member(n) {
+                    continue;
+                }
+                let comp = subsystem_component_of(&n.vname.path);
+                let sig = simple_symbol(&n.vname.signature);
+                let base = sig.split('.').next().unwrap_or(sig).to_string();
+                if let Some(m) = member_of.get_mut(&comp) {
+                    *m.entry(base).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    // Component-to-component edges, weighted by distinct crossing file pairs.
+    let mut weight: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for (src, dst) in &pairs {
+        let a = subsystem_component_of(src);
+        let b = subsystem_component_of(dst);
+        if a == b || !files.contains_key(&a) || !files.contains_key(&b) {
+            continue;
+        }
+        *weight.entry((a, b)).or_insert(0) += 1;
+    }
+
+    // Drop supporting directories, but only while that still leaves a graph. A
+    // library's only internal consumers can BE its tests and examples, and an
+    // empty diagram is worse than a noisy one.
+    let product: Vec<String> = files
+        .keys()
+        .filter(|c| !is_support_component(c))
+        .cloned()
+        .collect();
+    let product_edges = weight
+        .keys()
+        .filter(|(a, b)| !is_support_component(a) && !is_support_component(b))
+        .count();
+    let (names, view): (Vec<String>, &str) = if product.len() >= 2 && product_edges >= 1 {
+        weight.retain(|(a, b), _| !is_support_component(a) && !is_support_component(b));
+        (product, "tests, benchmarks and docs excluded")
+    } else {
+        (
+            files.keys().cloned().collect(),
+            "tests and examples included, because they carry the only dependencies here",
+        )
+    };
+    if names.is_empty() {
+        return sanitize_for_mcp("no components: this index has no indexed source files.");
+    }
+
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    let mut in_deg: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (a, b) in weight.keys() {
+        adj.entry(a.clone()).or_default().push(b.clone());
+        in_deg.entry(b.clone()).or_default().insert(a.clone());
+    }
+
+    // Layer = longest path to a sink over the SCC condensation.
+    let sccs = arch_sccs(&names, &adj);
+    let mut owner: HashMap<&str, usize> = HashMap::new();
+    for (i, g) in sccs.iter().enumerate() {
+        for m in g {
+            owner.insert(m.as_str(), i);
+        }
+    }
+    let mut cond: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); sccs.len()];
+    for (a, b) in weight.keys() {
+        let (x, y) = (owner[a.as_str()], owner[b.as_str()]);
+        if x != y {
+            cond[x].insert(y);
+        }
+    }
+    // Tarjan emits an SCC only after every SCC reachable from it, so `cond[i]`
+    // can hold nothing but indices below `i` and one ascending pass resolves each
+    // component after everything it points at. O(V + E).
+    //
+    // That ordering is the whole proof, so it is asserted rather than assumed.
+    // The previous version walked a DFS per component and folded over its
+    // reverse PREORDER, which is not a topological order — on 0 -> 1, 1 -> 2,
+    // 0 -> 2 it settles 1 before 2 and puts both on layer 0. It agreed with this
+    // only because the ascending outer loop had already resolved every successor,
+    // which is the same guarantee, reached the long way round.
+    let mut depth = vec![0usize; sccs.len()];
+    for i in 0..sccs.len() {
+        debug_assert!(
+            cond[i].iter().all(|&j| j < i),
+            "arch_sccs must emit in reverse topological order for layering to hold"
+        );
+        depth[i] = cond[i].iter().map(|&j| depth[j] + 1).max().unwrap_or(0);
+    }
+    let layer_of = |c: &str| depth[owner[c]];
+    let max_layer = names.iter().map(|n| layer_of(n)).max().unwrap_or(0);
+
+    let mut out = String::new();
+    out.push_str("ARCHITECTURE BRIEF\n");
+    out.push_str(&format!(
+        "provenance={} | components are one per package where the repo has them, else the \
+         containing directory | {} | snapshot of the code as indexed\n\n",
+        if provenance.is_empty() {
+            "all"
+        } else {
+            provenance
+        },
+        view
+    ));
+
+    let cycles: Vec<&Vec<String>> = sccs.iter().filter(|g| g.len() > 1).collect();
+    out.push_str(&format!(
+        "## Shape\n- {} component{}, {} edge{}, {} layer{}\n- {}\n\n",
+        names.len(),
+        if names.len() == 1 { "" } else { "s" },
+        weight.len(),
+        if weight.len() == 1 { "" } else { "s" },
+        max_layer + 1,
+        if max_layer == 0 { "" } else { "s" },
+        if cycles.is_empty() {
+            "acyclic".to_string()
+        } else {
+            format!(
+                "{} dependency cycle{}, listed below",
+                cycles.len(),
+                if cycles.len() == 1 { "" } else { "s" }
+            )
+        }
+    ));
+
+    if weight.is_empty() {
+        out.push_str(
+            "## No dependencies resolved\nTravsr recorded no cross-component edges here. That \
+             usually means full cross-file analysis has not run for this language, not that the \
+             components are independent. Read every \"depends on nothing\" below as unknown, \
+             never as none.\n\n",
+        );
+    }
+
+    if !cycles.is_empty() {
+        // Capped in both directions, like every other list here. A cycle is one
+        // SCC, so a single one can span the whole repository: a 140-component
+        // ring wrote one 5311-character line, and at a small token_budget that
+        // one line WAS the brief — the component list, the edges and every later
+        // section were trimmed away behind it.
+        out.push_str(&format!(
+            "## Cycles ({} of {})\n",
+            cycles.len().min(LIST_CAP),
+            cycles.len()
+        ));
+        for g in cycles.iter().take(LIST_CAP) {
+            // Members get the tighter cap: naming a cycle takes a few components,
+            // and `LIST_CAP` of them still wrote a 2311-character line that at a
+            // small budget crowded out the component list behind it.
+            let shown = g.len().min(DETAIL_CAP);
+            out.push_str(&format!("- {}", g[..shown].join(" <-> ")));
+            if g.len() > shown {
+                out.push_str(&format!(
+                    " <-> ... and {} more in this cycle",
+                    g.len() - shown
+                ));
+            }
+            out.push('\n');
+        }
+        if cycles.len() > LIST_CAP {
+            out.push_str(&format!(
+                "- ... and {} more cycles\n",
+                cycles.len() - LIST_CAP
+            ));
+        }
+        out.push('\n');
+    }
+
+    let dependents = |c: &str| in_deg.get(c).map(|s| s.len()).unwrap_or(0);
+    let mut ranked: Vec<&String> = names.iter().collect();
+    ranked.sort_by(|a, b| dependents(b).cmp(&dependents(a)).then_with(|| a.cmp(b)));
+
+    // Every list below is capped and discloses its remainder. Unbounded, the
+    // byte limit did the cutting instead: on kubernetes (3379 components) the
+    // brief emitted 346 of them, ended mid-line, and dropped its last two
+    // sections with no indication they had ever existed. A ranked head plus an
+    // honest count is a usable answer; a silent tenth of one is not.
+    let omitted = |shown: usize, total: usize, what: &str| -> String {
+        if total > shown {
+            format!("- ... and {} more {what}, ranked lower\n", total - shown)
+        } else {
+            String::new()
+        }
+    };
+
+    out.push_str(&format!(
+        "## Components, by how many others depend on them ({} of {})\n",
+        ranked.len().min(LIST_CAP),
+        ranked.len()
+    ));
+    for c in ranked.iter().take(LIST_CAP) {
+        let deps = weight.keys().filter(|(a, _)| a == *c).count();
+        out.push_str(&format!(
+            "- {} | layer {} | {} dependent{} | depends on {} | {} files | {} symbols\n",
+            c,
+            layer_of(c),
+            dependents(c),
+            if dependents(c) == 1 { "" } else { "s" },
+            deps,
+            files.get(*c).map(|f| f.len()).unwrap_or(0),
+            symbols.get(*c).copied().unwrap_or(0)
+        ));
+    }
+
+    out.push_str(&omitted(LIST_CAP, ranked.len(), "components"));
+
+    let mut ws: Vec<(&(String, String), &usize)> = weight.iter().collect();
+    ws.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    out.push_str(&format!(
+        "\n## Dependency edges, heaviest first ({} of {}; weight = distinct file pairs crossing)\n",
+        ws.len().min(LIST_CAP),
+        ws.len()
+    ));
+    for ((a, b), w) in ws.iter().take(LIST_CAP) {
+        out.push_str(&format!("- {a} -> {b} ({w})\n"));
+    }
+    out.push_str(&omitted(LIST_CAP, ws.len(), "edges"));
+
+    out.push_str(&format!(
+        "\n## What each component owns ({} of {})\n",
+        ranked.len().min(DETAIL_CAP),
+        ranked.len()
+    ));
+    for c in ranked.iter().take(DETAIL_CAP) {
+        out.push_str(&format!("### {c}\n"));
+        if let Some(es) = entries.get(*c) {
+            for e in es.iter().take(2) {
+                out.push_str(&format!("- entry point: {e}\n"));
+            }
+        }
+        if let (Some(decl), Some(m)) = (declared.get(*c), member_of.get(*c)) {
+            let mut ts: Vec<(&String, usize)> = decl
+                .iter()
+                .map(|t| (t, m.get(t).copied().unwrap_or(0)))
+                .collect();
+            ts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            let shown: Vec<String> = ts
+                .iter()
+                .take(6)
+                .map(|(t, n)| format!("{t} ({n})"))
+                .collect();
+            if !shown.is_empty() {
+                out.push_str(&format!("- most referenced types: {}\n", shown.join(", ")));
+            }
+        }
+        let ins: Vec<&String> = in_deg
+            .get(*c)
+            .map(|s| s.iter().collect())
+            .unwrap_or_default();
+        if !ins.is_empty() {
+            out.push_str(&format!(
+                "- used by: {}\n",
+                ins.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    out.push_str(&omitted(DETAIL_CAP, ranked.len(), "components detailed"));
+
+    if let Some(note) = phase_b_degraded_note(store) {
+        out.push_str(&format!("\n## Freshness\n{note}\n"));
+    }
+    out.push_str(
+        "\n## What this brief cannot tell you\n\
+         - a missing edge means the graph did not resolve it, not that it does not exist\n\
+         - type counts are references reaching a type or one of its members, so they rank by \
+           use and undercount where analysis is incomplete\n\
+         - nothing here states WHY a dependency exists\n",
+    );
+    wrap_envelope(&render_brief(&out, brief_byte_limit(token_budget)))
+}
+
+// ── architecture invariants ───────────────────────────────────────────────────
+
+/// A rule a repository's dependency graph must satisfy.
+///
+/// Deliberately three narrow shapes rather than a query language: these are the
+/// constraints projects actually write down in prose, and prose is exactly what
+/// drifts. CLAUDE.md's own dependency section had been missing two real edges.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Invariant {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    components: Vec<String>,
+    /// The only components this one may depend on. Empty list means "nothing".
+    #[serde(default, rename = "mayDependOn")]
+    may_depend_on: Option<Vec<String>>,
+    /// The only components allowed to depend on this one.
+    #[serde(default, rename = "mayBeUsedBy")]
+    may_be_used_by: Option<Vec<String>>,
+    #[serde(default)]
+    acyclic: bool,
+    #[serde(default)]
+    because: String,
+}
+
+/// Unknown keys are an error, not ignored: a misspelled `mayDependsOn` would
+/// otherwise be dropped and its rule would hold over nothing.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvariantFile {
+    #[serde(rename = "$comment", default)]
+    _comment: Option<String>,
+    #[serde(default)]
+    invariants: Vec<Invariant>,
+}
+
+/// What `check_architecture_invariants` found: the report to print, and how
+/// many rules it found broken. The caller keys its exit code on `violations`,
+/// not on the wording of `text`.
+pub struct InvariantReport {
+    pub text: String,
+    pub violations: usize,
+}
+
+/// Components and the weighted edges between them, at the same granularity and
+/// with the same filters the briefs use.
+///
+/// `get_architecture_brief` gathers this alongside symbols, types and entry
+/// points it needs and this does not. The pieces that decide what a component
+/// IS — `subsystem_component_of`, `resolved_dep_pairs`, the noise and test
+/// filters — are shared, and `invariants_and_brief_agree_on_components` holds
+/// the two answers together.
+fn component_dependency_graph(
+    store: &SqliteStore,
+    provenance: &str,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeMap<(String, String), usize>,
+) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut components: BTreeSet<String> = BTreeSet::new();
+    if let Ok(nodes) = store.all_nodes() {
+        for n in &nodes {
+            if !is_component_member(n) {
+                continue;
+            }
+            let comp = subsystem_component_of(&n.vname.path);
+            // The brief drops supporting directories; this must drop them too, or
+            // the two disagree about what a component is. Left in, the only cycle
+            // reported for this repository was `bench <-> packages/travsr-vscode`,
+            // which is two scratch trees, not an architecture violation.
+            if is_support_component(&comp) {
+                continue;
+            }
+            components.insert(comp);
+        }
+    }
+    let mut edges: BTreeMap<(String, String), usize> = BTreeMap::new();
+    if let Ok(pairs) = store.resolved_dep_pairs(provenance) {
+        for (src, dst) in &pairs {
+            let a = subsystem_component_of(src);
+            let b = subsystem_component_of(dst);
+            if a != b && components.contains(&a) && components.contains(&b) {
+                *edges.entry((a, b)).or_insert(0) += 1;
+            }
+        }
+    }
+    (components, edges)
+}
+
+/// Check declared architectural rules against the graph.
+///
+/// Plain text, not an MCP envelope: the one consumer is `travsr invariants`,
+/// which prints it to a terminal. Escaping `->` to `-&gt;` for a reader that
+/// does not exist would be the only effect.
+///
+/// Returns a report; the caller decides whether a violation is fatal. A rules
+/// file that does not parse is an `Err`, never a report, so a gate cannot pass
+/// on a file it could not read. A rule naming a component the graph does not
+/// have FAILS rather than passing vacuously, because renaming a crate would
+/// otherwise silently retire the rule that exists to protect it, which is the
+/// one failure mode a guard must not have.
+pub fn check_architecture_invariants(
+    store: &SqliteStore,
+    rules_json: &str,
+    provenance: &str,
+) -> Result<InvariantReport, String> {
+    let parsed: InvariantFile = serde_json::from_str(rules_json)
+        .map_err(|e| format!("could not read the invariants file: {e}"))?;
+    if parsed.invariants.is_empty() {
+        return Ok(InvariantReport {
+            text: "no invariants declared.".to_string(),
+            violations: 0,
+        });
+    }
+
+    let (components, edges) = component_dependency_graph(store, provenance);
+    let names: Vec<String> = components.iter().cloned().collect();
+    let mut adj: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (a, b) in edges.keys() {
+        adj.entry(a.clone()).or_default().push(b.clone());
+    }
+    let cycles: Vec<Vec<String>> = arch_sccs(&names, &adj)
+        .into_iter()
+        .filter(|g| g.len() > 1)
+        .collect();
+
+    let mut out = String::new();
+    // No early return here: on an empty index every rule naming a component must
+    // still fail as "not a component in this graph", not pass by being skipped.
+    if components.is_empty() {
+        out.push_str("no components: this index has no indexed source files.\n");
+    }
+    let mut violations = 0usize;
+    for rule in &parsed.invariants {
+        let name = if rule.name.is_empty() {
+            "(unnamed rule)"
+        } else {
+            &rule.name
+        };
+        let mut broken: Vec<String> = Vec::new();
+
+        if rule.acyclic {
+            for g in &cycles {
+                broken.push(format!("cycle: {} -> {}", g.join(" -> "), g[0]));
+            }
+        }
+        for comp in &rule.components {
+            if !components.contains(comp) {
+                broken.push(format!(
+                    "rule names '{comp}', which is not a component in this graph (renamed or removed?)"
+                ));
+                continue;
+            }
+            if let Some(allowed) = &rule.may_depend_on {
+                for ((a, b), w) in &edges {
+                    if a == comp && !allowed.contains(b) {
+                        broken.push(format!(
+                            "'{comp}' depends on '{b}' ({w} file pair{}); allowed: {}",
+                            if *w == 1 { "" } else { "s" },
+                            if allowed.is_empty() {
+                                "nothing internal".to_string()
+                            } else {
+                                allowed.join(", ")
+                            }
+                        ));
+                    }
+                }
+            }
+            if let Some(allowed) = &rule.may_be_used_by {
+                for ((a, b), w) in &edges {
+                    if b == comp && !allowed.contains(a) {
+                        broken.push(format!(
+                            "'{a}' depends on '{comp}' ({w} file pair{}); allowed: {}",
+                            if *w == 1 { "" } else { "s" },
+                            if allowed.is_empty() {
+                                "nothing internal".to_string()
+                            } else {
+                                allowed.join(", ")
+                            }
+                        ));
+                    }
+                }
+            }
+        }
+
+        if broken.is_empty() {
+            out.push_str(&format!("holds    {name}\n"));
+        } else {
+            violations += 1;
+            out.push_str(&format!("VIOLATED {name}\n"));
+            for b in &broken {
+                out.push_str(&format!("           {b}\n"));
+            }
+            if !rule.because.is_empty() {
+                out.push_str(&format!("           why: {}\n", rule.because));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "\n{} of {} invariant{} hold, over {} components and {} edges (provenance={}).\n",
+        parsed.invariants.len() - violations,
+        parsed.invariants.len(),
+        if parsed.invariants.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+        components.len(),
+        edges.len(),
+        if provenance.is_empty() {
+            "all"
+        } else {
+            provenance
+        }
+    ));
+    // A rule can only be broken by an edge the graph resolved. On this repository
+    // `travsr-daemon`'s manifest declares nine internal dependencies and the
+    // resolved graph carries four, so a rule about the five it cannot see would
+    // report "holds" over silence. The briefs disclose this; a gate that exits 0
+    // has more need to, not less.
+    if let Some(note) = phase_b_degraded_note(store) {
+        out.push_str(&format!("\n{note}\n"));
+    }
+    out.push_str(
+        "\nChecked against the edges the graph resolved. A dependency analysis has \
+         not resolved cannot break a rule here, so \"holds\" means no violation was \
+         visible, never that none exists. `travsr status` reports coverage.\n",
+    );
+    if violations > 0 {
+        out.push_str("VIOLATIONS FOUND\n");
+    }
+    Ok(InvariantReport {
+        text: out,
+        violations,
+    })
+}
+
+// ── get_subsystem_brief ───────────────────────────────────────────────────────
+
+/// The component a file belongs to: the package directory where the repository
+/// has one, otherwise the containing directory. Deliberately not `repo_regions`:
+/// that rollup is tuned for retrieval breadth, while a reader reasoning about a
+/// subsystem thinks in crates and packages.
+fn subsystem_component_of(path: &str) -> String {
+    for root in [
+        "crates/",
+        "packages/",
+        "apps/",
+        "services/",
+        "cmd/",
+        "modules/",
+    ] {
+        if let Some(rest) = path.strip_prefix(root) {
+            if let Some(name) = rest.split('/').next() {
+                if !name.is_empty() {
+                    return format!("{root}{name}");
+                }
+            }
+        }
+    }
+    // A root-level file goes to `(root)`, as in the repo map, rather than
+    // becoming a component named after itself.
+    repo_map_dir_of(path)
+}
+
+fn simple_symbol(sig: &str) -> &str {
+    match sig.find(':') {
+        Some(i) if sig[..i].chars().all(|c| c.is_ascii_lowercase() || c == '-') => &sig[i + 1..],
+        _ => sig,
+    }
+}
+
+/// What runs when control enters a symbol, as a fact packet rather than a
+/// document.
+///
+/// With neither `entry` nor `component`, it lists the subsystems it can see: a
+/// component's real entry points are the symbols something OUTSIDE it calls,
+/// which needs no naming convention and works in any language.
+///
+/// Callees are ranked by reach, but a call that LEAVES the component is never
+/// cut. Reach alone promotes widely-shared helpers and buried travsr-retrieval
+/// entirely when tracing get_context, whose whole job is PPR and knapsack. A
+/// cross-component call is a contract, and contracts are the point.
+pub fn get_subsystem_brief(
+    store: &SqliteStore,
+    entry: &str,
+    component: &str,
+    provenance: &str,
+    depth: u8,
+    width: usize,
+    token_budget: usize,
+) -> String {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    for (name, value) in [("entry", entry), ("component", component)] {
+        if value.is_empty() {
+            continue;
+        }
+        if let Err(reason) = validate_mcp_arg(value) {
+            tracing::warn!("get_subsystem_brief rejected invalid {name}: {reason}");
+            return sanitize_for_mcp(&format!("invalid {name}: {reason}"));
+        }
+    }
+
+    let nodes = match store.all_nodes() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_subsystem_brief: all_nodes error: {e}");
+            return sanitize_for_mcp("");
+        }
+    };
+    let edges = match store.all_edges() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("get_subsystem_brief: all_edges error: {e}");
+            return sanitize_for_mcp("");
+        }
+    };
+
+    let mut by_id: HashMap<travsr_core::NodeId, &travsr_core::Node> = HashMap::new();
+    for n in &nodes {
+        // Same membership rule as the architecture brief, so the two never
+        // disagree about what a component holds. `is_structural_noise` is part of
+        // it and is what keeps a raw SCIP module descriptor from outranking every
+        // real symbol and being reported as its component's entry point; it does
+        // NOT exclude `kind = "file"` nodes, which is why the kind check is
+        // there too.
+        if !is_component_member(n) {
+            continue;
+        }
+        by_id.insert(n.id, n);
+    }
+
+    // Reach and calls must describe the SAME universe. Counting reach over every
+    // edge while filtering calls let the brief say "nothing in the graph calls
+    // it" and print a non-zero reach two lines later, both as fact.
+    let mut reach: HashMap<travsr_core::NodeId, usize> = HashMap::new();
+    let mut calls: HashMap<travsr_core::NodeId, Vec<travsr_core::NodeId>> = HashMap::new();
+    let mut any_call_edge = false;
+    let mut any_call_past_filter = false;
+    for (src, dst, kind, prov) in &edges {
+        let is_call = kind == "ref/call";
+        if is_call {
+            any_call_edge = true;
+            if provenance_allowed(provenance, prov) {
+                any_call_past_filter = true;
+            }
+        }
+        if !provenance_allowed(provenance, prov)
+            || !by_id.contains_key(src)
+            || !by_id.contains_key(dst)
+        {
+            continue;
+        }
+        *reach.entry(*dst).or_insert(0) += 1;
+        if kind == "ref/call" && src != dst {
+            calls.entry(*src).or_default().push(*dst);
+        }
+    }
+
+    if calls.is_empty() {
+        // Three different causes, three different answers. Collapsing them told a
+        // user with a complete semantic index to install a toolchain they already
+        // had, which is worse than saying nothing.
+        return sanitize_for_mcp(&if !any_call_edge {
+            "no call edges in this index, so there is no flow to trace. Full cross-file \
+             analysis produces them: run `travsr lang install <language>` then `travsr init \
+             --semantic` in this repo. `travsr status` reports the current state."
+                .to_string()
+        } else if !any_call_past_filter {
+            format!(
+                "no call edges matched provenance '{provenance}', though this index does have \
+                 a call graph. Use 'ratified' for confirmed edges, '' for everything, or name \
+                 one provenance exactly (tree-sitter, lsif, scip, live)."
+            )
+        } else {
+            "every call edge in this index runs between symbols this view excludes (test code \
+             and structural noise), so there is no flow to show between the symbols that \
+             remain."
+                .to_string()
+        });
+    }
+
+    // Entry points per component: what something outside the component calls.
+    let mut external: BTreeMap<String, HashMap<travsr_core::NodeId, usize>> = BTreeMap::new();
+    for (src, dsts) in &calls {
+        let from = subsystem_component_of(&by_id[src].vname.path);
+        for dst in dsts {
+            let to = subsystem_component_of(&by_id[dst].vname.path);
+            if to == from {
+                continue;
+            }
+            *external.entry(to).or_default().entry(*dst).or_insert(0) += 1;
+        }
+    }
+
+    let ranked = |m: &HashMap<travsr_core::NodeId, usize>| -> Vec<(travsr_core::NodeId, usize)> {
+        let mut v: Vec<_> = m.iter().map(|(k, c)| (*k, *c)).collect();
+        v.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| {
+                by_id[&a.0]
+                    .vname
+                    .signature
+                    .cmp(&by_id[&b.0].vname.signature)
+            })
+        });
+        v
+    };
+
+    if entry.is_empty() && component.is_empty() {
+        let mut rows: Vec<_> = external.iter().collect();
+        rows.sort_by_key(|(_, m)| std::cmp::Reverse(m.values().sum::<usize>()));
+        // Capped and trimmed like every other list here. This was the one path
+        // that went straight to the byte limit: on a 140-component repository it
+        // ended mid-entity on `exported_function_037  &`, with no notice that
+        // anything had been cut and the closing instruction gone with it.
+        let mut out = format!(
+            "SUBSYSTEMS (components called from outside, {} of {})\n\n",
+            rows.len().min(LIST_CAP),
+            rows.len()
+        );
+        let shown = rows.len().min(LIST_CAP);
+        for (comp, m) in rows.iter().take(LIST_CAP) {
+            let total: usize = m.values().sum();
+            out.push_str(&format!(
+                "{comp}  ({total} external call{}, {} entry point{})\n",
+                if total == 1 { "" } else { "s" },
+                m.len(),
+                if m.len() == 1 { "" } else { "s" }
+            ));
+            for (id, c) in ranked(m).into_iter().take(3) {
+                out.push_str(&format!(
+                    "    {}  <- {c} caller{}\n",
+                    simple_symbol(&by_id[&id].vname.signature),
+                    if c == 1 { "" } else { "s" }
+                ));
+            }
+        }
+        if rows.len() > shown {
+            out.push_str(&format!(
+                "... and {} more components, fewer external calls\n",
+                rows.len() - shown
+            ));
+        }
+        out.push_str("\nTake one with `component`, or a single symbol with `entry`.\n");
+        return wrap_envelope(&render_brief(&out, brief_byte_limit(token_budget)));
+    }
+
+    // Roots: a named symbol, or the component's most-called-into entry points.
+    let roots: Vec<travsr_core::NodeId> = if !component.is_empty() {
+        match external.get(component) {
+            Some(m) => ranked(m).into_iter().take(4).map(|(id, _)| id).collect(),
+            None => {
+                let known: Vec<&str> = external.keys().map(|s| s.as_str()).take(12).collect();
+                return sanitize_for_mcp(&format!(
+                    "no component '{component}' is called from outside. Components with entry \
+                     points: {}",
+                    known.join(", ")
+                ));
+            }
+        }
+    } else {
+        let want = simple_symbol(entry);
+        let mut hit: Vec<travsr_core::NodeId> = by_id
+            .values()
+            .filter(|n| n.vname.signature == entry)
+            .map(|n| n.id)
+            .collect();
+        if hit.is_empty() {
+            hit = by_id
+                .values()
+                .filter(|n| simple_symbol(&n.vname.signature) == want)
+                .map(|n| n.id)
+                .collect();
+        }
+        if hit.is_empty() {
+            return sanitize_for_mcp(&format!("entry symbol '{entry}' is not in the graph"));
+        }
+        // Collected from a HashMap, so the order arriving here is arbitrary and a
+        // sort on reach alone leaves ties in whatever order the map yielded:
+        // identical queries returned different symbols across runs. Break ties on
+        // the path, which is unique per definition.
+        hit.sort_by(|a, b| {
+            reach
+                .get(b)
+                .unwrap_or(&0)
+                .cmp(reach.get(a).unwrap_or(&0))
+                .then_with(|| by_id[a].vname.path.cmp(&by_id[b].vname.path))
+        });
+        hit.truncate(1);
+        hit
+    };
+
+    // Walk outward, keeping every cross-component call and the widest-reaching
+    // same-component ones.
+    let mut levels: Vec<Vec<travsr_core::NodeId>> = vec![roots.clone()];
+    let mut seen: HashSet<travsr_core::NodeId> = roots.iter().copied().collect();
+    let mut kept: Vec<(travsr_core::NodeId, travsr_core::NodeId)> = Vec::new();
+    for d in 0..depth as usize {
+        let mut next = Vec::new();
+        for src in levels[d].clone() {
+            let here = subsystem_component_of(&by_id[&src].vname.path);
+            let mut crosses = Vec::new();
+            let mut internal = Vec::new();
+            let mut uniq: Vec<_> = calls.get(&src).cloned().unwrap_or_default();
+            uniq.sort();
+            uniq.dedup();
+            for dst in uniq {
+                if seen.contains(&dst) {
+                    continue;
+                }
+                if subsystem_component_of(&by_id[&dst].vname.path) == here {
+                    internal.push(dst);
+                } else {
+                    crosses.push(dst);
+                }
+            }
+            let by_reach = |v: &mut Vec<travsr_core::NodeId>| {
+                v.sort_by(|a, b| {
+                    reach
+                        .get(b)
+                        .unwrap_or(&0)
+                        .cmp(reach.get(a).unwrap_or(&0))
+                        .then_with(|| by_id[a].vname.signature.cmp(&by_id[b].vname.signature))
+                });
+            };
+            by_reach(&mut crosses);
+            by_reach(&mut internal);
+            internal.truncate(width);
+            // `seen` is global to the walk, so gating the record on it dropped a
+            // second call into an already-visited symbol. The spine is a tree and
+            // must stay one, but the contracts list is not: record every crossing,
+            // and only extend the frontier for a symbol not yet reached.
+            for dst in crosses.into_iter().chain(internal) {
+                let crossing = subsystem_component_of(&by_id[&dst].vname.path) != here;
+                let first_visit = seen.insert(dst);
+                if first_visit {
+                    next.push(dst);
+                }
+                if first_visit || crossing {
+                    kept.push((src, dst));
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        levels.push(next);
+    }
+
+    let label = |id: &travsr_core::NodeId| simple_symbol(&by_id[id].vname.signature);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "SUBSYSTEM BRIEF: {}\n",
+        if component.is_empty() {
+            label(&roots[0]).to_string()
+        } else {
+            component.to_string()
+        }
+    ));
+    out.push_str(&format!(
+        "provenance={} | snapshot of the code as indexed; not maintained\n\n",
+        if provenance.is_empty() {
+            "all"
+        } else {
+            provenance
+        }
+    ));
+
+    out.push_str("## Entry\n");
+    for r in &roots {
+        out.push_str(&format!("- {} - {}\n", label(r), by_id[r].vname.path));
+    }
+
+    out.push_str("\n## Called from\n");
+    let root_set: HashSet<_> = roots.iter().copied().collect();
+    // In component mode the entries ARE "what something outside calls", so a
+    // caller inside the component is not calling in. Listing travsr-retrieval's
+    // own `bfs_fallback` here answered a different question from the one the
+    // heading asks. In entry mode the caller named one symbol, and every caller
+    // of it is wanted.
+    let outside_of = if component.is_empty() {
+        None
+    } else {
+        Some(component)
+    };
+    let mut callers: Vec<travsr_core::NodeId> = calls
+        .iter()
+        .filter(|(src, dsts)| {
+            if root_set.contains(src) || !dsts.iter().any(|d| root_set.contains(d)) {
+                return false;
+            }
+            match outside_of {
+                Some(c) => subsystem_component_of(&by_id[src].vname.path) != c,
+                None => true,
+            }
+        })
+        .map(|(src, _)| *src)
+        .collect();
+    callers.sort_by(|a, b| {
+        reach
+            .get(b)
+            .unwrap_or(&0)
+            .cmp(reach.get(a).unwrap_or(&0))
+            .then_with(|| by_id[a].vname.signature.cmp(&by_id[b].vname.signature))
+    });
+    callers.truncate(8);
+    if callers.is_empty() {
+        out.push_str(
+            "- nothing in the graph calls it: a public entry reached from outside the indexed \
+             code, or unresolved\n",
+        );
+    }
+    for c in &callers {
+        out.push_str(&format!("- {} - {}\n", label(c), by_id[c].vname.path));
+    }
+
+    out.push_str(
+        "\n## Call spine, by depth from the entry\n(depth is calls from the entry, NOT elapsed \
+         order; reach = references arriving at that symbol)\n",
+    );
+    for (d, level) in levels.iter().enumerate() {
+        out.push_str(&format!("### depth {d}\n"));
+        for id in level {
+            out.push_str(&format!(
+                "- {} [{}] reach={} - {}\n",
+                label(id),
+                subsystem_component_of(&by_id[id].vname.path),
+                reach.get(id).copied().unwrap_or(0),
+                by_id[id].vname.path
+            ));
+        }
+    }
+
+    out.push_str("\n## Calls that leave the component (the contracts)\n");
+    let mut by_target: BTreeMap<String, Vec<(travsr_core::NodeId, travsr_core::NodeId)>> =
+        BTreeMap::new();
+    for (a, b) in &kept {
+        let (ca, cb) = (
+            subsystem_component_of(&by_id[a].vname.path),
+            subsystem_component_of(&by_id[b].vname.path),
+        );
+        if ca != cb {
+            by_target.entry(cb).or_default().push((*a, *b));
+        }
+    }
+    if by_target.is_empty() {
+        out.push_str("- none; control stays in one component for the traced depth\n");
+    }
+    let mut targets: Vec<_> = by_target.into_iter().collect();
+    targets.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    for (target, es) in targets {
+        out.push_str(&format!("### -> {target} ({})\n", es.len()));
+        for (a, b) in es {
+            out.push_str(&format!(
+                "- {} calls {} - {}\n",
+                label(&a),
+                label(&b),
+                by_id[&b].vname.path
+            ));
+        }
+    }
+
+    let spine_edges = kept
+        .iter()
+        .filter(|(_, b)| levels.iter().flatten().any(|n| n == b))
+        .count();
+    let comps: HashSet<String> = levels
+        .iter()
+        .flatten()
+        .map(|id| subsystem_component_of(&by_id[id].vname.path))
+        .collect();
+    out.push_str(&format!(
+        "\n## Shape\n- {} symbols, {} calls, {} components\n",
+        levels.iter().map(|l| l.len()).sum::<usize>(),
+        spine_edges,
+        comps.len()
+    ));
+
+    let degraded = phase_b_degraded_note(store);
+    if degraded.is_some() || kept.is_empty() {
+        out.push_str("\n## Freshness\n");
+    }
+    if let Some(note) = degraded {
+        out.push_str(&format!("{note}\n"));
+    }
+    if kept.is_empty() {
+        out.push_str(
+            "No outgoing calls resolved from this entry, so there is no flow \
+             to show. The symbol exists; its call edges do not, which means they are unresolved \
+             rather than absent. Check `travsr status` before reading this as \"it calls \
+             nothing\".\n",
+        );
+    }
+    out.push_str(
+        "\n## What this brief cannot tell you\n\
+         - a missing call means the graph did not resolve it, not that it does not happen\n\
+         - Phase B coverage varies by language; absence is unknown, never no\n\
+         - nothing here states WHY a call exists; read the source for that\n",
+    );
+    wrap_envelope(&render_brief(&out, brief_byte_limit(token_budget)))
+}
+
 // ── get_lang_status ───────────────────────────────────────────────────────────
 
 /// Detect the language of `file` from its extension, then check whether Phase B
@@ -2874,11 +5102,12 @@ pub fn get_lang_status_global(
     let raw = collect_global(repos, repo, |store, _repo_name, _single| {
         get_lang_status_raw(store, file)
     });
-    if raw.is_empty() {
-        UNKNOWN_LANG_JSON.to_string()
-    } else {
-        // collect_global joins results with "\n"; take only the first JSON line.
-        raw.lines().next().unwrap_or("").to_string()
+    // collect_global joins results with "\n" and may lead with a `[note: ...]`
+    // skipped-repo line (#893 B2). This surface is parsed as JSON by the
+    // extension, so take the first JSON line rather than the first line.
+    match raw.lines().find(|l| l.starts_with('{')) {
+        Some(json) => json.to_string(),
+        None => UNKNOWN_LANG_JSON.to_string(),
     }
 }
 
@@ -2898,7 +5127,7 @@ pub fn search_symbol(store: &SqliteStore, name: &str, exact: bool) -> String {
     // repos), but stripping "in rust" from "knapsack in rust" prevents the
     // FTS from matching unrelated files that contain "rust" as a token.
     let (stripped, lang_filter) = infer_language_from_query(name);
-    let raw = search_symbol_raw(store, stripped.as_str(), lang_filter, exact);
+    let (_, raw) = search_symbol_raw(store, stripped.as_str(), lang_filter, exact);
     let content = if raw.is_empty() {
         format!("No symbols matching '{name}' found in the graph.")
     } else {
@@ -2974,12 +5203,16 @@ fn infer_language_from_query(query: &str) -> (String, Option<&'static str>) {
     (query.to_owned(), None)
 }
 
+/// Returns `(total matches, rendered lines)`. The rendered list is capped at
+/// `MAX_SEARCH_RESULTS`, the count is not: a caller ranking repos against each
+/// other needs to tell a 200-match repo from a 60-match one, which the capped
+/// line count cannot express (#893 B3).
 fn search_symbol_raw(
     store: &SqliteStore,
     name: &str,
     lang_filter: Option<&str>,
     exact: bool,
-) -> String {
+) -> (usize, String) {
     // Cap results: prevents self-DoS from wildcard queries (e.g. "a") and limits
     // accidental bulk exfiltration. The store LIKE query has no SQL LIMIT yet —
     // this Rust-side cap is the guard until that is added at the store layer.
@@ -2989,7 +5222,7 @@ fn search_symbol_raw(
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("search_symbol error: {e}");
-            return String::new();
+            return (0, String::new());
         }
     };
 
@@ -3019,7 +5252,7 @@ fn search_symbol_raw(
             )
         })
         .collect();
-    lines.join("\n")
+    (nodes.len(), lines.join("\n"))
 }
 
 /// Global variant of `search_symbol`.
@@ -3041,10 +5274,15 @@ pub fn search_symbol_global(
     let (stripped, lang_filter) = infer_language_from_query(name);
     let search_term = stripped.as_str();
 
+    // #893 B2: repos the fan-out could not open. Surfaced in the payload, not
+    // only as a stderr warning, so a partial cross-repo answer is never read as
+    // a complete one. Stays empty on the single-repo path.
+    let mut skipped: Vec<String> = Vec::new();
+
     let raw = if repo.is_some() {
         // Single-repo path: SEC + stale filtering handled by collect_global.
         collect_global(repos, repo, |store, repo_name, single| {
-            let result = search_symbol_raw(store, search_term, lang_filter, exact);
+            let (_, result) = search_symbol_raw(store, search_term, lang_filter, exact);
             if result.is_empty() || single {
                 result
             } else {
@@ -3068,13 +5306,13 @@ pub fn search_symbol_global(
         candidates.retain(|(_, db)| db.exists());
         let single = candidates.len() == 1;
 
-        let mut parts: Vec<(usize, String)> = Vec::new();
+        let mut parts: Vec<(usize, &str, String)> = Vec::new();
         for (repo_name, db_path) in &candidates {
             match SqliteStore::open_read_only(db_path) {
                 Ok(store) => {
-                    let result = search_symbol_raw(&store, search_term, lang_filter, exact);
+                    let (count, result) =
+                        search_symbol_raw(&store, search_term, lang_filter, exact);
                     if !result.is_empty() {
-                        let count = result.lines().count();
                         let text = if single {
                             result
                         } else {
@@ -3084,17 +5322,24 @@ pub fn search_symbol_global(
                                 .collect::<Vec<_>>()
                                 .join("\n")
                         };
-                        parts.push((count, text));
+                        parts.push((count, repo_name, text));
                     }
                 }
-                Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
+                Err(e) => {
+                    tracing::warn!("failed to open {}: {e}", db_path.display());
+                    skipped.push(format!("{repo_name} ({e})"));
+                }
             }
         }
-        // Most matches first — most relevant repo surfaces at the top.
-        parts.sort_by_key(|b| std::cmp::Reverse(b.0));
+        // Most matches first — most relevant repo surfaces at the top, and
+        // survives the output cap, which truncates from the end. Repo name
+        // breaks ties: without it equal counts keep `HashMap` iteration order,
+        // so the same registry answered differently on each run (#893 B3).
+        parts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        skipped.sort();
         parts
             .into_iter()
-            .map(|(_, text)| text)
+            .map(|(_, _, text)| text)
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -3103,6 +5348,17 @@ pub fn search_symbol_global(
         format!("No symbols matching '{name}' found in the graph.")
     } else {
         raw
+    };
+    // Leading, not trailing: `sanitize_for_mcp` truncates from the end, which is
+    // exactly the large-fan-out case where this note matters most.
+    let content = if skipped.is_empty() {
+        content
+    } else {
+        format!(
+            "[note: this cross-repo answer is partial: {} registered repo(s) could not be opened and were skipped: {}]\n{content}",
+            skipped.len(),
+            skipped.join("; ")
+        )
     };
     sanitize_for_mcp(&content)
 }
@@ -3297,34 +5553,31 @@ fn repo_region_dep_edges(
     edges
 }
 
-/// Transitive-dependent count per region: distinct regions that can reach `R`
-/// through the reverse dependency edges. Integer counts → deterministic.
+/// Direct-dependent count per region: distinct regions with an edge straight
+/// into `R`. Integer counts → deterministic.
+///
+/// Deliberately NOT transitive. Reverse reachability saturates on a funnel-
+/// shaped graph: everything reaches `travsr-mcp`, so every leaf hanging off it
+/// inherits its whole ancestor set and a one-consumer utility (`travsr-rerank`)
+/// outranks the product surface it serves. Direct in-degree keeps the ranking
+/// discriminating.
 fn repo_region_dependents(
     regions_universe: &std::collections::HashSet<String>,
     dep_edges: &std::collections::HashSet<(String, String)>,
 ) -> std::collections::HashMap<String, usize> {
     use std::collections::{HashMap, HashSet};
-    let mut rev: HashMap<&str, Vec<&str>> = HashMap::new();
+    // Callers guarantee src != dst, so no region can depend on itself.
+    let mut direct: HashMap<&str, HashSet<&str>> = HashMap::new();
     for (a, b) in dep_edges {
-        rev.entry(b.as_str()).or_default().push(a.as_str());
+        direct.entry(b.as_str()).or_default().insert(a.as_str());
     }
-    let mut dependents = HashMap::new();
-    for region in regions_universe {
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut stack: Vec<&str> = vec![region.as_str()];
-        while let Some(cur) = stack.pop() {
-            if let Some(ins) = rev.get(cur) {
-                for &a in ins {
-                    if seen.insert(a) {
-                        stack.push(a);
-                    }
-                }
-            }
-        }
-        seen.remove(region.as_str());
-        dependents.insert(region.clone(), seen.len());
-    }
-    dependents
+    regions_universe
+        .iter()
+        .map(|region| {
+            let n = direct.get(region.as_str()).map_or(0, |ins| ins.len());
+            (region.clone(), n)
+        })
+        .collect()
 }
 
 /// Build the agent cold-start orientation map: directory-level components ranked
@@ -3388,7 +5641,8 @@ fn get_repo_map_raw(store: &SqliteStore, reserve_per_line: usize) -> String {
     // ── Spine: dependents from the RESOLVED graph (ref/call + resolves-to),
     // aggregated to regions. Language-agnostic — no import syntax is parsed. ──
     let known: HashSet<String> = region_symbols.keys().cloned().collect();
-    let pairs = store.resolved_dep_pairs().unwrap_or_default();
+    // The text repo map has no provenance argument, so it keeps seeing every edge.
+    let pairs = store.resolved_dep_pairs("").unwrap_or_default();
     let dep_edges = repo_region_dep_edges(&pairs, &regions, &known);
     let dependents = repo_region_dependents(&known, &dep_edges);
     let has_refcall = store.has_any_refcall_edges();
@@ -3564,7 +5818,7 @@ pub fn get_graph_stats_global(repos: &HashMap<String, PathBuf>, repo: Option<&st
     let mut total_nodes: u64 = 0;
     let mut total_edges: u64 = 0;
     // DEBT(cloud-launch): counts must be filtered to caller's EdgeFilter scope before SSE ships
-    collect_global(repos, repo, |store, _repo_name, _single| {
+    let skipped_note = collect_global(repos, repo, |store, _repo_name, _single| {
         total_nodes += match store.node_count() {
             Ok(n) => n,
             Err(e) => {
@@ -3581,7 +5835,15 @@ pub fn get_graph_stats_global(repos: &HashMap<String, PathBuf>, repo: Option<&st
         };
         String::new() // accumulation done via captured mutables; return value unused
     });
-    format!("nodes: {total_nodes}\nedges: {total_edges}")
+    let stats = format!("nodes: {total_nodes}\nedges: {total_edges}");
+    // #893 B2: the closure contributes no text, so `collect_global`'s return is
+    // either empty or the skipped-repo note. Without this the totals read as
+    // complete while silently missing every repo that failed to open.
+    if skipped_note.is_empty() {
+        stats
+    } else {
+        format!("{skipped_note}\n{stats}")
+    }
 }
 
 /// Return per-language node counts for the current repo graph.
@@ -4068,18 +6330,53 @@ fn get_execution_path_body(
         return String::new();
     }
 
-    let lines: Vec<String> = path
+    // `pcst_path` returns the route first, in traversal order, and then the
+    // lambda-corridor context (its own comment: "Route nodes first, in traversal
+    // order (source -> ... -> sink)", "The route must LEAD the result"). Both
+    // halves were rendered identically, so a caller could not tell where the
+    // path ended and the neighbourhood began: the first lines were a real call
+    // chain and the rest were nodes merely near it, presented as if they were
+    // the same thing. The sink terminates the route, and the guard above has
+    // already established it is present.
+    let route_end = path
         .iter()
-        .map(|n| {
-            format!(
-                "{} ({}) \u{2014} {}",
-                display_label(n),
-                n.kind,
-                n.vname.path
-            )
-        })
-        .collect();
-    lines.join("\n")
+        .position(|n| n.id == snk.id)
+        .map_or(path.len(), |i| i + 1);
+    let render = |n: &travsr_core::Node| {
+        format!(
+            "{} ({}) \u{2014} {}",
+            display_label(n),
+            n.kind,
+            n.vname.path
+        )
+    };
+
+    let mut out = String::new();
+    // Count hops, not symbols. `route_end` is how many nodes the route spans, so
+    // a direct call read as "2 steps"; one call is one step.
+    let hops = route_end.saturating_sub(1);
+    out.push_str(&format!(
+        "path ({} step{}, source to sink):\n",
+        hops,
+        if hops == 1 { "" } else { "s" }
+    ));
+    for n in &path[..route_end] {
+        out.push_str(&render(n));
+        out.push('\n');
+    }
+    let corridor = &path[route_end..];
+    if !corridor.is_empty() {
+        out.push_str(&format!(
+            "\nnearby context ({} node{}, within the corridor around that path, NOT on it):\n",
+            corridor.len(),
+            if corridor.len() == 1 { "" } else { "s" }
+        ));
+        for n in corridor {
+            out.push_str(&render(n));
+            out.push('\n');
+        }
+    }
+    out.trim_end().to_string()
 }
 
 /// Global variant of `get_execution_path` — searches one named repo or all registered repos.
@@ -4200,6 +6497,10 @@ pub(crate) fn get_context_authed(
 
 /// Raw variant — returns body without envelope. Used by global aggregation to
 /// prevent double-sanitization when multiple stores are aggregated before wrapping.
+///
+/// Reads the KNN hook off `store` rather than taking it as an argument: in global
+/// mode the caller opens the store and arms it, so hardcoding `None` here left the
+/// semantic lane off for every registry-wide `get_context`.
 pub(crate) fn get_context_raw(
     store: &SqliteStore,
     query: &str,
@@ -4207,6 +6508,7 @@ pub(crate) fn get_context_raw(
     include_snippets: bool,
     snippet_budget: Option<usize>,
 ) -> String {
+    let knn = store.embed_knn_fn();
     get_context_body(
         store,
         query,
@@ -4214,7 +6516,7 @@ pub(crate) fn get_context_raw(
         &OpenFilter,
         include_snippets,
         snippet_budget,
-        None,
+        knn.as_ref().map(|f| f as EmbedKnnFn),
     )
 }
 
@@ -4617,6 +6919,7 @@ pub(crate) fn build_context_signals(
         phase_b_pending(store),
         has_embed,
         embed_warming,
+        has_embed && store.embed_disabled(),
         store.has_embed_db(),
         knn_degraded,
         overflow_msg,
@@ -4637,6 +6940,7 @@ fn build_context_signals_with_r2(
     phase_b_pending: bool,
     has_embed: bool,
     embed_warming: bool,
+    embed_disabled: bool,
     embed_initialized: bool,
     knn_degraded: bool,
     overflow_msg: Option<&str>,
@@ -4662,6 +6966,13 @@ fn build_context_signals_with_r2(
     if embed_warming {
         parts.push(
             "[note: semantic embeddings still warming up (sidecar starting); this result is lexical-only; retry in a few seconds for full semantic ranking]",
+        );
+    } else if embed_disabled {
+        // Arming finished with no hook installed, so unlike `warming` this will
+        // not resolve on a retry. Most often the index was built with a
+        // different embedding model than the one installed.
+        parts.push(
+            "[note: semantic search unavailable (the embedding sidecar did not start, or the index was built with a different model); results are lexical only. Run `travsr embed status` to check, then `travsr embed reindex` if the model changed]",
         );
     } else if has_embed && knn_degraded {
         parts.push(
@@ -4795,17 +7106,33 @@ fn omit_seed_via(grouped: bool, ms: crate::seed::MatchSource) -> bool {
 /// are partitioned into Exact → Semantic → Relevant sections (each preceded by a
 /// one-line header) and sorted within a section by descending display score.
 /// Display-only: the knapsack set is unchanged — only presentation order differs.
+///
+/// #870: the ungrouped path keeps its flat code lines, but doc entries still
+/// get their header. `grouped` is false for a result of four nodes or fewer,
+/// where per-section headers cost more than they save. That is a rule about
+/// *code* rows, which carry their own kind and path. A doc entry carries
+/// neither: the header is the only thing that marks the line as author-written
+/// prose (§4.1, mitigation M2), and it is the only handle a consumer has for
+/// finding the section at all. Dropping it left doc lines rendered bare among
+/// the code rows, so `get_context` reported no docs for a query `ask` answered
+/// from one. That is the shape of a result on a sparse graph (a repo indexed
+/// without Phase B), not an edge case. A docs-free response is unaffected and
+/// stays byte-identical.
 fn assemble_context_body(
     entries: Vec<(crate::seed::MatchSource, f32, String)>,
     sep: &str,
     grouped: bool,
 ) -> String {
     if !grouped {
-        return entries
+        let (docs, code): (Vec<_>, Vec<_>) = entries
             .into_iter()
-            .map(|(_, _, line)| line)
-            .collect::<Vec<_>>()
-            .join(sep);
+            .partition(|(ms, _, _)| *ms == crate::seed::MatchSource::Docs);
+        let mut out: Vec<String> = code.into_iter().map(|(_, _, line)| line).collect();
+        if !docs.is_empty() {
+            out.push(match_source_header(crate::seed::MatchSource::Docs).to_string());
+            out.extend(docs.into_iter().map(|(_, _, line)| line));
+        }
+        return out.join(sep);
     }
     let mut entries = entries;
     entries.sort_by(|a, b| {
@@ -4914,8 +7241,8 @@ fn humanize_doc_anchor(sig: &str) -> String {
 /// but a store lookup failure or a node deleted between KNN and this call
 /// must degrade gracefully, not silently drop a real hit), or
 /// `crate::rerank::rerank` itself returns `None` (model absent, disabled,
-/// panicked, or over the circuit-breaker budget — same fail-open contract
-/// the code lane already relies on).
+/// panicked, or skipped because the circuit breaker is open — same fail-open
+/// contract the code lane already relies on).
 fn rerank_doc_candidates(
     store: &SqliteStore,
     query: &str,
@@ -5348,6 +7675,12 @@ fn get_context_body(
     // sidecar is still cold. Distinguishes "warming up" from "embeddings off"
     // so the header/notes never silently claim full semantic coverage.
     let embed_warming = has_embed && !store.embed_ready();
+    // #874: arming can settle with no hook installed (sidecar refused to start,
+    // or the index was built with a different embedding model). The MCP
+    // injector installs its meta-hooks unconditionally so `initialize` never
+    // blocks, so `has_embed` stays true and the query would otherwise report
+    // `embeddings: on` while the semantic lane is permanently dead.
+    let embed_disabled = has_embed && store.embed_disabled();
 
     // R3: track per-query KNN health; has_embed=true doesn't mean KNN worked.
     let mut knn_degraded = false;
@@ -5380,7 +7713,7 @@ fn get_context_body(
         .map(|f| f as &dyn Fn(&str, &[NodeId]) -> Vec<(NodeId, f32)>);
     let seed_set =
         crate::seed::build_seed_set(store, query, filter, knn_pairs, &knn_oracle, score_ref);
-    let tier_label = if has_embed && !seed_set.seeds.is_empty() {
+    let tier_label = if has_embed && !embed_disabled && !seed_set.seeds.is_empty() {
         "exact+lexical+semantic"
     } else {
         "exact+lexical"
@@ -5482,7 +7815,22 @@ fn get_context_body(
     }
 
     // Retrieval header — declared here so it can be prepended to the response body.
-    let n_resolved = seed_set.terms.iter().filter(|t| t.resolved).count();
+    // #529: report the count the abstention gate actually reads, not the looser
+    // `t.resolved` count. They are different numbers under the same name: the gate
+    // additionally requires `idf_w >= idf_coverage_min`, so a query whose tokens
+    // all matched something generic printed e.g. "coverage 4/5" while the gate saw
+    // 0/5 and abstained. An agent reading the envelope could not predict whether it
+    // would get an answer. The generic remainder is still surfaced, distinguished,
+    // because "4 tokens matched but none specifically enough" explains the verdict
+    // that a bare "0/5" only states.
+    let n_resolved = seed_set.n_resolved_gated;
+    let n_resolved_loose = seed_set.terms.iter().filter(|t| t.resolved).count();
+    let n_generic = n_resolved_loose.saturating_sub(n_resolved);
+    let coverage_note = if n_generic > 0 {
+        format!(" (+{n_generic} too generic to count)")
+    } else {
+        String::new()
+    };
     let n_terms = seed_set.terms.len();
 
     // R8: index freshness header — lets the AI know exactly which commit the graph
@@ -5496,6 +7844,8 @@ fn get_context_body(
         "degraded"
     } else if embed_warming {
         "warming"
+    } else if embed_disabled {
+        "disabled"
     } else if has_embed {
         "on"
     } else {
@@ -5504,7 +7854,7 @@ fn get_context_body(
     let freshness_header = format!("[index commit: {index_commit}, embeddings: {embed_status}]\n");
 
     let retrieval_header = format!(
-        "{freshness_header}[retrieval: {tier_label} | coverage {n_resolved}/{n_terms} | confidence: {} ]\n",
+        "{freshness_header}[retrieval: {tier_label} | coverage {n_resolved}/{n_terms}{coverage_note} | confidence: {} ]\n",
         seed_set.confidence.label()
     );
 
@@ -6072,6 +8422,7 @@ fn get_context_body(
             phase_b,
             has_embed,
             embed_warming,
+            embed_disabled,
             embed_initialized,
             knn_degraded,
             overflow_msg.as_deref(),
@@ -6121,6 +8472,7 @@ fn get_context_body(
             phase_b,
             has_embed,
             embed_warming,
+            embed_disabled,
             embed_initialized,
             knn_degraded,
             overflow_msg.as_deref(),
@@ -6279,6 +8631,20 @@ pub fn seed_trace(store: &SqliteStore, query: &str) -> String {
         score_ref,
     );
     out.push_str(&format!("CONF\t{}\n", seed_set.confidence.label()));
+    // #822: the gate inputs CONF is computed from, so a trace reader does not have
+    // to infer them from the per-token idf (which cannot express either).
+    out.push_str(&format!(
+        "GATES\tn_resolved={}\tcoverage={:.3}\tcoverage_ok={}\texact_anchor={}\tmax_rerank={}\trescued={}\n",
+        seed_set.n_resolved_gated,
+        seed_set.coverage,
+        seed_set.coverage_ok,
+        seed_set.exact_anchor_present,
+        seed_set
+            .max_rerank_score
+            .map(|r| format!("{r:.4}"))
+            .unwrap_or_else(|| "none".to_string()),
+        seed_set.anchor_rescued,
+    ));
     let final_ids: Vec<NodeId> = seed_set.seeds.iter().map(|s| s.node).collect();
     let final_nodes = store.get_nodes(&final_ids).unwrap_or_default();
     let by_id: HashMap<NodeId, &CoreNode> = final_nodes.iter().map(|n| (n.id, n)).collect();
@@ -6327,21 +8693,31 @@ pub fn get_context_global(
     // R4: use a per-repo header block rather than prefixing every line with
     // "[repo_name]". Per-line prefixing pollutes blank lines, footer lines, and
     // notes with repo tags that look like noise in an LLM context window.
-    let raw = if repo.is_some() {
-        collect_global(repos, repo, |store, repo_name, single| {
-            let result = get_context_raw(
-                store,
-                seed_query,
-                token_budget,
-                include_snippets,
-                snippet_budget,
-            );
-            if result.is_empty() || single {
-                result
-            } else {
-                format!("[repo: {repo_name}]\n{result}")
-            }
-        })
+    // Named repo: open the store here rather than through `collect_global`, which
+    // is shared with the 12 structural tools. Only this path arms the embed
+    // sidecar, so `get_callers` and friends never pay for a model load. With a
+    // single candidate the per-repo `[repo: ...]` header never applied, so it is
+    // not reproduced here.
+    let raw = if let Some(name) = repo {
+        match resolve_repo_db_path(repos, name) {
+            Some(db_path) => match SqliteStore::open_read_only(db_path) {
+                Ok(mut store) => {
+                    crate::inject_embed_hook(&mut store, db_path);
+                    get_context_raw(
+                        &store,
+                        seed_query,
+                        token_budget,
+                        include_snippets,
+                        snippet_budget,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!("failed to open {}: {e}", db_path.display());
+                    String::new()
+                }
+            },
+            None => String::new(),
+        }
     } else {
         // Fan-out: rank repos by result size (token-rich responses first).
         let mut candidates: Vec<(&str, &PathBuf)> =
@@ -6352,7 +8728,11 @@ pub fn get_context_global(
         let mut parts: Vec<(usize, String)> = Vec::new();
         for (repo_name, db_path) in &candidates {
             match SqliteStore::open_read_only(db_path) {
-                Ok(store) => {
+                Ok(mut store) => {
+                    // Lookup-only: a fan-out must never arm N sidecars for an
+                    // N-repo registry. A repo an earlier named query warmed keeps
+                    // its semantic lane; an unwarmed one stays lexical.
+                    crate::inject_cached_embed_hook(&mut store, db_path);
                     let result = get_context_raw(
                         &store,
                         seed_query,
@@ -6400,6 +8780,56 @@ pub struct GraphJsonParams<'a> {
     pub token_budget: usize,
     pub mode: &'a str,
     pub path_prefix: &'a str,
+    /// RFC-027 section 10: restrict edges by how they were derived.
+    ///
+    /// `""` (the default) returns everything, so an existing caller sees the
+    /// fresher graph and nothing changes for it. `"ratified"` excludes the live
+    /// overlay, for a consumer that needs only what the deterministic pipeline
+    /// has confirmed. Any other value names a single provenance exactly
+    /// (`tree-sitter`, `lsif`, `scip`, `live`).
+    ///
+    /// A word rather than a `!=` expression: the meaningful question a consumer
+    /// has is "confirmed, or everything", and spelling that as a filter grammar
+    /// would invite queries the store cannot answer cheaply.
+    pub provenance: &'a str,
+}
+
+impl Default for GraphJsonParams<'_> {
+    fn default() -> Self {
+        Self {
+            query: "",
+            direction: "both",
+            depth: 2,
+            kind_filter: "",
+            token_budget: 0,
+            mode: "",
+            path_prefix: "",
+            provenance: "",
+        }
+    }
+}
+
+/// Whether an edge with `provenance` passes the caller's filter.
+///
+/// Unknown filter values match nothing rather than everything: a typo should
+/// return an obviously empty graph, not silently ignore the constraint a
+/// consumer added precisely because it needed ground truth.
+/// Every value the `provenance` filter accepts: the two modes (`""` for all
+/// edges, `"ratified"` for everything the commit-gated pipeline has confirmed)
+/// and each provenance an edge can actually carry.
+///
+/// [`provenance_allowed`] answers an unknown value with "matches nothing", which
+/// is the right default for a query surface. A caller that treats an empty graph
+/// as a PASS has to reject the typo instead, which is why the vocabulary is
+/// named here rather than restated per call site.
+pub const PROVENANCE_FILTERS: &[&str] = &["", "ratified", "tree-sitter", "lsif", "scip", "live"];
+
+fn provenance_allowed(filter: &str, provenance: &str) -> bool {
+    match filter {
+        "" => true,
+        "ratified" => provenance != "live",
+        exact => provenance == exact,
+    }
 }
 
 /// BFS from seed node(s) matching `query`, respecting `direction` and `depth`.
@@ -6415,6 +8845,7 @@ pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> Stri
         token_budget,
         mode,
         path_prefix,
+        provenance,
     } = params;
     if !matches!(*mode, "" | "overview") {
         tracing::warn!("get_graph_json rejected unknown mode: {mode}");
@@ -6427,7 +8858,7 @@ pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> Stri
                 return "{}".to_string();
             }
         }
-        return overview_graph(store, path_prefix);
+        return overview_graph(store, path_prefix, provenance);
     }
     // Only "" (all kinds) and "file" are valid kind_filter values.
     if !matches!(*kind_filter, "" | "file") {
@@ -6452,6 +8883,7 @@ pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> Stri
         depth,
         kind_filter,
         *token_budget,
+        provenance,
         head.as_deref(),
     )
 }
@@ -6485,7 +8917,7 @@ fn file_label(path: &str) -> &str {
 }
 
 /// Entry point for `mode="overview"`. Routes by whether path_prefix is set.
-fn overview_graph(store: &SqliteStore, path_prefix: &str) -> String {
+fn overview_graph(store: &SqliteStore, path_prefix: &str, provenance: &str) -> String {
     let file_nodes = match store.nodes_by_kind("file") {
         Ok(n) => n,
         Err(e) => {
@@ -6497,7 +8929,7 @@ fn overview_graph(store: &SqliteStore, path_prefix: &str) -> String {
     // language-agnostic primitive the repo map uses. Replaces the old
     // depends+resolves-to-only `file_import_pairs`, which produced ~0 edges here
     // because top-level-dir buckets collapsed every intra-monorepo edge.
-    let pairs = match store.resolved_dep_pairs() {
+    let pairs = match store.resolved_dep_pairs(provenance) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("overview_graph: resolved_dep_pairs error: {e}");
@@ -6780,6 +9212,25 @@ fn strip_native_kind_prefix(label: &str) -> &str {
         .unwrap_or(label)
 }
 
+/// Mark the name-matched edges in a `get_graph_json` edge array.
+///
+/// The tree view flagged these and the edge array did not, so a renderer
+/// presented a call `resolve_unresolved_calls` guessed by name as one a
+/// compiler resolved. Derived once from `kind` + `provenance` here rather than
+/// at each of the six sites that build an edge object, all of which already
+/// carry both. Additive: an edge that is not name-matched gains no key.
+fn mark_heuristic_edges(edges: &mut [serde_json::Value]) {
+    for e in edges.iter_mut() {
+        if crate::query::is_heuristic_edge(
+            e["kind"].as_str().unwrap_or_default(),
+            e["provenance"].as_str().unwrap_or_default(),
+        ) {
+            e["heuristic"] = serde_json::Value::Bool(true);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn get_graph_json_raw(
     store: &SqliteStore,
     query: &str,
@@ -6787,6 +9238,8 @@ fn get_graph_json_raw(
     depth: u8,
     kind_filter: &str,
     token_budget: usize,
+    // RFC-027 section 10: edge provenance filter. `""` returns everything.
+    provenance: &str,
     // #645/#661: the caller's live short HEAD for the index/HEAD drift signal.
     // Injected (not read from LAUNCH_CWD here) so the global aggregator can pass
     // *each* repo's own HEAD rather than the one workspace's — see
@@ -7060,30 +9513,36 @@ fn get_graph_json_raw(
             ) {
                 // First pass: dedup via edge_seen, enqueue new visits.
                 // Collect (dst_id, kind_s) only for edges that produce JSON output.
-                let mut new_edges: Vec<(NodeId, &str)> = Vec::new();
-                for (kind, next_id, child_expand, _incoming) in &nexts {
+                let mut new_edges: Vec<(NodeId, &str, &str)> = Vec::new();
+                for (kind, next_id, child_expand, _incoming, edge_prov) in &nexts {
                     let kind_s = edge_kind_str(kind);
+                    if !provenance_allowed(provenance, edge_prov) {
+                        continue;
+                    }
                     if edge_seen.insert((current_id, *next_id, kind_s)) {
-                        new_edges.push((*next_id, kind_s));
+                        new_edges.push((*next_id, kind_s, edge_prov.as_str()));
                     }
                     if visited.insert(*next_id) {
                         queue.push_back((*next_id, hop + 1, *child_expand));
                     }
                 }
                 // Batch-fetch dst nodes, then emit JSON edges in original order.
-                let dst_ids: Vec<NodeId> = new_edges.iter().map(|(id, _)| *id).collect();
+                let dst_ids: Vec<NodeId> = new_edges.iter().map(|(id, _, _)| *id).collect();
                 let node_map: HashMap<NodeId, CoreNode> = store
                     .get_nodes(&dst_ids)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|n| (n.id, n))
                     .collect();
-                for (dst_id, kind_s) in &new_edges {
+                for (dst_id, kind_s, provenance) in &new_edges {
                     if let Some(dst) = node_map.get(dst_id) {
+                        // RFC-027 section 10: renderers and agents need to tell
+                        // the un-ratified overlay from committed truth.
                         edges_out.push(serde_json::json!({
-                            "source": node_json_id(&node),
-                            "target": node_json_id(dst),
-                            "kind":   kind_s,
+                            "source":     node_json_id(&node),
+                            "target":     node_json_id(dst),
+                            "kind":       kind_s,
+                            "provenance": provenance,
                         }));
                     }
                 }
@@ -7099,30 +9558,34 @@ fn get_graph_json_raw(
                 hop == 0,
             ) {
                 // First pass: dedup via edge_seen, enqueue new visits.
-                let mut new_edges: Vec<(NodeId, &str)> = Vec::new();
-                for (kind, next_id, child_expand, _incoming) in &nexts {
+                let mut new_edges: Vec<(NodeId, &str, &str)> = Vec::new();
+                for (kind, next_id, child_expand, _incoming, edge_prov) in &nexts {
                     let kind_s = edge_kind_str(kind);
+                    if !provenance_allowed(provenance, edge_prov) {
+                        continue;
+                    }
                     if edge_seen.insert((*next_id, current_id, kind_s)) {
-                        new_edges.push((*next_id, kind_s));
+                        new_edges.push((*next_id, kind_s, edge_prov.as_str()));
                     }
                     if visited.insert(*next_id) {
                         queue.push_back((*next_id, hop + 1, *child_expand));
                     }
                 }
                 // Batch-fetch src nodes, then emit JSON edges in original order.
-                let src_ids: Vec<NodeId> = new_edges.iter().map(|(id, _)| *id).collect();
+                let src_ids: Vec<NodeId> = new_edges.iter().map(|(id, _, _)| *id).collect();
                 let node_map: HashMap<NodeId, CoreNode> = store
                     .get_nodes(&src_ids)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|n| (n.id, n))
                     .collect();
-                for (src_id, kind_s) in &new_edges {
+                for (src_id, kind_s, provenance) in &new_edges {
                     if let Some(src) = node_map.get(src_id) {
                         edges_out.push(serde_json::json!({
-                            "source": node_json_id(src),
-                            "target": node_json_id(&node),
-                            "kind":   kind_s,
+                            "source":     node_json_id(src),
+                            "target":     node_json_id(&node),
+                            "kind":       kind_s,
+                            "provenance": provenance,
                         }));
                     }
                 }
@@ -7166,6 +9629,7 @@ fn get_graph_json_raw(
 
     // Additive envelope fields (#318 O5/O6) — first-party consumers read only
     // `nodes`/`edges`; the global merge likewise ignores extra keys.
+    mark_heuristic_edges(&mut edges_out);
     let mut out = serde_json::json!({
         "nodes": nodes_out,
         "edges": edges_out,
@@ -7184,7 +9648,7 @@ fn get_graph_json_raw(
     // incomplete (#617) and index/HEAD drift (#645) are independent and may both
     // apply. Carried as JSON `signals` array items (never appended as prose) so
     // the JSON body still parses; the global aggregator already merges `signals`.
-    let signals = read_note_signals(store, head);
+    let signals = read_note_signals(store, head, &out["nodes"].to_string());
     if !signals.is_empty() {
         out["signals"] = serde_json::Value::Array(signals);
     }
@@ -7211,6 +9675,7 @@ pub fn get_graph_json_global(
         token_budget: _,
         mode,
         path_prefix,
+        provenance,
     } = params;
     if *mode == "overview" {
         if !path_prefix.is_empty() {
@@ -7220,7 +9685,7 @@ pub fn get_graph_json_global(
             }
         }
         // Overview mode: run per-repo and merge package tiles
-        return get_graph_json_global_overview(repos, repo, path_prefix);
+        return get_graph_json_global_overview(repos, repo, path_prefix, provenance);
     }
     if !(query.is_empty() && *kind_filter == "file") {
         if let Err(reason) = validate_mcp_arg(query) {
@@ -7272,6 +9737,7 @@ pub fn get_graph_json_global(
                     depth,
                     kind_filter,
                     0,
+                    provenance,
                     head.as_deref(),
                 );
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
@@ -7324,6 +9790,7 @@ fn get_graph_json_global_overview(
     repos: &HashMap<String, PathBuf>,
     repo: Option<&str>,
     path_prefix: &str,
+    provenance: &str,
 ) -> String {
     use std::collections::HashMap as HMap;
 
@@ -7347,7 +9814,7 @@ fn get_graph_json_global_overview(
         }
         match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
-                let raw = overview_graph(&store, path_prefix);
+                let raw = overview_graph(&store, path_prefix, provenance);
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -7483,7 +9950,7 @@ mod tests {
     #[test]
     fn get_callers_global_rejects_path_traversal_repo_arg() {
         let repos: HashMap<String, PathBuf> = HashMap::new();
-        let result = get_callers_global(&repos, "charge", Some("../evil"));
+        let result = get_callers_global(&repos, "charge", None, Some("../evil"));
         // Invalid repo arg must return an empty envelope, not a panic or error.
         assert_eq!(
             result, "<travsr-data></travsr-data>",
@@ -7491,9 +9958,11 @@ mod tests {
         );
     }
 
-    /// SEC-002 end-to-end: an absolute-path repo arg must also be rejected.
+    /// An absolute-path repo arg is a well-formed registry key (every key is an
+    /// absolute repo root), so it is no longer rejected outright; naming one
+    /// that is not registered simply misses and returns the empty envelope.
     #[test]
-    fn get_dependencies_global_rejects_absolute_repo_arg() {
+    fn get_dependencies_global_absolute_repo_arg_that_is_not_registered_is_empty() {
         let repos: HashMap<String, PathBuf> = HashMap::new();
         let result = get_dependencies_global(&repos, "src/main.ts", Some("/etc/passwd"));
         assert_eq!(
@@ -7507,7 +9976,7 @@ mod tests {
     /// The `phase_b_warnings` parser matches a whole `crashed:<lang>` entry, not a
     /// prefix or a different warning class for the same language.
     #[test]
-    fn phase_b_lang_crashed_matches_exact_class_and_lang() {
+    fn phase_b_lang_incomplete_matches_exact_class_and_lang() {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store
             .set_meta(
@@ -7515,14 +9984,18 @@ mod tests {
                 "skipped_no_analyzer:php,crashed:objectivec",
             )
             .unwrap();
-        assert!(phase_b_lang_crashed(&store, "objectivec"));
-        // A different warning class for the same language is not a crash.
-        assert!(!phase_b_lang_crashed(&store, "php"));
+        assert_eq!(
+            phase_b_lang_incomplete(&store, "objectivec"),
+            Some("crashed")
+        );
+        // A different warning class for the same language is not partial
+        // coverage (a language that never ran has the empty-result gates).
+        assert_eq!(phase_b_lang_incomplete(&store, "php"), None);
         // Not a substring match: `objc` must not match `objectivec`.
-        assert!(!phase_b_lang_crashed(&store, "objc"));
-        // No warnings at all → false.
+        assert_eq!(phase_b_lang_incomplete(&store, "objc"), None);
+        // No warnings at all → None.
         store.set_meta("phase_b_warnings", "").unwrap();
-        assert!(!phase_b_lang_crashed(&store, "objectivec"));
+        assert_eq!(phase_b_lang_incomplete(&store, "objectivec"), None);
     }
 
     /// #715: get_callers must attach the incompleteness caveat when the target
@@ -7546,7 +10019,7 @@ mod tests {
             .unwrap();
 
         // Clean run: a confident caller list, no caveat.
-        let clean = get_callers_raw(&store, "charge");
+        let clean = get_callers_raw(&store, "charge", None);
         assert!(
             clean.contains("fn:process"),
             "caller must be listed: {clean}"
@@ -7558,7 +10031,7 @@ mod tests {
 
         // The language crashed: the same answer now carries the caveat.
         store.set_meta("phase_b_warnings", "crashed:rust").unwrap();
-        let crashed = get_callers_raw(&store, "charge");
+        let crashed = get_callers_raw(&store, "charge", None);
         assert!(
             crashed.contains("fn:process"),
             "caller still listed: {crashed}"
@@ -7566,6 +10039,344 @@ mod tests {
         assert!(
             crashed.contains("semantic analysis for 'rust' crashed on its last run"),
             "a crashed language must carry the incompleteness caveat: {crashed}"
+        );
+    }
+
+    /// #878: a TypeScript index whose LSIF pass was skipped has SOME callers
+    /// (from the native pass), which is exactly the confident-looking answer
+    /// that must carry a caveat. The crashed wording stays reserved for crashes.
+    #[test]
+    fn get_callers_caveats_a_language_whose_lsif_pass_was_skipped() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("c", "", "src/svc.ts", "typescript", "method:charge"),
+            "method",
+        );
+        let caller = Node::new(
+            VName::new("c", "", "src/main.ts", "typescript", "fn:process"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+
+        store
+            .set_meta("phase_b_warnings", "emitter_missing:typescript")
+            .unwrap();
+        let out = get_callers_raw(&store, "charge", None);
+        assert!(out.contains("fn:process"), "caller still listed: {out}");
+        assert!(
+            out.contains("is incomplete")
+                && out.contains("travsr-lsif-ts")
+                && out.contains("may be incomplete"),
+            "a skipped LSIF pass must carry the incompleteness caveat: {out}"
+        );
+        assert!(
+            !out.contains("crashed on its last run"),
+            "a skipped emitter is not a crash: {out}"
+        );
+
+        // The class match is exact: another language's skip says nothing here.
+        store
+            .set_meta("phase_b_warnings", "emitter_missing:go")
+            .unwrap();
+        let out = get_callers_raw(&store, "charge", None);
+        assert!(!out.contains("may be incomplete"), "no caveat: {out}");
+        assert_eq!(phase_b_lang_incomplete(&store, "typescript"), None);
+        assert_eq!(
+            phase_b_lang_incomplete(&store, "go"),
+            Some("emitter_missing")
+        );
+    }
+
+    /// get_callers used to seed on `search_nodes_by_name(..).first()`, so two
+    /// distinct definitions sharing a name collapsed to whichever one the FTS
+    /// ranked first: it returned that one's callers, said nothing about the
+    /// other, and a reader concluded the unreported definition had no callers.
+    /// `find_references` and `travsr graph` already refuse here; get_callers now
+    /// refuses with them.
+    #[test]
+    fn get_callers_refuses_two_distinct_definitions_of_one_name() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let unifier = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-indexer/src/scip_unifier.rs",
+                "rust",
+                "fn:candidate_signatures",
+            ),
+            "function",
+        );
+        let live = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-daemon/src/live_resolve.rs",
+                "rust",
+                "fn:candidate_signatures",
+            ),
+            "function",
+        );
+        let unifier_caller = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-daemon/src/scip_unifier.rs",
+                "rust",
+                "fn:unify_one",
+            ),
+            "function",
+        );
+        let live_caller = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-daemon/src/live_resolve.rs",
+                "rust",
+                "fn:resolve_live",
+            ),
+            "function",
+        );
+        for n in [&unifier, &live, &unifier_caller, &live_caller] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(unifier_caller.id, unifier.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(live_caller.id, live.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let out = get_callers_raw(&store, "candidate_signatures", None);
+        assert!(
+            out.contains("'candidate_signatures' is ambiguous, 2 definitions"),
+            "two definitions of one name must be refused, not silently picked: {out}"
+        );
+        assert!(
+            out.contains("crates/travsr-indexer/src/scip_unifier.rs")
+                && out.contains("crates/travsr-daemon/src/live_resolve.rs"),
+            "the refusal must name both definitions: {out}"
+        );
+        assert!(
+            !out.contains("fn:unify_one") && !out.contains("fn:resolve_live"),
+            "no single definition's callers may be presented as the answer: {out}"
+        );
+
+        // The `path` hint the refusal advertises is get_callers' own argument, so
+        // the answer is reachable in one more call on the same tool.
+        let pinned = get_callers_raw(&store, "candidate_signatures", Some("scip_unifier.rs"));
+        assert!(
+            !pinned.contains("is ambiguous"),
+            "the path hint the refusal advertises must disambiguate: {pinned}"
+        );
+        assert!(
+            pinned.contains("fn:unify_one") && !pinned.contains("fn:resolve_live"),
+            "only the pinned definition's callers: {pinned}"
+        );
+    }
+
+    /// The guard keys on two *exact definitions*, not on "more than one node
+    /// matched", so the partial matching the get_callers schema documents
+    /// ("partial match supported") still resolves and answers.
+    #[test]
+    fn get_callers_keeps_documented_partial_matching() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("c", "", "svc.rs", "rust", "fn:charge_customer"),
+            "function",
+        );
+        let caller = Node::new(
+            VName::new("c", "", "main.rs", "rust", "fn:process"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let out = get_callers_raw(&store, "charge", None);
+        assert!(
+            !out.contains("is ambiguous"),
+            "a partial query is not an ambiguous definition: {out}"
+        );
+        assert!(
+            out.contains("fn:process"),
+            "partial match must still answer: {out}"
+        );
+    }
+
+    /// The `path` hint has to mean the same thing on the partial tier as on the
+    /// exact ones. It used to be dropped once the exact ladder returned `None`,
+    /// so the fallback took the first FTS row and answered about a same-named
+    /// symbol in a file the hint excluded: #647's confident-wrong answer,
+    /// reachable through the one tier that never got the fix.
+    #[test]
+    fn get_callers_partial_fallback_still_honours_the_path_hint() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let mk =
+            |path: &str, sig: &str| Node::new(VName::new("c", "", path, "rust", sig), "function");
+        // Two partial matches for "charge", in two different directories.
+        let billing = mk("billing/svc.rs", "fn:charge_customer");
+        let payments = mk("payments/svc.rs", "fn:charge_card");
+        let billing_caller = mk("billing/main.rs", "fn:bill_it");
+        let payments_caller = mk("payments/main.rs", "fn:pay_it");
+        for n in [&billing, &payments, &billing_caller, &payments_caller] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(billing_caller.id, billing.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(
+                payments_caller.id,
+                payments.id,
+                EdgeKind::RefCall,
+            ))
+            .unwrap();
+
+        let pinned = get_callers_raw(&store, "charge", Some("billing"));
+        assert!(
+            pinned.contains("fn:bill_it"),
+            "the hinted directory's caller must be the answer: {pinned}"
+        );
+        assert!(
+            !pinned.contains("fn:pay_it"),
+            "a caller the hint excludes must not be reported: {pinned}"
+        );
+
+        // A hint matching no candidate must say so. Falling through to the
+        // unscoped first row is what this test exists to stop, and answering an
+        // empty list would read as an authoritative "no callers".
+        let missed = get_callers_raw(&store, "charge", Some("shipping"));
+        assert!(
+            missed.contains("no definition is under path 'shipping'"),
+            "a hint that matches nothing must be reported, not widened: {missed}"
+        );
+        assert!(
+            !missed.contains("fn:bill_it") && !missed.contains("fn:pay_it"),
+            "no caller list may be presented for a hint that matched nothing: {missed}"
+        );
+    }
+
+    /// An Objective-C selector family is one method at several arities, not rival
+    /// definitions (see `RefTarget::Family`). get_callers must union their callers,
+    /// the way find_references unions their sites, never refuse.
+    #[test]
+    fn get_callers_unions_a_selector_family_rather_than_refusing() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let short = Node::new(
+            VName::new(
+                "c",
+                "",
+                "AFSecurityPolicy.m",
+                "objectivec",
+                "method:AFSecurityPolicy.policyWithPinningMode:",
+            ),
+            "method",
+        );
+        let long = Node::new(
+            VName::new(
+                "c",
+                "",
+                "AFSecurityPolicy.m",
+                "objectivec",
+                "method:AFSecurityPolicy.policyWithPinningMode:withPinnedCertificates:",
+            ),
+            "method",
+        );
+        let short_caller = Node::new(
+            VName::new(
+                "c",
+                "",
+                "Session.m",
+                "objectivec",
+                "method:Session.configure",
+            ),
+            "method",
+        );
+        let long_caller = Node::new(
+            VName::new("c", "", "Pinning.m", "objectivec", "method:Pinning.install"),
+            "method",
+        );
+        for n in [&short, &long, &short_caller, &long_caller] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(short_caller.id, short.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(long_caller.id, long.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let out = get_callers_raw(&store, "policyWithPinningMode", None);
+        assert!(
+            !out.contains("is ambiguous"),
+            "a selector family is one method, not rival definitions: {out}"
+        );
+        assert!(
+            out.contains("Session.configure") && out.contains("Pinning.install"),
+            "every arity's callers must be present: {out}"
+        );
+    }
+
+    /// The family test compares a container NAME cut out of the signature. Two
+    /// classes that share a name (a vendored pod duplicated under two paths, a
+    /// category) are two methods, and unioning them presented one method's
+    /// callers under the other's name. The shared PATH is what tells them apart.
+    #[test]
+    fn two_same_named_classes_are_not_one_selector_family() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for path in ["Pods/A/AFSecurityPolicy.m", "Pods/B/AFSecurityPolicy.m"] {
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "c",
+                        "",
+                        path,
+                        "objectivec",
+                        "method:AFSecurityPolicy.policyWithPinningMode:",
+                    ),
+                    "method",
+                ))
+                .unwrap();
+        }
+
+        let out = get_callers_raw(&store, "policyWithPinningMode", None);
+        assert!(
+            out.contains("is ambiguous"),
+            "two classes sharing a name are rival definitions, not one family: {out}"
+        );
+    }
+
+    /// The family logic used to be gated on nothing but a trailing ':' in the
+    /// leaf, so it ran for every language.
+    #[test]
+    fn a_non_objc_leaf_ending_in_colon_is_not_a_selector_family() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for sig in ["method:Label.text:", "method:Label.text:color:"] {
+            store
+                .put_node(&Node::new(
+                    VName::new("c", "", "ui.dart", "dart", sig),
+                    "method",
+                ))
+                .unwrap();
+        }
+
+        let out = get_callers_raw(&store, "text", None);
+        assert!(
+            out.contains("is ambiguous"),
+            "only Objective-C spells a method name with embedded colons: {out}"
         );
     }
 
@@ -7586,7 +10397,7 @@ mod tests {
         store.put_node(&callee).unwrap();
         store.put_node(&caller).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 12)])
+            .record_edge_sites(&[(caller.id, callee.id, 12, None)])
             .unwrap();
 
         let clean = find_references_raw(&store, "charge", None);
@@ -7683,6 +10494,216 @@ mod tests {
         assert!(
             !res_exact.contains("struct:ClassDConfigurationManager"),
             "global exact=true must drop substring match, got: {res_exact}"
+        );
+    }
+
+    // ── #893 B2/B3: global fan-out disclosure + ordering ─────────────────────
+
+    /// Build a file-backed store under `root` holding `n` nodes whose names all
+    /// match the search term "Widget".
+    fn seed_fanout_repo(root: &std::path::Path, n: usize) -> PathBuf {
+        use travsr_core::{Node, VName};
+        let db_path = root.join("graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            for i in 0..n {
+                store
+                    .put_node(&Node::new(
+                        VName::new(
+                            "",
+                            "",
+                            format!("src/widget_{i}.rs"),
+                            "rust",
+                            format!("struct:Widget{i}"),
+                        ),
+                        "struct",
+                    ))
+                    .unwrap();
+            }
+        }
+        db_path
+    }
+
+    #[test]
+    fn search_symbol_global_fanout_ranks_by_match_count_and_is_deterministic() {
+        // #893 B3: identical input must produce an identical answer, and the
+        // documented "most matches first" order must be real. `alpha` and
+        // `bravo` tie deliberately: without an explicit tiebreak their relative
+        // order falls out of `HashMap` iteration, which varies per map.
+        let alpha_dir = tempfile::tempdir().unwrap();
+        let bravo_dir = tempfile::tempdir().unwrap();
+        let charlie_dir = tempfile::tempdir().unwrap();
+        let alpha = seed_fanout_repo(alpha_dir.path(), 5);
+        let bravo = seed_fanout_repo(bravo_dir.path(), 5);
+        let charlie = seed_fanout_repo(charlie_dir.path(), 9);
+
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..16 {
+            // Fresh map each round: `HashMap` randomises per instance, so this
+            // is the in-process equivalent of re-running the MCP server.
+            let repos: HashMap<String, PathBuf> = [
+                ("alpha".to_string(), alpha.clone()),
+                ("bravo".to_string(), bravo.clone()),
+                ("charlie".to_string(), charlie.clone()),
+            ]
+            .into();
+            seen.push(search_symbol_global(&repos, "Widget", None, false));
+        }
+        let distinct = {
+            let mut u: Vec<&String> = seen.iter().collect();
+            u.sort();
+            u.dedup();
+            u.len()
+        };
+        let first = &seen[0];
+        assert_eq!(
+            distinct, 1,
+            "fan-out must be deterministic across identical calls, got {distinct} distinct outputs"
+        );
+        let pos = |repo: &str| first.find(&format!("[{repo}]")).unwrap_or(usize::MAX);
+        assert!(
+            pos("charlie") < pos("alpha") && pos("charlie") < pos("bravo"),
+            "most matches first: charlie (9) must precede alpha/bravo (5 each), got: {first}"
+        );
+        assert!(
+            pos("alpha") < pos("bravo"),
+            "equal counts must break deterministically by repo name, got: {first}"
+        );
+    }
+
+    #[test]
+    fn search_symbol_global_fanout_keeps_highest_matching_repo_under_output_cap() {
+        // #893 B3, reproducing the registry measured in the issue: searching
+        // "Server" matched 228 nodes in kubernetes, 120 in travsr and 70 in
+        // AFNetworking. Every one of those renders exactly MAX_SEARCH_RESULTS
+        // lines, so ranking on the *rendered* line count scored all three at 50
+        // — a dead tie that `HashMap` order then broke arbitrarily, after which
+        // the 4 096-byte output cap kept only the winner. kubernetes, the
+        // strongest repo by a factor of three, was the one that vanished.
+        //
+        // Names are chosen so alphabetical order *opposes* match order: if the
+        // ranking silently degraded to the name tiebreak, `zzz-most` would sort
+        // last and this would fail rather than pass by luck.
+        let most_dir = tempfile::tempdir().unwrap();
+        let mid_dir = tempfile::tempdir().unwrap();
+        let least_dir = tempfile::tempdir().unwrap();
+        let most = seed_fanout_repo(most_dir.path(), 228);
+        let mid = seed_fanout_repo(mid_dir.path(), 120);
+        let least = seed_fanout_repo(least_dir.path(), 70);
+
+        for _ in 0..16 {
+            let repos: HashMap<String, PathBuf> = [
+                ("aaa-least".to_string(), least.clone()),
+                ("mmm-mid".to_string(), mid.clone()),
+                ("zzz-most".to_string(), most.clone()),
+            ]
+            .into();
+            let result = search_symbol_global(&repos, "Widget", None, false);
+            assert!(
+                result.contains("[zzz-most]"),
+                "the highest-matching repo must survive the output cap, got: {result}"
+            );
+            let pos = |repo: &str| result.find(&format!("[{repo}]")).unwrap_or(usize::MAX);
+            assert!(
+                pos("zzz-most") < pos("mmm-mid") && pos("mmm-mid") < pos("aaa-least"),
+                "ranking must follow true match count (228 > 120 > 70), got: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_symbol_global_fanout_discloses_repos_it_cannot_open() {
+        // #893 B2: a repo the fan-out cannot open was only reported through a
+        // `tracing::warn` on stderr; the MCP payload looked like a complete
+        // answer. The response must name what it skipped.
+        let good_dir = tempfile::tempdir().unwrap();
+        let bad_dir = tempfile::tempdir().unwrap();
+        let good = seed_fanout_repo(good_dir.path(), 3);
+        let bad = bad_dir.path().join("graph.db");
+        // Not a SQLite database: the read-only open path rejects it.
+        std::fs::write(&bad, b"this is not a sqlite database").unwrap();
+
+        let repos: HashMap<String, PathBuf> =
+            [("goodrepo".to_string(), good), ("badrepo".to_string(), bad)].into();
+        let result = search_symbol_global(&repos, "Widget", None, false);
+        assert!(
+            result.contains("struct:Widget0"),
+            "the readable repo must still answer, got: {result}"
+        );
+        assert!(
+            result.contains("badrepo"),
+            "the skipped repo must be named in the payload, got: {result}"
+        );
+    }
+
+    #[test]
+    fn collect_global_fanout_discloses_repos_it_cannot_open() {
+        // #893 B2: `collect_global` is the shared fan-out behind every global
+        // tool except search_symbol. A repo it could not open was reported only
+        // by a `tracing::warn` on stderr, so get_repo_map / get_blast_radius /
+        // get_graph_stats all returned confidently partial cross-repo answers.
+        let good_dir = tempfile::tempdir().unwrap();
+        let bad_dir = tempfile::tempdir().unwrap();
+        let good = seed_fanout_repo(good_dir.path(), 3);
+        let bad = bad_dir.path().join("graph.db");
+        // Not a SQLite database: the read-only open path rejects it.
+        std::fs::write(&bad, b"this is not a sqlite database").unwrap();
+
+        let repos: HashMap<String, PathBuf> =
+            [("goodrepo".to_string(), good), ("badrepo".to_string(), bad)].into();
+
+        let map = get_repo_map_global(&repos, None);
+        assert!(
+            map.contains("this cross-repo answer is partial"),
+            "get_repo_map_global must disclose the skipped repo, got: {map}"
+        );
+        assert!(
+            map.contains("badrepo"),
+            "the skipped repo must be named in the payload, got: {map}"
+        );
+        assert!(
+            map.contains("[goodrepo]"),
+            "the readable repo must still answer, got: {map}"
+        );
+
+        // The summing tool is the sharpest case: its totals are wrong, not
+        // merely incomplete, when a repo is skipped.
+        let stats = get_graph_stats_global(&repos, None);
+        assert!(
+            stats.contains("badrepo"),
+            "get_graph_stats_global must disclose the skipped repo, got: {stats}"
+        );
+
+        // get_lang_status_global is parsed as JSON by the extension: the note
+        // must not become the line it returns.
+        let lang = get_lang_status_global(&repos, "src/widget_0.rs", None);
+        assert!(
+            lang.starts_with('{'),
+            "get_lang_status_global must stay JSON, got: {lang}"
+        );
+    }
+
+    #[test]
+    fn collect_global_adds_no_note_when_every_repo_opens() {
+        // The disclosure must be invisible unless something was actually
+        // skipped: the no-skips payload stays byte-identical to pre-#893.
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let repos: HashMap<String, PathBuf> = [
+            ("alpha".to_string(), seed_fanout_repo(a_dir.path(), 3)),
+            ("bravo".to_string(), seed_fanout_repo(b_dir.path(), 3)),
+        ]
+        .into();
+
+        let map = get_repo_map_global(&repos, None);
+        assert!(
+            !map.contains("cross-repo answer is partial"),
+            "no repo was skipped, so no note may appear, got: {map}"
+        );
+        let stats = get_graph_stats_global(&repos, None);
+        assert_eq!(
+            stats, "nodes: 6\nedges: 0",
+            "no-skips get_graph_stats_global payload must be unchanged, got: {stats}"
         );
     }
 
@@ -7857,7 +10878,7 @@ mod tests {
         store.put_node(&ts_node).unwrap();
 
         // "auth handler typescript" should return only the TypeScript node.
-        let result = search_symbol_raw(&store, "auth", Some("typescript"), false);
+        let (_, result) = search_symbol_raw(&store, "auth", Some("typescript"), false);
         assert!(
             result.contains("src/auth.ts"),
             "expected typescript node: {result}"
@@ -7883,7 +10904,7 @@ mod tests {
         store.put_node(&rs_node).unwrap();
         store.put_node(&ts_node).unwrap();
 
-        let result = search_symbol_raw(&store, "auth", None, false);
+        let (_, result) = search_symbol_raw(&store, "auth", None, false);
         assert!(
             result.contains("auth.rs"),
             "rust node must appear: {result}"
@@ -7952,7 +10973,7 @@ mod tests {
         store
             .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
             .unwrap();
-        let result = get_callers(&store, "fn:callee");
+        let result = get_callers(&store, "fn:callee", None);
         assert!(
             result.contains("src/caller.rs:10"),
             "get_callers must emit path:line for caller, got: {result}"
@@ -8134,7 +11155,7 @@ mod tests {
             .set_meta("repo_root", dir.path().to_str().unwrap())
             .unwrap();
 
-        let result = get_callers(&store, "SyncPod");
+        let result = get_callers(&store, "SyncPod", None);
         assert!(result.contains("worker.go:4"), "site on line 4: {result}");
         assert!(result.contains("worker.go:6"), "site on line 6: {result}");
         assert!(
@@ -8146,6 +11167,225 @@ mod tests {
             result.matches("worker.go:").count(),
             2,
             "one edge → two call sites: {result}"
+        );
+    }
+
+    /// A recorded occurrence suppresses the textual re-scan for that edge.
+    ///
+    /// The scan counts the callee's name anywhere in the caller's span, so the
+    /// callee's own declaration and a mention in a comment come back as call
+    /// sites. Preferring the recorded rows is what removed 3127 phantom sites
+    /// across 1081 edges on this repo. The scan stays as the fallback for a
+    /// language that feeds no occurrence rows at all.
+    #[test]
+    fn get_callers_prefers_recorded_occurrences_over_the_textual_scan() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        // Three textual hits inside `run`'s span: a comment (3), the local
+        // declaration (4), and the one real call (5).
+        std::fs::write(
+            dir.path().join("app.ts"),
+            "x\nfunction run() {\n  // row is built below\n  const row = () => 1;\n  row();\n}\n",
+        )
+        .unwrap();
+
+        let callee = Node::new(
+            VName::new("", "", "grid.ts", "typescript", "fn:row"),
+            "function",
+        );
+        let caller = Node::new(
+            VName::new("", "", "app.ts", "typescript", "fn:run"),
+            "function",
+        )
+        .with_line(2)
+        .with_end_line(6);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        // An `lsif` edge, so `provenance_marker` is empty and the only marker
+        // in the output is the one the scan itself adds.
+        store
+            .put_edge_lsif(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .set_meta("repo_root", dir.path().to_str().unwrap())
+            .unwrap();
+
+        // Without occurrence rows the scan still runs: all three lines report.
+        let scanned = get_callers(&store, "row", None);
+        assert_eq!(
+            scanned.matches("app.ts:").count(),
+            3,
+            "the textual fallback is unchanged when nothing was recorded: {scanned}"
+        );
+
+        // With the real occurrence recorded, only that site reports: the
+        // comment and the declaration the scan counted are gone.
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 5, None)])
+            .unwrap();
+        let result = get_callers(&store, "row", None);
+        assert_eq!(
+            result.matches("app.ts:").count(),
+            1,
+            "the recorded occurrence must suppress the scan's phantom sites: {result}"
+        );
+        assert!(
+            result.contains("app.ts:5"),
+            "the surviving site must be the recorded one: {result}"
+        );
+    }
+
+    /// A site whose only backing edge was matched by leaf name must say so.
+    /// `reference_sites` used to select `path` and `line` alone and never touch
+    /// `edges`, the only table holding provenance, so a wholly fabricated site
+    /// was served as a resolved fact.
+    #[test]
+    fn find_references_marks_a_name_matched_site() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("", "", "grid.ts", "typescript", "fn:row"),
+            "function",
+        );
+        let guessed = Node::new(
+            VName::new("", "", "app.ts", "typescript", "fn:render"),
+            "function",
+        );
+        let resolved = Node::new(
+            VName::new("", "", "page.ts", "typescript", "fn:draw"),
+            "function",
+        );
+        let typed = Node::new(
+            VName::new("", "", "types.ts", "typescript", "fn:shape"),
+            "function",
+        );
+        for n in [&callee, &guessed, &resolved, &typed] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(
+                &Edge::new(guessed.id, callee.id, EdgeKind::RefCall)
+                    .with_provenance("tree-sitter".to_string()),
+            )
+            .unwrap();
+        // `put_edge` hardcodes tree-sitter provenance; the semantic writer is
+        // the one that records a compiler-resolved edge.
+        store
+            .put_edge_lsif(&Edge::new(resolved.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        // `typed` has an occurrence but no edge of its own: a resolved
+        // reference that is not a call (#650). Nothing to flag there either.
+        store
+            .record_edge_sites(&[
+                (guessed.id, callee.id, 7, None),
+                (resolved.id, callee.id, 9, None),
+                (typed.id, callee.id, 3, None),
+            ])
+            .unwrap();
+
+        let structured = find_references_structured(&store, "row", None);
+        assert_eq!(structured.total, Some(3));
+        let flags: Vec<(String, bool)> = structured
+            .references
+            .iter()
+            .map(|r| (format!("{}:{}", r.path, r.line), r.heuristic))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("app.ts:7".to_string(), true),
+                ("page.ts:9".to_string(), false),
+                ("types.ts:3".to_string(), false),
+            ],
+            "only the name-matched site is flagged"
+        );
+
+        let text = find_references(&store, "row", None);
+        assert!(
+            text.contains(&format!("app.ts:7{HEURISTIC_MARKER}")),
+            "the name-matched site carries the caveat: {text}"
+        );
+        assert!(
+            !text.contains(&format!("page.ts:9{HEURISTIC_MARKER}")),
+            "the compiler-resolved site carries no caveat: {text}"
+        );
+    }
+
+    /// A name-matched call edge costs one character on the row plus one legend
+    /// line at the end, not 49 bytes on every row. On a Phase-A-only language
+    /// essentially every call edge is name-matched, so the long marker was
+    /// spending the output budget on the caveat instead of on callers.
+    #[test]
+    fn a_name_matched_caller_row_carries_the_sigil_and_one_legend() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let callee = Node::new(VName::new("", "", "grid.go", "go", "fn:row"), "function");
+        let a = Node::new(VName::new("", "", "a.go", "go", "fn:run_a"), "function").with_line(2);
+        let b = Node::new(VName::new("", "", "b.go", "go", "fn:run_b"), "function").with_line(3);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for n in [&callee, &a, &b] {
+            store.put_node(n).unwrap();
+        }
+        for caller in [&a, &b] {
+            store
+                .put_edge(
+                    &Edge::new(caller.id, callee.id, EdgeKind::RefCall)
+                        .with_provenance("tree-sitter".to_string()),
+                )
+                .unwrap();
+        }
+
+        let out = get_callers(&store, "row", None);
+        assert_eq!(
+            out.matches(HEURISTIC_SIGIL_ROW).count(),
+            2,
+            "one sigil per marked row: {out}"
+        );
+        assert_eq!(
+            out.matches(HEURISTIC_LEGEND).count(),
+            1,
+            "the legend is printed once, not per row: {out}"
+        );
+        assert!(
+            !out.contains("[heuristic:"),
+            "the per-row long marker is gone: {out}"
+        );
+    }
+
+    /// Every structural tool routed through `collect_global` takes a `repo`
+    /// argument whose only legal values are the registry's keys, and every key
+    /// is an absolute repo root. The shared `validate_mcp_arg` rejects those
+    /// outright, so naming a real repo returned an empty envelope from all of
+    /// them.
+    #[test]
+    fn a_global_tool_answers_for_a_repo_named_by_its_absolute_key() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db).unwrap();
+            let callee = Node::new(
+                VName::new("", "", "pay.rs", "rust", "fn:charge"),
+                "function",
+            );
+            let caller = Node::new(
+                VName::new("", "", "cart.rs", "rust", "fn:checkout"),
+                "function",
+            );
+            store.put_node(&callee).unwrap();
+            store.put_node(&caller).unwrap();
+            store
+                .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        // Registry keys are `repo_root.to_string_lossy()`, i.e. absolute paths.
+        let key = dir.path().to_string_lossy().to_string();
+        let repos: HashMap<String, PathBuf> = HashMap::from([(key.clone(), db)]);
+
+        let result = get_callers_global(&repos, "charge", None, Some(&key));
+        assert!(
+            result.contains("cart.rs"),
+            "a repo named by its absolute registry key must answer: {result}"
         );
     }
 
@@ -9054,6 +12294,7 @@ mod tests {
                 direction: "both",
                 depth: 1,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "",
                 path_prefix: "",
@@ -9076,6 +12317,7 @@ mod tests {
                 direction: "both",
                 depth: 1,
                 kind_filter: "file",
+                provenance: "",
                 token_budget: 0,
                 mode: "",
                 path_prefix: "",
@@ -9122,6 +12364,7 @@ mod tests {
                 direction: "deps",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "",
                 path_prefix: "",
@@ -9136,6 +12379,7 @@ mod tests {
                 direction: "deps",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 30,
                 mode: "",
                 path_prefix: "",
@@ -9200,6 +12444,7 @@ mod tests {
                 direction: "both",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "overview",
                 path_prefix: "",
@@ -9260,6 +12505,7 @@ mod tests {
                 direction: "both",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "overview",
                 path_prefix: "",
@@ -9303,6 +12549,7 @@ mod tests {
                 direction: "both",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "overview",
                 path_prefix: "pkg/a/",
@@ -9374,6 +12621,7 @@ mod tests {
                 direction: "both",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "overview",
                 path_prefix: "pkg/a/",
@@ -9400,6 +12648,7 @@ mod tests {
                 direction: "both",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "badmode",
                 path_prefix: "",
@@ -9418,6 +12667,7 @@ mod tests {
                 direction: "both",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "overview",
                 path_prefix: "../etc/passwd",
@@ -9502,6 +12752,608 @@ mod tests {
     }
 
     #[test]
+    fn subsystem_brief_never_cuts_a_call_that_leaves_the_component() {
+        // Ranking callees by reach alone promotes widely-shared helpers and
+        // dropped travsr-retrieval entirely when tracing get_context, whose whole
+        // job is PPR and knapsack. A call that leaves the component is a contract
+        // between components and must survive any width limit.
+        use travsr_core::EdgeKind;
+        let entry = make_node("crates/a/src/lib.rs", "fn:entry");
+        let popular = make_node("crates/a/src/util.rs", "fn:popular");
+        let crosser = make_node("crates/b/src/lib.rs", "fn:crosser");
+        let noise = make_node("crates/a/src/noise.rs", "fn:noise");
+        // Give the same-component helpers more reach than the crossing call.
+        let mut edges = vec![
+            (entry.id, popular.id, EdgeKind::RefCall),
+            (entry.id, crosser.id, EdgeKind::RefCall),
+            (entry.id, noise.id, EdgeKind::RefCall),
+        ];
+        for extra in [&popular, &noise] {
+            edges.push((crosser.id, extra.id, EdgeKind::RefCall));
+        }
+        let store = make_store(&[entry, popular, crosser, noise], &edges);
+
+        // width = 1 keeps a single same-component callee, yet the crossing call
+        // must still be there.
+        let out = get_subsystem_brief(&store, "fn:entry", "", "", 3, 1, 8_000);
+        assert!(
+            out.contains("crosser"),
+            "a cross-component call must survive width=1:\n{out}"
+        );
+        assert!(
+            out.contains("Calls that leave the component"),
+            "crossings section must be present:\n{out}"
+        );
+    }
+
+    #[test]
+    fn type_and_entry_detection_covers_every_indexed_language() {
+        // The analyzers keep each language's own word in `kind` and normalise the
+        // SIGNATURE PREFIX. Matching on `kind` found no types at all in C, C++,
+        // Dart, Kotlin, Objective-C or Swift, because a union is kind="union"
+        // signature="struct:", a mixin and a Kotlin object are both "class:", and
+        // a typedef and a C# delegate are both "type:".
+        for sig in [
+            "struct:CUnion",     // C / C++ union
+            "struct:RustStruct", // Rust, Go
+            "class:DartMixin",   // Dart mixin, Kotlin object, Scala trait
+            "protocol:ObjCProto",
+            "interface:TsInterface",
+            "type:CsDelegate", // typedef, using-alias, delegate
+            "enum:JavaEnum",
+            "trait:RustTrait",
+            "actor:SwiftActor",
+        ] {
+            assert!(is_type_signature(sig), "must be a type: {sig}");
+        }
+        for sig in [
+            "fn:helper",
+            "method:Store.open",
+            "field:VName.path",
+            "var:x",
+            "const:LIMIT",
+            "impl:Foo",
+            "macro:m",
+            "import:os",
+        ] {
+            assert!(!is_type_signature(sig), "must not be a type: {sig}");
+        }
+
+        // Entry points: a free function in Rust/Go/C/C++/Python/Dart, a static
+        // method on a class in Java/Kotlin/C#/Scala.
+        assert!(is_entry_point_signature("fn:main"));
+        assert!(is_entry_point_signature("method:App.main"));
+        assert!(is_entry_point_signature("method:Program.Main"));
+        assert!(!is_entry_point_signature("fn:main_worktree_root"));
+        assert!(!is_entry_point_signature("fn:domain"));
+        assert!(!is_entry_point_signature("method:App.maintain"));
+    }
+
+    #[test]
+    fn architecture_brief_components_match_the_subsystem_tool() {
+        // Three different definitions of "component" across the generators is
+        // what made their outputs disagree. Both tools must use one rule.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+        let arch = get_architecture_brief(&store, "", 8_000);
+        let sub = get_subsystem_brief(&store, "fn:a", "", "", 3, 6, 8_000);
+        for comp in ["crates/alpha", "crates/beta"] {
+            assert!(
+                arch.contains(comp),
+                "architecture brief names {comp}:\n{arch}"
+            );
+            assert!(sub.contains(comp), "subsystem brief names {comp}:\n{sub}");
+        }
+    }
+
+    #[test]
+    fn invariants_catch_a_broken_rule_and_a_renamed_component() {
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+
+        let rules = r#"{"invariants":[
+            {"name":"alpha is pure","components":["crates/alpha"],"mayDependOn":[],"because":"r1"},
+            {"name":"gone","components":["crates/removed"],"mayDependOn":[],"because":"r2"},
+            {"name":"beta is fine","components":["crates/beta"],"mayDependOn":[],"because":"r3"}
+        ]}"#;
+        let report = check_architecture_invariants(&store, rules, "").unwrap();
+        let out = &report.text;
+
+        assert!(out.contains("VIOLATED alpha is pure"), "{out}");
+        assert!(out.contains("depends on 'crates/beta'"), "{out}");
+        // A rule naming a component the graph lacks must FAIL. Passing it
+        // vacuously would let a rename silently retire the rule protecting it.
+        assert!(out.contains("VIOLATED gone"), "{out}");
+        assert!(out.contains("not a component in this graph"), "{out}");
+        assert!(out.contains("holds    beta is fine"), "{out}");
+        assert_eq!(
+            report.violations, 2,
+            "the caller keys its exit code on this:\n{out}"
+        );
+
+        // A misspelled key must be rejected, not dropped. Dropped, the rule has
+        // no constraint left and holds over nothing.
+        let misspelled = r#"{"invariants":[
+            {"name":"alpha is pure","components":["crates/alpha"],"mayDependsOn":[]}
+        ]}"#;
+        let err = check_architecture_invariants(&store, misspelled, "")
+            .err()
+            .expect("an unknown rule key must be an error");
+        assert!(err.contains("mayDependsOn"), "{err}");
+
+        // An empty index must still fail a rule that names a component, rather
+        // than returning before any rule is checked.
+        let empty = make_store(&[], &[]);
+        let report = check_architecture_invariants(&empty, rules, "").unwrap();
+        assert_eq!(report.violations, 3, "{}", report.text);
+        assert!(
+            report
+                .text
+                .contains("rule names 'crates/alpha', which is not a component"),
+            "{}",
+            report.text
+        );
+    }
+
+    #[test]
+    fn invariants_reject_a_rules_file_that_does_not_parse() {
+        // Returned as a report, a parse error carried no violation marker and
+        // `travsr invariants` exited 0 on a file it could not read.
+        let store = make_store(&[make_node("crates/alpha/src/lib.rs", "fn:a")], &[]);
+        let trailing_comma = r#"{"invariants":[
+            {"name":"alpha is pure","components":["crates/alpha"],"mayDependOn":[]},
+        ]}"#;
+        assert!(check_architecture_invariants(&store, trailing_comma, "").is_err());
+        // The shipped file's top-level `$comment` must still parse.
+        let commented = r#"{"$comment":"why","invariants":[{"name":"n","acyclic":true}]}"#;
+        assert!(check_architecture_invariants(&store, commented, "").is_ok());
+    }
+
+    #[test]
+    fn a_root_level_file_belongs_to_the_root_component() {
+        // `main.go` at the root was its own component named after the file.
+        assert_eq!(subsystem_component_of("main.go"), "(root)");
+        assert_eq!(subsystem_component_of("cmd/tool/main.go"), "cmd/tool");
+        assert_eq!(subsystem_component_of("pkg/util/x.go"), "pkg/util");
+    }
+
+    #[test]
+    fn architecture_brief_ranks_types_by_references_not_members() {
+        // Counting every edge kind ranked a type by how many members it defines:
+        // `defines/binding` from a type to each member folded into the type.
+        use travsr_core::EdgeKind;
+        let big = make_node("crates/a/src/lib.rs", "struct:Big");
+        let used = make_node("crates/a/src/lib.rs", "struct:Used");
+        let user = make_node("crates/b/src/lib.rs", "fn:user");
+        let mut nodes = vec![big.clone(), used.clone(), user.clone()];
+        let mut edges = vec![(user.id, used.id, EdgeKind::RefCall)];
+        for m in ["x", "y", "z"] {
+            let member = make_node("crates/a/src/lib.rs", &format!("method:Big.{m}"));
+            edges.push((big.id, member.id, EdgeKind::DefinesBinding));
+            nodes.push(member);
+        }
+        let store = make_store(&nodes, &edges);
+        let out = get_architecture_brief(&store, "", 30_000);
+        assert!(
+            out.contains("most referenced types: Used (1), Big (0)"),
+            "only references may count toward a type's rank:\n{out}"
+        );
+    }
+
+    #[test]
+    fn architecture_brief_names_an_unknown_provenance() {
+        // A typo matched no edges and the brief blamed missing analysis.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+        let out = get_architecture_brief(&store, "ratifed", 8_000);
+        assert!(
+            out.contains("unknown provenance 'ratifed'"),
+            "must name the filter as the cause:\n{out}"
+        );
+        assert!(
+            !out.contains("has not run"),
+            "must not blame missing analysis:\n{out}"
+        );
+    }
+
+    #[test]
+    fn invariants_and_the_brief_agree_on_components() {
+        // They gather separately: the brief also needs symbols, types and entry
+        // points. Sharing `subsystem_component_of`, the noise/test filters and
+        // `is_support_component` is what keeps them describing one graph, and
+        // this holds them to it. Left unchecked, the invariant view counted
+        // supporting directories the brief drops and reported a cycle between
+        // two scratch trees as an architecture violation.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let t = make_node("crates/alpha/tests/it.rs", "fn:t");
+        let store = make_store(
+            &[a.clone(), b.clone(), t.clone()],
+            &[
+                (a.id, b.id, EdgeKind::RefCall),
+                (t.id, b.id, EdgeKind::RefCall),
+            ],
+        );
+
+        let (components, edges) = component_dependency_graph(&store, "");
+        let brief = get_architecture_brief(&store, "", 30_000);
+        for c in &components {
+            assert!(brief.contains(c.as_str()), "brief is missing {c}:\n{brief}");
+        }
+        // Compare the numbers, not a pluralised sentence: the brief writes
+        // "1 edge" and "2 edges", and this assertion should not care which.
+        assert!(
+            brief.contains(&format!("- {} component", components.len()))
+                && brief.contains(&format!(", {} edge", edges.len())),
+            "counts must disagree with neither: expected {} components / {} edges:\n{brief}",
+            components.len(),
+            edges.len()
+        );
+    }
+
+    #[test]
+    fn architecture_brief_caps_its_lists_and_says_what_it_dropped() {
+        // Unbounded, the byte limit did the cutting: on kubernetes the brief
+        // emitted 346 of 3379 components, ended mid-row on `| depends on 0 | 5 f`,
+        // and lost its last two sections with no sign they had existed. A ranked
+        // head with an honest count is an answer; a silent tenth of one is not.
+        use travsr_core::EdgeKind;
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let hub = make_node("crates/hub/src/lib.rs", "fn:hub");
+        nodes.push(hub.clone());
+        for i in 0..(LIST_CAP + 25) {
+            let n = make_node(&format!("crates/c{i}/src/lib.rs"), &format!("fn:f{i}"));
+            edges.push((n.id, hub.id, EdgeKind::RefCall));
+            nodes.push(n);
+        }
+        let store = make_store(&nodes, &edges);
+        let out = get_architecture_brief(&store, "", 30_000);
+
+        let listed = out
+            .lines()
+            .filter(|l| l.starts_with("- ") && l.contains("| layer "))
+            .count();
+        assert_eq!(
+            listed, LIST_CAP,
+            "the component list must stop at the cap, not run to the byte limit:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("({LIST_CAP} of {})", nodes.len())),
+            "the heading must say how many of how many:\n{out}"
+        );
+        let hidden = nodes.len() - LIST_CAP;
+        assert!(
+            out.contains(&format!("and {hidden} more components, ranked lower")),
+            "the remainder must be disclosed, not dropped silently:\n{out}"
+        );
+        // Every section must survive; losing the tail is what the byte limit did.
+        for section in [
+            "## Shape",
+            "## Components, by how many others depend on them",
+            "## What each component owns",
+            "## What this brief cannot tell you",
+        ] {
+            assert!(out.contains(section), "section {section} missing:\n{out}");
+        }
+    }
+
+    #[test]
+    fn a_brief_is_never_cut_mid_line() {
+        // `... | depends on 0 | 5 f` was a half-written fact presented as data.
+        // Rows carry `->`, because escaping is what defeated the first fix: it
+        // expands each angle bracket to four bytes AFTER the trim, so a body
+        // trimmed first came back over the limit and was cut at a raw byte
+        // boundary anyway — including through the truncation notice itself,
+        // which reached the caller as `[brief trun`.
+        let long = (0..400)
+            .map(|i| format!("- row {i} -> with enough text to cross the limit somewhere\n"))
+            .collect::<String>();
+        let out = render_brief(&long, 900);
+        assert!(out.len() <= 900, "must respect the limit: {}", out.len());
+        assert!(
+            out.ends_with("for the rest]\n"),
+            "the truncation notice must survive whole:\n{out}"
+        );
+        for line in out.lines().filter(|l| l.starts_with("- row")) {
+            assert!(
+                line.ends_with("somewhere"),
+                "every surviving row must be whole, got: {line:?}"
+            );
+        }
+        // A body that fits is escaped but not truncated.
+        assert_eq!(render_brief("- a -> b\n", 900), "- a -&gt; b\n");
+        // A multi-byte character astride the cut must not panic the tool.
+        let wide = (0..400)
+            .map(|i| format!("- ròw {i} -> ünicøde enough to cross the limit\n"))
+            .collect::<String>();
+        assert!(render_brief(&wide, 900).len() <= 900);
+    }
+
+    #[test]
+    fn architecture_brief_discloses_an_empty_dependency_graph() {
+        // Asserting independence from an empty graph called a Go file that
+        // imports and calls another package "separately buildable".
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a, b], &[]);
+        let out = get_architecture_brief(&store, "", 8_000);
+        assert!(
+            out.contains("No dependencies resolved"),
+            "must disclose rather than assert independence:\n{out}"
+        );
+        assert!(
+            out.contains("never as none"),
+            "must say absence is unknown:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_component_is_a_directory_that_owns_code() {
+        // `is_structural_noise` drops doc chunks but keeps the `kind = "file"`
+        // node beside them, so every path holding no symbols at all became its
+        // own component: `CLAUDE.md`, `Cargo.toml`, `README.md` and nine more
+        // root-level files, each reported as "1 files, 0 symbols". On this
+        // repository that was 12 of 39 components. A synthetic angle-bracket
+        // pseudo-path is not a directory either, and appeared at layer 3.
+        use travsr_core::EdgeKind;
+        let real = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let dep = make_node("crates/beta/src/lib.rs", "fn:b");
+        let readme = make_kind("README.md", "file", "file");
+        let manifest = make_kind("Cargo.toml", "file", "file");
+        let synthetic = make_kind("<cgo_synthetic>/main.go", "fn:GoCallback", "function");
+        let store = make_store(
+            &[real.clone(), dep.clone(), readme, manifest, synthetic],
+            &[(real.id, dep.id, EdgeKind::RefCall)],
+        );
+
+        let out = get_architecture_brief(&store, "", 30_000);
+        assert!(out.contains("2 components"), "only the two crates:\n{out}");
+        for phantom in ["README.md", "Cargo.toml", "cgo_synthetic"] {
+            assert!(
+                !out.contains(phantom),
+                "{phantom} is not a component:\n{out}"
+            );
+        }
+        // And the invariant view must agree, or a rule is checked against a
+        // different graph from the one the brief describes.
+        let (components, _) = component_dependency_graph(&store, "");
+        assert_eq!(
+            components.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            vec!["crates/alpha", "crates/beta"]
+        );
+    }
+
+    #[test]
+    fn architecture_brief_layers_a_diamond_by_longest_path() {
+        // a -> b -> c with a -> c as well. `b` depends on `c`, so it cannot share
+        // `c`'s layer, and `a` is two hops from the foundation even though it
+        // also reaches it in one. The layering leans on `arch_sccs` emitting in
+        // reverse topological order; this is what pins that it still does.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let c = make_node("crates/gamma/src/lib.rs", "fn:c");
+        let store = make_store(
+            &[a.clone(), b.clone(), c.clone()],
+            &[
+                (a.id, b.id, EdgeKind::RefCall),
+                (b.id, c.id, EdgeKind::RefCall),
+                (a.id, c.id, EdgeKind::RefCall),
+            ],
+        );
+        let out = get_architecture_brief(&store, "", 30_000);
+        for (comp, layer) in [("crates/gamma", 0), ("crates/beta", 1), ("crates/alpha", 2)] {
+            assert!(
+                out.contains(&format!("- {comp} | layer {layer} |")),
+                "{comp} belongs on layer {layer}:\n{out}"
+            );
+        }
+        assert!(out.contains("3 layers"), "three layers, not two:\n{out}");
+    }
+
+    #[test]
+    fn architecture_brief_caps_the_members_of_one_cycle() {
+        // A cycle is a single SCC, so one of them can span the whole repository.
+        // Uncapped, a 140-component ring wrote one 5311-character line, and at a
+        // small token_budget that line WAS the brief: the component list, the
+        // edges and every later section were trimmed away behind it.
+        use travsr_core::EdgeKind;
+        let n = DETAIL_CAP + 5;
+        let nodes: Vec<_> = (0..n)
+            .map(|i| make_node(&format!("crates/c{i:03}/src/lib.rs"), &format!("fn:f{i}")))
+            .collect();
+        let edges: Vec<_> = (0..n)
+            .map(|i| (nodes[i].id, nodes[(i + 1) % n].id, EdgeKind::RefCall))
+            .collect();
+        let store = make_store(&nodes, &edges);
+        let out = get_architecture_brief(&store, "", 30_000);
+
+        let cycle_line = out
+            .lines()
+            .find(|l| l.contains("&lt;-&gt;"))
+            .unwrap_or_else(|| panic!("the ring must be reported as a cycle:\n{out}"));
+        assert_eq!(
+            cycle_line.matches("crates/c").count(),
+            DETAIL_CAP,
+            "exactly DETAIL_CAP members are named: {cycle_line}"
+        );
+        assert!(
+            cycle_line.ends_with(&format!("and {} more in this cycle", n - DETAIL_CAP)),
+            "the rest must be disclosed, not dropped: {cycle_line}"
+        );
+        assert!(
+            out.contains("## Components, by how many others depend on them"),
+            "the sections behind the cycle must survive it:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_called_from_is_external_in_component_mode() {
+        // A component's entries are by definition what something OUTSIDE calls,
+        // so a caller inside it is not calling in. travsr-retrieval's own
+        // `bfs_fallback` was listed under "Called from" beside the travsr-mcp
+        // callers, which answers a different question from the one the heading
+        // asks.
+        use travsr_core::EdgeKind;
+        let entry = make_node("crates/lib/src/api.rs", "fn:entry");
+        let sibling = make_node("crates/lib/src/internal.rs", "fn:sibling");
+        let outsider = make_node("crates/app/src/main.rs", "fn:outsider");
+        let store = make_store(
+            &[entry.clone(), sibling.clone(), outsider.clone()],
+            &[
+                (outsider.id, entry.id, EdgeKind::RefCall),
+                (sibling.id, entry.id, EdgeKind::RefCall),
+            ],
+        );
+
+        let out = get_subsystem_brief(&store, "", "crates/lib", "", 3, 6, 8_000);
+        let called_from = out
+            .split("## Called from")
+            .nth(1)
+            .unwrap_or_else(|| panic!("section must exist:\n{out}"))
+            .split("## Call spine")
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            called_from.contains("outsider"),
+            "the external caller must be listed: {called_from}"
+        );
+        assert!(
+            !called_from.contains("sibling"),
+            "a caller inside the component is not calling in: {called_from}"
+        );
+
+        // Naming the symbol directly asks a different question, and there every
+        // caller is wanted.
+        let by_entry = get_subsystem_brief(&store, "fn:entry", "", "", 3, 6, 8_000);
+        let called_from = by_entry
+            .split("## Called from")
+            .nth(1)
+            .unwrap()
+            .split("## Call spine")
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            called_from.contains("sibling") && called_from.contains("outsider"),
+            "entry mode lists every caller: {called_from}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_is_deterministic_across_runs() {
+        // `hit` and `callers` were built from HashMaps and sorted on reach alone,
+        // so equal-reach candidates kept whatever order the map yielded and the
+        // same query returned different symbols across runs. CLAUDE.md requires
+        // the structural tier to be same-input-same-output.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/a/src/one.rs", "fn:dup");
+        let b = make_node("crates/b/src/two.rs", "fn:dup");
+        let c1 = make_node("crates/c/src/x.rs", "fn:c1");
+        let c2 = make_node("crates/c/src/y.rs", "fn:c2");
+        // Both `fn:dup` definitions get exactly one caller, so reach ties.
+        let edges = vec![
+            (c1.id, a.id, EdgeKind::RefCall),
+            (c2.id, b.id, EdgeKind::RefCall),
+        ];
+        let store = make_store(&[a, b, c1, c2], &edges);
+        let first = get_subsystem_brief(&store, "fn:dup", "", "", 3, 6, 8_000);
+        for _ in 0..12 {
+            assert_eq!(
+                get_subsystem_brief(&store, "fn:dup", "", "", 3, 6, 8_000),
+                first,
+                "identical queries must return identical briefs"
+            );
+        }
+    }
+
+    #[test]
+    fn subsystem_brief_reach_and_calls_describe_one_universe() {
+        // Reach counted every edge while calls counted only non-test ones, so the
+        // brief could say "nothing in the graph calls it" and print a non-zero
+        // reach two lines later, both as fact.
+        use travsr_core::EdgeKind;
+        let target = make_node("crates/a/src/lib.rs", "fn:target");
+        let real = make_node("crates/a/src/caller.rs", "fn:real_caller");
+        let mut test_caller = make_node("crates/a/tests/it.rs", "fn:test_caller");
+        test_caller.test_role = travsr_core::TestRole::EntryPoint;
+        let edges = vec![
+            (real.id, target.id, EdgeKind::RefCall),
+            (test_caller.id, target.id, EdgeKind::RefCall),
+        ];
+        let store = make_store(&[target, real, test_caller], &edges);
+        let out = get_subsystem_brief(&store, "fn:target", "", "", 3, 6, 8_000);
+        assert!(
+            out.contains("real_caller"),
+            "the non-test caller must be listed:\n{out}"
+        );
+        assert!(
+            !out.contains("test_caller"),
+            "the test caller must be excluded:\n{out}"
+        );
+        // One caller survives exclusion, so reach must be 1 and not 2.
+        assert!(
+            out.contains("reach=1"),
+            "reach must count only what calls counts:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_distinguishes_a_bad_filter_from_a_missing_call_graph() {
+        // Routing an unrecognised provenance through the same empty-calls branch
+        // told users with a complete semantic index to install a toolchain they
+        // already had.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/a/src/lib.rs", "fn:a");
+        let b = make_node("crates/b/src/lib.rs", "fn:b");
+        let store = make_store(
+            &[a, b],
+            &[(
+                make_node("crates/a/src/lib.rs", "fn:a").id,
+                make_node("crates/b/src/lib.rs", "fn:b").id,
+                EdgeKind::RefCall,
+            )],
+        );
+        let out = get_subsystem_brief(&store, "fn:a", "", "nonsense-filter", 3, 6, 8_000);
+        assert!(
+            out.contains("no call edges matched provenance"),
+            "must name the filter as the cause:\n{out}"
+        );
+        assert!(
+            !out.contains("lang install"),
+            "must not tell a user with a call graph to install an analyzer:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_says_so_when_there_is_no_call_graph() {
+        // Without Phase B there are no ref/call edges, so there is no flow. Say
+        // that, rather than returning an empty document that reads as "nothing
+        // happens here".
+        let a = make_node("crates/a/src/lib.rs", "fn:a");
+        let b = make_node("crates/b/src/lib.rs", "fn:b");
+        let store = make_store(&[a, b], &[]);
+        let out = get_subsystem_brief(&store, "fn:a", "", "", 3, 6, 8_000);
+        assert!(
+            out.contains("no call edges"),
+            "must disclose the missing call graph:\n{out}"
+        );
+        assert!(
+            out.contains("lang install"),
+            "must say how to get one:\n{out}"
+        );
+    }
+
+    #[test]
     fn get_repo_map_ranks_regions_by_dependents() {
         let store = two_crate_store(false);
         let result = get_repo_map(&store);
@@ -9518,6 +13370,28 @@ mod tests {
         assert!(
             result.contains("dependents: 1"),
             "core dependents shown:\n{result}"
+        );
+    }
+
+    #[test]
+    fn get_repo_map_counts_direct_dependents_only() {
+        // a -> b -> c: c has one direct dependent. A transitive count gives it
+        // two, and on a funnel-shaped graph lets a leaf outrank what it serves.
+        use travsr_core::EdgeKind;
+        let a = make_node("alpha/lib.rs", "fn:a");
+        let b = make_node("beta/lib.rs", "fn:b");
+        let c = make_node("gamma/lib.rs", "fn:c");
+        let store = make_store(
+            &[a.clone(), b.clone(), c.clone()],
+            &[
+                (a.id, b.id, EdgeKind::RefCall),
+                (b.id, c.id, EdgeKind::RefCall),
+            ],
+        );
+        let result = get_repo_map(&store);
+        assert!(
+            result.contains("gamma  dependents: 1 "),
+            "c must count one direct dependent, not two:\n{result}"
         );
     }
 
@@ -9675,6 +13549,7 @@ mod tests {
                 direction: "callers",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "",
                 path_prefix: "",
@@ -9731,6 +13606,7 @@ mod tests {
                 direction: "deps",
                 depth: 2,
                 kind_filter: "",
+                provenance: "",
                 token_budget: 0,
                 mode: "",
                 path_prefix: "",
@@ -10006,6 +13882,46 @@ fn parse_symbol_tokens(symbols_arg: &str) -> Vec<SymbolToken<'_>> {
 /// (no partial symbol output) once the token budget is exhausted — except the
 /// first resolved symbol is always included so a single large `Full` definition
 /// never returns empty.
+/// Appended to a snippet header when the source file changed after the index
+/// recorded the symbol's line span.
+const STALE_SPAN_MARKER: &str =
+    " [stale: file edited since indexing, this span may not be this symbol]";
+
+/// Has `path` changed on disk since the indexer last hashed it?
+///
+/// `files.sha256` exists for exactly this comparison (the batch writer calls it
+/// "needed for SHA256 delta detection"), so this reuses that column rather than
+/// adding a second freshness signal. The encoding matches the writer's
+/// lowercase `{:02x}` hex (`travsr-daemon::hex_encode`).
+///
+/// Why this matters (#895): `snippet_for_node_capped` reads the *current* file
+/// at the *stored* line. An uncommitted edit that inserts or deletes lines
+/// shifts every symbol below it, so the extractor returns a well-formed span of
+/// unrelated code under the requested name, with nothing to distrust. Dogfooded:
+/// 6 of 9 symbols in one file came back wrong, split exactly at the edit point.
+///
+/// `false` when no hash is recorded: an index predating the `files` table, or a
+/// path the indexer never hashed. Absence of evidence is not drift, and marking
+/// every symbol of such a repo would be noise.
+fn file_drifted_since_index(store: &SqliteStore, repo_root: &std::path::Path, path: &str) -> bool {
+    let Ok(Some(indexed)) = store.get_file_hash(path) else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(repo_root.join(path)) else {
+        // Unreadable is already handled by the snippet reader returning None.
+        return false;
+    };
+    use sha2::{Digest, Sha256};
+    let actual = Sha256::digest(&bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+    actual != indexed
+}
+
 fn get_snippets_body(
     store: &SqliteStore,
     symbols_arg: &str,
@@ -10094,14 +14010,21 @@ fn get_snippets_body(
     let mut parts: Vec<String> = Vec::new();
     let mut tokens_used: usize = 0;
     let mut n_with_snippet: usize = 0;
+    // One hash per file, not per symbol: a request routinely names several
+    // symbols from the same file (that is how #895 was found).
+    let mut drift_cache: HashMap<String, bool> = HashMap::new();
 
     for node in &resolved {
+        let drifted = *drift_cache
+            .entry(node.vname.path.clone())
+            .or_insert_with(|| file_drifted_since_index(store, &repo_root, &node.vname.path));
         let header = format!(
-            "{} ({}) \u{2014} {} [package: {}]",
+            "{} ({}) \u{2014} {} [package: {}]{}",
             display_label(node),
             node.kind,
             node.vname.path,
-            node.package
+            node.package,
+            if drifted { STALE_SPAN_MARKER } else { "" }
         );
         let skeleton = |n: &CoreNode| skeleton_for_node_inner(n, &repo_root).map(|s| s.render());
 
@@ -10276,6 +14199,7 @@ mod snippet_tests {
                         edges: vec![],
                         vname_path: path,
                         new_hash: "deadbeef".to_string(),
+                        source: None,
                     }],
                     false,
                 )
@@ -10496,6 +14420,63 @@ mod snippet_tests {
             result.contains("0 with snippets"),
             "snippet count must be 0: {result}"
         );
+    }
+
+    /// Dogfooded on this repo (#895): `get_snippets` returned the wrong
+    /// function body for 6 of 9 symbols in one file. The index held each symbol
+    /// at its pre-edit line; an uncommitted edit had shifted everything below
+    /// it by +35; `snippet_for_node_capped` read the *current* file at the
+    /// *stored* line and returned a plausible span of unrelated code under the
+    /// requested name. Every symbol above the edit point was correct and every
+    /// symbol below it was wrong, which is what identified line drift as the
+    /// cause rather than name-prefix collision.
+    ///
+    /// A wrong snippet is worse than a missing one: nothing in the output let a
+    /// reader distrust it. `files.sha256` already exists for delta detection, so
+    /// the drift is detectable without new storage.
+    #[test]
+    fn get_snippets_discloses_a_span_whose_file_changed_since_indexing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.ts");
+        let original = "function hello() {\n  return 'hi';\n}\n";
+        std::fs::write(&src, original).unwrap();
+
+        let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
+        let mut store = make_store_with_meta(&[node], dir.path());
+        // The hash the indexer would have recorded for the file as indexed.
+        store
+            .put_file_hash("lib.ts", &sha256_hex_for_test(original.as_bytes()))
+            .unwrap();
+
+        let fresh = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        assert!(
+            !fresh.contains("stale:"),
+            "an unmodified file must not be flagged: {fresh}"
+        );
+
+        // Two lines inserted above the symbol, no reindex: fn:hello is still
+        // recorded at 1..3 but now lives at 3..5, so the stored span no longer
+        // covers it.
+        std::fs::write(&src, format!("// added\n// added\n{original}")).unwrap();
+
+        let drifted = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        assert!(
+            drifted.contains("stale:"),
+            "a file edited since indexing must be disclosed, not answered \
+             silently from the stale span: {drifted}"
+        );
+    }
+
+    /// Mirrors `travsr-daemon`'s `hex_encode`: lowercase `{:02x}` over sha256.
+    fn sha256_hex_for_test(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .fold(String::with_capacity(64), |mut s, b| {
+                use std::fmt::Write;
+                let _ = write!(s, "{b:02x}");
+                s
+            })
     }
 
     #[test]
@@ -11663,6 +15644,41 @@ mod snippet_tests {
         );
     }
 
+    /// #874: arming settled with no hook installed (model mismatch, or a sidecar
+    /// that never started). The meta-hook is still present, so `has_embed` is
+    /// true and readiness is armed — without the third state this reads as
+    /// `embeddings: on` over a semantic lane that can never answer.
+    #[test]
+    fn get_context_disabled_reports_disabled_header_and_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let readiness = travsr_store::EmbedReadiness::new();
+        readiness.mark_disabled();
+        readiness.mark_ready();
+        store.set_embed_readiness(readiness);
+        let knn: EmbedKnnFn<'_> = &|_q, _k| vec![];
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, Some(knn));
+        assert!(
+            result.contains("embeddings: disabled"),
+            "a settled-but-unarmed hook must not report `on`; got: {result}"
+        );
+        assert!(
+            !result.contains("exact+lexical+semantic"),
+            "retrieval tier must not claim semantic; got: {result}"
+        );
+        assert!(
+            result.contains("semantic search unavailable"),
+            "must emit the unavailable note; got: {result}"
+        );
+        assert!(
+            !result.contains("warming"),
+            "disabled is settled, not warming; got: {result}"
+        );
+    }
+
     // ── #617 structural-tool Phase-B degraded signals ─────────────────────────
 
     #[test]
@@ -11708,6 +15724,84 @@ mod snippet_tests {
         store.set_meta("phase_b_dirty", "1").unwrap();
         let note = phase_b_degraded_note(&store).expect("must flag stale");
         assert!(note.contains("call-graph edges degraded"), "got: {note}");
+    }
+
+    #[test]
+    fn phase_b_note_not_degraded_when_the_live_overlay_resolved_the_edit() {
+        // dirty, and the overlay resolved its references with nothing pending.
+        // This drops the heavy "degraded, run init" note, but not all caution:
+        // the counts are repo-wide, so a resolved file cannot prove a *separate*
+        // headless edit (which leaves no rows) also came back. So the note is a
+        // light "a few edges may be missing until the next commit", never the
+        // false "results are current".
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let n = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+            "function",
+        )
+        .with_line(1);
+        store.put_node(&n).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "a.rs",
+                &[travsr_store::RefResolution {
+                    src: n.id,
+                    ref_line: 2,
+                    ref_col: 0,
+                    name: "b".into(),
+                    state: "resolved",
+                    resolved_dst: None,
+                }],
+            )
+            .unwrap();
+        let note = phase_b_degraded_note(&store).expect("a light caution must remain");
+        assert!(
+            !note.contains("degraded") && !note.contains("run `travsr init`"),
+            "a resolved overlay must drop the heavy degraded/run-init note, got: {note}"
+        );
+        assert!(
+            note.contains("until the next commit"),
+            "the light caution must still name the commit as the full refresh, got: {note}"
+        );
+    }
+
+    #[test]
+    fn phase_b_note_names_pending_references_instead_of_run_init() {
+        // dirty with an unresolved reference: name the gap honestly, without the
+        // heavy "run travsr init".
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let n = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+            "function",
+        )
+        .with_line(1);
+        store.put_node(&n).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "a.rs",
+                &[travsr_store::RefResolution {
+                    src: n.id,
+                    ref_line: 2,
+                    ref_col: 0,
+                    name: "b".into(),
+                    state: "pending",
+                    resolved_dst: None,
+                }],
+            )
+            .unwrap();
+        let note = phase_b_degraded_note(&store).expect("a pending overlay must note the gap");
+        assert!(
+            note.contains("not yet resolved") && !note.contains("travsr init"),
+            "got: {note}"
+        );
     }
 
     #[test]
@@ -11896,6 +15990,204 @@ mod snippet_tests {
         assert!(out.contains("chk1111"), "head note: {out}");
     }
 
+    // ── RFC-027 section 10: the live overlay is legible, never silent ────────
+
+    /// The note never fires on a clean tree, so it costs an ordinary reader
+    /// nothing, and fires as soon as either half of the overlay is non-empty.
+    #[test]
+    fn the_live_overlay_note_fires_only_when_there_is_an_overlay() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        assert!(
+            live_overlay_note(&store, "a.ts").is_none(),
+            "a repo with no uncommitted edits must get no note"
+        );
+
+        let a = node_with("fn:a", "function", "a.ts");
+        let b = node_with("fn:b", "function", "b.ts");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store
+            .put_edge_live(&travsr_core::Edge::new(
+                a.id,
+                b.id,
+                travsr_core::EdgeKind::RefCall,
+            ))
+            .unwrap();
+
+        let note = live_overlay_note(&store, "a.ts").expect("an overlay must be announced");
+        assert!(note.contains("1 edge resolved"), "singular form: {note}");
+        assert!(
+            note.contains("provenance != live"),
+            "a reader must be told how to get ratified-only truth: {note}"
+        );
+    }
+
+    /// Both halves are reported, because they mean opposite things: live edges
+    /// are extra freshness, pending references are known gaps. Reporting only
+    /// the first would read as pure upside and hide the abstentions.
+    #[test]
+    fn the_live_overlay_note_reports_abstentions_as_well_as_resolutions() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = node_with("fn:a", "function", "a.ts");
+        store.put_node(&a).unwrap();
+        store
+            .replace_ref_resolution_states(
+                &a.vname.corpus,
+                "a.ts",
+                &[travsr_store::RefResolution {
+                    src: a.id,
+                    ref_line: 3,
+                    ref_col: 0,
+                    name: "save".to_string(),
+                    state: "pending",
+                    resolved_dst: None,
+                }],
+            )
+            .unwrap();
+
+        let note = live_overlay_note(&store, "callers in a.ts:3")
+            .expect("a pending reference must be announced");
+        assert!(
+            note.contains("1 reference in the files above detected but not resolved"),
+            "the abstention must be visible: {note}"
+        );
+
+        // Scoped, not ambient: an answer that never mentions `a.ts` must not be
+        // told about `a.ts`'s gaps.
+        assert!(
+            live_overlay_note(&store, "callers in unrelated.ts:9").is_none(),
+            "the pending half must not fire for a file the answer never names"
+        );
+    }
+
+    /// The marker is attached per edge, and only where the edge's confidence
+    /// differs from the default: an un-ratified `live` overlay edge, or a
+    /// name-matched (rather than type-resolved) `ref/call`.
+    #[test]
+    fn only_a_live_or_heuristic_edge_is_marked_in_caller_output() {
+        let ratified = travsr_core::Edge::new(
+            travsr_core::NodeId(1),
+            travsr_core::NodeId(2),
+            travsr_core::EdgeKind::RefCall,
+        );
+        assert_eq!(
+            provenance_marker(&ratified),
+            "",
+            "an unlabelled edge is not marked"
+        );
+
+        let mut scip = ratified.clone();
+        scip.provenance = Some("scip".to_string());
+        assert_eq!(
+            provenance_marker(&scip),
+            "",
+            "a type-resolved edge is not marked"
+        );
+
+        // A `ref/call` labelled tree-sitter came from leaf-name matching in
+        // `resolve_unresolved_calls`, not from a compiler, so it is marked.
+        let mut ts_call = ratified.clone();
+        ts_call.provenance = Some("tree-sitter".to_string());
+        assert_eq!(
+            provenance_marker(&ts_call),
+            HEURISTIC_SIGIL_ROW,
+            "a name-matched call edge must carry the sigil"
+        );
+        assert!(
+            HEURISTIC_LEGEND.contains("matched by name, not resolved by type"),
+            "the legend must spell the sigil out in the CLI's words"
+        );
+
+        // Phase A's own structural edges are tree-sitter too, and are facts
+        // read off the AST. They must stay unmarked.
+        let mut ts_structural = travsr_core::Edge::new(
+            travsr_core::NodeId(1),
+            travsr_core::NodeId(2),
+            travsr_core::EdgeKind::DefinesBinding,
+        );
+        ts_structural.provenance = Some("tree-sitter".to_string());
+        assert_eq!(
+            provenance_marker(&ts_structural),
+            "",
+            "a structural Phase A edge is not a name guess"
+        );
+
+        let mut live = ratified.clone();
+        live.provenance = Some("live".to_string());
+        assert!(
+            provenance_marker(&live).contains("not yet ratified"),
+            "a live edge must say so"
+        );
+    }
+
+    /// The filter defaults to returning everything, so an existing caller keeps
+    /// the fresher graph; `ratified` is the opt-in for ground truth only.
+    #[test]
+    fn the_provenance_filter_defaults_to_everything() {
+        assert!(provenance_allowed("", "live"));
+        assert!(provenance_allowed("", "scip"));
+
+        assert!(!provenance_allowed("ratified", "live"));
+        assert!(provenance_allowed("ratified", "tree-sitter"));
+        assert!(provenance_allowed("ratified", "scip"));
+
+        assert!(provenance_allowed("live", "live"));
+        assert!(!provenance_allowed("live", "scip"));
+
+        // An unknown filter matches nothing rather than everything: a typo must
+        // produce an obviously empty graph, not silently drop the constraint a
+        // consumer added because it needed ground truth.
+        assert!(!provenance_allowed("ratifed", "scip"));
+    }
+
+    /// The prose and JSON surfaces must announce the overlay identically. They
+    /// are separate seams (`append_read_notes` vs `read_note_signals`) because a
+    /// prose note appended to a JSON body would break `JSON.parse`, and it would
+    /// be easy for one to gain a note the other never learns about.
+    #[test]
+    fn both_surfaces_announce_the_live_overlay() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        let a = node_with("fn:a", "function", "a.ts");
+        let b = node_with("fn:b", "function", "b.ts");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store
+            .put_edge_live(&travsr_core::Edge::new(
+                a.id,
+                b.id,
+                travsr_core::EdgeKind::RefCall,
+            ))
+            .unwrap();
+
+        let prose = append_read_notes(&store, "body".to_string(), None);
+        assert!(prose.contains("live overlay active"), "prose: {prose}");
+
+        let signals = read_note_signals(&store, None, "a.ts");
+        assert!(
+            signals
+                .iter()
+                .any(|s| s.as_str().unwrap_or("").contains("live overlay active")),
+            "json signals: {signals:?}"
+        );
+
+        // And the JSON body still parses with the signal embedded.
+        let out = serde_json::json!({ "nodes": [], "edges": [], "signals": signals });
+        let text = serde_json::to_string(&out).unwrap();
+        serde_json::from_str::<serde_json::Value>(&text).expect("body must stay valid JSON");
+    }
+
+    /// Build a node for the overlay tests.
+    fn node_with(sig: &str, kind: &str, path: &str) -> travsr_core::Node {
+        travsr_core::Node::new(
+            travsr_core::VName::new("test", "", path, "typescript", sig),
+            kind,
+        )
+    }
+
     // ── #661 WS-D: head-only note on the deterministic path:line tools ────────
 
     #[test]
@@ -11947,7 +16239,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "old9999").unwrap();
 
-        let signals = read_note_signals(&store, Some("chk1111"));
+        let signals = read_note_signals(&store, Some("chk1111"), "a.ts");
         assert_eq!(signals.len(), 2, "both signals present: {signals:?}");
 
         // Embedding them in a graph-json envelope must still parse as JSON.
@@ -11969,9 +16261,9 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "idx0000").unwrap();
         // Markers agree (no Phase-B signal) and no caller HEAD ⇒ no signals at all.
-        assert!(read_note_signals(&store, None).is_empty());
+        assert!(read_note_signals(&store, None, "a.ts").is_empty());
         // Caller at the same commit ⇒ still no head signal.
-        assert!(read_note_signals(&store, Some("idx0000")).is_empty());
+        assert!(read_note_signals(&store, Some("idx0000"), "a.ts").is_empty());
     }
 
     /// get_callers must carry the note alongside real results when the marker
@@ -11990,7 +16282,7 @@ mod snippet_tests {
             .unwrap();
         store.set_meta("last_commit", "def456").unwrap();
         store.set_meta("phase_b_commit", "abc123").unwrap();
-        let result = get_callers(&store, "beta");
+        let result = get_callers(&store, "beta", None);
         assert!(
             result.contains("fn:alpha"),
             "existing edges must still be reported; got: {result}"
@@ -12043,6 +16335,7 @@ mod snippet_tests {
             direction: "both",
             depth: 2,
             kind_filter: "",
+            provenance: "",
             token_budget: 0,
             mode: "",
             path_prefix: "",
@@ -12071,6 +16364,7 @@ mod snippet_tests {
             direction: "both",
             depth: 2,
             kind_filter: "",
+            provenance: "",
             token_budget: 0,
             mode: "",
             path_prefix: "",
@@ -12091,6 +16385,7 @@ mod snippet_tests {
             direction: "both",
             depth: 1,
             kind_filter: "",
+            provenance: "",
             token_budget: 0,
             mode: "",
             path_prefix: "",
@@ -12306,6 +16601,7 @@ mod snippet_tests {
                 direction: "both",
                 depth: 1,
                 kind_filter: "file",
+                provenance: "",
                 token_budget: 0,
                 mode: "",
                 path_prefix: "",
@@ -12717,6 +17013,65 @@ mod snippet_tests {
         assert!(
             !result.contains("no path found") && !result.contains("could not resolve"),
             "successful path must carry no diagnostics; got: {result}"
+        );
+    }
+
+    /// `pcst_path` returns the route first and then the lambda corridor around
+    /// it. Both halves were rendered identically, so a caller could not tell
+    /// where the call chain ended and the merely-nearby nodes began: the tool
+    /// existed to answer "how does A reach B" and its answer was
+    /// indistinguishable from "what is near A".
+    #[test]
+    fn get_execution_path_separates_the_route_from_the_corridor() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let mk = |path: &str, sig: &str| {
+            Node::new(VName::new("t", "", path, "typescript", sig), "function")
+        };
+        let a = mk("src/a.ts", "fn:alpha");
+        let b = mk("src/b.ts", "fn:beta");
+        let c = mk("src/c.ts", "fn:gamma");
+        // Hangs off the route, so it can only reach the corridor.
+        let off = mk("src/d.ts", "fn:delta");
+        for n in [&a, &b, &c, &off] {
+            store.put_node(n).unwrap();
+        }
+        for (src, dst) in [(a.id, b.id), (b.id, c.id), (b.id, off.id)] {
+            store
+                .put_edge(&Edge::new(src, dst, EdgeKind::RefCall))
+                .unwrap();
+        }
+
+        let result = get_execution_path(&store, "alpha", "gamma");
+        let path_at = result
+            .find("path (")
+            .unwrap_or_else(|| panic!("a successful result must label its path; got: {result}"));
+        // alpha -> beta -> gamma is two calls. The header used to count the three
+        // symbols it spans, so a direct call announced itself as "2 steps".
+        assert!(
+            result.contains("path (2 steps,"),
+            "the header counts hops, not symbols; got: {result}"
+        );
+        let sink_at = result
+            .find("fn:gamma")
+            .unwrap_or_else(|| panic!("the sink must appear; got: {result}"));
+
+        // `delta` hangs off the route, so this fixture always has a corridor.
+        // Requiring it keeps the boundary assertions below from being skipped.
+        let ctx_at = result
+            .find("nearby context")
+            .unwrap_or_else(|| panic!("the fixture must yield a corridor; got: {result}"));
+        assert!(
+            ctx_at > path_at,
+            "context must follow the path, never lead it; got: {result}"
+        );
+        assert!(
+            path_at < sink_at && sink_at < ctx_at,
+            "the sink terminates the path and must not fall in the corridor; got: {result}"
+        );
+        assert!(
+            result[ctx_at..].contains("fn:delta"),
+            "an off-route neighbour belongs in the corridor; got: {result}"
         );
     }
 
@@ -13260,7 +17615,10 @@ mod snippet_tests {
         store.put_node(&caller).unwrap();
         // Two distinct occurrence lines from the same caller must both appear.
         store
-            .record_edge_sites(&[(caller.id, callee.id, 9), (caller.id, callee.id, 10)])
+            .record_edge_sites(&[
+                (caller.id, callee.id, 9, None),
+                (caller.id, callee.id, 10, None),
+            ])
             .unwrap();
 
         let out = find_references(&store, "charge", None);
@@ -13274,7 +17632,7 @@ mod snippet_tests {
     fn find_references_softens_zero_when_target_file_has_no_occurrences() {
         // #450: the language gate passes (another file of the same language has
         // occurrence rows), but the target's OWN file has none — so a definitive
-        // "no recorded uses" would be a claim the index cannot support.
+        // "recorded no uses" would be a claim the index cannot support.
         use travsr_core::{Node, VName};
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
 
@@ -13297,7 +17655,7 @@ mod snippet_tests {
         store.put_node(&callee).unwrap();
         store.put_node(&orphan).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 11)])
+            .record_edge_sites(&[(caller.id, callee.id, 11, None)])
             .unwrap();
 
         let out = find_references(&store, "orphan", None);
@@ -13310,17 +17668,289 @@ mod snippet_tests {
             "should name the unanalysed file: {out}"
         );
         assert!(
-            !out.contains("has no recorded uses"),
+            !out.contains("No uses recorded"),
+            "must not assert absence: {out}"
+        );
+    }
+
+    /// Shared fixture for the #864 gate tests: a target whose own file carries
+    /// occurrence rows (so the #450 per-file gate passes and we are testing the
+    /// repo-wide gate, nothing else).
+    fn store_with_analyzed_target() -> travsr_store::SqliteStore {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let caller = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:caller"),
+            "function",
+        );
+        let callee = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:callee"),
+            "function",
+        );
+        let unused = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:unused"),
+            "function",
+        )
+        .with_line(20);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&unused).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 5, None)])
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn no_recorded_phase_b_failure_yields_a_definitive_zero() {
+        // Every phase_b_warnings class travsr-daemon writes must soften the zero
+        // for its language: the caller's partial-coverage gate handles crashed /
+        // emitter_*, phase_b_incomplete_reason handles the rest. Iterating the
+        // full daemon set, not a hand-picked subset, means a class added to the
+        // daemon without a decision here fails this test instead of silently
+        // earning a definitive zero. (travsr-daemon writes these as
+        // `<class>:{lang}`; version_mismatch carries `:{expected}:{got}` too.)
+        let daemon_classes = [
+            "crashed:rust",
+            "zero_nodes:rust",
+            "no_references:rust",
+            "version_mismatch:rust:1.0:2.0",
+            "needs_approval:rust",
+            "needs_consent:rust",
+            "skipped_unregistered:rust",
+            "untrusted_corpus:rust",
+            "skipped_no_analyzer:rust",
+            "skipped_no_compdb:rust",
+            "emitter_missing:rust",
+            "emitter_failed:rust",
+        ];
+        for warning in daemon_classes {
+            let mut store = store_with_analyzed_target();
+            store.set_meta("phase_b_warnings", warning).unwrap();
+            let out = find_references(&store, "unused", None);
+            assert!(
+                !out.contains("No uses recorded"),
+                "'{warning}' records that Phase B did not complete for rust, so \
+                 the zero must be softened rather than asserted: {out}"
+            );
+        }
+
+        // Control: a clean run still reaches the definitive zero, so the loop
+        // above cannot pass by hedging everything.
+        let mut clean = store_with_analyzed_target();
+        clean.set_meta("phase_b_warnings", "").unwrap();
+        clean.set_meta("rust_lsif_degraded", "").unwrap();
+        clean.set_meta("phase_b_dirty", "0").unwrap();
+        let out = find_references(&clean, "unused", None);
+        assert!(
+            out.contains("No uses recorded"),
+            "a clean index must still earn the definitive zero: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_when_phase_b_skipped_the_language() {
+        // A recorded fact that this language was not analysed: the softened
+        // answer must name the reason rather than assert absence.
+        let mut store = store_with_analyzed_target();
+        store
+            .set_meta("phase_b_warnings", "skipped_no_analyzer:rust")
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("not a definitive zero"),
+            "a language Phase B skipped must soften the claim: {out}"
+        );
+        assert!(
+            out.contains("no analyzer is installed"),
+            "should name the recorded reason: {out}"
+        );
+        assert!(
+            !out.contains("No uses of this symbol are recorded"),
             "must not assert absence: {out}"
         );
     }
 
     #[test]
-    fn find_references_keeps_definitive_zero_when_target_file_is_analyzed() {
-        // Converse of the above: the target's own file carries occurrence rows,
-        // so a zero for this symbol is a real zero and the existing confident
-        // wording must be preserved unchanged.
+    fn find_references_softens_zero_for_another_languages_warning_only() {
+        // The warning is per-language and must be matched as such: a skipped
+        // Go analyzer says nothing about Rust coverage, so the Rust answer
+        // stays definitive. Guards against a substring match on the meta blob.
+        let mut store = store_with_analyzed_target();
+        store
+            .set_meta(
+                "phase_b_warnings",
+                "skipped_no_analyzer:go,zero_nodes:java,skipped_no_compdb:c",
+            )
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("No uses recorded"),
+            "another language's warning must not soften this one: {out}"
+        );
+
+        // And when the target's own language IS in the blob, it is the one
+        // picked out, not the first entry and not a second language.
+        store
+            .set_meta(
+                "phase_b_warnings",
+                "skipped_no_analyzer:go,needs_approval:rust,skipped_no_compdb:c",
+            )
+            .unwrap();
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("'rust' was not analysed") && out.contains("waiting on approval"),
+            "must select the target language's own warning: {out}"
+        );
+        // The softening REASON is target-scoped: it must name rust and no other
+        // language. The repo-wide freshness banner appended after it
+        // (`with_phase_b_note` / `phase_b_unanalyzed_note`) lists every
+        // unanalysed language by design, so scope the leak check to the reason,
+        // ahead of that banner.
+        let reason = out.split("[note:").next().unwrap_or(&out);
+        assert!(
+            !reason.contains("go") && !reason.contains("compilation database"),
+            "the reason must not name another language: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_when_rust_lsif_degraded() {
+        // rust-analyzer never ran, so every Rust call edge is missing even
+        // though the target's own file has Phase A occurrence rows.
+        let mut store = store_with_analyzed_target();
+        store
+            .set_meta("rust_lsif_degraded", "sandbox_unavailable")
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("not a definitive zero") && out.contains("no OS sandbox"),
+            "a degraded Rust LSIF run must soften and explain: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_when_a_reindex_left_edges_dirty() {
+        // #583: a mid-edit reindex dropped call edges without moving HEAD.
+        let mut store = store_with_analyzed_target();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("not a definitive zero") && out.contains("dropped call edges"),
+            "dropped edges must soften the claim: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_keeps_definitive_zero_on_a_healthy_index() {
+        // The property the #864 gate must preserve: on an index whose markers
+        // are all clean, the definitive zero is still REACHABLE. The previous
+        // occurrence-ratio gate failed exactly here — the manifest and external
+        // crate nodes below can never hold a `ref/call` row, so the ratio never
+        // read complete and this branch became dead code on every real repo.
         use travsr_core::{Node, VName};
+        let mut store = store_with_analyzed_target();
+        // Every real Rust repo has these two. Neither can ever be "covered".
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "crates/foo/Cargo.toml", "rust", "crate:foo"),
+                "crate",
+            ))
+            .unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "", "rust", "crate:serde"),
+                "crate",
+            ))
+            .unwrap();
+        // Analysed, simply nothing to call: indistinguishable from unanalysed
+        // in the occurrence ratio, which is why the ratio could not gate this.
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "src/consts.rs", "rust", "const:K"),
+                "constant",
+            ))
+            .unwrap();
+        // Healthy markers, as a completed Phase B run leaves them.
+        store.set_meta("phase_b_warnings", "").unwrap();
+        store.set_meta("rust_lsif_degraded", "").unwrap();
+        store.set_meta("phase_b_dirty", "0").unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("No uses recorded"),
+            "a healthy index must still earn the definitive zero: {out}"
+        );
+        assert!(
+            !out.contains("not a definitive zero"),
+            "must not hedge on a complete run: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_definitive_zero_names_only_surviving_recall_limits() {
+        // #864's repro: a uniquely-named constant used once, inside a Rust
+        // inline format capture the provider walks as a string literal. The old
+        // caveat offered only the name-collision reason, which did not apply,
+        // so a miss with a different cause read as an authoritative absence.
+        let store = store_with_analyzed_target();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("defined in more than one place"),
+            "the caveat must keep the name-collision limit: {out}"
+        );
+        assert!(
+            !out.contains("format"),
+            "inline format captures are recovered by the extractor now, so the \
+             caveat must not claim they are unindexed: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_structured_softens_note_but_keeps_total_zero() {
+        // The structured contract across the #864 gate: only `note` changes.
+        // `total` stays a real Some(0) per #755 Part B item 9, so a consumer
+        // keying on it is not handed a null it would read as "not counted".
+        let mut store = store_with_analyzed_target();
+        store
+            .set_meta("phase_b_warnings", "skipped_no_analyzer:rust")
+            .unwrap();
+
+        let got = find_references_structured(&store, "unused", None);
+        assert_eq!(got.status, "resolved");
+        assert_eq!(got.total, Some(0), "total must stay a counted zero");
+        assert!(got.references.is_empty());
+        let note = got.note.expect("softened answer must carry a note");
+        assert!(
+            note.contains("not a definitive zero") && note.contains("no analyzer is installed"),
+            "note should carry the softened wording: {note}"
+        );
+        assert!(
+            !note.starts_with("resolved:"),
+            "header belongs in resolved_to, not note: {note}"
+        );
+    }
+
+    /// Dogfooded on this repo (#895): `travsr references collect_global`
+    /// answered `0 reference(s). The index recorded no uses of this symbol.`
+    /// and then appended `[note: live overlay active: 11 references in the
+    /// files above detected but not resolved.]`. Both sentences described the
+    /// same file and could not both be true: the overlay had already detected
+    /// 11 uses the resolver declined to place.
+    ///
+    /// The zero is only definitive once nothing is still pending in the file
+    /// the answer names, which is exactly the scope `live_overlay_note` reports
+    /// its pending half over. Gating on the same set is what keeps the answer
+    /// and the note from contradicting each other.
+    #[test]
+    fn find_references_softens_zero_when_target_file_has_pending_refs() {
+        use travsr_core::{Node, VName};
+        use travsr_store::RefResolution;
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
 
         let caller = Node::new(
@@ -13331,7 +17961,6 @@ mod snippet_tests {
             VName::new("", "", "src/svc.rs", "rust", "fn:callee"),
             "function",
         );
-        // Same file, analysed, but nothing references it.
         let unused = Node::new(
             VName::new("", "", "src/svc.rs", "rust", "fn:unused"),
             "function",
@@ -13340,18 +17969,60 @@ mod snippet_tests {
         store.put_node(&caller).unwrap();
         store.put_node(&callee).unwrap();
         store.put_node(&unused).unwrap();
+        // The file is analysed, so every other softening gate stays shut.
         store
-            .record_edge_sites(&[(caller.id, callee.id, 5)])
+            .record_edge_sites(&[(caller.id, callee.id, 5, None)])
+            .unwrap();
+        // ...but one reference in it is detected and unresolved.
+        store
+            .upsert_ref_resolution_states(&[RefResolution {
+                src: caller.id,
+                ref_line: 7,
+                ref_col: 9,
+                name: "unused".to_string(),
+                state: "pending",
+                resolved_dst: None,
+            }])
             .unwrap();
 
         let out = find_references(&store, "unused", None);
         assert!(
-            out.contains("has no recorded uses"),
-            "analysed file should still give a definitive zero: {out}"
+            !out.contains("recorded no uses"),
+            "a pending reference in the target's own file makes a confident \
+             zero unsupportable: {out}"
         );
         assert!(
-            !out.contains("not a definitive zero"),
-            "should not soften when the file was analysed: {out}"
+            out.contains("not a definitive zero"),
+            "should soften while a reference in the file is unresolved: {out}"
+        );
+    }
+
+    /// A watcher reindex drops a file's Phase B call edges without moving HEAD
+    /// (#583), so `find_references` on a symbol whose only caller sat in that
+    /// file answers `0` from an evidence set that is temporarily gone. The head
+    /// note cannot fire (HEAD did not move), so before this the zero carried no
+    /// caveat at all and read as fact. Dogfooded: `travsr references
+    /// detect_corpus` returned a bare 0 while the call sat at
+    /// `travsr-daemon/src/lib.rs:1303`.
+    #[test]
+    fn find_references_zero_says_so_when_phase_b_is_dirty() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Markers agree: HEAD did not move, so the head note stays silent.
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let orphan = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:orphaned"),
+            "function",
+        )
+        .with_line(3);
+        store.put_node(&orphan).unwrap();
+
+        let out = find_references(&store, "orphaned", None);
+        assert!(
+            out.contains("not authoritative"),
+            "a zero served while Phase B is dirty must not read as fact: {out}"
         );
     }
 
@@ -13511,7 +18182,9 @@ mod snippet_tests {
         );
         store.put_node(&def).unwrap();
         store.put_node(&caller).unwrap();
-        store.record_edge_sites(&[(caller.id, def.id, 42)]).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, def.id, 42, None)])
+            .unwrap();
 
         for hint in [
             "crates/travsr-retrieval",  // directory prefix
@@ -13591,7 +18264,7 @@ mod snippet_tests {
         store.put_node(&shared_d).unwrap();
         store.put_node(&caller).unwrap();
         store
-            .record_edge_sites(&[(caller.id, shared_c.id, 7)])
+            .record_edge_sites(&[(caller.id, shared_c.id, 7, None)])
             .unwrap();
 
         let out = find_references(&store, "ClassC.shared", None);
@@ -13654,7 +18327,7 @@ mod snippet_tests {
         store.put_node(&shared).unwrap();
         store.put_node(&caller).unwrap();
         store
-            .record_edge_sites(&[(caller.id, shared.id, 4)])
+            .record_edge_sites(&[(caller.id, shared.id, 4, None)])
             .unwrap();
 
         let out = find_references(&store, "ClassC.shared", None);
@@ -13929,6 +18602,52 @@ mod snippet_tests {
             !out.contains("dist/bundle.rs") && !out.contains("target/bundle.rs"),
             "a SKIP_DIRS path the walker never indexes must not be searchable, \
              even when no ignore rule covers it: {out}"
+        );
+    }
+
+    #[test]
+    fn find_pattern_searches_text_files_the_parser_does_not_index() {
+        // The filter used to be `travsr_core::is_indexable_path`, an extension
+        // ALLOWLIST, so a match in a `.sh` script or an extensionless file was
+        // dropped and reported as a bare "no matches". Only known-binary
+        // formats are removed now.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("tracked.rs"), "fn charge() {}\n").unwrap();
+        std::fs::write(root.join("deploy.sh"), "# charge the lock\n").unwrap();
+        std::fs::write(root.join("Makefile"), "charge:\n\ttrue\n").unwrap();
+        // A protobuf git classifies as text (no NUL in the first 8000 bytes),
+        // which `-I` therefore lets through.
+        std::fs::write(root.join("index.scip"), "charge\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+
+        let out = find_pattern(&store, "charge", None, false);
+        if !out.contains("tracked.rs") {
+            return; // git unavailable in this sandbox
+        }
+        assert!(out.contains("deploy.sh"), "a shell script is text: {out}");
+        assert!(
+            out.contains("Makefile"),
+            "an extensionless file is text: {out}"
+        );
+        assert!(
+            !out.contains("index.scip"),
+            "a binary artifact still must not be searched: {out}"
         );
     }
 
@@ -14940,6 +19659,24 @@ mod issue_755_tests {
         assert!(note.contains("objectivec"), "got: {note}");
     }
 
+    /// #878: so is a TypeScript LSIF pass that never ran. The language kept its
+    /// tree-sitter call edges, so an answer here is short rather than empty,
+    /// and the note must not claim there are no call edges at all.
+    #[test]
+    fn a_skipped_lsif_emitter_produces_a_per_query_note() {
+        for warn in ["emitter_missing:typescript", "emitter_failed:typescript"] {
+            let store = with_warnings(warn);
+            let note =
+                phase_b_degraded_note(&store).unwrap_or_else(|| panic!("{warn} must be surfaced"));
+            assert!(note.contains("typescript"), "got: {note}");
+            assert!(
+                note.contains("or not all of them") && note.contains("short result"),
+                "a partial language must be described as partial, not empty; got: {note}"
+            );
+            assert!(note.contains("not authoritative"), "got: {note}");
+        }
+    }
+
     /// So are the two "waiting on the user" states.
     #[test]
     fn pending_approval_and_consent_produce_a_per_query_note() {
@@ -15078,9 +19815,11 @@ mod issue_755_tests {
             "function",
         );
         store.put_node(&n).unwrap();
-        let out = get_callers(&store, "describe");
+        let out = get_callers(&store, "describe", None);
+        // #878 widened the wording to "no call edges, or not all of them", so
+        // pin the language attribution and the verdict rather than one phrase.
         assert!(
-            out.contains("no call edges were produced for php"),
+            out.contains("were produced for php") && out.contains("not authoritative"),
             "an empty caller list must say why; got: {out}"
         );
     }
@@ -15290,7 +20029,7 @@ mod issue_755_tests {
         store.put_node(&dog).unwrap();
         store.put_node(&target).unwrap();
         store
-            .record_edge_sites(&[(cat.id, target.id, 4), (dog.id, target.id, 7)])
+            .record_edge_sites(&[(cat.id, target.id, 4, None), (dog.id, target.id, 7, None)])
             .unwrap();
         let got = find_references_structured(&store, "speak", None);
         assert_eq!(got.status, "resolved");

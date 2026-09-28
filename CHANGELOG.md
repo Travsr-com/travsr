@@ -4,6 +4,192 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v1.2.1 - 2026-09-27
+
+> Install with `npm i -g @travsr.com/travsr` or
+> `curl -fsSL https://travsr.com/install.sh | sh`.
+>
+> A fresh build from `master`, carrying everything merged since `v1.2.0`.
+> Ships alongside VS Code extension 0.12.1, which offers this release when no
+> `travsr` binary resolves.
+
+### Added
+
+- **The live lane now covers C, Objective-C, PHP, and Kotlin.** An edit in one of these languages resolves through the live editor server (clangd, Intelephense, kotlin-language-server) between commits instead of waiting for the next one, the same live resolution TypeScript, JavaScript, Python, Rust, Go, Java, Scala, Ruby, C# and Swift already had. Measured against each language's oracle on the live-lane fixture: C and Objective-C score every claim `agree` with clangd live, PHP scores precision 1.0 over 6 verified claims with Intelephense, and Kotlin scores precision 1.0 over 11 verified claims with kotlin-language-server.
+
+### Fixed
+
+- **Several languages purged a file's committed edges on every save, because a real definition had no Phase A node to unify onto.** A Dart abstract getter, a Scala abstract `def` or constructor parameter, an Objective-C pointer-typed property or ivar, a Go interface method spec, a TypeScript interface or abstract method signature, a Swift protocol requirement, and a Swift script's top-level variables all stayed orphans, so the file's node set never matched a fresh parse and the whole file's edges were dropped and never rebuilt until the next commit. Each now gets the node its analyzer's definition unifies onto.
+- **C, C++, Go, and Scala had the same failure from the other direction: a definition the analyzer emits with no Phase A twin at all.** scip-clang's per-file namespace definition and scip-go's per-file package definition are now dropped the same way Kotlin's locals already were, an anonymous C `typedef struct` unifies its members onto the same-file field, a C++ destructor is now `method:Animal.~Animal`, and a Scala object's members (owned by a term, not a type) now split correctly so the object and its members both resolve.
+- **A C/C++ project below the repository root, or one whose only build marker is `compile_commands.json`, was skipped entirely**, the same class of bug that go.mod and composer.json already had fixes for. A header-only directory (`.h` files are language `c` by extension) no longer counts as a C build root, so scip-clang stopped running against an Objective-C compilation database until timeout. On macOS, `SDKROOT` is now passed into the sandbox, so scip-clang finds libc++ headers and no longer drops every expression touching a standard type.
+- **A PHP or Go project below the repository root was skipped**, or ran against the wrong `composer.json`, the same way a nested TypeScript project's `tsconfig.json` was read against the repo root instead of its own directory, and `--root` now only moves emitted paths rather than the file used to resolve the config.
+- **A save on a file with no live lane, or no editor attached, lost more edges than the edit itself removed** (Kotlin, Ruby, Scala and C# all went 8 of 8 to 0 of 8 on a one-line comment change), because the store kept only what the live lane re-derived instead of keeping a committed edge whose callee name still appears in the edited body.
+- **A top-level reference in a script-style file (`main.swift`, `main.php`) was resolved by the live editor and then silently dropped**, because the live lane attributed it to an enclosing definition the way Phase B does, but a top-level reference has none. It now hangs from the file node instead, the same fallback Phase B already uses.
+- **An ambiguous bare call (two same-language definitions sharing a name) was neither resolved nor sent to the editor**, so it was lost in both lanes instead of at least being asked about.
+- **A rename could mark an unrelated file's pending reference as resolved**, because the dependent-matching rule crossed language-tagged file extensions (a saved TypeScript `.ts` file could satisfy a plain JavaScript `.js` file's pending reference by name alone). A candidate whose own imports resolve now has to actually import the saved file.
+- **Retrieval tie-breaking depended on which directory the repository was checked out into.** Equal-rank name-search matches broke ties on `NodeId`, which hashes the corpus, and the corpus is the checkout's own directory name; ties now break on path and signature instead, so the same query returns the same answer in every checkout.
+- TypeScript: a `new` expression is now a call reference in its own right rather than only being reachable through an import specifier; a CommonJS member reached through `module.exports` or a destructured `require` now resolves by retrying the lookup at its declaration's name.
+- Python: a method inherited from a base class (`class Dog(Animal)`, `dog.describe()` resolving to `Animal.describe`) is now found by walking the recorded base classes breadth first.
+- Java: a constructor call (`new Zoo()`) is now captured as a live target, the same way PHP's already was. Objective-C: a keyword message (`initWithName:volume:`) is now captured and named by its whole selector instead of one target per keyword, none of which matched the method node.
+- Rust: a type-qualified call whose leaf is a generic noise name (`Dog::new()`) is no longer dropped by the same filter that correctly drops a bare `new` or `Box::new()`, which has no repo-local target to name.
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v1.2.0...v1.2.1
+
+---
+
+## v1.2.0 - 2026-09-26
+
+> Install with `npm i -g @travsr.com/travsr` or
+> `curl -fsSL https://travsr.com/install.sh | sh`.
+>
+> A fresh build from `master`, carrying everything merged since `v1.1.1`.
+> Ships alongside VS Code extension 0.12.1, which offers this release when no
+> `travsr` binary resolves.
+
+### Added
+
+- **`travsr guard`, a PreToolUse handler that redirects a search to the graph (#916).** Wired into `.claude/settings.json` by `init --guard[=strict]` or `connect --guard[=strict]`, it runs at the moment an agent reaches for text search and either names the Travsr call that answers the same question (advisory) or refuses and names it (strict). It ships inside the binary rather than as a hand-written script, is fail-open by construction (no index, an unreadable payload, a missed deadline, or anything it does not recognise all let the call through), and strict mode is bounded so an agent that queries the graph and still needs to grep can never be blocked twice for the same symbol in a session. A follow-up closed a real gap where advisory mode could still emit the host's auto-approve decision for a whole-file read it had no standing to vouch for (out-of-repo paths, `.env`, lockfiles); advisory now only ever adds context, never a decision.
+- **`travsr invariants`, a command that checks declared architecture rules on every commit.** It reads `architecture-invariants.json` from the repository root and evaluates dependency and cycle rules against the graph, exiting non-zero on a violation so it works as a CI gate. A rule naming a component the graph no longer has is reported as VIOLATED rather than skipped, and an unrecognised `--provenance` filter is now rejected instead of silently matching zero edges and reporting a green gate.
+- **`get_architecture_brief` and `get_subsystem_brief`, two new MCP tools.** The first returns components, weighted dependency edges, layering and cycles for the whole repository; the second walks the call graph from one entry point and returns who calls in, the spine by depth, and every call that crosses the component boundary. Both share one definition of "component" and one type-detection rule, so they and `get_repo_map` cannot disagree with each other the way three separate implementations used to. Both take a `token_budget` and disclose how many items a capped list dropped rather than truncating mid-line.
+- **The Android SDK is granted to Java and Kotlin analyzers, but only for repositories that build with the Android Gradle Plugin (#904).** Previously an AGP build failed with "SDK location not found" and the analyzer produced no symbols with no explanation; now the SDK is read from `ANDROID_HOME`, `ANDROID_SDK_ROOT`, or the IDE's default install location (never from repository content such as `local.properties`, to avoid a repo naming an arbitrary path), and the grant is skipped entirely for a plain Gradle or Maven build so it costs nothing on machines that never touch it. Sidecar diagnostics that used to be logged and dropped now persist and print in `travsr init` and `travsr status`, so a degraded analyzer run says why.
+
+### Fixed
+
+- **`find_references` returned nothing for a duplicated bare name (#810).** A TypeScript or Python function whose name is defined more than once, including a module-private helper called only in its own file, was dropped entirely by the uniqueness gate. A bare call now narrows its candidates to the definition in the caller's own file, then to one in a file the caller imports, before that gate applies.
+- **Several Phase B cross-file resolution bugs that produced wrong edges.** A trait or impl that only encloses a required method's definition is no longer treated as its callee (`self.name()` stopped resolving to `trait:Animal`). Scala `var` accessors and Kotlin properties now unify onto the same field Phase A already recorded, instead of being counted as orphan methods. JVM and Kotlin constructors are recognized and unified with their class instead of being silently dropped. A reference to a parameter type, supertype, or generic argument is no longer flagged `is_call: true` in languages whose emitters mark every occurrence that way. Cross-file unification is now scoped to the definition's own language family, so a Scala definition with no Scala counterpart can no longer alias onto an unrelated Ruby method. The Scala analyzer now runs at its `build.sbt` root instead of the repository root, so paths in a `scala/` subdirectory resolve correctly.
+- **Two index rebuild bugs that could leave a corrupted or permanently unrecoverable graph (#918).** Rebuilding an older-format index used to fail outright with a UNIQUE constraint violation, because the purge could only see paths the `files` table still tracked; a full purge now clears the graph outright over every table the live schema declares. A rebuild that failed after the purge used to leave the database readable as "up to date, 0 nodes" forever, with no way to recover; the format-skew check now also looks at whether any file hash survived, so the next `travsr init` heals it with no user action required.
+- **`get_execution_path` conflated the call chain with its surrounding neighborhood.** The route and the corridor around it are now rendered and labeled separately, and the header counts hops instead of nodes spanned.
+- **`get_repo_map` and `get_graph_json`'s overview ranked components by transitive reverse reachability**, which saturates on a funnel-shaped graph (a component with one consumer could outrank one with fifteen). Both now rank by distinct regions with a direct edge in.
+- **The graph overview ignored its own `--provenance` filter**, so a caller asking for ratified ground truth was handed the unratified live overlay anyway.
+
+### Release and CI
+
+- Several test flakes and CI-only failures fixed: a guard timeout test that raced its own deadline instead of forcing it, a plugin-host version-probe test that inherited a real subprocess's timing instead of testing the decision logic directly, and a clippy warning from a discarded loop binding.
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v1.1.1...v1.2.0
+
+---
+
+## v1.1.1 - 2026-09-20
+
+> Install with `npm i -g @travsr.com/travsr` or
+> `curl -fsSL https://travsr.com/install.sh | sh`.
+>
+> A patch release from `master`, carrying everything merged since `v1.1.0`.
+> Ships alongside VS Code extension 0.12.1, which offers this release when no
+> `travsr` binary resolves.
+
+### Upgrading from 1.1.0
+
+The index format is unchanged, so an existing index keeps working as is. In a
+TypeScript, JavaScript or Python repository, run
+`travsr init --semantic --force` once after upgrading to pick up the
+cross-file edges the newly bundled analyzers produce (see the first fix below).
+
+### Fixed
+
+- **TypeScript, JavaScript and Python cross-file analysis works in an installed binary (#905).** Their LSIF emitters had never been in a published artifact: every release from `v0.9.0` through `v1.1.0` shipped the `travsr` binary alone, so outside a source checkout those three languages got tree-sitter heuristics only while `travsr lang list` reported them active. The release tarball now carries a `travsr-lib/` directory beside the binary with both emitters bundled, and `install.sh`, the npm postinstall and the VS Code installer all extract it (tolerantly, so `--version` still installs older tarballs). Measured on a clean install outside the monorepo: TypeScript goes from 9 heuristic `ref/call` edges plus a "could not be started" warning to 13 `scip` and 4 `lsif` edges, and Python from 6 heuristic edges with no warning at all to 6 `scip` edges. The tarball grows from 14.8 MB to 16.7 MB.
+- **A failed analyzer is reported instead of reading as complete (#905).** With `rust-analyzer lsif` exiting non-zero, `travsr status` still printed `semantic: complete` and nothing anywhere said the language had lost its cross-file edges. An analyzer that ran and failed now downgrades `semantic:` to `partial (incomplete: <lang>)` and names the analyzer, on `init` and `status`. The Rust record is gated on a root `Cargo.toml`, so a directory that merely contains `.rs` files is not flagged.
+- **`travsr lang install` no longer claims what it has not checked (#905).** It printed "full cross-file analysis is on" for TypeScript while `travsr status` in the same repository said the analyzer could not be started. The success line is now derived from actually resolving the bundled analyzer; when it is missing, install says so and gives the reinstall remedy. The exit code is unchanged. `lang list` and `lang detect` report `partial` for a bundled analyzer that is not there.
+- **`travsr lang status <language>` works (#905).** It exited 2 with `unexpected argument`. `status` is an alias of `list`, which now takes an optional language filter and refuses an unknown language by name.
+- **An editor save gets its live resolution targets (#906).** The VS Code extension asks the daemon for live-resolution targets the moment a file is saved, but the daemon's watcher parses that save about a second later, so the request was answered from pre-save state and the save's edges stayed missing until the next commit. The daemon now folds the saved file in before answering, and whichever of the two passes reaches the file second is a genuine no-op. The fix is daemon side, so it holds for any editor.
+- **The live lexical floor no longer invents edges across languages or onto the standard library (#909, #815).** Between commits, a bare call was resolved by repo-wide name uniqueness alone, so a Python method calling the builtin `set` got a `ref/call` edge to a Rust `fn:set`, and Rust calls to `std::fs::write` or `std::thread::spawn` resolved to repo-local `fn:write` and `fn:spawn`. The floor now requires the same language on both ends and honours a call's qualifier, and uniqueness is judged on the full candidate set rather than a truncated lookup window. On the #813 recovery harness this removes every wrong edge the lexical and oracle lanes measured, at identical recall.
+
+### Removed
+
+- **The Phase A pyright pass (#909).** It never produced a single edge: `pyright --outputjson` emits diagnostics, not symbols, so the pass spent a subprocess per Python file on an empty result. Python's cross-file analysis is unaffected; it runs through the native Phase B pass and the bundled `travsr-lsif-py` emitter. The Python fuzz target now fuzzes the tree-sitter grammar itself instead of the removed JSON adapter.
+
+### Security
+
+- **esbuild 0.28.2 in both LSIF emitter packages (GHSA-67mh-4wv8-2f99; #910, #917)** and **js-yaml 4.3.2 in the VS Code extension's dev tree (#917).** All three are build-time dependencies; neither ships in the published binary or extension at runtime.
+
+### Release and CI
+
+- **The emitter bundle is built and smoke-tested on Linux, macOS and Windows on every pull request (#905, #907)**, including an old-glibc and a musl image on Linux, since `release.yml` only runs on a tag push. `tree-sitter-python` is now a dev dependency, so the emitter's production tree carries no native addon, and CI asserts that.
+- **The Linux test job refreshes its package index before installing bubblewrap (#917).** The runner image's cached index pointed at a bubblewrap build Ubuntu had pulled from the mirrors, which failed every Linux test run with a 404.
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v1.1.0...v1.1.1
+
+---
+
+## v1.1.0 - 2026-09-15
+
+> Install with `npm i -g @travsr.com/travsr` or
+> `curl -fsSL https://travsr.com/install.sh | sh`.
+>
+> A fresh build from `master`, carrying everything merged since `v1.0.0`.
+> Ships alongside VS Code extension 0.12.0, which offers this release when no
+> `travsr` binary resolves.
+
+### Upgrading from 1.0.0: run `travsr init` once in each repository
+
+The index format changes in this release (`SIGNATURE_FORMAT_VERSION` 2 to 3,
+#877), because Objective-C methods are now keyed by their whole selector and a
+node's identity hashes the format version. An index built by 1.0.0 is not
+updated in place: the watcher and the commit hook skip reindexing it, queries
+keep answering from the old graph, and `travsr status` prints
+
+```
+warning: this index was built with an older version of travsr (format v2, current v3); run `travsr init` to rebuild it
+```
+
+Run `travsr init` in each repository once after upgrading. It detects the old
+format and rebuilds the graph from scratch. Until then the graph does not
+follow new commits or saves.
+
+### Added
+
+- **The daemon's log level is a setting (#897, #896, RFC-029).** `log.level` is a registered config key (`error`, `warn`, `info`, `debug`, `trace`; default `info`; env `TRAVSR_LOG_LEVEL`), so `travsr config get/set/unset/list` manage it. `RUST_LOG` still wins when set. The log now describes itself at every level: the session start line records the level in force, and a daemon exit is logged as `daemon.session.exit`.
+- **Live semantic resolution between commits (RFC-027, #795, #814).** A save used to drop the file's committed semantic edges and rebuild from the fresh parse, recovering only the lexically unambiguous subset. Definitions an edit leaves byte-identical now keep their committed edges, only the changed region is re-resolved, and the live overlay reuses SCIP occurrences instead of guessing.
+- **JavaScript cross-file analysis without a tsconfig (#844, #833).** A CommonJS or plain JavaScript repository produced zero semantic edges, because the only path that resolves `require()` and ESM imports needed a `tsconfig.json` with `allowJs`. travsr now synthesizes one when the repository has none.
+- **Jest and Vitest test callbacks are indexed as tests (#887, #674).** `describe`, `it` and `test` callbacks in JavaScript and TypeScript become `test` and `suite` nodes carrying a test role, so `get_context` and `ask` file them under tests instead of letting them take the top slot.
+- **Language analyzers can report degraded runs (#877).** A sidecar's response carries run-scoped diagnostics, and the host logs every one, so an analyzer that produced partial output while knowing it was degraded is heard.
+- **`travsr status` names the semantic definitions that did not unify (#840, #825)**, instead of a count with a re-run suggestion that could never change it. Swift extension definitions now unify.
+- **`travsr explain` shows the gate inputs** behind an exact-anchor decision (#885).
+
+### Changed
+
+- **`travsr --version` and MCP `serverInfo.version` report the bare version (#782).** The `+<shortsha>` build suffix is gone, so both read `1.1.0`.
+- **`travsr ask`'s human table is borderless and drops the redundant Kind column (#839).** The frame roughly tripled the output size on broad queries. `--format json` is unchanged.
+- **The scaffolded `.travsrignore` covers more ecosystems (#837, #827):** `Pods/`, `Carthage/` and `.build/` join `vendor/` and `build/`. An `ask` abstention in a repository with no embeddings now suggests `travsr embed init` (#826).
+- **The reranker's circuit breaker keeps scores it already computed (#865).** A slow rerank used to discard its finished work and fall back to the lexical gate.
+- **The exact knapsack runs at the default token budget (#883, #824).** The cell limit was sized for a 2,000-token budget, so at the shipped 4,096 the exact selection was skipped for most queries.
+- **`travsr connect` names Claude Code's one-time approval step (#838, #829)** instead of reporting `ok` for a project-scoped server that is not usable until approved.
+- **A read command in a linked worktree says which checkout answered (#863)**, instead of blaming staleness.
+- **`get_context` discloses what the documentation lane sends (#884):** file paths and heading text leave the machine by default.
+- **A database whose version is current but whose shape is old is reported (#895).** The CLI heals it automatically; MCP cross-repo results exclude it and say so, rather than silently including it.
+
+### Fixed
+
+- **`travsr mcp` run directly in a terminal explains itself instead of hanging (#803, #777).**
+- **Exact short-symbol queries are grounded (#791, #778)**, and an exact anchor is grounded when no reranker scored it (#885, #822).
+- **`find_references` and `get_callers` agree (#877).** Both read the recorded occurrences; name-matched call edges are marked; `get_callers` no longer truncates at 4 KiB; two definitions sharing a name are disambiguated instead of collapsed.
+- **Global mode answers for real repositories (#877).** Twelve structural MCP tools returned nothing when a repository was named, because every registry key is an absolute path.
+- **`travsr init --force` keeps every `resolves-to` edge (#877).** An incremental delete removed inbound edges to symbols that survived the re-parse, losing a varying share on each run.
+- **Objective-C methods sharing a leading selector keyword no longer collapse into one node (#877)**, and TypeScript barrel re-exports produce a dependency edge.
+- **Rust inline format captures count as uses (#864)**, so a constant used only inside `format!("{NAME}")` no longer reports a confident zero.
+- **A skipped TypeScript LSIF pass is disclosed (#890, #878)** instead of reporting semantic analysis as complete.
+- **Build-driven analyzers run at their build root (#886, #724)**, so a project below the repository root is analysed.
+- **Embedding freshness follows file identity (#771, #509).** A deleted and recreated `embed.db` is picked up.
+- **`travsr mcp` uses the repository's own embedding backend (#876, #874)**, and the documentation lane measurements and header are corrected (#869, #870).
+- **Resolved references are reconciled after every semantic pass (#866, #811)**, and embedding progress counts only embeddable nodes (#867, #862).
+- **scip-ruby accessor, operator and DSL symbols reconcile with the parse (#793, #780).**
+- **Windows path containment in the TypeScript and Python LSIF emitters (#807, #806).**
+- **Seven defects from the dogfooding sweep (#895, #893)**, including a Cargo workspace root whose own dependencies were missing from the graph.
+
+### Security
+
+- **rustls 0.23.45 (RUSTSEC-2026-0285).** TLS 1.3 handshake messages were accepted across encryption level boundaries. The transcript stays authenticated, so an attacker cannot alter or complete a handshake.
+
+### Release and CI
+
+- **Promotion gates run on the tag-push path, and a skipped gate is never accepted (#892, #871).**
+- **VS Code extension drift is caught on the release side (#888, #882).** A daily job fails when a CLI release moves past the published extension, and extension publishing checks its version and download pin.
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v1.0.0...v1.1.0
+
+---
+
 ## v1.0.0 - 2026-08-23
 
 > First stable 1.0. Install with `npm i -g @travsr.com/travsr` or
@@ -207,7 +393,7 @@ Full detail in [packages/travsr-vscode/CHANGELOG.md](packages/travsr-vscode/CHAN
 
 ### Changed
 
-- **Documentation-prose retrieval (#376) is on by default (#519).** `get_context`, `ask`, and `find_references`/`find_pattern`'s doc lane now search Markdown documentation (ADRs, RFCs, plans) alongside code by default, surfacing rationale and design docs relevant to a query. All five docs-lane accuracy/regression gates are green on both bench repos (travsr and kubernetes) against merged code. Turn it off with `travsr config set docs.enabled false`.
+- **Documentation-prose retrieval (#376) is on by default (#519).** `get_context`, `ask`, and `find_references`/`find_pattern`'s doc lane now search Markdown documentation (ADRs, RFCs, plans) alongside code by default, surfacing rationale and design docs relevant to a query. All five docs-lane accuracy/regression gates are green on both bench repos (travsr and kubernetes) against merged code. This is an egress change as well as a retrieval-quality one: doc results put Markdown file paths and humanized heading trails (`path § Heading Trail:line-range`, never prose bodies) into an agent's context with no opt-in, and the Markdown exclusion list is quality-driven (`changelog`, `license`, `generated/`), not sensitivity-driven, so `SECURITY.md`, `docs/runbooks/*.md` and internal architecture docs are all in scope. That text is author-controlled, so a vendored dependency's README or an untrusted PR branch can now reach the model by default where it previously needed an explicit opt-in. Turn it off with `travsr config set docs.enabled false`.
 
 ### Security
 

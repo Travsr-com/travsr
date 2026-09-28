@@ -528,10 +528,50 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                     pal.dim("ℹ"),
                 );
             }
+            // #878: the line above is true (the native pass ran) but incomplete
+            // when the TypeScript LSIF pass was skipped: the language then lacks
+            // most of its cross-file call edges. Say so right here, at default
+            // verbosity, rather than only in a RUST_LOG warning.
+            for skip in &report.lsif_skipped {
+                use travsr_daemon::LsifSkipReason;
+                let lang = &skip.language;
+                let analyzer = travsr_daemon::lsif_analyzer_name(lang);
+                let (what, fix) = match skip.reason {
+                    // EmitterMissing is TypeScript-only (rust and python record a
+                    // failure, never a plain absence), so its remedy is the
+                    // TypeScript one #878 wrote.
+                    LsifSkipReason::EmitterMissing => (
+                        "could not be started",
+                        "set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr so it sits beside the binary), then re-run `travsr init --semantic --force`",
+                    ),
+                    LsifSkipReason::EmitterFailed => (
+                        "failed",
+                        "fix the analyzer (its error is above), then re-run `travsr init --semantic --force`",
+                    ),
+                };
+                println!(
+                    "  {} {lang} semantic analysis is incomplete: {analyzer} {what}, so cross-file call and reference edges are missing",
+                    pal.orange("⚠"),
+                );
+                println!("    {}", skip.detail);
+                println!("    {fix}");
+            }
             if !report.produced_no_nodes.is_empty() {
                 let langs = report.produced_no_nodes.join(", ");
+                // #904: when the analyzer said why, the reason prints right
+                // below; sending the user to `travsr status` for it would
+                // point at a copy of the same line.
+                let explained = report
+                    .diagnostics
+                    .iter()
+                    .any(|d| report.produced_no_nodes.contains(&d.lang));
+                let where_to_look = if explained {
+                    ""
+                } else {
+                    "; see `travsr status` for why"
+                };
                 println!(
-                    "  {} semantic analyzer ran but produced no symbols for: {langs}; see `travsr status` for why",
+                    "  {} semantic analyzer ran but produced no symbols for: {langs}{where_to_look}",
                     pal.orange("⚠"),
                 );
                 if report.produced_no_nodes.iter().any(|l| l == "java") {
@@ -539,6 +579,19 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                         println!("    {hint}");
                     }
                 }
+            }
+            // #904: what the sidecars themselves said about the run. A missing
+            // Android SDK arrives here in AGP's own words, so the user is not
+            // sent to `travsr status` (or to RUST_LOG) to learn what "produced
+            // no symbols" meant.
+            for d in &report.diagnostics {
+                println!(
+                    "  {} {} analysis: {} [{}]",
+                    pal.orange("⚠"),
+                    d.lang,
+                    d.message,
+                    d.code,
+                );
             }
             if !report.produced_no_references.is_empty() {
                 let langs = report.produced_no_references.join(", ");
@@ -590,6 +643,15 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
     if stats.travsrignore_scaffolded {
         println!(
             "  {} created .travsrignore, customize to exclude generated dirs, vendored deps, etc.",
+            pal.dim("ℹ"),
+        );
+    }
+
+    // #893: `.gitignore` is a tracked, user-authored file. RFC-026's rule that
+    // writes to those stay visible applies to this one too.
+    if stats.gitignore_scaffolded {
+        println!(
+            "  {} added /.travsr/ to .gitignore, the graph is local-only",
             pal.dim("ℹ"),
         );
     }

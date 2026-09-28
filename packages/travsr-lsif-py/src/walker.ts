@@ -25,12 +25,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import Parser from 'tree-sitter';
-import Python from 'tree-sitter-python';
+import { Language, Parser, type Node as SyntaxNode } from 'web-tree-sitter';
 import { Emitter } from './emitter';
 import { assertPathsContained, isUnderRoot, resolveRoot } from './security';
-
-type SyntaxNode = Parser.SyntaxNode;
 
 interface SymbolInfo {
   resultSetId: number;
@@ -72,7 +69,29 @@ const SKIP_DIRS = new Set([
   'eggs',
 ]);
 
+// web-tree-sitter types namedChildren as (Node | null)[], mirroring the C API.
+// Dropping the nulls here keeps every walk site free of a guard.
+function namedChildren(node: SyntaxNode): SyntaxNode[] {
+  return node.namedChildren.filter((c): c is SyntaxNode => c !== null);
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
+
+let parser: Parser | null = null;
+
+/**
+ * Load the tree-sitter WASM runtime and the Python grammar.  Must be awaited
+ * once before walk(); both .wasm files sit beside this file (see
+ * scripts/copy-wasm.mjs).
+ */
+export async function init(): Promise<void> {
+  if (parser !== null) return;
+  await Parser.init({ locateFile: () => path.join(__dirname, 'tree-sitter.wasm') });
+  const python = await Language.load(path.join(__dirname, 'tree-sitter-python.wasm'));
+  const p = new Parser();
+  p.setLanguage(python);
+  parser = p;
+}
 
 export function walk(rootDir: string, emitter: Emitter): void {
   const repoRoot = resolveRoot(rootDir);
@@ -101,8 +120,8 @@ export function walk(rootDir: string, emitter: Emitter): void {
   }
   emitter.emitContains(projectId, Array.from(documentIds.values()));
 
-  const parser = new Parser();
-  parser.setLanguage(Python);
+  const py = parser;
+  if (py === null) throw new Error('init() must be awaited before walk()');
 
   const defMap: DefMap = new Map();
 
@@ -115,10 +134,38 @@ export function walk(rootDir: string, emitter: Emitter): void {
     const source = safeReadFile(absPath);
     if (source === null) continue;
 
-    const tree = parser.parse(source);
+    const tree = py.parse(source);
+    if (tree === null) continue;
     const defRangeIds: number[] = [];
     visitDefs(tree.rootNode, relPath, null, docId, defMap, emitter, defRangeIds);
     emitter.emitContains(docId, defRangeIds);
+  }
+
+  // ── Class bases: `class Dog(Animal)` → Animal, resolved per file so an
+  // inherited `d.describe()` can walk up to the defining class in Pass 2.
+  const classBases = new Map<string, LocalType[]>();
+  for (const absPath of pyFiles) {
+    const relPath = toRelPath(absPath, repoRoot);
+    const source = safeReadFile(absPath);
+    if (source === null) continue;
+    const tree = py.parse(source);
+    if (tree === null) continue;
+    const fileDir = path.dirname(relPath).replace(/\\/g, '/');
+    const importTable = buildImportTable(tree.rootNode, fileDir, defMap);
+    for (const top of namedChildren(tree.rootNode)) {
+      const cls = top.type === 'decorated_definition' ? top.lastNamedChild : top;
+      if (cls?.type !== 'class_definition') continue;
+      const name = cls.childForFieldName('name')?.text;
+      const supers = cls.childForFieldName('superclasses');
+      if (!name || !supers) continue;
+      const bases: LocalType[] = [];
+      for (const arg of namedChildren(supers)) {
+        if (arg.type !== 'identifier') continue;
+        const base = resolveClassName(arg.text, importTable, defMap, relPath);
+        if (base) bases.push(base);
+      }
+      classBases.set(`${relPath}:class:${name}`, bases);
+    }
   }
 
   // ── Pass 2: references ─────────────────────────────────────────────────────
@@ -130,7 +177,8 @@ export function walk(rootDir: string, emitter: Emitter): void {
     const source = safeReadFile(absPath);
     if (source === null) continue;
 
-    const tree = parser.parse(source);
+    const tree = py.parse(source);
+    if (tree === null) continue;
     const refRangeIds: number[] = [];
     const fileDir = path.dirname(relPath).replace(/\\/g, '/');
     const importTable = buildImportTable(tree.rootNode, fileDir, defMap);
@@ -146,7 +194,8 @@ export function walk(rootDir: string, emitter: Emitter): void {
       refRangeIds,
       relPath,
       null,
-      localTypes
+      localTypes,
+      classBases
     );
     emitter.emitContains(docId, refRangeIds);
   }
@@ -233,7 +282,7 @@ function visitDefs(
   // PY-H2: guard against pathologically nested Python ASTs (e.g. deeply nested
   // class definitions in generated code) that could overflow the JS call stack.
   if (depth >= MAX_AST_DEPTH) return;
-  for (const child of node.namedChildren) {
+  for (const child of namedChildren(node)) {
     visitDefsNode(child, relPath, enclosingClass, docId, defMap, emitter, defRangeIds, depth + 1);
   }
 }
@@ -345,9 +394,9 @@ function buildImportTable(
 ): Map<string, ImportEntry> {
   const table = new Map<string, ImportEntry>();
 
-  for (const child of rootNode.namedChildren) {
+  for (const child of namedChildren(rootNode)) {
     if (child.type === 'import_statement') {
-      for (const importedNode of child.namedChildren) {
+      for (const importedNode of namedChildren(child)) {
         if (importedNode.type === 'dotted_name') {
           const modulePath = importedNode.text;
           // `import a.b.c` — only the first segment is in scope as a name.
@@ -398,13 +447,16 @@ function extractImportedNames(
 ): Array<{ localName: string; importedName: string }> {
   const results: Array<{ localName: string; importedName: string }> = [];
 
-  for (const child of importFromNode.namedChildren) {
-    if (child === moduleNameNode) continue;
+  for (const child of namedChildren(importFromNode)) {
+    // Compare by node id, not by reference: every web-tree-sitter accessor
+    // hands back a fresh wrapper, so `===` would never skip the module name
+    // and `from socket import X` would rebind `socket` itself.
+    if (child.id === moduleNameNode.id) continue;
     if (child.type === 'wildcard_import') return []; // skip *
 
     if (child.type === 'import_list') {
       // Parenthesized list: from x import (y, z)
-      for (const item of child.namedChildren) {
+      for (const item of namedChildren(child)) {
         const entry = extractSingleName(item);
         if (entry) results.push(entry);
       }
@@ -475,6 +527,7 @@ function visitRefs(
   relPath: string,
   enclosingClass: string | null,
   localTypes: Map<string, LocalType>,
+  classBases: Map<string, LocalType[]>,
   depth = 0
 ): void {
   // PY-H2: bail out before the JS call stack overflows on deeply nested ASTs.
@@ -489,7 +542,8 @@ function visitRefs(
         defMap,
         relPath,
         enclosingClass,
-        localTypes
+        localTypes,
+        classBases
       );
       if (info) {
         const rangeId = emitter.emitRange(funcNode);
@@ -506,7 +560,7 @@ function visitRefs(
       ? (node.childForFieldName('name')?.text ?? enclosingClass)
       : enclosingClass;
 
-  for (const child of node.namedChildren) {
+  for (const child of namedChildren(node)) {
     visitRefs(
       child,
       docId,
@@ -517,6 +571,7 @@ function visitRefs(
       relPath,
       nextClass,
       localTypes,
+      classBases,
       depth + 1
     );
   }
@@ -548,7 +603,7 @@ function buildLocalTypes(
         }
       }
     }
-    for (const child of node.namedChildren) visit(child, depth + 1);
+    for (const child of namedChildren(node)) visit(child, depth + 1);
   };
   visit(rootNode);
   return types;
@@ -578,7 +633,8 @@ function resolveCallTarget(
   defMap: DefMap,
   relPath: string,
   enclosingClass: string | null,
-  localTypes: Map<string, LocalType>
+  localTypes: Map<string, LocalType>,
+  classBases: Map<string, LocalType[]>
 ): SymbolInfo | undefined {
   if (funcNode.type === 'identifier') {
     // foo() — simple direct call: look up the name in the import table.
@@ -614,7 +670,8 @@ function resolveCallTarget(
     // #299 P1: `self.method()` inside a class body resolves to the enclosing
     // class's method.
     if (objNode.text === 'self' && enclosingClass) {
-      const info = defMap.get(`${relPath}:method:${enclosingClass}.${attrNode.text}`);
+      const self = { relpath: relPath, className: enclosingClass };
+      const info = lookupMethod(self, attrNode.text, defMap, classBases);
       if (info) return info;
     }
 
@@ -622,13 +679,34 @@ function resolveCallTarget(
     // to that class's method.
     const lt = localTypes.get(objNode.text);
     if (lt) {
-      const info = defMap.get(`${lt.relpath}:method:${lt.className}.${attrNode.text}`);
+      const info = lookupMethod(lt, attrNode.text, defMap, classBases);
       if (info) return info;
     }
 
     return undefined;
   }
 
+  return undefined;
+}
+
+/** `cls.method`, or the first base class (breadth-first) that defines it. */
+function lookupMethod(
+  cls: LocalType,
+  method: string,
+  defMap: DefMap,
+  classBases: Map<string, LocalType[]>
+): SymbolInfo | undefined {
+  const queue = [cls];
+  const seen = new Set<string>();
+  for (let i = 0; i < queue.length && i < 32; i++) {
+    const c = queue[i];
+    const key = `${c.relpath}:class:${c.className}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const info = defMap.get(`${c.relpath}:method:${c.className}.${method}`);
+    if (info) return info;
+    queue.push(...(classBases.get(key) ?? []));
+  }
   return undefined;
 }
 

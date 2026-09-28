@@ -26,14 +26,44 @@ pub mod noise;
 /// Version history:
 ///   0 — legacy (no version byte; all pre-RFC-002 databases)
 ///   1 — Tree-sitter vocabulary (`class:X`, `fn:X`, `method:X.Y`, `var:X`)
-///   2 — current: RFC-014 Phase B graph unification. Phase A now captures
+///   2 — RFC-014 Phase B graph unification. Phase A now captures
 ///       type-definition nodes and `end_line` spans that the G1/G2 unification
 ///       passes depend on, so v1 databases lack the tree-sitter nodes that
 ///       SCIP symbols unify onto. Bumping intentionally invalidates every
 ///       existing `.travsr/graph.db` so the daemon skew check and the
 ///       `travsr status` warning force a full re-index (RFC-014 "Re-index
 ///       Policy").
-pub const SIGNATURE_FORMAT_VERSION: u8 = 2;
+///   3 - current: Objective-C method signatures carry the WHOLE selector
+///       (`method:Class.setWidth:height:`) instead of only its leading keyword
+///       (`method:Class.setWidth`). The old form collapsed every selector
+///       sharing a first keyword onto one node, so sibling methods lost their
+///       own identity and calls between them degenerated into self-loops the
+///       store dropped. Node identity therefore changes for every ObjC method.
+///       A v2 database cannot be migrated in place: incremental reindex only
+///       re-parses files that changed, so an ObjC repo would hold collapsed
+///       signatures for untouched files and full selectors for the rest, with
+///       nothing able to tell the halves apart.
+///
+/// The constant does not invalidate anything by itself. It is a marker some code
+/// paths compare against, and only those paths act on a bump:
+///   * The write paths refuse to advance the graph or the freshness marker when
+///     the stored version differs. `reindex_files` (the commit hook and the
+///     watcher) indexes nothing and returns success, logging the reason to the
+///     daemon log so the hook never blocks a commit; `reconcile_head_drift` and
+///     the CLI reindex leave `last_commit` unstamped so freshness is not claimed
+///     for a reindex that never ran.
+///   * `travsr status` is what tells the user, printing the format skew and
+///     asking for a `travsr init`.
+///   * `init_repo_with_progress` reads the stored version before re-stamping it
+///     and, on a mismatch, purges the graph and clears the file-hash cache so
+///     every file is re-parsed, exactly as `--force` does, rather than taking
+///     the incremental path.
+///
+/// Read paths do not check the version at all. `open_read_only` verifies the
+/// schema version only, so queries keep answering from the old-format graph: it
+/// is stale, not corrupt, and the write-path refusals above are what stop the
+/// two formats from ever mixing.
+pub const SIGNATURE_FORMAT_VERSION: u8 = 3;
 
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
 
@@ -717,6 +747,16 @@ pub struct ScipRef {
     /// edge-emitting behavior with no regression.
     #[serde(default = "default_true")]
     pub is_call: bool,
+    /// 0-based UTF-8 BYTE column of the reference occurrence on `caller_line`
+    /// (RFC-027 #813 P2). Recorded on the `edge_sites` row so the live overlay
+    /// resolves the reference at its exact editor position instead of searching
+    /// the line for the name. Each source (SCIP sidecar, rust-analyzer LSIF,
+    /// Dart emitter) converts its own occurrence unit to a byte offset before
+    /// building this; the daemon converts byte to the editor's UTF-16 column at
+    /// use. `None` when the source cannot give a reliable position, in which case
+    /// the daemon falls back to its word-boundary search (no regression).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_col: Option<u32>,
 }
 
 /// serde default for [`ScipRef::is_call`] / [`LsifPositionalRef::is_call`].
@@ -748,6 +788,14 @@ pub struct LsifPositionalRef {
     /// record a `find_references` occurrence without creating a call edge (#650).
     #[serde(default = "default_true")]
     pub is_call: bool,
+    /// 0-based UTF-8 BYTE column of the reference occurrence on `caller_line`
+    /// (RFC-027 #813 P2). LSIF/LSP ranges are UTF-16 code units, so the indexer
+    /// converts the range's start character to a byte offset against the caller
+    /// line before setting this. Carried through to the resolved [`ScipRef`] and
+    /// recorded on the `edge_sites` row. `None` for a dump built before this
+    /// shipped, in which case the daemon name-searches the line (no regression).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_col: Option<u32>,
 }
 
 /// A single reference occurrence returned by `find_references` (issue #299):
@@ -762,6 +810,32 @@ pub struct RefSite {
     pub path: String,
     /// 1-based source line of the occurrence.
     pub line: u32,
+    /// True when at least one `ref/call` edge behind this site carries
+    /// `provenance = 'tree-sitter'`, i.e. it was matched by leaf name rather
+    /// than resolved by a compiler. Such a site can be wholly fabricated: a
+    /// local binding Phase A does not model leaves the only same-named node in
+    /// an unrelated file as the unique winner, and every occurrence enumerated
+    /// under it points at the wrong symbol. Renderers mark these; a `false`
+    /// means either compiler-resolved or (for an occurrence with no edge row of
+    /// its own, e.g. a SCIP type reference) nothing to flag.
+    ///
+    /// `#[serde(default)]` so a payload written before this field existed still
+    /// deserializes, reading as "nothing to flag" exactly as it did then.
+    #[serde(default)]
+    pub heuristic: bool,
+    /// True when at least one edge behind this site carries
+    /// `provenance = 'live'`: resolved from an uncommitted edit by the RFC-027
+    /// live lane, correct as far as the resolver could tell but not yet
+    /// ratified by Phase B.
+    ///
+    /// Deliberately a second flag rather than a value of [`Self::heuristic`]:
+    /// the two caveats are different and must not be conflated. A heuristic
+    /// site was matched by name and may be wholly fabricated; a live site *was*
+    /// resolved and is merely un-ratified. `#[serde(default)]` keeps the wire
+    /// format compatible with an index written before this shipped, matching
+    /// how `heuristic` itself was added.
+    #[serde(default)]
+    pub live: bool,
 }
 
 /// Human-readable label for a node in `graph` / reference output.
@@ -1013,7 +1087,7 @@ pub fn is_scip_anonymous_local(sig: &str) -> bool {
 }
 
 /// A directed, typed edge between two nodes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct Edge {
     pub src: NodeId,
     pub dst: NodeId,
@@ -1022,6 +1096,32 @@ pub struct Edge {
     /// `None` for all non-FFI edges. Stored in `edges.confidence` (migration v6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<u8>,
+    /// How this edge was derived: the `edges.provenance` tag required by
+    /// ADR-002 Rule 1 (`tree-sitter` / `lsif` / `scip` / `bridge:<mech>`).
+    ///
+    /// This is a **read-side** field, populated by the store's `iter_edges_*`
+    /// readers so consumers (the MCP surface, `travsr graph --format json`) can
+    /// report an edge's true origin instead of assuming `tree-sitter`
+    /// (DEBT-75). It is `None` on an edge that was constructed rather than read.
+    /// Writers are unaffected: every insert path still takes its provenance as
+    /// an explicit argument, so there is exactly one source of truth on write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
+}
+
+/// Equality is over `(src, dst, kind, confidence)` and deliberately **excludes**
+/// `provenance`: an edge's identity in the store is its `(src, dst, kind)`
+/// primary key, and provenance is metadata about how that one edge was derived,
+/// not a second edge. Two `Edge` values that differ only in provenance denote
+/// the same edge, so comparing a constructed edge against a read-back one stays
+/// meaningful.
+impl PartialEq for Edge {
+    fn eq(&self, other: &Self) -> bool {
+        self.src == other.src
+            && self.dst == other.dst
+            && self.kind == other.kind
+            && self.confidence == other.confidence
+    }
 }
 
 impl Edge {
@@ -1031,7 +1131,15 @@ impl Edge {
             dst,
             kind,
             confidence: None,
+            provenance: None,
         }
+    }
+
+    /// Attach a read-side provenance tag. Used by the store readers; see the
+    /// `provenance` field docs.
+    pub fn with_provenance(mut self, provenance: impl Into<String>) -> Self {
+        self.provenance = Some(provenance.into());
+        self
     }
 
     /// Build a cross-language FFI edge with a confidence score (RFC-005).
@@ -1047,6 +1155,7 @@ impl Edge {
             dst,
             kind: EdgeKind::FFICall,
             confidence: Some(confidence),
+            provenance: None,
         }
     }
 }
@@ -1091,6 +1200,16 @@ pub struct UnresolvedCall {
     /// skips `edge_sites` emission for zero lines.
     #[serde(default)]
     pub caller_line: u32,
+    /// 0-based byte column of the callee-name occurrence on `caller_line`
+    /// (RFC-027 #813 P2). It is the start column of the exact identifier node the
+    /// extractor captured, so it points at the reference the editor resolves,
+    /// which is strictly better than a name search when the name repeats on the
+    /// line. Byte offset, in the file's own encoding; the daemon converts it to
+    /// the editor's UTF-16 column against the current line. `None` for an emitter
+    /// that predates this field, in which case the daemon falls back to its
+    /// word-boundary search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_col: Option<u32>,
     /// True when this call came from a method-call receiver (`recv.method()`)
     /// whose type is not known syntactically. A method call can never resolve
     /// to a bare free function — the daemon resolver requires a qualified
@@ -1108,6 +1227,26 @@ pub struct UnresolvedCall {
     /// were introduced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recv_type: Option<String>,
+}
+
+/// An `extends`/`implements` clause the native extractor found but does not
+/// resolve cross-file, for RFC-027's live `IsImplementation` lane.
+///
+/// Like [`UnresolvedCall`] it carries no identity — only the base type's simple
+/// name and the line it is written on, which is exactly what the live lane needs
+/// to resolve it (lexically against a unique repo-wide definition, or via the
+/// editor's definition provider) and to abstain otherwise. The daemon derives
+/// the edge's source (the implementing class) from the line and owns both node
+/// ids, so nothing here mints a VName.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct InheritanceRef {
+    /// The base type's simple name (the edge *target*), exactly as written: the
+    /// superclass in `class C extends B`, the interface in `implements I`.
+    pub base_name: String,
+    /// 1-based line the base name appears on — the class declaration line, which
+    /// the daemon maps to the implementing class (the edge source) via
+    /// `enclosing_definition_at`.
+    pub line: u32,
 }
 
 // ── Import Resolution ────────────────────────────────────────────────────────
@@ -1500,6 +1639,71 @@ pub struct ReplaceReport {
     pub removed_count: usize,
     /// Paths of files that had inbound edges to the removed symbols.
     pub callers: DirtySet,
+    /// RFC-027 #813: the definitions in the reparsed file this edit actually
+    /// changed. It is every node this parse produced whose committed edges were
+    /// NOT preserved: the edited definitions on a pure body edit, or the whole
+    /// file when the edit added or removed a symbol (or no `content` was
+    /// supplied, so nothing could be proven unchanged). Empty means every
+    /// definition was preserved, so there is no changed region to re-resolve.
+    ///
+    /// Both lanes scope to exactly these. The save-path lexical lane
+    /// (`live_resolve_file`) filters to them so a preserved definition's
+    /// already-committed references are not re-recorded as `pending` and the
+    /// freshness count stays honest. The request-path editor targets
+    /// (`live_resolution_targets`) filter to them too, via the set stashed on the
+    /// `EditorPlane` at save, so a preserved definition emits no native provider
+    /// round trip. A whole-file re-derive stashes nothing, so the request path
+    /// stays whole-file; a dependent file (not reparsed by this save) is also
+    /// resolved whole-file.
+    #[serde(default)]
+    pub changed_defs: Vec<NodeId>,
+    /// RFC-027 #813 P2: the committed occurrence rows the reparse is about to
+    /// purge for the changed definitions, captured before the purge (see
+    /// [`ChangedOccurrence`]). The live lane enumerates
+    /// these as editor-resolution targets so it reaches references the
+    /// tree-sitter live extractor never detects (macro, desugared,
+    /// trait-dispatched) but the committed SCIP occurrence set did capture, and
+    /// resolves each at its exact stored column. The `dst` is deliberately NOT
+    /// carried: it is the stale committed target, and the editor must re-resolve
+    /// the CURRENT buffer position (RFC-027 section 8.2 fencing), so only the
+    /// position is trustworthy. Empty on a pure preserve or when no `content`
+    /// was supplied.
+    #[serde(default)]
+    pub changed_occurrences: Vec<ChangedOccurrence>,
+    /// RFC-027 #813 (finding 2): whether at least one definition was preserved,
+    /// i.e. this was a scoped pure-body edit and `changed_defs` is a proper
+    /// subset of the file. When false the whole file was re-derived and
+    /// `changed_defs` names every node, so the save path resolves the file
+    /// wholesale exactly as before and there is nothing to scope.
+    #[serde(default)]
+    pub preserved_any: bool,
+}
+
+/// RFC-027 #813 P2: one committed occurrence of a changed definition, captured
+/// by `reindex_replace` before it purges the file's owned sites, for the live
+/// lane to re-resolve at the editor. Carries only the position and kind, never
+/// the stale committed `dst` (see [`ReplaceReport::changed_occurrences`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChangedOccurrence {
+    /// The changed source definition this occurrence lived in (its enclosing
+    /// node), so the daemon can bound the occurrence to that def's current span.
+    pub src: NodeId,
+    /// 1-based line of the occurrence, already remapped to the current buffer by
+    /// the changed definition's block delta when captured.
+    pub line: u32,
+    /// 0-based UTF-8 byte column of the occurrence, or `None` when the committed
+    /// row carried no column (the daemon then name-searches the line).
+    pub col: Option<u32>,
+    /// The occurrence's edge kind (`ref/call` or `ref/field`), so the served
+    /// editor target requests the matching resolution.
+    pub kind: String,
+    /// Leaf name of the reference identifier at this occurrence (the committed
+    /// callee's signature leaf), so the editor can name-search the line when no
+    /// column is stored and label the target. Never a node identity: the editor
+    /// resolves the CURRENT buffer position and the daemon maps the result to a
+    /// SCIP-owned node (RFC-027 section 8.2 fencing), so the stale committed
+    /// target is deliberately not carried, only this name hint.
+    pub name: String,
 }
 
 /// Summary returned by `reconcile` / `travsr fsck`.
@@ -2137,6 +2341,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 42,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         };
@@ -2156,6 +2361,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 42,
+            caller_col: None,
             is_method_call: true,
             recv_type: None,
         };

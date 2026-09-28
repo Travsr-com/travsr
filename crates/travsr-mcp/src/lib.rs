@@ -39,6 +39,7 @@ pub use query::AMBIGUOUS_DISPLAY_LIMIT;
 // #645 WS-B: the CLI `status` surface reuses this exact classifier so the CLI
 // and MCP notes never disagree about an index/HEAD mismatch.
 pub use tools::head_index_mismatch_note;
+pub use tools::{check_architecture_invariants, InvariantReport, PROVENANCE_FILTERS};
 // The CLI surfaces the same call-graph completeness note as the MCP tools.
 // Shared rather than reimplemented: the doc on `phase_b_degraded_note` already
 // promised the two would never disagree, and until now only the MCP side used
@@ -49,6 +50,14 @@ pub use tools::phase_b_degraded_note;
 // only be checked from that side; without it a future edit to the daemon's list
 // silently widens `find_pattern` past the graph's file set.
 pub use tools::SKIP_DIRS;
+// SEC-002: exported so `travsr-daemon`'s control socket applies the same
+// argument guard the MCP tools do. The socket takes a caller-supplied `file`
+// and joins it onto the repo root, which is the case this validator exists for;
+// a second copy of it in the daemon would be one more place for the two to
+// drift apart. The daemon joins the path verbatim (never URL-decoded), so it
+// uses the file variant, which keeps every containment guard but allows the `%`
+// that is legal in a real filename.
+pub use sanitize::validate_mcp_file_arg;
 // RFC-021 P5: model distribution. The daemon auto-fetches on warm; the
 // `travsr rerank` CLI subcommand drives the same install path. The rest of
 // `rerank` stays private (query-path internals).
@@ -111,7 +120,76 @@ pub fn serve_stdio_global() -> anyhow::Result<()> {
     server::run_global()
 }
 
-/// Wire the active embed backend's KNN hook into `store`.
+/// The lazily-armed embed hooks for one repo, as installed on a `SqliteStore`.
+///
+/// Cloning is four `Arc` clones — the sidecar behind them is shared, never
+/// respawned. Held by [`embed_hook_cache`] so global mode, which opens a fresh
+/// read-only store per tool call, does not re-arm on every call.
+#[derive(Clone)]
+struct EmbedHooks {
+    knn: travsr_store::EmbedKnnHook,
+    doc: travsr_store::EmbedKnnHook,
+    score: travsr_store::EmbedScoreHook,
+    readiness: std::sync::Arc<travsr_store::EmbedReadiness>,
+}
+
+/// Armed embed hooks, keyed by graph.db path.
+///
+/// Single-repo mode arms once at startup and holds the store for the life of the
+/// process. Global mode has no such store: it opens one per tool call and drops
+/// it at the end, which would spawn, model-load and kill a sidecar every time —
+/// measured at ~2.1 s of arm cost per `get_context` on a small repo. This keeps
+/// the hooks (and so the sidecar) alive across calls.
+///
+/// One entry per repo the process has actually served a named `get_context`
+/// for, capped at [`MAX_CACHED_EMBED_HOOKS`]. Only [`inject_embed_hook`]
+/// inserts; the global fan-out reads through [`inject_cached_embed_hook`] so a
+/// query with no `repo` argument can never spawn a sidecar per registered repo.
+fn embed_hook_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, EmbedHooks>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, EmbedHooks>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Ceiling on cached entries. Each one pins a sidecar process holding a
+/// 200-1400 MB ONNX model for the life of the daemon, and global mode puts no
+/// bound on how many repos one process is asked to serve. Past the cap the
+/// hooks are still built and used for the call, they are just not kept: those
+/// repos pay the arm cost again next time instead of the process growing
+/// without limit.
+const MAX_CACHED_EMBED_HOOKS: usize = 8;
+
+fn install_embed_hooks(store: &mut SqliteStore, hooks: EmbedHooks) {
+    store.set_embed_readiness(hooks.readiness);
+    store.set_embed_knn_hook(hooks.knn);
+    store.set_embed_doc_knn_hook(hooks.doc);
+    store.set_embed_score_hook(hooks.score);
+}
+
+/// Install already-armed hooks for `db_path`, if some earlier call armed them.
+///
+/// Never starts a sidecar, so it is safe on the global fan-out path: a repo that
+/// a previous named-repo query warmed keeps its semantic lane for free, and one
+/// that was never warmed stays lexical-only. Returns whether hooks were installed.
+pub(crate) fn inject_cached_embed_hook(store: &mut SqliteStore, db_path: &Path) -> bool {
+    // A poisoned cache degrades to "no hook" rather than bringing down the query.
+    let hooks = embed_hook_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(db_path).cloned());
+    match hooks {
+        Some(hooks) => {
+            install_embed_hooks(store, hooks);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Wire the active embed backend's KNN hook into `store`, arming the sidecar on
+/// first use for this `db_path` and reusing it on every later call.
 ///
 /// The sidecar loads a 200–1400 MB ONNX model at startup — this takes 15–25 s
 /// on a cold start. To keep `serve_stdio` (and the extension's `initialize`
@@ -121,28 +199,84 @@ pub fn serve_stdio_global() -> anyhow::Result<()> {
 /// sidecar is still loading, and delegates to the real KNN hook once it is ready.
 /// This produces "embedding in progress" signals in `get_context` responses rather
 /// than blank results or a 15–25 s connect stall.
-fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
+///
+/// The lookup and the insert happen under ONE lock. Releasing it around
+/// `build_embed_hooks` let two concurrent SSE requests for the same cold repo
+/// both miss, both spawn a sidecar, and the loser's process stay alive with its
+/// model resident and nothing referencing it. `build_embed_hooks` only starts
+/// the arming thread, so holding the lock across it does not serialise the
+/// 15-25 s model load.
+pub(crate) fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
+    // A poisoned cache degrades to "no hook" rather than bringing down the query.
+    let Ok(mut cache) = embed_hook_cache().lock() else {
+        return;
+    };
+    let hooks = match cache.get(db_path) {
+        Some(hooks) => hooks.clone(),
+        None => {
+            let Some(hooks) = build_embed_hooks(store, db_path) else {
+                return;
+            };
+            if cache.len() < MAX_CACHED_EMBED_HOOKS {
+                cache.insert(db_path.to_path_buf(), hooks.clone());
+            } else {
+                tracing::debug!(
+                    cap = MAX_CACHED_EMBED_HOOKS,
+                    "embed hook cache full, not retaining hooks for {}",
+                    db_path.display()
+                );
+            }
+            hooks
+        }
+    };
+    drop(cache);
+    install_embed_hooks(store, hooks);
+}
+
+/// Build (and start arming) the embed hooks for `db_path`, or `None` when this
+/// repo has no embedding index, no installed backend binary, or no resolvable
+/// backend — in which case no sidecar is started.
+fn build_embed_hooks(store: &SqliteStore, db_path: &Path) -> Option<EmbedHooks> {
     use std::sync::{Arc, Mutex};
 
     use travsr_error::StoreError;
     use travsr_plugin_host::{
-        active_backend_id, embed_backends, lookup_embed_backend, EmbedQueryHook, EmbedSupervisor,
+        active_backend_id, embed_backends, lookup_embed_backend, repo_backend_id, EmbedQueryHook,
+        EmbedSupervisor,
     };
     use travsr_store::{EmbedKnnHook, EmbedReadiness, EmbedScoreHook};
 
     // Guard: no embed.db → nothing to query; skip to avoid spawning a sidecar
     // against a non-existent HNSW index.
     if !db_path.with_file_name("embed.db").exists() {
-        return;
+        return None;
     }
 
-    let Some(home) = dirs::home_dir() else { return };
-    let backend = active_backend_id()
+    let home = dirs::home_dir()?;
+    // #481: the embedding backend is a per-repo setting; `~/.travsr/embed.toml`
+    // is only the fallback. Reading the machine-global id here started the
+    // sidecar with a different model than this repo's index was built with, so
+    // `knn_hook`/`doc_knn_hook` were armed against a space that does not exist
+    // for that model id. The doc hook then stayed `None` forever and the docs
+    // section vanished with no error on every `get_context`, while `travsr ask`
+    // (served by the daemon, which resolves the repo model) still rendered it.
+    // Same resolution order as travsr-cli's embed paths.
+    let backend = db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(repo_backend_id)
+        .or_else(active_backend_id)
         .as_deref()
         .and_then(lookup_embed_backend)
         .or_else(|| embed_backends().first())
         .cloned();
-    let Some(backend) = backend else { return };
+    let backend = backend?;
+
+    // Mirror the daemon's guard (travsr-daemon: `embed model_id mismatch`): if
+    // the index records a model, the sidecar's must match it or the hooks would
+    // query a space built by a different encoder. Read before the init thread
+    // because `store` is not `Send`.
+    let stored_model = store.get_meta("current_embed_model").ok().flatten();
 
     let binary = home
         .join(".travsr")
@@ -150,7 +284,7 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
         .join(backend.binary_filename());
     // Fast path: if the binary isn't installed there's nothing to do.
     if !binary.exists() {
-        return;
+        return None;
     }
 
     let db_path_bg = db_path.to_path_buf();
@@ -185,48 +319,79 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     std::thread::Builder::new()
         .name("embed-hook-init".into())
         .spawn(move || {
-            let supervisor = EmbedSupervisor::try_start(&binary, &db_path_bg, &model_id_bg);
-            if supervisor.is_active() {
-                if let Some(mid) = supervisor.model_id().map(str::to_string) {
-                    if let Some(hook) = supervisor.knn_hook(mid.clone()) {
-                        // Warm the sidecar (ONNX + HNSW load) BEFORE arming the
-                        // hook, so the first real query never pays the cold-start
-                        // cost that would trip the host's 600 ms KNN breaker and
-                        // silently degrade to FTS. Blocking — we are already on a
-                        // background init thread, so this delays nothing visible.
-                        supervisor.prewarm();
-                        // RFC-019: arm the query-embedding hook before the KNN slot
-                        // so a query that observes `Some(knn)` also observes the
-                        // score hook (never a half-armed state).
-                        if let Some(qhook) = supervisor.embed_query_hook() {
-                            if let Ok(mut guard) = score_slot_bg.lock() {
-                                *guard = Some(qhook);
+            // Arming lives in a closure so that every exit from it - model
+            // mismatch, inactive supervisor, absent knn hook - still reaches the
+            // single `mark_ready` below. Readiness means "arming has settled",
+            // not "a hook exists": the meta-hooks further down are installed
+            // unconditionally, so `has_embed` is true regardless, and a
+            // readiness that never flips makes every `get_context` block for
+            // `embed_arm_wait_ms()` before degrading to lexical-only.
+            //
+            // Returns whether a KNN hook was actually installed. A `false` is
+            // not a transient state: nothing retries, so semantic search is off
+            // for the life of this process and the query path has to be told,
+            // or it reports `embeddings: on` over a lane that cannot run.
+            let arm = || -> bool {
+                let supervisor = EmbedSupervisor::try_start(&binary, &db_path_bg, &model_id_bg);
+                if supervisor.is_active() {
+                    if let Some(mid) = supervisor.model_id().map(str::to_string) {
+                        if stored_model.as_deref().is_some_and(|stored| stored != mid) {
+                            tracing::warn!(
+                                stored_model = ?stored_model,
+                                plugin_model = %mid,
+                                "embed model_id mismatch, semantic search disabled. \
+                                 Run `travsr embed reindex` to rebuild embeddings with the installed model."
+                            );
+                            return false;
+                        }
+                        if let Some(hook) = supervisor.knn_hook(mid.clone()) {
+                            // Warm the sidecar (ONNX + HNSW load) BEFORE arming the
+                            // hook, so the first real query never pays the cold-start
+                            // cost that would trip the host's 600 ms KNN breaker and
+                            // silently degrade to FTS. Blocking — we are already on a
+                            // background init thread, so this delays nothing visible.
+                            supervisor.prewarm();
+                            // RFC-019: arm the query-embedding hook before the KNN slot
+                            // so a query that observes `Some(knn)` also observes the
+                            // score hook (never a half-armed state).
+                            if let Some(qhook) = supervisor.embed_query_hook() {
+                                if let Ok(mut guard) = score_slot_bg.lock() {
+                                    *guard = Some(qhook);
+                                }
                             }
-                        }
-                        if let Ok(mut guard) = slot_bg.lock() {
-                            *guard = Some(hook);
-                        }
-                        // #376 Phase 2: arm the doc hook alongside the code hook.
-                        // `None` when the sidecar predates doc-space support or
-                        // has no doc-space index — `doc_slot` then simply stays
-                        // empty forever, and `doc_lane_seeds` (seed.rs) treats an
-                        // absent hook as "docs unavailable", not an error.
-                        if let Some(doc_hook) = supervisor.doc_knn_hook(mid.clone()) {
-                            if let Ok(mut guard) = doc_slot_bg.lock() {
-                                *guard = Some(doc_hook);
+                            if let Ok(mut guard) = slot_bg.lock() {
+                                *guard = Some(hook);
                             }
+                            // #376 Phase 2: arm the doc hook alongside the code hook.
+                            // `None` when the sidecar predates doc-space support or
+                            // has no doc-space index — `doc_slot` then simply stays
+                            // empty forever, and `doc_lane_seeds` (seed.rs) treats an
+                            // absent hook as "docs unavailable", not an error.
+                            if let Some(doc_hook) = supervisor.doc_knn_hook(mid.clone()) {
+                                if let Ok(mut guard) = doc_slot_bg.lock() {
+                                    *guard = Some(doc_hook);
+                                }
+                            }
+                            tracing::info!(
+                                model_id = %mid,
+                                "embed plugin active, Step 4 (semantic ANN) enabled"
+                            );
+                            return true;
                         }
-                        // Signal arm-complete AFTER the slots are populated so any
-                        // thread woken by `mark_ready` sees `Some(hook)`.
-                        readiness_bg.mark_ready();
-                        tracing::info!(
-                            model_id = %mid,
-                            "embed plugin active, Step 4 (semantic ANN) enabled"
-                        );
                     }
                 }
+                // supervisor drops here; sidecar stays alive via the hook's Arc.
+                false
+            };
+            if !arm() {
+                // Recorded before `mark_ready` so a thread woken by it observes
+                // both flags, and the query path can say `embeddings: disabled`
+                // instead of `on` over a lane that will never answer.
+                readiness_bg.mark_disabled();
             }
-            // supervisor drops here; sidecar stays alive via the hook's Arc.
+            // Signal arm-complete AFTER the slots are populated so any thread
+            // woken by `mark_ready` sees whatever `arm` managed to install.
+            readiness_bg.mark_ready();
         })
         .ok();
 
@@ -241,8 +406,6 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
             Some(hook) => hook(query, k),
         }
     });
-    store.set_embed_readiness(readiness);
-    store.set_embed_knn_hook(meta);
 
     // #376 Phase 2: doc-space meta-hook, same lazy-slot shape as `meta` above.
     // While `doc_slot` is `None` (sidecar warming, unsupported, or no doc-chunk
@@ -257,7 +420,6 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
             Some(hook) => hook(query, k),
         }
     });
-    store.set_embed_doc_knn_hook(meta_doc);
 
     // RFC-019: meta direct-cosine oracle hook. Reads the lazily-armed query hook;
     // while the sidecar warms (slot None) it scores nothing, so the classifier and
@@ -277,6 +439,11 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
             None => Ok(vec![]),
         }
     });
-    store.set_embed_score_hook(meta_score);
     tracing::info!("embed plugin hook installed (lazy, sidecar starting in background)");
+    Some(EmbedHooks {
+        knn: meta,
+        doc: meta_doc,
+        score: meta_score,
+        readiness,
+    })
 }

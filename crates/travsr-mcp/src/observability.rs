@@ -361,10 +361,16 @@ fn decode_phase_b_warnings(
                     rest.to_string(),
                     (
                         "failed",
+                        // The cause lives in the analyzer's own stderr, which the
+                        // host now forwards at warn. Do not assert it is the
+                        // project: the same symptom is produced by travsr
+                        // invoking the analyzer wrongly, and naming one cause
+                        // sends the reader the wrong way.
                         format!(
                             "semantic analyzer for '{rest}' ran but found no symbols despite \
                              '{rest}' sources being present, re-run \
-                             `travsr init --semantic --force` after fixing the project setup"
+                             `RUST_LOG=travsr_plugin_host=warn travsr init --semantic --force` \
+                             to see the analyzer's own diagnostics"
                         ),
                     ),
                 );
@@ -480,6 +486,42 @@ fn decode_phase_b_warnings(
                             "'{rest}' is registered but this repository's corpus is not \
                              trusted for semantic indexing. Run `travsr lang add {rest} \
                              --corpus {corpus}` to trust it"
+                        ),
+                    ),
+                );
+            }
+            // #878: the TypeScript LSIF pass was due but `travsr-lsif-ts` could
+            // not be started (discovery is anchored on the travsr binary's own
+            // location, so a relocated binary loses it). The native pass ran, so
+            // the language has SOME call edges and the marker advanced: this is
+            // the one class where "done" would be a confident lie rather than a
+            // missing answer. Wording tracks `travsr status` (status.rs).
+            "emitter_missing" => {
+                out.insert(
+                    rest.to_string(),
+                    (
+                        "unavailable",
+                        format!(
+                            "full '{rest}' analysis is incomplete: the TypeScript analyzer \
+                             (travsr-lsif-ts) could not be started, so cross-file call and \
+                             reference edges are missing. Set TRAVSR_LSIF_TS to the emitter's \
+                             dist/index.js (or reinstall travsr), then re-run \
+                             `travsr init --semantic --force`"
+                        ),
+                    ),
+                );
+            }
+            "emitter_failed" => {
+                out.insert(
+                    rest.to_string(),
+                    (
+                        "failed",
+                        format!(
+                            "full '{rest}' analysis is incomplete: the TypeScript analyzer \
+                             (travsr-lsif-ts) started but failed, so cross-file call and \
+                             reference edges are missing. Re-run \
+                             `RUST_LOG=travsr_daemon=warn travsr init --semantic --force` \
+                             to see its error"
                         ),
                     ),
                 );
@@ -631,6 +673,45 @@ fn semantic_block(store: &SqliteStore, root: Option<&Path>) -> serde_json::Value
     })
 }
 
+/// The single user-facing note for a graph built by an older travsr, or
+/// `None` when this database was written by the running binary's format.
+///
+/// Same RFC-014 #317 re-index policy the CLI reports, and deliberately the
+/// same sentence as `travsr status` (travsr-cli/src/status.rs), so the CLI,
+/// `get_index_status` and `get_graph_health` all say the same thing and point
+/// at the same fix; the only difference is that an unreadable version reads
+/// `format unknown` rather than `format vN`. An agent only ever sees the
+/// observability tools, so without this it kept answering from a graph the
+/// running binary can no longer reproduce, with no way to find out.
+fn stale_format_note(store: &SqliteStore) -> Option<String> {
+    // Gate on "Phase A has completed at least once", the same `last_commit`
+    // evidence `phase_a_state` below uses. A database that has never been
+    // indexed still reads back format 0 (the v3 migration's default, stamped
+    // only by a full index), and reporting "built with an older version" there
+    // would be a warning that fires on a healthy index, the same class of
+    // false alarm as the old `behind_by: 0, is_stale: true` (#636 round-4
+    // review). `phase_a.state` already reports "pending" for that case.
+    store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())?;
+
+    let current = travsr_core::SIGNATURE_FORMAT_VERSION;
+    let stored = match store.get_signature_format_version() {
+        Ok(v) if v == current => return None,
+        Ok(v) => format!("v{v}"),
+        // A read failure counts as drift, exactly as the daemon treats it
+        // before a reindex (travsr-daemon `reindex_files_reporting`):
+        // rebuilding is the recoverable direction, and staying silent leaves
+        // an agent trusting a graph nobody could verify.
+        Err(_) => "unknown".to_string(),
+    };
+    Some(format!(
+        "this index was built with an older version of travsr (format {stored}, current v{current}); run `travsr init` to rebuild it"
+    ))
+}
+
 /// Build the `get_index_status` JSON payload. `repo_label` is the value to
 /// report as `repo` (registry key in global mode, `corpus` meta in stdio
 /// mode); `root` is the repo's working-tree root when known (`None` disables
@@ -681,6 +762,11 @@ fn index_status_payload(
         None => commits_known_and_differ,
     };
     let dirty = root.and_then(working_tree_dirty);
+    // Reported inside `staleness` rather than as a new top-level key: it is
+    // the same question that object already answers ("is what I would read
+    // out of here current?"), just measured against the running binary
+    // instead of against git.
+    let rebuild_note = stale_format_note(store);
 
     let node_count = store.node_count().unwrap_or(0);
     let edge_count = store.edge_count().unwrap_or(0);
@@ -791,7 +877,7 @@ fn index_status_payload(
         "running"
     };
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "repo": repo,
         "schema_version": schema_version,
         "indexed_commit": last_commit,
@@ -800,6 +886,7 @@ fn index_status_payload(
             "behind_by": behind_by,
             "is_stale": is_stale,
             "working_tree_dirty": dirty,
+            "rebuild_required": rebuild_note.is_some(),
         },
         "counts": { "nodes": node_count, "edges": edge_count },
         "phase_a": { "state": phase_a_state },
@@ -809,7 +896,11 @@ fn index_status_payload(
             "languages": lang_entries,
         },
         "semantic": semantic_block(store, root),
-    })
+    });
+    if let Some(note) = rebuild_note {
+        payload["staleness"]["rebuild_note"] = serde_json::json!(note);
+    }
+    payload
 }
 
 /// Index freshness / completeness snapshot for the caller's own repo
@@ -1404,9 +1495,18 @@ fn graph_health_payload(store: &SqliteStore, repo_label: &str, root: &Path) -> s
     let healthy =
         report.orphan_edges_detected == 0 && ghost_count == 0 && parity_ok && self_ref_count == 0;
 
+    // Carried beside `healthy` instead of folded into it: `healthy` is defined
+    // by the integrity scan (the report half of `travsr fsck`), and an index
+    // written by an older travsr can be perfectly intact. It still cannot be
+    // trusted to match what the running binary would produce, and this tool is
+    // where an agent asks about the graph's health, so it is reported here too
+    // rather than left only in `travsr status` (RFC-014 #317).
+    let rebuild_note = stale_format_note(store);
+
     let mut payload = serde_json::json!({
         "repo": repo,
         "healthy": healthy,
+        "rebuild_required": rebuild_note.is_some(),
         "node_count": report.node_count,
         "edge_count": report.edge_count,
         "ghost_paths": { "count": ghost_count, "sample": sample },
@@ -1433,6 +1533,9 @@ fn graph_health_payload(store: &SqliteStore, repo_label: &str, root: &Path) -> s
                 "run `travsr init` to rebuild the lexical index"
             };
         payload["recommendation"] = serde_json::json!(recommendation);
+    }
+    if let Some(note) = rebuild_note {
+        payload["rebuild_note"] = serde_json::json!(note);
     }
     payload
 }
@@ -2337,6 +2440,50 @@ mod tests {
         assert_eq!(payload["phase_a"]["state"], "done", "got: {payload}");
     }
 
+    /// An index stamped by the running binary must NOT carry the rebuild
+    /// warning: a warning that fires on a healthy index is worse than none.
+    #[test]
+    fn index_status_current_format_reports_no_rebuild() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+
+        let payload = index_status_payload(&store, "repo", None);
+        assert_eq!(payload["staleness"]["rebuild_required"], false);
+        assert!(payload["staleness"].get("rebuild_note").is_none());
+    }
+
+    /// A graph written before the format bump must tell an agent what to do
+    /// about it, in the same words `travsr status` uses.
+    #[test]
+    fn index_status_older_format_reports_rebuild_with_actionable_note() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION - 1)
+            .unwrap();
+
+        let payload = index_status_payload(&store, "repo", None);
+        assert_eq!(payload["staleness"]["rebuild_required"], true);
+        let note = payload["staleness"]["rebuild_note"].as_str().unwrap();
+        assert!(note.contains("older version of travsr"), "{note}");
+        assert!(note.contains("run `travsr init` to rebuild it"), "{note}");
+    }
+
+    /// A database nobody has indexed yet reads back format 0 by migration
+    /// default. That is "not indexed", not "indexed by an older travsr", and
+    /// `phase_a.state` already reports it, so no rebuild warning.
+    #[test]
+    fn index_status_never_indexed_store_does_not_claim_an_older_format() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let payload = index_status_payload(&store, "repo", None);
+        assert_eq!(payload["phase_a"]["state"], "pending");
+        assert_eq!(payload["staleness"]["rebuild_required"], false);
+        assert!(payload["staleness"].get("rebuild_note").is_none());
+    }
+
     // ── get_daemon_logs parsing / caps ────────────────────────────────────
 
     /// A real line off this machine's `.travsr/daemon.log.2026-08-12`, which
@@ -2401,6 +2548,9 @@ mod tests {
             "no_references",
             "zero_nodes",
             "needs_consent",
+            // #878: the TypeScript LSIF pass skipped under a marker that advanced.
+            "emitter_missing",
+            "emitter_failed",
         ] {
             // `version_mismatch` carries `lang:expected:got`, the rest `lang`.
             let warning = if class == "version_mismatch" {
@@ -2970,6 +3120,40 @@ mod tests {
         let payload = graph_health_payload(&store, "repo", tmp.path());
         assert_eq!(payload["healthy"], true);
         assert!(payload.get("recommendation").is_none());
+    }
+
+    /// Integrity-clean AND written by the running binary: no rebuild warning.
+    #[test]
+    fn graph_health_current_format_reports_no_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+
+        let payload = graph_health_payload(&store, "repo", tmp.path());
+        assert_eq!(payload["rebuild_required"], false);
+        assert!(payload.get("rebuild_note").is_none());
+    }
+
+    /// An intact graph can still have been built by an older travsr: `healthy`
+    /// stays true (nothing is corrupt) but the rebuild note must be there.
+    #[test]
+    fn graph_health_older_format_reports_rebuild_with_actionable_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION - 1)
+            .unwrap();
+
+        let payload = graph_health_payload(&store, "repo", tmp.path());
+        assert_eq!(payload["healthy"], true);
+        assert_eq!(payload["rebuild_required"], true);
+        let note = payload["rebuild_note"].as_str().unwrap();
+        assert!(note.contains("older version of travsr"), "{note}");
+        assert!(note.contains("run `travsr init` to rebuild it"), "{note}");
     }
 
     #[test]

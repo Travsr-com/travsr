@@ -538,7 +538,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         native_phase_b: true,
         has_share_assets: false,
         runtime_driver: Some("node"),
-        prerequisites: "Node.js",
+        prerequisites: "Node.js (runs the bundled Python analyzer)",
     },
     PhaseBEntry {
         language: "java",
@@ -688,7 +688,14 @@ pub static CATALOG: &[PhaseBEntry] = &[
         windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/php"),
         command: "scip-php",
-        args: &["{root}", "--output", "{output}"],
+        // scip-php takes no positional root and has no `--output`: it indexes its
+        // own working directory and hardcodes `./index.scip` (bin/scip-php:39,53,
+        // read by the travsr-lang-php sidecar, crates/php/src/main.rs:211). The
+        // sidecar therefore runs it in the repo and moves the artifact into
+        // scratch, which is what the `RepoWrite::File("index.scip")` grant in
+        // sandbox/toolchain.rs exists for. The form recorded here used to say
+        // otherwise, which read as if that grant were unnecessary.
+        args: &[],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "travsr lang install php",
@@ -903,6 +910,34 @@ pub static CATALOG: &[PhaseBEntry] = &[
 /// Look up a Phase B entry by canonical language string.
 pub fn lookup(language: &str) -> Option<&'static PhaseBEntry> {
     CATALOG.iter().find(|e| e.language == language)
+}
+
+/// Filenames that mark a directory as a workspace this language's analyzer can
+/// index (#724 Finding 5).
+///
+/// A build-system-driven analyzer autoindexes the directory it is handed:
+/// scip-java exits with "No build tool detected in workspace" when that
+/// directory holds no Maven or Gradle manifest, which is every repo whose
+/// project lives one level down. Phase B uses this list to hand the analyzer
+/// the nearest directory that does have a manifest instead.
+///
+/// Empty for analyzers that do not drive a build system; those keep being
+/// invoked at the repo root.
+pub fn build_manifests(language: &str) -> &'static [&'static str] {
+    match language {
+        "java" => &[
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+        ],
+        "scala" => &["build.sbt"],
+        "go" => &["go.mod"],
+        "php" => &["composer.json"],
+        "c" | "cpp" => &["compile_commands.json"],
+        _ => &[],
+    }
 }
 
 // ── RFC-025 SidecarSpec impls ───────────────────────────────────────────────

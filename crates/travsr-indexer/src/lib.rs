@@ -18,7 +18,6 @@ pub mod ffi; // thin re-export wrapper → travsr_analysis::ffi
 mod ffi_resolver;
 mod hash;
 pub mod lsif;
-pub mod python_lsif;
 pub mod ra_runner;
 pub mod runner;
 pub mod sandbox;
@@ -31,7 +30,7 @@ use travsr_core::{EdgeKind, Language};
 // ParseOutput and FfiMarker are now owned by travsr-analysis.
 pub use ffi::{FfiMarker, FfiMarkerKind};
 pub use ffi_resolver::FfiConfig;
-pub use hash::hash_file;
+pub use hash::{hash_bytes, hash_file};
 pub use lsif::ingest as ingest_lsif;
 pub use lsif::{
     ingest_g2 as ingest_lsif_g2, ingest_g2_from_reader as ingest_lsif_g2_from_reader,
@@ -40,7 +39,10 @@ pub use lsif::{
     LsifG2Output,
 };
 pub use ra_runner::run_ra_lsif;
-pub use runner::{run_lsif_emitter, run_lsif_py_emitter, run_scip_python};
+pub use runner::{
+    bundled_lsif_emitter_available, emitter_missing, run_lsif_emitter, run_lsif_emitter_with_root,
+    run_lsif_py_emitter, run_scip_python, synthesize_js_tsconfig, EmitterNotFound, JS_EXTENSIONS,
+};
 pub use travsr_analysis::ParseOutput;
 pub use travsr_core::{Edge, Node};
 pub use travsr_error::IndexError;
@@ -682,8 +684,7 @@ impl Indexer {
     /// Override the FFI resolver configuration (RFC-005).
     ///
     /// Call this after [`Indexer::with_corpus`] (or on a value from [`Indexer::new`])
-    /// to control the emit threshold, enable/disable FFI resolution, or adjust
-    /// the pyright timeout.
+    /// to control the emit threshold or enable/disable FFI resolution.
     pub fn with_ffi_config(mut self, cfg: ffi_resolver::FfiConfig) -> Self {
         self.ffi_config = cfg;
         self
@@ -733,17 +734,8 @@ impl Indexer {
                 travsr_analysis::rust::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
             }
             Some(Language::Python) => {
-                let mut ts_out = travsr_analysis::python::parse(&self.corpus, abs_path, vname_path)
-                    .map_err(map_err)?;
-                // Best-effort semantic enrichment via pyright (RFC-005 §3).
-                // Runs after tree-sitter; failures are logged and silently ignored.
-                let pyright_out = python_lsif::parse_python_with_pyright(
-                    abs_path,
-                    std::time::Duration::from_secs(self.ffi_config.pyright_timeout_secs),
-                )
-                .unwrap_or_default();
-                ts_out.merge_deduped(pyright_out);
-                ts_out
+                travsr_analysis::python::parse(&self.corpus, abs_path, vname_path)
+                    .map_err(map_err)?
             }
             Some(Language::Go) => {
                 travsr_analysis::go::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?

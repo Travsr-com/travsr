@@ -123,6 +123,19 @@ $ travsr mcp --stdio
 - undo it later      travsr connect --remove
 connect records the absolute path of the binary it was run from, so an agent started days later launches the same travsr you tested with. Run it again after moving or upgrading the binary, and remember the agent only reads its config at startup.
 
+## how do I stop my agent reaching for grep?
+
+> Install the guard, a hook that intervenes at the moment it does.
+1. nudge it, never block :: travsr init --guard
+2. or refuse reads the graph can answer :: travsr init --guard=strict
+3. take the hook back out :: travsr connect --remove
+- matched      Grep, Glob, Read, and shell grep/rg/find/ag/ack/ls -R
+- advisory     allows the call and names the Travsr call to use instead
+- strict       denies it, with that same call in the refusal
+- turn it off  TRAVSR_GUARD=off
+Wiring MCP makes the graph reachable; it does not make an agent prefer it. The guard runs at the exact point the agent reaches for text search and hands it the replacement, which is worth more there than in a rules file it re-reads and skims every turn. It refuses only what the graph can genuinely answer: a missing, stale or unreadable index, an unknown symbol, a regex, a file the index does not carry, or its own 200ms deadline all let the call straight through. In strict mode you get at most one redirect per symbol per session, so a search you repeat is always allowed. Claude Code only, because it is the one host with a pre-tool contract to hook.
+$ travsr init --guard
+
 ## what tools does the MCP server expose?
 > Twenty-six, grouped by the kind of question they answer.
 - structure   get_callers, get_dependencies, get_blast_radius
@@ -196,8 +209,18 @@ $ travsr daemon logs -f --level warn --since 10m
 - lsif.spawn, lsif.complete, kcore.updated
 - query.served, embed.text.updated, lsp.diagnostics
 - file.skipped, the one you see most when something is wrong
+query.served is the exception to "it is in the log": a query slower than 200ms is recorded at info, a faster one at debug, so at the default level you see the slow ones and nothing else. Set log.level to debug to see every query.
 The keys are identifiers and keep their spelling; the messages beside them are written for people and can be reworded at any time. That is why both exist: an alert or a jq filter built on event=phase_b.complete keeps working, where one that matched the message text would break the next time someone improved the wording.
 $ travsr daemon logs --lines 0 --json
+
+## can travsr check my architecture rules?
+> Write them down and it checks them against the graph on every run.
+- rules live in architecture-invariants.json at the repo root
+- a rule caps what a component may depend on, or what may use it
+- or asserts there are no cycles at all
+- it exits non-zero on a violation, so it works as a CI step
+A rule naming a component that no longer exists is reported as broken, not skipped. Renaming a crate would otherwise silently retire the rule protecting it, which is the one way a guard fails without anyone noticing. travsr checks its own rules this way: the dependency graph written into its CLAUDE.md had been missing two real edges, and nothing caught it.
+$ travsr invariants
 
 ## how do I tell if something is broken?
 > Three commands, in the order worth trying them.

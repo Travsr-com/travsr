@@ -61,6 +61,10 @@ fn run_piped_expecting_prompt_eof(
     let mut child = Command::new(travsr_exe())
         .args(args)
         .current_dir(repo)
+        // #893: `travsr init` runs through here, and without this it appends
+        // this tempdir to the developer's real ~/.travsr/registry.json, which
+        // then lists a directory `tempfile` deletes on drop.
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

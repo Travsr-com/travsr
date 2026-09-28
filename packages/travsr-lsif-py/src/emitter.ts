@@ -16,9 +16,7 @@
  *   method:ClassName.name    — method inside a class
  */
 
-import type Parser from 'tree-sitter';
-
-type SyntaxNode = Parser.SyntaxNode;
+import type { Node as SyntaxNode } from 'web-tree-sitter';
 
 export class Emitter {
   private idCounter = 0;

@@ -7,7 +7,6 @@ import {
   parseSynonymList,
   parseExecutionPath,
   parseReposList,
-  parseLanguageCounts,
   parseAvailableLanguages,
   buildStatsView,
   buildClickableFileListHtml,
@@ -198,19 +197,6 @@ suite("VSCODE-247: buildDepListHtml", () => {
     const html = buildDepListHtml("Deps", [{ display: "vscode" }, { display: "fs" }], []);
     assert.ok(!html.includes("data-path="), "no clickable paths for external deps");
     assert.ok(html.includes("dep-ext"));
-  });
-});
-
-suite("VSCODE-247: parseLanguageCounts", () => {
-  test("parses TSV language/count pairs", () => {
-    const counts = parseLanguageCounts("typescript\t1234\nrust\t567");
-    assert.strictEqual(counts.length, 2);
-    assert.deepStrictEqual(counts[0], { language: "typescript", count: 1234 });
-    assert.deepStrictEqual(counts[1], { language: "rust", count: 567 });
-  });
-  test("empty / enveloped input", () => {
-    assert.deepStrictEqual(parseLanguageCounts(""), []);
-    assert.deepStrictEqual(parseLanguageCounts("<travsr-data></travsr-data>"), []);
   });
 });
 

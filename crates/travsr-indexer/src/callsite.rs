@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 /// the line length. LSIF and SCIP positions are UTF-16 code units; source is
 /// UTF-8. For ASCII (the overwhelming majority of identifier positions) this is
 /// the identity map. The returned offset always lands on a `char` boundary.
-fn utf16_col_to_byte(line: &str, column: u32) -> usize {
+pub(crate) fn utf16_col_to_byte(line: &str, column: u32) -> usize {
     let mut units = 0u32;
     for (byte_idx, ch) in line.char_indices() {
         if units >= column {

@@ -3,6 +3,10 @@ use anyhow::Context as _;
 
 use crate::repo::find_git_root_for_write;
 
+// One parameter per `travsr init` flag, the same shape `graph::run` uses. A
+// struct would only move the list somewhere else: clap already owns the
+// canonical definition, and a second one here would be a copy to keep in sync.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     quiet: bool,
     json: bool,
@@ -11,6 +15,7 @@ pub fn run(
     force: bool,
     allow_unsandboxed_lsif: bool,
     no_connect: bool,
+    guard: Option<crate::guard::GuardMode>,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     // Write command: index the worktree we are standing in, never redirect to
@@ -39,12 +44,31 @@ pub fn run(
 
     let db_path = repo_root.join(".travsr/graph.db");
 
+    // #893: a `.gitignore` entry cannot un-track a path git already holds, so on
+    // a repo that committed `.travsr/` before this existed, `init_repo`'s
+    // scaffold changed nothing and `git revert`/`git merge` still refuse to run
+    // against the permanently dirty WAL. Always stderr, so it reaches the `--json` path too without landing in
+    // the machine-readable summary on stdout. Reported, not auto-fixed: removing
+    // it rewrites the user's index.
+    if stats.travsr_dir_tracked {
+        eprintln!(
+            "warning: git tracks files under .travsr/, so ignoring it has no effect. \
+             The graph's WAL changes on every read, which keeps the working tree \
+             dirty and makes `git revert`/`git merge` refuse to run. \
+             `git rm -r --cached .travsr` to untrack it, then commit."
+        );
+    }
+
     if json {
         // Machine-readable summary on stdout for CI; progress went to stderr.
-        let phase_b = if stats.phase_b_report.is_some() {
-            "complete"
-        } else {
-            "pending"
+        // #878: a CI consumer reads this field instead of the human summary, so
+        // it must not say `complete` over a run whose TypeScript LSIF pass was
+        // skipped, or whose analyzer crashed. `travsr status` calls both
+        // `partial`; agree with it.
+        let phase_b = match &stats.phase_b_report {
+            None => "pending",
+            Some(r) if !r.lsif_skipped.is_empty() || !r.crashed.is_empty() => "partial",
+            Some(_) => "complete",
         };
         let summary = serde_json::json!({
             "files_indexed": stats.files_indexed,
@@ -63,7 +87,12 @@ pub fn run(
         // stdout carries the machine-readable summary, so the connect report goes
         // to stderr. It must not be dropped: these writes land in tracked,
         // user-authored files, and RFC-026 promises they stay visible.
-        maybe_connect(&repo_root, no_connect, crate::connect::Report::Stderr);
+        maybe_connect(
+            &repo_root,
+            no_connect,
+            guard,
+            crate::connect::Report::Stderr,
+        );
         return Ok(());
     }
 
@@ -117,6 +146,7 @@ pub fn run(
     maybe_connect(
         &repo_root,
         no_connect,
+        guard,
         if quiet {
             crate::connect::Report::Silent
         } else {
@@ -129,12 +159,20 @@ pub fn run(
 
 /// Detect AI coding tools and wire them to Travsr (RFC-026). Non-fatal: wiring
 /// is a convenience, so a failure here must never fail `travsr init`.
-fn maybe_connect(repo_root: &std::path::Path, no_connect: bool, report: crate::connect::Report) {
+fn maybe_connect(
+    repo_root: &std::path::Path,
+    no_connect: bool,
+    guard: Option<crate::guard::GuardMode>,
+    report: crate::connect::Report,
+) {
     if no_connect {
         return;
     }
     let mut opts = crate::connect::ConnectOpts::auto();
     opts.report = report;
+    // #916: `None` unless `--guard` was passed, which is what keeps a plain
+    // `travsr init` from installing enforcement nobody asked for.
+    opts.guard = guard;
     let _ = crate::connect::run(repo_root, &opts);
 }
 
