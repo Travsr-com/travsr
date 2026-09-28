@@ -188,8 +188,8 @@ export function parseExecutionPath(raw: string): GraphData {
 
 /**
  * Why `get_execution_path` returned no route, in the server's own words: its
- * `no path found` / `could not resolve` sentence, or the pending message when
- * the call-edge index is not built yet.
+ * `no path found` / `could not resolve` sentence, its ambiguity list, or the
+ * pending message when the call-edge index is not built yet.
  */
 export function describeNoPath(raw: string, source: string, sink: string): string {
   const body = envelopeBody(raw).trim();
@@ -199,8 +199,12 @@ export function describeNoPath(raw: string, source: string, sink: string): strin
   } catch {
     // Not JSON: prose.
   }
-  const first = body.split("\n")[0]?.trim();
-  return first || `No path found from ${source} to ${sink}.`;
+  // An ambiguous endpoint is the advice line followed by one candidate per
+  // line, and the candidates are the part that says which file is which. A
+  // notification shows no line breaks, so they are joined onto the advice.
+  const [first, ...rest] = body.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (!first) return `No path found from ${source} to ${sink}.`;
+  return rest.length > 0 ? `${first} ${rest.join("; ")}` : first;
 }
 
 /** Parse `repos_list` TSV output (`name\tdb_path\t{0|1}`) into rows. */

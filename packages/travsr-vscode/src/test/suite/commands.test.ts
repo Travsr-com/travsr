@@ -117,6 +117,25 @@ suite("VSCODE-247: parseExecutionPath", () => {
   test("an empty answer falls back to naming both ends", () => {
     assert.strictEqual(describeNoPath("", "a", "b"), "No path found from a to b.");
   });
+  test("an ambiguous endpoint keeps its candidates, which say where each one is", () => {
+    // get_execution_path's ambiguity answer (#799): the advice line, then one
+    // candidate per line. A notification shows no line breaks, so the
+    // candidates join the advice rather than being dropped.
+    const raw =
+      "<travsr-data>\n" +
+      "source 'main' is ambiguous, 2 definitions. A signature listed once below resolves uniquely on a re-run:\n" +
+      "  fn:main (function) at bench/stub_server.go\n" +
+      "  fn:main (function) at main.go\n" +
+      "</travsr-data>\n[note: x]";
+    assert.strictEqual(parseExecutionPath(raw).nodes.length, 0);
+    const msg = describeNoPath(raw, "main", "selectServer");
+    assert.ok(msg.startsWith("source 'main' is ambiguous"), msg);
+    assert.ok(
+      msg.endsWith("fn:main (function) at bench/stub_server.go; fn:main (function) at main.go"),
+      msg
+    );
+    assert.ok(!msg.includes("[note:"), msg);
+  });
   test("empty input yields empty graph", () => {
     const data = parseExecutionPath("<travsr-data></travsr-data>");
     assert.strictEqual(data.nodes.length, 0);
