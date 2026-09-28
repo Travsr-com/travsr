@@ -6094,6 +6094,188 @@ fn get_execution_path_with_filter(
     )
 }
 
+/// How one `get_execution_path` endpoint name resolved, after access filtering.
+///
+/// #779: the distinction that was missing. The old code took the first hit from
+/// `search_nodes_by_name`, so "several definitions" and "exactly one" were the
+/// same case, and an ambiguous name silently became a guess.
+enum EndpointResolution {
+    Unique(CoreNode),
+    /// More than one definition the caller may see. Never resolved by picking
+    /// one: the caller is handed the list, exactly as `graph` does.
+    Ambiguous(Vec<CoreNode>),
+    None,
+}
+
+impl EndpointResolution {
+    /// The node when unique, else `None`. `Ambiguous` deliberately collapses to
+    /// `None` here so a caller that skipped the ambiguity branch (the
+    /// non-diagnose path, which returns an empty string for every failure) can
+    /// never accidentally proceed on a guessed endpoint.
+    fn into_unique(self) -> Option<CoreNode> {
+        match self {
+            EndpointResolution::Unique(n) => Some(n),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve one endpoint through the shared tiered resolver, then apply the
+/// access filter.
+///
+/// SEC P0: the filter runs BEFORE the count, and that order is load-bearing.
+/// Ambiguity is a property of what *this caller* may see, so a name with four
+/// definitions of which the caller may see one resolves uniquely for them and
+/// they are never told the other three exist. Counting first and filtering
+/// after would leak their existence through the candidate list, which is the
+/// same oracle `get_execution_path_denied_matches_not_found` exists to prevent.
+fn resolve_endpoint(
+    store: &SqliteStore,
+    name: &str,
+    filter: &dyn EdgeFilter,
+) -> EndpointResolution {
+    let visible = |n: &CoreNode| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()));
+    // Set when the partial-name fallback hit the search limit, so its survivors
+    // are a sample, not every match.
+    let mut truncated = false;
+    let mut candidates = match resolve_reference_targets(store, name, None) {
+        RefTarget::Unique(n) => vec![n],
+        // A path needs one node per endpoint, and each arity of an Objective-C
+        // method family has its own full selector that resolves uniquely, so a
+        // family is answered like any other ambiguity: list it, never pick.
+        RefTarget::Ambiguous(list) | RefTarget::Family(list) => list,
+        // The schema promises partial names, which the tiered resolver does not
+        // match: fall back to the substring search the tool used before #779.
+        // Its hits go through the same filter-then-count below, so a partial
+        // name resolves only when exactly one visible node matches it.
+        //
+        // That search also matches file paths, so only symbols whose own
+        // signature contains the name are kept: a file or import node, or any
+        // node merely sitting in a matching file, is not an endpoint, and
+        // listing one offered a "signature" whose re-run was another list.
+        RefTarget::None => match store.search_nodes_by_name(name) {
+            Ok(hits) => {
+                truncated = hits.len() >= travsr_store::NODE_NAME_SEARCH_LIMIT;
+                let needle = name.to_lowercase();
+                hits.into_iter()
+                    .filter(|n| {
+                        repo_map_is_symbol_kind(&n.kind)
+                            && n.vname.signature.to_lowercase().contains(&needle)
+                    })
+                    .collect()
+            }
+            Err(e) => {
+                tracing::warn!("get_execution_path partial-name search error: {e}");
+                Vec::new()
+            }
+        },
+    };
+    candidates.retain(visible);
+    // A path-only hit ranks the same as a signature hit, so a truncated search
+    // can keep one symbol out of dozens that match (kubernetes: `wrappers`
+    // kept 1 of 31). That survivor is a guess, so it is not resolved.
+    if truncated && candidates.len() == 1 {
+        return EndpointResolution::None;
+    }
+    match candidates.len() {
+        0 => EndpointResolution::None,
+        1 => EndpointResolution::Unique(candidates.remove(0)),
+        _ => EndpointResolution::Ambiguous(candidates),
+    }
+}
+
+/// The candidate list for an ambiguous `get_execution_path` endpoint.
+///
+/// The advice is chosen per candidate set rather than fixed, because the
+/// signature hatch is only real when the candidates differ by signature.
+///
+/// This borrowed `graph`'s wording, but `graph` leads with `--path` "(for
+/// cross-file matches)" and offers the signature as the same-file fallback;
+/// only the signature half came over, onto the one tool with no `path`
+/// argument (schema in `server.rs`). For the fastlane `Runner.run` case #779
+/// exists for, all four definitions carry the identical `method:Runner.run`
+/// and differ only in path, and Tier 1 (`lookup_nodes_exact`) matches on
+/// `signature = ?1`, so following the advice returned this same message: a
+/// dead loop, and the same "restore a brace that is right in front of you"
+/// shape the tool was fixed for (#799 review).
+///
+/// So a signature is advertised as re-runnable only when it appears once. When
+/// it does not, the caller is pointed at the tools that do carry a path lever:
+/// `find_references` and `get_callers` take a `path` hint (#719), and the
+/// `graph` CLI takes `--path`.
+fn ambiguous_endpoint_message(which: &str, name: &str, candidates: &[CoreNode]) -> String {
+    let limit = crate::AMBIGUOUS_DISPLAY_LIMIT;
+    let count = candidates.len();
+    let truncated = count > limit;
+    let head = if truncated {
+        format!("{which} '{name}' is ambiguous, showing {limit} of at least {count} definitions.")
+    } else {
+        format!("{which} '{name}' is ambiguous, {count} definitions.")
+    };
+    // Counted over every candidate, not just the displayed ones: a signature is
+    // re-runnable when the resolver holds exactly one node for it, which
+    // truncation does not change.
+    let mut per_signature: HashMap<&str, usize> = HashMap::new();
+    for n in candidates {
+        *per_signature.entry(n.vname.signature.as_str()).or_insert(0) += 1;
+    }
+    let all_unique = per_signature.len() == count;
+    // Sorted by path so same-signature candidates print adjacent, which is what
+    // makes "listed more than once" checkable by eye. Node id order is a hash,
+    // so the old order was arbitrary as well as unhelpful (#799 review).
+    let mut candidates: Vec<&CoreNode> = candidates.iter().collect();
+    candidates.sort_by(|a, b| {
+        a.vname
+            .path
+            .cmp(&b.vname.path)
+            .then_with(|| a.vname.signature.cmp(&b.vname.signature))
+    });
+    let mut out = if all_unique {
+        format!(
+            "{head} Re-run with one of the exact signatures below, which each resolve \
+             uniquely, instead of the bare name:"
+        )
+    } else {
+        // A real path off the candidate list, not a `<dir>` placeholder: the MCP
+        // sanitizer escapes angle brackets, so a placeholder reaches the caller
+        // as `&lt;dir&gt;` (#799 review round 2). `graph` uses the same idiom for
+        // its signature hint.
+        //
+        // When no candidate carries a path (the empty string sorts first, so this
+        // is reachable) the `graph --path` half is dropped rather than filled with
+        // a placeholder. Prose in an argument position does not read as a command,
+        // and a bracketed one would reintroduce the very escaping this avoids.
+        let example = candidates
+            .first()
+            .map(|n| n.vname.path.as_str())
+            .filter(|p| !p.is_empty());
+        let lever = match example {
+            Some(path) => format!(
+                "find_references or get_callers (`path` hint), or `travsr graph {name} --path {path}`"
+            ),
+            None => "find_references or get_callers (`path` hint)".to_string(),
+        };
+        format!(
+            "{head} A signature listed once below resolves uniquely on a re-run; one \
+             listed more than once returns this same list, and get_execution_path takes \
+             no path argument. For those, narrow by location first with {lever}:"
+        )
+    };
+    for n in candidates.into_iter().take(limit) {
+        // " at " rather than the em-dash `graph` uses for the same list. This
+        // is a diagnostic message, not the `<sig> (<kind>) \u{2014} <path>` wire
+        // header packages/travsr-vscode parses, so it has no separator to
+        // preserve and falls under the no-em-dash rule the CI gate enforces.
+        let loc = if n.vname.path.is_empty() {
+            String::new()
+        } else {
+            format!(" at {}", n.vname.path)
+        };
+        out.push_str(&format!("\n  {} ({}){}", n.vname.signature, n.kind, loc));
+    }
+    out
+}
+
 /// Shared search body. `diagnose` controls whether the empty outcomes are
 /// explained (#620): single-repo callers pass `true` so an agent never gets a
 /// silent blank; the multi-repo aggregator passes `false` because a repo
@@ -6106,25 +6288,17 @@ fn get_execution_path_body(
     diagnose: bool,
 ) -> String {
     // SEC P0: resolve source and sink; treat "not found" == "access denied" identically.
-    let src_node = match store.search_nodes_by_name(source) {
-        Ok(n) => n
-            .into_iter()
-            .find(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()))),
-        Err(e) => {
-            tracing::warn!("get_execution_path source search error: {e}");
-            return String::new();
-        }
-    };
-
-    let sink_node = match store.search_nodes_by_name(sink) {
-        Ok(n) => n
-            .into_iter()
-            .find(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()))),
-        Err(e) => {
-            tracing::warn!("get_execution_path sink search error: {e}");
-            return String::new();
-        }
-    };
+    //
+    // #779: goes through `resolve_reference_targets`, the same tiered resolver
+    // `graph` and `search_symbol` use, rather than taking the first hit from
+    // `search_nodes_by_name`. Picking `[0]` from an ambiguous name silently
+    // chose one of several same-named definitions and then reported "no path
+    // found", which is a *wrong* answer rather than a missing one: the caller is
+    // told two symbols are disconnected when the tool simply looked at the wrong
+    // pair. On fastlane/fastlane, `Runner.run` has four definitions and only
+    // match's calls `fetch_certificate`.
+    let src_res = resolve_endpoint(store, source, filter);
+    let sink_res = resolve_endpoint(store, sink, filter);
 
     // #755 Part B item 6: say WHICH endpoint failed. The old message hedged with
     // "source X and/or sink Y" even when only one side was bad, so the caller had
@@ -6136,6 +6310,31 @@ fn get_execution_path_body(
     // existence oracle needs — "sink 'X' did not resolve" is emitted identically
     // for a nonexistent X and for an X the caller may not see, which is exactly
     // the indistinguishability `get_execution_path_denied_matches_not_found` pins.
+    // #779: an ambiguous endpoint is answered with the candidate list, never by
+    // guessing. Checked before the resolution failure below, because "I found
+    // several and will not choose" is a different, more actionable answer than
+    // "I found none". Only the endpoint that is actually ambiguous is reported;
+    // if both are, the source is named first so the caller has one thing to fix.
+    //
+    // In a multi-repo aggregate (`!diagnose`) a repo that lacks either name
+    // stays silent (#620), so ambiguity is reported there only when the other
+    // endpoint exists in this repo too: a repo with several `main`s and no
+    // sink can never answer. Dropping it whenever `!diagnose` was the opposite
+    // mistake, silencing a repo that could.
+    let present = |r: &EndpointResolution| !matches!(r, EndpointResolution::None);
+    if let EndpointResolution::Ambiguous(candidates) = &src_res {
+        if diagnose || present(&sink_res) {
+            return ambiguous_endpoint_message("source", source, candidates);
+        }
+    }
+    if let EndpointResolution::Ambiguous(candidates) = &sink_res {
+        if diagnose || present(&src_res) {
+            return ambiguous_endpoint_message("sink", sink, candidates);
+        }
+    }
+
+    let (src_node, sink_node) = (src_res.into_unique(), sink_res.into_unique());
+
     let (src, snk) = match (src_node, sink_node) {
         (Some(a), Some(b)) => (a, b),
         (src_opt, sink_opt) => {
@@ -16486,6 +16685,492 @@ mod snippet_tests {
         assert!(
             result.contains("fn:alpha") && result.contains("fn:beta"),
             "the resolved signatures confirm resolution succeeded; got: {result}"
+        );
+    }
+
+    /// #779: an ambiguous endpoint must be answered with the candidate list,
+    /// not silently resolved to one of them and then reported as disconnected.
+    ///
+    /// The reported shape on fastlane/fastlane: `Runner.run` has four
+    /// definitions, only match's calls `fetch_certificate`, and the tool picked
+    /// a different one and said "no path found". That is a wrong answer rather
+    /// than a missing one, which is why it outranks the no-path message.
+    #[test]
+    fn get_execution_path_ambiguous_endpoint_lists_candidates() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for dir in ["gym", "scan", "sigh", "match"] {
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "t",
+                        "",
+                        format!("{dir}/runner.rb"),
+                        "ruby",
+                        "method:Runner.run",
+                    ),
+                    "method",
+                ))
+                .unwrap();
+        }
+        store
+            .put_node(&Node::new(
+                VName::new(
+                    "t",
+                    "",
+                    "match/runner.rb",
+                    "ruby",
+                    "method:Runner.fetch_certificate",
+                ),
+                "method",
+            ))
+            .unwrap();
+
+        let result = get_execution_path(&store, "Runner.run", "fetch_certificate");
+        assert!(
+            result.contains("ambiguous"),
+            "an ambiguous source must be reported as ambiguous; got: {result}"
+        );
+        assert!(
+            !result.contains("no path found"),
+            "reporting disconnection for a name that was never resolved is the \
+             bug itself; got: {result}"
+        );
+        assert!(
+            result.contains("source"),
+            "the message must say WHICH endpoint is ambiguous; got: {result}"
+        );
+        assert!(
+            result.contains("method:Runner.run"),
+            "the candidate signatures are the escape hatch, so they must be \
+             listed; got: {result}"
+        );
+        // #799 review: this is the case the message must NOT promise unique
+        // resolution for. All four share `method:Runner.run`, so the advice
+        // to re-run with the exact signature returned this same message.
+        assert!(
+            !result.contains("which each resolve uniquely"),
+            "all four definitions share one signature, so re-running with it \
+             returns this list again; promising unique resolution sends the \
+             caller round a loop; got: {result}"
+        );
+        assert!(
+            result.contains("find_references") && result.contains("--path"),
+            "when the signature is not a lever the message must name one that \
+             is; got: {result}"
+        );
+        assert!(
+            result.contains("get_callers"),
+            "get_callers takes a `path` hint (#719), so it is a lever that works \
+             and must be named; got: {result}"
+        );
+    }
+
+    /// #799 review: the other half of the same rule. When the candidates really
+    /// do differ by signature, the signature IS a working lever (Tier 1 matches
+    /// on `signature = ?1`), so the message must still teach it rather than
+    /// sending everyone to a path hint they do not need.
+    #[test]
+    fn get_execution_path_ambiguity_keeps_the_signature_hatch_when_it_works() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Same bare name `run`, two genuinely different signatures.
+        for (path, sig) in [("a/x.rb", "fn:run"), ("b/y.rb", "method:Runner.run")] {
+            store
+                .put_node(&Node::new(VName::new("t", "", path, "ruby", sig), "method"))
+                .unwrap();
+        }
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "b/y.rb", "ruby", "method:Runner.sink"),
+                "method",
+            ))
+            .unwrap();
+
+        let result = get_execution_path(&store, "run", "sink");
+        assert!(
+            result.contains("ambiguous"),
+            "two distinct signatures for one bare name is still ambiguous; got: {result}"
+        );
+        assert!(
+            result.contains("which each resolve uniquely"),
+            "distinct signatures each resolve uniquely, so the hatch is real \
+             here and must be offered; got: {result}"
+        );
+    }
+
+    /// #799 review round 2: no branch of `ambiguous_endpoint_message` may emit
+    /// angle brackets. The MCP sanitizer escapes them, so a `<dir>`-shaped
+    /// placeholder reaches the caller as `&lt;dir&gt;` -- the defect the real-path
+    /// hint was introduced to avoid. The empty-path fallback is the branch that
+    /// reintroduced it, and it is reachable: the empty string sorts first.
+    #[test]
+    fn get_execution_path_ambiguity_never_emits_angle_brackets() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Same signature twice (so the non-unique branch fires) with the
+        // path-sorted first candidate carrying no path at all.
+        for path in ["", "b/y.rb"] {
+            store
+                .put_node(&Node::new(
+                    VName::new("t", "", path, "ruby", "method:Runner.run"),
+                    "method",
+                ))
+                .unwrap();
+        }
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "b/y.rb", "ruby", "method:Runner.sink"),
+                "method",
+            ))
+            .unwrap();
+
+        let result = get_execution_path(&store, "Runner.run", "sink");
+        assert!(
+            result.contains("ambiguous"),
+            "precondition: the set must be ambiguous; got: {result}"
+        );
+        // The `<travsr-data>` envelope is added by the caller and legitimately
+        // carries brackets, so assert on the body it wraps.
+        let body = result
+            .replace("<travsr-data>", "")
+            .replace("</travsr-data>", "");
+        assert!(
+            !body.contains('<') && !body.contains('>'),
+            "no branch may emit angle brackets, the sanitizer escapes them; got: {body}"
+        );
+        assert!(
+            !body.contains("&lt;") && !body.contains("&gt;"),
+            "and none may reach the caller already escaped; got: {body}"
+        );
+    }
+
+    /// #799 review: the candidate list is sorted by path, so same-signature
+    /// definitions print adjacent and "listed more than once" is checkable by
+    /// eye. Node id order is a hash, so the previous order was arbitrary.
+    #[test]
+    fn get_execution_path_ambiguity_lists_candidates_in_path_order() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for dir in ["gym", "scan", "sigh", "match"] {
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "t",
+                        "",
+                        format!("{dir}/runner.rb"),
+                        "ruby",
+                        "method:Runner.run",
+                    ),
+                    "method",
+                ))
+                .unwrap();
+        }
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "match/runner.rb", "ruby", "method:Runner.sink"),
+                "method",
+            ))
+            .unwrap();
+
+        let result = get_execution_path(&store, "Runner.run", "sink");
+        let paths: Vec<&str> = result
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("method:Runner.run (method) at "))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "gym/runner.rb",
+                "match/runner.rb",
+                "scan/runner.rb",
+                "sigh/runner.rb"
+            ],
+            "candidates must print in path order; got: {result}"
+        );
+    }
+
+    /// #779: the same guard on the sink side, and it must name the sink rather
+    /// than blaming the source.
+    #[test]
+    fn get_execution_path_ambiguous_sink_names_the_sink() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "a/x.rb", "ruby", "method:Only.start"),
+                "method",
+            ))
+            .unwrap();
+        for dir in ["a", "b"] {
+            store
+                .put_node(&Node::new(
+                    VName::new("t", "", format!("{dir}/y.rb"), "ruby", "method:Dup.finish"),
+                    "method",
+                ))
+                .unwrap();
+        }
+        let result = get_execution_path(&store, "Only.start", "Dup.finish");
+        assert!(
+            result.contains("ambiguous") && result.contains("sink"),
+            "an ambiguous sink must be named as the sink; got: {result}"
+        );
+    }
+
+    /// An Objective-C selector family (`RefTarget::Family`) is one method at
+    /// several arities. A path needs one node per endpoint, so the bare head is
+    /// listed like any ambiguity, and since every arity has its own full
+    /// selector the signature hatch is real: re-running with one finds the path.
+    #[test]
+    fn get_execution_path_lists_a_selector_family_and_its_full_selectors_resolve() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let objc = |sig: &str| {
+            Node::new(
+                VName::new("c", "", "AFSecurityPolicy.m", "objectivec", sig),
+                "method",
+            )
+        };
+        let short = objc("method:AFSecurityPolicy.policyWithPinningMode:");
+        let long = objc("method:AFSecurityPolicy.policyWithPinningMode:withPinnedCertificates:");
+        let sink = objc("method:AFSecurityPolicy.validate");
+        for n in [&short, &long, &sink] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(long.id, sink.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let result = get_execution_path(&store, "policyWithPinningMode", "validate");
+        assert!(
+            result.contains("ambiguous") && result.contains("which each resolve uniquely"),
+            "a family is listed with the signature hatch, never guessed; got: {result}"
+        );
+
+        let pinned = get_execution_path(
+            &store,
+            "method:AFSecurityPolicy.policyWithPinningMode:withPinnedCertificates:",
+            "validate",
+        );
+        assert!(
+            pinned.contains("path (1 step"),
+            "the full selector the list offers must resolve and find the path; got: {pinned}"
+        );
+    }
+
+    /// The schema promises "partial match supported", and before #779 the
+    /// substring search delivered it. The tiered resolver matches whole names
+    /// only, so a name it cannot place falls back to the substring search,
+    /// through the same filter-then-count: one match resolves, several are
+    /// listed, none is ever picked.
+    #[test]
+    fn get_execution_path_partial_name_resolves_or_lists_never_guesses() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let go = |sig: &str| Node::new(VName::new("t", "", "main.go", "go", sig), "function");
+        let client = go("fn:ClientRequest");
+        let select = go("fn:selectServer");
+        for n in [&client, &select] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(client.id, select.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let unique = get_execution_path(&store, "ClientRequest", "selectServ");
+        assert!(
+            unique.contains("path (1 step"),
+            "a partial name with one match must resolve, as the schema promises; got: {unique}"
+        );
+
+        store.put_node(&go("fn:selectServerFast")).unwrap();
+        let two = get_execution_path(&store, "ClientRequest", "selectServ");
+        assert!(
+            two.contains("ambiguous") && two.contains("sink") && !two.contains("path ("),
+            "a partial name with several matches must be listed, never guessed; got: {two}"
+        );
+    }
+
+    /// #620 keeps a repo that lacks the names silent in a multi-repo aggregate
+    /// (`diagnose = false`). A repo that has the name several times is not that
+    /// case: dropping it replaced the answer master gave with nothing at all.
+    #[test]
+    fn get_execution_path_aggregate_still_reports_ambiguity() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for dir in ["a", "b"] {
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "t",
+                        "",
+                        format!("{dir}/runner.rb"),
+                        "ruby",
+                        "method:Runner.run",
+                    ),
+                    "method",
+                ))
+                .unwrap();
+        }
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "a/runner.rb", "ruby", "method:Runner.sink"),
+                "method",
+            ))
+            .unwrap();
+
+        let result =
+            get_execution_path_body(&store, "Runner.run", "Runner.sink", &OpenFilter, false);
+        assert!(
+            result.contains("ambiguous"),
+            "an aggregate must still say a repo's endpoint is ambiguous; got: {result:?}"
+        );
+        let missing =
+            get_execution_path_body(&store, "Nope.none", "Runner.sink", &OpenFilter, false);
+        assert!(
+            missing.is_empty(),
+            "a repo without the name stays silent in an aggregate (#620); got: {missing:?}"
+        );
+        // Ambiguous source, absent sink: this repo can never answer, so its
+        // candidate list is noise in an aggregate (#620), not an answer.
+        let cannot_answer =
+            get_execution_path_body(&store, "Runner.run", "Nope.none", &OpenFilter, false);
+        assert!(
+            cannot_answer.is_empty(),
+            "a repo lacking the other endpoint stays silent in an aggregate; got: {cannot_answer:?}"
+        );
+    }
+
+    /// The substring fallback matches paths as well as signatures, so without a
+    /// filter a name that only appears in a file path listed that file's file
+    /// and import nodes, and offered them as signatures that "each resolve
+    /// uniquely" when re-running with one returned another list.
+    #[test]
+    fn get_execution_path_partial_fallback_lists_symbols_only() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let at = |sig: &str, kind: &str| {
+            Node::new(
+                VName::new("t", "", "strategies/leastConnection.go", "go", sig),
+                kind,
+            )
+        };
+        for n in [
+            at("file", "file"),
+            at("import:errors", "import"),
+            at("fn:selectServer", "function"),
+        ] {
+            store.put_node(&n).unwrap();
+        }
+        let result = get_execution_path(&store, "leastConnection", "selectServer");
+        assert!(
+            result.contains("could not resolve source"),
+            "a name found only in a path is not a symbol; got: {result}"
+        );
+        assert!(
+            !result.contains("import:errors") && !result.contains("(file)"),
+            "file and import nodes are never endpoint candidates; got: {result}"
+        );
+    }
+
+    /// The substring search stops at `NODE_NAME_SEARCH_LIMIT` rows, and a
+    /// path-only hit ranks the same as a signature hit, so a directory-like
+    /// query can fill the limit with path hits. Filtering then leaves one
+    /// symbol out of many (kubernetes: `wrappers` kept 1 of 31), which must
+    /// not become a silent unique endpoint.
+    #[test]
+    fn get_execution_path_truncated_partial_search_never_guesses() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let func =
+            |path: &str, sig: &str| Node::new(VName::new("t", "", path, "go", sig), "function");
+        // Path-only hits for `kuberuntime` that fill the search limit.
+        for i in 0..travsr_store::NODE_NAME_SEARCH_LIMIT {
+            store
+                .put_node(&func(
+                    &format!("a_kuberuntime/f{i:03}.go"),
+                    &format!("fn:f{i}"),
+                ))
+                .unwrap();
+        }
+        // One real match inside the limit, one past it.
+        let inside = func("a_kuberuntime/a.go", "fn:newKuberuntimeManager");
+        let outside = func("zz/k.go", "fn:kuberuntimeVersion");
+        let sink = func("zz/t.go", "fn:target");
+        for n in [&inside, &outside, &sink] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(inside.id, sink.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let result = get_execution_path(&store, "kuberuntime", "target");
+        assert!(
+            !result.contains("path (") && !result.contains("no path found"),
+            "a survivor of a truncated search is a guess, never an endpoint; got: {result}"
+        );
+    }
+
+    /// #779 + SEC P0: ambiguity is a property of what THIS caller may see.
+    ///
+    /// Four definitions exist, the caller may see one, so it resolves uniquely
+    /// for them and they are never told the other three exist. This pins the
+    /// filter-before-count order in `resolve_endpoint`: counting first and
+    /// filtering after would leak the hidden definitions through the candidate
+    /// list, which is the existence oracle
+    /// `get_execution_path_denied_matches_not_found` exists to prevent.
+    #[test]
+    fn get_execution_path_ambiguity_never_leaks_denied_definitions() {
+        use travsr_core::{Node, VName};
+        use travsr_retrieval::RbacFilter;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // One visible definition, three the caller may not see.
+        store
+            .put_node(&Node::new(
+                VName::new("public", "", "ok/runner.rb", "ruby", "method:Runner.run"),
+                "method",
+            ))
+            .unwrap();
+        for dir in ["s1", "s2", "s3"] {
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "secret",
+                        "",
+                        format!("{dir}/runner.rb"),
+                        "ruby",
+                        "method:Runner.run",
+                    ),
+                    "method",
+                ))
+                .unwrap();
+        }
+        store
+            .put_node(&Node::new(
+                VName::new("public", "", "ok/runner.rb", "ruby", "method:Runner.sink"),
+                "method",
+            ))
+            .unwrap();
+
+        let filter = RbacFilter::new(["public"]);
+        let result = get_execution_path_authed(&store, "Runner.run", "Runner.sink", &filter);
+        assert!(
+            !result.contains("ambiguous"),
+            "one visible definition is not ambiguous for this caller; got: {result}"
+        );
+        for hidden in ["s1", "s2", "s3", "secret"] {
+            assert!(
+                !result.contains(hidden),
+                "a definition the caller may not see must never appear, not even \
+                 in a candidate list ({hidden}); got: {result}"
+            );
+        }
+        // Positive half: the visible definition really resolved. Without this,
+        // a filter that hid everything would pass the checks above vacuously.
+        assert!(
+            result.contains("no path found") && result.contains("method:Runner.run"),
+            "the one visible definition must resolve, so the answer is about the \
+             path, not the name; got: {result}"
         );
     }
 
