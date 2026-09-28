@@ -73,8 +73,7 @@ pub enum LangCommand {
     Detect {
         /// Install every detected language without prompting. Use this in scripts
         /// and from the editor extension, where there is no interactive terminal to
-        /// answer the per-language prompt. Elevated languages that need a security
-        /// approval are skipped with a note rather than reaching the network.
+        /// answer the per-language prompt.
         #[arg(long)]
         yes: bool,
     },

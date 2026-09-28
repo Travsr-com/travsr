@@ -381,8 +381,8 @@ fn decode_phase_b_warnings(
                     (
                         "unavailable",
                         format!(
-                            "'{rest}' analysis needs security approval before it can run, \
-                             run `travsr lang install {rest}` interactively to grant it"
+                            "full '{rest}' analysis needs your permission to run, \
+                             run `travsr lang allow-unsandboxed {rest}`"
                         ),
                     ),
                 );
@@ -2523,6 +2523,15 @@ mod tests {
         );
         // The repo forbids em-dashes, so the CLI's dash is a comma here.
         assert!(!detail.contains('\u{2014}'), "em-dash: {detail}");
+
+        // needs_consent is the Windows unsandboxed permission, granted by
+        // `lang allow-unsandboxed`, not the approval step `lang install` dropped.
+        let decoded = decode_phase_b_warnings("needs_consent:go", "");
+        let (_, detail) = decoded.get("go").expect("go must decode");
+        assert!(
+            detail.contains("travsr lang allow-unsandboxed go"),
+            "must name the remedy travsr status names, got: {detail}"
+        );
     }
 
     /// #636 round-5 review: pinning one string's wording was not enough. The
