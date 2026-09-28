@@ -1639,7 +1639,7 @@ export function registerShowRepos(client: McpClient): vscode.Disposable {
       const res = stripEnvelope(await client.callTool("repos_remove", { name })).trim();
       if (res.startsWith("ambiguous")) {
         void vscode.window.showWarningMessage(
-          `Travsr: more than one registered repository is named ${name}, so this entry was left alone. Remove it by path with travsr repos remove.`
+          `Travsr: more than one registered repository is named ${name}, so this entry was left alone. Remove it by path with travsr repos --remove <path>.`
         );
       } else if (res !== "ok") {
         void vscode.window.showWarningMessage(
@@ -1992,7 +1992,7 @@ export function registerShowGraphStats(
       void vscode.window.showInformationMessage(
         removed === names.length
           ? `Travsr: removed ${removed} test registry entr${removed === 1 ? "y" : "ies"}.`
-          : `Travsr: removed ${removed} of ${names.length} test registry entries. The rest could not be resolved by name; travsr repos remove takes a path.`
+          : `Travsr: removed ${removed} of ${names.length} test registry entries. The rest could not be resolved by name; travsr repos --remove takes a path.`
       );
       return;
     }
@@ -2377,7 +2377,7 @@ export function registerShowDependencies(client: McpClient): vscode.Disposable {
 
 /**
  * travsr.showExecutionPath — prompt for source + sink (source seeded from the
- * word under the cursor), then render the PCST path in the graph panel.
+ * word under the cursor), then render the lowest-cost path in the graph panel.
  */
 export function registerShowExecutionPath(
   client: McpClient,

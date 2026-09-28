@@ -100,7 +100,7 @@ function getHtml(): string {
 
   <h2>Getting started</h2>
   <p>Install the Travsr CLI and initialise your repo:</p>
-  <div class="command-block">npm install -g travsr</div>
+  <div class="command-block">npm install -g @travsr.com/travsr</div>
   <div class="command-block">cd your-repo &amp;&amp; travsr init</div>
   <p>The status bar turns green when the graph is ready. The Activity Bar panel updates as you move your cursor.</p>
 
@@ -109,8 +109,8 @@ function getHtml(): string {
   <div class="links">
     <a href="https://travsr.com">travsr.com</a>
     <a href="https://docs.travsr.com">Documentation</a>
-    <a href="https://github.com/raj-rkv/travsr/issues">Report an issue</a>
-    <a href="https://github.com/raj-rkv/travsr/discussions">Discussions</a>
+    <a href="https://github.com/Travsr-com/travsr/issues">Report an issue</a>
+    <a href="https://github.com/Travsr-com/travsr/discussions">Discussions</a>
   </div>
 </body>
 </html>`;
