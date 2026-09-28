@@ -426,10 +426,11 @@ export function activate(context: vscode.ExtensionContext): void {
         let symbol = symbolArg;
         if (!symbol) {
           const editor = vscode.window.activeTextEditor;
+          const range = editor?.document.getWordRangeAtPosition(editor.selection.active);
           symbol = await vscode.window.showInputBox({
             prompt: "Symbol",
-            value: editor
-              ? editor.document.getText(editor.document.getWordRangeAtPosition(editor.selection.active))
+            value: editor && range
+              ? editor.document.getText(range)
               : "",
           });
           if (!symbol) return;

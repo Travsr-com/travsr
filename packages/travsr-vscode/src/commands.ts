@@ -2421,8 +2421,9 @@ export function registerShowExecutionPath(
 ): vscode.Disposable {
   return vscode.commands.registerCommand("travsr.showExecutionPath", async () => {
     const editor = vscode.window.activeTextEditor;
-    const seed = editor
-      ? editor.document.getText(editor.document.getWordRangeAtPosition(editor.selection.active))
+    const range = editor?.document.getWordRangeAtPosition(editor.selection.active);
+    const seed = editor && range
+      ? editor.document.getText(range)
       : "";
 
     const source = await vscode.window.showInputBox({
