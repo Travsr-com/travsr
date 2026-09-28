@@ -15,7 +15,7 @@ All notable changes to Travsr are documented here.
 
 ### Added
 
-- **The live lane now covers C, Objective-C, PHP, and Kotlin.** An edit in one of these languages resolves through the live editor server (clangd, Intelephense, kotlin-language-server) between commits instead of waiting for the next one, the same live resolution TypeScript, JavaScript, Python, Rust, Go, Java, Scala, Ruby, C# and Swift already had. Measured against each language's oracle on the live-lane fixture: C and Objective-C score every claim `agree` with clangd live, PHP scores precision 1.0 over 6 verified claims with Intelephense, and Kotlin scores precision 1.0 over 11 verified claims with kotlin-language-server.
+- **The live lane now covers C, Objective-C, PHP, and Kotlin.** An edit in one of these languages resolves through the live editor server (clangd, Intelephense, kotlin-language-server) between commits instead of waiting for the next one, the same live resolution TypeScript, JavaScript, Python, Rust, Go, Java, C#, Swift, Dart and C++ already had. Ruby and Scala stay off on purpose: ruby-lsp has nothing to resolve an untyped receiver against, and Scala's oracle needs `sbt compile`. Measured against each language's oracle on the live-lane fixture: C and Objective-C score every claim `agree` with clangd live, PHP scores precision 1.0 over 6 verified claims with Intelephense, and Kotlin scores precision 1.0 over 11 verified claims with kotlin-language-server.
 
 ### Fixed
 

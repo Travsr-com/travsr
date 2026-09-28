@@ -66,6 +66,17 @@ export function stripEnvelope(raw: string): string {
   return m ? m[1] : raw;
 }
 
+/**
+ * The envelope's inner text only, dropping any note the server appends after
+ * `</travsr-data>` (which otherwise stops stripEnvelope from matching at all).
+ * For parsers that read result rows; a caller that wants the notes uses
+ * stripEnvelope.
+ */
+export function envelopeBody(raw: string): string {
+  const end = raw.lastIndexOf("</travsr-data>");
+  return stripEnvelope(end < 0 ? raw : raw.slice(0, end + "</travsr-data>".length));
+}
+
 /** A ranked symbol search result row. */
 export interface SymbolItem extends vscode.QuickPickItem {
   path: string;
@@ -143,12 +154,18 @@ export function parseSynonymList(raw: string): SynonymPair[] {
 }
 
 /**
- * Parse `get_execution_path` prose (`signature (kind) — path`, one node per
- * line) into a synthetic GraphData: a node per line flagged `root` (so the graph
- * highlights it) chained source→sink by `flows` edges.
+ * Parse `get_execution_path` prose into a synthetic GraphData: the route's
+ * nodes (`signature (kind) — path`, one per line) flagged `root` (so the graph
+ * highlights it) chained source→sink by `calls` edges (the server's "call
+ * chain"; the graph webview draws only the kinds its edge filter knows).
+ *
+ * Only the route is a path. The server prints a `path (N steps, …):` header
+ * before it and may follow it with a `nearby context (…, NOT on it):` section,
+ * and a failed lookup is one sentence (`no path found: …`); none of those are
+ * nodes, which describeNoPath reports instead.
  */
 export function parseExecutionPath(raw: string): GraphData {
-  const inner = stripEnvelope(raw);
+  const inner = envelopeBody(raw);
   // PROTOCOL, not prose: `get_callers` and friends print
   // `<sig> (<kind>) — <path>` and this splits on that exact
   // separator, so a punctuation sweep that reaches it breaks it.
@@ -156,19 +173,38 @@ export function parseExecutionPath(raw: string): GraphData {
   const nodes: GraphNode[] = [];
   for (const line of inner.split("\n")) {
     const t = line.trim();
-    if (!t) continue;
+    if (t.startsWith("nearby context")) break;
     const m = lineRe.exec(t);
-    const node: GraphNode = m
-      ? { id: m[1], label: m[1], kind: m[2], path: m[3], package: "", score: 0, root: true }
-      : { id: t, label: t, kind: "symbol", path: "", package: "", score: 0, root: true };
-    nodes.push(node);
+    if (!m) continue;
+    nodes.push({ id: m[1], label: m[1], kind: m[2], path: m[3], package: "", score: 0, root: true });
   }
   const edges = nodes.slice(1).map((n, i) => ({
     source: nodes[i].id,
     target: n.id,
-    kind: "flows",
+    kind: "calls",
   }));
   return { nodes, edges };
+}
+
+/**
+ * Why `get_execution_path` returned no route, in the server's own words: its
+ * `no path found` / `could not resolve` sentence, its ambiguity list, or the
+ * pending message when the call-edge index is not built yet.
+ */
+export function describeNoPath(raw: string, source: string, sink: string): string {
+  const body = envelopeBody(raw).trim();
+  try {
+    const j = JSON.parse(body) as { status?: string; message?: string };
+    if (j.status === "pending" && j.message) return j.message;
+  } catch {
+    // Not JSON: prose.
+  }
+  // An ambiguous endpoint is the advice line followed by one candidate per
+  // line, and the candidates are the part that says which file is which. A
+  // notification shows no line breaks, so they are joined onto the advice.
+  const [first, ...rest] = body.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (!first) return `No path found from ${source} to ${sink}.`;
+  return rest.length > 0 ? `${first} ${rest.join("; ")}` : first;
 }
 
 /** Parse `repos_list` TSV output (`name\tdb_path\t{0|1}`) into rows. */
@@ -1639,7 +1675,7 @@ export function registerShowRepos(client: McpClient): vscode.Disposable {
       const res = stripEnvelope(await client.callTool("repos_remove", { name })).trim();
       if (res.startsWith("ambiguous")) {
         void vscode.window.showWarningMessage(
-          `Travsr: more than one registered repository is named ${name}, so this entry was left alone. Remove it by path with travsr repos remove.`
+          `Travsr: more than one registered repository is named ${name}, so this entry was left alone. Remove it by path with travsr repos --remove <path>.`
         );
       } else if (res !== "ok") {
         void vscode.window.showWarningMessage(
@@ -1992,7 +2028,7 @@ export function registerShowGraphStats(
       void vscode.window.showInformationMessage(
         removed === names.length
           ? `Travsr: removed ${removed} test registry entr${removed === 1 ? "y" : "ies"}.`
-          : `Travsr: removed ${removed} of ${names.length} test registry entries. The rest could not be resolved by name; travsr repos remove takes a path.`
+          : `Travsr: removed ${removed} of ${names.length} test registry entries. The rest could not be resolved by name; travsr repos --remove takes a path.`
       );
       return;
     }
@@ -2377,7 +2413,7 @@ export function registerShowDependencies(client: McpClient): vscode.Disposable {
 
 /**
  * travsr.showExecutionPath — prompt for source + sink (source seeded from the
- * word under the cursor), then render the PCST path in the graph panel.
+ * word under the cursor), then render the lowest-cost path in the graph panel.
  */
 export function registerShowExecutionPath(
   client: McpClient,
@@ -2385,8 +2421,9 @@ export function registerShowExecutionPath(
 ): vscode.Disposable {
   return vscode.commands.registerCommand("travsr.showExecutionPath", async () => {
     const editor = vscode.window.activeTextEditor;
-    const seed = editor
-      ? editor.document.getText(editor.document.getWordRangeAtPosition(editor.selection.active))
+    const range = editor?.document.getWordRangeAtPosition(editor.selection.active);
+    const seed = editor && range
+      ? editor.document.getText(range)
       : "";
 
     const source = await vscode.window.showInputBox({
@@ -2400,7 +2437,7 @@ export function registerShowExecutionPath(
     const raw = await client.callTool("get_execution_path", { source, sink });
     const data = parseExecutionPath(raw);
     if (data.nodes.length === 0) {
-      void vscode.window.showInformationMessage(`No path found from ${source} to ${sink}.`);
+      void vscode.window.showInformationMessage(`Travsr: ${describeNoPath(raw, source, sink)}`);
       return;
     }
     const panel = GraphPanel.show(client, context);

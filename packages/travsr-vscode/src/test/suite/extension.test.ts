@@ -7,6 +7,22 @@ import {
 import { CallersHoverProvider } from "../../hover";
 import { showWelcome } from "../../welcome";
 import { StdioMcpClient } from "../../mcp";
+import { parseEnvelope } from "../../extension";
+
+suite("parseEnvelope returns result rows only", () => {
+  test("drops the name-match legend and a note after the envelope", () => {
+    // Real get_callers output while semantic analysis is behind.
+    const raw =
+      "<travsr-data>\n" +
+      "[call] fn:blastCommand (function) — src/codelens.ts:67 ~\n" +
+      "~ = matched by name, not resolved by type\n" +
+      "</travsr-data>\n" +
+      "[note: call-graph index incomplete; call edges may be missing.]";
+    assert.deepStrictEqual(parseEnvelope(raw), [
+      "[call] fn:blastCommand (function) — src/codelens.ts:67 ~",
+    ]);
+  });
+});
 
 // Minimal stub for McpClient — returns controlled responses.
 function makeMcp(
@@ -28,6 +44,7 @@ suite("VSCODE-201: BlastRadius selector covers expected languages", () => {
     assert.ok(langs.includes("rust"));
     assert.ok(langs.includes("python"));
     assert.ok(langs.includes("go"));
+    assert.ok(langs.includes("objective-c"));
   });
 });
 

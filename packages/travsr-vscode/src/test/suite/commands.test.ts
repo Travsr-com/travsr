@@ -6,6 +6,7 @@ import {
   parseGraphSymbols,
   parseSynonymList,
   parseExecutionPath,
+  describeNoPath,
   parseReposList,
   parseAvailableLanguages,
   buildStatsView,
@@ -80,12 +81,60 @@ suite("VSCODE-247: parseExecutionPath", () => {
     assert.strictEqual(data.nodes[0].root, true, "path nodes flagged root for highlight");
     assert.strictEqual(data.edges[0].source, "fn:a");
     assert.strictEqual(data.edges[0].target, "fn:b");
+    // media/graph.js draws only the kinds in its edgeKinds filter (calls,
+    // imports); any other kind is dropped and the path renders with no edges.
+    assert.strictEqual(data.edges[0].kind, "calls");
   });
-  test("tolerates lines without the `(kind), path` shape", () => {
-    const data = parseExecutionPath("just-a-signature");
-    assert.strictEqual(data.nodes.length, 1);
-    assert.strictEqual(data.nodes[0].id, "just-a-signature");
-    assert.strictEqual(data.edges.length, 0);
+  test("takes the route only: no header, corridor, envelope or trailing note", () => {
+    // Real get_execution_path output shape (tools.rs), with the note the server
+    // appends after the envelope while semantic analysis is behind.
+    const raw =
+      "<travsr-data>\n" +
+      "path (1 step, source to sink):\n" +
+      "fn:a (function) — src/a.ts\n" +
+      "fn:b (function) — src/b.ts\n" +
+      "\n" +
+      "nearby context (1 node, within the corridor around that path, NOT on it):\n" +
+      "fn:c (function) — src/c.ts\n" +
+      "</travsr-data>\n" +
+      "[note: call-graph index incomplete; call edges may be missing.]";
+    const data = parseExecutionPath(raw);
+    assert.deepStrictEqual(data.nodes.map((n) => n.id), ["fn:a", "fn:b"]);
+    assert.strictEqual(data.edges.length, 1);
+  });
+  test("a no-path answer is not a node", () => {
+    const raw =
+      "<travsr-data>\nno path found: 'fn:a' and 'fn:b' both resolved, but no connecting call chain was found within traversal limits.\n</travsr-data>\n[note: x]";
+    assert.strictEqual(parseExecutionPath(raw).nodes.length, 0);
+    assert.ok(describeNoPath(raw, "a", "b").startsWith("no path found: 'fn:a' and 'fn:b'"));
+  });
+  test("a pending index says so instead of 'no path'", () => {
+    const raw =
+      '{"status":"pending","message":"Semantic call-edge index has not finished."}';
+    assert.strictEqual(parseExecutionPath(raw).nodes.length, 0);
+    assert.strictEqual(describeNoPath(raw, "a", "b"), "Semantic call-edge index has not finished.");
+  });
+  test("an empty answer falls back to naming both ends", () => {
+    assert.strictEqual(describeNoPath("", "a", "b"), "No path found from a to b.");
+  });
+  test("an ambiguous endpoint keeps its candidates, which say where each one is", () => {
+    // get_execution_path's ambiguity answer (#799): the advice line, then one
+    // candidate per line. A notification shows no line breaks, so the
+    // candidates join the advice rather than being dropped.
+    const raw =
+      "<travsr-data>\n" +
+      "source 'main' is ambiguous, 2 definitions. A signature listed once below resolves uniquely on a re-run:\n" +
+      "  fn:main (function) at bench/stub_server.go\n" +
+      "  fn:main (function) at main.go\n" +
+      "</travsr-data>\n[note: x]";
+    assert.strictEqual(parseExecutionPath(raw).nodes.length, 0);
+    const msg = describeNoPath(raw, "main", "selectServer");
+    assert.ok(msg.startsWith("source 'main' is ambiguous"), msg);
+    assert.ok(
+      msg.endsWith("fn:main (function) at bench/stub_server.go; fn:main (function) at main.go"),
+      msg
+    );
+    assert.ok(!msg.includes("[note:"), msg);
   });
   test("empty input yields empty graph", () => {
     const data = parseExecutionPath("<travsr-data></travsr-data>");
