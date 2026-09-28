@@ -6141,7 +6141,17 @@ fn resolve_endpoint(
         // method family has its own full selector that resolves uniquely, so a
         // family is answered like any other ambiguity: list it, never pick.
         RefTarget::Ambiguous(list) | RefTarget::Family(list) => list,
-        RefTarget::None => Vec::new(),
+        // The schema promises partial names, which the tiered resolver does not
+        // match: fall back to the substring search the tool used before #779.
+        // Its hits go through the same filter-then-count below, so a partial
+        // name resolves only when exactly one visible node matches it.
+        RefTarget::None => match store.search_nodes_by_name(name) {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!("get_execution_path partial-name search error: {e}");
+                Vec::new()
+            }
+        },
     };
     candidates.retain(visible);
     match candidates.len() {
@@ -6282,13 +6292,15 @@ fn get_execution_path_body(
     // several and will not choose" is a different, more actionable answer than
     // "I found none". Only the endpoint that is actually ambiguous is reported;
     // if both are, the source is named first so the caller has one thing to fix.
-    if diagnose {
-        if let EndpointResolution::Ambiguous(candidates) = &src_res {
-            return ambiguous_endpoint_message("source", source, candidates);
-        }
-        if let EndpointResolution::Ambiguous(candidates) = &sink_res {
-            return ambiguous_endpoint_message("sink", sink, candidates);
-        }
+    //
+    // Not gated on `diagnose`: that flag keeps a repo WITHOUT the names silent
+    // in a multi-repo aggregate (#620), and a repo with several of them is not
+    // that case. Gating it dropped the repo's answer entirely.
+    if let EndpointResolution::Ambiguous(candidates) = &src_res {
+        return ambiguous_endpoint_message("source", source, candidates);
+    }
+    if let EndpointResolution::Ambiguous(candidates) = &sink_res {
+        return ambiguous_endpoint_message("sink", sink, candidates);
     }
 
     let (src_node, sink_node) = (src_res.into_unique(), sink_res.into_unique());
@@ -16916,6 +16928,81 @@ mod snippet_tests {
         );
     }
 
+    /// The schema promises "partial match supported", and before #779 the
+    /// substring search delivered it. The tiered resolver matches whole names
+    /// only, so a name it cannot place falls back to the substring search,
+    /// through the same filter-then-count: one match resolves, several are
+    /// listed, none is ever picked.
+    #[test]
+    fn get_execution_path_partial_name_resolves_or_lists_never_guesses() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let go = |sig: &str| Node::new(VName::new("t", "", "main.go", "go", sig), "function");
+        let client = go("fn:ClientRequest");
+        let select = go("fn:selectServer");
+        for n in [&client, &select] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(client.id, select.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let unique = get_execution_path(&store, "ClientRequest", "selectServ");
+        assert!(
+            unique.contains("path (1 step"),
+            "a partial name with one match must resolve, as the schema promises; got: {unique}"
+        );
+
+        store.put_node(&go("fn:selectServerFast")).unwrap();
+        let two = get_execution_path(&store, "ClientRequest", "selectServ");
+        assert!(
+            two.contains("ambiguous") && two.contains("sink") && !two.contains("path ("),
+            "a partial name with several matches must be listed, never guessed; got: {two}"
+        );
+    }
+
+    /// #620 keeps a repo that lacks the names silent in a multi-repo aggregate
+    /// (`diagnose = false`). A repo that has the name several times is not that
+    /// case: dropping it replaced the answer master gave with nothing at all.
+    #[test]
+    fn get_execution_path_aggregate_still_reports_ambiguity() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for dir in ["a", "b"] {
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "t",
+                        "",
+                        format!("{dir}/runner.rb"),
+                        "ruby",
+                        "method:Runner.run",
+                    ),
+                    "method",
+                ))
+                .unwrap();
+        }
+        store
+            .put_node(&Node::new(
+                VName::new("t", "", "a/runner.rb", "ruby", "method:Runner.sink"),
+                "method",
+            ))
+            .unwrap();
+
+        let result =
+            get_execution_path_body(&store, "Runner.run", "Runner.sink", &OpenFilter, false);
+        assert!(
+            result.contains("ambiguous"),
+            "an aggregate must still say a repo's endpoint is ambiguous; got: {result:?}"
+        );
+        let missing =
+            get_execution_path_body(&store, "Nope.none", "Runner.sink", &OpenFilter, false);
+        assert!(
+            missing.is_empty(),
+            "a repo without the name stays silent in an aggregate (#620); got: {missing:?}"
+        );
+    }
+
     /// #779 + SEC P0: ambiguity is a property of what THIS caller may see.
     ///
     /// Four definitions exist, the caller may see one, so it resolves uniquely
@@ -16970,6 +17057,13 @@ mod snippet_tests {
                  in a candidate list ({hidden}); got: {result}"
             );
         }
+        // Positive half: the visible definition really resolved. Without this,
+        // a filter that hid everything would pass the checks above vacuously.
+        assert!(
+            result.contains("no path found") && result.contains("method:Runner.run"),
+            "the one visible definition must resolve, so the answer is about the \
+             path, not the name; got: {result}"
+        );
     }
 
     /// An endpoint that does not resolve must get the could-not-resolve
