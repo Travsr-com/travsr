@@ -173,6 +173,182 @@ pub fn capability(cap: &Capability) -> LangStatus {
     }
 }
 
+/// The per-repo answer to "will `travsr init` trace calls for this language
+/// here, and if not, why". One predicate for `init`, `lang list`, `status` and
+/// MCP, so they cannot disagree about a language.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Readiness {
+    Ready,
+    /// Something `travsr init` fixes itself: install, registration, trust.
+    SettingUp,
+    /// The user must install `needs` first; travsr never installs toolchains.
+    NeedsToolchain {
+        needs: String,
+    },
+    Unsupported {
+        os: String,
+    },
+    /// The analyzer ran and produced nothing usable, with no known cause.
+    Failed,
+}
+
+/// Inputs to [`readiness`], gathered by [`gather`]. Plain facts so the ladder
+/// is tested without disk, PATH or processes (same shape as [`Capability`]).
+pub struct RepoCapability<'a> {
+    pub entry: &'a PhaseBEntry,
+    pub unsupported_on: Option<String>,
+    /// A tool the user must install that is absent: the analyzer's runtime,
+    /// the command its install runs, or the project's compile_commands.json.
+    pub driver_missing: Option<String>,
+    pub registered: bool,
+    pub corpus_trusted: bool,
+    pub analyzer_ready: bool,
+    /// This language's class from the stored `phase_b_warnings` of the last run.
+    pub last_warning: Option<&'a str>,
+}
+
+/// The ladder, in the order `invoke_phase_b_all` gates a language.
+pub fn readiness(c: &RepoCapability) -> Readiness {
+    if let Some(os) = &c.unsupported_on {
+        return Readiness::Unsupported { os: os.clone() };
+    }
+    let prerequisites = c.entry.effective_prerequisites();
+    let known_prerequisite = !prerequisites.is_empty() && prerequisites != "none";
+    if let Some(driver) = &c.driver_missing {
+        let needs = if known_prerequisite {
+            prerequisites
+        } else {
+            driver
+        };
+        return Readiness::NeedsToolchain {
+            needs: needs.to_string(),
+        };
+    }
+    // A bundled analyzer's prerequisite is travsr's own runtime, already checked
+    // above, so a run with no symbols there has no known cause.
+    if c.last_warning == Some("zero_nodes") && known_prerequisite && !c.entry.analyzer_bundled() {
+        return Readiness::NeedsToolchain {
+            needs: prerequisites.to_string(),
+        };
+    }
+    let enabled = c.entry.builtin || (c.registered && c.corpus_trusted);
+    if !enabled || !c.analyzer_ready {
+        return Readiness::SettingUp;
+    }
+    match c.last_warning {
+        Some("crashed" | "zero_nodes" | "no_references") => Readiness::Failed,
+        _ => Readiness::Ready,
+    }
+}
+
+/// This language's warning class in a stored `phase_b_warnings` value
+/// (`class:lang,class:lang,...`).
+fn warning_class<'a>(warnings: &'a str, language: &str) -> Option<&'a str> {
+    warnings
+        .split(',')
+        .filter_map(|w| w.trim().split_once(':'))
+        .find(|(_, lang)| *lang == language)
+        .map(|(class, _)| class)
+}
+
+/// Fill [`RepoCapability`] for one language in `repo_root`. `warnings` is the
+/// store's `phase_b_warnings` meta, passed in because this crate has no store.
+pub fn gather<'a>(
+    entry: &'a PhaseBEntry,
+    repo_root: &std::path::Path,
+    corpus: &str,
+    lang_toml: &crate::trust::LangToml,
+    resolver: &crate::resolver::CatalogResolver,
+    warnings: &'a str,
+) -> RepoCapability<'a> {
+    use crate::resolver::PluginResolver as _;
+    use travsr_core::exec::tool_available;
+
+    let analyzer_ready = if entry.builtin {
+        analyzer_present(entry)
+    } else {
+        // The indexer runs dart's emitter without the resolver, so registration
+        // is the whole test for it (same as MCP `phase_b_availability`).
+        entry.language == "dart" || resolver.resolve(entry.language).is_some()
+    };
+    let driver_missing = entry
+        .runtime_driver
+        .filter(|d| !tool_available(d))
+        .or(match entry.scip_install {
+            // The install command's driver only matters while there is
+            // something left to install.
+            super::catalog::ScipInstall::Command(args)
+                if !analyzer_ready && !tool_available(args[0]) =>
+            {
+                Some(args[0])
+            }
+            // Nothing travsr can install: the tool itself is the prerequisite.
+            super::catalog::ScipInstall::Manual if !tool_available(entry.command) => {
+                Some(entry.command)
+            }
+            _ => None,
+        })
+        .map(str::to_string)
+        .or_else(|| {
+            (entry.command == "scip-clang" && !repo_root.join("compile_commands.json").exists())
+                .then(|| "compile_commands.json".to_string())
+        });
+    RepoCapability {
+        entry,
+        unsupported_on: super::platform::unsupported_reason(entry),
+        driver_missing,
+        registered: lang_toml.registered.iter().any(|r| r == entry.language),
+        corpus_trusted: lang_toml.trusted_corpora.contains(corpus),
+        analyzer_ready,
+        last_warning: warning_class(warnings, entry.language),
+    }
+}
+
+/// Whether `entry`'s analyzer is on this machine: a bundled one with its Node
+/// runtime, or an external one whose binaries resolve.
+pub fn analyzer_present(entry: &PhaseBEntry) -> bool {
+    if entry.analyzer_bundled() {
+        bundled_analyzer_ready(entry)
+    } else {
+        entry
+            .provider_binary
+            .map_or(true, travsr_core::exec::tool_available)
+            && analyzer_command_present(entry)
+    }
+}
+
+/// Whether a bundled analyzer's hidden interpreter is present. travsr-lsif-ts
+/// and travsr-lsif-py ship as JS files run through `node` — "bundled" only
+/// means the emitter file itself needs no separate install, not that Node.js
+/// is guaranteed to exist on the machine. True when the entry declares no such
+/// hidden driver (nothing to check).
+pub fn bundled_analyzer_ready(entry: &PhaseBEntry) -> bool {
+    // Both halves are required and neither implies the other: node is the
+    // runtime, the emitter is the program it runs. Checking only node is what
+    // let `lang install typescript` answer "full cross-file analysis is on" in
+    // a repo where `travsr status` reported the analyzer could not be started.
+    entry
+        .runtime_driver
+        .map_or(true, travsr_core::exec::tool_available)
+        && travsr_indexer::bundled_lsif_emitter_available(entry.language)
+}
+
+/// Whether the entry's analyzer command resolves on this machine.
+///
+/// Like `tool_available(entry.command)`, but also consults `rustup which` for
+/// rust-analyzer: `rustup component add rust-analyzer` installs it into the
+/// active toolchain's bin dir (`~/.rustup/toolchains/<tc>/bin`), which is not on
+/// PATH and not in `~/.cargo/bin`, so `tool_available` alone can't see it. Every
+/// analyzer-presence decision routes through here so `lang list`, `lang detect`,
+/// `lang status`, `lang install`, and the index-time resolver never disagree.
+pub fn analyzer_command_present(entry: &PhaseBEntry) -> bool {
+    use travsr_core::exec::tool_available;
+    let command_present = tool_available(entry.command)
+        || (entry.command == "rust-analyzer"
+            && travsr_indexer::ra_runner::resolve_ra_binary().is_some());
+    command_present && entry.runtime_driver.map_or(true, tool_available)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +487,152 @@ mod tests {
             unsandboxed_consent: true,
         });
         assert_eq!(status, LangStatus::Active);
+    }
+
+    fn repo(lang: &str) -> RepoCapability<'static> {
+        RepoCapability {
+            entry: lookup(lang).expect("known language"),
+            unsupported_on: None,
+            driver_missing: None,
+            registered: true,
+            corpus_trusted: true,
+            analyzer_ready: true,
+            last_warning: None,
+        }
+    }
+
+    #[test]
+    fn readiness_ladder_every_rung() {
+        let needs = |s: &str| Readiness::NeedsToolchain { needs: s.into() };
+        let cases: Vec<(&str, RepoCapability, Readiness)> = vec![
+            ("all set", repo("go"), Readiness::Ready),
+            (
+                "no build for this os wins over everything",
+                RepoCapability {
+                    unsupported_on: Some("windows".into()),
+                    driver_missing: Some("go".into()),
+                    ..repo("go")
+                },
+                Readiness::Unsupported {
+                    os: "windows".into(),
+                },
+            ),
+            (
+                "missing driver names the catalog prerequisite",
+                RepoCapability {
+                    driver_missing: Some("go".into()),
+                    analyzer_ready: false,
+                    ..repo("go")
+                },
+                needs("Go toolchain"),
+            ),
+            (
+                "prerequisite 'none' falls back to the driver name",
+                RepoCapability {
+                    driver_missing: Some("swiftc".into()),
+                    ..repo("swift")
+                },
+                needs("swiftc"),
+            ),
+            (
+                "no symbols with a known prerequisite is a toolchain problem",
+                RepoCapability {
+                    last_warning: Some("zero_nodes"),
+                    ..repo("java")
+                },
+                needs("JDK, Maven or Gradle"),
+            ),
+            (
+                "builtin without its analyzer is fixed by init",
+                RepoCapability {
+                    registered: false,
+                    corpus_trusted: false,
+                    analyzer_ready: false,
+                    ..repo("rust")
+                },
+                Readiness::SettingUp,
+            ),
+            (
+                "builtin needs no registration or trust",
+                RepoCapability {
+                    registered: false,
+                    corpus_trusted: false,
+                    ..repo("rust")
+                },
+                Readiness::Ready,
+            ),
+            (
+                "not registered",
+                RepoCapability {
+                    registered: false,
+                    ..repo("go")
+                },
+                Readiness::SettingUp,
+            ),
+            (
+                // Bug 1 shape: set up in another repo, never trusted in this one.
+                "registered but this repo untrusted",
+                RepoCapability {
+                    corpus_trusted: false,
+                    ..repo("go")
+                },
+                Readiness::SettingUp,
+            ),
+            (
+                "registered and trusted but analyzer not resolvable",
+                RepoCapability {
+                    analyzer_ready: false,
+                    ..repo("go")
+                },
+                Readiness::SettingUp,
+            ),
+            (
+                "unexplained crash",
+                RepoCapability {
+                    last_warning: Some("crashed"),
+                    ..repo("go")
+                },
+                Readiness::Failed,
+            ),
+            (
+                // python's prerequisite is travsr's own runtime (Node.js), which
+                // `driver_missing` already checked, so nothing is left to blame.
+                "no symbols from a bundled analyzer",
+                RepoCapability {
+                    last_warning: Some("zero_nodes"),
+                    ..repo("python")
+                },
+                Readiness::Failed,
+            ),
+            (
+                "builtin crash is not hidden behind ready",
+                RepoCapability {
+                    last_warning: Some("crashed"),
+                    ..repo("typescript")
+                },
+                Readiness::Failed,
+            ),
+            (
+                "a gate-skip warning from an earlier run does not outlive its fix",
+                RepoCapability {
+                    last_warning: Some("untrusted_corpus"),
+                    ..repo("go")
+                },
+                Readiness::Ready,
+            ),
+        ];
+        for (name, cap, want) in cases {
+            assert_eq!(readiness(&cap), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn warning_class_is_read_for_this_language_only() {
+        let w = "zero_nodes:java,crashed:go,scip_unification_misses:2/38";
+        assert_eq!(warning_class(w, "go"), Some("crashed"));
+        assert_eq!(warning_class(w, "java"), Some("zero_nodes"));
+        assert_eq!(warning_class(w, "rust"), None);
+        assert_eq!(warning_class("", "go"), None);
     }
 
     #[test]

@@ -10,6 +10,9 @@ use travsr_plugin_host::phase_b::catalog::{
     lookup, GzBinarySpec, PhaseBEntry, SandboxRequirement, ScipBinarySpec, ScipInstall,
     ZipBinarySpec, CATALOG,
 };
+use travsr_plugin_host::phase_b::status::{
+    analyzer_command_present, analyzer_present, bundled_analyzer_ready,
+};
 
 #[derive(Debug, Subcommand)]
 pub enum LangCommand {
@@ -185,48 +188,13 @@ fn unavailable_status(entry: &PhaseBEntry, target: &str) -> String {
 
 // ── list ──────────────────────────────────────────────────────────────────────
 
-/// Whether a bundled analyzer's hidden interpreter is present. travsr-lsif-ts
-/// and travsr-lsif-py ship as JS files run through `node` — "bundled" only
-/// means the emitter file itself needs no separate install, not that Node.js
-/// is guaranteed to exist on the machine. True when the entry declares no such
-/// hidden driver (nothing to check).
-fn bundled_analyzer_ready(entry: &PhaseBEntry) -> bool {
-    // Both halves are required and neither implies the other: node is the
-    // runtime, the emitter is the program it runs. Checking only node is what
-    // let `lang install typescript` answer "full cross-file analysis is on" in
-    // a repo where `travsr status` reported the analyzer could not be started.
-    entry.runtime_driver.map_or(true, tool_available)
-        && travsr_indexer::bundled_lsif_emitter_available(entry.language)
-}
-
 /// Whether full cross-file semantic can actually run for `entry` on this machine:
 /// the analyzer is present (bundled, or its external binary resolves) AND the
 /// language is enabled (built in, or registered for indexing). One rule for every
 /// language — nothing is special-cased, so `lang list` and `lang detect` can never
 /// disagree again.
 fn analyzer_ready(entry: &PhaseBEntry, registered: bool) -> bool {
-    let enabled = entry.builtin || registered;
-    let present = if entry.analyzer_bundled() {
-        bundled_analyzer_ready(entry)
-    } else {
-        entry.provider_binary.map_or(true, tool_available) && analyzer_command_present(entry)
-    };
-    enabled && present
-}
-
-/// Whether the entry's analyzer command resolves on this machine.
-///
-/// Like `tool_available(entry.command)`, but also consults `rustup which` for
-/// rust-analyzer: `rustup component add rust-analyzer` installs it into the
-/// active toolchain's bin dir (`~/.rustup/toolchains/<tc>/bin`), which is not on
-/// PATH and not in `~/.cargo/bin`, so `tool_available` alone can't see it. Every
-/// analyzer-presence decision routes through here so `lang list`, `lang detect`,
-/// `lang status`, `lang install`, and the index-time resolver never disagree.
-fn analyzer_command_present(entry: &PhaseBEntry) -> bool {
-    let command_present = tool_available(entry.command)
-        || (entry.command == "rust-analyzer"
-            && travsr_indexer::ra_runner::resolve_ra_binary().is_some());
-    command_present && entry.runtime_driver.map_or(true, tool_available)
+    (entry.builtin || registered) && analyzer_present(entry)
 }
 
 /// The capability-view status for one language, shared by `lang list` (text and
