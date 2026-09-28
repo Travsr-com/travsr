@@ -156,7 +156,8 @@ export function parseSynonymList(raw: string): SynonymPair[] {
 /**
  * Parse `get_execution_path` prose into a synthetic GraphData: the route's
  * nodes (`signature (kind) — path`, one per line) flagged `root` (so the graph
- * highlights it) chained source→sink by `flows` edges.
+ * highlights it) chained source→sink by `calls` edges (the server's "call
+ * chain"; the graph webview draws only the kinds its edge filter knows).
  *
  * Only the route is a path. The server prints a `path (N steps, …):` header
  * before it and may follow it with a `nearby context (…, NOT on it):` section,
@@ -180,7 +181,7 @@ export function parseExecutionPath(raw: string): GraphData {
   const edges = nodes.slice(1).map((n, i) => ({
     source: nodes[i].id,
     target: n.id,
-    kind: "flows",
+    kind: "calls",
   }));
   return { nodes, edges };
 }

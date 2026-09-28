@@ -81,6 +81,9 @@ suite("VSCODE-247: parseExecutionPath", () => {
     assert.strictEqual(data.nodes[0].root, true, "path nodes flagged root for highlight");
     assert.strictEqual(data.edges[0].source, "fn:a");
     assert.strictEqual(data.edges[0].target, "fn:b");
+    // media/graph.js draws only the kinds in its edgeKinds filter (calls,
+    // imports); any other kind is dropped and the path renders with no edges.
+    assert.strictEqual(data.edges[0].kind, "calls");
   });
   test("takes the route only: no header, corridor, envelope or trailing note", () => {
     // Real get_execution_path output shape (tools.rs), with the note the server
