@@ -1283,6 +1283,31 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     init_repo_with_progress(repo_root, None, false, false, &mut |_| {})
 }
 
+/// Whether a semantic `init` must run Phase B at a commit it already covered.
+/// `now_ready` is asked only about languages the last run skipped at a gate, so
+/// "install X, then run `travsr init`" works without a new commit. Languages
+/// that ran and found nothing are not re-run: that repeats the same result.
+fn phase_b_inline_needed(
+    already_done: bool,
+    dirty: bool,
+    warnings: &str,
+    now_ready: impl Fn(&str) -> bool,
+) -> bool {
+    const GATE_SKIPS: &[&str] = &[
+        "skipped_unregistered",
+        "untrusted_corpus",
+        "skipped_no_analyzer",
+        "needs_consent",
+        "skipped_no_compdb",
+    ];
+    !already_done
+        || dirty
+        || warnings
+            .split(',')
+            .filter_map(|w| w.trim().split_once(':'))
+            .any(|(class, lang)| GATE_SKIPS.contains(&class) && now_ready(lang))
+}
+
 /// Like [`init_repo`], but reports progress via `on_progress` so the CLI can
 /// show that a long indexing run is alive (issue #293). The callback is invoked
 /// on the indexing thread; keep it cheap.
@@ -1976,6 +2001,7 @@ pub fn init_repo_with_progress(
     //
     // Inline path (`--semantic` flag, or repo has no HEAD commit):
     //   • `--semantic`: callers (CI, scripts) need call edges before querying.
+    //     Skipped when Phase B already covers HEAD (`phase_b_inline_needed`).
     //   • No commit: `run_background_phase_b` bails when `last_commit` is empty,
     //     so there is no deferred path available for fresh repos.
     let current_sha = read_head_commit_sha(repo_root).unwrap_or_default();
@@ -1986,7 +2012,28 @@ pub fn init_repo_with_progress(
         .flatten()
         .unwrap_or_default();
     let phase_b_already_done = !current_sha.is_empty() && phase_b_commit_stored == current_sha;
-    let run_phase_b_inline = semantic || !has_commit;
+    let run_phase_b_inline = !has_commit
+        || (semantic && {
+            let meta = |key| store.get_meta(key).ok().flatten().unwrap_or_default();
+            let warnings = meta("phase_b_warnings");
+            let lang_toml = travsr_plugin_host::trust::LangToml::from_disk();
+            let resolver = std::cell::OnceCell::new();
+            phase_b_inline_needed(
+                phase_b_already_done,
+                meta("phase_b_dirty") == "1",
+                &warnings,
+                |lang| {
+                    use travsr_plugin_host::phase_b::status::{gather, readiness, Readiness};
+                    travsr_plugin_host::phase_b::lookup(lang).is_some_and(|entry| {
+                        let resolver = resolver
+                            .get_or_init(travsr_plugin_host::resolver::CatalogResolver::new);
+                        let cap =
+                            gather(entry, repo_root, &corpus, &lang_toml, resolver, &warnings);
+                        readiness(&cap) == Readiness::Ready
+                    })
+                },
+            )
+        });
 
     // Observed before Phase B starts, compared after it finishes. `init.lock`
     // serialises two `travsr init` invocations, but not the daemon's watcher,
@@ -6134,6 +6181,58 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
+
+    #[test]
+    fn phase_b_inline_needed_table() {
+        let check = |name: &str, done: bool, dirty: bool, warnings: &str, ready: &[&str], want| {
+            let got = phase_b_inline_needed(done, dirty, warnings, |l| ready.contains(&l));
+            assert_eq!(got, want, "{name}");
+        };
+        check("done, nothing new", true, false, "", &["go"], false);
+        check("not done at this commit", false, false, "", &[], true);
+        check(
+            "done but a later edit dropped calls",
+            true,
+            true,
+            "",
+            &[],
+            true,
+        );
+        check(
+            "skipped, still not ready",
+            true,
+            false,
+            "skipped_unregistered:go",
+            &[],
+            false,
+        );
+        check(
+            "skipped language now ready",
+            true,
+            false,
+            "crashed:java,untrusted_corpus:go",
+            &["go"],
+            true,
+        );
+        check(
+            "every gate-skip class counts",
+            true,
+            false,
+            "skipped_no_analyzer:go,skipped_no_compdb:c,needs_consent:java",
+            &["go"],
+            true,
+        );
+        // Re-running a language that ran and found nothing only repeats the
+        // same result; it is not a gate skip.
+        check(
+            "no symbols is not a gate skip",
+            true,
+            false,
+            "zero_nodes:go,crashed:go,no_references:go",
+            &["go"],
+            false,
+        );
+    }
 
     /// Run `body` under a subscriber filtered by `directive`, and return the
     /// (target, level) of every event that actually reached it.
