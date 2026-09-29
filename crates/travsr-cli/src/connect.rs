@@ -96,7 +96,9 @@ struct McpCommand {
 
 impl McpCommand {
     /// Prefer the bare `travsr` command when `~/.travsr/bin` is on PATH (portable,
-    /// no username leak); fall back to the absolute current exe otherwise.
+    /// no username leak); fall back to the absolute current exe otherwise. The
+    /// absolute path is complete on its own (G2: the user never edits PATH), and
+    /// re-running `travsr init` rewrites it if travsr moves.
     fn resolve() -> Self {
         let command = if crate::install::path_contains_travsr_bin() {
             "travsr".to_string()
@@ -110,10 +112,6 @@ impl McpCommand {
             command,
             args: vec!["mcp".to_string(), "--stdio".to_string()],
         }
-    }
-
-    fn on_path(&self) -> bool {
-        self.command == "travsr"
     }
 }
 
@@ -473,8 +471,8 @@ enum Tool {
 }
 
 /// How a tool was detected, which decides whether we auto-write project files or
-/// just print a snippet (never auto-write into a repo for a tool only known from a
-/// global/home marker).
+/// just print a snippet. A home marker writes only for Claude Code and Cursor,
+/// whose project config is a gitignored `.mcp.json` (plan Q1).
 enum Detection {
     /// Project-local marker present, safe to write project-scoped config.
     Auto,
@@ -564,20 +562,22 @@ impl Tool {
     fn detect(&self, repo: &Path, home: Option<&Path>) -> Detection {
         let has = |p: PathBuf| p.exists();
         match self {
+            // Plan Q1: a home marker is enough for these two, because what gets
+            // written is this project's own gitignored `.mcp.json` (and the
+            // managed block), never the tool's global config.
             Tool::ClaudeCode => {
-                if has(repo.join(".claude")) || has(repo.join("CLAUDE.md")) {
+                if has(repo.join(".claude"))
+                    || has(repo.join("CLAUDE.md"))
+                    || home.is_some_and(|h| has(h.join(".claude")))
+                {
                     Detection::Auto
-                } else if home.is_some_and(|h| has(h.join(".claude"))) {
-                    Detection::Print
                 } else {
                     Detection::None
                 }
             }
             Tool::Cursor => {
-                if has(repo.join(".cursor")) {
+                if has(repo.join(".cursor")) || home.is_some_and(|h| has(h.join(".cursor"))) {
                     Detection::Auto
-                } else if home.is_some_and(|h| has(h.join(".cursor"))) {
-                    Detection::Print
                 } else {
                     Detection::None
                 }
@@ -1712,13 +1712,6 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         );
     }
 
-    if !opts.remove && !cmd.on_path() {
-        say!(
-            "note: `travsr` is not on PATH, so configs use an absolute path. Add \
-             ~/.travsr/bin to PATH so the wiring survives moves."
-        );
-    }
-
     Ok(())
 }
 
@@ -1898,6 +1891,25 @@ mod tests {
         assert!(matches!(Tool::Cursor.detect(repo, None), Detection::None));
         std::fs::create_dir(repo.join(".cursor")).unwrap();
         assert!(matches!(Tool::Cursor.detect(repo, None), Detection::Auto));
+    }
+
+    /// Plan Q1 (project scope): Claude Code or Cursor installed for the user
+    /// (`~/.claude`, `~/.cursor`) is enough to wire this project, because what is
+    /// written is the project's own gitignored `.mcp.json`. It used to only print
+    /// a snippet, so a fresh repo got no connection from `travsr init`.
+    #[test]
+    fn a_home_marker_wires_claude_code_and_cursor_for_the_project() {
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".claude")).unwrap();
+        std::fs::create_dir(home.path().join(".cursor")).unwrap();
+        for tool in [Tool::ClaudeCode, Tool::Cursor] {
+            assert!(
+                matches!(tool.detect(repo.path(), Some(home.path())), Detection::Auto),
+                "{}",
+                tool.id()
+            );
+        }
     }
 
     #[test]

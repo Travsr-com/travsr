@@ -903,3 +903,48 @@ fn init_outside_ci_keeps_a_daemon_running_without_a_terminal() {
         String::from_utf8_lossy(&status.stdout)
     );
 }
+
+/// Plan S7 / G2: a machine with Claude Code installed for the user (only
+/// `~/.claude`, nothing in the repo) gets this project wired by `init` alone,
+/// through the project's own `.mcp.json`, and is never told to edit PATH: the
+/// config carries the absolute path.
+#[test]
+fn init_wires_claude_code_from_a_home_marker_without_a_path_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(home.path().join(".claude")).unwrap();
+    git_init(tmp.path());
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("HOME", home.path())
+        .env("TRAVSR_LANG_TOML", home.path().join("lang.toml"))
+        .current_dir(tmp.path())
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mcp: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".mcp.json"))
+            .unwrap_or_else(|e| panic!("init must write .mcp.json ({e}):\n{text}")),
+    )
+    .unwrap();
+    assert!(
+        mcp["mcpServers"]["travsr"]["command"].is_string(),
+        "the project config must carry the travsr server: {mcp}"
+    );
+    assert!(!text.contains("PATH"), "no PATH instruction (G2):\n{text}");
+}
