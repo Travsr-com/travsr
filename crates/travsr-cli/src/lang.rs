@@ -524,8 +524,10 @@ fn cmd_list(language: Option<&str>, json: bool) -> Result<()> {
         let state = match states.get(entry.language) {
             Some(r) => {
                 if let Some(fix) = r.fix() {
-                    if matches!(r, Readiness::SettingUp | Readiness::Failed)
-                        && !fixes.contains(&fix)
+                    if matches!(
+                        r,
+                        Readiness::SettingUp | Readiness::Failed | Readiness::PartMissing
+                    ) && !fixes.contains(&fix)
                     {
                         fixes.push(fix);
                     }

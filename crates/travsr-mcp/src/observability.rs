@@ -329,8 +329,10 @@ pub(crate) fn decode_phase_b_warnings(warnings: &str) -> HashMap<String, (&'stat
         // language, from `Readiness`, so the two surfaces cannot drift. The
         // per-class detail (which analyzer, which rebuild) is `status --verbose`.
         let (state, readiness) = match class {
-            "crashed" | "no_references" | "version_mismatch" | "emitter_failed"
-            | "emitter_missing" | "zero_nodes" => ("failed", Readiness::Failed),
+            "crashed" | "no_references" | "version_mismatch" | "emitter_failed" | "zero_nodes" => {
+                ("failed", Readiness::Failed)
+            }
+            "emitter_missing" => ("failed", Readiness::PartMissing),
             // All of these are what `travsr init` sets up itself: install,
             // registration, trust, the unsandboxed permission (plan 4.4).
             "needs_consent"

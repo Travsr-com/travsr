@@ -190,6 +190,9 @@ pub enum Readiness {
     },
     /// The analyzer ran and produced nothing usable, with no known cause.
     Failed,
+    /// A tracer that ships inside travsr's install was not found (the binary
+    /// was copied out of it). Only reinstalling brings it back.
+    PartMissing,
 }
 
 impl Readiness {
@@ -200,7 +203,7 @@ impl Readiness {
             Readiness::SettingUp => "setting_up",
             Readiness::NeedsToolchain { .. } => "needs_toolchain",
             Readiness::Unsupported { .. } => "unsupported_os",
-            Readiness::Failed => "failed",
+            Readiness::Failed | Readiness::PartMissing => "failed",
         }
     }
 
@@ -212,6 +215,7 @@ impl Readiness {
             Readiness::NeedsToolchain { needs } => format!("needs {needs}"),
             Readiness::Unsupported { os } => format!("not available on {os}"),
             Readiness::Failed => "could not trace calls".into(),
+            Readiness::PartMissing => "could not trace calls: part of travsr is missing".into(),
         }
     }
 
@@ -227,6 +231,7 @@ impl Readiness {
                 Some(format!("Install {needs}, then run `travsr init`."))
             }
             Readiness::Failed => Some("See `travsr status --verbose`.".into()),
+            Readiness::PartMissing => Some("Reinstall travsr, then run `travsr init`.".into()),
         }
     }
 }
@@ -265,10 +270,12 @@ pub fn readiness(c: &RepoCapability) -> Readiness {
     }
     // A bundled emitter that could not be found or started ships with travsr,
     // so `travsr init` cannot restore it; send the user to the reason instead.
-    if c.entry.analyzer_bundled()
-        && matches!(c.last_warning, Some("emitter_failed" | "emitter_missing"))
-    {
-        return Readiness::Failed;
+    if c.entry.analyzer_bundled() {
+        match c.last_warning {
+            Some("emitter_missing") => return Readiness::PartMissing,
+            Some("emitter_failed") => return Readiness::Failed,
+            _ => {}
+        }
     }
     let enabled = c.entry.builtin || (c.registered && c.corpus_trusted);
     if !enabled || !c.analyzer_ready {
@@ -776,6 +783,12 @@ mod tests {
                 "could not trace calls",
                 Some("See `travsr status --verbose`."),
             ),
+            (
+                Readiness::PartMissing,
+                "failed",
+                "could not trace calls: part of travsr is missing",
+                Some("Reinstall travsr, then run `travsr init`."),
+            ),
         ];
         for (r, tag, label, fix) in cases {
             assert_eq!(r.tag(), tag);
@@ -820,7 +833,7 @@ mod tests {
     /// not ready: `status` would otherwise call it ready over a warning.
     #[test]
     fn a_failed_type_checked_pass_or_old_analyzer_is_failed() {
-        for class in ["emitter_failed", "emitter_missing", "version_mismatch"] {
+        for class in ["emitter_failed", "version_mismatch"] {
             let cap = RepoCapability {
                 last_warning: Some(class),
                 ..repo("typescript")
@@ -834,13 +847,18 @@ mod tests {
     /// bring back a file that ships with travsr, so that remedy would loop.
     #[test]
     fn a_missing_bundled_emitter_is_failed_not_setting_up() {
-        for class in ["emitter_failed", "emitter_missing"] {
-            let cap = RepoCapability {
-                analyzer_ready: false,
-                last_warning: Some(class),
-                ..repo("typescript")
-            };
-            assert_eq!(readiness(&cap), Readiness::Failed, "{class}");
+        for (class, want) in [
+            ("emitter_failed", Readiness::Failed),
+            ("emitter_missing", Readiness::PartMissing),
+        ] {
+            for analyzer_ready in [false, true] {
+                let cap = RepoCapability {
+                    analyzer_ready,
+                    last_warning: Some(class),
+                    ..repo("typescript")
+                };
+                assert_eq!(readiness(&cap), want, "{class}");
+            }
         }
         // Without the record, an absent bundled analyzer is still set up by init.
         let cap = RepoCapability {
