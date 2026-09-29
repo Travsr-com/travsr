@@ -429,6 +429,8 @@ pub struct InitSummary {
     pub diagnostics: Vec<String>,
     /// This repo has not turned on meaning-based search (decision 3: optional).
     pub embed_optional: bool,
+    /// The repo has no commit yet, so freshness has no baseline (DEBT-013).
+    pub no_commit: bool,
     pub quiet: bool,
 }
 
@@ -526,6 +528,12 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
         }
         if s.embed_optional {
             out.push("  Optional: `travsr embed init` adds meaning-based search.".to_string());
+        }
+        if s.no_commit {
+            out.push(
+                "  Make a first commit so `travsr status` can tell you how fresh the index is."
+                    .to_string(),
+            );
         }
     }
     out.push(if s.no_op { READY_NO_CHANGE } else { READY }.to_string());
@@ -843,6 +851,7 @@ mod tests {
             ],
             diagnostics: vec![],
             embed_optional: true,
+            no_commit: false,
             quiet: false,
         }
     }
@@ -907,6 +916,18 @@ mod tests {
         assert_eq!(
             lines.iter().filter(|l| l.starts_with("Ready.")).count(),
             1,
+            "{lines:?}"
+        );
+
+        // G6: in a repo with no commit yet, `Ready.` is still the last line at
+        // the left margin; the first-commit advice sits above it.
+        let mut s = summary();
+        s.no_commit = true;
+        let lines = render_summary(&s);
+        let last_unindented = lines.iter().rfind(|l| !l.starts_with(' ')).unwrap();
+        assert!(last_unindented.starts_with("Ready."), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("first commit")),
             "{lines:?}"
         );
     }

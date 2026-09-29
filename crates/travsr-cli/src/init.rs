@@ -240,21 +240,14 @@ pub fn run(
             .map(crate::progress::analyzer_words)
             .unwrap_or_default(),
         embed_optional: travsr_plugin_host::repo_backend_id(&repo_root).is_none(),
+        no_commit: travsr_store::SqliteStore::open(&db_path)
+            .ok()
+            .and_then(|st| st.get_meta("last_commit").ok().flatten())
+            .is_none(),
         quiet,
     };
     for line in crate::progress::render_summary(&summary) {
         println!("{line}");
-    }
-
-    // DEBT-013: a repo with no commits yet has no baseline for freshness.
-    if !quiet && !no_op {
-        let check = travsr_store::SqliteStore::open(&db_path)?;
-        if check.get_meta("last_commit")?.is_none() {
-            println!(
-                "tip: run `git commit` to record a baseline, \
-                 `travsr status` will show freshness after your first commit"
-            );
-        }
     }
 
     Ok(())
