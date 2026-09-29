@@ -5055,6 +5055,33 @@ fn live_lane_enabled_for(store: &SqliteStore, language: &str) -> bool {
     LIVE_LANE_SHIPPED.iter().any(|(l, _)| *l == language) || live_lane_measure_forced(language)
 }
 
+/// Whether calls in a language are traced as the user edits, for `status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditTracing {
+    On,
+    /// Shipped, but its measured precision here fell below the bar.
+    OffMeasured,
+    /// Not available for this language (not on [`LIVE_LANE_SHIPPED`]).
+    OffUnavailable,
+}
+
+/// [`live_lane_enabled_for`] with the reason when it is off. Takes a catalog
+/// language; `javascript` files are metered as `typescript`.
+pub fn edit_tracing(store: &SqliteStore, language: &str) -> EditTracing {
+    let language = if language == "javascript" {
+        "typescript"
+    } else {
+        language
+    };
+    if live_lane_enabled_for(store, language) {
+        EditTracing::On
+    } else if LIVE_LANE_SHIPPED.iter().any(|(l, _)| *l == language) {
+        EditTracing::OffMeasured
+    } else {
+        EditTracing::OffUnavailable
+    }
+}
+
 /// RFC-027 section 8.3: retire the live overlay and clear resolved pendings.
 ///
 /// Extracted so the convergence property test can drive ratification directly
@@ -10652,6 +10679,23 @@ mod tests {
             live_lane_enabled_for(&store, "typescript"),
             "the gate must be scoped per language, not corpus-wide"
         );
+    }
+
+    /// `travsr status` says why calls are not traced as you edit: measured off
+    /// here, or never available for the language. `javascript` is metered as
+    /// `typescript`, the same node language its files carry.
+    #[test]
+    fn edit_tracing_names_why_it_is_off() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        assert_eq!(edit_tracing(&store, "rust"), EditTracing::On);
+        assert_eq!(edit_tracing(&store, "javascript"), EditTracing::On);
+        assert_eq!(edit_tracing(&store, "ruby"), EditTracing::OffUnavailable);
+        store.set_meta("live_precision.rust", "18,5,3").unwrap();
+        assert_eq!(edit_tracing(&store, "rust"), EditTracing::OffMeasured);
+        store
+            .set_meta("live_precision.typescript", "18,5,3")
+            .unwrap();
+        assert_eq!(edit_tracing(&store, "javascript"), EditTracing::OffMeasured);
     }
 
     /// RFC-027 section 8.7.6: an unmeasured, un-vouched language ships DISABLED.

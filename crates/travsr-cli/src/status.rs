@@ -257,7 +257,42 @@ fn head_at(cwd: &std::path::Path) -> Option<String> {
     crate::git_bounded::git_stdout_bounded(Some(cwd), ["rev-parse", "--short", "HEAD"])
 }
 
-pub fn run() -> anyhow::Result<()> {
+/// The default language block: one line per language that is not simply
+/// ready, plus a note for a ready language whose calls are not traced as you
+/// edit. Plain words only (plan 3.0); the details are under `--verbose`.
+fn language_lines(
+    states: &[(
+        String,
+        travsr_plugin_host::phase_b::status::Readiness,
+        travsr_daemon::EditTracing,
+    )],
+) -> Vec<String> {
+    use travsr_daemon::EditTracing;
+    use travsr_plugin_host::phase_b::status::Readiness;
+    states
+        .iter()
+        .filter_map(|(lang, readiness, editing)| {
+            let text = match (readiness, editing) {
+                (Readiness::Ready, EditTracing::On) => return None,
+                (Readiness::Ready, EditTracing::OffMeasured) => {
+                    "calls update at each commit, not as you edit (edit-time results \
+                     disagreed with commit results here too often)"
+                        .to_string()
+                }
+                (Readiness::Ready, EditTracing::OffUnavailable) => {
+                    "calls update at each commit, not as you edit".to_string()
+                }
+                (r, _) => match r.fix() {
+                    Some(fix) => format!("{}. {fix}", r.label()),
+                    None => r.label(),
+                },
+            };
+            Some(format!("  {lang:<11} {text}"))
+        })
+        .collect()
+}
+
+pub fn run(verbose: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     // `head_at` and `find_git_root` are independent, bounded git queries on the
     // same `cwd` (the latter only shells out in the linked-worktree branch, via
@@ -311,8 +346,24 @@ pub fn run() -> anyhow::Result<()> {
     //
     // Silent when the lane has never claimed anything, which is every repo that
     // has not used it — a counter of zero is not news.
+    //
+    // Plan 3.0: the numbers are a diagnostic, so they are under `--verbose`; the
+    // default says per language, in plain words, where calls are not traced as
+    // you edit.
     if let Ok(store) = daemon_client::open_read_store(&db_path) {
-        if let Some(line) = live_precision_line(&store) {
+        if verbose {
+            if let Some(line) = live_precision_line(&store) {
+                println!("{line}");
+            }
+        }
+        let states: Vec<_> = crate::init::repo_language_states(&repo_root)
+            .into_iter()
+            .map(|(lang, r)| {
+                let editing = travsr_daemon::edit_tracing(&store, &lang);
+                (lang, r, editing)
+            })
+            .collect();
+        for line in language_lines(&states) {
             println!("{line}");
         }
     }
@@ -364,8 +415,9 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     // H3: surface Phase B warnings so the user knows about crashed/mismatched
-    // analyzers without having to re-read the init output.
-    if let Some(warnings) = &payload.phase_b_warnings {
+    // analyzers without having to re-read the init output. Under `--verbose`:
+    // the language block above gives each one's state and fix in plain words.
+    if let Some(warnings) = payload.phase_b_warnings.as_ref().filter(|_| verbose) {
         if !warnings.is_empty() {
             // Trust is per-repo, not per-language: a single `install` enables
             // every language at once, so collapse the "not enabled here" notices
@@ -376,7 +428,7 @@ pub fn run() -> anyhow::Result<()> {
                 .collect();
             if !untrusted.is_empty() {
                 eprintln!(
-                    "warning: semantic analysis is not enabled for this repository yet ({}); run `travsr lang install <lang>` here to enable",
+                    "warning: semantic analysis is not enabled for this repository yet ({}); run `travsr init` here to enable",
                     untrusted.join(", ")
                 );
             }
@@ -558,7 +610,10 @@ pub fn run() -> anyhow::Result<()> {
     // this is where "the Android SDK was not found" reaches the user without
     // a RUST_LOG re-run. Printed after the classes so it reads as the reason
     // for the warning above it.
-    for d in sidecar_diagnostics(&payload) {
+    for d in sidecar_diagnostics(&payload)
+        .into_iter()
+        .filter(|_| verbose)
+    {
         eprintln!("warning: '{}' analysis: {} [{}]", d.lang, d.message, d.code);
     }
 
@@ -567,7 +622,7 @@ pub fn run() -> anyhow::Result<()> {
     // (bubblewrap); Windows and macOS have none to add here, so the only path
     // to full edges is the trusted-repo opt-in. `cfg!` (not `#[cfg]`) keeps
     // every platform's wording compiled and checked.
-    if let Some(reason) = &payload.rust_lsif_degraded {
+    if let Some(reason) = payload.rust_lsif_degraded.as_ref().filter(|_| verbose) {
         match reason.as_str() {
             "sandbox_unavailable" => {
                 let remedy = if cfg!(target_os = "linux") {
@@ -610,7 +665,9 @@ pub fn run() -> anyhow::Result<()> {
     // RFC-025 §8: sidecar version health (installed vs required vs latest), with
     // the exact remedy. Computed offline; the `latest` note is present only when
     // the local cache is warm. Prints nothing when no sidecar is installed.
-    crate::sidecar_health::print_block();
+    if verbose {
+        crate::sidecar_health::print_block();
+    }
 
     // #712 F: the embed sidecar can be installed while no backend is active, so
     // the semantic path silently runs without embeddings. Nudge to enable it.
@@ -704,6 +761,43 @@ mod tests {
         );
     }
     use super::*;
+
+    /// The default language block: one plain line per language that is not
+    /// simply ready, and a note where calls are not traced as you edit. Never
+    /// a line for a ready language traced as you edit.
+    #[test]
+    fn language_lines_are_plain_and_only_for_what_needs_saying() {
+        use travsr_daemon::EditTracing::{OffMeasured, OffUnavailable, On};
+        use travsr_plugin_host::phase_b::status::{jargon_in, Readiness};
+        let states = vec![
+            ("typescript".to_string(), Readiness::Ready, On),
+            ("rust".to_string(), Readiness::Ready, OffMeasured),
+            ("scala".to_string(), Readiness::Ready, OffUnavailable),
+            (
+                "c".to_string(),
+                Readiness::NeedsToolchain {
+                    needs: "compile_commands.json".into(),
+                },
+                On,
+            ),
+            ("ruby".to_string(), Readiness::Failed, OffUnavailable),
+        ];
+        let lines = language_lines(&states);
+        assert_eq!(
+            lines,
+            vec![
+                "  rust        calls update at each commit, not as you edit \
+                 (edit-time results disagreed with commit results here too often)",
+                "  scala       calls update at each commit, not as you edit",
+                "  c           needs compile_commands.json. Generate compile_commands.json \
+                 with your build, then run `travsr init`.",
+                "  ruby        could not trace calls. See `travsr status --verbose`.",
+            ]
+        );
+        for line in &lines {
+            assert_eq!(jargon_in(line), None, "{line}");
+        }
+    }
 
     fn payload(last: &str, phase_b: &str, dirty: bool) -> StatusPayload {
         StatusPayload {

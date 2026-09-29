@@ -180,9 +180,16 @@ fn assert_disclosed(bin: &Path, repo: &Path, out: &Output, class: &str) {
         status.contains("semantic: partial (incomplete: typescript)"),
         "status must downgrade the semantic field:\n{status}"
     );
+    // Plan 3.0: the default names the language and where to look, in plain
+    // words; the explanation itself is under `--verbose`.
     assert!(
-        status.contains("warning: full 'typescript' analysis is incomplete"),
-        "status must explain the downgrade:\n{status}"
+        status.contains("typescript  could not trace calls. See `travsr status --verbose`."),
+        "status must name the language that could not be traced:\n{status}"
+    );
+    let verbose = text(&run(bin, repo, &["status", "--verbose"], &[]));
+    assert!(
+        verbose.contains("warning: full 'typescript' analysis is incomplete"),
+        "status --verbose must explain the downgrade:\n{verbose}"
     );
 }
 

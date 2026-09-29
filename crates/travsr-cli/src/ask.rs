@@ -323,7 +323,7 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             }
             "travsr status" => {
                 println!("{}", pal.dim(redirect.answer));
-                crate::status::run()?;
+                crate::status::run(false)?;
             }
             other => {
                 println!("{}", redirect.answer);

@@ -209,7 +209,11 @@ enum Command {
         json: bool,
     },
     /// Print index and graph status.
-    Status,
+    Status {
+        /// Also print each language's diagnostics, measurements and tool versions.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Ask a natural-language question about the codebase (graph-grounded
     /// retrieval). Also accepts a bare symbol name.
     Ask {
@@ -1412,7 +1416,7 @@ async fn run(cli: Cli) -> Result<()> {
             remove,
             json,
         } => repos::run(prune, remove.as_deref(), json)?,
-        Command::Status => status::run()?,
+        Command::Status { verbose } => status::run(verbose)?,
         Command::Ask {
             query,
             format,

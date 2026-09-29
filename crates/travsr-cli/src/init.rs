@@ -292,6 +292,19 @@ fn readiness_of(
         .collect()
 }
 
+/// Readiness of every language in `repo_root`, from the same detection, corpus
+/// key and last-run warnings `travsr init` uses, so `status` agrees with it.
+pub(crate) fn repo_language_states(repo_root: &std::path::Path) -> Vec<(String, Readiness)> {
+    let corpus = travsr_daemon::detect_corpus(
+        &repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.to_path_buf()),
+    );
+    let languages = crate::lang::detect_languages_in(repo_root);
+    let warnings = stored_warnings(&repo_root.join(".travsr/graph.db"));
+    readiness_of(repo_root, &corpus, &languages, &warnings)
+}
+
 /// The last run's `phase_b_warnings`, or empty before the first run.
 fn stored_warnings(db_path: &std::path::Path) -> String {
     if !db_path.exists() {

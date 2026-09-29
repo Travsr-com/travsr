@@ -204,6 +204,17 @@ impl Readiness {
         }
     }
 
+    /// The state in plain words, for text output (plan 3.1).
+    pub fn label(&self) -> String {
+        match self {
+            Readiness::Ready => "ready".into(),
+            Readiness::SettingUp => "setting up".into(),
+            Readiness::NeedsToolchain { needs } => format!("needs {needs}"),
+            Readiness::Unsupported { os } => format!("not available on {os}"),
+            Readiness::Failed => "could not trace calls".into(),
+        }
+    }
+
     /// The one next action, in plain words; `None` when there is nothing to do.
     pub fn fix(&self) -> Option<String> {
         match self {
@@ -215,9 +226,7 @@ impl Readiness {
             Readiness::NeedsToolchain { needs } => {
                 Some(format!("Install {needs}, then run `travsr init`."))
             }
-            Readiness::Failed => {
-                Some("Calls could not be traced. See `travsr status` for why.".into())
-            }
+            Readiness::Failed => Some("See `travsr status --verbose`.".into()),
         }
     }
 }
@@ -261,24 +270,94 @@ pub fn readiness(c: &RepoCapability) -> Readiness {
             needs: prerequisites.to_string(),
         };
     }
+    // A bundled emitter that could not be found or started ships with travsr,
+    // so `travsr init` cannot restore it; send the user to the reason instead.
+    if c.entry.analyzer_bundled()
+        && matches!(c.last_warning, Some("emitter_failed" | "emitter_missing"))
+    {
+        return Readiness::Failed;
+    }
     let enabled = c.entry.builtin || (c.registered && c.corpus_trusted);
     if !enabled || !c.analyzer_ready {
         return Readiness::SettingUp;
     }
     match c.last_warning {
-        Some("crashed" | "zero_nodes" | "no_references") => Readiness::Failed,
+        Some(
+            "crashed" | "zero_nodes" | "no_references" | "emitter_failed" | "emitter_missing"
+            | "version_mismatch",
+        ) => Readiness::Failed,
         _ => Readiness::Ready,
     }
 }
 
 /// This language's warning class in a stored `phase_b_warnings` value
-/// (`class:lang,class:lang,...`).
+/// (`class:lang,class:lang,...`; `version_mismatch:lang:expected:got` carries
+/// more after the language).
 fn warning_class<'a>(warnings: &'a str, language: &str) -> Option<&'a str> {
     warnings
         .split(',')
         .filter_map(|w| w.trim().split_once(':'))
-        .find(|(_, lang)| *lang == language)
+        .find(|(_, rest)| rest.split(':').next() == Some(language))
         .map(|(class, _)| class)
+}
+
+/// Section 3.0: words that must not reach default output, as whole words,
+/// case-insensitive. `Node.js` is a real tool the user installs, so it is
+/// allowed although `node` is not.
+const JARGON: &[&str] = &[
+    "phase a",
+    "phase b",
+    "semantic",
+    "lsif",
+    "scip",
+    "sidecar",
+    "wrapper",
+    "analyzer",
+    "corpus",
+    "trust grant",
+    "registered",
+    "sandbox",
+    "bwrap",
+    "unsandboxed",
+    "daemon",
+    "node",
+    "nodes",
+    "edge",
+    "edges",
+    "schema",
+    "provenance",
+    "vname",
+    "ppr",
+    "knapsack",
+    "seed",
+    "knn",
+    "live overlay",
+    "live lane",
+    "control socket",
+    "rust_log",
+    "lang install",
+    "lang add",
+    "allow-unsandboxed",
+    "init --semantic",
+    "<lang>",
+];
+
+/// The first section 3.0 banned word in `text`, or `None` when it reads plainly.
+/// Every surface's string tests share this, so the list cannot drift.
+pub fn jargon_in(text: &str) -> Option<&'static str> {
+    let text = text.to_lowercase().replace("node.js", "");
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    JARGON.iter().copied().find(|term| {
+        text.match_indices(term).any(|(i, _)| {
+            let before = text[..i].chars().next_back();
+            let after = text[i + term.len()..].chars().next();
+            let edge_ok = |c: Option<char>, t: Option<char>| {
+                // A term that starts or ends in punctuation needs no boundary there.
+                t.is_some_and(|t| !word(t)) || c.map_or(true, |c| !word(c))
+            };
+            edge_ok(before, term.chars().next()) && edge_ok(after, term.chars().next_back())
+        })
+    })
 }
 
 /// Fill [`RepoCapability`] for one language in `repo_root`. `warnings` is the
@@ -657,23 +736,26 @@ mod tests {
     }
 
     #[test]
-    fn readiness_tags_and_fixes_are_plain() {
+    fn readiness_tags_labels_and_fixes_are_plain() {
         let needs = |s: &str| Readiness::NeedsToolchain { needs: s.into() };
         let cases = [
-            (Readiness::Ready, "ready", None),
+            (Readiness::Ready, "ready", "ready", None),
             (
                 Readiness::SettingUp,
                 "setting_up",
+                "setting up",
                 Some("Run `travsr init` to finish tracing calls."),
             ),
             (
                 needs("Go toolchain"),
                 "needs_toolchain",
+                "needs Go toolchain",
                 Some("Install Go toolchain, then run `travsr init`."),
             ),
             (
                 needs("compile_commands.json"),
                 "needs_toolchain",
+                "needs compile_commands.json",
                 Some("Generate compile_commands.json with your build, then run `travsr init`."),
             ),
             (
@@ -681,38 +763,87 @@ mod tests {
                     os: "windows".into(),
                 },
                 "unsupported_os",
+                "not available on windows",
                 None,
             ),
             (
                 Readiness::Failed,
                 "failed",
-                Some("Calls could not be traced. See `travsr status` for why."),
+                "could not trace calls",
+                Some("See `travsr status --verbose`."),
             ),
         ];
-        for (r, tag, fix) in cases {
+        for (r, tag, label, fix) in cases {
             assert_eq!(r.tag(), tag);
+            assert_eq!(r.label(), label, "{tag}");
             assert_eq!(r.fix().as_deref(), fix, "{tag}");
-            // Section 3.0: no internal vocabulary, no placeholders.
-            let text = r.fix().unwrap_or_default().to_lowercase();
-            for banned in [
-                "phase", "semantic", "lsif", "scip", "sidecar", "analyzer", "corpus", "sandbox",
-                "daemon", "node", "edge", "<",
-            ] {
-                assert!(
-                    !text.contains(banned),
-                    "{tag}: {text:?} contains {banned:?}"
-                );
-            }
+            let text = format!("{} {}", r.label(), r.fix().unwrap_or_default());
+            assert_eq!(jargon_in(&text), None, "{tag}: {text:?}");
         }
+    }
+
+    /// Section 3.0's check itself: whole words, case-insensitive, with the one
+    /// real tool name that contains a banned word allowed.
+    #[test]
+    fn jargon_in_finds_internal_words_only() {
+        assert_eq!(jargon_in("Install Node.js, then run `travsr init`."), None);
+        assert_eq!(jargon_in("the daemon is running"), Some("daemon"));
+        assert_eq!(jargon_in("live overlay active"), Some("live overlay"));
+        assert_eq!(
+            jargon_in("run `travsr lang install <lang>`"),
+            Some("lang install")
+        );
+        assert_eq!(jargon_in("see the Semantic pass"), Some("semantic"));
+        assert_eq!(jargon_in("3 edges"), Some("edges"));
+        assert_eq!(
+            jargon_in("a knowledge edgeless design"),
+            None,
+            "whole words only"
+        );
     }
 
     #[test]
     fn warning_class_is_read_for_this_language_only() {
-        let w = "zero_nodes:java,crashed:go,scip_unification_misses:2/38";
+        let w = "zero_nodes:java,crashed:go,scip_unification_misses:2/38,version_mismatch:php:2:1";
         assert_eq!(warning_class(w, "go"), Some("crashed"));
         assert_eq!(warning_class(w, "java"), Some("zero_nodes"));
+        assert_eq!(warning_class(w, "php"), Some("version_mismatch"));
         assert_eq!(warning_class(w, "rust"), None);
         assert_eq!(warning_class("", "go"), None);
+    }
+
+    /// A pass that started and failed, or an analyzer too old to talk to, is
+    /// not ready: `status` would otherwise call it ready over a warning.
+    #[test]
+    fn a_failed_type_checked_pass_or_old_analyzer_is_failed() {
+        for class in ["emitter_failed", "emitter_missing", "version_mismatch"] {
+            let cap = RepoCapability {
+                last_warning: Some(class),
+                ..repo("typescript")
+            };
+            assert_eq!(readiness(&cap), Readiness::Failed, "{class}");
+        }
+    }
+
+    /// A bundled analyzer whose emitter could not be found (a travsr binary
+    /// copied out of its install) is not "setting up": `travsr init` cannot
+    /// bring back a file that ships with travsr, so that remedy would loop.
+    #[test]
+    fn a_missing_bundled_emitter_is_failed_not_setting_up() {
+        for class in ["emitter_failed", "emitter_missing"] {
+            let cap = RepoCapability {
+                analyzer_ready: false,
+                last_warning: Some(class),
+                ..repo("typescript")
+            };
+            assert_eq!(readiness(&cap), Readiness::Failed, "{class}");
+        }
+        // Without the record, an absent bundled analyzer is still set up by init.
+        let cap = RepoCapability {
+            analyzer_ready: false,
+            ..repo("typescript")
+        };
+        assert_eq!(readiness(&cap), Readiness::SettingUp);
     }
 
     #[test]
