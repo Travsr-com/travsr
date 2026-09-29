@@ -65,7 +65,10 @@ pub fn run(
     );
 
     // Get the language tools this repo needs. Gated on readiness so a re-run
-    // with everything in place makes no network call.
+    // with everything in place makes no network call. The default
+    // `.travsrignore` is written first, so detection skips the same folders
+    // (vendor/, testdata/, ...) indexing will, and sets up nothing for them.
+    let travsrignore_scaffolded = travsr_daemon::scaffold_travsrignore(&repo_root).unwrap_or(false);
     let languages = crate::lang::detect_languages_in(&repo_root);
     grant_unsandboxed_where_needed(&languages);
     let skip_downloads = std::env::var_os("TRAVSR_SKIP_DOWNLOAD").is_some();
@@ -97,12 +100,14 @@ pub fn run(
     // Live progress so a long indexing run is not mistaken for a hang (#293).
     // Renders to stderr; the summary below stays on stdout.
     let mut progress = crate::progress::ProgressReporter::new(quiet, json);
-    let stats = travsr_daemon::init_repo_with_progress(&repo_root, jobs, true, force, &mut |ev| {
-        if matches!(ev, travsr_daemon::InitProgress::Finalizing) {
-            TRACING_CALLS.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        progress.update(ev)
-    })?;
+    let mut stats =
+        travsr_daemon::init_repo_with_progress(&repo_root, jobs, true, force, &mut |ev| {
+            if matches!(ev, travsr_daemon::InitProgress::Finalizing) {
+                TRACING_CALLS.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            progress.update(ev)
+        })?;
+    stats.travsrignore_scaffolded |= travsrignore_scaffolded;
     let elapsed = progress.elapsed();
     progress.finish();
 

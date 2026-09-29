@@ -3934,6 +3934,7 @@ dependencies = [
  "dirs",
  "flate2",
  "fs2",
+ "ignore",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

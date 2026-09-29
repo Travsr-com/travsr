@@ -625,7 +625,7 @@ const DEFAULT_TRAVSRIGNORE_RULE_COUNT: usize = 8;
 ///
 /// Idempotent: never overwrites an existing file.  Reports whether the file was
 /// freshly created so `init_repo` can mention it in the summary.
-fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
+pub fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
     let path = repo_root.join(".travsrignore");
     if path.exists() {
         return Ok(false);

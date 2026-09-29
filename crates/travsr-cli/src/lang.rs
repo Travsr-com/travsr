@@ -1813,7 +1813,9 @@ fn confirm_unsandboxed_grant(yes: bool) -> Result<bool> {
 // ── language detection ────────────────────────────────────────────────────────
 
 /// Walk `dir` and return catalog language names whose file extensions appear
-/// in the tree. Skips .git, node_modules, target, build, dist, .cache.
+/// in the tree. Skips .git, node_modules, target, build, dist, .cache, and
+/// whatever `.gitignore` and `.travsrignore` exclude, with the same walker the
+/// indexer uses, so no tools are set up for files that are never indexed.
 /// Returns languages in catalog order for stable output.
 pub(crate) fn detect_languages_in(dir: &std::path::Path) -> Vec<String> {
     const SKIP_DIRS: &[&str] = &[
@@ -1829,15 +1831,18 @@ pub(crate) fn detect_languages_in(dir: &std::path::Path) -> Vec<String> {
 
     let mut found = std::collections::HashSet::new();
 
-    for entry in walkdir::WalkDir::new(dir)
+    for entry in ignore::WalkBuilder::new(dir)
+        .hidden(false)
+        .git_ignore(true)
         .follow_links(false)
-        .into_iter()
+        .add_custom_ignore_filename(".travsrignore")
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
             !SKIP_DIRS.iter().any(|d| *d == name.as_ref())
         })
+        .build()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
     {
         if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
             let ext_dot = format!(".{ext}");
@@ -2095,6 +2100,29 @@ fn phase_b_tool_floor_refusal(entry: &travsr_plugin_host::PhaseBEntry) -> Option
 mod tests {
     use super::resolve_install_tag;
     use super::LangConfig;
+
+    /// Detection sees the files the indexer indexes and nothing else: a
+    /// language present only under a gitignored or `.travsrignore`d folder has
+    /// no file to trace, so setting it up only cost a download. Fixture folders
+    /// that are indexed still count.
+    #[test]
+    fn detection_skips_only_what_the_ignore_files_skip() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join(".git")).unwrap();
+        for (path, body) in [
+            ("src/main.rs", "fn main() {}"),
+            ("tests/fixtures/app.java", "class A {}"),
+            ("vendor/lib.go", "package lib"),
+            (".claude/worktrees/x/app.rb", "def x; end"),
+            (".gitignore", ".claude/\n"),
+            (".travsrignore", "vendor/\n"),
+        ] {
+            std::fs::create_dir_all(r.join(path).parent().unwrap()).unwrap();
+            std::fs::write(r.join(path), body).unwrap();
+        }
+        assert_eq!(super::detect_languages_in(r), vec!["rust", "java"]);
+    }
 
     #[test]
     fn elevated_approvals_survive_a_save_load_round_trip() {
