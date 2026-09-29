@@ -884,24 +884,37 @@ impl PluginIndexer {
                                 // node — 100% dangling (18,530 dead edges here).
                                 let mut positional_refs: Vec<travsr_core::LsifPositionalRef> =
                                     Vec::new();
-                                match travsr_indexer::run_ra_lsif(repo_root, &cfg) {
-                                    Ok(Some(dump)) => {
-                                        let prefs = travsr_indexer::ingest_rust_positional(
-                                            &dump,
-                                            &repo_root.to_string_lossy(),
-                                        );
-                                        tracing::debug!(
-                                            positional_refs = prefs.len(),
-                                            "Phase B: rust-analyzer LSIF positional refs parsed"
-                                        );
-                                        positional_refs = prefs;
+                                // Every cargo project, as TypeScript does for
+                                // tsconfig: a repo whose only Cargo.toml files
+                                // sit below the root got "no projects" here.
+                                let mut ra_roots = build_roots(
+                                    repo_root,
+                                    item.files.as_deref().unwrap_or(&[]),
+                                    crate::phase_b::catalog::build_manifests("rust"),
+                                );
+                                if ra_roots.is_empty() {
+                                    ra_roots.push(repo_root.to_path_buf());
+                                }
+                                for ra_root in &ra_roots {
+                                    match travsr_indexer::run_ra_lsif(ra_root, &cfg) {
+                                        Ok(Some(dump)) => {
+                                            let prefs = travsr_indexer::ingest_rust_positional(
+                                                &dump,
+                                                &repo_root.to_string_lossy(),
+                                            );
+                                            tracing::debug!(
+                                                positional_refs = prefs.len(),
+                                                "Phase B: rust-analyzer LSIF positional refs parsed"
+                                            );
+                                            positional_refs.extend(prefs);
+                                        }
+                                        Ok(None) => {
+                                            tracing::debug!(
+                                                "rust-analyzer not available, native phase_b only"
+                                            )
+                                        }
+                                        Err(e) => tracing::warn!("rust-analyzer failed: {e}"),
                                     }
-                                    Ok(None) => {
-                                        tracing::debug!(
-                                            "rust-analyzer not available, native phase_b only"
-                                        )
-                                    }
-                                    Err(e) => tracing::warn!("rust-analyzer failed: {e}"),
                                 }
                                 nodes.sort_unstable_by_key(|n| n.id);
                                 nodes.dedup_by_key(|n| n.id);
@@ -1864,6 +1877,37 @@ mod tests {
         assert_eq!(
             build_roots(root, &files, TSCONFIG),
             vec![root.join("javascript"), root.join("typescript")]
+        );
+    }
+
+    /// yugabyte-db's Rust is two cargo workspaces under
+    /// `src/postgres/third-party-extensions/` with no `Cargo.toml` at the repo
+    /// root, so rust-analyzer handed the root said "no projects" and Rust got
+    /// no cross-file calls. Each outermost cargo directory is a root instead.
+    #[test]
+    fn rust_roots_are_the_outermost_cargo_directories() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for dir in ["ext/pgrx/pgrx-macros/src", "ext/pgrx/src", "ext/gw/src"] {
+            std::fs::create_dir_all(root.join(dir)).expect("mkdir");
+        }
+        for manifest in ["ext/pgrx", "ext/pgrx/pgrx-macros", "ext/gw"] {
+            std::fs::write(root.join(manifest).join("Cargo.toml"), "").expect("write");
+        }
+        let files = vec![
+            "ext/pgrx/pgrx-macros/src/lib.rs".to_string(),
+            "ext/pgrx/src/lib.rs".to_string(),
+            "ext/gw/src/main.rs".to_string(),
+        ];
+        assert_eq!(
+            build_roots(
+                root,
+                &files,
+                crate::phase_b::catalog::build_manifests("rust")
+            ),
+            vec![root.join("ext/gw"), root.join("ext/pgrx")]
         );
     }
 
