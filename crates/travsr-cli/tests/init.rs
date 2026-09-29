@@ -854,6 +854,22 @@ fn init_json_is_one_object_and_never_reads_stdin() {
     assert!(ts["state"].is_string());
     assert!(["installed", "skipped"].contains(&v["search_ranking"].as_str().unwrap()));
     assert_eq!(v["keeping_fresh"], "not_started", "CI is set");
+    assert_eq!(v["next"], "Ready. Ask your AI about this code.");
+
+    // `next` is the line the text summary ends with, so a re-run with nothing
+    // to do says so here too.
+    let again = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("TRAVSR_LANG_TOML", tmp.path().join("lang.toml"))
+        .current_dir(tmp.path())
+        .args(["init", "--json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(v["next"], "Ready. Nothing changed since the last run.");
 }
 
 /// Stops the repo's daemon when dropped, so a failed assert never leaks one.

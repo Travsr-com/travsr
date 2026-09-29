@@ -438,6 +438,15 @@ pub struct InitSummary {
 pub const READY: &str = "Ready. Ask your AI about this code.";
 pub const READY_NO_CHANGE: &str = "Ready. Nothing changed since the last run.";
 
+/// The final line for a run, shared by the text summary and `--json`'s `next`.
+pub fn ready_line(no_op: bool) -> &'static str {
+    if no_op {
+        READY_NO_CHANGE
+    } else {
+        READY
+    }
+}
+
 /// The `init` summary in plain words (plan 3.0, 3.2): one line per stage, the
 /// `Ready` line, then each language that is not ready with its one fix.
 pub fn render_summary(s: &InitSummary) -> Vec<String> {
@@ -542,7 +551,7 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
             );
         }
     }
-    out.push(if s.no_op { READY_NO_CHANGE } else { READY }.to_string());
+    out.push(ready_line(s.no_op).to_string());
     for (lang, r) in &s.languages {
         if let Some(line) = crate::status::readiness_line(lang, r) {
             out.push(line);

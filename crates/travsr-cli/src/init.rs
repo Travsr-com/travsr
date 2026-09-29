@@ -165,6 +165,7 @@ pub fn run(
         }
     };
 
+    let no_op = stats.nodes_written == 0 && stats.edges_written == 0;
     if json {
         // Machine-readable summary on stdout for CI; progress went to stderr.
         // #878: a CI consumer reads this field instead of the human summary, so
@@ -200,12 +201,11 @@ pub fn run(
             .map(|t| serde_json::Value::from(*t))
             .collect();
         summary["interrupted"] = false.into();
-        summary["next"] = crate::progress::READY.into();
+        summary["next"] = crate::progress::ready_line(no_op).into();
         println!("{summary}");
         return Ok(());
     }
 
-    let no_op = stats.nodes_written == 0 && stats.edges_written == 0;
     use crate::progress::{InitSummary, Traced};
     let traced = match (&stats.phase_b_report, keeping_fresh) {
         (Some(_), _) => Traced::Done,
