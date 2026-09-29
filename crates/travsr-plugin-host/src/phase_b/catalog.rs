@@ -640,7 +640,9 @@ pub static CATALOG: &[PhaseBEntry] = &[
             version_fallback: "1.3.13",
             sha256_fn: Some(kls_sha256),
         }),
-        extensions: &[".kt", ".kts"],
+        // Not `.kts`: a repo's only Kotlin is often its Gradle build scripts,
+        // which hold no calls worth minutes of language server time.
+        extensions: &[".kt"],
         wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,

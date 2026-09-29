@@ -2149,6 +2149,21 @@ mod tests {
         assert_eq!(super::detect_languages_in(r), vec!["rust", "java"]);
     }
 
+    /// Gradle build scripts are Kotlin syntax but hold no calls worth tracing:
+    /// a Java repo with `build.gradle.kts` must not set up Kotlin's language
+    /// tools, which spent minutes on yugabyte-db's six scripts for 5 calls.
+    #[test]
+    fn build_scripts_alone_are_not_kotlin() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join(".git")).unwrap();
+        std::fs::write(r.join("build.gradle.kts"), "plugins { java }").unwrap();
+        std::fs::write(r.join("App.java"), "class App {}").unwrap();
+        assert_eq!(super::detect_languages_in(r), vec!["java"]);
+        std::fs::write(r.join("Main.kt"), "fun main() {}").unwrap();
+        assert_eq!(super::detect_languages_in(r), vec!["java", "kotlin"]);
+    }
+
     #[test]
     fn elevated_approvals_survive_a_save_load_round_trip() {
         // #756 review: dropping the field used to rewrite lang.toml without a

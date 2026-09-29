@@ -1701,6 +1701,7 @@ pub fn init_repo_with_progress(
         }
     }
     reclassify_objc_headers(&mut present_languages, &indexable_paths);
+    drop_build_script_only_kotlin(&mut present_languages, &indexable_paths);
 
     // L13: warn if a rebase is in progress — init during rebase risks indexing
     // conflict-marker noise into graph.db; the user should finish rebasing first.
@@ -3721,6 +3722,7 @@ fn collect_present_languages_and_paths(
     }
 
     reclassify_objc_headers(&mut langs, &paths);
+    drop_build_script_only_kotlin(&mut langs, &paths);
 
     (langs, paths)
 }
@@ -3753,6 +3755,19 @@ fn reclassify_objc_headers(langs: &mut std::collections::HashSet<String>, paths:
         if !has_c_source {
             langs.remove(Language::C.as_str());
         }
+    }
+}
+
+/// Kotlin's language tools run only when a `.kt` file exists. `.kts` is
+/// Kotlin syntax, so it is parsed and indexed, but a repo whose only Kotlin is
+/// its Gradle build scripts has no calls there worth a language server's
+/// minutes. Called beside [`reclassify_objc_headers`] by every builder.
+fn drop_build_script_only_kotlin(langs: &mut std::collections::HashSet<String>, paths: &[PathBuf]) {
+    if !paths
+        .iter()
+        .any(|p| p.extension().and_then(|e| e.to_str()) == Some("kt"))
+    {
+        langs.remove(Language::Kotlin.as_str());
     }
 }
 
@@ -6460,6 +6475,22 @@ mod tests {
             !langs.contains("objectivec"),
             "must not enroll objectivec without any .m/.mm, got {langs:?}"
         );
+    }
+
+    // A Gradle build script alone is not Kotlin source: tracing it cost
+    // yugabyte-db minutes for 5 calls. A real .kt file still enrolls kotlin.
+    #[test]
+    fn collect_present_languages_and_paths_ignores_build_script_only_kotlin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("build.gradle.kts"), "plugins { java }\n").unwrap();
+        std::fs::write(dir.path().join("App.java"), "class App {}\n").unwrap();
+        let (langs, paths) = collect_present_languages_and_paths(dir.path());
+        assert!(!langs.contains("kotlin"), "got {langs:?}");
+        assert_eq!(paths.len(), 2, "the script is still indexed: {paths:?}");
+
+        std::fs::write(dir.path().join("Main.kt"), "fun main() {}\n").unwrap();
+        let (langs, _paths) = collect_present_languages_and_paths(dir.path());
+        assert!(langs.contains("kotlin"), "got {langs:?}");
     }
 
     // L5b: a mixed C + Obj-C repo (genuine .c files alongside .m) must enroll
