@@ -1133,6 +1133,11 @@ fn remove_json_server(path: &Path, top_key: &str) -> Result<Outcome> {
     if !removed {
         return Ok(Outcome::Absent);
     }
+    if root == json!({ top_key: {} }) {
+        // Whole file was our server, remove it.
+        std::fs::remove_file(path).ok();
+        return Ok(Outcome::Removed);
+    }
     let pretty = serde_json::to_string_pretty(&root)? + "\n";
     write_atomic(path, &pretty)?;
     Ok(Outcome::Removed)
@@ -1942,6 +1947,30 @@ mod tests {
             remove_json_server(&p, "mcpServers").unwrap(),
             Outcome::Absent
         ));
+    }
+
+    /// A config file that held only travsr's server is travsr's to take back,
+    /// as `remove_block` does for a file that was only our block: leaving
+    /// `{"mcpServers": {}}` behind is clutter the user did not write.
+    #[test]
+    fn remove_json_server_deletes_a_file_left_with_nothing_else() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join(".mcp.json");
+        std::fs::write(&p, r#"{"mcpServers":{"travsr":{"command":"travsr"}}}"#).unwrap();
+        assert!(matches!(
+            remove_json_server(&p, "mcpServers").unwrap(),
+            Outcome::Removed
+        ));
+        assert!(!p.exists(), "an emptied config must be deleted");
+
+        // Any other content, even a top-level key, keeps the file.
+        std::fs::write(
+            &p,
+            r#"{"inputs":[],"mcpServers":{"travsr":{"command":"travsr"}}}"#,
+        )
+        .unwrap();
+        remove_json_server(&p, "mcpServers").unwrap();
+        assert!(p.exists(), "a file with the user's own keys stays");
     }
 
     #[test]
