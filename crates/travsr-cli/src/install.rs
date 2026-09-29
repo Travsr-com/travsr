@@ -10,8 +10,8 @@ use anyhow::{bail, Context as _, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use travsr_plugin_host::sidecar_version::{
-    below_floor_message, floor_status, unreadable_message, write_cached_latest, FloorStatus,
-    SidecarSpec,
+    below_floor_message, floor_status, read_cached_latest, unreadable_message, write_cached_latest,
+    FloorStatus, SidecarSpec,
 };
 
 const RELEASES_BASE_ENV: &str = "TRAVSR_LANG_RELEASES_BASE";
@@ -268,10 +268,11 @@ pub async fn fetch_latest_version_for_repo(repo: &str) -> Result<String> {
 ///   floor, print a WARN with the reinstall remedy. The *hard* refuse stays at
 ///   spawn/reindex (Point A) - init only warns, so the user is left in a
 ///   runnable state and the fix is one command away.
-/// - **Leg 2 (network).** Fetch the latest release on every call; if it is newer
-///   than what is installed, print an advisory. Offline -> silent. The fetched
-///   tag is written to `~/.travsr/.sidecar-latest.json` so the daemon can
-///   re-surface staleness without ever fetching (local-first).
+/// - **Leg 2 (network).** Fetch the latest release unless one fetched in the
+///   last day is cached; if it is newer than what is installed, print an
+///   advisory. Offline -> silent. The fetched tag is written to
+///   `~/.travsr/.sidecar-latest.json`, which the daemon and `status --verbose`
+///   read to re-surface staleness without ever fetching (local-first).
 ///
 /// `reinstall_remedy` is the exact command surfaced to the user, e.g.
 /// `"travsr embed init --reinstall"`.
@@ -311,12 +312,14 @@ pub fn advise_installed_sidecar(spec: &dyn SidecarSpec, bin_path: &Path, reinsta
         return;
     }
     let repo = spec.github_repo().to_string();
-    let Ok(latest_tag) =
-        crate::lang::run_async(async move { fetch_latest_version_for_repo(&repo).await })
-    else {
+    let Some((latest, fetched)) = latest_release(read_cached_latest(install_name), || {
+        crate::lang::run_async(async move { fetch_latest_version_for_repo(&repo).await }).ok()
+    }) else {
         return; // offline / fetch failed -> silent, never fails the command
     };
-    write_cached_latest(install_name, &latest_tag);
+    if let Some(tag) = fetched {
+        write_cached_latest(install_name, &tag);
+    }
 
     // Reuse the version already read by the floor probe above; only the states
     // that carry a readable version can be compared against `latest`.
@@ -327,12 +330,22 @@ pub fn advise_installed_sidecar(spec: &dyn SidecarSpec, bin_path: &Path, reinsta
         | FloorStatus::UnreadableNoFloor
         | FloorStatus::ProbeTimeout { .. } => return,
     };
-    let Some(latest) = travsr_plugin_host::Semver::parse(&latest_tag) else {
-        return;
-    };
     if latest > installed {
         eprintln!("  newer {install_name} v{latest} available - run: {reinstall_remedy}");
     }
+}
+
+/// Leg 2's comparison target: the cached latest release while it is fresh,
+/// with no network, else a fetch whose tag is returned so the caller caches it.
+fn latest_release(
+    cached: Option<travsr_plugin_host::Semver>,
+    fetch: impl FnOnce() -> Option<String>,
+) -> Option<(travsr_plugin_host::Semver, Option<String>)> {
+    if let Some(v) = cached {
+        return Some((v, None));
+    }
+    let tag = fetch()?;
+    Some((travsr_plugin_host::Semver::parse(&tag)?, Some(tag)))
 }
 
 /// Fetches the latest version tag for the travsr-lang releases.
@@ -1004,6 +1017,26 @@ fn parse_sha256_line(line: &str) -> Result<String> {
 mod tests {
     use super::*;
     use travsr_plugin_host::phase_b::platform::WRAPPER_RELEASE_TARGETS;
+
+    /// A second repo's `init` found the tool installed and still asked GitHub
+    /// for its latest release, although the answer from minutes before was
+    /// cached. A fresh cached answer must not reach for the network.
+    #[test]
+    fn a_fresh_cached_latest_skips_the_fetch() {
+        let cached = travsr_plugin_host::Semver::parse("0.4.7");
+        let (latest, fetched) =
+            latest_release(cached, || panic!("must not fetch")).expect("cached");
+        assert_eq!(Some(latest), cached);
+        assert_eq!(fetched, None);
+
+        let (latest, fetched) = latest_release(None, || Some("v0.4.8".into())).unwrap();
+        assert_eq!(Some(latest), travsr_plugin_host::Semver::parse("0.4.8"));
+        assert_eq!(fetched.as_deref(), Some("v0.4.8"), "a fetch is cached");
+        assert!(
+            latest_release(None, || None).is_none(),
+            "offline stays silent"
+        );
+    }
 
     // ── #506: replace_file — displace-aside self-update dance ──────────────
 
