@@ -238,11 +238,6 @@ pub fn run(
         ghosts_pruned: stats.ghosts_pruned,
         ghost_prune_aborted: stats.ghost_prune_aborted,
         languages: readiness_of(&repo_root, &corpus, &languages, &stored_warnings(&db_path)),
-        diagnostics: stats
-            .phase_b_report
-            .as_ref()
-            .map(crate::progress::analyzer_words)
-            .unwrap_or_default(),
         embed_optional: travsr_plugin_host::repo_backend_id(&repo_root).is_none(),
         no_commit: travsr_store::SqliteStore::open(&db_path)
             .ok()

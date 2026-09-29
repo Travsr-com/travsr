@@ -425,8 +425,6 @@ pub struct InitSummary {
     pub ghosts_pruned: u64,
     pub ghost_prune_aborted: bool,
     pub languages: Vec<(String, travsr_plugin_host::phase_b::status::Readiness)>,
-    /// What analyzers said themselves (#904, #878), shown as they said it.
-    pub diagnostics: Vec<String>,
     /// This repo has not turned on meaning-based search (decision 3: optional).
     pub embed_optional: bool,
     /// The repo has no commit yet, so freshness has no baseline (DEBT-013).
@@ -566,29 +564,6 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
                 crate::connect::display_name(id)
             ));
         }
-    }
-    out.extend(s.diagnostics.iter().cloned());
-    out
-}
-
-/// What the analyzers said about this run in their own words (#904, #878),
-/// plus the macOS Java hint: the user's next step when the plain readiness line
-/// alone would leave them guessing.
-pub fn analyzer_words(report: &travsr_daemon::PhaseBReport) -> Vec<String> {
-    let mut out = Vec::new();
-    if report.produced_no_nodes.iter().any(|l| l == "java") {
-        if let Some(hint) = macos_java_bash_hint() {
-            out.push(format!("    {hint}"));
-        }
-    }
-    for d in &report.diagnostics {
-        out.push(format!(
-            "  ! {} analysis: {} [{}]",
-            d.lang, d.message, d.code
-        ));
-    }
-    for skip in &report.lsif_skipped {
-        out.push(format!("  ! {}: {}", skip.language, skip.detail));
     }
     out
 }
@@ -875,7 +850,6 @@ mod tests {
                     },
                 ),
             ],
-            diagnostics: vec![],
             embed_optional: true,
             no_commit: false,
             quiet: false,
