@@ -203,7 +203,12 @@ pub fn build_sandboxed_command(
     // scip-go) are on PATH inside the sandbox.
     if let Ok(home) = std::env::var("HOME") {
         let travsr_bin = format!("{home}/.travsr/bin");
-        let base = std::env::var("PATH").unwrap_or_default();
+        let base = tc
+            .env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
         cmd.env("PATH", format!("{travsr_bin}:{base}"));
     }
     Ok(SandboxedSpawn::Wrapped(cmd))
