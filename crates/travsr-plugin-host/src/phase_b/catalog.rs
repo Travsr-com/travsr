@@ -71,6 +71,9 @@ pub struct ScipBinarySpec {
     pub windows_pin: Option<&'static str>,
     /// Run this instead where `asset_fn` has no binary for the platform.
     pub fallback_command: Option<&'static [&'static str]>,
+    /// The oldest Go (major, minor) that builds the fallback. An older Go
+    /// fails it, so the language needs a newer Go rather than a re-run.
+    pub fallback_min_go: Option<(u32, u32)>,
 }
 
 /// Specifies a zip archive on GitHub Releases that must be extracted rather than
@@ -533,6 +536,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
                 "install",
                 "github.com/scip-code/scip-go/cmd/scip-go@latest",
             ]),
+            // scip-go v0.2.7's go.mod: `requires go >= 1.25.0`.
+            fallback_min_go: Some((1, 25)),
         }),
         extensions: &[".go"],
         wrapper_version_fallback: "v0.6.0",
@@ -600,6 +605,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             // needs 0.12.x. Pin it on Windows; mac/linux keep tracking latest.
             windows_pin: Some("v0.12.3"),
             fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".java"],
         wrapper_version_fallback: "v0.6.0",
@@ -706,6 +712,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             sha256_fn: Some(scip_ruby_sha256),
             windows_pin: None,
             fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".rb"],
         wrapper_version_fallback: "v0.6.0",
@@ -801,6 +808,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             sha256_fn: Some(scip_clang_sha256),
             windows_pin: None,
             fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
         wrapper_version_fallback: "v0.6.0",
@@ -836,6 +844,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             sha256_fn: Some(scip_clang_sha256),
             windows_pin: None,
             fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".c", ".h"],
         wrapper_version_fallback: "v0.6.0",
@@ -866,6 +875,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             sha256_fn: None,
             windows_pin: None,
             fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".swift"],
         wrapper_version_fallback: "v0.6.0",
@@ -896,6 +906,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             sha256_fn: None,
             windows_pin: None,
             fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".m", ".mm"],
         wrapper_version_fallback: "v0.6.0",
@@ -933,6 +944,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             sha256_fn: None,
             windows_pin: None,
             fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".dart"],
         wrapper_version_fallback: "v0.6.0",

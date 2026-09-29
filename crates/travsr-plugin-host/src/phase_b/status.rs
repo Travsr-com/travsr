@@ -244,6 +244,9 @@ pub struct RepoCapability<'a> {
     /// A tool the user must install that is absent: the analyzer's runtime,
     /// the command its install runs, or the project's compile_commands.json.
     pub driver_missing: Option<String>,
+    /// The analyzer must be built here and the installed Go is older than the
+    /// build needs, so `travsr init` cannot finish setting it up.
+    pub driver_too_old: bool,
     pub registered: bool,
     pub corpus_trusted: bool,
     pub analyzer_ready: bool,
@@ -266,6 +269,11 @@ pub fn readiness(c: &RepoCapability) -> Readiness {
         };
         return Readiness::NeedsToolchain {
             needs: needs.to_string(),
+        };
+    }
+    if c.driver_too_old {
+        return Readiness::NeedsToolchain {
+            needs: format!("a newer {prerequisites}"),
         };
     }
     // A bundled emitter that could not be found or started ships with travsr,
@@ -402,15 +410,42 @@ pub fn gather<'a>(
             (entry.command == "scip-clang" && !repo_root.join("compile_commands.json").exists())
                 .then(|| "compile_commands.json".to_string())
         });
+    let driver_too_old = match entry.scip_install {
+        super::catalog::ScipInstall::GithubBinary(ref spec) if !analyzer_ready => {
+            spec.fallback_min_go.is_some_and(|min| {
+                let prebuilt = super::platform::current_target()
+                    .is_some_and(|t| (spec.asset_fn)(spec.version_fallback, t).is_some());
+                !prebuilt && installed_go().is_some_and(|go| go < min)
+            })
+        }
+        _ => false,
+    };
     RepoCapability {
         entry,
         unsupported_on: super::platform::unsupported_reason(entry),
         driver_missing,
+        driver_too_old,
         registered: lang_toml.registered.iter().any(|r| r == entry.language),
         corpus_trusted: lang_toml.trusted_corpora.contains(corpus),
         analyzer_ready,
         last_warning: warning_class(warnings, entry.language),
     }
+}
+
+/// The installed Go as (major, minor), or `None` when there is no `go`.
+fn installed_go() -> Option<(u32, u32)> {
+    let out = std::process::Command::new("go")
+        .arg("version")
+        .output()
+        .ok()?;
+    parse_go_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `go version go1.23.4 darwin/amd64` -> `(1, 23)`.
+fn parse_go_version(text: &str) -> Option<(u32, u32)> {
+    let ver = text.split_whitespace().nth(2)?.strip_prefix("go")?;
+    let mut parts = ver.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
 /// Whether `entry`'s analyzer is on this machine: a bundled one with its Node
@@ -603,11 +638,25 @@ mod tests {
             entry: lookup(lang).expect("known language"),
             unsupported_on: None,
             driver_missing: None,
+            driver_too_old: false,
             registered: true,
             corpus_trusted: true,
             analyzer_ready: true,
             last_warning: None,
         }
+    }
+
+    #[test]
+    fn go_version_reads_major_and_minor() {
+        assert_eq!(
+            parse_go_version("go version go1.23.4 darwin/amd64"),
+            Some((1, 23))
+        );
+        assert_eq!(
+            parse_go_version("go version go1.25 windows/amd64"),
+            Some((1, 25))
+        );
+        assert_eq!(parse_go_version("go version devel +abc"), None);
     }
 
     #[test]
@@ -634,6 +683,18 @@ mod tests {
                     ..repo("go")
                 },
                 needs("Go toolchain"),
+            ),
+            (
+                // macOS Intel / Windows build scip-go with `go install`, which
+                // needs a newer Go than 1.23: without this it read "setting up.
+                // Run travsr init" after every run.
+                "a driver too old to build the analyzer",
+                RepoCapability {
+                    driver_too_old: true,
+                    analyzer_ready: false,
+                    ..repo("go")
+                },
+                needs("a newer Go toolchain"),
             ),
             (
                 "prerequisite 'none' falls back to the driver name",
