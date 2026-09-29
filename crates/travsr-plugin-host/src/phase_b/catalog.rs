@@ -224,7 +224,8 @@ pub fn rust_analyzer_asset(_tag: &str, target: &str) -> Option<String> {
 }
 
 /// Vendored sha256 of each rust-analyzer asset for the pinned release. Fetched
-/// over TLS on 2026-08-17 from rust-lang/rust-analyzer, which publishes no
+/// over TLS on 2026-08-17 and re-checked on 2026-09-29 against the plain weekly
+/// tag (same bytes as the deleted `.3` respin) from rust-lang/rust-analyzer, which publishes no
 /// `.sha256` sidecar — pinning + a vendored hash is the only fixity check
 /// available. A hash is only ever returned for the tag `version_fallback` points
 /// at; a different tag returns `None`, so the checksum can never be applied to
@@ -233,19 +234,19 @@ pub fn rust_analyzer_asset(_tag: &str, target: &str) -> Option<String> {
 /// than downloading unverified.
 pub fn rust_analyzer_sha256(tag: &str, target: &str) -> Option<&'static str> {
     match (tag, target) {
-        ("2026-08-17.3", "aarch64-apple-darwin") => {
+        ("2026-08-17", "aarch64-apple-darwin") => {
             Some("ece932daf2f077be87bf745d2eb0a62cbc550f4b1e2e31ca76dfafdd0cc599b3")
         }
-        ("2026-08-17.3", "x86_64-apple-darwin") => {
+        ("2026-08-17", "x86_64-apple-darwin") => {
             Some("134a7d305991de776864e43d1e6c291f60fa2888d4b9b7749864c562c5dc28b7")
         }
-        ("2026-08-17.3", "x86_64-unknown-linux-gnu") => {
+        ("2026-08-17", "x86_64-unknown-linux-gnu") => {
             Some("a559eaa29920e4c12718fba101f2055f1da0ad8bc458ef9dc1a670778cc66901")
         }
-        ("2026-08-17.3", "aarch64-unknown-linux-gnu") => {
+        ("2026-08-17", "aarch64-unknown-linux-gnu") => {
             Some("941ad31c4256eec3c8457257b0fcfb696d2b4f80c0e5a996f7375a92130c2447")
         }
-        ("2026-08-17.3", "x86_64-pc-windows-msvc") => {
+        ("2026-08-17", "x86_64-pc-windows-msvc") => {
             Some("3212cc9e7ab3f6b07f97be681c2a7200f73fb0463e6f8055c214ebe0b00901f2")
         }
         _ => None,
@@ -477,7 +478,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
                 repo: "rust-lang/rust-analyzer",
                 asset_fn: rust_analyzer_asset,
                 install_name: "rust-analyzer",
-                version_fallback: "2026-08-17.3",
+                version_fallback: "2026-08-17",
                 sha256_fn: rust_analyzer_sha256,
             },
         ),
@@ -1073,6 +1074,29 @@ mod vendored_hash_tests {
             ScipInstall::GithubBinary(spec) => Some(spec),
             _ => None,
         }
+    }
+
+    /// rust-lang/rust-analyzer deletes superseded respins: the pinned
+    /// `2026-08-17.3` vanished once `.4` shipped, so the direct download 404'd
+    /// on every machine without rustup. The plain weekly tag carries the same
+    /// bytes and stays, so the pin must be one, with a hash for it.
+    #[test]
+    fn rust_analyzer_pin_is_a_weekly_tag_with_a_hash() {
+        let rust = CATALOG.iter().find(|e| e.language == "rust").unwrap();
+        let ScipInstall::CommandThenGithubGz(_, spec) = &rust.scip_install else {
+            panic!("rust downloads rust-analyzer as a fallback");
+        };
+        let tag = spec.version_fallback;
+        let weekly = tag.len() == 10
+            && tag.chars().enumerate().all(|(i, c)| {
+                if i == 4 || i == 7 {
+                    c == '-'
+                } else {
+                    c.is_ascii_digit()
+                }
+            });
+        assert!(weekly, "{tag} is not a plain YYYY-MM-DD tag");
+        assert!(super::rust_analyzer_sha256(tag, "aarch64-apple-darwin").is_some());
     }
 
     /// #410 M2: a vendored hash is only meaningful against one exact asset, so
