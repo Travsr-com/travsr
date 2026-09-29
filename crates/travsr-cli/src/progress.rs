@@ -478,7 +478,13 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
             stage("Keeping it fresh on every commit".to_string());
         }
         if !s.connected.tools.is_empty() {
-            stage(format!("Connected to {}", s.connected.tools.join(", ")));
+            let names: Vec<&str> = s
+                .connected
+                .tools
+                .iter()
+                .map(|id| crate::connect::display_name(id))
+                .collect();
+            stage(format!("Connected to {}", names.join(", ")));
         }
         if s.ranking == "failed" {
             out.push(
@@ -831,7 +837,7 @@ mod tests {
             traced: Traced::Done,
             keeping_fresh: "started",
             connected: crate::connect::Connected {
-                tools: vec!["Claude Code", "Cursor"],
+                tools: vec!["claude-code", "cursor"],
                 needs_approval: true,
                 user_files: vec![".gitignore".into()],
             },

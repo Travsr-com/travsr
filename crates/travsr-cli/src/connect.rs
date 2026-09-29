@@ -49,13 +49,22 @@ pub enum Report {
 /// What a connect run did, for `travsr init`'s one-line summary (plan 3.2).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Connected {
-    /// Tools whose server config ended the run in place, by display name.
+    /// Tools whose server config ended the run in place, by stable id
+    /// (`claude-code`), the tag `--json` reports; see [`display_name`].
     pub tools: Vec<&'static str>,
     /// Claude Code was wired and still asks once to trust the project (#829).
     pub needs_approval: bool,
     /// Files the user owns that this run changed (RFC-026: such writes stay
     /// visible), repo-relative.
     pub user_files: Vec<String>,
+}
+
+/// The name the user knows a tool by, from its stable id (`claude-code`).
+pub fn display_name(id: &str) -> &'static str {
+    Tool::ALL
+        .iter()
+        .find(|t| t.id() == id)
+        .map_or("an AI tool", Tool::display)
 }
 
 /// Options controlling a connect run. `auto()` is the zero-config path used by
@@ -1620,7 +1629,7 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<Connected> {
                     // there is nothing to approve and the hint would send the
                     // user at the wrong fix.
                     if wired {
-                        connected.tools.push(tool.display());
+                        connected.tools.push(tool.id());
                         if let Some(hint) = tool.approval_hint() {
                             connected.needs_approval = true;
                             say!("{hint}");
