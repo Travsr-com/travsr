@@ -320,13 +320,21 @@ const PENDING_FILE_CAP: usize = 64;
 /// drawn from, not of any one file in it.
 fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
     let live = store.count_edges_with_provenance("live").ok().unwrap_or(0);
-    let pending: u64 = store
-        .pending_ref_counts_by_file(PENDING_FILE_CAP)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(path, _)| answer.contains(path.as_str()))
-        .map(|(_, n)| n)
-        .sum();
+    // With calls traced at HEAD, what stays pending is a call no commit resolves
+    // (`Vec::new`, `join`); only an edit since then makes the note true. Same
+    // gate as `travsr status`.
+    let dirty = store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1");
+    let pending: u64 = if dirty {
+        store
+            .pending_ref_counts_by_file(PENDING_FILE_CAP)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(path, _)| answer.contains(path.as_str()))
+            .map(|(_, n)| n)
+            .sum()
+    } else {
+        0
+    };
     if live == 0 && pending == 0 {
         return None;
     }
@@ -16331,6 +16339,14 @@ mod snippet_tests {
             )
             .unwrap();
 
+        // Calls are traced at HEAD: what is still pending is a call no commit
+        // resolves (`Vec::new`), so "the next commit confirms them" is false.
+        assert!(
+            live_overlay_note(&store, "callers in a.ts:3").is_none(),
+            "no pending note while no edit awaits tracing"
+        );
+
+        store.set_meta("phase_b_dirty", "1").unwrap();
         let note = live_overlay_note(&store, "callers in a.ts:3")
             .expect("a pending reference must be announced");
         assert!(
