@@ -229,6 +229,14 @@ pub fn run(
             return Ok(());
         }
     }
+    if payload.fuzzy {
+        if let Some(seed) = &payload.seed {
+            eprintln!(
+                "no exact match for '{query_str}', showing the closest: {} ({})",
+                seed.label, seed.path
+            );
+        }
+    }
 
     // C3: a manifest/config file has no inbound edges — no source file depends on
     // a manifest, so `--direction callers` is legitimately empty. Explain that
@@ -760,6 +768,7 @@ mod tests {
             coverage: None,
             last_commit: None,
             candidates: None,
+            fuzzy: false,
         };
         let labels = tree_labels(&payload);
         assert_eq!(labels[&1], "fn:run (method) src/init.rs:3");
@@ -803,6 +812,7 @@ mod tests {
             coverage: None,
             last_commit: None,
             candidates: None,
+            fuzzy: false,
         };
 
         let out = build_graph_json(&payload, 0, 0).unwrap();

@@ -163,6 +163,9 @@ pub struct GraphPayload {
     /// Ambiguous candidates, if the query resolves to multiple definitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<NodeEntry>>,
+    /// No definition has the queried name: `seed` is the closest name match.
+    #[serde(default)]
+    pub fuzzy: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -920,6 +923,7 @@ fn coverage_for(store: &SqliteStore, language: &str) -> Coverage {
 /// discovery order; `tree` holds the spanning-tree expansion steps.
 pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result<GraphPayload> {
     let mut candidates: Option<Vec<NodeEntry>> = None;
+    let mut fuzzy = false;
     let seed =
         match crate::tools::resolve_reference_targets(store, &args.query, args.path.as_deref()) {
             crate::tools::RefTarget::Unique(n) => Some(n),
@@ -970,6 +974,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                     // is a precise miss, not an invitation to guess a first hit.
                     _ => {
                         if args.path.is_none() {
+                            fuzzy = !matches.is_empty();
                             matches
                                 .iter()
                                 .find(|n| n.kind == "file")
@@ -992,6 +997,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             coverage: None,
             last_commit: store.get_meta("last_commit").ok().flatten(),
             candidates,
+            fuzzy: false,
         });
     };
 
@@ -1073,6 +1079,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
         coverage: Some(coverage),
         last_commit: store.get_meta("last_commit")?,
         candidates,
+        fuzzy,
     })
 }
 
@@ -1104,6 +1111,7 @@ pub fn graph_all_payload(store: &SqliteStore) -> anyhow::Result<GraphPayload> {
         coverage: None,
         last_commit: store.get_meta("last_commit")?,
         candidates: None,
+        fuzzy: false,
     })
 }
 
@@ -1314,6 +1322,28 @@ mod tests {
         let before = payload.nodes.len();
         assert_eq!(apply_token_budget(&mut payload, 0), 0);
         assert_eq!(payload.nodes.len(), before);
+    }
+
+    /// `travsr graph run_phase_b` rooted itself on a test named
+    /// `..._does_not_run_phase_b` without saying the name did not match. The
+    /// payload flags a guess so the caller can say so.
+    #[test]
+    fn a_graph_rooted_on_a_guess_says_so() {
+        let (store, _, _, _) = seeded_store();
+        let args = |query: &str| GraphQueryArgs {
+            query: query.to_string(),
+            path: None,
+            depth: 1,
+            direction: QueryDirection::Both,
+            edge_mode: QueryEdgeMode::All,
+            include_noise: true,
+        };
+        assert!(!graph_query(&store, &args("PaymentService")).unwrap().fuzzy);
+        let guess = graph_query(&store, &args("PaymentServ")).unwrap();
+        assert!(
+            guess.seed.is_some() && guess.fuzzy,
+            "a partial name is a guess"
+        );
     }
 
     // ── #564: every direction mode must preserve true edge orientation ───────
