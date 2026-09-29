@@ -48,13 +48,18 @@ fn may_report_zero_occurrences(lang: &str) -> bool {
 /// Classify one language's Phase B result. Split out so it can be tested
 /// directly: the behaviour this adds had no assertion, only the helper it calls
 /// did (#752 review).
+///
+/// A native analyzer (see [`may_report_zero_occurrences`]) is never flagged: it
+/// emits no definitions of its own and extracts call sites in-process, so an
+/// empty result there means the files have no calls. A broken type-checked pass
+/// still leaves those call sites and is reported by its own `emitter_*` class.
 fn classify_empty_output(lang: &str, nodes_empty: bool, no_occurrences: bool) -> EmptyOutput {
-    if nodes_empty && no_occurrences {
-        EmptyOutput::NoNodes
-    } else if no_occurrences && !may_report_zero_occurrences(lang) {
-        EmptyOutput::NoReferences
-    } else {
+    if may_report_zero_occurrences(lang) || !no_occurrences {
         EmptyOutput::Fine
+    } else if nodes_empty {
+        EmptyOutput::NoNodes
+    } else {
+        EmptyOutput::NoReferences
     }
 }
 
@@ -1685,15 +1690,21 @@ mod tests {
     fn an_empty_result_is_classified_by_what_the_analyzer_could_have_produced() {
         use super::{classify_empty_output, EmptyOutput};
 
-        // #712, unchanged: nothing at all, from anyone.
+        // #712: nothing at all from an analyzer that emits its own definitions.
         assert_eq!(
             classify_empty_output("java", true, true),
             EmptyOutput::NoNodes
         );
-        assert_eq!(
-            classify_empty_output("rust", true, true),
-            EmptyOutput::NoNodes
-        );
+        // A native analyzer never emits definitions and extracts call sites
+        // in-process, so nothing at all means the files have no calls. A repo
+        // like that was told its calls could not be traced.
+        for native in ["rust", "typescript", "javascript", "python"] {
+            assert_eq!(
+                classify_empty_output(native, true, true),
+                EmptyOutput::Fine,
+                "{native}: no calls is not a failure"
+            );
+        }
 
         // #724: definitions and no occurrences, from an analyzer that cannot
         // legitimately return that. This is scip-java's shape.
