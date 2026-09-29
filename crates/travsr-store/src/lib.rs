@@ -10402,8 +10402,16 @@ impl Store for SqliteStore {
                 ],
             )
             .context("inserting node")?;
-            Self::put_node_fts(&tx, node).context("put_node_fts")?;
-            Self::put_node_fts_words(&tx, node).context("put_node_fts_words")?;
+            if self.staging_active {
+                // Bulk init: the node's FTS row may exist only as a map row, which
+                // `put_node_fts` cannot retract. Defer it like the batch path does.
+                Self::put_node_fts_map_only(&tx, node).context("put_node_fts_map_only")?;
+                Self::put_node_fts_words_map_only(&tx, node)
+                    .context("put_node_fts_words_map_only")?;
+            } else {
+                Self::put_node_fts(&tx, node).context("put_node_fts")?;
+                Self::put_node_fts_words(&tx, node).context("put_node_fts_words")?;
+            }
             tx.commit().context("committing put_node transaction")?;
             Ok(())
         })()
@@ -16736,6 +16744,47 @@ mod tests {
                 .iter()
                 .any(|n| n.vname.signature.contains("Auth")),
             "bulk FTS must find AuthService"
+        );
+    }
+
+    /// The Cargo workspace dependency pass writes its nodes with `put_node`
+    /// while `travsr init` is still in bulk mode, after the manifests that
+    /// name the same dependency nodes went through the bulk path. Every one of
+    /// them failed (65 on yugabyte-db) and was dropped from the index.
+    #[test]
+    fn put_node_during_bulk_init_writes_a_node_the_bulk_path_already_wrote() {
+        let corpus = "ws-dep-test";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.begin_bulk_fts_tracking().unwrap();
+        store.begin_staging_tables().unwrap();
+
+        let dep = Node::new(
+            VName::new(corpus, "", "a/Cargo.toml", "toml", "dep:serde"),
+            "dependency",
+        );
+        let batch = vec![FileGraph {
+            vname_path: "a/Cargo.toml".into(),
+            new_hash: "aaa".into(),
+            nodes: vec![dep.clone()],
+            edges: vec![],
+            source: None,
+        }];
+        store.write_file_graphs_batch(&batch, true).unwrap();
+
+        store
+            .put_node(&dep)
+            .expect("the dependency node must be written");
+
+        store.flush_staging_to_production().unwrap();
+        store.rebuild_fts_from_map().unwrap();
+        assert!(store.get_node(dep.id).unwrap().is_some());
+        assert!(
+            store
+                .search_nodes_fuzzy("serde")
+                .unwrap()
+                .iter()
+                .any(|n| n.id == dep.id),
+            "the dependency node must be searchable"
         );
     }
 
