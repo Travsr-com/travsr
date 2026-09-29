@@ -419,7 +419,7 @@ fn typescript_constructs_resolve_end_to_end() {
                 symbol: "describe",
                 site: "main.ts:8",
                 construct: "inherited method on an abstract class",
-                gap: Some("call is on a subclass instance; the method is defined on the base"),
+                gap: None,
             },
             Probe {
                 symbol: "firstOf",

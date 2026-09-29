@@ -490,3 +490,78 @@ fn a_relocated_binary_uses_the_bundled_emitter() {
         warnings(repo.path())
     );
 }
+
+/// A call is made by a function, never by a file. The TypeScript compiler pass
+/// used to also write `file -> callee` edges beside the function-level ones,
+/// so every callee listed its own file as an extra caller.
+#[test]
+fn no_call_edge_starts_at_a_file() {
+    let Some(emitter) = bundled_emitter().filter(|_| node_available()) else {
+        eprintln!("SKIP: node or the built emitter not available");
+        return;
+    };
+    let repo = seed_ts_repo();
+    let bin = in_place_binary();
+    let out = init_semantic(
+        &bin,
+        repo.path(),
+        &[("TRAVSR_LSIF_TS", emitter.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let conn = rusqlite::Connection::open(db(repo.path())).unwrap();
+    let from_file: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id = e.src \
+             WHERE e.kind = 'ref/call' AND n.kind = 'file'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(from_file, 0, "ref/call edges from a file node");
+    assert!(!has_emitter_warning(&warnings(repo.path())));
+}
+
+/// Without a tsconfig, TypeScript files still get the compiler's cross-file
+/// resolution, the way plain JavaScript already does (#833).
+#[test]
+fn typescript_without_a_tsconfig_is_still_resolved_by_the_compiler() {
+    let Some(emitter) = bundled_emitter().filter(|_| node_available()) else {
+        eprintln!("SKIP: node or the built emitter not available");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/a.ts"),
+        "export function helper(): number { return 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/b.ts"),
+        "import { helper } from './a'\nexport function main(): number { return helper() }\n",
+    )
+    .unwrap();
+    git(root, &["-c", "init.defaultBranch=main", "init", "-q"]);
+    git(root, &["config", "user.email", "qa@travsr.test"]);
+    git(root, &["config", "user.name", "QA Bot"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "seed"]);
+    let out = init_semantic(
+        &in_place_binary(),
+        root,
+        &[("TRAVSR_LSIF_TS", emitter.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let conn = rusqlite::Connection::open(db(root)).unwrap();
+    let resolved: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst \
+             WHERE e.kind = 'ref/call' AND e.provenance = 'scip' \
+             AND s.signature = 'fn:main' AND d.signature = 'fn:helper'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(resolved, 1, "main -> helper resolved by the compiler");
+}

@@ -998,16 +998,23 @@ impl PluginIndexer {
                                                 Err(e) => tracing::warn!("ts lsif ingest: {e}"),
                                             }
                                         }
-                                        // #878: only a failure to *start* the emitter
-                                        // is "not available" (the daemon's own LSIF
-                                        // pass records that skip in the outcome). An
-                                        // emitter that ran and failed is a real fault
-                                        // and must be visible at default verbosity,
-                                        // matching the JS pass below.
-                                        Err(e) if travsr_indexer::emitter_missing(&e) => {
-                                            tracing::debug!("ts lsif emitter not available: {e}")
+                                        // #878: a failure to *start* the emitter and
+                                        // one that ran and failed have different
+                                        // fixes, so they are recorded apart; the
+                                        // daemon turns both into the disclosed skip.
+                                        Err(e) => {
+                                            let missing = travsr_indexer::emitter_missing(&e);
+                                            if missing {
+                                                tracing::debug!("ts lsif emitter not available: {e}");
+                                            } else {
+                                                tracing::warn!("ts lsif emitter failed: {e:#}");
+                                            }
+                                            travsr_indexer::sandbox::record_lsif_emitter_skip(
+                                                "typescript",
+                                                missing,
+                                                format!("{e:#}"),
+                                            );
                                         }
-                                        Err(e) => tracing::warn!("ts lsif emitter failed: {e:#}"),
                                     }
                                 }
 
@@ -1019,8 +1026,10 @@ impl PluginIndexer {
                                 // Run a second pass over a synthesized allowJs
                                 // tsconfig covering exactly this repo's JS files so
                                 // they get real cross-file semantic refs instead of
-                                // only tree-sitter heuristics. The pass is a no-op
-                                // when there are no JS files (pure-TS repos), and
+                                // only tree-sitter heuristics. With no project
+                                // tsconfig at all, the TypeScript files join the
+                                // same pass, or they would get no compiler pass.
+                                // It is a no-op when nothing is left to cover, and
                                 // its writes are idempotent where a real allowJs
                                 // tsconfig already covered them.
                                 //
@@ -1037,6 +1046,9 @@ impl PluginIndexer {
                                                 .and_then(|e| e.to_str())
                                                 .is_some_and(|e| {
                                                     travsr_indexer::JS_EXTENSIONS.contains(&e)
+                                                        || (ts_roots.is_empty()
+                                                            && ["ts", "tsx", "mts", "cts"]
+                                                                .contains(&e))
                                                 })
                                         })
                                         .map(|r| repo_root.join(r))

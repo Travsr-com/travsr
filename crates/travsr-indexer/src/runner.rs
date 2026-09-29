@@ -382,8 +382,8 @@ fn run_lsif_emitter_impl(tsconfig: &Path, root: Option<&Path>) -> anyhow::Result
 }
 
 /// File extensions treated as JavaScript for the synthesized-tsconfig pass.
-/// TypeScript (`ts`/`tsx`/`mts`/`cts`) is already covered by a project tsconfig
-/// when one exists, so only these are swept into the JS fallback.
+/// TypeScript (`ts`/`tsx`/`mts`/`cts`) is covered by a project tsconfig when one
+/// exists; the caller adds it to this pass only when none does.
 pub const JS_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs"];
 
 /// Write an ephemeral `tsconfig.json` into a fresh temp dir that makes the
