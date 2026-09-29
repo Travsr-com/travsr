@@ -6,6 +6,7 @@ import {
   contractSkewMessage,
   buildLanguageRows,
   parseRepoLanguages,
+  shouldOfferSetup,
 } from "../../commands";
 import {
   buildStatsHtml,
@@ -456,5 +457,59 @@ suite("Health Languages: installed on this machine versus enabled for this repo"
     );
     assert.strictEqual(r.flagged, true);
     assert.strictEqual(r.fix, "semantic");
+  });
+});
+
+suite("one-command setup: rows render the CLI's readiness state (plan 3.5)", () => {
+  const withState = (state: string, extra: Record<string, unknown> = {}): LangInfo =>
+    ({ ...CURRENT_ROW, state, ...extra }) as unknown as LangInfo;
+
+  test("a language init can finish offers one action, Set up again", () => {
+    for (const [state, extra] of [
+      ["setting_up", { fix: "Run `travsr init` to finish tracing calls." }],
+      ["needs_toolchain", { needs: "Go toolchain", fix: "Install Go toolchain, then run `travsr init`." }],
+      ["failed", { fix: "See `travsr status --verbose`." }],
+    ] as const) {
+      const [row] = buildLanguageRows([withState(state, extra)], []);
+      assert.strictEqual(row.fix, "setup", state);
+      const html = healthWith([row]);
+      assert.ok(html.includes("Set up again"), `${state}: the one action`);
+      assert.ok(html.includes(esc(extra.fix)), `${state}: the CLI's fix sentence is the tooltip`);
+      for (const old of ["Install analyzer", "Enable for this repo", "Allow &amp; enable", "Re-run semantic"]) {
+        assert.ok(!html.includes(old), `${state}: no per-language command (${old})`);
+      }
+    }
+  });
+
+  test("the state reads in plain words, and ready or unsupported offers nothing", () => {
+    const [needs] = buildLanguageRows([withState("needs_toolchain", { needs: "Go toolchain" })], []);
+    assert.strictEqual(needs.statusLine, "needs Go toolchain");
+    const [ready] = buildLanguageRows([withState("ready")], []);
+    assert.strictEqual(ready.fix, "none");
+    assert.strictEqual(ready.statusLine, "ready");
+    const [os] = buildLanguageRows(
+      [withState("unsupported_os", { availableOnThisPlatform: false, unavailableTarget: "windows" })],
+      []
+    );
+    assert.strictEqual(os.fix, "none");
+  });
+
+  test("an older CLI without `state` keeps its per-language actions", () => {
+    const [row] = buildLanguageRows([{ ...CURRENT_ROW, installed: false } as unknown as LangInfo], []);
+    assert.strictEqual(row.fix, "install");
+  });
+});
+
+/** The page escapes text it interpolates; compare against the escaped form. */
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+suite("one-command setup: first-open offer (plan 3.5)", () => {
+  test("offered once, only for a git folder that has no index yet", () => {
+    assert.strictEqual(shouldOfferSetup(true, false, false), true);
+    assert.strictEqual(shouldOfferSetup(true, true, false), false, "already set up");
+    assert.strictEqual(shouldOfferSetup(false, false, false), false, "not a git repository");
+    assert.strictEqual(shouldOfferSetup(true, false, true), false, "asked once already");
   });
 });

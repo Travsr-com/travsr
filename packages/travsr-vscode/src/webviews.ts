@@ -942,7 +942,10 @@ export interface LanguageRow {
    *    OS and need the user's one-time consent;
    *  - `semantic`: enabled, but a warning on this page says it resolved
    *    nothing, so re-run the semantic pass. */
-  fix: "install" | "enable" | "permission" | "semantic" | "none";
+  fix: "install" | "enable" | "permission" | "semantic" | "setup" | "none";
+  /** `setup` only: the CLI's own sentence for what `travsr init` will do or
+   *  what to install first, shown as the button's tooltip. */
+  fixText?: string;
   /** Full analysis is on and this is not a builtin, so it can be turned off. */
   canDisable: boolean;
 }
@@ -1643,7 +1646,7 @@ export function buildStatsHtml(
       : langPartial > 0
         ? statusChip("warn", `${langPartial} partial`)
         : statusChip("ok", `${langHere.length} full`),
-    act("Detect", "detectLangs"),
+    act("Set up again", "detectLangs"),
     health.languagesSkew !== undefined
       ? skewBanner(health.languagesSkew)
       : health.languages === null
@@ -1707,7 +1710,9 @@ export function buildStatsHtml(
                     ? `<button class="btn mini primary" onclick="fixLang(this, ${i})" title="Full analysis for ${esc(l.language)} needs your one-time permission to run on ${esc(l.osName || "this OS")}; it uses your project's own build tools">Allow &amp; enable</button>`
                     : l.fix === "semantic"
                       ? `<button class="btn mini primary" onclick="fixLang(this, ${i})">Re-run semantic</button>`
-                      : "";
+                      : l.fix === "setup"
+                        ? `<button class="btn mini primary" onclick="fixLang(this, ${i})" title="${esc(l.fixText ?? "Runs travsr init")}">Set up again</button>`
+                        : "";
             const disable = l.canDisable
               ? `<button class="btn mini" onclick="disableLang(this, ${i})" title="Turn full analysis off for ${esc(l.language)}">Disable</button>`
               : "";
@@ -2352,6 +2357,14 @@ export interface LangInfo {
     | "unsupported";
   /** The exact plain wording the CLI shows for this status, used as the tooltip. */
   statusLine: string;
+  /** One-command setup (additive, absent from older CLIs): the language's
+   *  readiness in this repo, `ready` | `setting_up` | `needs_toolchain` |
+   *  `unsupported_os` | `failed`. When present it drives the row. */
+  state?: string;
+  /** What to install first, on a `needs_toolchain` row. */
+  needs?: string | null;
+  /** The CLI's one next action in plain words, or null when there is none. */
+  fix?: string | null;
   /** Per-repo enablement for the target repo (corpus trust gate), computed by the
    *  CLI. `always_on` = builtin, no per-repo step; `enabled` = on for this repo;
    *  `needs_analyzer` = authorized for this repo but the analyzer is not installed
