@@ -1344,6 +1344,58 @@ mod traced_change_tests {
     }
 }
 
+/// `daemon status`'s `semantic:` value. An edit reindexed at an unchanged
+/// HEAD reads exactly as `travsr status` says it.
+fn semantic_line(
+    running: bool,
+    debouncing: bool,
+    last_commit: &str,
+    phase_b_commit: &str,
+    dirty: bool,
+    live_resolved: u64,
+    live_pending: u64,
+) -> String {
+    if running {
+        "running".to_string()
+    } else if debouncing {
+        "pending (debounce)".to_string()
+    } else if last_commit.is_empty() {
+        "not run (no commits yet)".to_string()
+    } else if phase_b_commit.is_empty() {
+        "pending".to_string()
+    } else if phase_b_commit == last_commit && dirty {
+        travsr_mcp::query::dirty_semantic_state(live_resolved, live_pending)
+    } else if phase_b_commit == last_commit {
+        "complete".to_string()
+    } else {
+        "stale (new commits since last run)".to_string()
+    }
+}
+
+#[cfg(test)]
+mod daemon_semantic_line_tests {
+    use super::semantic_line;
+
+    /// `daemon status` said "complete" while `travsr status` said "stale" for
+    /// the same index: it ignored the flag a mid-edit reindex sets.
+    #[test]
+    fn daemon_status_reads_the_edit_flag_like_travsr_status() {
+        assert_eq!(
+            semantic_line(false, false, "0b0492a", "0b0492a", false, 0, 0),
+            "complete"
+        );
+        assert_eq!(
+            semantic_line(false, false, "0b0492a", "0b0492a", true, 0, 0),
+            travsr_mcp::query::dirty_semantic_state(0, 0)
+        );
+        assert_eq!(
+            semantic_line(false, false, "0b0492a", "0b0492a", true, 0, 3),
+            travsr_mcp::query::dirty_semantic_state(0, 3)
+        );
+        assert_eq!(semantic_line(true, false, "a", "a", true, 0, 0), "running");
+    }
+}
+
 #[cfg(test)]
 mod rebase_tests {
     /// Git leaves `REBASE_HEAD` behind after a rebase finishes, so it is not
@@ -16228,19 +16280,15 @@ fn handle_control_message(
             let edges = s.edge_count().unwrap_or(0);
 
             // Live Phase B activity from the scheduler.
-            let phase_b_activity = if phase_b_scheduler.is_running() {
-                "running".to_string()
-            } else if phase_b_scheduler.is_pending() {
-                "pending (debounce)".to_string()
-            } else if last_commit.is_empty() {
-                "not run (no commits yet)".to_string()
-            } else if phase_b_commit.is_empty() {
-                "pending".to_string()
-            } else if phase_b_commit == last_commit {
-                "complete".to_string()
-            } else {
-                "stale (new commits since last run)".to_string()
-            };
+            let phase_b_activity = semantic_line(
+                phase_b_scheduler.is_running(),
+                phase_b_scheduler.is_pending(),
+                &last_commit,
+                &phase_b_commit,
+                s.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1"),
+                s.resolved_ref_count().unwrap_or(0),
+                s.pending_ref_count().unwrap_or(0),
+            );
 
             // Embed progress — per-repo configured model only.
             let embed_line = if let Some(backend_id) =

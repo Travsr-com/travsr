@@ -301,6 +301,36 @@ pub struct StatusPayload {
 
 // ── status ────────────────────────────────────────────────────────────────────
 
+/// The semantic state when a mid-edit reindex set `phase_b_dirty` while HEAD
+/// did not move, from the live overlay's `resolved` and `pending` reference
+/// counts. One wording for `travsr status` and `travsr daemon status`.
+///
+/// A mid-edit reindex dropped the changed region's committed edges. Whether
+/// that is a real degradation depends on the live overlay, in three cases:
+///   - live lane inactive (no ref_resolution rows at all: a headless daemon
+///     with no editor, or a generic-detector language with no lexical floor):
+///     nothing recovered the edit, so it is genuinely stale until a refresh.
+///   - active with references still pending: name how many are unknown until
+///     commit.
+///   - active with nothing pending: the overlay resolved every reference it
+///     detected, so "stale, re-run init" would be wrong advice.
+///
+/// The counts are repo-wide and phase_b_dirty is a single flag, so this last
+/// case cannot prove every dropped edge came back: an editor-resolved file and
+/// a headless generic-language edit (which leaves no rows at all) both feed
+/// one flag, and the resolved rows may belong only to the first. So it reports
+/// the recovery it can see without claiming a full refresh, which the
+/// commit-gated path is what actually delivers.
+pub fn dirty_semantic_state(resolved: u64, pending: u64) -> String {
+    if resolved == 0 && pending == 0 {
+        "stale (run travsr init to refresh)".to_string()
+    } else if pending > 0 {
+        format!("{pending} reference(s) in edits not yet committed are not traced yet")
+    } else {
+        "edits not yet committed were traced where found; commit for a full refresh".to_string()
+    }
+}
+
 pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
     let nodes = store.node_count()?;
     // L11: detect FTS/nodes skew — indicates a partial write or a bad migration.

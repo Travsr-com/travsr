@@ -76,37 +76,10 @@ fn phase_b_state(payload: &StatusPayload) -> String {
     match payload.phase_b_commit.as_deref() {
         Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => {
             if payload.phase_b_dirty {
-                // A mid-edit reindex dropped the changed region's committed
-                // edges. Whether that is a real degradation depends on the live
-                // overlay, in three cases:
-                //   - live lane inactive (no ref_resolution rows at all: a
-                //     headless daemon with no editor, or a generic-detector
-                //     language with no lexical floor): nothing recovered the
-                //     edit, so it is genuinely stale until a refresh.
-                //   - active with references still pending: name how many are
-                //     unknown until commit.
-                //   - active with nothing pending: the overlay resolved every
-                //     reference it detected, so "stale, re-run init" would be
-                //     wrong advice.
-                // The counts are repo-wide and phase_b_dirty is a single flag,
-                // so this last case cannot prove every dropped edge came back:
-                // an editor-resolved file and a headless generic-language edit
-                // (which leaves no rows at all) both feed one flag, and the
-                // resolved rows may belong only to the first. So it reports the
-                // recovery it can see without claiming a full refresh, which the
-                // commit-gated path is what actually delivers.
-                let live_active = payload.live_refs_resolved > 0 || payload.live_refs_pending > 0;
-                if !live_active {
-                    "stale (run travsr init to refresh)".to_string()
-                } else if payload.live_refs_pending > 0 {
-                    format!(
-                        "{} reference(s) in edits not yet committed are not traced yet",
-                        payload.live_refs_pending
-                    )
-                } else {
-                    "edits not yet committed were traced where found; commit for a full refresh"
-                        .to_string()
-                }
+                travsr_mcp::query::dirty_semantic_state(
+                    payload.live_refs_resolved,
+                    payload.live_refs_pending,
+                )
             } else {
                 // #712: the marker now advances even when a language crashed, so
                 // the healthy languages are complete and queryable at HEAD. Name
