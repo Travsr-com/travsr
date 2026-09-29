@@ -64,15 +64,6 @@ function getHtml(): string {
       font-family: var(--vscode-editor-font-family);
       font-size: 13px;
     }
-    .command-block {
-      background: var(--vscode-textCodeBlock-background);
-      border-left: 3px solid var(--vscode-textLink-foreground);
-      padding: 10px 14px;
-      margin: 12px 0;
-      border-radius: 0 4px 4px 0;
-      font-family: var(--vscode-editor-font-family);
-      font-size: 13px;
-    }
     .links { margin-top: 36px; display: flex; gap: 20px; flex-wrap: wrap; }
     a { color: var(--vscode-textLink-foreground); text-decoration: none; }
     a:hover { text-decoration: underline; }
@@ -81,28 +72,30 @@ function getHtml(): string {
 </head>
 <body>
   <h1>Travsr</h1>
-  <p class="tagline">The code graph that lives next to git.</p>
+  <p class="tagline">Your AI sees how your code connects.</p>
 
   <p>
-    Travsr builds a deterministic graph of your codebase on every git commit.
-    Instead of guessing from text chunks, your AI tools traverse real structure,
-    call edges, import edges, type references, and return exactly the context
-    they need.
+    Travsr reads your project and keeps track of what calls what. Your AI asks
+    it instead of guessing from text, and it stays up to date on every commit.
   </p>
 
-  <h2>Features in this extension</h2>
+  <h2>Get started</h2>
   <ul>
-    <li><strong>Status bar</strong>, live graph health at the bottom of VS Code</li>
-    <li><strong>Blast radius code lens</strong>, how many files break if this file changes</li>
-    <li><strong>Callers hover</strong>, hover any symbol to see what calls it</li>
-    <li><strong>Graph panel</strong>, Activity Bar view with live dependencies and callers for the active symbol</li>
+    <li>Open a folder that is a Git project.</li>
+    <li>Click <strong>Set up</strong> when Travsr asks, or run <strong>Travsr: Re-index Now</strong> from the Command Palette.</li>
+    <li>Wait for <strong>Ready.</strong> Claude Code and Cursor are connected for you.</li>
+  </ul>
+  <p>If a language needs something installed first, <strong>Travsr: Health</strong> lists it with the one thing to do.</p>
+
+  <h2>In the editor</h2>
+  <ul>
+    <li><strong>Status bar</strong>: whether this project is ready and up to date</li>
+    <li><strong>Above each file</strong>: how many files are affected if it changes</li>
+    <li><strong>Hover a function</strong>: what calls it</li>
+    <li><strong>Travsr view in the Activity Bar</strong>: what the current function calls and what calls it</li>
   </ul>
 
-  <h2>Getting started</h2>
-  <p>Install the Travsr CLI and initialise your repo:</p>
-  <div class="command-block">npm install -g @travsr.com/travsr</div>
-  <div class="command-block">cd your-repo &amp;&amp; travsr init</div>
-  <p>The status bar turns green when the graph is ready. The Activity Bar panel updates as you move your cursor.</p>
+  <p>Prefer the terminal? Run <code>travsr init</code> in your project.</p>
 
   <hr>
 
