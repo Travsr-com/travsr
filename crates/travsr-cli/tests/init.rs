@@ -982,6 +982,10 @@ fn init_wires_claude_code_from_a_home_marker_without_a_path_note() {
 /// Setup output stays hidden unless an install fails. Here every download is
 /// refused, so the install fails and `init` shows what it printed, then carries
 /// on offline and still finishes.
+///
+/// Not on Windows: there is no scip-go download there, only `go install`,
+/// which needs a newer Go than the runner may have (then nothing installs).
+#[cfg(not(windows))]
 #[test]
 fn a_failed_language_install_shows_its_output_and_init_finishes() {
     // Go's tools install only where Go is: without it, Go reads "needs Go
