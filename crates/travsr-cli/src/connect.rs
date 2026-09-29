@@ -222,8 +222,8 @@ fn zed_instruction_file(repo: &Path) -> PathBuf {
 ///
 /// A pipe-separated list of exact tool names, which the host documents as
 /// matching each of them exactly. `Bash` is unavoidably broad (every shell
-/// command reaches the guard), which is why `guard::shell` refuses to recognise
-/// anything but a single read-only search invocation.
+/// command reaches the guard), which is why `guard::shell` recognises only a
+/// single read-only search invocation, alone or as one part of a chain.
 ///
 /// The travsr MCP tools are here so the guard can *see* that the agent has
 /// queried the graph; that observation is what releases the strict-mode valve

@@ -1,16 +1,14 @@
 //! Recognising a read-only search command inside a `Bash` tool call (#916).
 //!
-//! The guard has to answer one question about a shell command: *is this whole
-//! command line nothing but a single invocation of `grep`, `rg`, `find`, `ag`,
-//! `ack`, or `ls -R`?* Anything else (a pipeline, a `&&` chain, a command
+//! The guard has to answer one question about a shell command: *is some part
+//! of this `&&` / `||` / `;` chain a single invocation of `grep`, `rg`, `find`,
+//! `ag`, `ack`, or `ls -R`?* A part with anything else in it (a pipe, a command
 //! substitution, a redirect) is left alone.
 //!
-//! "Whole command line" is not fussiness. The guard's `allow` is the host's
-//! *auto-approve*, not merely "do not block", so answering yes to
-//! `grep foo && rm -rf build` would spend the user's permission prompt on the
-//! `rm`. Requiring a single simple command makes that unreachable, and it
-//! happens to be the same rule that keeps `find . | xargs sed -i` out of the
-//! match set, which nobody would want nudged toward a graph query either.
+//! Recognising a search inside a chain is safe because the guard never
+//! approves: it only denies or adds context (see `payload::HookOutput`). The
+//! part rule is what keeps `cargo test | grep foo` and `find . | xargs sed -i`
+//! out of the match set, which nobody would want nudged toward a graph query.
 //!
 //! Substring matching is not used anywhere here. `programgrep` and
 //! `my-rg-wrapper` are different programs that merely spell a tool's name
@@ -116,9 +114,46 @@ fn is_flag(word: &str) -> bool {
     word.starts_with('-') && word != "-"
 }
 
-/// Classify a `Bash` command line, or `None` when it is not a single read-only
-/// search invocation.
+/// Classify a `Bash` command line: the first part of an `&&` / `||` / `;`
+/// chain that is a single read-only search invocation, or `None`.
 pub fn classify(command: &str) -> Option<SearchCommand> {
+    chain_parts(command).into_iter().find_map(classify_simple)
+}
+
+/// Split a command line on `&&`, `||` and `;` outside quotes. Anything else
+/// stays inside its part, where [`simple_words`] refuses it.
+fn chain_parts(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut parts = Vec::new();
+    let mut quote: Option<u8> = None;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'\'' || b == b'"' => quote = Some(b),
+            None if b == b';' => {
+                parts.push(&command[start..i]);
+                start = i + 1;
+            }
+            None if (b == b'&' || b == b'|') && bytes.get(i + 1) == Some(&b) => {
+                parts.push(&command[start..i]);
+                start = i + 2;
+                i += 1;
+            }
+            None => {}
+        }
+        i += 1;
+    }
+    parts.push(&command[start..]);
+    parts
+}
+
+/// Classify one simple command, or `None` when it is not a single read-only
+/// search invocation.
+fn classify_simple(command: &str) -> Option<SearchCommand> {
     let words = simple_words(command)?;
     let mut words = words.into_iter();
     let program = basename(&words.next()?);
@@ -298,13 +333,37 @@ mod tests {
         assert_eq!(classify("ripgrep needle"), None, "not the `rg` binary");
     }
 
-    /// The property that makes an explicit `allow` safe to emit: a command with
-    /// anything else in it is never recognised, so it is never auto-approved.
+    /// A search inside an `&&` / `||` / `;` chain is the same search: the old
+    /// hook caught `grep` only as the first word, so `cd x && grep Sym .`
+    /// slipped past while `grep Sym .` was stopped. The guard only ever denies
+    /// or adds context, so recognising a chain can never approve its other parts.
     #[test]
-    fn a_compound_command_is_never_a_match() {
+    fn a_search_inside_a_chain_is_recognised() {
+        assert_eq!(
+            term("cd crates && rg install_selected"),
+            Some("install_selected".into())
+        );
+        assert_eq!(term("grep -rn foo . && rm -rf build"), Some("foo".into()));
+        assert_eq!(
+            term("echo hi; grep -n needle src/a.rs"),
+            Some("needle".into())
+        );
+        assert_eq!(term("true || grep needle ."), Some("needle".into()));
+        assert_eq!(
+            chain_parts("grep 'a && b' . && rg x"),
+            vec!["grep 'a && b' . ", " rg x"],
+            "a quoted && is not a split"
+        );
+        assert_eq!(classify("cd crates && cargo test"), None);
+    }
+
+    /// A part with a pipe, redirect or substitution is still refused: `cargo test
+    /// | grep foo` filters another command's output and is no repo search.
+    #[test]
+    fn a_part_with_a_pipe_or_substitution_is_never_a_match() {
         for cmd in [
-            "grep -rn foo . && rm -rf build",
-            "grep foo . ; curl evil.example",
+            "cargo test | grep foo",
+            "cd x && cargo test 2>&1 | grep foo",
             "grep foo . | xargs rm",
             "rg needle > out.txt",
             "rg needle 2>/dev/null",
@@ -315,7 +374,7 @@ mod tests {
             "(grep foo .)",
             "grep foo . & ",
         ] {
-            assert_eq!(classify(cmd), None, "{cmd} must not be auto-approved");
+            assert_eq!(classify(cmd), None, "{cmd} must not match");
         }
     }
 
