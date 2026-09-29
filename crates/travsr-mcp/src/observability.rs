@@ -1925,11 +1925,14 @@ mod tests {
         // running, and says how to fix it.
         let ruby = langs.iter().find(|l| l["language"] == "ruby").unwrap();
         assert_eq!(ruby["state"], "unavailable", "got: {payload}");
+        // Windows has no ruby analyzer build, so it says that instead.
+        let fix = if cfg!(windows) {
+            "not available on windows"
+        } else {
+            "travsr init"
+        };
         assert!(
-            ruby["detail"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("travsr init"),
+            ruby["detail"].as_str().unwrap_or_default().contains(fix),
             "got: {payload}"
         );
         // Installed analyzer, Phase B complete at this commit, no warning and
@@ -1984,6 +1987,8 @@ mod tests {
     /// only fires when the repo root is known. Deterministic on any machine:
     /// the compdb check sits *above* the resolver, so whether `scip-clang`
     /// happens to be installed cannot change either half of this test.
+    /// Not on Windows, where C has no analyzer build at all.
+    #[cfg(not(windows))]
     #[test]
     fn phase_b_unavailable_names_compile_commands_json_only_when_the_root_lacks_one() {
         use travsr_core::{Node, VName};

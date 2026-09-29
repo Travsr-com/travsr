@@ -12075,6 +12075,8 @@ mod tests {
 
     /// A partial language's line is the one `travsr status` prints for it, from
     /// the last run's record, never an internal rebuild flag (plan 3.0).
+    /// Not on Windows, where C has no analyzer build at all.
+    #[cfg(not(windows))]
     #[test]
     fn get_lang_status_partial_line_is_the_plain_readiness_line() {
         let mut store = make_store(&[], &[]);
