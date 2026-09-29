@@ -642,7 +642,13 @@ function resolveCallTarget(
     if (entry?.kind === 'direct') {
       return defMap.get(entry.key);
     }
-    return undefined;
+    if (entry) return undefined;
+    // Otherwise a top-level def or class in this file, but only when nothing
+    // else binds the name: a wrong edge is worse than a missing one.
+    if (boundInEnclosingFunction(funcNode) || moduleBindings(funcNode) !== 1) return undefined;
+    return (
+      defMap.get(`${relPath}:fn:${funcNode.text}`) ?? defMap.get(`${relPath}:class:${funcNode.text}`)
+    );
   }
 
   if (funcNode.type === 'attribute') {
@@ -687,6 +693,58 @@ function resolveCallTarget(
   }
 
   return undefined;
+}
+
+/** Field holding the names each binding construct introduces. */
+const BINDING_FIELDS: Record<string, string> = {
+  assignment: 'left',
+  augmented_assignment: 'left',
+  for_statement: 'left',
+  for_in_clause: 'left',
+  named_expression: 'name',
+  as_pattern: 'alias',
+};
+/** Constructs every identifier of which counts as bound (parameters, imports, globals). */
+const BINDING_WHOLE = new Set([
+  'parameters',
+  'lambda_parameters',
+  'import_statement',
+  'import_from_statement',
+  'global_statement',
+  'nonlocal_statement',
+]);
+
+/** How many times `node`'s subtree binds `name`; `nested` also walks into defs. */
+function countBindings(node: SyntaxNode, name: string, nested: boolean, depth = 0): number {
+  if (depth >= MAX_AST_DEPTH) return 1; // unknown: treat as bound
+  const hasName = (n: SyntaxNode | null): boolean =>
+    n !== null && (n.type === 'identifier' ? n.text === name : namedChildren(n).some(hasName));
+  if (BINDING_WHOLE.has(node.type)) return hasName(node) ? 1 : 0;
+  let count = 0;
+  const field = BINDING_FIELDS[node.type];
+  if (field && hasName(node.childForFieldName(field))) count++;
+  const isDef = node.type === 'function_definition' || node.type === 'class_definition';
+  if (isDef && node.childForFieldName('name')?.text === name) count++;
+  if (isDef && !nested) return count; // a def's body is its own scope
+  for (const child of namedChildren(node)) count += countBindings(child, name, nested, depth + 1);
+  return count;
+}
+
+/** Whether a function around the call binds the called name itself. */
+function boundInEnclosingFunction(call: SyntaxNode): boolean {
+  for (let p = call.parent; p !== null; p = p.parent) {
+    if (p.type !== 'function_definition' && p.type !== 'lambda') continue;
+    const own = p.childForFieldName('name')?.text === call.text ? 1 : 0;
+    if (countBindings(p, call.text, true) > own) return true;
+  }
+  return false;
+}
+
+/** How many module-level statements bind the called name. */
+function moduleBindings(call: SyntaxNode): number {
+  let root = call;
+  while (root.parent !== null) root = root.parent;
+  return namedChildren(root).reduce((n, stmt) => n + countBindings(stmt, call.text, false), 0);
 }
 
 /** `cls.method`, or the first base class (breadth-first) that defines it. */
