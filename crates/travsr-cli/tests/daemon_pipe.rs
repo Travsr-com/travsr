@@ -66,6 +66,7 @@ fn run_piped_expecting_prompt_eof(
         // then lists a directory `tempfile` deletes on drop.
         .env("TRAVSR_DISABLE_REGISTRY", "1")
         .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("CI", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

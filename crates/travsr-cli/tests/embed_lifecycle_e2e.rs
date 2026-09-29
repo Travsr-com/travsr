@@ -117,6 +117,7 @@ fn mcp_get_context(repo: &Path, query: &str) -> String {
     use std::io::{BufRead as _, BufReader, Write as _};
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("CI", "1") // no background daemon from `travsr mcp`
         .arg("mcp")
         .current_dir(repo)
         .stdin(std::process::Stdio::piped())

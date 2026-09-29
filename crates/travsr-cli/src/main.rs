@@ -1403,6 +1403,23 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("{err_msg}");
                     anyhow::bail!("not initialized; run `travsr init` first");
                 }
+                // Plan 4.10: an agent connecting is exactly when the index must
+                // be kept fresh, so start the daemon if none is running (after a
+                // reboot, a killed `init`, or a crash). On a thread, so startup
+                // never waits for it; its output goes nowhere near the JSON-RPC
+                // stdout. `CI` opts out, as it does for `travsr init`.
+                if std::env::var_os("CI").is_none() {
+                    if let Some(root) = db_path.parent().and_then(|p| p.parent()) {
+                        let root = root.to_path_buf();
+                        std::thread::spawn(move || {
+                            if !daemon_client::daemon_lock_held(&root) {
+                                if let Ok(exe) = std::env::current_exe() {
+                                    daemon_client::spawn_background_daemon(&root, &exe, false);
+                                }
+                            }
+                        });
+                    }
+                }
                 travsr_mcp::serve_stdio(&db_path)?;
             }
         }
