@@ -1304,6 +1304,15 @@ fn phase_b_inline_needed(
             .any(|(class, lang)| GATE_SKIPS.contains(&class) && now_ready(lang))
 }
 
+/// Counter incremented every time a reindex marks Phase B dirty.
+///
+/// Paired with `phase_b_dirty`, which says *whether* the graph is degraded.
+/// This says *when*, well enough for `init` to distinguish a flag that predates
+/// its run from one that arrived while it was working: the first is stale and
+/// safe to clear, the second describes a real degradation this Phase B did not
+/// cover.
+const PHASE_B_DIRTY_SEQ: &str = "phase_b_dirty_seq";
+
 /// Like [`init_repo`], but reports progress via `on_progress` so the CLI can
 /// show that a long indexing run is alive (issue #293). The callback is invoked
 /// on the indexing thread; keep it cheap.
@@ -1319,15 +1328,6 @@ fn phase_b_inline_needed(
 /// the existing graph so every file is re-parsed from scratch, even when no file
 /// content changed. Needed because config that affects *semantic* output (e.g.
 /// `--allow-unsandboxed-lsif` toggling whether Rust LSIF edges are built) is not
-/// Counter incremented every time a reindex marks Phase B dirty.
-///
-/// Paired with `phase_b_dirty`, which says *whether* the graph is degraded.
-/// This says *when*, well enough for `init` to distinguish a flag that predates
-/// its run from one that arrived while it was working: the first is stale and
-/// safe to clear, the second describes a real degradation this Phase B did not
-/// cover.
-const PHASE_B_DIRTY_SEQ: &str = "phase_b_dirty_seq";
-
 /// part of the per-file hash delta, so a plain re-init would report "up to date"
 /// without actually rebuilding those edges.
 pub fn init_repo_with_progress(
@@ -2046,6 +2046,12 @@ pub fn init_repo_with_progress(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
 
+    // Stamped here as well as at the end, so an init interrupted during Phase B
+    // leaves last_commit ahead of phase_b_commit: the daemon arms on that gap.
+    if has_commit {
+        let _ = store.set_meta("last_commit", &current_sha);
+    }
+
     let phase_b_report = if run_phase_b_inline {
         on_progress(InitProgress::Finalizing);
 
@@ -2219,7 +2225,7 @@ pub fn init_repo_with_progress(
         Some(report)
     } else if phase_b_already_done {
         // Phase B is current for this commit — nothing to do, no message.
-        // Return Some(empty) so init.rs skips the daemon spawn.
+        // Return Some(empty): Phase B is not pending.
         Some(PhaseBReport::default())
     } else {
         on_progress(InitProgress::PhaseBDeferred);
@@ -5227,6 +5233,12 @@ fn ratified_languages(report: &PhaseBReport, lsif_ran: bool) -> Vec<String> {
     langs
 }
 
+/// Whether a `travsr init` holds this repo's `init.lock`.
+fn init_running(repo_root: &Path) -> bool {
+    std::fs::File::open(repo_root.join(".travsr").join("init.lock"))
+        .is_ok_and(|f| fs2::FileExt::try_lock_exclusive(&f).is_err())
+}
+
 fn run_background_phase_b_inner(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
@@ -5250,6 +5262,12 @@ fn run_background_phase_b_inner(
         }
         (corpus, last)
     };
+    // A `travsr init` is running Phase B inline for this commit; doing it here
+    // too repeats the same work. The next tick runs it if that init is
+    // interrupted, since the markers still differ once it releases the lock.
+    if init_running(repo_root) {
+        return phase_b_sched::RunOutcome::Success;
+    }
 
     tracing::info!(
         event = "phase_b.start",
@@ -6177,6 +6195,18 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
+
+    #[test]
+    fn init_running_follows_init_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        assert!(!init_running(tmp.path()), "no lock file, no init");
+        let held = std::fs::File::create(tmp.path().join(".travsr/init.lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        assert!(init_running(tmp.path()), "an init holds the lock");
+        fs2::FileExt::unlock(&held).unwrap();
+        assert!(!init_running(tmp.path()), "released");
+    }
 
     #[test]
     fn phase_b_inline_needed_table() {
@@ -9932,7 +9962,7 @@ mod tests {
             .status()
             .unwrap();
         std::process::Command::new("git")
-            .args(["commit", "-m", "init"])
+            .args(["-c", "core.hooksPath=/dev/null", "commit", "-m", "init"])
             .current_dir(tmp.path())
             .status()
             .unwrap();
@@ -10336,6 +10366,8 @@ mod tests {
                 "user.email=t@t",
                 "-c",
                 "user.name=t",
+                "-c",
+                "core.hooksPath=/dev/null",
                 "commit",
                 "-qm",
                 "edit",
@@ -10593,6 +10625,8 @@ mod tests {
                     "user.email=t@t",
                     "-c",
                     "user.name=t",
+                    "-c",
+                    "core.hooksPath=/dev/null",
                     "commit",
                     "-qm",
                     msg,
@@ -13088,7 +13122,7 @@ mod tests {
             .status()
             .unwrap();
         StdCommand::new("git")
-            .args(["commit", "-q", "-m", msg])
+            .args(["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", msg])
             .current_dir(dir)
             .status()
             .unwrap();

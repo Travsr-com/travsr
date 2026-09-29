@@ -65,9 +65,7 @@ enum Command {
         #[arg(long, hide = true)]
         semantic: bool,
         /// Force a full rebuild, bypassing the incremental "up to date" skip.
-        /// Re-parses every file even when nothing changed on disk — use it after
-        /// changing a flag that affects semantic output (e.g. --allow-unsandboxed-lsif)
-        /// which the per-file change detection does not otherwise pick up.
+        /// Re-parses every file even when nothing changed on disk.
         #[arg(long, visible_alias = "rebuild")]
         force: bool,
         /// Allow rust-analyzer to run without OS sandboxing (bubblewrap on Linux,

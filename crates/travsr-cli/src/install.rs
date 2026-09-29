@@ -289,9 +289,9 @@ pub async fn fetch_latest_version_for_repo(repo: &str) -> Result<String> {
 ///   floor, print a WARN with the reinstall remedy. The *hard* refuse stays at
 ///   spawn/reindex (Point A) - init only warns, so the user is left in a
 ///   runnable state and the fix is one command away.
-/// - **Leg 2 (network, cached 24h).** Fetch the latest release; if it is newer
+/// - **Leg 2 (network).** Fetch the latest release on every call; if it is newer
 ///   than what is installed, print an advisory. Offline -> silent. The fetched
-///   tag is cached in `~/.travsr/.sidecar-latest.json` so the daemon can
+///   tag is written to `~/.travsr/.sidecar-latest.json` so the daemon can
 ///   re-surface staleness without ever fetching (local-first).
 ///
 /// `reinstall_remedy` is the exact command surfaced to the user, e.g.

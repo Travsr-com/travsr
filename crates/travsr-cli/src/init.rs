@@ -37,6 +37,24 @@ pub fn run(
         }
     }
 
+    // Ctrl-C, or SIGTERM from an editor or an agent's timeout: once indexing
+    // is done, hand the rest to the daemon. An interrupted Phase B leaves
+    // `last_commit` ahead of `phase_b_commit`, so the daemon picks it up.
+    let _ = ctrlc::set_handler({
+        let repo_root = repo_root.clone();
+        move || {
+            let indexed = TRACING_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let ci = std::env::var_os("CI").is_some();
+            let outcome = hand_off_on_interrupt(ci, indexed).then(|| {
+                std::env::current_exe().map_or(crate::daemon_client::SpawnOutcome::Failed, |exe| {
+                    crate::daemon_client::spawn_background_daemon(&repo_root, &exe, false)
+                })
+            });
+            eprintln!("\n{}", interrupt_note(outcome));
+            std::process::exit(130);
+        }
+    });
+
     let db_path = repo_root.join(".travsr/graph.db");
     // The key the Phase B trust gate checks, from this worktree rather than cwd,
     // so a linked worktree trusts itself and not the main one.
@@ -80,6 +98,9 @@ pub fn run(
     // Renders to stderr; the summary below stays on stdout.
     let mut progress = crate::progress::ProgressReporter::new(quiet, json);
     let stats = travsr_daemon::init_repo_with_progress(&repo_root, jobs, true, force, &mut |ev| {
+        if matches!(ev, travsr_daemon::InitProgress::Finalizing) {
+            TRACING_CALLS.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         progress.update(ev)
     })?;
     let elapsed = progress.elapsed();
@@ -217,6 +238,27 @@ fn maybe_connect(
     let _ = crate::connect::run(repo_root, &opts);
 }
 
+/// Set once indexing is done and call tracing has started: from then on an
+/// interrupted init has work the daemon can finish.
+static TRACING_CALLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether an interrupted init starts the daemon to finish its work.
+fn hand_off_on_interrupt(ci: bool, tracing_calls: bool) -> bool {
+    !ci && tracing_calls
+}
+
+/// What an interrupted init tells the user, given the daemon it tried to hand
+/// off to (`None` in CI, where nothing is left running).
+fn interrupt_note(outcome: Option<crate::daemon_client::SpawnOutcome>) -> &'static str {
+    use crate::daemon_client::SpawnOutcome::{AlreadyRunning, Started, Starting};
+    match outcome {
+        Some(Started | Starting | AlreadyRunning) => {
+            "Tracing calls continues in the background (travsr status)."
+        }
+        _ => "Stopped. Run `travsr init` again to finish.",
+    }
+}
+
 /// Languages `travsr init` can set up itself; the rest need the user.
 fn languages_to_set_up(states: &[(String, Readiness)]) -> Vec<&str> {
     states
@@ -313,6 +355,35 @@ mod tests {
         ];
         assert_eq!(languages_to_set_up(&states), ["go", "rust"]);
         assert!(languages_to_set_up(&[]).is_empty());
+    }
+
+    #[test]
+    fn an_interrupt_only_promises_what_the_daemon_will_do() {
+        use crate::daemon_client::SpawnOutcome;
+        let continues = "Tracing calls continues in the background (travsr status).";
+        let stopped = "Stopped. Run `travsr init` again to finish.";
+        for outcome in [
+            SpawnOutcome::Started,
+            SpawnOutcome::Starting,
+            SpawnOutcome::AlreadyRunning,
+        ] {
+            assert_eq!(interrupt_note(Some(outcome)), continues);
+        }
+        assert_eq!(interrupt_note(Some(SpawnOutcome::Failed)), stopped);
+        // No hand-off attempted: nothing is left running.
+        assert_eq!(interrupt_note(None), stopped);
+    }
+
+    #[test]
+    fn an_interrupt_hands_off_only_finished_indexing_outside_ci() {
+        // Before indexing finished the daemon has nothing to continue from.
+        assert!(hand_off_on_interrupt(false, true));
+        assert!(!hand_off_on_interrupt(false, false));
+        assert!(
+            !hand_off_on_interrupt(true, true),
+            "CI leaves nothing running"
+        );
+        assert!(!hand_off_on_interrupt(true, false));
     }
 
     #[test]

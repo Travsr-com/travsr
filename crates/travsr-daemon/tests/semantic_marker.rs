@@ -43,7 +43,19 @@ fn git_init(dir: &Path) {
 
 fn commit_all(dir: &Path, message: &str) {
     git(dir, &["add", "-A"]);
-    git(dir, &["commit", "-q", "-m", message]);
+    // init installs hooks pinned to its own executable, which here is this
+    // test binary; the commit would run it as `hook-run --from-hook`.
+    git(
+        dir,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    );
 }
 
 fn meta(db: &Path, key: &str) -> Option<String> {
@@ -350,4 +362,33 @@ fn read_dirty_seq(store: &mut travsr_store::SqliteStore) -> u64 {
         .flatten()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
+}
+
+/// An `init` interrupted during Phase B must leave `last_commit` at HEAD and
+/// `phase_b_commit` behind it: that gap is what arms the daemon's Phase B, so
+/// the work handed off on Ctrl-C actually gets done.
+#[test]
+fn last_commit_is_stamped_before_phase_b_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    git_init(root);
+    std::fs::write(root.join("m.py"), "def add():\n    return 1\n").unwrap();
+    commit_all(root, "c1");
+    disable_registry();
+    let db = root.join(".travsr/graph.db");
+    let at_phase_b_start = std::sync::Mutex::new(None);
+    travsr_daemon::init_repo_with_progress(root, None, true, false, &mut |ev| {
+        let mut seen = at_phase_b_start.lock().unwrap();
+        if matches!(ev, travsr_daemon::InitProgress::Finalizing) && seen.is_none() {
+            *seen = Some((meta(&db, "last_commit"), meta(&db, "phase_b_commit")));
+        }
+    })
+    .unwrap();
+    let (last, phase_b) = at_phase_b_start
+        .into_inner()
+        .unwrap()
+        .expect("Phase B started");
+    assert!(last.is_some(), "last_commit stamped before Phase B");
+    assert_eq!(last, meta(&db, "last_commit"), "and it is HEAD");
+    assert_eq!(phase_b, None, "Phase B not yet stamped");
 }
