@@ -2132,7 +2132,7 @@ export function registerShowGraphStats(
               `${name} is enabled for this repository. Full analysis runs on the next semantic index.`,
               "Re-index now"
             );
-            if (pick === "Re-index now") runTravsrCommand(["init", "--semantic", "--force"], repo);
+            if (pick === "Re-index now") runTravsrCommand(["init", "--force"], repo);
           }
           return;
         }
@@ -2163,7 +2163,7 @@ export function registerShowGraphStats(
             );
             return;
           }
-          const { cancelled } = await spawnManagedInstall(bin, ["init", "--semantic", "--force"], repo, `Enabling ${name}…`);
+          const { cancelled } = await spawnManagedInstall(bin, ["init", "--force"], repo, `Enabling ${name}…`);
           await refresh();
           void (cancelled
             ? vscode.window.showWarningMessage(`Enabling ${name} was cancelled before analysis finished. Refresh to check its state.`)
@@ -2171,7 +2171,7 @@ export function registerShowGraphStats(
           return;
         }
         case "semantic":
-          runTravsrCommand(["init", "--semantic", "--force"], repo);
+          runTravsrCommand(["init", "--force"], repo);
           return;
         case "setup": {
           // One-command setup: `travsr init` installs what it can, traces

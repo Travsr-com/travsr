@@ -5103,7 +5103,7 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
         LangStatus::Active
     } else {
         let next = if analyzer_installed(meta.language) {
-            "travsr init --semantic --force".to_string()
+            "travsr init --force".to_string()
         } else {
             install_step(meta.language)
         };
@@ -12169,11 +12169,11 @@ mod tests {
         assert!(json.contains(r#""builtin":false"#));
         assert!(json.contains(r#""semantic_available":false"#));
         assert!(
-            json.contains("travsr lang install go")
-                || json.contains("travsr init --semantic --force"),
+            json.contains("travsr lang install go") || json.contains(r#""travsr init --force""#),
             "non-builtin go must surface a concrete next step (install when the \
              analyzer is absent, rebuild when it is already installed): {json}"
         );
+        assert!(!json.contains("--semantic"), "a retired flag: {json}");
     }
 
     /// Rust is not special: with no cross-file edges it reads `partial` and points

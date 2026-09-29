@@ -41,7 +41,7 @@ $ travsr status
 > Install, then index a repo. Five steps from nothing to a query.
 1. install the binary :: curl -fsSL https://travsr.com/install.sh | sh
 2. check it is on your PATH :: travsr --version
-3. index a repo, from its root :: travsr init --semantic
+3. index a repo, from its root :: travsr init
 4. confirm the graph is ready :: travsr status
 5. ask it something :: travsr ask "<a symbol in your code>"
 - sh -s -- --system   installs for all users, not just you
@@ -55,9 +55,9 @@ The installer checks the release signature before it installs anything, and drop
 - parses every tracked file, skipping whatever git ignores
 - installs a hook so the graph follows your commits
 - registers the repo so other tools can find it
-- --semantic waits for call edges instead of backgrounding them
+- init traces calls before it returns
 init is incremental and safe to repeat: a second run picks up only what changed, which is exactly what the git hook does on your behalf after each commit. Reach for --force only after changing a flag that affects analysis, since per-file change detection cannot see that by itself.
-$ travsr init --semantic
+$ travsr init
 
 ## which languages does it support?
 > Sixteen parse out of the box; four resolve calls with no setup.
@@ -180,7 +180,7 @@ $ travsr explain "<your query>" <symbol>
 - the .travsr directory only affects the checkout it sits in
 There is no uninstall step to run first and nothing outside these two paths. Remove them and travsr is gone; run init again and the graph comes back from your source, because everything in it was derived from your source to begin with.
 $ rm -rf .travsr
-$ travsr init --semantic
+$ travsr init
 
 ## how do I see the logs?
 > There are two logs, and one command reads either of them.
@@ -264,12 +264,12 @@ $ travsr serve --tenants-dir <dir>
 
 ## can I use it in CI?
 > Yes. Index synchronously, and read the output as JSON.
-- init --semantic finishes call edges before it returns
+- init finishes call edges before it returns
 - --json on init, status and ask gives machine-readable output
 - travsr index emits a graph JSON without touching a repo's .travsr
 - no daemon is needed; queries read the database directly
-The thing to get right in CI is ordering: init backgrounds the expensive pass by default, so a job that queries call edges immediately after it can race the work. --semantic makes init wait, which is what it is for.
-$ travsr init --semantic --json
+init traces calls before it returns, so a job can query call edges the moment it exits: there is no background pass to race, and no daemon to start or wait for.
+$ travsr init --json
 $ travsr index <dir> --output graph.json
 
 ## how do I update travsr?

@@ -422,7 +422,7 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
                     // no-op Phase A can make look like it did nothing; `--force`
                     // purges and rebuilds so the retry is unambiguous.
                     ["crashed", lang] => eprintln!(
-                        "warning: semantic analyzer for '{lang}' crashed, fix the tool (e.g. `travsr lang install {lang}`), then re-run `travsr init --semantic --force` to rebuild"
+                        "warning: semantic analyzer for '{lang}' crashed, fix the tool (e.g. `travsr lang install {lang}`), then re-run `travsr init --force` to rebuild"
                     ),
                     ["version_mismatch", rest] => {
                         let v: Vec<&str> = rest.splitn(3, ':').collect();
@@ -454,7 +454,7 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
                     // success, which is what makes it worth saying out loud.
                     ["no_references", lang] => {
                         eprintln!(
-                            "warning: '{lang}' analysis produced definitions but no references, so no call edges came from it. The analyzer reported success, so this is its output being incomplete rather than a crash. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see its own diagnostics"
+                            "warning: '{lang}' analysis produced definitions but no references, so no call edges came from it. The analyzer reported success, so this is its output being incomplete rather than a crash. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --force` to see its own diagnostics"
                         );
                     }
                     ["zero_nodes", lang] => {
@@ -467,7 +467,7 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
                             // agent `=warn` for this same condition. Two
                             // surfaces naming two levels for one problem is how
                             // the advice starts drifting.
-                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help. The cause is in the analyzer's own output: re-run `RUST_LOG=travsr_plugin_host=warn travsr init --semantic --force` to see it. It may be this project (a missing SDK, an unbuildable project, or a build that skips part of its sources), or it may be how travsr invoked the analyzer"
+                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help. The cause is in the analyzer's own output: re-run `RUST_LOG=travsr_plugin_host=warn travsr init --force` to see it. It may be this project (a missing SDK, an unbuildable project, or a build that skips part of its sources), or it may be how travsr invoked the analyzer"
                         );
                         // Name the concrete thing to check rather than leaving
                         // the possible causes as the only clue: the catalog
@@ -538,12 +538,12 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
                     // analyzer that is not installed is a capability question
                     // `travsr lang list` answers rather than a failed run.
                     ["emitter_missing", lang] => eprintln!(
-                        "warning: full '{lang}' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) could not be started, so cross-file call and reference edges are missing. This happens when the travsr binary is run from outside its install layout. Set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr), then re-run `travsr init --semantic --force`"
+                        "warning: full '{lang}' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) could not be started, so cross-file call and reference edges are missing. This happens when the travsr binary is run from outside its install layout. Set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr), then re-run `travsr init --force`"
                     ),
                     ["emitter_failed", lang] => {
                         let analyzer = travsr_daemon::lsif_analyzer_name(lang);
                         eprintln!(
-                            "warning: full '{lang}' analysis is incomplete: {analyzer} started but failed, so cross-file call and reference edges are missing. Re-run `RUST_LOG=travsr_daemon=warn,travsr_plugin_host=warn travsr init --semantic --force` to see its error"
+                            "warning: full '{lang}' analysis is incomplete: {analyzer} started but failed, so cross-file call and reference edges are missing. Re-run `RUST_LOG=travsr_daemon=warn,travsr_plugin_host=warn travsr init --force` to see its error"
                         )
                     }
                     // E6: SCIP definitions that did not unify onto their Phase A
@@ -570,7 +570,7 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
                             missed,
                         );
                         let tail = if rows.is_empty() {
-                            "run `travsr init --semantic` once to record which definitions they are"
+                            "run `travsr init` once to record which definitions they are"
                         } else {
                             "the unreconciled definitions are listed below"
                         };
@@ -743,6 +743,23 @@ mod tests {
         );
     }
     use super::*;
+
+    /// `--semantic` does nothing any more, so no advice may name it: a user who
+    /// copies `travsr init --semantic --force` gets `travsr init --force` at
+    /// best, and a hidden flag in a remedy reads as the step that mattered.
+    #[test]
+    fn no_advice_names_the_retired_semantic_flag() {
+        let flag = concat!("init --", "semantic");
+        for (file, src) in [
+            ("status.rs", include_str!("status.rs")),
+            ("lang.rs", include_str!("lang.rs")),
+            ("faq.txt", include_str!("faq.txt")),
+        ] {
+            for line in src.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                assert!(!line.contains(flag), "{file}: {line}");
+            }
+        }
+    }
 
     /// The default language block: one plain line per language that is not
     /// simply ready, and a note where calls are not traced as you edit. Never

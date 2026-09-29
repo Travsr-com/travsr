@@ -898,7 +898,7 @@ fn cmd_install(
              travsr ('{}') was not found next to the travsr binary, so full cross-file \
              analysis stays off and basic analysis still runs.\n\
              Reinstall travsr so the analyzer sits beside the binary, then re-run \
-             `travsr init --semantic --force`.",
+             `travsr init --force`.",
             entry.command
         );
     } else if enabled_here {
@@ -1794,7 +1794,7 @@ fn cmd_allow_unsandboxed(
 
     println!(
         "Permission recorded for '{language}'.\n\
-         Re-index to use it now:  travsr init --semantic --force\n\
+         Re-index to use it now:  travsr init --force\n\
          To withdraw it later:    travsr lang allow-unsandboxed {language} --revoke"
     );
     Ok(())
