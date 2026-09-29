@@ -1317,6 +1317,33 @@ fn rebase_in_progress(git_dir: &Path) -> bool {
     git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir()
 }
 
+/// Whether reindexing `path` can drop committed call edges: only a file in a
+/// language whose calls are traced.
+fn change_can_drop_calls(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    Language::from_extension(ext)
+        .is_some_and(|l| travsr_plugin_host::phase_b::lookup(l.as_str()).is_some())
+}
+
+#[cfg(test)]
+mod traced_change_tests {
+    /// Reindexing a file whose language has no traced calls cannot drop a
+    /// call edge, so it must not mark the index stale: `init`'s own
+    /// `.cursor/mcp.json` write did, right after a complete run.
+    #[test]
+    fn only_a_file_with_traced_calls_can_leave_calls_stale() {
+        for path in ["main.go", "src/a.ts", "pkg/b.py"] {
+            assert!(super::change_can_drop_calls(path), "{path}");
+        }
+        for path in [".cursor/mcp.json", "README.md", ".gitignore", "go.mod"] {
+            assert!(!super::change_can_drop_calls(path), "{path}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod rebase_tests {
     /// Git leaves `REBASE_HEAD` behind after a rebase finishes, so it is not
@@ -5678,6 +5705,9 @@ pub fn reindex_files_reporting(
     // instead of degrading them to the `@workspace` sentinel.
     let mut member_manifests: Vec<PathBuf> = Vec::new();
     let mut any_changed = false;
+    // A change that can drop committed call edges (#583), as opposed to one to
+    // a file whose language has no traced calls.
+    let mut calls_changed = false;
     // Accumulate Tier-0 dirty callers across all files in this batch.
     let mut callers_all = travsr_core::DirtySet::default();
     // RFC-027 #813 P2: per-file changed-definition committed occurrences, for the
@@ -5726,6 +5756,7 @@ pub fn reindex_files_reporting(
                             callers_all.extend(callers);
                         }
                         any_changed = true;
+                        calls_changed |= change_can_drop_calls(&vname_path);
                     }
                     Err(e) => tracing::warn!(path = %vname_path, err = %e, "delete_file failed"),
                 }
@@ -5821,6 +5852,7 @@ pub fn reindex_files_reporting(
                     ));
                 }
                 any_changed = true;
+                calls_changed |= change_can_drop_calls(&vname_path);
                 written_paths.push(vname_path.clone());
                 // Collect FFI markers for the repo-level pass (RFC-005).
                 all_ffi_markers.extend(out.ffi_markers);
@@ -5903,20 +5935,23 @@ pub fn reindex_files_reporting(
         // so the two markers stay equal while the graph is degraded below the
         // committed snapshot. Record that here so `travsr status` can say so
         // instead of reporting `complete`. Cleared by the next completed Phase
-        // B run, which is still commit-gated on purpose.
-        let _ = store.set_meta("phase_b_dirty", "1");
-        // A monotonic counter beside the flag, so a run that clears the flag can
-        // tell whether anything marked it dirty *while that run was working*.
-        // The flag alone cannot answer that: it is already "1" in the case that
-        // matters, so a before/after comparison of its value sees no change and
-        // clears a degradation that arrived mid-run (#742 review).
-        let seq = store
-            .get_meta(PHASE_B_DIRTY_SEQ)
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-        let _ = store.set_meta(PHASE_B_DIRTY_SEQ, &seq.wrapping_add(1).to_string());
+        // B run, which is still commit-gated on purpose. A file with no traced
+        // calls (a config file `connect` wrote) cannot drop one.
+        if calls_changed {
+            let _ = store.set_meta("phase_b_dirty", "1");
+            // A monotonic counter beside the flag, so a run that clears the flag can
+            // tell whether anything marked it dirty *while that run was working*.
+            // The flag alone cannot answer that: it is already "1" in the case that
+            // matters, so a before/after comparison of its value sees no change and
+            // clears a degradation that arrived mid-run (#742 review).
+            let seq = store
+                .get_meta(PHASE_B_DIRTY_SEQ)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let _ = store.set_meta(PHASE_B_DIRTY_SEQ, &seq.wrapping_add(1).to_string());
+        }
 
         // Recompute k-core shell numbers so they stay fresh after every commit.
         // O(V + E) — fast enough to run inline on the hook path at MVP scale.
