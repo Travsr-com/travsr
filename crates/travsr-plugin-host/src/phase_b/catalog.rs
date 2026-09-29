@@ -507,7 +507,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             "github.com/scip-code/scip-go/cmd/scip-go@latest",
         ]),
         extensions: &[".go"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -573,7 +573,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             windows_pin: Some("v0.12.3"),
         }),
         extensions: &[".java"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -612,7 +612,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             sha256_fn: Some(kls_sha256),
         }),
         extensions: &[".kt", ".kts"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -643,7 +643,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         ],
         scip_install: ScipInstall::Manual,
         extensions: &[".scala", ".sbt"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -676,7 +676,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             windows_pin: None,
         }),
         extensions: &[".rb"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -704,7 +704,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         elevated_hosts: &[],
         scip_install: ScipInstall::Manual,
         extensions: &[".php"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -736,7 +736,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             "scip-dotnet",
         ]),
         extensions: &[".cs", ".csx"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -770,7 +770,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             windows_pin: None,
         }),
         extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -804,7 +804,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             windows_pin: None,
         }),
         extensions: &[".c", ".h"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -833,7 +833,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             windows_pin: None,
         }),
         extensions: &[".swift"],
-        wrapper_version_fallback: "v0.3.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -862,7 +862,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             windows_pin: None,
         }),
         extensions: &[".m", ".mm"],
-        wrapper_version_fallback: "v0.3.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -898,7 +898,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             windows_pin: None,
         }),
         extensions: &[".dart"],
-        wrapper_version_fallback: "v0.3.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -1175,5 +1175,18 @@ mod vendored_hash_tests {
                 );
             }
         }
+    }
+
+    /// Every travsr-lang wrapper ships in one release, so the offline fallback
+    /// is one tag: a partial bump sends some languages to a years-old wrapper
+    /// whenever the GitHub API is unreachable or rate limited.
+    #[test]
+    fn wrapper_fallbacks_name_one_release() {
+        let tags: std::collections::BTreeSet<_> = CATALOG
+            .iter()
+            .filter(|e| e.provider_binary.is_some())
+            .map(|e| e.wrapper_version_fallback)
+            .collect();
+        assert_eq!(tags.len(), 1, "{tags:?}");
     }
 }
