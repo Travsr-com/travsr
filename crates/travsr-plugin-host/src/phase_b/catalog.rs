@@ -539,7 +539,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         native_phase_b: true,
         has_share_assets: false,
         runtime_driver: Some("node"),
-        prerequisites: "Node.js (runs the bundled Python analyzer)",
+        prerequisites: "Node.js",
     },
     PhaseBEntry {
         language: "java",

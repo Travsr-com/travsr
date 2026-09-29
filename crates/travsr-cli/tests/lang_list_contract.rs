@@ -209,6 +209,36 @@ fn every_row_carries_its_readiness() {
     }
 }
 
+/// Plan 3.0 on the text table: every default line reads plainly, including with
+/// an installed tool whose version is readable (which used to print a
+/// `sidecars:` block here; `travsr status --verbose` still shows it).
+#[cfg(unix)]
+#[test]
+fn text_table_reads_plainly() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join(".travsr/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let tool = bin.join("scip-ruby");
+    std::fs::write(&tool, "#!/bin/sh\necho 0.4.7\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = Command::new(travsr())
+        .args(["lang", "list"])
+        .env("HOME", home.path())
+        .env("TRAVSR_LANG_TOML", home.path().join("lang.toml"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        travsr_plugin_host::phase_b::status::jargon_in(&stdout),
+        None,
+        "{stdout}"
+    );
+}
+
 // ── Part B item 2: `--version` for a hash-pinned language ────────────────────
 
 /// The reported behaviour, on a language whose analyzer is hash-pinned on every

@@ -552,12 +552,6 @@ fn cmd_list(language: Option<&str>, json: bool) -> Result<()> {
         }
     }
 
-    // RFC-025 §8: sidecar version health for the installed Phase B tools
-    // (installed vs required vs latest), with the exact remedy. Text output only
-    // — the JSON branch returned above.
-    println!();
-    crate::sidecar_health::print_block();
-
     Ok(())
 }
 
