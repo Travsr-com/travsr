@@ -787,13 +787,9 @@ fn cmd_install(
     };
     let full_ready = provider_ready && tool_ready;
 
-    // One PATH hint per `lang install` run, not one per downloaded binary — the
-    // wrapper and the underlying analyzer used to each print the identical
-    // "add ~/.travsr/bin to your PATH" block back to back when both were fresh
-    // downloads, telling the user the same thing twice in a row.
-    if !crate::install::path_contains_travsr_bin() {
-        eprintln!("\n{}", crate::install::path_hint());
-    }
+    // No PATH hint (plan 9.2.2): travsr finds its tools in ~/.travsr/bin itself
+    // and the user never runs them directly, so the advice cost a beginner a
+    // shell edit for nothing.
 
     // The success line at the end of this function carries the repo-scope
     // confirmation ("... on for this repository") when the language was enabled

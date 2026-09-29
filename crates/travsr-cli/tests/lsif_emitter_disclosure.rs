@@ -224,7 +224,7 @@ fn missing_emitter_is_disclosed_on_init_in_meta_and_in_status() {
         "the summary must name the override that is wrong:\n{combined}"
     );
     assert!(
-        combined.contains("semantic analysis produced symbols for: typescript"),
+        combined.contains("Traced calls"),
         "the native pass did run and may still be reported, just not alone:\n{combined}"
     );
     // The marker advances (the native pass is current at HEAD), exactly as it

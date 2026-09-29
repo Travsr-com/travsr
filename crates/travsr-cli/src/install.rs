@@ -219,27 +219,6 @@ pub fn travsr_bin_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The "add ~/.travsr/bin to your PATH" hint, in the host's own shell syntax.
-///
-/// #588: every call site printed `export PATH="$HOME/.travsr/bin:$PATH"` and
-/// told the user to edit `~/.zshrc`. On Windows that is three pieces of advice
-/// none of which apply, printed at the one moment the user has just installed a
-/// binary they now need to find.
-pub fn path_hint() -> String {
-    if cfg!(windows) {
-        "hint: add %USERPROFILE%\\.travsr\\bin to your PATH:\n\n\
-         \t$env:PATH = \"$env:USERPROFILE\\.travsr\\bin;$env:PATH\"\n\n\
-         To make it permanent (new terminals only):\n\n\
-         \tsetx PATH \"%USERPROFILE%\\.travsr\\bin;%PATH%\"\n"
-            .to_string()
-    } else {
-        "hint: add ~/.travsr/bin to your PATH:\n\n\
-         \texport PATH=\"$HOME/.travsr/bin:$PATH\"\n\n\
-         Add this line to your ~/.zshrc or ~/.bashrc to make it permanent.\n"
-            .to_string()
-    }
-}
-
 /// Returns true if ~/.travsr/bin is present in the PATH environment variable.
 pub fn path_contains_travsr_bin() -> bool {
     let Some(home) = dirs::home_dir() else {

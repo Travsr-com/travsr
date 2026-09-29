@@ -46,6 +46,18 @@ pub enum Report {
     Silent,
 }
 
+/// What a connect run did, for `travsr init`'s one-line summary (plan 3.2).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Connected {
+    /// Tools whose server config ended the run in place, by display name.
+    pub tools: Vec<&'static str>,
+    /// Claude Code was wired and still asks once to trust the project (#829).
+    pub needs_approval: bool,
+    /// Files the user owns that this run changed (RFC-026: such writes stay
+    /// visible), repo-relative.
+    pub user_files: Vec<String>,
+}
+
 /// Options controlling a connect run. `auto()` is the zero-config path used by
 /// `travsr init`.
 pub struct ConnectOpts {
@@ -545,6 +557,20 @@ impl Tool {
         Tool::Windsurf,
         Tool::Zed,
     ];
+
+    /// The name the user knows the tool by.
+    fn display(&self) -> &'static str {
+        match self {
+            Tool::ClaudeCode => "Claude Code",
+            Tool::Cursor => "Cursor",
+            Tool::VsCodeCopilot => "VS Code Copilot",
+            Tool::GeminiCli => "Gemini CLI",
+            Tool::Antigravity => "Antigravity",
+            Tool::Codex => "Codex",
+            Tool::Windsurf => "Windsurf",
+            Tool::Zed => "Zed",
+        }
+    }
 
     fn id(&self) -> &'static str {
         match self {
@@ -1348,7 +1374,8 @@ fn rel(repo: &Path, path: &Path) -> Option<String> {
 /// Detect AI tools under `repo_root` and wire each to Travsr. Never returns an
 /// error to the caller for routine skips; the bool indicates whether anything was
 /// detected. Used by both `travsr init` and `travsr connect`.
-pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
+pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<Connected> {
+    let mut connected = Connected::default();
     let home = dirs::home_dir();
     let cmd = McpCommand::resolve();
     let verb = if opts.remove { "removed" } else { "configured" };
@@ -1544,6 +1571,11 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                             {
                                 wired = true;
                             }
+                            // A shared file the user owns (never git-ignored)
+                            // that this run actually changed.
+                            if !planned.gitignore && matches!(outcome, Outcome::Written) {
+                                connected.user_files.push(disp.clone());
+                            }
                             if matches!(planned.content, Content::JsonHook { .. })
                                 && matches!(outcome, Outcome::Written | Outcome::Unchanged)
                             {
@@ -1588,7 +1620,9 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                     // there is nothing to approve and the hint would send the
                     // user at the wrong fix.
                     if wired {
+                        connected.tools.push(tool.display());
                         if let Some(hint) = tool.approval_hint() {
+                            connected.needs_approval = true;
                             say!("{hint}");
                         }
                     }
@@ -1671,7 +1705,7 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
             "tip: no AI coding tool detected. Run `travsr connect` after installing \
              Claude Code, Cursor, Copilot, Gemini CLI, Codex, Windsurf, or Zed"
         );
-        return Ok(());
+        return Ok(connected);
     }
 
     // What is left after the refusal above: a tracked config that already holds
@@ -1694,11 +1728,17 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         }
     } else {
         match ensure_gitignored(repo_root, &gitignore, &unignore) {
-            Ok(Outcome::Written) if already_tracked.is_empty() => say!(
-                "  {} .gitignore (generated files are local-only)",
-                label(&Outcome::Written)
-            ),
-            Ok(Outcome::Written) => say!("  {} .gitignore", label(&Outcome::Written)),
+            Ok(Outcome::Written) if already_tracked.is_empty() => {
+                connected.user_files.push(".gitignore".to_string());
+                say!(
+                    "  {} .gitignore (generated files are local-only)",
+                    label(&Outcome::Written)
+                )
+            }
+            Ok(Outcome::Written) => {
+                connected.user_files.push(".gitignore".to_string());
+                say!("  {} .gitignore", label(&Outcome::Written))
+            }
             Ok(Outcome::Removed) => say!("  {} .gitignore", label(&Outcome::Removed)),
             _ => {}
         }
@@ -1712,7 +1752,7 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         );
     }
 
-    Ok(())
+    Ok(connected)
 }
 
 /// Whether a server config file ended the run actually carrying our entry: the

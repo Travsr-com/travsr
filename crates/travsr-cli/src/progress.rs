@@ -19,7 +19,7 @@
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use travsr_daemon::{InitProgress, InitStats};
+use travsr_daemon::InitProgress;
 
 /// Pulsing graph-node spinner frames (on-brand: "nodes pulse").
 const NODE: [char; 4] = ['◐', '◓', '◑', '◒'];
@@ -241,7 +241,7 @@ impl ProgressReporter {
             InitProgress::Indexing { done, total, .. } => {
                 let pct = (done * 100).checked_div(total).unwrap_or(0);
                 format!(
-                    "  {spinner} indexing  {}  {}/{}  {pct}%   {}",
+                    "  {spinner} reading files  {}  {}/{}  {pct}%   {}",
                     bar(pal, pct),
                     commas(done),
                     commas(total),
@@ -249,14 +249,11 @@ impl ProgressReporter {
                 )
             }
             InitProgress::Finalizing => {
-                format!(
-                    "  {spinner} finalizing  semantic pass   {}",
-                    pal.dim(&elapsed)
-                )
+                format!("  {spinner} tracing calls   {}", pal.dim(&elapsed))
             }
             InitProgress::SemanticRunning { langs, budget_secs } => {
                 format!(
-                    "  {spinner} semantic  {}   {}",
+                    "  {spinner} tracing calls  {}   {}",
                     semantic_langs_cell(&langs),
                     pal.dim(&semantic_tail(&langs, budget_secs, &elapsed))
                 )
@@ -266,11 +263,7 @@ impl ProgressReporter {
                 // depends on whether a daemon is running, which init decides after
                 // this pass). print_summary states it accurately; here just report
                 // that the structural pass is done.
-                format!(
-                    "  {} structural index ready   {}",
-                    pal.green("●"),
-                    pal.dim(&elapsed)
-                )
+                format!("  {} files read   {}", pal.green("●"), pal.dim(&elapsed))
             }
         }
     }
@@ -285,21 +278,21 @@ impl ProgressReporter {
             InitProgress::Indexing { done, total, .. } => {
                 let pct = (done * 100).checked_div(total).unwrap_or(0);
                 format!(
-                    "indexing {}/{} ({pct}%)  {elapsed}",
+                    "reading files {}/{} ({pct}%)  {elapsed}",
                     commas(done),
                     commas(total)
                 )
             }
-            InitProgress::Finalizing => format!("finalizing (semantic pass)  {elapsed}"),
+            InitProgress::Finalizing => format!("tracing calls  {elapsed}"),
             InitProgress::SemanticRunning { langs, budget_secs } => {
                 format!(
-                    "semantic: {}  {}",
+                    "tracing calls: {}  {}",
                     semantic_langs_cell(&langs),
                     semantic_tail(&langs, budget_secs, &elapsed)
                 )
             }
             InitProgress::PhaseBDeferred => {
-                format!("structural index ready  {elapsed}")
+                format!("files read  {elapsed}")
             }
         }
     }
@@ -394,206 +387,199 @@ fn semantic_tail(langs: &[(String, u64, bool)], budget_secs: u64, elapsed: &str)
     // Scoped wording rather than "per language": a mixed run has both kinds on
     // the line at once, and only the external ones are bounded.
     format!(
-        "(external analyzers stop at {} each{hint})   {elapsed}",
+        "(language tools stop at {} each{hint})   {elapsed}",
         fmt_dur(Duration::from_secs(budget_secs))
     )
 }
 
-/// Print the final, on-brand summary for the human modes (TTY/plain) to stdout.
-/// `--json` is handled by the caller; this is a no-op for it via the caller's
-/// branch. The summary node is fresh green; the "try" hint is shown unless quiet.
-pub fn print_summary(
-    stats: &InitStats,
-    elapsed: Duration,
-    quiet: bool,
-    daemon_running: bool,
-    languages: &[(String, travsr_plugin_host::phase_b::status::Readiness)],
-) {
-    let pal = Palette::for_stream(std::io::stdout().is_terminal());
-    let node = pal.green("●");
-    let dur = fmt_dur(elapsed);
-
-    // UX-023: the ghost sweep's result is otherwise only a `tracing` event, which
-    // the default `error` stderr filter hides (UX-002 downgraded these to WARN).
-    // Surface it on stdout — in *both* the up-to-date and normal branches — so a
-    // pruned-ghosts run, or a sweep that tripped the mass-delete breaker and
-    // pruned nothing, is visible in the summary the user actually reads.
-    let emit_ghost_note = || {
-        if stats.ghost_prune_aborted {
-            println!(
-                "  {} ghost sweep skipped, an unusual number of indexed files \
-                 vanished at once, so nothing was pruned; run \
-                 `travsr fsck --fix --force` if that was intentional",
-                pal.orange("⚠"),
-            );
-        } else if stats.ghosts_pruned > 0 {
-            println!(
-                "  {} pruned {} node(s) for files no longer on disk",
-                pal.dim("ℹ"),
-                commas(stats.ghosts_pruned),
-            );
-        }
-    };
-
-    if stats.nodes_written == 0 && stats.edges_written == 0 {
-        // Re-run with nothing to do — already fresh.
-        println!(
-            "  {node} up to date · {} nodes · {} edges · {dur}",
-            commas(stats.total_nodes),
-            commas(stats.total_edges),
-        );
-        emit_ghost_note();
-        // UX-2: "up to date" reports the Phase A delta only. When Phase B still
-        // re-ran its analyzers (e.g. after `--force`, or a re-run following a
-        // crash) the graph delta can be zero yet the semantic pass did execute —
-        // say so, so the message is not read as "nothing happened".
-        if let Some(report) = &stats.phase_b_report {
-            if !report.ran.is_empty() {
-                println!(
-                    "  {} semantic analysis re-ran for: {} (no graph changes)",
-                    pal.dim("ℹ"),
-                    report.ran.join(", "),
-                );
-            }
-        }
-        print_language_block(languages);
-        return;
-    }
-
-    // UX-006: split the two kinds of skip so the counts reconcile with the
-    // progress denominator. The bar counts indexable files (indexed + unchanged),
-    // while `ignored` files never enter the bar at all. Bundling both into one
-    // "N skipped" number made three unrelated totals (bar total, indexed, and
-    // indexed+skipped) that added up to nothing. Naming them lets the reader see
-    // `indexed + unchanged = bar total`, with `ignored` accounted separately.
-    let mut skip_parts: Vec<String> = Vec::new();
-    if stats.files_skipped_unchanged > 0 {
-        skip_parts.push(format!(
-            "{} unchanged",
-            commas(stats.files_skipped_unchanged)
-        ));
-    }
-    if stats.files_skipped_ignored > 0 {
-        skip_parts.push(format!("{} ignored", commas(stats.files_skipped_ignored)));
-    }
-    let skipped_note = if skip_parts.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", skip_parts.join(", "))
-    };
-    // UX-003: the counts written this pass are a *delta*, not the graph total, so
-    // "0 nodes · 6,028 edges" looked self-contradictory and matched neither the
-    // real graph nor `travsr status`. Show `+delta/total` for both so the pass
-    // change and the resulting totals (which `status` reports) are both explicit.
-    println!(
-        "  {node} indexed {} files{skipped_note} · +{}/{} nodes · +{}/{} edges · {dur}",
-        commas(stats.files_indexed),
-        commas(stats.nodes_written.max(0) as u64),
-        commas(stats.total_nodes),
-        commas(stats.edges_written),
-        commas(stats.total_edges),
-    );
-    emit_ghost_note();
-
-    match &stats.phase_b_report {
-        None => {
-            if daemon_running {
-                // A daemon is up (interactive init spawned one, or one was already
-                // running). It auto-arms Phase B on startup and indexes semantic
-                // call edges in the background for the current commit — so this is
-                // genuinely "in progress", not commit-gated.
-                println!(
-                    "  {} semantic call edges are indexing in the background; run `travsr status` to check progress",
-                    pal.dim("ℹ"),
-                );
-            } else {
-                // No daemon running (non-interactive / CI, or spawn failed): Phase
-                // B waits for one. The git-commit hook starts a daemon, or the user
-                // can build the edges now, synchronously.
-                println!(
-                    "  {} semantic call edges will build once a daemon is running, your next `git commit` starts one, or run `travsr init --semantic` to build them now",
-                    pal.dim("ℹ"),
-                );
-            }
-        }
-        Some(report) => {
-            // UX-8: `ran` includes languages whose analyzer executed but emitted
-            // zero symbols. Calling those "enabled" reads to the user as "working",
-            // so report only the languages that actually produced symbols here, and
-            // call out the ones that ran dry separately (matches the `travsr status`
-            // zero-node warning rather than masking it under "enabled").
-            let produced: Vec<&str> = report
-                .ran
-                .iter()
-                .filter(|l| !report.produced_no_nodes.contains(l))
-                .map(String::as_str)
-                .collect();
-            if !produced.is_empty() {
-                let langs = produced.join(", ");
-                println!(
-                    "  {} semantic analysis produced symbols for: {langs}",
-                    pal.dim("ℹ"),
-                );
-            }
-            // Plan 3.0: each language's state and fix come from the readiness
-            // block below, in plain words; the per-class detail (which analyzer,
-            // which environment variable, which rebuild) is `travsr status
-            // --verbose`. What an analyzer said itself (#904) stays: a missing
-            // Android SDK in AGP's own words is the user's next step.
-            if report.produced_no_nodes.iter().any(|l| l == "java") {
-                if let Some(hint) = macos_java_bash_hint() {
-                    println!("    {hint}");
-                }
-            }
-            for d in &report.diagnostics {
-                println!(
-                    "  {} {} analysis: {} [{}]",
-                    pal.orange("⚠"),
-                    d.lang,
-                    d.message,
-                    d.code,
-                );
-            }
-            // #878: the type-checked pass's own error, for the same reason.
-            for skip in &report.lsif_skipped {
-                println!("  {} {}: {}", pal.orange("⚠"), skip.language, skip.detail);
-            }
-        }
-    }
-
-    print_language_block(languages);
-
-    if stats.travsrignore_scaffolded {
-        println!(
-            "  {} created .travsrignore, customize to exclude generated dirs, vendored deps, etc.",
-            pal.dim("ℹ"),
-        );
-    }
-
-    // #893: `.gitignore` is a tracked, user-authored file. RFC-026's rule that
-    // writes to those stay visible applies to this one too.
-    if stats.gitignore_scaffolded {
-        println!(
-            "  {} added /.travsr/ to .gitignore, the graph is local-only",
-            pal.dim("ℹ"),
-        );
-    }
-
-    if !quiet {
-        println!(
-            "    {}",
-            pal.dim(r#"try: travsr ask "what calls PaymentService?""#)
-        );
-    }
+/// How calls got traced this run, for the `init` summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Traced {
+    /// Traced before `init` returned.
+    Done,
+    /// Left to the background process, which is running.
+    Background,
+    /// Nothing is running to trace them (a CI run); the next commit will.
+    AtNextCommit,
 }
 
-/// The languages that are not ready, one line each with their fix, the same
-/// lines `travsr status` prints.
-fn print_language_block(languages: &[(String, travsr_plugin_host::phase_b::status::Readiness)]) {
-    for (lang, r) in languages {
-        if let Some(line) = crate::status::readiness_line(lang, r) {
-            println!("{line}");
+/// Everything the `init` summary says, gathered as `init` runs, so the whole
+/// summary is one pure function with a golden test (plan S9).
+pub struct InitSummary {
+    pub repo: String,
+    /// Detected languages, by the name the user knows them by.
+    pub found: Vec<&'static str>,
+    /// Downloads stopped at the first network failure.
+    pub offline: bool,
+    /// `installed`, `failed` or `skipped`, as in `--json`'s `search_ranking`.
+    pub ranking: &'static str,
+    pub files_read: u64,
+    /// Nothing changed since the last run.
+    pub no_op: bool,
+    pub traced: Traced,
+    /// `running`, `started` or `not_started`, as in `--json`'s `keeping_fresh`.
+    pub keeping_fresh: &'static str,
+    pub connected: crate::connect::Connected,
+    pub travsrignore_created: bool,
+    pub gitignore_updated: bool,
+    pub ghosts_pruned: u64,
+    pub ghost_prune_aborted: bool,
+    pub languages: Vec<(String, travsr_plugin_host::phase_b::status::Readiness)>,
+    /// What analyzers said themselves (#904, #878), shown as they said it.
+    pub diagnostics: Vec<String>,
+    /// This repo has not turned on meaning-based search (decision 3: optional).
+    pub embed_optional: bool,
+    pub quiet: bool,
+}
+
+/// The final line. Stable, because agents key on it (G6).
+pub const READY: &str = "Ready. Ask your AI about this code.";
+pub const READY_NO_CHANGE: &str = "Ready. Nothing changed since the last run.";
+
+/// The `init` summary in plain words (plan 3.0, 3.2): one line per stage, the
+/// `Ready` line, then each language that is not ready with its one fix.
+pub fn render_summary(s: &InitSummary) -> Vec<String> {
+    let mut out = Vec::new();
+    let full = !s.no_op && !s.quiet;
+    if s.offline {
+        out.push(
+            "  ! No network, so some language tools were not downloaded. Run `travsr init` \
+             again when online."
+                .to_string(),
+        );
+    }
+    if full {
+        out.insert(0, format!("travsr  Setting up {}", s.repo));
+        let mut stage = |text: String| out.push(format!("  \u{2713} {text}"));
+        if !s.found.is_empty() {
+            stage(format!("Found {}", s.found.join(", ")));
         }
+        if !s.offline {
+            stage("Got language tools".to_string());
+        }
+        if s.ranking == "installed" {
+            stage("Got search ranking".to_string());
+        }
+        stage(format!(
+            "Read {} file{}",
+            commas(s.files_read),
+            if s.files_read == 1 { "" } else { "s" }
+        ));
+        match s.traced {
+            Traced::Done => stage("Traced calls".to_string()),
+            Traced::Background => stage(
+                "Tracing calls in the background (`travsr status` shows progress)".to_string(),
+            ),
+            Traced::AtNextCommit => {}
+        }
+        if s.keeping_fresh != "not_started" {
+            stage("Keeping it fresh on every commit".to_string());
+        }
+        if !s.connected.tools.is_empty() {
+            stage(format!("Connected to {}", s.connected.tools.join(", ")));
+        }
+        if s.ranking == "failed" {
+            out.push(
+                "  ! Could not get search ranking; results are ordered by text match until \
+                 `travsr init` runs again online."
+                    .to_string(),
+            );
+        }
+        if s.traced == Traced::AtNextCommit {
+            out.push("  Calls will be traced at your next commit.".to_string());
+        }
+        if s.connected.needs_approval {
+            out.push(
+                "  Claude Code asks once whether to trust this project's tools: accept it \
+                 (or run /mcp in Claude Code)."
+                    .to_string(),
+            );
+        }
+        if s.ghost_prune_aborted {
+            out.push(
+                "  ! Kept the entries for missing files: an unusual number vanished at once. \
+                 Run `travsr fsck --fix --force` if that was intended."
+                    .to_string(),
+            );
+        } else if s.ghosts_pruned > 0 {
+            out.push(format!(
+                "  Removed {} entr{} for files no longer on disk.",
+                commas(s.ghosts_pruned),
+                if s.ghosts_pruned == 1 { "y" } else { "ies" }
+            ));
+        }
+        if s.travsrignore_created {
+            out.push(
+                "  Created .travsrignore: edit it to leave generated or vendored folders out."
+                    .to_string(),
+            );
+        }
+        let mut changed: Vec<&str> = s.connected.user_files.iter().map(String::as_str).collect();
+        if s.gitignore_updated && !changed.contains(&".gitignore") {
+            changed.push(".gitignore");
+        }
+        if !changed.is_empty() {
+            out.push(format!(
+                "  Updated {} so travsr's files stay on this machine.",
+                changed.join(", ")
+            ));
+        }
+        if s.embed_optional {
+            out.push("  Optional: `travsr embed init` adds meaning-based search.".to_string());
+        }
+    }
+    out.push(if s.no_op { READY_NO_CHANGE } else { READY }.to_string());
+    for (lang, r) in &s.languages {
+        if let Some(line) = crate::status::readiness_line(lang, r) {
+            out.push(line);
+        }
+    }
+    out.extend(s.diagnostics.iter().cloned());
+    out
+}
+
+/// What the analyzers said about this run in their own words (#904, #878),
+/// plus the macOS Java hint: the user's next step when the plain readiness line
+/// alone would leave them guessing.
+pub fn analyzer_words(report: &travsr_daemon::PhaseBReport) -> Vec<String> {
+    let mut out = Vec::new();
+    if report.produced_no_nodes.iter().any(|l| l == "java") {
+        if let Some(hint) = macos_java_bash_hint() {
+            out.push(format!("    {hint}"));
+        }
+    }
+    for d in &report.diagnostics {
+        out.push(format!(
+            "  ! {} analysis: {} [{}]",
+            d.lang, d.message, d.code
+        ));
+    }
+    for skip in &report.lsif_skipped {
+        out.push(format!("  ! {}: {}", skip.language, skip.detail));
+    }
+    out
+}
+
+/// The name a user knows a catalog language by.
+pub fn language_name(lang: &str) -> &'static str {
+    match lang {
+        "typescript" => "TypeScript",
+        "javascript" => "JavaScript",
+        "python" => "Python",
+        "rust" => "Rust",
+        "go" => "Go",
+        "java" => "Java",
+        "kotlin" => "Kotlin",
+        "scala" => "Scala",
+        "csharp" => "C#",
+        "cpp" => "C++",
+        "c" => "C",
+        "ruby" => "Ruby",
+        "php" => "PHP",
+        "swift" => "Swift",
+        "objectivec" => "Objective-C",
+        "dart" => "Dart",
+        _ => "another language",
     }
 }
 
@@ -801,7 +787,7 @@ pub(crate) fn macos_java_bash_hint() -> Option<String> {
         return None;
     }
     Some(format!(
-        "note: scip-java's javac shim requires bash 4.4+, but this Mac's `bash` is {major}.{minor}. Install a newer bash (`brew install bash`) and put it ahead of /bin/bash on PATH, otherwise Java semantic indexing silently produces no call edges."
+        "note: tracing Java calls needs bash 4.4 or newer, and this Mac's `bash` is {major}.{minor}. Install a newer bash (`brew install bash`) and put it ahead of /bin/bash on PATH, or Java calls will not be traced."
     ))
 }
 
@@ -824,6 +810,106 @@ fn parse_bash_version(text: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary() -> InitSummary {
+        use travsr_plugin_host::phase_b::status::Readiness;
+        InitSummary {
+            repo: "maya-app".into(),
+            found: vec!["TypeScript", "Python", "Java"],
+            offline: false,
+            ranking: "installed",
+            files_read: 5,
+            no_op: false,
+            traced: Traced::Done,
+            keeping_fresh: "started",
+            connected: crate::connect::Connected {
+                tools: vec!["Claude Code", "Cursor"],
+                needs_approval: true,
+                user_files: vec![".gitignore".into()],
+            },
+            travsrignore_created: true,
+            gitignore_updated: true,
+            ghosts_pruned: 0,
+            ghost_prune_aborted: false,
+            languages: vec![
+                ("typescript".into(), Readiness::Ready),
+                ("python".into(), Readiness::Ready),
+                (
+                    "java".into(),
+                    Readiness::NeedsToolchain {
+                        needs: "JDK, Maven or Gradle".into(),
+                    },
+                ),
+            ],
+            diagnostics: vec![],
+            embed_optional: true,
+            quiet: false,
+        }
+    }
+
+    /// Plan S9 golden output: the first run, stage by stage, then `Ready`, then
+    /// each language that is not ready with its one fix. Every line plain
+    /// (plan 3.0): no counts of internal things, no PATH, no placeholders.
+    #[test]
+    fn init_summary_golden() {
+        let lines = render_summary(&summary());
+        assert_eq!(
+            lines,
+            vec![
+                "travsr  Setting up maya-app",
+                "  \u{2713} Found TypeScript, Python, Java",
+                "  \u{2713} Got language tools",
+                "  \u{2713} Got search ranking",
+                "  \u{2713} Read 5 files",
+                "  \u{2713} Traced calls",
+                "  \u{2713} Keeping it fresh on every commit",
+                "  \u{2713} Connected to Claude Code, Cursor",
+                "  Claude Code asks once whether to trust this project's tools: accept it \
+                 (or run /mcp in Claude Code).",
+                "  Created .travsrignore: edit it to leave generated or vendored folders out.",
+                "  Updated .gitignore so travsr's files stay on this machine.",
+                "  Optional: `travsr embed init` adds meaning-based search.",
+                "Ready. Ask your AI about this code.",
+                "  java        needs JDK, Maven or Gradle. Install JDK, Maven or Gradle, then \
+                 run `travsr init`.",
+            ]
+        );
+        for line in &lines {
+            assert_eq!(
+                travsr_plugin_host::phase_b::status::jargon_in(line),
+                None,
+                "{line}"
+            );
+            assert!(!line.contains("PATH"), "{line}");
+        }
+    }
+
+    /// A re-run with nothing to do says so in one line, and still lists what the
+    /// user must do; the offline case says what to do when back online.
+    #[test]
+    fn init_summary_no_change_and_offline() {
+        let mut s = summary();
+        s.no_op = true;
+        let lines = render_summary(&s);
+        assert_eq!(lines[0], "Ready. Nothing changed since the last run.");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("java"), "{lines:?}");
+
+        let mut s = summary();
+        s.offline = true;
+        s.ranking = "skipped";
+        let lines = render_summary(&s);
+        assert!(lines.iter().any(|l| l.contains("when online")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("Got language tools")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("Ready.")).count(),
+            1,
+            "{lines:?}"
+        );
+    }
 
     #[test]
     fn commas_groups_thousands() {
@@ -945,7 +1031,7 @@ mod issue_755_heartbeat_tests {
     fn the_tail_states_the_budget_for_bounded_languages() {
         let tail = semantic_tail(&kotlin_scala(), 360, "2m 0s");
         assert!(
-            tail.contains("external analyzers stop at 6m00s each"),
+            tail.contains("language tools stop at 6m00s each"),
             "the ceiling must be stated, and scoped to what it applies to; got: {tail}"
         );
         assert!(
@@ -984,7 +1070,12 @@ mod issue_755_heartbeat_tests {
             360,
             "2m 0s",
         );
-        assert!(tail.contains("external analyzers stop at"), "got: {tail}");
+        assert!(tail.contains("language tools stop at"), "got: {tail}");
+        assert_eq!(
+            travsr_plugin_host::phase_b::status::jargon_in(&tail),
+            None,
+            "{tail}"
+        );
         assert!(
             !tail.contains("per language"),
             "the old wording claimed every language was bounded; got: {tail}"

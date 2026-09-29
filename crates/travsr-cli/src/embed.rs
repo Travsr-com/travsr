@@ -814,10 +814,6 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
             backend.binary_name,
             path.display()
         );
-
-        if !crate::install::path_contains_travsr_bin() {
-            println!("\n{}", crate::install::path_hint());
-        }
     }
 
     // Before the model download, not after: model files run to 1.3 GB, and

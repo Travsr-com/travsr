@@ -93,7 +93,8 @@ pub fn run(
             }
         }
     };
-    if offline {
+    // The human summary says this itself; `--json` names each language's state.
+    if offline && json {
         eprintln!("warning: no network. Run `travsr init` again when online to finish setting up.");
     }
 
@@ -176,38 +177,77 @@ pub fn run(
             "search_ranking": search_ranking,
             "keeping_fresh": keeping_fresh,
         });
-        println!("{summary}");
         // stdout carries the machine-readable summary, so the connect report goes
         // to stderr. It must not be dropped: these writes land in tracked,
         // user-authored files, and RFC-026 promises they stay visible.
-        maybe_connect(
+        let connected = maybe_connect(
             &repo_root,
             no_connect,
             guard,
             crate::connect::Report::Stderr,
         );
+        let mut summary = summary;
+        summary["connected"] = connected
+            .tools
+            .iter()
+            .map(|t| serde_json::Value::from(*t))
+            .collect();
+        summary["interrupted"] = false.into();
+        summary["next"] = crate::progress::READY.into();
+        println!("{summary}");
         return Ok(());
     }
 
-    // A running daemon auto-arms Phase B on startup and indexes semantic call
-    // edges in the background, so the summary must not call them commit-gated.
-    let states = readiness_of(&repo_root, &corpus, &languages, &stored_warnings(&db_path));
-    crate::progress::print_summary(
-        &stats,
-        elapsed,
-        quiet,
-        keeping_fresh != "not_started",
-        &states,
+    // Plan S9: connect first, silently, so the summary can say what it did in
+    // one line; the files it changed are named there (RFC-026).
+    let connected = maybe_connect(
+        &repo_root,
+        no_connect,
+        guard,
+        crate::connect::Report::Silent,
     );
-
-    // UX-007: a no-op re-run (nothing changed) should not reprint the setup
-    // nudges — they are advice for a fresh index, not chatter for every `init`.
     let no_op = stats.nodes_written == 0 && stats.edges_written == 0;
+    use crate::progress::{InitSummary, Traced};
+    let traced = match (&stats.phase_b_report, keeping_fresh) {
+        (Some(_), _) => Traced::Done,
+        (None, "not_started") => Traced::AtNextCommit,
+        (None, _) => Traced::Background,
+    };
+    let summary = InitSummary {
+        repo: repo_root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        found: languages
+            .iter()
+            .map(|l| crate::progress::language_name(l))
+            .collect(),
+        offline,
+        ranking: search_ranking,
+        files_read: stats.files_indexed,
+        no_op,
+        traced,
+        keeping_fresh,
+        connected,
+        travsrignore_created: stats.travsrignore_scaffolded,
+        gitignore_updated: stats.gitignore_scaffolded,
+        ghosts_pruned: stats.ghosts_pruned,
+        ghost_prune_aborted: stats.ghost_prune_aborted,
+        languages: readiness_of(&repo_root, &corpus, &languages, &stored_warnings(&db_path)),
+        diagnostics: stats
+            .phase_b_report
+            .as_ref()
+            .map(crate::progress::analyzer_words)
+            .unwrap_or_default(),
+        embed_optional: travsr_plugin_host::repo_backend_id(&repo_root).is_none(),
+        quiet,
+    };
+    for line in crate::progress::render_summary(&summary) {
+        println!("{line}");
+    }
 
-    // Tips are advisory chatter — suppress under --quiet and on no-op re-runs.
+    // DEBT-013: a repo with no commits yet has no baseline for freshness.
     if !quiet && !no_op {
-        // DEBT-013 closed: hint users whose repo has no commits yet so
-        // `travsr status` showing last_commit: (none) is not confusing.
         let check = travsr_store::SqliteStore::open(&db_path)?;
         if check.get_meta("last_commit")?.is_none() {
             println!(
@@ -216,17 +256,6 @@ pub fn run(
             );
         }
     }
-
-    maybe_connect(
-        &repo_root,
-        no_connect,
-        guard,
-        if quiet {
-            crate::connect::Report::Silent
-        } else {
-            crate::connect::Report::Stdout
-        },
-    );
 
     Ok(())
 }
@@ -238,16 +267,16 @@ fn maybe_connect(
     no_connect: bool,
     guard: Option<crate::guard::GuardMode>,
     report: crate::connect::Report,
-) {
+) -> crate::connect::Connected {
     if no_connect {
-        return;
+        return Default::default();
     }
     let mut opts = crate::connect::ConnectOpts::auto();
     opts.report = report;
     // #916: `None` unless `--guard` was passed, which is what keeps a plain
     // `travsr init` from installing enforcement nobody asked for.
     opts.guard = guard;
-    let _ = crate::connect::run(repo_root, &opts);
+    crate::connect::run(repo_root, &opts).unwrap_or_default()
 }
 
 /// Set once indexing is done and call tracing has started: from then on an
