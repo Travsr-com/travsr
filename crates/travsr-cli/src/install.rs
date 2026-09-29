@@ -913,7 +913,6 @@ pub async fn download_zip_and_extract(
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
         .join(".travsr")
         .join(extract_dir);
-    std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
 
     verify_and_extract_zip(&bytes, &dest, expected_sha256, asset_name, tag)?;
 
@@ -1641,7 +1640,31 @@ pub(crate) fn verify_and_extract_zip(
             );
         }
     }
-    extract_zip(bytes, dest).with_context(|| format!("extracting {asset_name}"))
+    // Extract beside `dest` and swap it in only once complete, so an install
+    // that stops partway never leaves a half-written tree behind a wrapper.
+    let sibling = |suffix: &str| {
+        let mut name = dest.file_name().unwrap_or_default().to_os_string();
+        name.push(suffix);
+        dest.with_file_name(name)
+    };
+    let (staging, displaced) = (sibling(".partial"), sibling(".old"));
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_dir_all(&displaced);
+    std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
+    if let Err(e) = extract_zip(bytes, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e).with_context(|| format!("extracting {asset_name}"));
+    }
+    if dest.exists() {
+        std::fs::rename(dest, &displaced)
+            .with_context(|| format!("moving aside {}", dest.display()))?;
+    }
+    if let Err(e) = std::fs::rename(&staging, dest) {
+        let _ = std::fs::rename(&displaced, dest);
+        return Err(e).with_context(|| format!("moving {} into place", staging.display()));
+    }
+    let _ = std::fs::remove_dir_all(&displaced);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1880,6 +1903,38 @@ mod extraction_tests {
 
         extract_zip(&bytes, &dest).unwrap();
         assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"binary");
+    }
+
+    /// A reinstall that stops partway (Ctrl-C, or here a bad second entry) used
+    /// to leave the first entry overwritten while the wrapper still pointed at
+    /// the tree: kotlin's server jar ended up 0 bytes and `init` kept calling
+    /// it installed. The old tree must stay whole until the new one is complete.
+    #[test]
+    fn a_reinstall_that_fails_partway_keeps_the_old_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("kls");
+        std::fs::create_dir_all(dest.join("lib")).unwrap();
+        std::fs::write(dest.join("lib/server.jar"), b"old").unwrap();
+
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        w.start_file::<_, ()>("lib/server.jar", opts).unwrap();
+        std::io::Write::write_all(&mut w, b"new").unwrap();
+        w.start_file::<_, ()>("../escaped.txt", opts).unwrap();
+        let broken = w.finish().unwrap().into_inner();
+
+        assert!(super::verify_and_extract_zip(&broken, &dest, None, "server.zip", "1").is_err());
+        assert_eq!(std::fs::read(dest.join("lib/server.jar")).unwrap(), b"old");
+
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file::<_, ()>("lib/server.jar", opts).unwrap();
+        std::io::Write::write_all(&mut w, b"new").unwrap();
+        let good = w.finish().unwrap().into_inner();
+
+        super::verify_and_extract_zip(&good, &dest, None, "server.zip", "1").unwrap();
+        assert_eq!(std::fs::read(dest.join("lib/server.jar")).unwrap(), b"new");
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(left.len(), 1, "no staging or displaced tree is left behind");
     }
 }
 
