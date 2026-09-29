@@ -263,13 +263,6 @@ pub fn readiness(c: &RepoCapability) -> Readiness {
             needs: needs.to_string(),
         };
     }
-    // A bundled analyzer's prerequisite is travsr's own runtime, already checked
-    // above, so a run with no symbols there has no known cause.
-    if c.last_warning == Some("zero_nodes") && known_prerequisite && !c.entry.analyzer_bundled() {
-        return Readiness::NeedsToolchain {
-            needs: prerequisites.to_string(),
-        };
-    }
     // A bundled emitter that could not be found or started ships with travsr,
     // so `travsr init` cannot restore it; send the user to the reason instead.
     if c.entry.analyzer_bundled()
@@ -644,9 +637,20 @@ mod tests {
                 needs("swiftc"),
             ),
             (
-                "no symbols with a known prerequisite is a toolchain problem",
+                // Nothing is missing, so "needs JDK, Maven or Gradle" would be
+                // false (this repo's java fixtures have no pom.xml).
+                "no symbols with every checked tool present",
                 RepoCapability {
                     last_warning: Some("zero_nodes"),
+                    ..repo("java")
+                },
+                Readiness::Failed,
+            ),
+            (
+                "no symbols with the driver missing names the prerequisite",
+                RepoCapability {
+                    last_warning: Some("zero_nodes"),
+                    driver_missing: Some("java".into()),
                     ..repo("java")
                 },
                 needs("JDK, Maven or Gradle"),

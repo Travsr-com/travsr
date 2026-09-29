@@ -330,24 +330,7 @@ pub(crate) fn decode_phase_b_warnings(warnings: &str) -> HashMap<String, (&'stat
         // per-class detail (which analyzer, which rebuild) is `status --verbose`.
         let (state, readiness) = match class {
             "crashed" | "no_references" | "version_mismatch" | "emitter_failed"
-            | "emitter_missing" => ("failed", Readiness::Failed),
-            // The same rung `readiness` applies: a run with no symbols whose
-            // analyzer has a known prerequisite points at that prerequisite.
-            "zero_nodes" => {
-                let needs = travsr_plugin_host::phase_b::catalog::lookup(lang)
-                    .filter(|e| !e.analyzer_bundled())
-                    .map(|e| e.effective_prerequisites())
-                    .filter(|p| !p.is_empty() && *p != "none");
-                match needs {
-                    Some(needs) => (
-                        "failed",
-                        Readiness::NeedsToolchain {
-                            needs: needs.to_string(),
-                        },
-                    ),
-                    None => ("failed", Readiness::Failed),
-                }
-            }
+            | "emitter_missing" | "zero_nodes" => ("failed", Readiness::Failed),
             // All of these are what `travsr init` sets up itself: install,
             // registration, trust, the unsandboxed permission (plan 4.4).
             "needs_consent"
@@ -2389,6 +2372,17 @@ mod tests {
                 "em-dash in {class:?}: {detail}"
             );
         }
+    }
+
+    /// A run with no symbols proves nothing is missing: `travsr status` says
+    /// "needs" only for a tool it found absent, so this must not claim one.
+    #[test]
+    fn zero_nodes_does_not_claim_a_missing_tool() {
+        let decoded = decode_phase_b_warnings("zero_nodes:java");
+        assert_eq!(
+            decoded.get("java").map(|(_, d)| d.as_str()),
+            Some("java: could not trace calls. See `travsr status --verbose`.")
+        );
     }
 
     /// The blocking half of #636 round-5: a trust-gated language must never
