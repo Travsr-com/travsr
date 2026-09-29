@@ -1312,6 +1312,31 @@ fn phase_b_inline_needed(
 /// cover.
 const PHASE_B_DIRTY_SEQ: &str = "phase_b_dirty_seq";
 
+/// Whether git is in the middle of a rebase: its state directory exists.
+fn rebase_in_progress(git_dir: &Path) -> bool {
+    git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir()
+}
+
+#[cfg(test)]
+mod rebase_tests {
+    /// Git leaves `REBASE_HEAD` behind after a rebase finishes, so it is not
+    /// evidence of one in progress; the state directories are (#L13).
+    #[test]
+    fn only_a_rebase_state_directory_means_a_rebase_is_in_progress() {
+        let git = tempfile::tempdir().unwrap();
+        std::fs::write(git.path().join("REBASE_HEAD"), "0b0492a\n").unwrap();
+        assert!(
+            !super::rebase_in_progress(git.path()),
+            "leftover REBASE_HEAD"
+        );
+        for dir in ["rebase-merge", "rebase-apply"] {
+            let g = tempfile::tempdir().unwrap();
+            std::fs::create_dir(g.path().join(dir)).unwrap();
+            assert!(super::rebase_in_progress(g.path()), "{dir}");
+        }
+    }
+}
+
 /// Like [`init_repo`], but reports progress via `on_progress` so the CLI can
 /// show that a long indexing run is alive (issue #293). The callback is invoked
 /// on the indexing thread; keep it cheap.
@@ -1722,7 +1747,7 @@ pub fn init_repo_with_progress(
 
     // L13: warn if a rebase is in progress — init during rebase risks indexing
     // conflict-marker noise into graph.db; the user should finish rebasing first.
-    if repo_root.join(".git").join("REBASE_HEAD").exists() {
+    if rebase_in_progress(&repo_root.join(".git")) {
         eprintln!(
             "warning: a git rebase is in progress, consider finishing or aborting it \
              before running `travsr init` to avoid indexing conflict markers"
