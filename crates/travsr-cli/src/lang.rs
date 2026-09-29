@@ -115,6 +115,10 @@ pub enum LangCommand {
     },
 }
 
+/// Exit code of `lang install` when it could not reach the network, so `init`
+/// stops downloading instead of waiting out the same timeout per language.
+pub(crate) const OFFLINE_EXIT: i32 = 3;
+
 /// Exit code 2: wrapper installed but underlying SCIP tool missing (partial install).
 /// Callers that dispatch install directly should exit(2) on this variant.
 #[derive(Debug, PartialEq)]
@@ -143,9 +147,14 @@ pub fn run(cmd: LangCommand) -> Result<()> {
                 skip_wrapper,
                 yes,
                 version.as_deref(),
-            )? {
-                InstallStatus::WrapperOnly => std::process::exit(2),
-                InstallStatus::FullyReady => Ok(()),
+            ) {
+                Ok(InstallStatus::WrapperOnly) => std::process::exit(2),
+                Ok(InstallStatus::FullyReady) => Ok(()),
+                Err(e) if is_network_error(&e) => {
+                    eprintln!("error: {e:#}");
+                    std::process::exit(OFFLINE_EXIT)
+                }
+                Err(e) => Err(e),
             }
         }
         LangCommand::Detect { yes } => cmd_detect(yes),

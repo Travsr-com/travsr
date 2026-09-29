@@ -964,3 +964,43 @@ fn init_wires_claude_code_from_a_home_marker_without_a_path_note() {
     );
     assert!(!text.contains("PATH"), "no PATH instruction (G2):\n{text}");
 }
+
+/// Setup output stays hidden unless an install fails. Here every download is
+/// refused, so the install fails and `init` shows what it printed, then carries
+/// on offline and still finishes.
+#[test]
+fn a_failed_language_install_shows_its_output_and_init_finishes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(
+        tmp.path().join("main.go"),
+        "package main\n\nfunc main() {}\n",
+    )
+    .unwrap();
+    let out = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env_remove("TRAVSR_SKIP_DOWNLOAD")
+        .env("HOME", home.path())
+        .env("TRAVSR_LANG_TOML", home.path().join("lang.toml"))
+        .env("TRAVSR_LANG_RELEASES_BASE", "http://127.0.0.1:9")
+        .env("TRAVSR_LANG_API_URL", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .current_dir(tmp.path())
+        .arg("init")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Could not get the language tools for Go. What went wrong:"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("  error:"),
+        "the install's own output: {stderr}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Ready"));
+}

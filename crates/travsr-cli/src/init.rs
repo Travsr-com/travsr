@@ -77,7 +77,7 @@ pub fn run(
         let states = readiness_of(&repo_root, &corpus, &languages, &stored_warnings(&db_path));
         let to_set_up = languages_to_set_up(&states);
         if !to_set_up.is_empty() {
-            offline = crate::lang::install_selected(&to_set_up, true, true, Some(&corpus));
+            offline = install_languages(&to_set_up, &corpus, quiet);
         }
     }
     let search_ranking = if travsr_mcp::rerank_model_installed() {
@@ -293,6 +293,76 @@ fn interrupt_note(outcome: Option<crate::daemon_client::SpawnOutcome>) -> &'stat
 }
 
 /// Languages `travsr init` can set up itself; the rest need the user.
+/// How one language's `travsr lang install` child ended.
+#[derive(Debug, PartialEq)]
+enum InstallOutcome {
+    Ready,
+    Failed,
+    Offline,
+}
+
+fn install_outcome(code: Option<i32>) -> InstallOutcome {
+    match code {
+        Some(0) => InstallOutcome::Ready,
+        Some(crate::lang::OFFLINE_EXIT) => InstallOutcome::Offline,
+        _ => InstallOutcome::Failed,
+    }
+}
+
+fn failed_install_report(lang: &str, output: &str) -> String {
+    let mut report = format!(
+        "Could not get the language tools for {}. What went wrong:",
+        crate::progress::language_name(lang)
+    );
+    for line in output.lines() {
+        report.push_str("\n  ");
+        report.push_str(line);
+    }
+    report
+}
+
+/// Get each language's tools in a child `travsr lang install`, so what it and
+/// the tools it runs (`go install`, `rustup`) print is shown only when the
+/// install fails. Stops at the first network failure, since every later
+/// download would wait out the same timeout; returns true when it did.
+fn install_languages(languages: &[&str], corpus: &str, quiet: bool) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return crate::lang::install_selected(languages, true, true, Some(corpus));
+    };
+    for lang in languages {
+        if !quiet {
+            eprintln!(
+                "travsr: getting language tools: {}",
+                crate::progress::language_name(lang)
+            );
+        }
+        let out = std::process::Command::new(&exe)
+            .args(["lang", "install", lang, "--yes", "--no-interactive"])
+            .args(["--corpus", corpus])
+            .stdin(std::process::Stdio::null())
+            .output();
+        let (code, text) = match out {
+            Ok(o) => (
+                o.status.code(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (None, e.to_string()),
+        };
+        let outcome = install_outcome(code);
+        if outcome != InstallOutcome::Ready {
+            eprintln!("{}", failed_install_report(lang, &text));
+        }
+        if outcome == InstallOutcome::Offline {
+            return true;
+        }
+    }
+    false
+}
+
 fn languages_to_set_up(states: &[(String, Readiness)]) -> Vec<&str> {
     states
         .iter()
@@ -380,6 +450,28 @@ fn grant_unsandboxed_where_needed(languages: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_language_install_is_judged_by_its_exit_code() {
+        assert_eq!(install_outcome(Some(0)), InstallOutcome::Ready);
+        assert_eq!(install_outcome(Some(3)), InstallOutcome::Offline);
+        // 2 is "language tools still missing", 1 any other error, None a signal.
+        for code in [Some(1), Some(2), None] {
+            assert_eq!(install_outcome(code), InstallOutcome::Failed);
+        }
+    }
+
+    #[test]
+    fn a_failed_install_shows_what_it_printed_under_a_plain_header() {
+        let report = failed_install_report("go", "error: download failed\nsecond line\n");
+        let header = report.lines().next().unwrap();
+        assert_eq!(
+            header,
+            "Could not get the language tools for Go. What went wrong:"
+        );
+        assert_eq!(travsr_plugin_host::phase_b::status::jargon_in(header), None);
+        assert!(report.contains("\n  error: download failed\n  second line"));
+    }
 
     #[test]
     fn only_languages_init_can_fix_are_set_up() {
