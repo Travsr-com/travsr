@@ -77,7 +77,8 @@ fn handle_request(store: &mut SqliteStore, req: RpcRequest) -> Option<String> {
             serde_json::json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": server_capabilities(),
-                "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+                "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
+                "instructions": crate::INSTRUCTIONS
             }),
         ),
 
@@ -476,13 +477,12 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_lang_status",
-                "description": "Return whether semantic (full cross-file) analysis is available for the language of the given file, and an install hint if not. Returns JSON.",
+                "description": "Return whether calls are fully traced for the language of the given file, and what to do if not. Without `file`, returns one entry per language in this repo. Returns JSON.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "file": { "type": "string", "description": "Repo-relative file path to detect language for" }
+                        "file": { "type": "string", "description": "Repo-relative file path to detect language for; omit it for every language in this repo" }
                     },
-                    "required": ["file"],
                     "additionalProperties": false
                 }
             },
@@ -803,7 +803,8 @@ fn handle_request_global(req: RpcRequest) -> Option<String> {
             serde_json::json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": server_capabilities(),
-                "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+                "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
+                "instructions": crate::INSTRUCTIONS
             }),
         ),
         "tools/list" => ok_response(id, tools_list_global()),
@@ -1718,6 +1719,34 @@ mod tests {
             "prompts capability and endpoint must agree (advertised={prompts_advertised}, \
              answered={prompts_answered})"
         );
+    }
+
+    /// Plan 8.5: `initialize` tells the client, in plain words, what this server
+    /// is for and which tools to reach for first. Both stdio servers carry it.
+    #[test]
+    fn initialize_carries_plain_instructions() {
+        let req = || RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "initialize".into(),
+            params: None,
+        };
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for resp in [
+            handle_request_global(req()).expect("global initialize answers"),
+            handle_request(&mut store, req()).expect("initialize answers"),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            let text = v["result"]["instructions"]
+                .as_str()
+                .expect("initialize must carry instructions");
+            assert!(text.contains("get_callers"), "{text}");
+            assert_eq!(
+                travsr_plugin_host::phase_b::status::jargon_in(text),
+                None,
+                "{text}"
+            );
+        }
     }
 
     #[test]

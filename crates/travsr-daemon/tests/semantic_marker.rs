@@ -3,7 +3,7 @@
 //!
 //! `travsr status` derives `semantic:` from three meta keys. `phase_b_commit ==
 //! last_commit` with `phase_b_dirty = 1` renders as
-//! `stale (run travsr init --semantic to refresh)`.
+//! `stale (run travsr init to refresh)`.
 //!
 //! The flag is set by `reindex_files`, because rewriting a file's Phase A nodes
 //! drops its `ref/call` edges (#583). Init's own indexing does not route through
@@ -18,9 +18,10 @@
 //! this a status-honesty bug rather than real staleness.
 //!
 //! Both halves are asserted, since fixing the flag by suppressing the reindex
-//! would be a regression in the other direction. Only `--semantic` clears it:
-//! plain `init` defers Phase B, so the edges really are missing there and the
-//! flag is honest, which is why the remedy names `--semantic`.
+//! would be a regression in the other direction. Only a Phase B run clears it:
+//! the daemon API's `semantic = false` path defers Phase B, so the edges really
+//! are missing there and the flag is honest. The `travsr init` command always
+//! runs Phase B, which is why the remedy names it.
 
 use std::path::Path;
 use std::process::Command as StdCommand;
@@ -271,19 +272,28 @@ fn plain_init_leaves_the_flag_set_because_it_does_not_run_phase_b() {
 
 /// The remediation string must name a command that can actually clear the state
 /// it appears in. Pinned as a string because the message is the whole product
-/// surface for this bug: #741 was a dead-end loop precisely because the text
-/// named `travsr init`, which cannot clear the flag on an already-committed repo.
+/// surface for this bug: #741 was a dead-end loop because the text named a
+/// command that could not clear the flag.
+///
+/// Plain `travsr init` clears it now: the CLI always passes `semantic = true`
+/// (one-command setup), and the daemon's done-guard re-runs Phase B when the
+/// flag is set. Both halves are pinned, so the message cannot outlive the
+/// behaviour that makes it true.
 #[test]
 fn the_remediation_names_a_command_that_works() {
     let status_rs = include_str!("../../travsr-cli/src/status.rs");
     assert!(
-        status_rs.contains("stale (run travsr init --semantic to refresh)"),
-        "the stale message must name `travsr init --semantic`"
+        status_rs.contains("stale (run travsr init to refresh)"),
+        "the stale message must name `travsr init`"
     );
     assert!(
-        !status_rs.contains("stale (run travsr init to refresh)"),
-        "the old message named plain `travsr init`, which defers Phase B and so \
-         cannot clear the flag: running it returns the user to the same message"
+        !status_rs.contains("init --semantic to refresh"),
+        "the flag is internal; the remedy is the one command, plan 3.0"
+    );
+    let init_rs = include_str!("../../travsr-cli/src/init.rs");
+    assert!(
+        init_rs.contains("init_repo_with_progress(&repo_root, jobs, true, force"),
+        "`travsr init` must run Phase B inline, or the message above is a dead end"
     );
 }
 

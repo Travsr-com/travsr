@@ -227,8 +227,9 @@ fn phase_b_pending(store: &SqliteStore) -> bool {
 /// never disagree about completeness. Returns the note to append, or `None`
 /// when Phase B is complete for the current commit.
 pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
-    const PENDING: &str = "[note: call-graph index incomplete; semantic analysis has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
-    const STALE: &str = "[note: call-graph edges degraded; a background re-index dropped call edges since the last semantic analysis run; empty results are not authoritative. Run `travsr init` to rebuild.]";
+    // Plan 3.0/3.4: plain words and the one remedy, `travsr init`.
+    const PENDING: &str = "[note: calls are still being traced for this commit, so some may be missing and an empty result is not final. Run `travsr init` to finish now.]";
+    const STALE: &str = "[note: a background update dropped some calls since they were last traced, so an empty result is not final. Run `travsr init` to trace them again.]";
     let phase_b = store
         .get_meta("phase_b_commit")
         .ok()
@@ -265,16 +266,16 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
                 Some(STALE.to_string())
             } else if pending == 0 {
                 Some(
-                    "[note: a background re-index dropped some call edges; \
-                     uncommitted edits were re-resolved where detected, but a few \
-                     edges may still be missing until the next commit.]"
+                    "[note: a background update dropped some calls; edits not yet \
+                     committed were traced again where found, but a few calls may \
+                     be missing until the next commit.]"
                         .to_string(),
                 )
             } else {
                 Some(format!(
-                    "[note: {pending} reference(s) in uncommitted edits are not \
-                     yet resolved, so a few call edges may be missing until the \
-                     next commit; other results are current.]"
+                    "[note: {pending} reference(s) in edits not yet committed are \
+                     not traced yet, so a few calls may be missing until the next \
+                     commit; other results are current.]"
                 ))
             }
         }
@@ -329,21 +330,27 @@ fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
     if live == 0 && pending == 0 {
         return None;
     }
+    // Plan 3.0: plain words, and no claim that tracing as you edit is on: a
+    // pending count is also what a language with it off reports.
     let mut parts = Vec::new();
     if live > 0 {
         parts.push(format!(
-            "{live} edge{} resolved from uncommitted edits and not yet ratified (repo-wide)",
-            if live == 1 { "" } else { "s" }
+            "{live} call{} found in edits not yet committed {} included and marked `live` \
+             (repo-wide)",
+            if live == 1 { "" } else { "s" },
+            if live == 1 { "is" } else { "are" }
         ));
     }
     if pending > 0 {
         parts.push(format!(
-            "{pending} reference{} in the files above detected but not resolved",
-            if pending == 1 { "" } else { "s" }
+            "{pending} reference{} in the files above changed since the last commit and {} \
+             not traced yet",
+            if pending == 1 { "" } else { "s" },
+            if pending == 1 { "is" } else { "are" }
         ));
     }
     Some(format!(
-        "[note: live overlay active: {}. These resolve deterministically at the next commit; filter to provenance != live for ratified truth only.]",
+        "[note: {}. The next commit confirms them.]",
         parts.join("; ")
     ))
 }
@@ -396,19 +403,23 @@ fn phase_b_unanalyzed_note(store: &SqliteStore) -> Option<String> {
     if langs.is_empty() {
         return None;
     }
-    // "or not all of them": the #878 classes leave a language with some call
-    // edges (native) but not the compiler-derived rest, so "no call edges" alone
-    // would overstate the gap while a short answer is still not authoritative.
+    // "not fully": the #878 classes leave a language with some calls traced
+    // but not the rest. Each language gets the line `travsr status` prints.
+    let decoded = crate::observability::decode_phase_b_warnings(&warnings);
+    let details: Vec<String> = langs
+        .iter()
+        .filter_map(|l| decoded.get(*l).map(|(_, d)| d.clone()))
+        .collect();
     Some(format!(
-        "[note: no call edges, or not all of them, were produced for {} on the last \
-         semantic analysis run, so an empty or short result here is not authoritative \
-         for {}. Run `travsr status` for the reason and the fix.]",
+        "[note: calls were not fully traced for {} on the last run, so an empty or short \
+         result here is not final for {}. {}]",
         langs.join(", "),
         if langs.len() == 1 {
             "that language"
         } else {
             "those languages"
-        }
+        },
+        details.join(" ")
     ))
 }
 
@@ -662,7 +673,7 @@ pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     // No-commit repos (both keys absent) and fully-indexed repos (both keys
     // present) fall through to the normal path.
     if phase_b_pending(store) {
-        return phase_b_pending_json("Semantic call-edge index");
+        return phase_b_pending_json();
     }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
     // Use the larger find-output limit, not the 4 KiB scalar cap: this tool
@@ -760,63 +771,56 @@ fn phase_b_lang_incomplete(store: &SqliteStore, lang: &str) -> Option<&'static s
 fn phase_b_incomplete_reason(store: &SqliteStore, lang: &str) -> Option<String> {
     // Rust-specific: rust-analyzer never ran, or ran and lost every ref.
     if lang == "rust" {
-        match store
+        if let Some("sandbox_unavailable" | "all_refs_dropped") = store
             .get_meta("rust_lsif_degraded")
             .ok()
             .flatten()
             .as_deref()
         {
-            Some("sandbox_unavailable") => {
-                return Some("Rust analysis did not run (no OS sandbox)".to_string())
-            }
-            Some("all_refs_dropped") => {
-                return Some("no Rust reference resolved to an indexed symbol".to_string())
-            }
-            _ => {}
+            return Some(
+                "Calls in 'rust' were not fully traced here. See `travsr status --verbose`."
+                    .to_string(),
+            );
         }
     }
-    // Per-language classes: the analyzer was missing, skipped, or is waiting on
-    // a one-time approval, so this language has no call edges from that run.
-    // The full set travsr-daemon writes as `<class>:{lang}`, minus the three
-    // (`crashed`, `emitter_missing`, `emitter_failed`) the caller softens ahead
-    // of this gate. Any daemon class not accounted for in one of the two places
-    // would let its language keep the definitive zero, so this list tracks the
-    // daemon's, not `phase_b_unanalyzed_note`'s narrower banner set.
-    const CLASSES: &[(&str, &str)] = &[
-        ("skipped_no_analyzer", "no analyzer is installed"),
-        ("needs_approval", "its analyzer is waiting on approval"),
-        ("needs_consent", "its analyzer is waiting on consent"),
-        ("skipped_no_compdb", "it has no compilation database"),
-        ("zero_nodes", "its analyzer produced no symbols"),
-        (
-            "no_references",
-            "no reference resolved to an indexed symbol",
-        ),
-        ("version_mismatch", "its analyzer is a mismatched version"),
-        ("skipped_unregistered", "its analyzer is not registered"),
-        (
-            "untrusted_corpus",
-            "this corpus is not trusted for analysis",
-        ),
+    // Per-language classes: every class travsr-daemon writes as `<class>:{lang}`,
+    // minus the three (`crashed`, `emitter_missing`, `emitter_failed`) the
+    // caller softens ahead of this gate. Any daemon class not accounted for in
+    // one of the two places would let its language keep the definitive zero, so
+    // this list tracks the daemon's, not `phase_b_unanalyzed_note`'s narrower
+    // banner set. The sentence is the one `travsr status` prints (plan 3.0).
+    const CLASSES: &[&str] = &[
+        "skipped_no_analyzer",
+        "needs_approval",
+        "needs_consent",
+        "skipped_no_compdb",
+        "zero_nodes",
+        "no_references",
+        "version_mismatch",
+        "skipped_unregistered",
+        "untrusted_corpus",
     ];
     if let Some(warnings) = store.get_meta("phase_b_warnings").ok().flatten() {
+        let decoded = crate::observability::decode_phase_b_warnings(&warnings);
         for entry in warnings.split(',') {
             let mut parts = entry.trim().splitn(3, ':');
             let (Some(class), Some(entry_lang)) = (parts.next(), parts.next()) else {
                 continue;
             };
-            if entry_lang != lang {
+            if entry_lang != lang || !CLASSES.contains(&class) {
                 continue;
             }
-            if let Some((_, why)) = CLASSES.iter().find(|(c, _)| *c == class) {
-                return Some(format!("'{lang}' was not analysed, {why}"));
+            if let Some((_, detail)) = decoded.get(lang) {
+                return Some(detail.clone());
             }
         }
     }
     // Repo-wide (#583): a mid-edit reindex dropped call edges without moving
     // HEAD. Cleared to "0" by the next Phase B run, so this does not latch.
     if store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1") {
-        return Some("a re-index dropped call edges and they are not rebuilt yet".to_string());
+        return Some(
+            "A background update dropped some calls and they are not traced again yet.".to_string(),
+        );
     }
     None
 }
@@ -824,22 +828,10 @@ fn phase_b_incomplete_reason(store: &SqliteStore, lang: &str) -> Option<String> 
 /// The one-line caveat appended to a get_callers / find_references answer when
 /// [`phase_b_lang_incomplete`] holds for the target language. The `crashed`
 /// wording is unchanged from #715; the #878 classes name the skipped analyzer.
-fn incomplete_caveat(lang: &str, class: &str) -> String {
-    let cause = match class {
-        "emitter_missing" => {
-            "the TypeScript analyzer (travsr-lsif-ts) could not be started on its last run"
-        }
-        "emitter_failed" => "the TypeScript analyzer (travsr-lsif-ts) failed on its last run",
-        _ => "crashed on its last run",
-    };
-    let subject = if class == "crashed" {
-        format!("semantic analysis for '{lang}' {cause}")
-    } else {
-        format!("semantic analysis for '{lang}' is incomplete: {cause}")
-    };
+fn incomplete_caveat(lang: &str) -> String {
     format!(
-        "note: {subject}, so these results may be incomplete. Run `travsr status` for \
-         detail or `travsr init --semantic --force` to rebuild."
+        "note: calls in '{lang}' could not be fully traced on the last run, so these \
+         results may be incomplete. See `travsr status --verbose`."
     )
 }
 
@@ -1056,10 +1048,8 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     // Phase B run leaves partial coverage while the marker reads complete, so
     // this list may be missing callers. Attach the caveat to the confident
     // (non-empty) answer.
-    if !lines.is_empty() {
-        if let Some(class) = phase_b_lang_incomplete(store, &seed.vname.language) {
-            lines.push(incomplete_caveat(&seed.vname.language, class));
-        }
+    if !lines.is_empty() && phase_b_lang_incomplete(store, &seed.vname.language).is_some() {
+        lines.push(incomplete_caveat(&seed.vname.language));
     }
     lines.join("\n")
 }
@@ -1696,9 +1686,13 @@ fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
 /// One function rather than three literals because the three tools drifted:
 /// `find_references`, `get_callers` and `get_execution_path` each carried their
 /// own copy, so fixing one left the other two telling users the same falsehood.
-fn phase_b_pending_json(index_name: &str) -> String {
-    format!(
-        r#"{{"status":"pending","message":"{index_name} has not finished. It is built by the daemon: check `travsr daemon status` and start one with `travsr daemon start` if none is running, or build it now with `travsr init --semantic`. `travsr status` shows progress."}}"#
+///
+/// Plan 3.4: the one remedy in plain words, inside the `<travsr-data>`
+/// envelope every other answer carries (the VS Code extension strips it before
+/// parsing, as it does for them).
+fn phase_b_pending_json() -> String {
+    wrap_envelope(
+        r#"{"status":"pending","message":"Calls are still being traced for this commit. Run `travsr init` to finish now, then ask again."}"#,
     )
 }
 
@@ -1721,7 +1715,7 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
         }
     }
     if phase_b_pending(store) {
-        return phase_b_pending_json("Semantic occurrence index");
+        return phase_b_pending_json();
     }
     // SEC-001: sanitize before returning. Use the larger find-output limit (not
     // the 4 KiB scalar cap) so a capped 500-site list and its truncation notice
@@ -1828,8 +1822,8 @@ pub fn find_references_structured(
     if phase_b_pending(store) {
         out.status = "pending";
         out.note = Some(
-            "Semantic occurrence index is still building, results are not yet \
-             authoritative. Run `travsr status` to check progress."
+            "Calls are still being traced for this commit, so results are not final \
+             yet. Run `travsr init` to finish now."
                 .to_string(),
         );
         return out;
@@ -1897,8 +1891,8 @@ pub fn find_references_structured(
             // or a skipped LSIF pass, leaves partial coverage under a complete
             // marker, so even a non-empty site list may be short. Surface the
             // same caveat instead of `note: None`.
-            if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
-                out.note = Some(incomplete_caveat(&target.vname.language, class));
+            if phase_b_lang_incomplete(store, &target.vname.language).is_some() {
+                out.note = Some(incomplete_caveat(&target.vname.language));
             }
         }
         _ => {
@@ -2052,8 +2046,8 @@ fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String 
             // #715 / #878: a crashed last run, or a skipped LSIF pass, leaves
             // partial coverage under a complete marker, so this occurrence list
             // may be short.
-            if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
-                lines.push(incomplete_caveat(&target.vname.language, class));
+            if phase_b_lang_incomplete(store, &target.vname.language).is_some() {
+                lines.push(incomplete_caveat(&target.vname.language));
             }
             lines.join("\n")
         }
@@ -2098,18 +2092,11 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // per-file / language-wide coverage gates below — those key on whether
         // occurrences exist, not on whether the run finished. Soften first so
         // neither is ever reported as a clean zero.
-        if let Some(class) = phase_b_lang_incomplete(store, lang) {
-            let cause = match class {
-                "crashed" => format!("Semantic analysis for '{lang}' crashed on its last run"),
-                _ => format!(
-                    "The TypeScript analyzer (travsr-lsif-ts) did not run for '{lang}' \
-                     on the last semantic analysis run"
-                ),
-            };
+        if phase_b_lang_incomplete(store, lang).is_some() {
             return format!(
-                "{header}\n0 recorded reference(s), not a definitive zero. {cause}, so its \
-                 occurrence coverage is partial. Run `travsr status` for detail, `travsr init \
-                 --semantic --force` to rebuild, or `find_pattern` for a textual search."
+                "{header}\n0 recorded reference(s), not a definitive zero: calls in '{lang}' \
+                 could not be fully traced on the last run. See `travsr status --verbose`, or \
+                 use `find_pattern` for a text search."
             );
         }
         let index_built_for_lang = store.language_has_edge_sites(lang).unwrap_or(false);
@@ -2118,11 +2105,9 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
             // Phase B did not run / failed / its provider records no occurrence
             // lines. This is a coverage gap, not a "zero references" answer.
             return format!(
-                "{header}\nOccurrence index unavailable for '{lang}': semantic \
-                 analysis recorded no reference occurrences for this \
-                 language in this repo; the result below is not a definitive \
-                 zero. Run `travsr status` to check progress, or use `find_pattern` \
-                 for a textual search."
+                "{header}\n0 recorded reference(s), not a definitive zero: calls in '{lang}' \
+                 are not traced in this repo yet. Run `travsr status` to see why, or use \
+                 `find_pattern` for a text search."
             );
         }
         // #450: the language has *some* occurrence data, but "some" is not
@@ -2152,12 +2137,10 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                 store.language_occurrence_coverage(lang).unwrap_or((0, 0));
             let coverage_pct = (100 * files_with_occ).checked_div(files_total).unwrap_or(0) as u32;
             return format!(
-                "{header}\n0 recorded reference(s), not a definitive zero. No \
-                 reference occurrences are recorded for '{}' itself, so semantic \
-                 analysis may never have covered this file ({files_with_occ} of \
-                 {files_total} '{lang}' files in this repo carry occurrence data, \
-                 {coverage_pct}%). Run `travsr status` to check Phase B, or use \
-                 `find_pattern` for a textual search.",
+                "{header}\n0 recorded reference(s), not a definitive zero: calls were not \
+                 traced in '{}' ({files_with_occ} of {files_total} '{lang}' files here \
+                 have traced calls, {coverage_pct}%). Run `travsr status` to see why, or \
+                 use `find_pattern` for a text search.",
                 target.vname.path
             );
         }
@@ -2200,12 +2183,11 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
             .unwrap_or(0);
         if pending_here > 0 {
             return format!(
-                "{header}\n0 recorded reference(s), not a definitive zero. \
-                 {pending_here} reference{} in '{}' {} detected but not yet \
-                 resolved, so uses of this symbol may be among them. They \
-                 resolve deterministically at the next commit; run `travsr init \
-                 --semantic` to resolve them now, or use `find_pattern` for a \
-                 textual search.",
+                "{header}\n0 recorded reference(s), not a definitive zero: \
+                 {pending_here} reference{} in '{}' changed since the last commit and \
+                 {} not traced yet, so uses of this symbol may be among them. Run \
+                 `travsr init` to trace them now, or use `find_pattern` for a text \
+                 search.",
                 if pending_here == 1 { "" } else { "s" },
                 target.vname.path,
                 if pending_here == 1 { "is" } else { "are" },
@@ -2232,8 +2214,8 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // healthy run, so a complete analysis still earns the definitive zero.
         if let Some(reason) = phase_b_incomplete_reason(store, lang) {
             return format!(
-                "{header}\n0 reference(s) recorded, but not a definitive zero: {reason}. \
-                 Run `travsr status`, or `find_pattern` for a textual search."
+                "{header}\n0 reference(s) recorded, but not a definitive zero. {reason} \
+                 Use `find_pattern` for a text search."
             );
         }
         // Analysis for this language ran to completion and this symbol has
@@ -2276,8 +2258,8 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
     // #715 / #878: these structural caller definitions can also be short if the
     // language's last Phase B run crashed before indexing every file, or if its
     // LSIF pass never ran.
-    if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
-        lines.push(incomplete_caveat(&target.vname.language, class));
+    if phase_b_lang_incomplete(store, &target.vname.language).is_some() {
+        lines.push(incomplete_caveat(&target.vname.language));
     }
     lines.join("\n")
 }
@@ -5028,6 +5010,19 @@ pub fn get_subsystem_brief(
 /// JSON is returned unsanitised — it is parsed by first-party TypeScript code,
 /// not fed to an LLM.
 pub fn get_lang_status(store: &SqliteStore, file: &str) -> String {
+    // Plan 8.5: no file means "every language here", one entry each in the
+    // same shape as a file query, rather than "not a supported language".
+    if file.is_empty() {
+        let entries: Vec<String> = store
+            .language_distribution()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(lang, _)| travsr_plugin_host::phase_b::catalog::lookup(&lang))
+            .filter_map(|e| e.extensions.first())
+            .map(|ext| get_lang_status_raw(store, &format!("file{ext}")))
+            .collect();
+        return format!("[{}]", entries.join(","));
+    }
     if let Err(reason) = validate_mcp_arg(file) {
         tracing::warn!("get_lang_status rejected invalid arg: {reason}");
         return UNKNOWN_LANG_JSON.to_string();
@@ -5140,13 +5135,47 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
         r#"{{"language":"{lang}","status":"{status_tag}","statusLine":"{status_line}","builtin":{builtin},"semantic_available":{sem},"install_hint":"{hint}","prerequisites":"{prereq}","phase_b_commit":{pbc}}}"#,
         lang = meta.language,
         status_tag = status.tag(),
-        status_line = status.line(),
+        status_line = match status {
+            LangStatus::Partial { .. } => plain_partial_line(store, meta.language),
+            _ => status.line(),
+        },
         builtin = meta.builtin,
         sem = semantic_available,
         hint = install_hint,
         prereq = meta.effective_prerequisites(),
         pbc = phase_b_commit,
     )
+}
+
+/// A partial language's line in plain words (plan 3.0): what the last run
+/// recorded for it, else what the setup ladder says, else "setting up". The
+/// same lines `travsr status` and `get_index_status` give, from `Readiness`.
+fn plain_partial_line(store: &SqliteStore, lang: &str) -> String {
+    use travsr_plugin_host::phase_b::status::Readiness;
+    let prefix = format!("{lang}: ");
+    let warnings = store
+        .get_meta("phase_b_warnings")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let from_run = crate::observability::decode_phase_b_warnings(&warnings)
+        .remove(lang)
+        .map(|(_, d)| d);
+    let from_setup = || {
+        let root = store.resolve_repo_root()?;
+        let corpus = store.get_meta("corpus").ok().flatten().unwrap_or_default();
+        crate::observability::phase_b_availability(Some(&root), &corpus)
+            .remove(lang)
+            .flatten()
+    };
+    let detail = from_run.or_else(from_setup).unwrap_or_else(|| {
+        let r = Readiness::SettingUp;
+        format!("{lang}: {}. {}", r.label(), r.fix().unwrap_or_default())
+    });
+    detail
+        .strip_prefix(&prefix)
+        .map(str::to_string)
+        .unwrap_or(detail)
 }
 
 /// Global variant of `get_lang_status` — opens the first matched repo store.
@@ -6115,7 +6144,7 @@ pub fn repos_remove(name: &str) -> String {
 pub fn get_execution_path(store: &SqliteStore, source: &str, sink: &str) -> String {
     // Phase B deferred: execution paths require call edges which are not yet indexed.
     if phase_b_pending(store) {
-        return phase_b_pending_json("Semantic call-edge index");
+        return phase_b_pending_json();
     }
     get_execution_path_with_filter(store, source, sink, &OpenFilter)
 }
@@ -7071,30 +7100,33 @@ fn build_context_signals_with_r2(
     }
     if embed_warming {
         parts.push(
-            "[note: semantic embeddings still warming up (sidecar starting); this result is lexical-only; retry in a few seconds for full semantic ranking]",
+            "[note: meaning-based search is still starting; this result uses text match only; ask again in a few seconds]",
         );
     } else if embed_disabled {
         // Arming finished with no hook installed, so unlike `warming` this will
         // not resolve on a retry. Most often the index was built with a
         // different embedding model than the one installed.
         parts.push(
-            "[note: semantic search unavailable (the embedding sidecar did not start, or the index was built with a different model); results are lexical only. Run `travsr embed status` to check, then `travsr embed reindex` if the model changed]",
+            "[note: meaning-based search could not start (often the index was built with a different model); results use text match only. Run `travsr embed status` to check, then `travsr embed reindex` if the model changed]",
         );
     } else if has_embed && knn_degraded {
         parts.push(
-            "[note: semantic search degraded, KNN timed out or returned empty; results are lexical only]",
+            "[note: meaning-based search timed out or found nothing; results use text match only]",
         );
     } else if !has_embed && embed_initialized {
         // Phase 1 has run (embed.db exists) but KNN hook not yet active.
         parts.push(
-            "[note: embedding in progress; run `travsr embed status` to check; results improve as index builds]",
+            "[note: meaning-based search is still being built; run `travsr embed status` to check; results improve as it finishes]",
         );
     } else if !has_embed {
-        parts.push("[note: semantic search disabled; run `travsr embed init` for better results]");
+        // Plan 8.5: optional and off by default (decision 3), so not a fault.
+        parts.push(
+            "[note: meaning-based search is optional and off here; results use text match. Run `travsr embed init` to add it]",
+        );
     }
     if phase_b_pending {
         parts.push(
-            "[note: call traversal limited; run `travsr lang install <lang>` to enable call-graph edges]",
+            "[note: calls are still being traced for this commit; run `travsr init` to finish now]",
         );
     }
     parts.join("\n")
@@ -10143,7 +10175,7 @@ mod tests {
             "caller still listed: {crashed}"
         );
         assert!(
-            crashed.contains("semantic analysis for 'rust' crashed on its last run"),
+            crashed.contains("calls in 'rust' could not be fully traced on the last run"),
             "a crashed language must carry the incompleteness caveat: {crashed}"
         );
     }
@@ -10175,9 +10207,7 @@ mod tests {
         let out = get_callers_raw(&store, "charge", None);
         assert!(out.contains("fn:process"), "caller still listed: {out}");
         assert!(
-            out.contains("is incomplete")
-                && out.contains("travsr-lsif-ts")
-                && out.contains("may be incomplete"),
+            out.contains("could not be fully traced") && out.contains("may be incomplete"),
             "a skipped LSIF pass must carry the incompleteness caveat: {out}"
         );
         assert!(
@@ -10516,7 +10546,7 @@ mod tests {
         store.set_meta("phase_b_warnings", "crashed:rust").unwrap();
         let crashed = find_references_raw(&store, "charge", None);
         assert!(
-            crashed.contains("semantic analysis for 'rust' crashed on its last run"),
+            crashed.contains("calls in 'rust' could not be fully traced on the last run"),
             "crashed language caveat on the occurrence path: {crashed}"
         );
     }
@@ -12003,6 +12033,59 @@ mod tests {
         assert!(
             result.contains("app/View.m"),
             "View.m imports Model.h and must appear in its blast radius, got: {result}"
+        );
+    }
+
+    /// Plan 8.5: called with no file, it used to answer "not a supported
+    /// language". It now lists every language in this repo, one entry each, in
+    /// the same shape a file query returns.
+    #[test]
+    fn get_lang_status_without_a_file_lists_the_repo_languages() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for (path, lang) in [("src/a.ts", "typescript"), ("src/b.go", "go")] {
+            store
+                .put_node(&CoreNode::new(
+                    travsr_core::VName::new("c", "", path, lang, "fn:f"),
+                    "function",
+                ))
+                .unwrap();
+        }
+        let json = get_lang_status(&store, "");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let langs: Vec<&str> = parsed
+            .as_array()
+            .expect("an array without a file")
+            .iter()
+            .filter_map(|e| e["language"].as_str())
+            .collect();
+        assert!(
+            langs.contains(&"typescript") && langs.contains(&"go"),
+            "{json}"
+        );
+        assert!(!json.contains("not a supported language"), "{json}");
+    }
+
+    /// A partial language's line is the one `travsr status` prints for it, from
+    /// the last run's record, never an internal rebuild flag (plan 3.0).
+    #[test]
+    fn get_lang_status_partial_line_is_the_plain_readiness_line() {
+        let mut store = make_store(&[], &[]);
+        store
+            .set_meta("phase_b_warnings", "skipped_no_compdb:c")
+            .unwrap();
+        let json = get_lang_status(&store, "src/a.c");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["status"], "partial", "{json}");
+        let line = v["statusLine"].as_str().unwrap();
+        assert_eq!(
+            line,
+            "needs compile_commands.json. Generate compile_commands.json with your build, \
+             then run `travsr init`."
+        );
+        assert_eq!(
+            travsr_plugin_host::phase_b::status::jargon_in(line),
+            None,
+            "{line}"
         );
     }
 
@@ -14301,6 +14384,55 @@ mod snippet_tests {
     use std::path::Path;
     use travsr_core::VName;
 
+    /// Plan 3.0: every note an agent reads by default is plain words, the one
+    /// remedy, and no placeholder. Rendered from real stores so a new branch
+    /// that reintroduces an internal word fails here.
+    #[test]
+    fn default_notes_read_plainly() {
+        use travsr_plugin_host::phase_b::status::jargon_in;
+        let mut notes: Vec<String> = Vec::new();
+        let at = |pairs: &[(&str, &str)]| {
+            let mut s = SqliteStore::open_in_memory().unwrap();
+            for (k, v) in pairs {
+                s.set_meta(k, v).unwrap();
+            }
+            s
+        };
+        for store in [
+            at(&[("last_commit", "b")]),
+            at(&[("last_commit", "b"), ("phase_b_commit", "a")]),
+            at(&[
+                ("last_commit", "a"),
+                ("phase_b_commit", "a"),
+                ("phase_b_dirty", "1"),
+            ]),
+            at(&[
+                ("last_commit", "a"),
+                ("phase_b_commit", "a"),
+                (
+                    "phase_b_warnings",
+                    "crashed:go,skipped_no_analyzer:php,zero_nodes:java",
+                ),
+            ]),
+        ] {
+            notes.extend(phase_b_degraded_note(&store));
+            for (has_embed, warming, degraded) in [
+                (false, false, false),
+                (true, true, false),
+                (true, false, true),
+            ] {
+                notes.push(build_context_signals(
+                    &store, has_embed, warming, degraded, None, None,
+                ));
+            }
+        }
+        notes.push(phase_b_pending_json());
+        notes.push(incomplete_caveat("go"));
+        for note in &notes {
+            assert_eq!(jargon_in(note), None, "{note}");
+        }
+    }
+
     // ── helper: build a Node with explicit line/end_line ─────────────────────
 
     fn make_fn_node(path: &str, sig: &str, line: u32, end_line: u32) -> CoreNode {
@@ -15697,7 +15829,7 @@ mod snippet_tests {
         // We do NOT set phase_b_commit so both notes could fire; only test the embed note.
         let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, None);
         assert!(
-            result.contains("semantic search disabled"),
+            result.contains("meaning-based search is optional and off"),
             "must emit embed-missing note when embed_knn=None; got: {result}"
         );
     }
@@ -15712,7 +15844,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "abc123").unwrap();
         let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, None);
         assert!(
-            result.contains("call traversal limited"),
+            result.contains("calls are still being traced for this commit; run"),
             "must emit phase-B-pending note when phase_b_commit absent; got: {result}"
         );
     }
@@ -15755,7 +15887,7 @@ mod snippet_tests {
             "header must report warming while sidecar is cold; got: {result}"
         );
         assert!(
-            result.contains("still warming up"),
+            result.contains("is still starting"),
             "must emit warming note; got: {result}"
         );
     }
@@ -15810,7 +15942,7 @@ mod snippet_tests {
             "retrieval tier must not claim semantic; got: {result}"
         );
         assert!(
-            result.contains("semantic search unavailable"),
+            result.contains("meaning-based search could not start"),
             "must emit the unavailable note; got: {result}"
         );
         assert!(
@@ -15841,7 +15973,10 @@ mod snippet_tests {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store.set_meta("last_commit", "abc").unwrap();
         let note = phase_b_degraded_note(&store).expect("must flag pending");
-        assert!(note.contains("call-graph index incomplete"), "got: {note}");
+        assert!(
+            note.contains("calls are still being traced for this commit"),
+            "got: {note}"
+        );
     }
 
     #[test]
@@ -15852,7 +15987,10 @@ mod snippet_tests {
         store.set_meta("last_commit", "def456").unwrap();
         store.set_meta("phase_b_commit", "abc123").unwrap();
         let note = phase_b_degraded_note(&store).expect("must flag pending");
-        assert!(note.contains("call-graph index incomplete"), "got: {note}");
+        assert!(
+            note.contains("calls are still being traced for this commit"),
+            "got: {note}"
+        );
     }
 
     #[test]
@@ -15863,7 +16001,10 @@ mod snippet_tests {
         store.set_meta("phase_b_commit", "abc").unwrap();
         store.set_meta("phase_b_dirty", "1").unwrap();
         let note = phase_b_degraded_note(&store).expect("must flag stale");
-        assert!(note.contains("call-graph edges degraded"), "got: {note}");
+        assert!(
+            note.contains("dropped some calls since they were last traced"),
+            "got: {note}"
+        );
     }
 
     #[test]
@@ -15939,7 +16080,7 @@ mod snippet_tests {
             .unwrap();
         let note = phase_b_degraded_note(&store).expect("a pending overlay must note the gap");
         assert!(
-            note.contains("not yet resolved") && !note.contains("travsr init"),
+            note.contains("not traced yet") && !note.contains("travsr init"),
             "got: {note}"
         );
     }
@@ -16124,7 +16265,7 @@ mod snippet_tests {
         // ...and the caller is at yet another commit ⇒ head note also fires.
         let out = append_read_notes(&store, "body".to_string(), Some("chk1111"));
         assert!(
-            out.contains("call-graph index incomplete"),
+            out.contains("calls are still being traced for this commit"),
             "phase-b note: {out}"
         );
         assert!(out.contains("chk1111"), "head note: {out}");
@@ -16157,9 +16298,12 @@ mod snippet_tests {
             .unwrap();
 
         let note = live_overlay_note(&store, "a.ts").expect("an overlay must be announced");
-        assert!(note.contains("1 edge resolved"), "singular form: {note}");
         assert!(
-            note.contains("provenance != live"),
+            note.contains("1 call found in edits not yet committed is included"),
+            "singular form: {note}"
+        );
+        assert!(
+            note.contains("marked `live`"),
             "a reader must be told how to get ratified-only truth: {note}"
         );
     }
@@ -16190,7 +16334,7 @@ mod snippet_tests {
         let note = live_overlay_note(&store, "callers in a.ts:3")
             .expect("a pending reference must be announced");
         assert!(
-            note.contains("1 reference in the files above detected but not resolved"),
+            note.contains("1 reference in the files above changed since the last commit and is not traced yet"),
             "the abstention must be visible: {note}"
         );
 
@@ -16304,13 +16448,13 @@ mod snippet_tests {
             .unwrap();
 
         let prose = append_read_notes(&store, "body".to_string(), None);
-        assert!(prose.contains("live overlay active"), "prose: {prose}");
+        assert!(prose.contains("marked `live`"), "prose: {prose}");
 
         let signals = read_note_signals(&store, None, "a.ts");
         assert!(
             signals
                 .iter()
-                .any(|s| s.as_str().unwrap_or("").contains("live overlay active")),
+                .any(|s| s.as_str().unwrap_or("").contains("marked `live`")),
             "json signals: {signals:?}"
         );
 
@@ -16345,7 +16489,7 @@ mod snippet_tests {
             "got: {out}"
         );
         assert!(
-            !out.contains("call-graph index incomplete"),
+            !out.contains("calls are still being traced for this commit"),
             "head-only wrapper must not carry the Phase-B note: {out}"
         );
 
@@ -16428,7 +16572,7 @@ mod snippet_tests {
             "existing edges must still be reported; got: {result}"
         );
         assert!(
-            result.contains("call-graph index incomplete"),
+            result.contains("calls are still being traced for this commit"),
             "must append pending note; got: {result}"
         );
     }
@@ -16444,7 +16588,7 @@ mod snippet_tests {
         store.set_meta("phase_b_dirty", "1").unwrap();
         let result = get_blast_radius(&store, "src/missing.ts", AnalysisMode::TreeSitter);
         assert!(
-            result.contains("call-graph edges degraded"),
+            result.contains("dropped some calls since they were last traced"),
             "empty result must surface the stale note; got: {result}"
         );
     }
@@ -16457,7 +16601,7 @@ mod snippet_tests {
         store.set_meta("phase_b_commit", "abc123").unwrap();
         let result = get_execution_path(&store, "alpha", "beta");
         assert!(
-            result.contains("call-graph index incomplete"),
+            result.contains("calls are still being traced for this commit"),
             "disconnected/no-result path must carry the pending note; got: {result}"
         );
     }
@@ -16487,7 +16631,7 @@ mod snippet_tests {
             signals.iter().any(|s| s
                 .as_str()
                 .unwrap_or("")
-                .contains("call-graph edges degraded")),
+                .contains("dropped some calls since they were last traced")),
             "graph JSON must carry the degraded signal; got: {raw}"
         );
     }
@@ -17536,7 +17680,7 @@ mod snippet_tests {
         );
         let overflow_pos = result.find("[overflow msg]").unwrap();
         let seed_pos = result.find("[seed cap msg]").unwrap();
-        let note_pos = result.find("[note: semantic search").unwrap();
+        let note_pos = result.find("[note: meaning-based search").unwrap();
         assert!(overflow_pos < seed_pos, "overflow must precede seed-cap");
         assert!(seed_pos < note_pos, "seed-cap must precede degraded notes");
     }
@@ -18104,8 +18248,8 @@ mod snippet_tests {
             "a language Phase B skipped must soften the claim: {out}"
         );
         assert!(
-            out.contains("no analyzer is installed"),
-            "should name the recorded reason: {out}"
+            out.contains("setting up"),
+            "should name the recorded state: {out}"
         );
         assert!(
             !out.contains("No uses of this symbol are recorded"),
@@ -18142,7 +18286,7 @@ mod snippet_tests {
             .unwrap();
         let out = find_references(&store, "unused", None);
         assert!(
-            out.contains("'rust' was not analysed") && out.contains("waiting on approval"),
+            out.contains("rust: setting up"),
             "must select the target language's own warning: {out}"
         );
         // The softening REASON is target-scoped: it must name rust and no other
@@ -18168,7 +18312,7 @@ mod snippet_tests {
 
         let out = find_references(&store, "unused", None);
         assert!(
-            out.contains("not a definitive zero") && out.contains("no OS sandbox"),
+            out.contains("not a definitive zero") && out.contains("not fully traced here"),
             "a degraded Rust LSIF run must soften and explain: {out}"
         );
     }
@@ -18181,7 +18325,7 @@ mod snippet_tests {
 
         let out = find_references(&store, "unused", None);
         assert!(
-            out.contains("not a definitive zero") && out.contains("dropped call edges"),
+            out.contains("not a definitive zero") && out.contains("dropped some calls"),
             "dropped edges must soften the claim: {out}"
         );
     }
@@ -18268,7 +18412,7 @@ mod snippet_tests {
         assert!(got.references.is_empty());
         let note = got.note.expect("softened answer must carry a note");
         assert!(
-            note.contains("not a definitive zero") && note.contains("no analyzer is installed"),
+            note.contains("not a definitive zero") && note.contains("setting up"),
             "note should carry the softened wording: {note}"
         );
         assert!(
@@ -18362,7 +18506,7 @@ mod snippet_tests {
 
         let out = find_references(&store, "orphaned", None);
         assert!(
-            out.contains("not authoritative"),
+            out.contains("not a definitive zero"),
             "a zero served while Phase B is dirty must not read as fact: {out}"
         );
     }
@@ -19916,13 +20060,13 @@ mod snippet_tests {
     /// first three each did.
     #[test]
     fn the_phase_b_pending_answer_never_promises_a_time() {
-        let msg = super::phase_b_pending_json("Semantic occurrence index");
+        let msg = super::phase_b_pending_json();
         assert!(
             !msg.contains("minute") && !msg.contains("~"),
             "pending answer must not carry an ETA: {msg}"
         );
         assert!(
-            msg.contains("travsr daemon start"),
+            msg.contains("Run `travsr init` to finish now"),
             "pending answer must name what actually produces the index: {msg}"
         );
         assert!(
@@ -19979,11 +20123,11 @@ mod issue_755_tests {
             "the note must name the language; got: {note}"
         );
         assert!(
-            note.contains("no call edges"),
+            note.contains("not fully traced"),
             "the note must say what is missing, not just that something is; got: {note}"
         );
         assert!(
-            note.contains("not authoritative"),
+            note.contains("not final"),
             "the note exists to stop an empty result being trusted; got: {note}"
         );
         assert!(
@@ -20011,10 +20155,10 @@ mod issue_755_tests {
                 phase_b_degraded_note(&store).unwrap_or_else(|| panic!("{warn} must be surfaced"));
             assert!(note.contains("typescript"), "got: {note}");
             assert!(
-                note.contains("or not all of them") && note.contains("short result"),
+                note.contains("not fully traced") && note.contains("short result"),
                 "a partial language must be described as partial, not empty; got: {note}"
             );
-            assert!(note.contains("not authoritative"), "got: {note}");
+            assert!(note.contains("not final"), "got: {note}");
         }
     }
 
@@ -20038,9 +20182,8 @@ mod issue_755_tests {
         let store = with_warnings("skipped_no_analyzer:php,crashed:php,needs_approval:java");
         let note = phase_b_degraded_note(&store).expect("must fire");
         assert!(note.contains("php") && note.contains("java"), "got: {note}");
-        assert_eq!(
-            note.matches("php").count(),
-            1,
+        assert!(
+            note.contains("for php, java on the last run") && note.matches("php:").count() == 1,
             "a language named by two classes must still appear once; got: {note}"
         );
         assert!(
@@ -20134,7 +20277,10 @@ mod issue_755_tests {
             .set_meta("phase_b_warnings", "skipped_no_analyzer:php")
             .unwrap();
         let note = phase_b_degraded_note(&behind).expect("must fire");
-        assert!(note.contains("call-graph index incomplete"), "got: {note}");
+        assert!(
+            note.contains("calls are still being traced for this commit"),
+            "got: {note}"
+        );
 
         let mut dirty = store_at_head();
         dirty.set_meta("phase_b_dirty", "1").unwrap();
@@ -20142,7 +20288,10 @@ mod issue_755_tests {
             .set_meta("phase_b_warnings", "skipped_no_analyzer:php")
             .unwrap();
         let note = phase_b_degraded_note(&dirty).expect("must fire");
-        assert!(note.contains("call-graph edges degraded"), "got: {note}");
+        assert!(
+            note.contains("dropped some calls since they were last traced"),
+            "got: {note}"
+        );
     }
 
     /// The note has to reach an actual query, not just the helper: this is the
@@ -20160,7 +20309,7 @@ mod issue_755_tests {
         // #878 widened the wording to "no call edges, or not all of them", so
         // pin the language attribution and the verdict rather than one phrase.
         assert!(
-            out.contains("were produced for php") && out.contains("not authoritative"),
+            out.contains("not fully traced for php") && out.contains("not final"),
             "an empty caller list must say why; got: {out}"
         );
     }

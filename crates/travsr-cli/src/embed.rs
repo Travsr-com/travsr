@@ -2528,7 +2528,7 @@ pub fn hint_activate_if_installed(repo_root: &Path) {
     }
     if embed_binary_installed() {
         println!(
-            "tip: embeddings are installed but not enabled for this repo; run `travsr embed init` to turn on semantic search here"
+            "tip: meaning-based search is installed but off for this repo; run `travsr embed init` to turn it on here"
         );
     }
 }

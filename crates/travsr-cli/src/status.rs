@@ -62,16 +62,12 @@ fn live_precision_line(store: &travsr_store::SqliteStore) -> Option<String> {
 /// revert) all restore the file to its committed content, so the working tree
 /// ends up equal to HEAD with the flag still set and the `ref/call` edge still
 /// missing. Telling the user to commit is a dead end there: there is nothing
-/// to stage. Recovery is `travsr init --semantic`, or any later commit that
-/// fires the hook.
+/// to stage. Recovery is `travsr init`, or any later commit that fires the hook.
 ///
-/// The `--semantic` is load-bearing rather than decorative. Plain `travsr init`
-/// defers Phase B to the daemon (`run_phase_b_inline = semantic || !has_commit`),
-/// so on an already-committed repo it re-runs Phase A and returns without
-/// rebuilding the `ref/call` edges this flag is reporting as missing. The flag
-/// therefore survives, and the message would be naming a command that cannot
-/// clear it. Nor can the daemon rescue it here: `arm_phase_b_if_pending` only
-/// arms when `last_commit != phase_b_commit`, and in this state they are equal.
+/// Plain `travsr init` is enough: it always runs Phase B inline, and its
+/// done-guard (`phase_b_inline_needed`) re-runs it when this flag is set even
+/// though the markers are equal. The daemon cannot rescue it here:
+/// `arm_phase_b_if_pending` only arms when `last_commit != phase_b_commit`.
 ///
 /// Clearing the flag on the deferred path instead would be the wrong fix: the
 /// edges genuinely are missing until Phase B re-runs, so the flag is honest and
@@ -101,14 +97,14 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                 // commit-gated path is what actually delivers.
                 let live_active = payload.live_refs_resolved > 0 || payload.live_refs_pending > 0;
                 if !live_active {
-                    "stale (run travsr init --semantic to refresh)".to_string()
+                    "stale (run travsr init to refresh)".to_string()
                 } else if payload.live_refs_pending > 0 {
                     format!(
-                        "{} reference(s) in uncommitted edits not yet resolved",
+                        "{} reference(s) in edits not yet committed are not traced yet",
                         payload.live_refs_pending
                     )
                 } else {
-                    "uncommitted edits resolved where detected; commit for a full refresh"
+                    "edits not yet committed were traced where found; commit for a full refresh"
                         .to_string()
                 }
             } else {
@@ -867,7 +863,7 @@ mod tests {
         // old logic said `complete`, but the file's `ref/call` edges are gone.
         assert_eq!(
             phase_b_state(&payload("abc", "abc", true)),
-            "stale (run travsr init --semantic to refresh)"
+            "stale (run travsr init to refresh)"
         );
     }
 
@@ -883,7 +879,7 @@ mod tests {
         p.live_refs_pending = 0;
         assert_eq!(
             phase_b_state(&p),
-            "uncommitted edits resolved where detected; commit for a full refresh"
+            "edits not yet committed were traced where found; commit for a full refresh"
         );
     }
 
@@ -896,7 +892,7 @@ mod tests {
         p.live_refs_pending = 3;
         assert_eq!(
             phase_b_state(&p),
-            "3 reference(s) in uncommitted edits not yet resolved"
+            "3 reference(s) in edits not yet committed are not traced yet"
         );
     }
 
@@ -909,7 +905,7 @@ mod tests {
         p.live_refs_pending = 4;
         assert_eq!(
             phase_b_state(&p),
-            "4 reference(s) in uncommitted edits not yet resolved"
+            "4 reference(s) in edits not yet committed are not traced yet"
         );
     }
 

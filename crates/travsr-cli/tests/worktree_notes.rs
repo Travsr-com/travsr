@@ -105,7 +105,7 @@ fn the_degraded_caveat_reaches_only_commands_that_ride_call_edges() {
     // fails here rather than letting the assertions below pass vacuously.
     let control = stderr_of(&mut travsr(main), &["references", "hello"]);
     assert!(
-        control.contains("has not caught up"),
+        control.contains("still being traced"),
         "precondition: the main index must be Phase B degraded, got: {control}"
     );
 
