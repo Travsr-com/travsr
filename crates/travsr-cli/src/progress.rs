@@ -248,6 +248,9 @@ impl ProgressReporter {
                     pal.dim(&elapsed)
                 )
             }
+            InitProgress::Saving => {
+                format!("  {spinner} making it searchable   {}", pal.dim(&elapsed))
+            }
             InitProgress::Finalizing => {
                 format!("  {spinner} tracing calls   {}", pal.dim(&elapsed))
             }
@@ -283,6 +286,7 @@ impl ProgressReporter {
                     commas(total)
                 )
             }
+            InitProgress::Saving => format!("making it searchable  {elapsed}"),
             InitProgress::Finalizing => format!("tracing calls  {elapsed}"),
             InitProgress::SemanticRunning { langs, budget_secs } => {
                 format!(
@@ -307,6 +311,9 @@ impl ProgressReporter {
                 format!(
                     r#"{{"phase":"indexing","done":{done},"total":{total},"elapsed_s":{secs}}}"#
                 )
+            }
+            InitProgress::Saving => {
+                format!(r#"{{"phase":"saving","elapsed_s":{secs}}}"#)
             }
             InitProgress::Finalizing => {
                 format!(r#"{{"phase":"finalizing","elapsed_s":{secs}}}"#)
@@ -1022,6 +1029,21 @@ mod tests {
             line.trim_end().ends_with('s'),
             "measured elapsed must remain: {line}"
         );
+    }
+
+    /// Saving what was read took 74 s on yugabyte-db (15 s flush, 59 s search
+    /// rebuild) with the line frozen at "reading files ... 99%". The heartbeat
+    /// names the step and keeps its clock moving.
+    #[test]
+    fn saving_is_named_in_plain_words() {
+        let r = ProgressReporter::new(true, false);
+        let line = r.describe_plain(InitProgress::Saving);
+        assert!(line.starts_with("making it searchable"), "{line}");
+        assert!(line.trim_end().ends_with('s'), "elapsed must show: {line}");
+        assert_eq!(travsr_plugin_host::phase_b::status::jargon_in(&line), None);
+        assert!(r
+            .describe_json(InitProgress::Saving)
+            .contains(r#""phase":"saving""#));
     }
 }
 

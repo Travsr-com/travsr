@@ -292,6 +292,9 @@ pub enum InitProgress {
         total: u64,
         workers: usize,
     },
+    /// Heartbeat while what was read is saved and made searchable (the staging
+    /// flush and the search rebuild): 74 s on yugabyte-db with no other event.
+    Saving,
     /// Post-index semantic passes (LSIF + Phase B); no granular count.
     /// Only emitted when `--semantic` is passed or there is no HEAD commit.
     Finalizing,
@@ -1788,35 +1791,55 @@ pub fn init_repo_with_progress(
         "TIMING: index_paths_parallel done"
     );
 
-    // Flush staging tables → production in one deduplicating GROUP BY pass.
-    // Must happen before rebuild_fts_from_map, which reads nodes_fts_map rows
-    // written during the staging phase and joins them against production nodes.
-    let t_flush = std::time::Instant::now();
-    if index_result.is_ok() {
-        let (nodes_written, edges_written) = store
-            .flush_staging_to_production()
-            .context("flushing staging tables to production")?;
-        tracing::info!(
-            elapsed_ms = t_flush.elapsed().as_millis(),
-            nodes = nodes_written,
-            edges = edges_written,
-            "TIMING: flush_staging_to_production done"
-        );
-    }
+    // Both steps below block this thread for over a minute on a large repo,
+    // with no event of their own: a heartbeat keeps the progress line alive,
+    // as the Phase B fan-out does.
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let hb_progress: &mut (dyn FnMut(InitProgress) + Send) = &mut *on_progress;
+    std::thread::scope(|s| -> anyhow::Result<()> {
+        let hb_done = &done;
+        let hb = s.spawn(move || {
+            while !hb_done.load(std::sync::atomic::Ordering::Relaxed) {
+                hb_progress(InitProgress::Saving);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+        let saved = (|| -> anyhow::Result<()> {
+            // Flush staging tables → production in one deduplicating GROUP BY pass.
+            // Must happen before rebuild_fts_from_map, which reads nodes_fts_map rows
+            // written during the staging phase and joins them against production nodes.
+            let t_flush = std::time::Instant::now();
+            if index_result.is_ok() {
+                let (nodes_written, edges_written) = store
+                    .flush_staging_to_production()
+                    .context("flushing staging tables to production")?;
+                tracing::info!(
+                    elapsed_ms = t_flush.elapsed().as_millis(),
+                    nodes = nodes_written,
+                    edges = edges_written,
+                    "TIMING: flush_staging_to_production done"
+                );
+            }
 
-    // Rebuild FTS + vocab in one pass now that all nodes are written.
-    // Do this before restoring pragmas so the rebuild benefits from the
-    // expanded cache and synchronous=OFF.
-    let t_fts = std::time::Instant::now();
-    if index_result.is_ok() {
-        store
-            .rebuild_fts_from_map()
-            .context("rebuilding FTS after bulk init")?;
-    }
-    tracing::info!(
-        elapsed_ms = t_fts.elapsed().as_millis(),
-        "TIMING: rebuild_fts_from_map done"
-    );
+            // Rebuild FTS + vocab in one pass now that all nodes are written.
+            // Do this before restoring pragmas so the rebuild benefits from the
+            // expanded cache and synchronous=OFF.
+            let t_fts = std::time::Instant::now();
+            if index_result.is_ok() {
+                store
+                    .rebuild_fts_from_map()
+                    .context("rebuilding FTS after bulk init")?;
+            }
+            tracing::info!(
+                elapsed_ms = t_fts.elapsed().as_millis(),
+                "TIMING: rebuild_fts_from_map done"
+            );
+            Ok(())
+        })();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = hb.join();
+        saved
+    })?;
 
     // Always restore pragmas — even on error — so the store is left in a
     // consistent state if the caller catches the error and continues.
