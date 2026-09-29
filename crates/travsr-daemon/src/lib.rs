@@ -3589,7 +3589,17 @@ fn write_phase_b_results(
     // and a class alone (`zero_nodes:java`) cannot name the Android SDK.
     // Bounded and sanitized by the indexer before it reaches here. Written
     // on every run, so a stale diagnostic does not outlive its fix.
-    let diagnostics_json = serde_json::to_string(&pb_outcome.diagnostics).unwrap_or_default();
+    // An emitter that could not run says why here too, so `init` can keep to
+    // the plain line and `status --verbose` still has the emitter's own words.
+    let mut diagnostics = pb_outcome.diagnostics.clone();
+    diagnostics.extend(lsif_skips.iter().map(|skip| {
+        travsr_plugin_host::indexer::SidecarDiagnostic {
+            lang: skip.language.clone(),
+            code: skip.warning_class().to_string(),
+            message: skip.detail.clone(),
+        }
+    }));
+    let diagnostics_json = serde_json::to_string(&diagnostics).unwrap_or_default();
     let _ = store.set_meta("phase_b_diagnostics", &diagnostics_json);
 
     // M1 degradation flag: surfaced by `travsr status` so the user knows Rust

@@ -162,14 +162,22 @@ fn stub_emitter(dir: &Path, body: &str) -> String {
 /// Everything the user can see after a skipped LSIF pass, asserted together so
 /// one surface cannot quietly stop agreeing with the others.
 fn assert_disclosed(bin: &Path, repo: &Path, out: &Output, class: &str) {
+    // A missing emitter ships with travsr, so only a reinstall brings it back;
+    // one that started and failed is explained under `--verbose`.
+    let line = if class.starts_with("emitter_missing") {
+        "typescript  could not trace calls: part of travsr is missing. \
+         Reinstall travsr, then run `travsr init`."
+    } else {
+        "typescript  could not trace calls. See `travsr status --verbose`."
+    };
     let combined = text(out);
     assert!(
         combined.contains(INCOMPLETE_LINE),
         "init must say the TypeScript analysis is incomplete at default verbosity:\n{combined}"
     );
     assert!(
-        combined.contains("See `travsr status --verbose`."),
-        "init must say where the reason and the retry are:\n{combined}"
+        combined.contains(line),
+        "init must give the next step:\n{combined}"
     );
     assert!(
         warnings(repo).split(',').any(|w| w == class),
@@ -184,7 +192,7 @@ fn assert_disclosed(bin: &Path, repo: &Path, out: &Output, class: &str) {
     // Plan 3.0: the default names the language and where to look, in plain
     // words; the explanation itself is under `--verbose`.
     assert!(
-        status.contains("typescript  could not trace calls. See `travsr status --verbose`."),
+        status.contains(line),
         "status must name the language that could not be traced:\n{status}"
     );
     let verbose = text(&run(bin, repo, &["status", "--verbose"], &[]));
@@ -218,10 +226,17 @@ fn missing_emitter_is_disclosed_on_init_in_meta_and_in_status() {
         text(&out)
     );
     assert_disclosed(&bin, repo.path(), &out, "emitter_missing:typescript");
+    // Plan 3.0: an env var name is not for default output; `--verbose` names
+    // the override that is wrong.
     let combined = text(&out);
     assert!(
-        combined.contains("TRAVSR_LSIF_TS"),
-        "the summary must name the override that is wrong:\n{combined}"
+        !combined.contains("TRAVSR_LSIF_TS"),
+        "init must not name an env var by default:\n{combined}"
+    );
+    let verbose = text(&run(&bin, repo.path(), &["status", "--verbose"], &[]));
+    assert!(
+        verbose.contains("TRAVSR_LSIF_TS"),
+        "status --verbose must name the override that is wrong:\n{verbose}"
     );
     assert!(
         combined.contains("Traced calls"),
@@ -268,10 +283,12 @@ fn failing_emitter_is_disclosed_as_failed() {
     let out = init_semantic(&bin, repo.path(), &[("TRAVSR_LSIF_TS", &stub)]);
     assert!(out.status.success(), "{}", text(&out));
     assert_disclosed(&bin, repo.path(), &out, "emitter_failed:typescript");
-    let combined = text(&out);
+    // Plan 3.0: init keeps to the plain line; the emitter's own error is
+    // under `status --verbose`.
+    let verbose = text(&run(&bin, repo.path(), &["status", "--verbose"], &[]));
     assert!(
-        combined.contains("boom"),
-        "the summary must carry the emitter's own error:\n{combined}"
+        verbose.contains("boom"),
+        "status --verbose must carry the emitter's own error:\n{verbose}"
     );
 }
 
