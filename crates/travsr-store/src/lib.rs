@@ -4711,8 +4711,7 @@ LIMIT ?4",
     /// `fn:Type.method` / `method:Type.method` node, the exact-signature pass
     /// misses it. This precise, index-time fallback recovers the qualified
     /// node by leaf name; the caller resolves only when the match is unique so
-    /// no false edge is created. LIKE metacharacters (`_`, `%`) in identifiers
-    /// are escaped so `announce_all` is matched literally.
+    /// no false edge is created.
     pub fn fn_nodes_by_leaf_name(
         &self,
         names: &[String],
@@ -4720,53 +4719,40 @@ LIMIT ?4",
         if names.is_empty() {
             return Ok(Vec::new());
         }
+        let wanted: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        // The leaf a caller could look `sig` up by: after the last `.` of a
+        // qualified `fn:`/`method:` signature, or the whole name of a bare
+        // `fn:name`.
+        let leaf = |sig: &str| -> Option<String> {
+            let (bare, rest) = match sig.strip_prefix("fn:") {
+                Some(rest) => (true, rest),
+                None => (false, sig.strip_prefix("method:")?),
+            };
+            match rest.rsplit_once('.') {
+                Some((_, leaf)) => Some(leaf.to_string()),
+                None => bare.then(|| rest.to_string()),
+            }
+        };
         (|| -> AnyResult<Vec<(NodeId, String, String, String)>> {
-            // Each name contributes 3 params (exact + 2 LIKE). Chunk so a large
-            // `names` slice never exceeds SQLite's SQLITE_MAX_VARIABLE_NUMBER
-            // (default 999 on older builds) or the expression-tree depth limit:
-            // 300 names → 900 params / 900 OR-terms per statement.
-            const NAMES_PER_CHUNK: usize = 300;
-            let mut out = Vec::new();
-            for chunk in names.chunks(NAMES_PER_CHUNK) {
-                let mut clauses: Vec<&str> = Vec::with_capacity(chunk.len() * 3);
-                let mut params: Vec<String> = Vec::with_capacity(chunk.len() * 3);
-                for name in chunk {
-                    let esc = name
-                        .replace('\\', "\\\\")
-                        .replace('%', "\\%")
-                        .replace('_', "\\_");
-                    clauses.push("signature = ?");
-                    params.push(format!("fn:{name}"));
-                    clauses.push("signature LIKE ? ESCAPE '\\'");
-                    params.push(format!("fn:%.{esc}"));
-                    clauses.push("signature LIKE ? ESCAPE '\\'");
-                    params.push(format!("method:%.{esc}"));
-                }
-                // Kind set matches `fetch_all_fn_spans` (incl. the `fn` kind used
-                // by some Phase A parsers) so leaf-name resolution and span
-                // attribution consider the same node population.
-                let sql = format!(
+            // One scan, matched in Rust. A `LIKE 'fn:%.name'` per name cannot
+            // use an index and re-scanned every node per pattern: minutes on
+            // a 588k-node repo. Kind set matches `fetch_all_fn_spans` (incl.
+            // the `fn` kind used by some Phase A parsers) so leaf-name
+            // resolution and span attribution consider the same nodes.
+            let mut stmt = self
+                .conn
+                .prepare(
                     "SELECT id, signature, path, language FROM nodes \
-                     WHERE kind IN ('function','method','fn') AND ({})",
-                    clauses.join(" OR ")
-                );
-                let mut stmt = self
-                    .conn
-                    .prepare(&sql)
-                    .context("preparing fn_nodes_by_leaf_name")?;
-                let params_vec: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-                let rows = stmt
-                    .query_map(params_vec.as_slice(), |row| {
-                        let id = i64_to_node_id(row.get::<_, i64>(0)?);
-                        let sig: String = row.get(1)?;
-                        let path: String = row.get(2)?;
-                        let lang: String = row.get(3)?;
-                        Ok((id, sig, path, lang))
-                    })
-                    .context("executing fn_nodes_by_leaf_name")?;
-                for row in rows {
-                    out.push(row.context("decoding fn_nodes_by_leaf_name row")?);
+                     WHERE kind IN ('function','method','fn')",
+                )
+                .context("preparing fn_nodes_by_leaf_name")?;
+            let mut rows = stmt.query([]).context("executing fn_nodes_by_leaf_name")?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().context("reading fn_nodes_by_leaf_name row")? {
+                let sig: String = row.get(1)?;
+                if leaf(&sig).is_some_and(|l| wanted.contains(l.as_str())) {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    out.push((id, sig, row.get(2)?, row.get(3)?));
                 }
             }
             Ok(out)
@@ -12718,6 +12704,33 @@ mod tests {
 
         // Empty input short-circuits with no query.
         assert!(store.fn_nodes_by_leaf_name(&[]).unwrap().is_empty());
+    }
+
+    /// The leaf is matched exactly, the way the caller looks it up. The old
+    /// `LIKE 'fn:%.name'` (case-insensitive, one scan of every node per
+    /// pattern) took minutes on yugabyte-db's 588k nodes.
+    #[test]
+    fn fn_nodes_by_leaf_name_matches_the_leaf_exactly() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for (sig, kind) in [
+            ("fn:Svc.run", "method"),
+            ("fn:Svc.Run", "method"),
+            ("method:a.b.Svc.run", "method"),
+            ("method:run", "method"),
+            ("fn:Svc.rerun", "function"),
+        ] {
+            let n =
+                travsr_core::Node::new(travsr_core::VName::new("c", "", "a.go", "go", sig), kind);
+            store.put_node(&n).unwrap();
+        }
+        let mut got: Vec<String> = store
+            .fn_nodes_by_leaf_name(&["run".to_string()])
+            .unwrap()
+            .into_iter()
+            .map(|(_, sig, _, _)| sig)
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["fn:Svc.run", "method:a.b.Svc.run"]);
     }
 
     #[test]
