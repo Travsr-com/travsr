@@ -288,12 +288,16 @@ main() {
 
   install_binary
 
-  case ":${PATH}:" in
-    *":${dir}:"*) ;;
-    *) warn "${dir} is not on your PATH. Add this to your shell profile: export PATH=\"${dir}:\$PATH\"" ;;
-  esac
-
   info "installed travsr to ${dir}/travsr"
+
+  # The one next step, runnable as printed (plan G2: nobody edits PATH). When
+  # the install dir is not on PATH, the absolute path runs just the same, and
+  # `travsr init` writes absolute paths into the AI tool configs it sets up.
+  case ":${PATH}:" in
+    *":${dir}:"*) next="travsr init" ;;
+    *) next="${dir}/travsr init" ;;
+  esac
+  printf 'Next: in your project folder, run %s\n' "$next"
 }
 
 main "$@"
