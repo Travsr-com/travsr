@@ -928,6 +928,10 @@ fn init_outside_ci_keeps_a_daemon_running_without_a_terminal() {
 /// `~/.claude`, nothing in the repo) gets this project wired by `init` alone,
 /// through the project's own `.mcp.json`, and is never told to edit PATH: the
 /// config carries the absolute path.
+///
+/// Not on Windows: `dirs::home_dir` asks Windows for the profile folder and
+/// ignores `HOME`, so the test cannot give it a home with `.claude` in it.
+#[cfg(not(windows))]
 #[test]
 fn init_wires_claude_code_from_a_home_marker_without_a_path_note() {
     let tmp = tempfile::tempdir().unwrap();
@@ -980,6 +984,13 @@ fn init_wires_claude_code_from_a_home_marker_without_a_path_note() {
 /// on offline and still finishes.
 #[test]
 fn a_failed_language_install_shows_its_output_and_init_finishes() {
+    // Go's tools install only where Go is: without it, Go reads "needs Go
+    // toolchain" and no install runs to fail.
+    let go = StdCommand::new("go").arg("version").output();
+    if !go.is_ok_and(|o| o.status.success()) {
+        eprintln!("SKIP: go not available");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     git_init(tmp.path());
