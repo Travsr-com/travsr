@@ -127,6 +127,22 @@ pub fn run(
         );
     }
 
+    // Connect before the daemon starts: connect writes `.gitignore`, and a
+    // watcher already running would reindex on that write and mark the index
+    // stale moments after a complete run. stdout carries the machine-readable
+    // summary under `--json`, so the connect report goes to stderr there; it
+    // must not be dropped (RFC-026: these writes land in user-owned files).
+    let connected = maybe_connect(
+        &repo_root,
+        no_connect,
+        guard,
+        if json {
+            crate::connect::Report::Stderr
+        } else {
+            crate::connect::Report::Silent
+        },
+    );
+
     // Keep the index fresh in the background: file watching, git hooks, and
     // Phase B for later commits. `CI` is the one opt-out, so a CI step or a test
     // never leaves a process behind; a terminal is not required, because agents
@@ -177,15 +193,6 @@ pub fn run(
             "search_ranking": search_ranking,
             "keeping_fresh": keeping_fresh,
         });
-        // stdout carries the machine-readable summary, so the connect report goes
-        // to stderr. It must not be dropped: these writes land in tracked,
-        // user-authored files, and RFC-026 promises they stay visible.
-        let connected = maybe_connect(
-            &repo_root,
-            no_connect,
-            guard,
-            crate::connect::Report::Stderr,
-        );
         let mut summary = summary;
         summary["connected"] = connected
             .tools
@@ -198,14 +205,6 @@ pub fn run(
         return Ok(());
     }
 
-    // Plan S9: connect first, silently, so the summary can say what it did in
-    // one line; the files it changed are named there (RFC-026).
-    let connected = maybe_connect(
-        &repo_root,
-        no_connect,
-        guard,
-        crate::connect::Report::Silent,
-    );
     let no_op = stats.nodes_written == 0 && stats.edges_written == 0;
     use crate::progress::{InitSummary, Traced};
     let traced = match (&stats.phase_b_report, keeping_fresh) {
