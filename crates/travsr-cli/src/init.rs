@@ -200,6 +200,11 @@ pub fn run(
             .iter()
             .map(|t| serde_json::Value::from(*t))
             .collect();
+        summary["one_step"] = connected
+            .one_step
+            .iter()
+            .map(|t| serde_json::Value::from(*t))
+            .collect();
         summary["interrupted"] = false.into();
         summary["next"] = crate::progress::ready_line(no_op).into();
         println!("{summary}");

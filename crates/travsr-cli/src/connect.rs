@@ -57,6 +57,50 @@ pub struct Connected {
     /// Files the user owns that this run changed (RFC-026: such writes stay
     /// visible), repo-relative.
     pub user_files: Vec<String>,
+    /// Tools found that need a step of the user's own, by stable id.
+    pub one_step: Vec<&'static str>,
+}
+
+/// `connect --print --json`: each AI tool found for `repo` and whether it
+/// connects by itself (`automatic`) or needs a step of the user's own.
+pub fn found_tools_json(repo: &Path) -> Value {
+    tools_json(&found_tools(
+        repo,
+        dirs::home_dir().as_deref(),
+        &McpCommand::resolve(),
+    ))
+}
+
+fn tools_json(found: &[(&'static str, bool)]) -> Value {
+    found
+        .iter()
+        .map(|(id, by_itself)| {
+            serde_json::json!({
+                "tool": id,
+                "name": display_name(id),
+                "setup": if *by_itself { "automatic" } else { "one_step" },
+            })
+        })
+        .collect()
+}
+
+/// Every AI tool found for `repo`, by stable id, with whether `connect` wires
+/// it by itself (it writes the tool's server config) or the user must add
+/// travsr in the tool's own settings. Nothing is written.
+fn found_tools(repo: &Path, home: Option<&Path>, cmd: &McpCommand) -> Vec<(&'static str, bool)> {
+    Tool::ALL
+        .iter()
+        .filter_map(|tool| match tool.detect(repo, home) {
+            Detection::Auto => Some((
+                tool.id(),
+                tool.plan(repo, cmd, None)
+                    .iter()
+                    .any(|p| matches!(p.content, Content::JsonServer { .. })),
+            )),
+            Detection::Print => Some((tool.id(), false)),
+            Detection::None => None,
+        })
+        .collect()
 }
 
 /// The name the user knows a tool by, from its stable id (`claude-code`).
@@ -901,21 +945,13 @@ impl Tool {
     fn snippet(&self, repo: &Path, cmd: &McpCommand) -> String {
         let server = indent(&mcp_servers_json(cmd));
         match self {
-            Tool::Antigravity => format!(
-                "  add to ~/.gemini/config/mcp_config.json:\n{server}\n  \
-                 and put the Travsr guidance in {}/GEMINI.md",
-                repo.display()
-            ),
+            Tool::Antigravity => format!("  add to ~/.gemini/config/mcp_config.json:\n{server}"),
             Tool::Codex => format!(
-                "  add [mcp_servers.travsr] to ~/.codex/config.toml, and put the Travsr \
-                 guidance in {}/AGENTS.md",
-                repo.display()
+                "  add to ~/.codex/config.toml:\n    \
+                 [mcp_servers.travsr]\n    command = \"{}\"\n    args = [\"mcp\", \"--stdio\"]",
+                cmd.command
             ),
-            Tool::Windsurf => format!(
-                "  add to ~/.codeium/windsurf/mcp_config.json:\n{server}\n  \
-                 and create {}/.windsurf/rules/travsr.md with the Travsr guidance",
-                repo.display()
-            ),
+            Tool::Windsurf => format!("  add to ~/.codeium/windsurf/mcp_config.json:\n{server}"),
             // Both destinations, because which one the user picks is what
             // decides whether an approval is pending: a project `.mcp.json` is
             // gated behind the one-time trust prompt `approval_hint` names
@@ -1753,6 +1789,14 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<Connected> {
         }
     }
 
+    if !opts.remove && opts.only.is_none() {
+        connected.one_step = found_tools(repo_root, home.as_deref(), &cmd)
+            .into_iter()
+            .filter(|(_, by_itself)| !by_itself)
+            .map(|(id, _)| id)
+            .collect();
+    }
+
     for r in &already_tracked {
         warn!(
             "warning: {r} is tracked by git and already holds the travsr server \
@@ -1959,6 +2003,35 @@ mod tests {
                 tool.id()
             );
         }
+    }
+
+    /// What `init` can promise per tool: Claude Code is wired into the project,
+    /// while Codex (home marker) and Windsurf (project marker, but its MCP
+    /// servers live in a global file travsr never writes) need a step of the
+    /// user's own.
+    #[test]
+    fn found_tools_says_which_connect_by_themselves() {
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".claude")).unwrap();
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+        std::fs::create_dir(repo.path().join(".windsurf")).unwrap();
+        assert_eq!(
+            found_tools(repo.path(), Some(home.path()), &cmd()),
+            vec![("claude-code", true), ("codex", false), ("windsurf", false)]
+        );
+    }
+
+    /// `connect --print --json`, which the VS Code welcome page reads.
+    #[test]
+    fn found_tools_as_json() {
+        assert_eq!(
+            tools_json(&[("claude-code", true), ("codex", false)]),
+            serde_json::json!([
+                {"tool": "claude-code", "name": "Claude Code", "setup": "automatic"},
+                {"tool": "codex", "name": "Codex", "setup": "one_step"},
+            ])
+        );
     }
 
     #[test]
@@ -2398,6 +2471,20 @@ mod tests {
         // A tool whose snippet names no destination must not claim either.
         let generic = Tool::Cursor.snippet(dir.path(), &cmd());
         assert!(!generic.contains("approval"), "{generic}");
+    }
+
+    /// `init` sends the user to `travsr connect --tool <id>` for a tool it
+    /// cannot wire, so what that prints must be pasteable: Codex said only
+    /// "add [mcp_servers.travsr]" with nothing to add, and each asked for
+    /// "Travsr guidance" it never printed.
+    #[test]
+    fn every_one_step_snippet_carries_the_config_to_paste() {
+        let dir = tempdir().unwrap();
+        for tool in Tool::ALL {
+            let snippet = tool.snippet(dir.path(), &cmd());
+            assert!(snippet.contains("\"travsr\""), "{}: {snippet}", tool.id());
+            assert!(!snippet.contains("guidance"), "{}: {snippet}", tool.id());
+        }
     }
 
     #[test]

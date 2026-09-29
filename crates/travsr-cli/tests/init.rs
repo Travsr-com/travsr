@@ -855,6 +855,10 @@ fn init_json_is_one_object_and_never_reads_stdin() {
     assert!(["installed", "skipped"].contains(&v["search_ranking"].as_str().unwrap()));
     assert_eq!(v["keeping_fresh"], "not_started", "CI is set");
     assert_eq!(v["next"], "Ready. Ask your AI about this code.");
+    assert!(
+        v["one_step"].is_array(),
+        "tools needing a step of the user's own"
+    );
 
     // `next` is the line the text summary ends with, so a re-run with nothing
     // to do says so here too.
@@ -929,6 +933,8 @@ fn init_wires_claude_code_from_a_home_marker_without_a_path_note() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir(home.path().join(".claude")).unwrap();
+    // Codex keeps its servers in a global file travsr never writes.
+    std::fs::create_dir(home.path().join(".codex")).unwrap();
     git_init(tmp.path());
     std::fs::write(
         tmp.path().join("a.ts"),
@@ -963,6 +969,10 @@ fn init_wires_claude_code_from_a_home_marker_without_a_path_note() {
         "the project config must carry the travsr server: {mcp}"
     );
     assert!(!text.contains("PATH"), "no PATH instruction (G2):\n{text}");
+    assert!(
+        text.contains("Codex needs one step from you: run `travsr connect --tool codex`"),
+        "{text}"
+    );
 }
 
 /// Setup output stays hidden unless an install fails. Here every download is

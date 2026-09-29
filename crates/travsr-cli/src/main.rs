@@ -120,6 +120,11 @@ enum Command {
         /// Show what would change without writing anything.
         #[arg(long)]
         print: bool,
+        /// With --print: list the AI tools found as JSON, each with whether it
+        /// connects by itself (`automatic`) or needs a step of your own
+        /// (`one_step`).
+        #[arg(long, requires = "print")]
+        json: bool,
         /// Remove previously generated Travsr config.
         #[arg(long)]
         remove: bool,
@@ -904,6 +909,7 @@ async fn run(cli: Cli) -> Result<()> {
             commit,
             rules,
             guard,
+            json,
         } => {
             let cwd = std::env::current_dir()?;
             // Write command: `connect` creates files in the resolved root, so it
@@ -912,6 +918,10 @@ async fn run(cli: Cli) -> Result<()> {
             // which would drop this checkout's AI config into a different one.
             // `travsr init` already wires connect through the write resolver.
             let repo_root = repo::find_git_root_for_write(&cwd)?;
+            if json {
+                println!("{}", connect::found_tools_json(&repo_root));
+                return Ok(());
+            }
             connect::run(
                 &repo_root,
                 &connect::ConnectOpts {

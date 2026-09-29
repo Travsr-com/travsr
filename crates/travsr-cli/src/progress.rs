@@ -557,6 +557,16 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
             out.push(line);
         }
     }
+    // Not on a no-change run: travsr cannot see a tool's own settings, so a
+    // step already taken would otherwise be asked for on every run.
+    if !s.no_op {
+        for id in &s.connected.one_step {
+            out.push(format!(
+                "  {} needs one step from you: run `travsr connect --tool {id}` to see it.",
+                crate::connect::display_name(id)
+            ));
+        }
+    }
     out.extend(s.diagnostics.iter().cloned());
     out
 }
@@ -849,6 +859,7 @@ mod tests {
                 tools: vec!["claude-code", "cursor"],
                 needs_approval: true,
                 user_files: vec![".gitignore".into()],
+                one_step: vec!["codex"],
             },
             travsrignore_created: true,
             gitignore_updated: true,
@@ -896,6 +907,7 @@ mod tests {
                 "Ready. Ask your AI about this code.",
                 "  java        needs JDK, Maven or Gradle. Install JDK, Maven or Gradle, then \
                  run `travsr init`.",
+                "  Codex needs one step from you: run `travsr connect --tool codex` to see it.",
             ]
         );
         for line in &lines {
