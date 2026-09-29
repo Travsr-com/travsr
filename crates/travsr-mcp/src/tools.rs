@@ -1491,6 +1491,9 @@ pub(crate) fn resolve_reference_targets(
     path: Option<&str>,
 ) -> RefTarget {
     let mut candidates = resolve_symbol_nodes(store, symbol, path);
+    if candidates.is_empty() {
+        candidates = resolve_alias(store, symbol, path);
+    }
 
     // C/C++ split a symbol into a header declaration and a source definition
     // (`utils.h` decl + `utils.c` def). They share the simple name, so both
@@ -1525,6 +1528,64 @@ pub(crate) fn resolve_reference_targets(
             .unwrap_or(RefTarget::None),
         _ => RefTarget::Ambiguous(candidates),
     }
+}
+
+/// Definitions a name reaches only as an `as` alias (`pub use a::b as c`,
+/// `from m import b as c`, `import { b as c }`). Parsers index the original
+/// name, so a lookup by the alias found nothing although its calls are in the
+/// graph under the original. One bounded text search over the indexed files,
+/// run only when the name has no definition of its own; an original that
+/// resolves to no definition (a cast like `x as u32`) is dropped.
+fn resolve_alias(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<CoreNode> {
+    if symbol.is_empty() || !symbol.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return Vec::new();
+    }
+    let Some(repo_root) = resolve_repo_root(store) else {
+        return Vec::new();
+    };
+    let pattern = format!("[[:space:]]as[[:space:]]+{symbol}([^[:alnum:]_]|$)");
+    let GrepOutcome::Matches(body) = run_git_grep(&repo_root, &pattern, &[], false) else {
+        return Vec::new();
+    };
+    let mut originals: Vec<String> = Vec::new();
+    for o in body.lines().flat_map(|l| alias_originals(l, symbol)) {
+        if !originals.contains(&o) {
+            originals.push(o);
+        }
+    }
+    let mut nodes: Vec<CoreNode> = originals
+        .iter()
+        .flat_map(|o| resolve_symbol_nodes(store, o, path))
+        .collect();
+    nodes.sort_by_key(|n| n.id.0);
+    nodes.dedup_by_key(|n| n.id);
+    nodes
+}
+
+/// The identifiers `line` renames to `alias` (`orig as alias`), in order.
+fn alias_originals(line: &str, alias: &str) -> Vec<String> {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out: Vec<String> = Vec::new();
+    for (i, _) in line.match_indices(" as ") {
+        let Some(after) = line[i + 4..].trim_start().strip_prefix(alias) else {
+            continue;
+        };
+        if after.starts_with(is_ident) {
+            continue;
+        }
+        let before = line[..i].trim_end();
+        let start = before
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| is_ident(*c))
+            .last()
+            .map_or(before.len(), |(j, _)| j);
+        let orig = &before[start..];
+        if !orig.is_empty() && orig != alias && !out.iter().any(|o| o == orig) {
+            out.push(orig.to_string());
+        }
+    }
+    out
 }
 
 /// Whether every candidate is a multi-part Objective-C selector of ONE class
@@ -11155,6 +11216,40 @@ mod tests {
                 "not a pattern problem, so the POSIX ERE hint would mislead: {other}"
             );
         }
+    }
+
+    /// A name that exists only as an `as` alias resolves through the name it
+    /// renames: Rust re-exports (one line or inside a `{}` group), Python and
+    /// TypeScript imports. A glob, a cast to a type, or a longer name that only
+    /// starts with the alias yield nothing.
+    #[test]
+    fn an_alias_line_names_the_original() {
+        let a = "install_rerank_model";
+        assert_eq!(
+            alias_originals(
+                "    install_model_blocking as install_rerank_model, model_installed as x,",
+                a
+            ),
+            vec!["install_model_blocking"]
+        );
+        assert_eq!(
+            alias_originals(
+                "pub use rerank::install_model_blocking as install_rerank_model;",
+                a
+            ),
+            vec!["install_model_blocking"]
+        );
+        assert_eq!(
+            alias_originals("from m import greet as hello", "hello"),
+            vec!["greet"]
+        );
+        assert_eq!(
+            alias_originals("import { greet as hello } from './m'", "hello"),
+            vec!["greet"]
+        );
+        assert!(alias_originals("import * as hello from './m'", "hello").is_empty());
+        assert!(alias_originals("let n = x as install_rerank_model_v2;", a).is_empty());
+        assert!(alias_originals("let n = install_rerank_model as u32;", a).is_empty());
     }
 
     #[test]
