@@ -31,6 +31,22 @@ fn welcome_page_reads_plainly() {
         }
     }
 
+    // The AI tool lines are built at run time from what the machine has; their
+    // wording is the string literals of `welcomeToolLines`.
+    let tools = src
+        .split("export function welcomeToolLines")
+        .nth(1)
+        .and_then(|f| f.split("\nexport function").next())
+        .expect("welcome page builds its tool lines");
+    let mut quoted = String::new();
+    for (i, part) in tools.split(['`', '"']).enumerate() {
+        if i % 2 == 1 {
+            quoted.push_str(part);
+            quoted.push(' ');
+        }
+    }
+    text.push_str(&quoted.replace(['<', '>'], " "));
+
     assert_eq!(
         travsr_plugin_host::phase_b::status::jargon_in(&text),
         None,

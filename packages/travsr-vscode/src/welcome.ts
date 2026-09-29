@@ -5,6 +5,7 @@
  * at any time via the travsr.showWelcome command.
  */
 
+import * as cp from "child_process";
 import * as vscode from "vscode";
 
 const WELCOME_SHOWN_KEY = "travsr.welcomeShown";
@@ -12,13 +13,47 @@ const WELCOME_SHOWN_KEY = "travsr.welcomeShown";
 // Module-level ref so re-running the command reveals the existing panel.
 let currentPanel: vscode.WebviewPanel | undefined;
 
-export function showWelcomeIfFirstRun(context: vscode.ExtensionContext): void {
+export function showWelcomeIfFirstRun(context: vscode.ExtensionContext, root?: string): void {
   if (context.globalState.get<boolean>(WELCOME_SHOWN_KEY, false)) return;
   void context.globalState.update(WELCOME_SHOWN_KEY, true);
-  showWelcome();
+  showWelcome(root);
 }
 
-export function showWelcome(): void {
+/** One row of `travsr connect --print --json`. */
+export interface FoundTool {
+  tool: string;
+  name: string;
+  /** `automatic`: setup connects it. `one_step`: the user adds Travsr in the tool. */
+  setup: string;
+}
+
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function joinNames(names: string[]): string {
+  return names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/** The "Get started" lines about AI tools, from what this machine has.
+ *  `undefined` until the CLI answers (or when it cannot): stay generic. */
+export function welcomeToolLines(tools: FoundTool[] | undefined): string[] {
+  const ready = "Wait for <strong>Ready.</strong>";
+  if (!tools) return [`${ready} The AI tools Travsr finds are connected for you.`];
+  if (tools.length === 0) {
+    return [`${ready} No AI coding tool found yet: install one, then run <strong>Travsr: Re-index Now</strong>.`];
+  }
+  const automatic = tools.filter((t) => t.setup === "automatic").map((t) => esc(t.name));
+  const lines = [automatic.length ? `${ready} Travsr connects ${joinNames(automatic)} for you.` : ready];
+  for (const t of tools.filter((t) => t.setup !== "automatic")) {
+    lines.push(
+      `${esc(t.name)} needs one step from you: after setup, run <code>travsr connect --tool ${esc(t.tool)}</code> to see it.`
+    );
+  }
+  return lines;
+}
+
+export function showWelcome(root?: string): void {
   if (currentPanel) {
     currentPanel.reveal(vscode.ViewColumn.One);
     return;
@@ -30,10 +65,22 @@ export function showWelcome(): void {
     { localResourceRoots: [], enableScripts: false }
   );
   currentPanel.onDidDispose(() => { currentPanel = undefined; });
-  currentPanel.webview.html = getHtml();
+  currentPanel.webview.html = getHtml(undefined);
+  if (!root) return;
+  // Read-only: names the tools found without writing anything.
+  const panel = currentPanel;
+  const binary = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
+  cp.execFile(binary, ["connect", "--print", "--json"], { cwd: root, timeout: 10_000 }, (err, stdout) => {
+    if (err || panel !== currentPanel) return;
+    try {
+      panel.webview.html = getHtml(JSON.parse(stdout) as FoundTool[]);
+    } catch {
+      // Keep the generic line.
+    }
+  });
 }
 
-function getHtml(): string {
+function getHtml(tools: FoundTool[] | undefined): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -83,7 +130,7 @@ function getHtml(): string {
   <ul>
     <li>Open a folder that is a Git project.</li>
     <li>Click <strong>Set up</strong> when Travsr asks, or run <strong>Travsr: Re-index Now</strong> from the Command Palette.</li>
-    <li>Wait for <strong>Ready.</strong> Claude Code and Cursor are connected for you.</li>
+    ${welcomeToolLines(tools).map((l) => `<li>${l}</li>`).join("\n    ")}
   </ul>
   <p>If a language needs something installed first, <strong>Travsr: Health</strong> lists it with the one thing to do.</p>
 

@@ -219,7 +219,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // First-run welcome page (VSCODE-204)
-  showWelcomeIfFirstRun(context);
+  showWelcomeIfFirstRun(context, workspaceRoot);
 
   // One-command setup (plan 3.5): offer it once for a git folder with no index.
   // The graph.db watcher above reconnects once it exists.
@@ -479,7 +479,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("travsr.showWelcome", () => showWelcome())
+    vscode.commands.registerCommand("travsr.showWelcome", () => showWelcome(workspaceRoot))
   );
 
   // Graph panel (VSCODE-245)
