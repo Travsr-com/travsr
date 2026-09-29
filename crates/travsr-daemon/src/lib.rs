@@ -711,128 +711,6 @@ fn travsr_dir_tracked(repo_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Top-level directory names that are well-known source roots, never dep/vendor dirs.
-/// Auto-exclusion never fires for these regardless of file count.
-const KNOWN_SOURCE_DIRS: &[&str] = &[
-    "src",
-    "lib",
-    "pkg",
-    "internal",
-    "cmd",
-    "api",
-    "test",
-    "tests",
-    "app",
-    "apps",
-    "plugins",
-    "modules",
-    "services",
-    "components",
-    "core",
-    "common",
-    "shared",
-    "utils",
-    "crates",
-    "staging",
-    "hack",
-    "cluster",
-    "docs",
-    "examples",
-    "samples",
-    // Standard source root for static-site generators (Hugo, Jekyll, Gatsby,
-    // Next.js content collections) — the entire doc corpus of a docs-only
-    // repo commonly lives here. Without this, `travsr init` on such a repo
-    // auto-excludes essentially all of it as a false-positive "large dep
-    // dir", silently (non-TTY runs only log the decision via tracing::info!,
-    // never in the command's own visible output) — found indexing
-    // kubernetes/website while measuring #376 lifecycle plan L4.
-    "content",
-];
-
-/// Heuristic: a single directory holding ≥ 1 000 source-language files AND
-/// ≥ 15 % of the total discovered source files is flagged as a "large dep dir",
-/// unless the directory name is in `KNOWN_SOURCE_DIRS`.
-///
-/// Returns `(dir_name, file_count, total_count)` for the first such directory
-/// that is not already excluded by the walker (SKIP_DIRS or .travsrignore).
-fn detect_large_dep_dir(indexable: &[PathBuf], repo_root: &Path) -> Option<(String, u64, u64)> {
-    use std::collections::HashMap;
-
-    let total = indexable.len() as u64;
-    if total == 0 {
-        return None;
-    }
-
-    let mut top_counts: HashMap<String, u64> = HashMap::new();
-    for p in indexable {
-        if let Some(first) = p.strip_prefix(repo_root).ok().and_then(|r| {
-            r.components()
-                .next()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        }) {
-            *top_counts.entry(first).or_insert(0) += 1;
-        }
-    }
-
-    for (dir, count) in top_counts {
-        if KNOWN_SOURCE_DIRS.contains(&dir.as_str()) {
-            continue;
-        }
-        let pct = count * 100 / total;
-        if count >= 1_000 && pct >= 15 {
-            return Some((dir, count, total));
-        }
-    }
-    None
-}
-
-/// If stderr is a TTY, prompt the user once to exclude a detected large dep dir.
-/// If non-TTY / CI, auto-exclude and log the decision without blocking.
-///
-/// Appends the rule to `.travsrignore` if the user accepts (or in CI mode).
-/// Returns `true` if a rule was appended (caller should re-build the walker).
-fn maybe_prompt_large_dep(repo_root: &Path, dir: &str, count: u64, total: u64) -> bool {
-    use std::io::{IsTerminal, Write};
-
-    let pct = count * 100 / total;
-    let is_tty = std::io::stderr().is_terminal();
-
-    let exclude = if is_tty {
-        let mut err = std::io::stderr().lock();
-        let _ = write!(
-            err,
-            "\nDetected {dir}/ ({count} files, ~{pct}% of repo). \
-             Exclude from index? [Y/n] "
-        );
-        let _ = err.flush();
-        drop(err);
-        let mut line = String::new();
-        let _ = std::io::stdin().read_line(&mut line);
-        let answer = line.trim().to_ascii_lowercase();
-        answer.is_empty() || answer == "y" || answer == "yes"
-    } else {
-        tracing::info!(
-            dir = %dir,
-            count,
-            pct,
-            "non-TTY: auto-excluding large dep dir from index (add !{dir}/ to .travsrignore to override)"
-        );
-        true
-    };
-
-    if exclude {
-        let path = repo_root.join(".travsrignore");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&path)
-        {
-            let _ = writeln!(f, "{dir}/");
-        }
-    }
-    exclude
-}
-
 /// File count above which an embed pass announces itself before starting.
 ///
 /// An incremental pass touches the handful of files a commit changed and lands
@@ -1831,48 +1709,6 @@ pub fn init_repo_with_progress(
             "warning: a git rebase is in progress, consider finishing or aborting it \
              before running `travsr init` to avoid indexing conflict markers"
         );
-    }
-
-    // T4 (1c): detect a large un-excluded dep dir and prompt/auto-exclude it.
-    // If the user accepts, re-discover so the excluded files are dropped.
-    if let Some((dir, count, total)) = detect_large_dep_dir(&indexable_paths, repo_root) {
-        let appended = maybe_prompt_large_dep(repo_root, &dir, count, total);
-        if appended {
-            // Re-build the walker and re-discover now that .travsrignore is updated.
-            let walker2 = WalkBuilder::new(repo_root)
-                .hidden(false)
-                .git_ignore(true)
-                .follow_links(false)
-                .add_custom_ignore_filename(".travsrignore")
-                .build();
-            indexable_paths.clear();
-            present_languages.clear();
-            for entry in walker2.flatten() {
-                if !entry.file_type().is_some_and(|t| t.is_file()) {
-                    continue;
-                }
-                let p = entry.into_path();
-                let rel = p.strip_prefix(repo_root).unwrap_or(&p);
-                if rel.components().any(|c| {
-                    crate::watcher::SKIP_DIRS
-                        .iter()
-                        .any(|skip| c.as_os_str() == *skip)
-                }) {
-                    continue;
-                }
-                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if let Some(lang) = Language::from_extension(ext) {
-                    present_languages.insert(lang.as_str().to_string());
-                    indexable_paths.push(p);
-                } else if travsr_core::is_manifest_file(
-                    p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
-                ) {
-                    // Name-recognized manifest (go.mod, *.csproj): unmapped ext.
-                    indexable_paths.push(p);
-                }
-            }
-            reclassify_objc_headers(&mut present_languages, &indexable_paths);
-        }
     }
 
     // M10: warn before spending minutes indexing when the file count is unusually
@@ -9925,41 +9761,30 @@ mod tests {
         );
     }
 
-    /// L4 (#376 lifecycle plan): found indexing kubernetes/website, whose
-    /// entire doc corpus lives under `content/` — the standard source root
-    /// for Hugo/Jekyll/Gatsby-style static sites. Before `content` was added
-    /// to `KNOWN_SOURCE_DIRS`, a single top-level `content/` directory large
-    /// enough to dominate the repo (>=1000 files, >=15% of the total) was
-    /// flagged as a false-positive "large dep dir" and auto-excluded in
-    /// non-TTY runs with no visible warning in the command's own output —
-    /// silently discarding the repo's actual content.
+    /// A folder that holds most of the repo is not evidence it is a dependency:
+    /// init asked `[Y/n]` about it on a terminal and silently excluded it
+    /// everywhere else, and in yugabyte-db that folder (`managed/`) is the
+    /// platform's own code. Dependency folders are left out by the default
+    /// `.travsrignore`; everything else is indexed.
     #[test]
-    fn detect_large_dep_dir_does_not_flag_content() {
-        let repo_root = std::path::Path::new("/repo");
-        let mut files: Vec<PathBuf> = (0..1200)
-            .map(|i| repo_root.join(format!("content/en/docs/page-{i}.md")))
-            .collect();
-        files.push(repo_root.join("go.mod"));
-        assert_eq!(
-            detect_large_dep_dir(&files, repo_root),
-            None,
-            "content/ is a known source dir and must never be auto-excluded"
-        );
-    }
+    fn a_dominant_folder_is_indexed_not_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir(tmp.path().join("managed")).unwrap();
+        for i in 0..1200 {
+            std::fs::write(tmp.path().join(format!("managed/c{i}.yaml")), "a: 1\n").unwrap();
+        }
+        std::fs::write(tmp.path().join("go.mod"), "module m\n").unwrap();
 
-    #[test]
-    fn detect_large_dep_dir_still_flags_an_unknown_large_dir() {
-        let repo_root = std::path::Path::new("/repo");
-        let mut files: Vec<PathBuf> = (0..1200)
-            .map(|i| repo_root.join(format!("node_modules/pkg-{i}/index.js")))
-            .collect();
-        files.push(repo_root.join("go.mod"));
-        let detected = detect_large_dep_dir(&files, repo_root);
-        assert_eq!(
-            detected.map(|(dir, ..)| dir),
-            Some("node_modules".to_string()),
-            "an unknown, dominant top-level dir must still be flagged"
+        let stats = init_repo(tmp.path()).unwrap();
+
+        assert!(
+            stats.files_indexed >= 1200,
+            "indexed {}",
+            stats.files_indexed
         );
+        let ignore = std::fs::read_to_string(tmp.path().join(".travsrignore")).unwrap_or_default();
+        assert!(!ignore.contains("managed"), "{ignore}");
     }
 
     #[test]
