@@ -69,6 +69,8 @@ pub struct ScipBinarySpec {
     /// (0.12.x) and drives the build itself (`travsr-lang-java`). `None` elsewhere
     /// means the platform-independent tag resolution applies on every OS.
     pub windows_pin: Option<&'static str>,
+    /// Run this instead where `asset_fn` has no binary for the platform.
+    pub fallback_command: Option<&'static [&'static str]>,
 }
 
 /// Specifies a zip archive on GitHub Releases that must be extracted rather than
@@ -152,6 +154,18 @@ pub enum ScipInstall {
 /// preamble directly.
 pub fn scip_java_asset(tag: &str, _target: &str) -> Option<String> {
     Some(format!("scip-java-{tag}"))
+}
+
+/// scip-go ships darwin-arm64 and linux amd64/arm64 tarballs (no version in the
+/// asset name); other platforms use the `go install` fallback.
+pub fn scip_go_asset(_tag: &str, target: &str) -> Option<String> {
+    let platform = match target {
+        "aarch64-apple-darwin" => "darwin-arm64",
+        "x86_64-unknown-linux-gnu" => "linux-amd64",
+        "aarch64-unknown-linux-gnu" => "linux-arm64",
+        _ => return None,
+    };
+    Some(format!("scip-go-{platform}.tar.gz"))
 }
 
 /// scip-ruby ships arm64-darwin and x86_64-linux binaries (no version in asset name).
@@ -502,17 +516,30 @@ pub static CATALOG: &[PhaseBEntry] = &[
         underlying_tool_hint: "go install github.com/scip-code/scip-go/cmd/scip-go@latest",
         provider_binary: Some("travsr-lang-go"),
         elevated_hosts: &[],
-        scip_install: ScipInstall::Command(&[
-            "go",
-            "install",
-            "github.com/scip-code/scip-go/cmd/scip-go@latest",
-        ]),
+        // scip-go's own release binary, latest tag, checked against its sha256
+        // sidecar. `go install @latest` needs the newest Go to build and made an
+        // older Go download a toolchain, so it is only the fallback where no
+        // prebuilt exists (macOS Intel, Windows).
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "scip-code/scip-go",
+            asset_fn: scip_go_asset,
+            install_name: "scip-go",
+            version_fallback: "v0.2.7",
+            verify_sha256: true,
+            sha256_fn: None,
+            windows_pin: None,
+            fallback_command: Some(&[
+                "go",
+                "install",
+                "github.com/scip-code/scip-go/cmd/scip-go@latest",
+            ]),
+        }),
         extensions: &[".go"],
         wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
-        runtime_driver: None,
+        runtime_driver: Some("go"),
         prerequisites: "Go toolchain",
     },
     PhaseBEntry {
@@ -572,6 +599,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             // the `index-semanticdb` subcommand; travsr-lang-java's Windows driver
             // needs 0.12.x. Pin it on Windows; mac/linux keep tracking latest.
             windows_pin: Some("v0.12.3"),
+            fallback_command: None,
         }),
         extensions: &[".java"],
         wrapper_version_fallback: "v0.6.0",
@@ -675,6 +703,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             verify_sha256: false,
             sha256_fn: Some(scip_ruby_sha256),
             windows_pin: None,
+            fallback_command: None,
         }),
         extensions: &[".rb"],
         wrapper_version_fallback: "v0.6.0",
@@ -769,6 +798,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             verify_sha256: false,
             sha256_fn: Some(scip_clang_sha256),
             windows_pin: None,
+            fallback_command: None,
         }),
         extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
         wrapper_version_fallback: "v0.6.0",
@@ -803,6 +833,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             verify_sha256: false,
             sha256_fn: Some(scip_clang_sha256),
             windows_pin: None,
+            fallback_command: None,
         }),
         extensions: &[".c", ".h"],
         wrapper_version_fallback: "v0.6.0",
@@ -832,6 +863,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             verify_sha256: true,
             sha256_fn: None,
             windows_pin: None,
+            fallback_command: None,
         }),
         extensions: &[".swift"],
         wrapper_version_fallback: "v0.6.0",
@@ -861,6 +893,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             verify_sha256: true,
             sha256_fn: None,
             windows_pin: None,
+            fallback_command: None,
         }),
         extensions: &[".m", ".mm"],
         wrapper_version_fallback: "v0.6.0",
@@ -897,6 +930,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             verify_sha256: true,
             sha256_fn: None,
             windows_pin: None,
+            fallback_command: None,
         }),
         extensions: &[".dart"],
         wrapper_version_fallback: "v0.6.0",
@@ -1074,6 +1108,36 @@ mod vendored_hash_tests {
             ScipInstall::GithubBinary(spec) => Some(spec),
             _ => None,
         }
+    }
+
+    /// `go install scip-go@latest` needs the newest Go to build, so on an older
+    /// Go it downloaded a whole Go toolchain. scip-go's own prebuilt release
+    /// (latest tag, checked against its published sha256) runs with the user's
+    /// Go; only platforms without one fall back to `go install`.
+    #[test]
+    fn go_uses_the_prebuilt_scip_go_and_falls_back_to_go_install() {
+        let go = CATALOG.iter().find(|e| e.language == "go").unwrap();
+        let spec = binary_spec(go).expect("go downloads a release binary");
+        assert!(
+            spec.verify_sha256 && spec.sha256_fn.is_none(),
+            "latest, sidecar-checked"
+        );
+        assert_eq!(
+            (spec.asset_fn)("v0.2.7", "aarch64-apple-darwin").as_deref(),
+            Some("scip-go-darwin-arm64.tar.gz")
+        );
+        assert_eq!((spec.asset_fn)("v0.2.7", "x86_64-apple-darwin"), None);
+        assert_eq!(
+            spec.fallback_command,
+            Some(
+                &[
+                    "go",
+                    "install",
+                    "github.com/scip-code/scip-go/cmd/scip-go@latest"
+                ][..]
+            )
+        );
+        assert_eq!(go.runtime_driver, Some("go"), "scip-go runs `go list`");
     }
 
     /// rust-lang/rust-analyzer deletes superseded respins: the pinned

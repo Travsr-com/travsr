@@ -918,6 +918,18 @@ enum CmdOutcome {
     NotRun,
 }
 
+/// The command an install step runs. Never lets it download a Go toolchain:
+/// `go install` of a tool that needs a newer Go fetched one; a user's own
+/// GOTOOLCHAIN still wins.
+fn install_command(cmd_args: &[&str]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(cmd_args[0]);
+    cmd.args(&cmd_args[1..]);
+    if std::env::var_os("GOTOOLCHAIN").is_none() {
+        cmd.env("GOTOOLCHAIN", "local");
+    }
+    cmd
+}
+
 /// Run (or hint at) a package-manager install command for `entry`, honouring the
 /// same interactive / `--yes` / hint gating every `Command`-style install uses.
 /// Shared by the plain `Command` path and the `CommandThenGithubGz` path so the
@@ -966,10 +978,7 @@ fn run_pkg_command(
     if !do_run {
         return Ok(CmdOutcome::NotRun);
     }
-    let mut child = match std::process::Command::new(cmd_args[0])
-        .args(&cmd_args[1..])
-        .spawn()
-    {
+    let mut child = match install_command(cmd_args).spawn() {
         Ok(child) => child,
         // The install driver itself (e.g. `go`, `dotnet`) is not on PATH. That is a
         // normal "can't auto-install here" outcome, not a fatal error — report it
@@ -1143,7 +1152,18 @@ fn install_scip_tool(
             return Ok(analyzer_command_present(entry));
         }
         ScipInstall::GithubBinary(ref spec) => {
-            install_scip_github_binary(entry, spec, override_version)?;
+            let prebuilt = crate::install::current_target()
+                .is_ok_and(|t| (spec.asset_fn)(spec.version_fallback, t).is_some());
+            if let (false, Some(cmd_args)) = (prebuilt, spec.fallback_command) {
+                // Same trust in exit 0 as the Command path above.
+                if let CmdOutcome::Ran { success: true } =
+                    run_pkg_command(entry, cmd_args, interactive, yes)?
+                {
+                    return Ok(true);
+                }
+            } else {
+                install_scip_github_binary(entry, spec, override_version)?;
+            }
             return Ok(analyzer_command_present(entry));
         }
         ScipInstall::ZipBinary(ref spec) => {
@@ -2310,7 +2330,7 @@ granted_date = "2026-01-02"
 /// for `lang install` (Part B item 2).
 #[cfg(test)]
 mod issue_755_tests {
-    use super::{analyzer_version_pin, LANG_LIST_CONTRACT};
+    use super::{analyzer_version_pin, install_command, LANG_LIST_CONTRACT};
     use travsr_plugin_host::phase_b::catalog::{lookup, ScipInstall, CATALOG};
 
     // ── Part A: the contract marker ──────────────────────────────────────────
@@ -2383,12 +2403,32 @@ mod issue_755_tests {
         );
     }
 
+    /// An install command must never pull in a toolchain: `go install` of a
+    /// tool that needs a newer Go downloaded one. A user's own GOTOOLCHAIN wins.
+    #[test]
+    fn install_commands_never_download_a_go_toolchain() {
+        let cmd = install_command(&["go", "install", "example.com/tool@latest"]);
+        let env: Vec<_> = cmd.get_envs().collect();
+        if std::env::var_os("GOTOOLCHAIN").is_none() {
+            assert_eq!(
+                env,
+                vec![(
+                    std::ffi::OsStr::new("GOTOOLCHAIN"),
+                    Some(std::ffi::OsStr::new("local"))
+                )]
+            );
+        } else {
+            assert!(env.is_empty(), "the user's own GOTOOLCHAIN is left alone");
+        }
+        assert_eq!(cmd.get_program(), "go");
+    }
+
     /// A package-manager install resolves its own version, so there is nothing
     /// to pin — `--version` is separately warned about as having no effect, not
     /// rejected as unverifiable.
     #[test]
     fn a_package_manager_analyzer_has_no_version_pin() {
-        for lang in ["go", "typescript", "javascript", "csharp"] {
+        for lang in ["typescript", "javascript", "csharp"] {
             let entry = lookup(lang).expect("lang is in the catalog");
             assert!(
                 matches!(entry.scip_install, ScipInstall::Command(_)),

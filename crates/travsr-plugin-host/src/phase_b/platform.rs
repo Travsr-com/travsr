@@ -85,7 +85,9 @@ pub fn wrapper_unavailable_target(entry: &PhaseBEntry) -> Option<&'static str> {
 pub fn analyzer_unavailable_os(entry: &PhaseBEntry) -> Option<String> {
     let target = current_target()?;
     let no_asset = match &entry.scip_install {
-        ScipInstall::GithubBinary(s) => (s.asset_fn)(s.version_fallback, target).is_none(),
+        ScipInstall::GithubBinary(s) => {
+            (s.asset_fn)(s.version_fallback, target).is_none() && s.fallback_command.is_none()
+        }
         ScipInstall::CommandThenGithubGz(_, s) => {
             (s.asset_fn)(s.version_fallback, target).is_none()
         }

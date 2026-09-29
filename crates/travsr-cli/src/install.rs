@@ -415,6 +415,12 @@ pub async fn download_scip_binary(
     };
     let label = format!("{asset_name} at {tag}");
     let bin_bytes = fetch_verified(&client, &bin_url, &label, SCIP_SIZE_LIMIT, integrity).await?;
+    // Verified as published, then the binary taken out of a tarball asset.
+    let bin_bytes = if asset_name.ends_with(".tar.gz") {
+        tar_gz_single_member(&bin_bytes, install_name)?
+    } else {
+        bin_bytes
+    };
 
     let dest_dir = travsr_bin_dir()?;
     let dest = dest_dir.join(install_name);
@@ -1618,6 +1624,35 @@ pub(crate) fn gunzip_single(bytes: &[u8]) -> Result<Vec<u8>> {
 /// Read the single `*.exe` member out of a zip archive into memory. Used for
 /// upstreams (rust-analyzer on windows) that ship one executable plus debug
 /// side files (`.pdb`) in a zip; the first `.exe` is the binary we install.
+/// Read the one file named `member` out of a `.tar.gz` release asset, in
+/// memory, capped like every other archive here.
+pub(crate) fn tar_gz_single_member(bytes: &[u8], member: &str) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    anyhow::ensure!(
+        bytes.len() <= MAX_ARCHIVE_BYTES,
+        "archive is {} bytes, over the {MAX_ARCHIVE_BYTES}-byte limit",
+        bytes.len()
+    );
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+    for entry in archive.entries().context("reading tar archive")? {
+        let mut entry = entry.context("reading a tar entry")?;
+        let is_member = entry
+            .path()
+            .ok()
+            .is_some_and(|p| p.file_name() == Some(member.as_ref()));
+        if entry.header().entry_type().is_file() && is_member {
+            anyhow::ensure!(
+                entry.size() <= MAX_ARCHIVE_BYTES as u64,
+                "tar member exceeds the {MAX_ARCHIVE_BYTES}-byte limit"
+            );
+            let mut out = Vec::with_capacity(entry.size() as usize);
+            entry.read_to_end(&mut out).context("reading tar member")?;
+            return Ok(out);
+        }
+    }
+    bail!("no {member} in the tar archive")
+}
+
 pub(crate) fn zip_extract_single_exe(bytes: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read as _;
     anyhow::ensure!(
@@ -1936,6 +1971,29 @@ mod extraction_tests {
 
         extract_zip(&bytes, &dest).unwrap();
         assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"binary");
+    }
+
+    /// scip-go ships `scip-go-<os>-<arch>.tar.gz` holding the binary and a
+    /// LICENSE; only the binary is installed.
+    #[test]
+    fn tar_gz_single_member_pulls_the_named_binary() {
+        let mut b = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (name, body) in [("LICENSE", &b"text"[..]), ("scip-go", &b"binary"[..])] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, name, body).unwrap();
+        }
+        let bytes = b.into_inner().unwrap().finish().unwrap();
+        assert_eq!(
+            super::tar_gz_single_member(&bytes, "scip-go").unwrap(),
+            b"binary"
+        );
+        assert!(super::tar_gz_single_member(&bytes, "scip-java").is_err());
     }
 
     /// A reinstall that stops partway (Ctrl-C, or here a bad second entry) used
