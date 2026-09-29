@@ -282,14 +282,27 @@ fn language_lines(
                 (Readiness::Ready, EditTracing::OffUnavailable) => {
                     "calls update at each commit, not as you edit".to_string()
                 }
-                (r, _) => match r.fix() {
-                    Some(fix) => format!("{}. {fix}", r.label()),
-                    None => r.label(),
-                },
+                (r, _) => return readiness_line(lang, r),
             };
             Some(format!("  {lang:<11} {text}"))
         })
         .collect()
+}
+
+/// One language's state and its one fix, for `status` and the `init` summary;
+/// `None` for a ready language.
+pub(crate) fn readiness_line(
+    lang: &str,
+    r: &travsr_plugin_host::phase_b::status::Readiness,
+) -> Option<String> {
+    if *r == travsr_plugin_host::phase_b::status::Readiness::Ready {
+        return None;
+    }
+    let text = match r.fix() {
+        Some(fix) => format!("{}. {fix}", r.label()),
+        None => r.label(),
+    };
+    Some(format!("  {lang:<11} {text}"))
 }
 
 pub fn run(verbose: bool) -> anyhow::Result<()> {

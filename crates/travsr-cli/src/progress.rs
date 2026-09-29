@@ -402,7 +402,13 @@ fn semantic_tail(langs: &[(String, u64, bool)], budget_secs: u64, elapsed: &str)
 /// Print the final, on-brand summary for the human modes (TTY/plain) to stdout.
 /// `--json` is handled by the caller; this is a no-op for it via the caller's
 /// branch. The summary node is fresh green; the "try" hint is shown unless quiet.
-pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_running: bool) {
+pub fn print_summary(
+    stats: &InitStats,
+    elapsed: Duration,
+    quiet: bool,
+    daemon_running: bool,
+    languages: &[(String, travsr_plugin_host::phase_b::status::Readiness)],
+) {
     let pal = Palette::for_stream(std::io::stdout().is_terminal());
     let node = pal.green("●");
     let dur = fmt_dur(elapsed);
@@ -450,6 +456,7 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                 );
             }
         }
+        print_language_block(languages);
         return;
     }
 
@@ -528,62 +535,16 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                     pal.dim("ℹ"),
                 );
             }
-            // #878: the line above is true (the native pass ran) but incomplete
-            // when the TypeScript LSIF pass was skipped: the language then lacks
-            // most of its cross-file call edges. Say so right here, at default
-            // verbosity, rather than only in a RUST_LOG warning.
-            for skip in &report.lsif_skipped {
-                use travsr_daemon::LsifSkipReason;
-                let lang = &skip.language;
-                let analyzer = travsr_daemon::lsif_analyzer_name(lang);
-                let (what, fix) = match skip.reason {
-                    // EmitterMissing is TypeScript-only (rust and python record a
-                    // failure, never a plain absence), so its remedy is the
-                    // TypeScript one #878 wrote.
-                    LsifSkipReason::EmitterMissing => (
-                        "could not be started",
-                        "set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr so it sits beside the binary), then re-run `travsr init --semantic --force`",
-                    ),
-                    LsifSkipReason::EmitterFailed => (
-                        "failed",
-                        "fix the analyzer (its error is above), then re-run `travsr init --semantic --force`",
-                    ),
-                };
-                println!(
-                    "  {} {lang} semantic analysis is incomplete: {analyzer} {what}, so cross-file call and reference edges are missing",
-                    pal.orange("⚠"),
-                );
-                println!("    {}", skip.detail);
-                println!("    {fix}");
-            }
-            if !report.produced_no_nodes.is_empty() {
-                let langs = report.produced_no_nodes.join(", ");
-                // #904: when the analyzer said why, the reason prints right
-                // below; sending the user to `travsr status` for it would
-                // point at a copy of the same line.
-                let explained = report
-                    .diagnostics
-                    .iter()
-                    .any(|d| report.produced_no_nodes.contains(&d.lang));
-                let where_to_look = if explained {
-                    ""
-                } else {
-                    "; see `travsr status` for why"
-                };
-                println!(
-                    "  {} semantic analyzer ran but produced no symbols for: {langs}{where_to_look}",
-                    pal.orange("⚠"),
-                );
-                if report.produced_no_nodes.iter().any(|l| l == "java") {
-                    if let Some(hint) = macos_java_bash_hint() {
-                        println!("    {hint}");
-                    }
+            // Plan 3.0: each language's state and fix come from the readiness
+            // block below, in plain words; the per-class detail (which analyzer,
+            // which environment variable, which rebuild) is `travsr status
+            // --verbose`. What an analyzer said itself (#904) stays: a missing
+            // Android SDK in AGP's own words is the user's next step.
+            if report.produced_no_nodes.iter().any(|l| l == "java") {
+                if let Some(hint) = macos_java_bash_hint() {
+                    println!("    {hint}");
                 }
             }
-            // #904: what the sidecars themselves said about the run. A missing
-            // Android SDK arrives here in AGP's own words, so the user is not
-            // sent to `travsr status` (or to RUST_LOG) to learn what "produced
-            // no symbols" meant.
             for d in &report.diagnostics {
                 println!(
                     "  {} {} analysis: {} [{}]",
@@ -593,52 +554,14 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                     d.code,
                 );
             }
-            if !report.produced_no_references.is_empty() {
-                let langs = report.produced_no_references.join(", ");
-                println!(
-                    "  {} semantic analyzer produced definitions but no references for: {langs}, so no call edges can come from it",
-                    pal.orange("⚠"),
-                );
-                println!(
-                    "    the analyzer reported success, so this is its output being incomplete rather than a crash"
-                );
-            }
-            if !report.skipped_no_analyzer.is_empty() {
-                let langs = report.skipped_no_analyzer.join(", ");
-                println!(
-                    "  {} no semantic analyzer for: {langs}; run `travsr lang install <lang>` to enable",
-                    pal.dim("ℹ"),
-                );
-            }
-            for lang in &report.skipped_needs_consent {
-                println!(
-                    "  {} full analysis for {lang} needs your permission; run `travsr lang allow-unsandboxed {lang}` to enable",
-                    pal.dim("ℹ"),
-                );
-            }
-            if !report.skipped_untrusted_corpus.is_empty() {
-                let langs = report.skipped_untrusted_corpus.join(", ");
-                println!(
-                    "  {} semantic analysis not enabled here for: {langs}; run `travsr lang install <lang>` in this repository to enable",
-                    pal.dim("ℹ"),
-                );
-            }
-            if !report.skipped_no_compdb.is_empty() {
-                let langs = report.skipped_no_compdb.join(", ");
-                println!(
-                    "  {} no compile_commands.json for: {langs}, generate one to enable semantic analysis",
-                    pal.dim("ℹ"),
-                );
-            }
-            if !report.crashed.is_empty() {
-                let langs = report.crashed.join(", ");
-                println!(
-                    "  {} semantic analysis failed for: {langs}, rerun with RUST_LOG=travsr_plugin_host=debug",
-                    pal.dim("⚠"),
-                );
+            // #878: the type-checked pass's own error, for the same reason.
+            for skip in &report.lsif_skipped {
+                println!("  {} {}: {}", pal.orange("⚠"), skip.language, skip.detail);
             }
         }
     }
+
+    print_language_block(languages);
 
     if stats.travsrignore_scaffolded {
         println!(
@@ -661,6 +584,16 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
             "    {}",
             pal.dim(r#"try: travsr ask "what calls PaymentService?""#)
         );
+    }
+}
+
+/// The languages that are not ready, one line each with their fix, the same
+/// lines `travsr status` prints.
+fn print_language_block(languages: &[(String, travsr_plugin_host::phase_b::status::Readiness)]) {
+    for (lang, r) in languages {
+        if let Some(line) = crate::status::readiness_line(lang, r) {
+            println!("{line}");
+        }
     }
 }
 

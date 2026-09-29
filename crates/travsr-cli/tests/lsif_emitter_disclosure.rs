@@ -17,8 +17,9 @@ use std::process::{Command, Output};
 
 use travsr_store::SqliteStore;
 
-/// The line `init` prints when the LSIF pass was skipped (progress.rs).
-const INCOMPLETE_LINE: &str = "typescript semantic analysis is incomplete";
+/// The `init` summary's line for a language whose calls could not be traced
+/// (plan 3.0: plain words at default, the detail under `status --verbose`).
+const INCOMPLETE_LINE: &str = "typescript  could not trace calls";
 
 fn git(dir: &Path, args: &[&str]) {
     let ok = Command::new("git")
@@ -167,8 +168,8 @@ fn assert_disclosed(bin: &Path, repo: &Path, out: &Output, class: &str) {
         "init must say the TypeScript analysis is incomplete at default verbosity:\n{combined}"
     );
     assert!(
-        combined.contains("travsr init --semantic --force"),
-        "init must name the retry:\n{combined}"
+        combined.contains("See `travsr status --verbose`."),
+        "init must say where the reason and the retry are:\n{combined}"
     );
     assert!(
         warnings(repo).split(',').any(|w| w == class),
@@ -269,7 +270,7 @@ fn failing_emitter_is_disclosed_as_failed() {
     assert_disclosed(&bin, repo.path(), &out, "emitter_failed:typescript");
     let combined = text(&out);
     assert!(
-        combined.contains("failed") && combined.contains("boom"),
+        combined.contains("boom"),
         "the summary must carry the emitter's own error:\n{combined}"
     );
 }

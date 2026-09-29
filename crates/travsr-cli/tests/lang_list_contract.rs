@@ -177,6 +177,38 @@ fn unsupported_status_agrees_with_platform_availability() {
     }
 }
 
+/// Plan 3.3: the additive readiness fields, beside the v1 ones. `state` is the
+/// same tag `init --json` reports, `needs` names the tool only on a
+/// `needs_toolchain` row, and `fix` is plain words (plan 3.0) with no
+/// placeholder. Run inside this repo, so every row has a repo to judge.
+#[test]
+fn every_row_carries_its_readiness() {
+    const STATE: &[&str] = &[
+        "ready",
+        "setting_up",
+        "needs_toolchain",
+        "unsupported_os",
+        "failed",
+    ];
+    for row in lang_list_json().as_array().expect("array") {
+        let lang = row["language"].as_str().unwrap_or("<unnamed>");
+        let state = row["state"].as_str().expect("state must be a string");
+        assert!(STATE.contains(&state), "{lang}: unknown state '{state}'");
+        assert_eq!(
+            row["needs"].is_string(),
+            state == "needs_toolchain",
+            "{lang}: `needs` belongs on needs_toolchain rows only"
+        );
+        if let Some(fix) = row["fix"].as_str() {
+            assert_eq!(
+                travsr_plugin_host::phase_b::status::jargon_in(fix),
+                None,
+                "{lang}: {fix}"
+            );
+        }
+    }
+}
+
 // ── Part B item 2: `--version` for a hash-pinned language ────────────────────
 
 /// The reported behaviour, on a language whose analyzer is hash-pinned on every

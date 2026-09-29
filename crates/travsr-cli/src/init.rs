@@ -191,7 +191,14 @@ pub fn run(
 
     // A running daemon auto-arms Phase B on startup and indexes semantic call
     // edges in the background, so the summary must not call them commit-gated.
-    crate::progress::print_summary(&stats, elapsed, quiet, keeping_fresh != "not_started");
+    let states = readiness_of(&repo_root, &corpus, &languages, &stored_warnings(&db_path));
+    crate::progress::print_summary(
+        &stats,
+        elapsed,
+        quiet,
+        keeping_fresh != "not_started",
+        &states,
+    );
 
     // UX-007: a no-op re-run (nothing changed) should not reprint the setup
     // nudges — they are advice for a fresh index, not chatter for every `init`.
@@ -273,7 +280,7 @@ fn languages_to_set_up(states: &[(String, Readiness)]) -> Vec<&str> {
         .collect()
 }
 
-fn readiness_of(
+pub(crate) fn readiness_of(
     repo_root: &std::path::Path,
     corpus: &str,
     languages: &[String],
@@ -306,7 +313,7 @@ pub(crate) fn repo_language_states(repo_root: &std::path::Path) -> Vec<(String, 
 }
 
 /// The last run's `phase_b_warnings`, or empty before the first run.
-fn stored_warnings(db_path: &std::path::Path) -> String {
+pub(crate) fn stored_warnings(db_path: &std::path::Path) -> String {
     if !db_path.exists() {
         return String::new();
     }

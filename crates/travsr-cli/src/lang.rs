@@ -298,17 +298,6 @@ impl RepoState {
         }
     }
 
-    /// The cell text for the THIS REPO column.
-    fn cell(&self) -> &'static str {
-        match self {
-            RepoState::BuiltinAlwaysOn => "always on",
-            RepoState::Enabled => "enabled",
-            RepoState::NeedsAnalyzer => "not enabled",
-            RepoState::NotEnabled => "not enabled",
-            RepoState::NotInRepo => "n/a",
-        }
-    }
-
     /// Stable machine tag for JSON consumers (the VS Code panel). Never reworded
     /// once shipped: it is an API surface, not UI copy.
     fn tag(&self) -> &'static str {
@@ -402,6 +391,29 @@ fn cmd_list(language: Option<&str>, json: bool) -> Result<()> {
         (Some(c), Some(cfg)) => cfg.is_corpus_trusted(c),
         _ => false,
     };
+    // Plan 3.2: each language's state here, from the one readiness predicate
+    // `init` and `status` use. Empty outside a repo, where there is no repo to
+    // judge and the machine-level STATUS line stands in.
+    let states: std::collections::HashMap<String, travsr_plugin_host::phase_b::status::Readiness> =
+        match (
+            &corpus,
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| crate::repo::find_git_root(&cwd).ok()),
+        ) {
+            (Some(c), Some(root)) => {
+                let all: Vec<String> = CATALOG
+                    .iter()
+                    .filter(|e| selected(e))
+                    .map(|e| e.language.to_string())
+                    .collect();
+                let warnings = crate::init::stored_warnings(&root.join(".travsr/graph.db"));
+                crate::init::readiness_of(&root, c, &all, &warnings)
+                    .into_iter()
+                    .collect()
+            }
+            _ => Default::default(),
+        };
 
     if json {
         let mut entries: Vec<String> = Vec::new();
@@ -457,8 +469,18 @@ fn cmd_list(language: Option<&str>, json: bool) -> Result<()> {
                 corpus_trusted,
                 analyzer_ready(entry, registered),
             );
+            use travsr_plugin_host::phase_b::status::Readiness;
+            let readiness = states.get(entry.language);
+            let state = readiness.map_or("null".to_string(), |r| json_str(r.tag()));
+            let needs = match readiness {
+                Some(Readiness::NeedsToolchain { needs }) => json_str(needs),
+                _ => "null".to_string(),
+            };
+            let fix = readiness
+                .and_then(Readiness::fix)
+                .map_or("null".to_string(), |f| json_str(&f));
             entries.push(format!(
-                r#"{{"contract":{LANG_LIST_CONTRACT},"language":{},"package":{},"sandbox":{},"status":{},"statusLine":{},"repoState":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"prerequisites":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{}}}"#,
+                r#"{{"contract":{LANG_LIST_CONTRACT},"language":{},"package":{},"sandbox":{},"status":{},"statusLine":{},"repoState":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"prerequisites":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{},"state":{state},"needs":{needs},"fix":{fix}}}"#,
                 json_str(entry.language),
                 json_str(package),
                 json_str(sandbox),
@@ -482,65 +504,52 @@ fn cmd_list(language: Option<&str>, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    // `corpus`, `in_repo` and `corpus_trusted` were resolved once at the top of
-    // this function and are shared with the JSON branch above.
-    let mut any_not_enabled = false;
-
-    println!(
-        "{:<12} {:<13} {:<24} STATUS",
-        "LANGUAGE", "THIS REPO", "PREREQUISITES"
-    );
+    // Plan 3.2: one STATE column from the readiness predicate `init` and
+    // `status` use. Outside a repo there is nothing to judge per repo, so the
+    // machine-level line stands in.
+    use travsr_plugin_host::phase_b::status::Readiness;
+    println!("{:<12} {:<24} STATE", "LANGUAGE", "PREREQUISITES");
     println!("{}", "-".repeat(84));
-
+    let mut fixes: Vec<String> = Vec::new();
     for entry in CATALOG.iter().filter(|e| selected(e)) {
-        let registered = config
-            .as_ref()
-            .map(|c| c.is_registered(entry.language))
-            .unwrap_or(false);
-        // One computed status for every language — the same call `lang detect` and
-        // the JSON branch make, so the three can never drift apart again.
-        let consent = unsandboxed_consent_present(config.as_ref(), entry.language);
-        let status = lang_capability_status(entry, registered, consent);
-
-        // Is full analysis turned on for the repo we are in? (corpus trust gate)
-        let repo_state = RepoState::compute(
-            entry,
-            registered,
-            in_repo,
-            corpus_trusted,
-            analyzer_ready(entry, registered),
-        );
-        if matches!(repo_state, RepoState::NotEnabled) {
-            any_not_enabled = true;
-        }
-
+        let state = match states.get(entry.language) {
+            Some(r) => {
+                if let Some(fix) = r.fix() {
+                    if matches!(r, Readiness::SettingUp | Readiness::Failed)
+                        && !fixes.contains(&fix)
+                    {
+                        fixes.push(fix);
+                    }
+                }
+                r.label()
+            }
+            None => {
+                let registered = config
+                    .as_ref()
+                    .map(|c| c.is_registered(entry.language))
+                    .unwrap_or(false);
+                let consent = unsandboxed_consent_present(config.as_ref(), entry.language);
+                lang_capability_status(entry, registered, consent).line()
+            }
+        };
         println!(
-            "{:<12} {:<13} {:<24} {}",
+            "{:<12} {:<24} {}",
             entry.language,
-            repo_state.cell(),
             entry.effective_prerequisites(),
-            status.line(),
+            state
         );
     }
-
-    // Explain the THIS REPO column once, below the table, rather than repeating a
-    // remedy on every row.
     if !in_repo {
         println!();
         println!(
-            "THIS REPO shows 'n/a' because you are not inside a git repository. \
-             cd into a repo to enable languages there."
+            "You are not inside a git repository; cd into one to see each language's \
+             state there."
         );
-    } else if any_not_enabled {
+    } else if !fixes.is_empty() {
         println!();
-        println!(
-            "'not enabled' means full analysis is off for THIS repo even when the tool \
-             is installed globally."
-        );
-        println!(
-            "Turn a language on for this repo:  travsr lang install <language>   \
-             (run inside the repo)"
-        );
+        for fix in fixes {
+            println!("{fix}");
+        }
     }
 
     // RFC-025 §8: sidecar version health for the installed Phase B tools
@@ -1586,10 +1595,7 @@ fn cmd_detect(yes: bool) -> Result<()> {
     }
 
     if !std::io::stdin().is_terminal() {
-        println!(
-            "(non-interactive; run `travsr lang install <lang>` to install one, or \
-             `travsr lang detect --yes` to set up all detected)"
-        );
+        println!("(no terminal to answer; run `travsr init` to set up every language above)");
         return Ok(());
     }
 
@@ -2225,17 +2231,13 @@ granted_date = "2026-01-02"
     #[test]
     fn builtin_without_its_analyzer_is_not_reported_always_on() {
         // Rust is builtin but its analyzer (rust-analyzer) is external and can be
-        // missing. The THIS REPO column must not claim "always on" while STATUS
-        // says "partial" — it reads "not enabled" (matching the other partial
-        // languages), whose remedy is the same `travsr lang install rust`. The
-        // machine tag stays `needs_analyzer` so JSON consumers keep the precise
-        // reason.
+        // missing, so `repoState` must not claim "always on". The machine tag is
+        // `needs_analyzer` so JSON consumers keep the precise reason.
         let rust = lookup("rust").expect("rust entry present");
         let missing = RepoState::compute(
             rust, /*registered*/ true, true, true, /*ready*/ false,
         );
         assert_eq!(missing.tag(), "needs_analyzer");
-        assert_eq!(missing.cell(), "not enabled");
 
         // With rust-analyzer present, the builtin is honestly always on.
         let present = RepoState::compute(rust, true, true, true, /*ready*/ true);
