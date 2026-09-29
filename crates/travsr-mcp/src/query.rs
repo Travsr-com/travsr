@@ -970,12 +970,15 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
     let mut edges_raw: Vec<(NodeId, NodeId, String, String)> = Vec::new();
     let mut tree: Vec<TreeStep> = Vec::new();
     let mut visited: HashSet<NodeId> = HashSet::new();
-    let mut queue: VecDeque<(NodeId, u8, bool)> = VecDeque::new();
+    // Each node carries the direction it was reached in. `Both` applies to the
+    // seed only; past it a caller keeps walking up and a dependency down, so the
+    // tree never shows a callee's other callers or a caller's other callees.
+    let mut queue: VecDeque<(NodeId, u8, bool, QueryDirection)> = VecDeque::new();
 
     visited.insert(seed.id);
-    queue.push_back((seed.id, 0, true));
+    queue.push_back((seed.id, 0, true, args.direction));
 
-    while let Some((current_id, depth, expand)) = queue.pop_front() {
+    while let Some((current_id, depth, expand, direction)) = queue.pop_front() {
         if let Some(node) = store.get_node(current_id)? {
             if node_index.insert(current_id) {
                 nodes.push(node_entry(&node, depth));
@@ -990,13 +993,9 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             continue;
         }
 
-        for (edge_kind, next_id, child_expand, edge_incoming, edge_provenance) in next_edges(
-            store,
-            current_id,
-            args.direction,
-            args.edge_mode,
-            depth == 0,
-        )? {
+        for (edge_kind, next_id, child_expand, edge_incoming, edge_provenance) in
+            next_edges(store, current_id, direction, args.edge_mode, depth == 0)?
+        {
             // #564: orient from the edge itself, not the direction flag — in
             // `Both` mode a single expansion mixes incoming and outgoing edges.
             let (src, dst) = if edge_incoming {
@@ -1022,7 +1021,12 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                     incoming: edge_incoming,
                     heuristic,
                 });
-                queue.push_back((next_id, depth + 1, child_expand));
+                let onward = if edge_incoming {
+                    QueryDirection::Callers
+                } else {
+                    QueryDirection::Deps
+                };
+                queue.push_back((next_id, depth + 1, child_expand, onward));
             }
         }
     }
@@ -1351,6 +1355,60 @@ mod tests {
         assert!(
             !call_step.incoming,
             "Deps: outgoing call step wrongly tagged incoming"
+        );
+    }
+
+    /// `both` is callers upward plus deps downward from the seed. A callee's
+    /// other callers and a caller's other callees answer neither question and
+    /// turned a 10-line view into 200+ lines.
+    #[test]
+    fn both_direction_keeps_each_branch_going_one_way() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let seed = node("fn:seed", "function", "src/a.ts");
+        let caller = node("fn:caller", "function", "src/b.ts");
+        let callee = node("fn:callee", "function", "src/c.ts");
+        let callee_other_caller = node("fn:elsewhere", "function", "src/d.ts");
+        let caller_other_callee = node("fn:unrelated", "function", "src/e.ts");
+        for n in [
+            &seed,
+            &caller,
+            &callee,
+            &callee_other_caller,
+            &caller_other_callee,
+        ] {
+            store.put_node(n).unwrap();
+        }
+        for (src, dst) in [
+            (&caller, &seed),
+            (&seed, &callee),
+            (&callee_other_caller, &callee),
+            (&caller, &caller_other_callee),
+        ] {
+            store
+                .put_edge(&Edge::new(src.id, dst.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "seed".to_string(),
+                path: None,
+                depth: 3,
+                direction: QueryDirection::Both,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        let shown: HashSet<u64> = payload.nodes.iter().map(|n| n.id).collect();
+        assert!(shown.contains(&caller.id.0) && shown.contains(&callee.id.0));
+        assert!(
+            !shown.contains(&callee_other_caller.id.0),
+            "a callee's other caller was shown"
+        );
+        assert!(
+            !shown.contains(&caller_other_callee.id.0),
+            "a caller's other callee was shown"
         );
     }
 

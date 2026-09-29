@@ -23,7 +23,8 @@ pub enum Direction {
     /// Follow incoming edges (who calls / depends on this symbol?). Containment
     /// edges to the defining file are shown but not expanded.
     Callers,
-    /// Follow both directions
+    /// Callers and dependencies together: callers walked upward, dependencies
+    /// downward, never a callee's other callers
     Both,
 }
 
@@ -351,7 +352,7 @@ fn print_budget_footer(
 }
 
 fn print_tree(payload: &GraphPayload) {
-    let nodes_by_id: HashMap<u64, &NodeEntry> = payload.nodes.iter().map(|n| (n.id, n)).collect();
+    let labels = tree_labels(payload);
     // Children per parent, in BFS discovery order.
     let mut children: HashMap<u64, Vec<(&str, u64, bool, bool)>> = HashMap::new();
     for step in &payload.tree {
@@ -364,7 +365,7 @@ fn print_tree(payload: &GraphPayload) {
     }
     let mut any_heuristic = false;
     if let Some(seed) = &payload.seed {
-        print_tree_level(seed.id, &nodes_by_id, &children, "", &mut any_heuristic);
+        print_tree_level(seed.id, &labels, &children, "", &mut any_heuristic);
     }
     // Only when a row was actually rendered with the sigil: a legend for a mark
     // that is not on screen is noise. Kept to one line, and off every row, so
@@ -375,6 +376,30 @@ fn print_tree(payload: &GraphPayload) {
     }
 }
 
+/// Each node's row text: `label (kind)`, plus `path:line` when another node
+/// in the tree shares its label, so three `fn:run` rows say which `run`.
+fn tree_labels(payload: &GraphPayload) -> HashMap<u64, String> {
+    let mut count: HashMap<&str, usize> = HashMap::new();
+    for n in &payload.nodes {
+        *count.entry(n.label.as_str()).or_default() += 1;
+    }
+    payload
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut text = format!("{} ({})", n.label, n.kind);
+            if count[n.label.as_str()] > 1 {
+                text.push(' ');
+                text.push_str(&n.path);
+                if let Some(line) = n.line {
+                    text.push_str(&format!(":{line}"));
+                }
+            }
+            (n.id, text)
+        })
+        .collect()
+}
+
 /// Suffixes the orientation arrow on a name-matched `ref/call` edge.
 /// The long form of this caveat is what `find_references` prints per site; a
 /// tree repeats the same edge kind on every row, so it gets the compact form
@@ -383,7 +408,7 @@ const HEURISTIC_SIGIL: &str = "~";
 
 fn print_tree_level(
     node_id: u64,
-    nodes_by_id: &HashMap<u64, &NodeEntry>,
+    labels: &HashMap<u64, String>,
     children: &HashMap<u64, Vec<(&str, u64, bool, bool)>>,
     prefix: &str,
     any_heuristic: &mut bool,
@@ -396,7 +421,7 @@ fn print_tree_level(
         let connector = if is_last { "└── " } else { "├── " };
         let extension = if is_last { "    " } else { "│   " };
 
-        if let Some(child) = nodes_by_id.get(child_id) {
+        if let Some(label) = labels.get(child_id) {
             // #564: the arrow renders the stored edge orientation — `→` for an
             // outgoing edge (parent → child), `←` for an incoming one (the
             // child calls / contains the parent).
@@ -414,13 +439,10 @@ fn print_tree_level(
             } else {
                 ""
             };
-            println!(
-                "{prefix}{connector}{edge_kind} {arrow}{mark} {} ({})",
-                child.label, child.kind
-            );
+            println!("{prefix}{connector}{edge_kind} {arrow}{mark} {label}");
             print_tree_level(
                 *child_id,
-                nodes_by_id,
+                labels,
                 children,
                 &format!("{prefix}{extension}"),
                 any_heuristic,
@@ -702,6 +724,47 @@ mod tests {
             tokens: 1,
             line: Some(3),
         }
+    }
+
+    /// Plan 3.0: `graph --help` is read by people and agents at default
+    /// verbosity, so the `both` line uses plain words only.
+    #[test]
+    fn both_help_is_plain_words() {
+        use clap::ValueEnum as _;
+        let help = Direction::Both
+            .to_possible_value()
+            .and_then(|v| v.get_help().map(ToString::to_string))
+            .unwrap_or_default();
+        assert!(
+            help.contains("upward") && help.contains("downward"),
+            "{help}"
+        );
+        for banned in ["Phase", "semantic", "edge", "node", "graph", "BFS"] {
+            assert!(!help.contains(banned), "'{banned}' in {help:?}");
+        }
+    }
+
+    /// Three `fn:run` rows with nothing to tell them apart: a label two nodes
+    /// share gets its location, a unique one stays short.
+    #[test]
+    fn a_label_two_nodes_share_carries_its_location() {
+        let payload = GraphPayload {
+            seed: None,
+            nodes: vec![
+                node(1, "fn:run", "fn:run", "src/init.rs"),
+                node(2, "fn:run", "fn:run", "src/main.rs"),
+                node(3, "fn:cmd_detect", "fn:cmd_detect", "src/lang.rs"),
+            ],
+            edges: vec![],
+            tree: vec![],
+            coverage: None,
+            last_commit: None,
+            candidates: None,
+        };
+        let labels = tree_labels(&payload);
+        assert_eq!(labels[&1], "fn:run (method) src/init.rs:3");
+        assert_eq!(labels[&2], "fn:run (method) src/main.rs:3");
+        assert_eq!(labels[&3], "fn:cmd_detect (method)");
     }
 
     /// Pin the schema_version 1 contract the review regressed and this PR
