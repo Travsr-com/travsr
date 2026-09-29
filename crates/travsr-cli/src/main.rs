@@ -1422,7 +1422,7 @@ async fn run(cli: Cli) -> Result<()> {
                     if let Some(root) = db_path.parent().and_then(|p| p.parent()) {
                         let root = root.to_path_buf();
                         std::thread::spawn(move || {
-                            if !daemon_client::daemon_lock_held(&root) {
+                            if daemon_client::lazy_daemon_wanted(&root) {
                                 if let Ok(exe) = std::env::current_exe() {
                                     daemon_client::spawn_background_daemon(&root, &exe, false);
                                 }

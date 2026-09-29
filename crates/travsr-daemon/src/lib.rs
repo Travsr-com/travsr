@@ -5291,7 +5291,7 @@ fn ratified_languages(report: &PhaseBReport) -> Vec<String> {
 }
 
 /// Whether a `travsr init` holds this repo's `init.lock`.
-fn init_running(repo_root: &Path) -> bool {
+pub fn init_running(repo_root: &Path) -> bool {
     std::fs::File::open(repo_root.join(".travsr").join("init.lock"))
         .is_ok_and(|f| fs2::FileExt::try_lock_exclusive(&f).is_err())
 }

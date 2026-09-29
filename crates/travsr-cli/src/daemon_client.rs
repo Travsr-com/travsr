@@ -28,6 +28,12 @@ pub(crate) enum SpawnOutcome {
     Failed,
 }
 
+/// Whether `travsr mcp` should start a daemon: none is running and no
+/// `travsr init` is under way (init starts one itself when it finishes).
+pub(crate) fn lazy_daemon_wanted(repo_root: &Path) -> bool {
+    !daemon_lock_held(repo_root) && !travsr_daemon::init_running(repo_root)
+}
+
 /// True iff a **live** daemon currently holds this repo's exclusive lock.
 ///
 /// This is the race-free singleton authority. It tries the very same
@@ -361,6 +367,22 @@ mod lock_tests {
 
     /// The singleton semantics the probe exists for are unchanged: an
     /// exclusively locked, already-present lock file still reads as held.
+    /// `travsr mcp` from an editor reconnects the moment `init` creates the
+    /// index, and used to start a daemon while `init` was still running; the
+    /// daemon then watched init's own config writes. `init` starts it itself.
+    #[test]
+    fn no_lazy_daemon_while_init_runs() {
+        use fs2::FileExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        assert!(lazy_daemon_wanted(tmp.path()), "nothing running");
+        let lock = std::fs::File::create(tmp.path().join(".travsr/init.lock")).unwrap();
+        lock.lock_exclusive().unwrap();
+        assert!(!lazy_daemon_wanted(tmp.path()), "init holds its lock");
+        fs2::FileExt::unlock(&lock).unwrap();
+        assert!(lazy_daemon_wanted(tmp.path()), "init finished");
+    }
+
     #[test]
     fn lock_held_for_an_existing_exclusively_locked_file() {
         use fs2::FileExt as _;
