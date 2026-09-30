@@ -508,6 +508,7 @@ fn index_paths_parallel(
         let mut batch: Vec<FileGraph> = Vec::with_capacity(BATCH_SIZE);
         let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
         let mut all_ws_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker> = Vec::new();
+        let mut calls_changed = false;
 
         for (done, result) in (1_u64..).zip(rx) {
             let pr = result?;
@@ -523,6 +524,7 @@ fn index_paths_parallel(
                 continue;
             }
 
+            calls_changed |= change_can_drop_calls(&pr.file_graph.vname_path);
             all_ffi_markers.extend(pr.ffi_markers);
             all_ws_markers.extend(pr.workspace_dep_markers);
             batch.push(pr.file_graph);
@@ -548,6 +550,13 @@ fn index_paths_parallel(
             counts.nodes_upserted += written.nodes_upserted;
             counts.edges_upserted += written.edges_upserted;
             counts.files_written += written.files_written;
+        }
+
+        // Re-parsing a file drops its Phase B call edges, as in `reindex_files`:
+        // record it so a semantic `init` at the same commit runs Phase B again.
+        // Only once Phase B has run: before that there were none to drop.
+        if calls_changed && store.get_meta("phase_b_commit").ok().flatten().is_some() {
+            let _ = store.set_meta("phase_b_dirty", "1");
         }
 
         // Repo-level FFI resolution (same logic as reindex_files).
@@ -1542,6 +1551,10 @@ pub fn init_repo_with_progress(
             .reconcile(&empty_walked, &purge_policy, repo_root, &stored_corpus)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("corpus-change global-invalidation purge")?;
+        // Same as the `--force` purge below: no Phase B edge survived it.
+        store
+            .delete_meta("phase_b_commit")
+            .context("clearing the Phase B marker after the identity change")?;
         tracing::info!("identity-change purge complete, rebuilding from scratch");
     }
 
@@ -2237,9 +2250,8 @@ pub fn init_repo_with_progress(
             //
             // The flag is set by `reindex_files` on the watcher and hook paths,
             // because rewriting a file's Phase A nodes drops its `ref/call` edges
-            // (#583). Init's own indexing does not route through `reindex_files`,
-            // so the flag reaching here was set by an earlier watcher or hook
-            // reindex, not by this run. Phase B has just rebuilt those edges, so
+            // (#583). Init's own re-parse sets it the same way, before Phase B
+            // starts. Phase B has just rebuilt those edges, so
             // by this point the flag describes a degradation that no longer
             // exists and leaving it set makes `travsr status` report `stale`
             // over a correct graph.

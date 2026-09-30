@@ -402,3 +402,69 @@ fn last_commit_is_stamped_before_phase_b_starts() {
     assert_eq!(last, meta(&db, "last_commit"), "and it is HEAD");
     assert_eq!(phase_b, None, "Phase B not yet stamped");
 }
+
+fn traced_calls(db: &Path) -> i64 {
+    rusqlite::Connection::open(db)
+        .expect("open graph.db")
+        .query_row(
+            "SELECT count(*) FROM edges WHERE kind = 'ref/call' AND provenance = 'scip'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count traced calls")
+}
+
+/// Re-reading an edited file drops its traced calls, so `init --semantic` at
+/// the same commit must trace them again rather than trust `phase_b_commit`.
+#[test]
+fn semantic_init_retraces_a_file_it_re_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    git_init(root);
+    std::fs::write(root.join("b.py"), "def helper():\n    return 1\n").unwrap();
+    let caller = "from b import helper\n\n\ndef main():\n    return helper()\n";
+    std::fs::write(root.join("a.py"), caller).unwrap();
+    commit_all(root, "seed");
+
+    init_semantic(root);
+    let db = root.join(".travsr/graph.db");
+    let before = traced_calls(&db);
+    assert!(before > 0, "arrangement failed: Phase B traced no call");
+
+    std::fs::write(root.join("a.py"), format!("# edited\n{caller}")).unwrap();
+    init_semantic(root);
+    assert_eq!(traced_calls(&db), before);
+}
+
+/// A new git remote changes every node id and purges the graph, Phase B edges
+/// included, so the next `init --semantic` must run Phase B again.
+#[test]
+fn semantic_init_retraces_after_the_repository_identity_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    git_init(root);
+    std::fs::write(root.join("b.py"), "def helper():\n    return 1\n").unwrap();
+    std::fs::write(
+        root.join("a.py"),
+        "from b import helper\n\n\ndef main():\n    return helper()\n",
+    )
+    .unwrap();
+    commit_all(root, "seed");
+
+    init_semantic(root);
+    let db = root.join(".travsr/graph.db");
+    let before = traced_calls(&db);
+    assert!(before > 0, "arrangement failed: Phase B traced no call");
+
+    git(
+        root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/x/retrace.git",
+        ],
+    );
+    init_semantic(root);
+    assert_eq!(traced_calls(&db), before);
+}
