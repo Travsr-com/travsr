@@ -34,7 +34,7 @@ A vector index answers "what looks like this query". That works for prose and st
 - Phase B     resolves calls to the definitions they point at
 - retrieval   seeds from your query, walks the graph, reranks
 - packing     trims the result to the token budget you have
-Phase A is fast and always runs, so the index is usable seconds after init. Phase B is the expensive part and runs in the background via the daemon unless you pass --semantic. Queries work throughout: before Phase B lands you get structure, and after it you get call edges too.
+Phase A is fast and always runs. Phase B is the expensive part: travsr init runs it before it finishes, and the daemon re-runs it after each commit. Queries work throughout: before Phase B lands you get structure, and after it you get call edges too.
 $ travsr status
 
 ## how do I install it?
@@ -168,7 +168,7 @@ $ travsr ask --examples
 - conceptual questions naming no symbol are a known gap
 - a misspelled symbol will not fuzzy-match its way to an answer
 - the abstention suggests a narrower command to run
-- semantic search widens it, if you indexed with --semantic
+- meaning-based search widens it, once `travsr embed init` has run
 A confident wrong answer costs more than an empty one, especially when an agent is about to act on it. When it abstains it prints what to try instead, and explain, given the query and a symbol you expected it to return, shows which terms matched and which threshold it fell short of.
 $ travsr explain "<your query>" <symbol>
 

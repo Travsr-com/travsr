@@ -1020,27 +1020,42 @@ pub fn required_build_files(language: &str) -> (&'static [&'static str], &'stati
 
 /// How to name `language`'s missing build file when the repo has none of
 /// [`required_build_files`], or `None` when it has one or needs none. Asks git
-/// for tracked and unignored files; when git cannot answer it says nothing,
-/// so a repo is never blocked on a failed probe.
+/// for tracked and unignored files, then for files inside submodules, then
+/// looks in the repo's top folder on disk, where tools such as Unity write
+/// gitignored `.sln` and `.csproj` files. When git cannot answer it says
+/// nothing, so a repo is never blocked on a failed probe.
 pub fn missing_build_file(language: &str, repo_root: &std::path::Path) -> Option<&'static str> {
     let (files, needs) = required_build_files(language);
     if files.is_empty() {
         return None;
     }
-    let mut git = std::process::Command::new("git");
-    git.arg("-C").arg(repo_root).args([
-        "ls-files",
-        "--cached",
-        "--others",
-        "--exclude-standard",
-        "-z",
-        "--",
-    ]);
-    for f in files {
-        git.arg(format!(":(glob)**/{f}"));
-    }
-    let out = git.output().ok().filter(|o| o.status.success())?;
-    (!listed_build_file(&String::from_utf8_lossy(&out.stdout), files)).then_some(needs)
+    let git_lists = |mode: &[&str]| {
+        let mut git = std::process::Command::new("git");
+        git.arg("-C")
+            .arg(repo_root)
+            .arg("ls-files")
+            .args(mode)
+            .args(["-z", "--"]);
+        for f in files {
+            git.arg(format!(":(glob)**/{f}"));
+        }
+        let out = git.output().ok().filter(|o| o.status.success())?;
+        Some(listed_build_file(
+            &String::from_utf8_lossy(&out.stdout),
+            files,
+        ))
+    };
+    let top_folder = std::fs::read_dir(repo_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\0");
+    let found = git_lists(&["--cached", "--others", "--exclude-standard"])?
+        || git_lists(&["--cached", "--recurse-submodules"]) == Some(true)
+        || listed_build_file(&top_folder, files);
+    (!found).then_some(needs)
 }
 
 /// Whether a NUL-separated `git ls-files -z` listing holds one of `files`.
@@ -1405,5 +1420,11 @@ mod build_file_tests {
         std::fs::write(root.join("svc/pom.xml"), "<project/>").expect("write");
         assert_eq!(missing_build_file("java", root), None);
         assert_eq!(missing_build_file("rust", root), None);
+
+        // Unity's .gitignore hides the .csproj it writes at the top folder;
+        // the file is on disk, so C# has its build file.
+        std::fs::write(root.join(".gitignore"), "*.csproj\n").expect("write");
+        std::fs::write(root.join("Game.csproj"), "<Project/>").expect("write");
+        assert_eq!(missing_build_file("csharp", root), None);
     }
 }

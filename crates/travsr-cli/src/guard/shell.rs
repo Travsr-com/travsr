@@ -114,24 +114,53 @@ fn is_flag(word: &str) -> bool {
     word.starts_with('-') && word != "-"
 }
 
-/// Classify a `Bash` command line: the first part of an `&&` / `||` / `;` /
-/// newline chain that is a single read-only search invocation, preferring one
-/// that carries a term (`ls -R && rg Foo` is about `Foo`), or `None`.
-pub fn classify(command: &str) -> Option<SearchCommand> {
-    let found: Vec<SearchCommand> = chain_parts(command)
-        .into_iter()
-        .filter_map(classify_simple)
-        .collect();
-    let with_term = found.iter().position(|c| c.term.is_some());
-    found.into_iter().nth(with_term.unwrap_or(0))
+/// Classify a `Bash` command line: every part of an `&&` / `||` / `;` /
+/// newline chain that is a single read-only search invocation, those carrying
+/// a term first (`ls -R && rg Foo` is about `Foo`). Empty when a part writes a
+/// file (`cargo test > t.log; grep x t.log`): the search reads that output, and
+/// judging the chain would block the command that writes it.
+pub fn classify_chain(command: &str) -> Vec<SearchCommand> {
+    let parts = chain_parts(command);
+    if parts.iter().any(|p| writes_a_file(p)) {
+        return Vec::new();
+    }
+    let mut found: Vec<SearchCommand> = parts.into_iter().filter_map(classify_simple).collect();
+    found.sort_by_key(|c| c.term.is_none());
+    found
 }
 
-/// Split a command line on `&&`, `||`, `;` and newlines outside quotes.
-/// Anything else stays inside its part, where [`simple_words`] refuses it. A
-/// heredoc's body lines are data, so a command with `<<` is not split on
-/// newlines.
+/// Whether `part` redirects output with `>` outside quotes.
+fn writes_a_file(part: &str) -> bool {
+    let mut quote: Option<u8> = None;
+    part.bytes().any(|b| match quote {
+        Some(q) => {
+            if b == q {
+                quote = None;
+            }
+            false
+        }
+        None if b == b'\'' || b == b'"' => {
+            quote = Some(b);
+            false
+        }
+        None => b == b'>',
+    })
+}
+
+/// The first of [`classify_chain`]: what the chain is about, if a search.
+#[cfg(test)]
+fn classify(command: &str) -> Option<SearchCommand> {
+    classify_chain(command).into_iter().next()
+}
+
+/// Split a command line on `&&`, `||`, `;` and newlines outside quotes,
+/// dropping `#` comments. Anything else stays inside its part, where
+/// [`simple_words`] refuses it. A heredoc's body is data, so a command with
+/// `<<` is not split at all.
 fn chain_parts(command: &str) -> Vec<&str> {
-    let split_lines = !command.contains("<<");
+    if command.contains("<<") {
+        return vec![command];
+    }
     let bytes = command.as_bytes();
     let mut parts = Vec::new();
     let mut quote: Option<u8> = None;
@@ -143,7 +172,15 @@ fn chain_parts(command: &str) -> Vec<&str> {
             Some(q) if b == q => quote = None,
             Some(_) => {}
             None if b == b'\'' || b == b'"' => quote = Some(b),
-            None if b == b';' || (b == b'\n' && split_lines) => {
+            // A comment runs to the end of its line.
+            None if b == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) => {
+                parts.push(&command[start..i]);
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                start = (i + 1).min(bytes.len());
+            }
+            None if b == b';' || b == b'\n' => {
                 parts.push(&command[start..i]);
                 start = i + 1;
             }
@@ -364,6 +401,30 @@ mod tests {
             "a quoted && is not a split"
         );
         assert_eq!(classify("cd crates && cargo test"), None);
+    }
+
+    /// PR #940 review: a search is judged anywhere in the chain, but a chain
+    /// that writes a file is not a search, and comments and heredoc bodies are
+    /// not commands.
+    #[test]
+    fn chains_that_write_or_only_mention_a_search_are_not_matched() {
+        let terms = |cmd: &str| -> Vec<Option<String>> {
+            classify_chain(cmd).into_iter().map(|c| c.term).collect()
+        };
+        assert_eq!(
+            terms("find . -name '*.rs' && rg install_selected"),
+            vec![Some(".rs".into()), Some("install_selected".into())]
+        );
+        assert!(
+            terms("cargo test > /tmp/t.log 2>&1; grep -n install_selected /tmp/t.log").is_empty()
+        );
+        assert!(terms("cargo build  # then; rg install_selected").is_empty());
+        assert!(terms("cat > /tmp/x.sh <<'EOF'\nset -e; rg install_selected src\nEOF").is_empty());
+        assert_eq!(term("rg needle . # trailing"), Some("needle".into()));
+        assert_eq!(
+            term("git log --grep='a > b' && rg needle"),
+            Some("needle".into())
+        );
     }
 
     /// PR #940 review: strict mode denied `rg compute_total` but passed

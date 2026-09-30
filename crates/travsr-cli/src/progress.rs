@@ -6,7 +6,7 @@
 //!
 //! - **TTY**: a single self-updating line — a pulsing graph-node spinner, an
 //!   eighth-precision bar, `done/total`, percent, and elapsed time.
-//!   Brand orange while working; the final summary node flips to fresh green.
+//!   Brand orange while working; the summary that follows is plain text.
 //! - **Non-TTY** (pipe/CI): occasional newline-terminated lines, no control
 //!   chars or color.
 //! - **`--json`**: one JSON object per (throttled) event on stderr.
@@ -399,17 +399,6 @@ fn semantic_tail(langs: &[(String, u64, bool)], budget_secs: u64, elapsed: &str)
     )
 }
 
-/// How calls got traced this run, for the `init` summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Traced {
-    /// Traced before `init` returned.
-    Done,
-    /// Left to the background process, which is running.
-    Background,
-    /// Nothing is running to trace them (a CI run); the next commit will.
-    AtNextCommit,
-}
-
 /// Everything the `init` summary says, gathered as `init` runs, so the whole
 /// summary is one pure function with a golden test (plan S9).
 pub struct InitSummary {
@@ -423,7 +412,6 @@ pub struct InitSummary {
     pub files_read: u64,
     /// Nothing changed since the last run.
     pub no_op: bool,
-    pub traced: Traced,
     /// `running`, `started` or `not_started`, as in `--json`'s `keeping_fresh`.
     pub keeping_fresh: &'static str,
     pub connected: crate::connect::Connected,
@@ -464,13 +452,28 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
                 .to_string(),
         );
     }
+    // On every run, as UX-023 requires: a tripped limit deletes nothing, so the
+    // run also reads as "Nothing changed".
+    if s.ghost_prune_aborted {
+        out.push(
+            "  ! Kept the entries for missing files: an unusual number vanished at once. \
+             Run `travsr fsck --fix --force` if that was intended."
+                .to_string(),
+        );
+    }
     if full {
         out.insert(0, format!("travsr  Setting up {}", s.repo));
         let mut stage = |text: String| out.push(format!("  \u{2713} {text}"));
         if !s.found.is_empty() {
             stage(format!("Found {}", s.found.join(", ")));
         }
-        if !s.offline {
+        // Not while a language still waits on tools init gets itself (a failed
+        // download). What only the user can supply has its own line below.
+        let tools_pending = s
+            .languages
+            .iter()
+            .any(|(_, r)| *r == travsr_plugin_host::phase_b::status::Readiness::SettingUp);
+        if !s.offline && !tools_pending {
             stage("Got language tools".to_string());
         }
         if s.ranking == "installed" {
@@ -481,13 +484,7 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
             commas(s.files_read),
             if s.files_read == 1 { "" } else { "s" }
         ));
-        match s.traced {
-            Traced::Done => stage("Traced calls".to_string()),
-            Traced::Background => stage(
-                "Tracing calls in the background (`travsr status` shows progress)".to_string(),
-            ),
-            Traced::AtNextCommit => {}
-        }
+        stage("Traced calls".to_string());
         if s.keeping_fresh != "not_started" {
             stage("Keeping it fresh on every commit".to_string());
         }
@@ -507,9 +504,6 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
                     .to_string(),
             );
         }
-        if s.traced == Traced::AtNextCommit {
-            out.push("  Calls will be traced at your next commit.".to_string());
-        }
         if s.connected.needs_approval {
             out.push(
                 "  Claude Code asks once whether to trust this project's tools: accept it \
@@ -517,13 +511,7 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
                     .to_string(),
             );
         }
-        if s.ghost_prune_aborted {
-            out.push(
-                "  ! Kept the entries for missing files: an unusual number vanished at once. \
-                 Run `travsr fsck --fix --force` if that was intended."
-                    .to_string(),
-            );
-        } else if s.ghosts_pruned > 0 {
+        if s.ghosts_pruned > 0 && !s.ghost_prune_aborted {
             out.push(format!(
                 "  Removed {} entr{} for files no longer on disk.",
                 commas(s.ghosts_pruned),
@@ -845,7 +833,6 @@ mod tests {
             ranking: "installed",
             files_read: 5,
             no_op: false,
-            traced: Traced::Done,
             keeping_fresh: "started",
             connected: crate::connect::Connected {
                 tools: vec!["claude-code", "cursor"],
@@ -872,6 +859,37 @@ mod tests {
             no_commit: false,
             quiet: false,
         }
+    }
+
+    /// A tripped mass-delete limit prunes nothing, so the run is a no-change
+    /// one; the warning must show anyway, and under --quiet too (UX-023).
+    #[test]
+    fn a_kept_missing_file_warning_shows_on_a_no_change_quiet_run() {
+        let mut s = summary();
+        s.no_op = true;
+        s.quiet = true;
+        s.ghost_prune_aborted = true;
+        let lines = render_summary(&s);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("travsr fsck --fix --force")),
+            "{lines:#?}"
+        );
+    }
+
+    /// A download that failed leaves a language setting up: no "Got language
+    /// tools" over it.
+    #[test]
+    fn no_got_language_tools_while_one_still_waits_on_them() {
+        use travsr_plugin_host::phase_b::status::Readiness;
+        let mut s = summary();
+        s.languages.push(("rust".into(), Readiness::SettingUp));
+        let lines = render_summary(&s);
+        assert!(
+            !lines.iter().any(|l| l.contains("Got language tools")),
+            "{lines:#?}"
+        );
     }
 
     /// PR #940 review: a commented `.mcp.json` left Claude Code unconnected

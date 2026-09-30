@@ -1031,11 +1031,11 @@ interface FileListOpts {
 /** Strip the `<travsr-data>…</travsr-data>` MCP envelope and return trimmed non-empty lines. */
 export function parseEnvelope(raw: string): string[] {
   // Every caller counts the lines as results, so drop what is not one: a note
-  // the server appends after `</travsr-data>`, and the `~ =` legend.
+  // the server appends after `</travsr-data>` or inside it, and the `~ =` legend.
   return envelopeBody(raw)
     .split("\n")
     .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("~ = "));
+    .filter((l) => l && !l.startsWith("~ = ") && !/^\[?note:/.test(l));
 }
 
 export function buildFileListHtml(

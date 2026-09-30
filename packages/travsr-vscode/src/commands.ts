@@ -867,7 +867,8 @@ export function buildLanguageRows(
         language: l.language,
         analysis,
         full,
-        statusLine: READY_STATES[state](needs),
+        // The CLI's own words when it sends them; the map is for older binaries.
+        statusLine: typeof sent["label"] === "string" ? String(sent["label"]) : READY_STATES[state](needs),
         flagged,
         installed,
         repoState,
@@ -1824,7 +1825,7 @@ export function registerShowGraphStats(
         : (logFiles.files[0]?.name ?? "");
     const log = root && selected !== "" ? readDaemonLogFile(root, selected, logLines) : [];
     const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
-    // readDiagnostics spawns `travsr status`.
+    // readDiagnostics spawns `travsr status --verbose`.
     const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
     // Drift, straight from the daemon. An older binary does not serve this tool
     // and the client answers "" for an unknown tool, which parseIndexHealth
@@ -2490,7 +2491,12 @@ export function registerShowExecutionPath(
  * which wants a file to attach to.
  */
 export async function readDiagnostics(binary: string, cwd: string): Promise<Diagnostic[]> {
-  const out = await spawnLangCommand(binary, ["status"], cwd);
+  // `warning:` lines print only with --verbose; plain status is plain words.
+  // A binary older than --verbose printed them by default.
+  let out = await spawnLangCommand(binary, ["status", "--verbose"], cwd);
+  if (out.includes("unexpected argument '--verbose'")) {
+    out = await spawnLangCommand(binary, ["status"], cwd);
+  }
   const found: Diagnostic[] = [];
   for (const line of out.split("\n")) {
     const m = /^\s*warning:\s*(.+)$/.exec(line);
@@ -2553,9 +2559,6 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
   return spawnLangCommandResult(binary, args, cwd, timeoutMs).then((r) => r.out);
 }
 
-/** The last non-empty line of CLI output, the final status the command printed
- *  (e.g. "'rust' is active — full cross-file analysis is on."). Empty when the
- *  command printed nothing. */
 /** Whether to offer one-command setup on opening a folder (plan 3.5): a git
  *  repository with no index yet, asked once per workspace. */
 export function shouldOfferSetup(isGitRepo: boolean, hasIndex: boolean, alreadyOffered: boolean): boolean {
@@ -2576,6 +2579,9 @@ export async function setUpRepo(repo: string): Promise<{ out: string; cancelled:
   return run;
 }
 
+/** The last non-empty line of CLI output, the final status the command printed
+ *  (e.g. "'rust' is active — full cross-file analysis is on."). Empty when the
+ *  command printed nothing. */
 function lastLine(s: string): string {
   const lines = s.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   return lines.length ? lines[lines.length - 1] : "";

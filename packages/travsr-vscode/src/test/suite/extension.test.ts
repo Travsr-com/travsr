@@ -22,6 +22,14 @@ suite("parseEnvelope returns result rows only", () => {
       "[call] fn:blastCommand (function) — src/codelens.ts:67 ~",
     ]);
   });
+
+  test("drops a note inside the envelope, which is not a caller", () => {
+    const raw =
+      "<travsr-data>\n" +
+      "[note: nothing calls 'Point', but it is used at 2 place(s); find_references lists them.]\n" +
+      "</travsr-data>";
+    assert.deepStrictEqual(parseEnvelope(raw), []);
+  });
 });
 
 // Minimal stub for McpClient — returns controlled responses.

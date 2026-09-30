@@ -52,7 +52,7 @@ fn stderr_of(cmd: &mut Command, args: &[&str]) -> String {
 /// `travsr init` traces calls, so a later commit reindexed by the git hook with
 /// no daemon running leaves the index genuinely Phase B degraded. That is a
 /// precondition rather than an accident, so the tests below assert it rather
-/// than assume it — without it the
+/// than assume it: without it the
 /// degraded-caveat test would pass while proving nothing.
 fn main_and_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();

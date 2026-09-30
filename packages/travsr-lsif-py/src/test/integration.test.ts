@@ -413,6 +413,9 @@ test('a same-file name bound locally does not resolve to the module function', a
     'def run():\n    local = print\n    return local()\n',
     'def run():\n    for local in []:\n        local()\n',
     'def run():\n    def local():\n        return 3\n    return local()\n',
+    'def run(ev):\n    match ev:\n        case {"h": local}:\n            return local()\n',
+    'def run(ev):\n    match ev:\n        case local:\n            return local()\n',
+    'def run(ev):\n    match ev:\n        case [x] as local:\n            return local()\n',
   ]) {
     const refs = await refsFrom({ 'app.py': `def local():\n    return 2\n\n\n${body}` }, 'app.py');
     assert.deepStrictEqual(refs, [], body);

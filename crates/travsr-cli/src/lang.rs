@@ -495,8 +495,10 @@ fn cmd_list(language: Option<&str>, json: bool) -> Result<()> {
             let fix = readiness
                 .and_then(Readiness::fix)
                 .map_or("null".to_string(), |f| json_str(&f));
+            // The words `lang list` prints, so a renderer need not keep a copy.
+            let label = readiness.map_or("null".to_string(), |r| json_str(&r.label()));
             entries.push(format!(
-                r#"{{"contract":{LANG_LIST_CONTRACT},"language":{},"package":{},"sandbox":{},"status":{},"statusLine":{},"repoState":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"prerequisites":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{},"state":{state},"needs":{needs},"fix":{fix}}}"#,
+                r#"{{"contract":{LANG_LIST_CONTRACT},"language":{},"package":{},"sandbox":{},"status":{},"statusLine":{},"repoState":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"prerequisites":{},"elevatedHosts":{},"availableOnThisPlatform":{},"unavailableTarget":{},"state":{state},"needs":{needs},"fix":{fix},"label":{label}}}"#,
                 json_str(entry.language),
                 json_str(package),
                 json_str(sandbox),
@@ -538,12 +540,20 @@ fn cmd_list(language: Option<&str>, json: bool) -> Result<()> {
             .map_or_else(Vec::new, |root| detect_languages_in(&root))
     };
     for entry in CATALOG.iter().filter(|e| selected(e)) {
+        // A language the repo lacks has no repo state: "setting up" would never
+        // clear, since init sets up only what the repo has.
+        let repo_has_it = present.iter().any(|l| l == entry.language);
+        if !states.is_empty() && !repo_has_it {
+            println!(
+                "{:<12} {:<24} not in this repo",
+                entry.language,
+                entry.effective_prerequisites()
+            );
+            continue;
+        }
         let state = match states.get(entry.language) {
             Some(r) => {
-                if let Some(fix) = r
-                    .fix()
-                    .filter(|_| present.iter().any(|l| l == entry.language))
-                {
+                if let Some(fix) = r.fix() {
                     if matches!(
                         r,
                         Readiness::SettingUp | Readiness::Failed | Readiness::PartMissing
@@ -1346,6 +1356,8 @@ fn install_scip_github_binary(
                 }
             }
         }
+        // No network is not an install error: the caller exits OFFLINE_EXIT.
+        Err(e) if is_network_error(&e) => return Err(e),
         Err(e) => {
             eprintln!(
                 "Download failed: {e:#}\n\
@@ -1441,6 +1453,8 @@ fn install_gz_github_binary(
                 }
             }
         }
+        // No network is not an install error: the caller exits OFFLINE_EXIT.
+        Err(e) if is_network_error(&e) => return Err(e),
         Err(e) => {
             eprintln!(
                 "Download failed: {e:#}\n\
@@ -1496,6 +1510,7 @@ fn install_zip_binary(
         .await
     }) {
         Ok(p) => p,
+        Err(e) if is_network_error(&e) => return Err(e),
         Err(e) => {
             eprintln!(
                 "Download failed: {e:#}\nInstall '{}' manually:\n\t{}",
@@ -1634,7 +1649,6 @@ fn cmd_detect(yes: bool) -> Result<()> {
             &installable,
             /*no_interactive*/ true,
             /*yes*/ true,
-            None,
         );
         return Ok(());
     }
@@ -1675,30 +1689,22 @@ fn cmd_detect(yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    install_selected(
-        &selected, /*no_interactive*/ false, /*yes*/ false, None,
-    );
+    install_selected(&selected, /*no_interactive*/ false, /*yes*/ false);
     Ok(())
 }
 
 /// Install each detected language in turn, reporting per-language outcome without
-/// aborting the batch on a single failure. Shared by the interactive selection, the
-/// `--yes` path and `travsr init`, so all install exactly the same way — only the
-/// interactivity of each underlying `cmd_install` differs. `corpus` is the repo to
-/// enable; `None` derives it from the current directory.
+/// aborting the batch on a single failure. Shared by the interactive selection and
+/// the `--yes` path, so both install exactly the same way; only the interactivity
+/// of each underlying `cmd_install` differs.
 ///
 /// Stops at the first network failure, since every later download would wait out
-/// the same timeout; returns true when it did.
-pub(crate) fn install_selected(
-    selected: &[&str],
-    no_interactive: bool,
-    yes: bool,
-    corpus: Option<&str>,
-) -> bool {
+/// the same timeout.
+fn install_selected(selected: &[&str], no_interactive: bool, yes: bool) {
     eprintln!();
     for lang in selected {
         eprintln!("{lang}:");
-        match cmd_install(lang, false, no_interactive, corpus, false, yes, None) {
+        match cmd_install(lang, false, no_interactive, None, false, yes, None) {
             Ok(InstallStatus::FullyReady) => {}
             Ok(InstallStatus::WrapperOnly) => {
                 eprintln!("  {lang}: analyzer not installed yet, full analysis stays off")
@@ -1706,13 +1712,12 @@ pub(crate) fn install_selected(
             Err(e) => {
                 eprintln!("  error: {e:#}");
                 if is_network_error(&e) {
-                    return true;
+                    return;
                 }
             }
         }
         eprintln!();
     }
-    false
 }
 
 /// Whether `e` failed to reach the network at all (refused, unresolvable, timed
@@ -1765,37 +1770,49 @@ fn cmd_allow_unsandboxed(
     let entry =
         lookup(language).ok_or_else(|| anyhow::anyhow!("Unknown language '{language}'."))?;
 
+    let mut config = load_config().unwrap_or_default();
+
+    // Before the check below: `travsr init` also records this permission for a
+    // language that runs inside isolation elsewhere (Rust where no sandbox
+    // exists), and it must be possible to withdraw it, for good.
+    if revoke {
+        let had = config.revoke_unsandboxed_consent(language);
+        save_config(&config)?;
+        if had {
+            println!("Permission for '{language}' withdrawn.");
+        } else {
+            println!("No permission was on record for '{language}'.");
+        }
+        println!(
+            "`travsr init` will not grant it again. Grant it with \
+             `travsr lang allow-unsandboxed {language}`."
+        );
+        return Ok(());
+    }
+
     // Only the analyzers that cannot run inside Travsr's isolation need this. For
-    // every other language it would grant privileges for no reason, so refuse it.
-    if !entry.windows_sandbox_unsupported() {
+    // every other language it would grant privileges for no reason, so refuse it,
+    // unless the user withdrew one `travsr init` gave and wants it back.
+    let withdrawn = config.unsandboxed_withdrawn.iter().any(|l| l == language);
+    if !entry.windows_sandbox_unsupported() && !withdrawn {
         anyhow::bail!(
             "'{language}' already runs inside Travsr's isolation, so it does not need this. \
              Run `travsr lang install {language}` to set up full analysis."
         );
     }
 
-    let mut config = load_config().unwrap_or_default();
-
-    if revoke {
-        if config.revoke_unsandboxed_consent(language) {
-            save_config(&config)?;
-            println!(
-                "Permission for '{language}' withdrawn. Full analysis will pause on \
-                 Windows until you grant it again with `travsr lang allow-unsandboxed {language}`."
-            );
-        } else {
-            println!("No permission was on record for '{language}', nothing to withdraw.");
-        }
-        return Ok(());
-    }
-
     // Explain the trade-off BEFORE recording anything, then confirm. This grant
     // lifts Travsr's isolation for one language, so the user must see what they
     // are agreeing to first — plain language, no internal jargon.
+    // A withdrawn Rust grant is back here because no sandbox exists, not Windows.
+    let why = if entry.windows_sandbox_unsupported() {
+        " on Windows.\nIts build tools cannot run inside Travsr's isolation there"
+    } else {
+        ".\nThis machine has no isolation Travsr can run its build tools in"
+    };
     println!(
-        "Granting '{language}' permission to run with your own privileges on Windows.\n\
-         Its build tools cannot run inside Travsr's isolation there, so full analysis \
-         needs this.\n\
+        "Granting '{language}' permission to run with your own privileges{why}, so full \
+         analysis needs this.\n\
          \n\
          What this allows: when Travsr indexes this project, '{language}' analysis will \
          download dependencies and run this project's own build with your privileges, \
@@ -1829,6 +1846,15 @@ fn cmd_allow_unsandboxed(
 /// Record an unsandboxed grant made by `travsr init` for the repo `corpus`
 /// alone, so the daemon, a separate process that never sees init's flags,
 /// honours it there too. True when this call recorded it.
+/// Whether the user withdrew `language`'s unsandboxed permission (`--revoke`).
+pub(crate) fn unsandboxed_withdrawn(language: &str) -> bool {
+    load_config()
+        .unwrap_or_default()
+        .unsandboxed_withdrawn
+        .iter()
+        .any(|l| l == language)
+}
+
 pub(crate) fn grant_unsandboxed_from_init(language: &str, corpus: &str) -> Result<bool> {
     let mut config = load_config().unwrap_or_default();
     if config.has_unsandboxed_consent(language, Some(corpus)) {
@@ -1982,6 +2008,10 @@ pub(crate) struct LangConfig {
     /// runs inside a repo; also settable via `--corpus` or `travsr config set`.
     #[serde(default)]
     trusted_corpora: Vec<String>,
+    /// Languages whose unsandboxed permission the user withdrew with
+    /// `--revoke`: `travsr init` does not grant them again on its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unsandboxed_withdrawn: Vec<String>,
     /// Per-language permission to run an analyzer that cannot run inside Travsr's
     /// isolation (java/scala on Windows) with the user's own privileges. Written by
     /// `travsr lang allow-unsandboxed`; honoured by the indexer resolver so the
@@ -2058,6 +2088,7 @@ impl LangConfig {
     ) {
         self.unsandboxed_consent
             .retain(|c| !(c.language == language && c.corpus.as_deref() == corpus));
+        self.unsandboxed_withdrawn.retain(|l| l != language);
         self.unsandboxed_consent.push(UnsandboxedConsent {
             language: language.to_string(),
             corpus: corpus.map(str::to_string),
@@ -2070,6 +2101,9 @@ impl LangConfig {
     fn revoke_unsandboxed_consent(&mut self, language: &str) -> bool {
         let before = self.unsandboxed_consent.len();
         self.unsandboxed_consent.retain(|c| c.language != language);
+        if !self.unsandboxed_withdrawn.iter().any(|l| l == language) {
+            self.unsandboxed_withdrawn.push(language.to_string());
+        }
         self.unsandboxed_consent.len() < before
     }
 }
@@ -2218,6 +2252,20 @@ mod tests {
         assert!(cfg.has_unsandboxed_consent("rust", Some("github.com/a/one")));
         assert!(!cfg.has_unsandboxed_consent("rust", Some("github.com/b/two")));
         assert!(cfg.has_unsandboxed_consent("java", Some("github.com/b/two")));
+    }
+
+    /// PR #940 review: a revoke must outlast the next `travsr init`, which
+    /// otherwise records the grant again; an explicit grant lifts it.
+    #[test]
+    fn a_revoke_is_remembered_until_an_explicit_grant() {
+        let mut cfg = super::LangConfig::default();
+        cfg.grant_unsandboxed_consent("rust", "travsr init", Some("github.com/a/one"));
+        assert!(cfg.revoke_unsandboxed_consent("rust"));
+        let mut cfg: super::LangConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(cfg.unsandboxed_withdrawn, vec!["rust".to_string()]);
+        assert!(!cfg.has_unsandboxed_consent("rust", Some("github.com/a/one")));
+        cfg.grant_unsandboxed_consent("rust", "octocat", None);
+        assert!(cfg.unsandboxed_withdrawn.is_empty());
     }
 
     #[test]

@@ -261,7 +261,10 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
             //     still warns lightly that a few edges may be missing until the
             //     commit, rather than falling through to "results current".
             let resolved = store.resolved_ref_count().unwrap_or(0);
-            let pending = store.pending_ref_count().unwrap_or(0);
+            let pending: u64 = crate::query::pending_refs_in_edited_files(store)
+                .iter()
+                .map(|(_, n)| n)
+                .sum();
             if resolved == 0 && pending == 0 {
                 Some(STALE.to_string())
             } else if pending == 0 {
@@ -283,14 +286,6 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
         _ => phase_b_unanalyzed_note(store),
     }
 }
-
-/// Files considered when scoping a pending-reference count. Beyond this the
-/// report is advisory anyway, and the cap is what keeps the group-by bounded.
-///
-/// Shared by [`live_overlay_note`] and `find_references`' zero gate on purpose:
-/// the note and the answer it decorates must describe the same file set, or
-/// they can contradict each other (#895).
-const PENDING_FILE_CAP: usize = 64;
 
 /// RFC-027 section 10: tell a reader that this answer includes un-ratified
 /// edges, and where the remaining gaps are.
@@ -320,21 +315,12 @@ const PENDING_FILE_CAP: usize = 64;
 /// drawn from, not of any one file in it.
 fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
     let live = store.count_edges_with_provenance("live").ok().unwrap_or(0);
-    // With calls traced at HEAD, what stays pending is a call no commit resolves
-    // (`Vec::new`, `join`); only an edit since then makes the note true. Same
-    // gate as `travsr status`.
-    let dirty = store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1");
-    let pending: u64 = if dirty {
-        store
-            .pending_ref_counts_by_file(PENDING_FILE_CAP)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(path, _)| answer.contains(path.as_str()))
-            .map(|(_, n)| n)
-            .sum()
-    } else {
-        0
-    };
+    // Only files edited since HEAD: the same count `travsr status` gives.
+    let pending: u64 = crate::query::pending_refs_in_edited_files(store)
+        .into_iter()
+        .filter(|(path, _)| answer.contains(path.as_str()))
+        .map(|(_, n)| n)
+        .sum();
     if live == 0 && pending == 0 {
         return None;
     }
@@ -835,8 +821,8 @@ fn phase_b_incomplete_reason(store: &SqliteStore, lang: &str) -> Option<String> 
 }
 
 /// The one-line caveat appended to a get_callers / find_references answer when
-/// [`phase_b_lang_incomplete`] holds for the target language. The `crashed`
-/// wording is unchanged from #715; the #878 classes name the skipped analyzer.
+/// [`phase_b_lang_incomplete`] holds for the target language: one plain line
+/// for every class, with the reason under `travsr status --verbose`.
 fn incomplete_caveat(lang: &str) -> String {
     format!(
         "note: calls in '{lang}' could not be fully traced on the last run, so these \
@@ -1565,7 +1551,8 @@ fn resolve_alias(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<C
     else {
         return Vec::new();
     };
-    let mut originals: Vec<String> = Vec::new();
+    // Each original with the import line that names its module.
+    let mut originals: Vec<(String, String)> = Vec::new();
     // Each hit is `path:line:col:text`.
     for hit in body.lines() {
         let mut parts = hit.splitn(4, ':');
@@ -1574,22 +1561,36 @@ fn resolve_alias(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<C
         else {
             continue;
         };
+        // A list member's module is on the line that opens the list.
+        let mut opener: Option<String> = None;
         let in_list = || {
             let line_no: usize = line_no.parse().unwrap_or(0);
-            std::fs::read_to_string(repo_root.join(path)).is_ok_and(|file| {
-                let above: Vec<&str> = file.lines().take(line_no.saturating_sub(1)).collect();
-                opens_import_list(&above)
-            })
+            opener = std::fs::read_to_string(repo_root.join(path))
+                .ok()
+                .and_then(|file| {
+                    let above: Vec<&str> = file.lines().take(line_no.saturating_sub(1)).collect();
+                    import_list_opener(&above).map(str::to_string)
+                });
+            opener.is_some()
         };
         for o in alias_originals(text, symbol, in_list) {
-            if !originals.contains(&o) {
-                originals.push(o);
+            let import = opener.clone().unwrap_or_else(|| text.to_string());
+            if !originals.iter().any(|(seen, _)| *seen == o) {
+                originals.push((o, import));
             }
         }
     }
+    // Aliasing usually exists to avoid a clash with a local name, so a
+    // same-named definition elsewhere is the wrong answer unless the import
+    // names where it lives (`use std::process::Command as StdCommand` is not
+    // this repo's `Command`).
     let mut nodes: Vec<CoreNode> = originals
         .iter()
-        .flat_map(|o| resolve_symbol_nodes(store, o, path))
+        .flat_map(|(o, import)| {
+            resolve_symbol_nodes(store, o, path)
+                .into_iter()
+                .filter(|n| import_names_home(import, &n.vname.path))
+        })
         .collect();
     nodes.sort_by_key(|n| n.id.0);
     nodes.dedup_by_key(|n| n.id);
@@ -1648,23 +1649,68 @@ fn alias_originals(line: &str, alias: &str, in_import_list: impl FnOnce() -> boo
     out
 }
 
-/// Whether the lines `above` a list member (nearest last) open an import list:
-/// past the other members and comments, the line that opens the list is an
-/// import (`use a::{`, `import {`, `from m import (`, `export {`).
-fn opens_import_list(above: &[&str]) -> bool {
+/// The line that opens the import list the lines `above` a list member
+/// (nearest last) end inside: past the other members and comments, the line
+/// that opens the list is an import (`use a::{`, `import {`, `from m import (`,
+/// `export {`). `None` when that line is not an import.
+fn import_list_opener<'a>(above: &[&'a str]) -> Option<&'a str> {
     let opener =
         above.iter().rev().map(|l| l.trim()).find(|l| {
             !(l.is_empty() || l.ends_with(',') || l.starts_with("//") || l.starts_with('#'))
         });
-    opener.is_some_and(|l| {
+    opener.filter(|l| {
         let l = l
             .strip_prefix("pub")
-            .map_or(l, |r| r.split_once(' ').map_or(r, |(_, r)| r.trim_start()));
+            .map_or(*l, |r| r.split_once(' ').map_or(r, |(_, r)| r.trim_start()));
         (l.ends_with('{') || l.ends_with('('))
-            && ["use ", "import ", "from ", "export "]
+            && ["use ", "import ", "from ", "export {", "export type {"]
                 .iter()
                 .any(|k| l.starts_with(k))
     })
+}
+
+/// Whether `import` names where `def_path` lives: one of its module words
+/// (`travsr_core`, `graph`, `'./button'`) is a folder or file name on the path.
+/// An import naming none (`use super::x as y`, `from . import x as y`) is this
+/// folder's own code, so it passes.
+fn import_names_home(import: &str, def_path: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "use", "pub", "import", "from", "export", "type", "extern", "crate", "self", "super",
+    ];
+    let norm = |w: &str| w.to_ascii_lowercase().replace('-', "_");
+    let mut module = import.trim();
+    // `from m import a as b`: the names after `import` are not the module.
+    if let Some((head, _)) = module
+        .split_once(" import ")
+        .filter(|_| module.starts_with("from "))
+    {
+        module = head;
+    }
+    // Drop the listed names (`{a as b}`, `(a as b)`), then a lone `a as b`.
+    let mut outside = String::new();
+    let mut depth = 0usize;
+    for c in module.chars() {
+        match c {
+            '{' | '(' => depth += 1,
+            '}' | ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => outside.push(c),
+            _ => {}
+        }
+    }
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    let outside = match outside.split_once(" as ") {
+        Some((head, _)) => head.trim_end_matches(is_ident).to_string(),
+        None => outside,
+    };
+    let folders: Vec<String> = def_path
+        .split('/')
+        .map(|c| norm(c.split('.').next().unwrap_or(c)))
+        .collect();
+    let mut words = outside
+        .split(|c: char| !is_ident(c))
+        .filter(|w| !w.is_empty() && !KEYWORDS.contains(w))
+        .peekable();
+    words.peek().is_none() || words.any(|w| folders.contains(&norm(w)))
 }
 
 /// Whether every candidate is a multi-part Objective-C selector of ONE class
@@ -2264,21 +2310,13 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // call sites sat pending in `travsr-mcp/src/tools.rs`; they resolved
         // verbatim once Phase B caught up.
         //
-        // Same gate as `live_overlay_note`: with calls traced at HEAD, what
-        // stays pending is a call no commit resolves, so "changed since the
-        // last commit" would be false and `travsr init` could not clear it.
-        let dirty = store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1");
-        let pending_here = if dirty {
-            store
-                .pending_ref_counts_by_file(PENDING_FILE_CAP)
-                .unwrap_or_default()
-                .into_iter()
-                .find(|(path, _)| path == &target.vname.path)
-                .map(|(_, n)| n)
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        // Same count as `live_overlay_note`: only files edited since HEAD, so
+        // "changed since the last commit" is true of the file it names.
+        let pending_here = crate::query::pending_refs_in_edited_files(store)
+            .into_iter()
+            .find(|(path, _)| path == &target.vname.path)
+            .map(|(_, n)| n)
+            .unwrap_or(0);
         if pending_here > 0 {
             return format!(
                 "{header}\n0 recorded reference(s), not a definitive zero: \
@@ -5245,8 +5283,8 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
     )
 }
 
-/// A partial language's line in plain words (plan 3.0): what the last run
-/// recorded for it, else what the setup ladder says, else "setting up". The
+/// A partial language's line in plain words (plan 3.0): what the readiness
+/// ladder says, else what the last run recorded, else "setting up". The
 /// same lines `travsr status` and `get_index_status` give, from `Readiness`.
 fn plain_partial_line(store: &SqliteStore, lang: &str) -> String {
     use travsr_plugin_host::phase_b::status::Readiness;
@@ -5259,14 +5297,13 @@ fn plain_partial_line(store: &SqliteStore, lang: &str) -> String {
     let from_run = crate::observability::decode_phase_b_warnings(&warnings)
         .remove(lang)
         .map(|(_, d)| d);
-    let from_setup = || {
-        let root = store.resolve_repo_root()?;
+    let from_ladder = store.resolve_repo_root().and_then(|root| {
         let corpus = store.get_meta("corpus").ok().flatten().unwrap_or_default();
-        crate::observability::phase_b_availability(Some(&root), &corpus)
+        crate::observability::phase_b_availability(Some(&root), &corpus, &warnings)
             .remove(lang)
             .flatten()
-    };
-    let detail = from_run.or_else(from_setup).unwrap_or_else(|| {
+    });
+    let detail = from_ladder.or(from_run).unwrap_or_else(|| {
         let r = Readiness::SettingUp;
         format!("{lang}: {}. {}", r.label(), r.fix().unwrap_or_default())
     });
@@ -7165,7 +7202,7 @@ pub(crate) fn build_context_signals(
 /// PF-M4: accepts `phase_b_pending` as a pre-computed bool so callers can
 /// hoist the two `get_meta` queries out of the hot path and compute once.
 ///
-/// `embed_initialized` = embed.db exists (Phase 1 has run at some point).
+/// `embed_initialized` = embed.db exists and the repo turned embedding on.
 /// When `!has_embed && embed_initialized` the daemon hasn't injected the KNN hook yet
 /// (e.g. Phase 1 just completed, daemon restarting) — show "in progress" instead of "init needed".
 #[allow(clippy::too_many_arguments)]
@@ -7876,7 +7913,11 @@ fn get_context_body(
     // Capture embed presence before embed_knn is consumed by the seed-lookup block.
     let has_embed = embed_knn.is_some();
     // Distinguish "Phase 1 done, hook not yet active" from "embed never initialized".
-    let embed_initialized = store.has_embed_db();
+    // Only a repo that turned meaning-based search on (`travsr embed init`,
+    // `.travsr/embed.toml`) ever gets it built; a bare embed.db does not.
+    let embed_initialized = store.has_embed_db()
+        && resolve_repo_root(store)
+            .is_some_and(|r| travsr_plugin_host::repo_backend_id(&r).is_some());
     // PF-M4: compute once here so neither include_snippets branch calls get_meta twice.
     let phase_b = phase_b_pending(store);
 
@@ -11393,20 +11434,32 @@ mod tests {
         // PR #940 review: a cast at the start of a line inside an array or
         // object reads like a list member; only an import list makes it one.
         assert!(alias_originals("  value as Handler,", "Handler", || false).is_empty());
-        assert!(opens_import_list(&["use rerank::{", "    a as b,"]));
-        assert!(opens_import_list(&["pub use rerank::{"]));
-        assert!(opens_import_list(&[
-            "from m import (",
-            "    # note",
-            "    a as b,"
-        ]));
-        assert!(opens_import_list(&["import {"]));
-        assert!(!opens_import_list(&[
-            "const handlers = [",
-            "  other as Handler,"
-        ]));
-        assert!(!opens_import_list(&["let x = f(", "    y,"]));
-        assert!(!opens_import_list(&[]));
+        // An alias is followed only to a definition where its import points.
+        let std_cmd = "use std::process::Command as StdCommand;";
+        assert!(!import_names_home(std_cmd, "crates/travsr-cli/src/main.rs"));
+        let anyhow = "use anyhow::{Context, Result as AnyResult};";
+        assert!(!import_names_home(anyhow, "fixtures/go/kubectl_sample.go"));
+        let core = "use travsr_core::{Node as CoreNode, VName};";
+        assert!(import_names_home(core, "crates/travsr-core/src/lib.rs"));
+        assert!(import_names_home("use super::render as r;", "src/any.rs"));
+        let ts = "import { greet as hello } from './greeter'";
+        assert!(import_names_home(ts, "src/greeter.ts"));
+        assert!(!import_names_home(ts, "src/other.ts"));
+        let py = "from app.models import User as U";
+        assert!(import_names_home(py, "app/models.py"));
+        assert!(!import_names_home(
+            "import numpy.random as npr",
+            "src/random.py"
+        ));
+        // A call that spans lines is not an import list, even after `export`.
+        assert!(!import_list_opener(&["export const store = createStore("]).is_some());
+        assert!(import_list_opener(&["use rerank::{", "    a as b,"]).is_some());
+        assert!(import_list_opener(&["pub use rerank::{"]).is_some());
+        assert!(import_list_opener(&["from m import (", "    # note", "    a as b,"]).is_some());
+        assert!(import_list_opener(&["import {"]).is_some());
+        assert!(!import_list_opener(&["const handlers = [", "  other as Handler,"]).is_some());
+        assert!(!import_list_opener(&["let x = f(", "    y,"]).is_some());
+        assert!(!import_list_opener(&[]).is_some());
     }
 
     #[test]
@@ -16212,11 +16265,31 @@ mod snippet_tests {
         );
     }
 
+    /// A git repo holding `files` uncommitted, recorded as `store`'s root, so
+    /// pending rows in them count as edits since HEAD.
+    fn edited_repo(store: &mut travsr_store::SqliteStore, files: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        for f in files {
+            std::fs::write(tmp.path().join(f), "").unwrap();
+        }
+        store
+            .set_meta("repo_root", &tmp.path().to_string_lossy())
+            .unwrap();
+        tmp
+    }
+
     #[test]
     fn phase_b_note_names_pending_references_instead_of_run_init() {
         // dirty with an unresolved reference: name the gap honestly, without the
         // heavy "run travsr init".
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let _repo = edited_repo(&mut store, &["a.rs"]);
         store.set_meta("last_commit", "abc").unwrap();
         store.set_meta("phase_b_commit", "abc").unwrap();
         store.set_meta("phase_b_dirty", "1").unwrap();
@@ -16476,6 +16549,7 @@ mod snippet_tests {
     #[test]
     fn the_live_overlay_note_reports_abstentions_as_well_as_resolutions() {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let repo = edited_repo(&mut store, &["a.ts"]);
         let a = node_with("fn:a", "function", "a.ts");
         store.put_node(&a).unwrap();
         store
@@ -16513,6 +16587,25 @@ mod snippet_tests {
         assert!(
             live_overlay_note(&store, "callers in unrelated.ts:9").is_none(),
             "the pending half must not fire for a file the answer never names"
+        );
+
+        // A pending row in a file unchanged since HEAD is a call no commit
+        // resolves, whatever else was edited: no "changed since" claim.
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .status()
+                .unwrap()
+        };
+        git(&["add", "a.ts"]);
+        git(&["commit", "-q", "-m", "a"]);
+        std::fs::write(repo.path().join("other.ts"), "").unwrap();
+        assert!(
+            live_overlay_note(&store, "callers in a.ts:3").is_none(),
+            "a committed file's pending rows were reported as changed"
         );
     }
 

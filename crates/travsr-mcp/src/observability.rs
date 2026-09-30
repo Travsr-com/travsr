@@ -357,7 +357,10 @@ pub(crate) fn decode_phase_b_warnings(warnings: &str) -> HashMap<String, (&'stat
             ),
             _ => continue,
         };
-        out.insert(lang.to_string(), (state, plain_detail(lang, &readiness)));
+        // The first warning for a language wins, as in `travsr status`
+        // (`warning_class`), so both surfaces report the same state.
+        out.entry(lang.to_string())
+            .or_insert_with(|| (state, plain_detail(lang, &readiness)));
     }
     out
 }
@@ -389,6 +392,7 @@ fn plain_detail(lang: &str, r: &travsr_plugin_host::phase_b::status::Readiness) 
 pub(crate) fn phase_b_availability(
     root: Option<&Path>,
     corpus: &str,
+    warnings: &str,
 ) -> HashMap<&'static str, Option<String>> {
     use travsr_plugin_host::phase_b::status::{gather, readiness, Readiness};
 
@@ -396,25 +400,26 @@ pub(crate) fn phase_b_availability(
     let resolver = travsr_plugin_host::resolver::CatalogResolver::for_corpus(corpus);
     let mut out = HashMap::with_capacity(travsr_plugin_host::PHASE_B_CATALOG.len());
     for entry in travsr_plugin_host::PHASE_B_CATALOG {
-        // Plan 4.2: the one readiness ladder, with no last-run warnings, so
-        // only the setup rungs apply (the last run is `decode_phase_b_warnings`).
+        // Plan 4.2: the one readiness ladder, fed the stored warnings, so the
+        // line is the one `travsr status` prints for the language.
         let cap = gather(
             entry,
             root.unwrap_or_else(|| Path::new("")),
             corpus,
             &lang_toml,
             &resolver,
-            "",
+            warnings,
         );
         let detail = match readiness(&cap) {
             Readiness::Ready => None,
             // Without a known root there is no project to look for a compile
-            // database in, so do not claim one is missing.
+            // database or a build file in, so do not claim one is missing.
             Readiness::NeedsToolchain { needs }
                 if root.is_none() && needs == "compile_commands.json" =>
             {
                 None
             }
+            Readiness::NeedsBuildFile { .. } if root.is_none() => None,
             r => Some(plain_detail(entry.language, &r)),
         };
         out.insert(entry.language, detail);
@@ -615,7 +620,7 @@ fn index_status_payload(
     // hand-maintained copy: that copy is missing `objectivec`, which is a
     // real Phase B language, so it was excluded from `phase_b.languages`
     // entirely. It is now reported like any other catalog language.
-    let availability = phase_b_availability(root, &corpus_meta);
+    let availability = phase_b_availability(root, &corpus_meta, &warnings_raw);
     let languages = store.language_distribution().unwrap_or_default();
     let languages: Vec<(String, u64)> = languages
         .into_iter()
@@ -631,8 +636,11 @@ fn index_status_payload(
         // with them, so an agent polling for readiness never got an answer).
         let (state, detail) = if let Some((cls, msg)) = decoded_warnings.get(lang) {
             // 1. A recorded warning still wins: it is what actually happened
-            //    on the last run, more specific than any static prediction.
-            (*cls, Some(msg.clone()))
+            //    on the last run. The line is the ladder's when it has one, so
+            //    it matches `travsr status` (a missing build file, say, comes
+            //    before what the last run recorded).
+            let line = availability.get(lang.as_str()).cloned().flatten();
+            (*cls, Some(line.unwrap_or_else(|| msg.clone())))
         } else if store.has_refcall_edges_for_language(lang) {
             // 2. Edges exist: Phase B produced output for this language.
             ("done", None)
@@ -665,13 +673,15 @@ fn index_status_payload(
     }
 
     let degraded = |s: &&str| *s == "failed" || *s == "unavailable";
+    // A tracer that ran and found no calls is finished, not still running.
+    let finished = |s: &&str| *s == "done" || *s == "no_calls";
     let phase_b_state = if lang_states.is_empty() {
         "pending"
-    } else if lang_states.iter().all(|s| *s == "done") {
+    } else if lang_states.iter().all(finished) {
         "done"
     } else if lang_states.iter().all(degraded) {
         "failed"
-    } else if lang_states.contains(&"done") && lang_states.iter().any(degraded) {
+    } else if lang_states.iter().any(finished) && lang_states.iter().any(degraded) {
         "partial"
     } else if lang_states.contains(&"pending") {
         "pending"
@@ -1924,6 +1934,38 @@ mod tests {
     /// `TRAVSR_LANG_TOML` points at an empty registry so the result does not
     /// depend on which analyzers the developer running the suite happens to
     /// have installed.
+    /// Two warnings for one language: MCP must pick the one `travsr status`
+    /// picks (the first), or the two surfaces disagree.
+    #[test]
+    fn decode_keeps_the_first_warning_like_travsr_status() {
+        let decoded = decode_phase_b_warnings("crashed:rust,needs_consent:rust");
+        assert_eq!(decoded["rust"].0, "failed");
+    }
+
+    /// A language whose tracer found no calls is finished, so the aggregate
+    /// must not read "running" with no job in flight.
+    #[test]
+    fn index_status_no_calls_is_a_finished_aggregate() {
+        use travsr_core::{Node, VName};
+        use travsr_store::Store as _;
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        store
+            .set_meta("phase_b_warnings", "no_references:ruby")
+            .unwrap();
+        let node = Node::new(
+            VName::new("corpus", "main", "src/f.rb", "ruby", "fn:b"),
+            "function",
+        );
+        store.put_node(&node).unwrap();
+
+        let payload = index_status_payload(&store, "repo", None);
+
+        assert_eq!(payload["phase_b"]["languages"][0]["state"], "no_calls");
+        assert_eq!(payload["phase_b"]["state"], "done", "got: {payload}");
+    }
+
     #[test]
     fn index_status_phase_b_always_reaches_a_terminal_state() {
         use travsr_core::{Node, VName};

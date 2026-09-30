@@ -365,8 +365,6 @@ mod lock_tests {
         );
     }
 
-    /// The singleton semantics the probe exists for are unchanged: an
-    /// exclusively locked, already-present lock file still reads as held.
     /// `travsr mcp` from an editor reconnects the moment `init` creates the
     /// index, and used to start a daemon while `init` was still running; the
     /// daemon then watched init's own config writes. `init` starts it itself.
@@ -383,6 +381,8 @@ mod lock_tests {
         assert!(lazy_daemon_wanted(tmp.path()), "init finished");
     }
 
+    /// The singleton semantics the probe exists for are unchanged: an
+    /// exclusively locked, already-present lock file still reads as held.
     #[test]
     fn lock_held_for_an_existing_exclusively_locked_file() {
         use fs2::FileExt as _;

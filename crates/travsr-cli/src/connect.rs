@@ -1773,12 +1773,21 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<Connected> {
              not detected here, so no hook was installed. guard.mode is recorded; \
              re-run `travsr connect` once it is."
         );
+        // `init` runs connect silently and shows only `problems`.
+        connected.problems.push(
+            "No guard hook installed: it is a Claude Code feature and Claude Code was not \
+             found. Run `travsr connect` once it is installed."
+                .to_string(),
+        );
     }
 
     if !detected {
         say!(
             "tip: no AI coding tool detected. Run `travsr connect` after installing \
              Claude Code, Cursor, Copilot, Gemini CLI, Codex, Windsurf, or Zed"
+        );
+        connected.problems.push(
+            "No AI coding tool found. Run `travsr connect` after installing one.".to_string(),
         );
         return Ok(connected);
     }

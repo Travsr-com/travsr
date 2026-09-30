@@ -705,10 +705,13 @@ const BINDING_FIELDS: Record<string, string> = {
   named_expression: 'name',
   as_pattern: 'alias',
 };
-/** Constructs every identifier of which counts as bound (parameters, imports, globals). */
+/** Constructs every identifier of which counts as bound (parameters, imports,
+ *  globals, `case` patterns). A class name in a pattern (`case Point(x=0)`)
+ *  counts too, which costs recall, never precision. */
 const BINDING_WHOLE = new Set([
   'parameters',
   'lambda_parameters',
+  'case_pattern',
   'import_statement',
   'import_from_statement',
   'global_statement',

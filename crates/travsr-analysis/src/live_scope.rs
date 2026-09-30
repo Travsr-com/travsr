@@ -157,6 +157,7 @@ const RUST_BINDERS: &str = "
 (slice_pattern (identifier) @bind)
 (or_pattern (identifier) @bind)
 (ref_pattern (identifier) @bind)
+(reference_pattern (identifier) @bind)
 (mut_pattern (identifier) @bind)
 (captured_pattern (identifier) @bind)
 (field_pattern name: (shorthand_field_identifier) @bind)
@@ -275,10 +276,14 @@ mod tests {
              let (ref r, mut m) = (1, 2);\n\
              let whole @ Some(_) = o else { return };\n\
              while let Some(w) = o { w() }\n\
+             for &hook2 in HOOKS { hook2() }\n\
+             v.iter().for_each(|&cb| cb());\n\
+             if let Some(&h2) = o { h2() }\n\
              }",
         );
         for n in [
-            "hook", "arm", "a", "b", "each", "field", "renamed", "r", "m", "whole", "w",
+            "hook", "arm", "a", "b", "each", "field", "renamed", "r", "m", "whole", "w", "hook2",
+            "cb", "h2",
         ] {
             assert!(found.contains(n), "{n} missing from {found:?}");
         }

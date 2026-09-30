@@ -6002,15 +6002,17 @@ LIMIT ?4",
             // so the narrowest one with that name wins, not merely the narrowest
             // (a field on its struct's line lost every reference to the struct
             // or to itself, whichever sorted second). An enum variant has no
-            // node of its own, so a use of one counts for the enum around it.
+            // node of its own, so a use of one counts for the enum around it:
+            // below its first line, or on it for a one-line enum
+            // (`enum Mode { Fast, Slow }`).
             let found = match &p.callee_name {
                 Some(name) => containing
                     .iter()
                     .find(|(_, _, sig)| leaf_name(sig) == *name)
                     .or_else(|| {
-                        containing
-                            .first()
-                            .filter(|(s, kind, _)| kind == "enum" && s.line < def_line)
+                        containing.first().filter(|(s, kind, _)| {
+                            kind == "enum" && (s.line < def_line || s.line == s.end_line)
+                        })
                     }),
                 None => containing.first(),
             };
@@ -17875,8 +17877,13 @@ mod tests {
         let p = node("struct:P", "struct", 1, 1);
         let x = node("field:P.x", "field", 1, 1);
         let shape = node("enum:Shape", "enum", 2, 5);
+        let mode = node("enum:Mode", "enum", 7, 7);
         store
-            .write_scip_attributed_batch(corpus, &[p.clone(), x.clone(), shape.clone()], &[])
+            .write_scip_attributed_batch(
+                corpus,
+                &[p.clone(), x.clone(), shape.clone(), mode.clone()],
+                &[],
+            )
             .unwrap();
         let at = |def_line: u32, name: &str| travsr_core::LsifPositionalRef {
             caller_path: "b.rs".to_string(),
@@ -17890,11 +17897,17 @@ mod tests {
         let refs = store
             .resolve_lsif_positional_refs(
                 corpus,
-                &[at(1, "P"), at(1, "x"), at(3, "Circle"), at(2, "Other")],
+                &[
+                    at(1, "P"),
+                    at(1, "x"),
+                    at(3, "Circle"),
+                    at(2, "Other"),
+                    at(7, "Fast"),
+                ],
             )
             .unwrap();
         let callees: Vec<_> = refs.iter().map(|r| r.callee_id).collect();
-        assert_eq!(callees, vec![p.id, x.id, shape.id]);
+        assert_eq!(callees, vec![p.id, x.id, shape.id, mode.id]);
     }
 
     /// `--fix` remediation for DBs written before the guard: `fsck` counts and

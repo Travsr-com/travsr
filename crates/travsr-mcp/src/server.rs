@@ -702,7 +702,7 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_index_status",
-                "description": "Return index freshness and completeness: schema version, indexed vs HEAD commit staleness, node/edge counts, structural and semantic analysis state (including per-language failed/unavailable/done), and semantic (embeddings/rerank) readiness. Read-only. Returns JSON.",
+                "description": "Return index freshness and completeness: schema version, indexed vs HEAD commit staleness, node/edge counts, structural and semantic analysis state (including per-language failed/unavailable/no_calls/done), and semantic (embeddings/rerank) readiness. Read-only. Returns JSON.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -1249,7 +1249,7 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_index_status",
-                "description": "Return index freshness and completeness for a single repo: schema version, indexed vs HEAD commit staleness, node/edge counts, structural and semantic analysis state (including per-language failed/unavailable/done), and semantic (embeddings/rerank) readiness. Read-only. Never aggregates across repos; supply `repo` when more than one is registered, or the call returns an ambiguity error. Returns JSON.",
+                "description": "Return index freshness and completeness for a single repo: schema version, indexed vs HEAD commit staleness, node/edge counts, structural and semantic analysis state (including per-language failed/unavailable/no_calls/done), and semantic (embeddings/rerank) readiness. Read-only. Never aggregates across repos; supply `repo` when more than one is registered, or the call returns an ambiguity error. Returns JSON.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

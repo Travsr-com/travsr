@@ -20,6 +20,10 @@
 //! Nothing here says "Phase B", "sandbox", "SCIP", "LSIF", "wrapper", "built-in",
 //! or "corpus" — those are internal terms an end user does not know. This is the
 //! ONLY place the wording lives; every renderer calls it so the words cannot drift.
+//!
+//! [`Readiness`] below is the per-repo counterpart: what one repo still needs for
+//! a language (`ready`, `needs <X>`, `setting up`, ...), the lines `init`,
+//! `status`, `lang list` and the MCP notes print.
 
 use super::catalog::PhaseBEntry;
 
@@ -304,8 +308,10 @@ pub fn readiness(c: &RepoCapability) -> Readiness {
     }
     // A bundled emitter that could not be found or started ships with travsr,
     // so `travsr init` cannot restore it; send the user to the reason instead.
+    // Absent now (not beside the binary) reads the same, before any run says so.
     if c.entry.analyzer_bundled() {
         match c.last_warning {
+            _ if !c.analyzer_ready => return Readiness::PartMissing,
             Some("emitter_missing") => return Readiness::PartMissing,
             Some("emitter_failed") => return Readiness::Failed,
             _ => {}
@@ -499,7 +505,7 @@ pub fn analyzer_present(entry: &PhaseBEntry) -> bool {
 }
 
 /// Whether a bundled analyzer's hidden interpreter is present. travsr-lsif-ts
-/// and travsr-lsif-py ship as JS files run through `node` — "bundled" only
+/// and travsr-lsif-py ship as JS files run through `node`; "bundled" only
 /// means the emitter file itself needs no separate install, not that Node.js
 /// is guaranteed to exist on the machine. True when the entry declares no such
 /// hidden driver (nothing to check).
@@ -990,21 +996,22 @@ mod tests {
             ("emitter_failed", Readiness::Failed),
             ("emitter_missing", Readiness::PartMissing),
         ] {
-            for analyzer_ready in [false, true] {
-                let cap = RepoCapability {
-                    analyzer_ready,
-                    last_warning: Some(class),
-                    ..repo("typescript")
-                };
-                assert_eq!(readiness(&cap), want, "{class}");
-            }
+            let cap = RepoCapability {
+                last_warning: Some(class),
+                ..repo("typescript")
+            };
+            assert_eq!(readiness(&cap), want, "{class}");
         }
-        // Without the record, an absent bundled analyzer is still set up by init.
-        let cap = RepoCapability {
-            analyzer_ready: false,
-            ..repo("typescript")
-        };
-        assert_eq!(readiness(&cap), Readiness::SettingUp);
+        // Absent now, with or without a record: `travsr lang install` cannot
+        // restore it either, so it is part missing, not setting up.
+        for last_warning in [None, Some("emitter_failed")] {
+            let cap = RepoCapability {
+                analyzer_ready: false,
+                last_warning,
+                ..repo("typescript")
+            };
+            assert_eq!(readiness(&cap), Readiness::PartMissing, "{last_warning:?}");
+        }
     }
 
     #[test]

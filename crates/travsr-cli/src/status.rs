@@ -343,9 +343,21 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
                 println!("{line}");
             }
         }
+        use travsr_plugin_host::phase_b::status::Readiness;
+        // rust-analyzer ran and added no type-resolved calls: not ready, though
+        // no `phase_b_warnings` class records it.
+        let rust_degraded = payload
+            .rust_lsif_degraded
+            .as_deref()
+            .is_some_and(|d| !d.is_empty());
         let states: Vec<_> = crate::init::repo_language_states(&repo_root)
             .into_iter()
             .map(|(lang, r)| {
+                let r = if lang == "rust" && r == Readiness::Ready && rust_degraded {
+                    Readiness::Failed
+                } else {
+                    r
+                };
                 let editing = travsr_daemon::edit_tracing(&store, &lang);
                 (lang, r, editing)
             })
@@ -633,8 +645,8 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
                 "warning: Rust is on basic analysis, rust-analyzer produced \
                  references but none could be matched to indexed symbols, so no \
                  type-resolved call edges were added (structural call edges are \
-                 unaffected). Re-run `travsr init --force --allow-unsandboxed \
-                 --semantic`; if it persists, please report it."
+                 unaffected). Re-run `travsr init --force --allow-unsandboxed`; \
+                 if it persists, please report it."
             ),
             _ => {}
         }
@@ -756,9 +768,10 @@ mod tests {
     /// `--semantic` does nothing any more, so no advice may name it: a user who
     /// copies `travsr init --semantic --force` gets `travsr init --force` at
     /// best, and a hidden flag in a remedy reads as the step that mattered.
+    /// Any mention, not only `init --semantic`: advice wraps across lines.
     #[test]
     fn no_advice_names_the_retired_semantic_flag() {
-        let flag = concat!("init --", "semantic");
+        let flag = concat!("--", "semantic");
         for (file, src) in [
             ("status.rs", include_str!("status.rs")),
             ("lang.rs", include_str!("lang.rs")),

@@ -123,10 +123,8 @@ pub fn run(
         })?;
     // Traced here: an interrupt from now on stops what follows (connecting AI
     // tools), which the daemon does not finish, so it must not say tracing
-    // continues. Left to the background, the hand-off still applies.
-    if stats.phase_b_report.is_some() {
-        TRACING_CALLS.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
+    // continues.
+    TRACING_CALLS.store(false, std::sync::atomic::Ordering::SeqCst);
     stats.travsrignore_scaffolded |= travsrignore_scaffolded;
     let elapsed = progress.elapsed();
     progress.finish();
@@ -231,12 +229,7 @@ pub fn run(
         return Ok(());
     }
 
-    use crate::progress::{InitSummary, Traced};
-    let traced = match (&stats.phase_b_report, keeping_fresh) {
-        (Some(_), _) => Traced::Done,
-        (None, "not_started") => Traced::AtNextCommit,
-        (None, _) => Traced::Background,
-    };
+    use crate::progress::InitSummary;
     let summary = InitSummary {
         repo: repo_root
             .file_name()
@@ -250,7 +243,6 @@ pub fn run(
         ranking: search_ranking,
         files_read: stats.files_indexed,
         no_op,
-        traced,
         keeping_fresh,
         connected,
         travsrignore_created: stats.travsrignore_scaffolded,
@@ -316,7 +308,6 @@ fn interrupt_note(outcome: Option<crate::daemon_client::SpawnOutcome>) -> &'stat
     }
 }
 
-/// Languages `travsr init` can set up itself; the rest need the user.
 /// How one language's `travsr lang install` child ended.
 #[derive(Debug, PartialEq)]
 enum InstallOutcome {
@@ -350,8 +341,10 @@ fn failed_install_report(lang: &str, output: &str) -> String {
 /// install fails. Stops at the first network failure, since every later
 /// download would wait out the same timeout; returns true when it did.
 fn install_languages(languages: &[&str], corpus: &str, quiet: bool) -> bool {
+    // Without its own path init cannot run the child installs; it stops on
+    // the same failure a few steps later anyway.
     let Ok(exe) = std::env::current_exe() else {
-        return crate::lang::install_selected(languages, true, true, Some(corpus));
+        return false;
     };
     for lang in languages {
         if !quiet {
@@ -387,6 +380,7 @@ fn install_languages(languages: &[&str], corpus: &str, quiet: bool) -> bool {
     false
 }
 
+/// Languages `travsr init` can set up itself; the rest need the user.
 fn languages_to_set_up(states: &[(String, Readiness)]) -> Vec<&str> {
     states
         .iter()
@@ -468,7 +462,12 @@ fn grant_unsandboxed_where_needed(languages: &[String], corpus: &str) {
             || (cfg!(windows)
                 && travsr_plugin_host::phase_b::lookup(lang)
                     .is_some_and(|e| e.windows_sandbox_unsupported()));
-        if needed {
+        if needed && crate::lang::unsandboxed_withdrawn(lang) {
+            eprintln!(
+                "note: you withdrew {lang}'s permission to run outside the sandbox, so its \
+                 calls are not traced. Grant it with `travsr lang allow-unsandboxed {lang}`."
+            );
+        } else if needed {
             match crate::lang::grant_unsandboxed_from_init(lang, corpus) {
                 Ok(true) if !cfg!(windows) => eprintln!(
                     "note: this machine has no sandbox travsr can use, so {lang}'s call \

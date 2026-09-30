@@ -1417,9 +1417,22 @@ async fn run(cli: Cli) -> Result<()> {
                 // be kept fresh, so start the daemon if none is running (after a
                 // reboot, a killed `init`, or a crash). On a thread, so startup
                 // never waits for it; its output goes nowhere near the JSON-RPC
-                // stdout. `CI` opts out, as it does for `travsr init`.
+                // stdout. `CI` opts out, as it does for `travsr init`. Only when
+                // the daemon, which sets up the repo it is started in, would
+                // keep this index fresh: a linked worktree reading the main
+                // repo's index would get an empty index of its own instead.
+                let own_index = |root: &std::path::Path| {
+                    std::env::current_dir()
+                        .ok()
+                        .and_then(|cwd| repo::find_git_root_for_write(&cwd).ok())
+                        .is_some_and(|write_root| write_root == root)
+                };
                 if std::env::var_os("CI").is_none() {
-                    if let Some(root) = db_path.parent().and_then(|p| p.parent()) {
+                    if let Some(root) = db_path
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .filter(|root| own_index(root))
+                    {
                         let root = root.to_path_buf();
                         std::thread::spawn(move || {
                             if daemon_client::lazy_daemon_wanted(&root) {

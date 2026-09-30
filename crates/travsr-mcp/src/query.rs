@@ -324,6 +324,44 @@ pub struct StatusPayload {
 /// one flag, and the resolved rows may belong only to the first. So it reports
 /// the recovery it can see without claiming a full refresh, which the
 /// commit-gated path is what actually delivers.
+/// Unresolved references per file, only in files that differ from HEAD and
+/// only while an edit awaits (`phase_b_dirty`). A pending row in an untouched
+/// file is a call no commit resolves (`Vec::new`, `join`), not an edit waiting
+/// to be traced, so counting it would say "changed since the last commit" of a
+/// file nobody changed.
+pub fn pending_refs_in_edited_files(store: &SqliteStore) -> Vec<(String, u64)> {
+    let dirty = store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1");
+    let Some(root) = store.resolve_repo_root().filter(|_| dirty) else {
+        return Vec::new();
+    };
+    let git_paths = |args: &[&str]| -> Vec<String> {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let edited: HashSet<String> = git_paths(&["diff", "--name-only", "HEAD"])
+        .into_iter()
+        .chain(git_paths(&["ls-files", "--others", "--exclude-standard"]))
+        .collect();
+    store
+        .pending_ref_counts_by_file(usize::MAX)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(path, _)| edited.contains(path))
+        .collect()
+}
+
 pub fn dirty_semantic_state(resolved: u64, pending: u64) -> String {
     if resolved == 0 && pending == 0 {
         "stale (run travsr init to refresh)".to_string()
@@ -343,7 +381,10 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
     // recovered reads as live-fresh rather than a blanket "stale". A read error
     // degrades to zero, which keeps the conservative signal.
     let resolved_refs = store.resolved_ref_count().unwrap_or(0);
-    let pending_refs = store.pending_ref_count().unwrap_or(0);
+    let pending_refs = pending_refs_in_edited_files(store)
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
     Ok(StatusPayload {
         nodes,
         fts_nodes: fts_count,
@@ -1005,13 +1046,17 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
     let mut node_index: HashSet<NodeId> = HashSet::new();
     let mut edges_raw: Vec<(NodeId, NodeId, String, String)> = Vec::new();
     let mut tree: Vec<TreeStep> = Vec::new();
-    let mut visited: HashSet<NodeId> = HashSet::new();
+    // Keyed by node and side (`true` = reached as a caller), so a node that is
+    // both a caller and a callee of the seed, as in a call cycle, is walked on
+    // each side instead of only on the side that reached it first.
+    let mut visited: HashSet<(NodeId, bool)> = HashSet::new();
     // Each node carries the direction it was reached in. `Both` applies to the
     // seed only; past it a caller keeps walking up and a dependency down, so the
     // tree never shows a callee's other callers or a caller's other callees.
     let mut queue: VecDeque<(NodeId, u8, bool, QueryDirection)> = VecDeque::new();
 
-    visited.insert(seed.id);
+    visited.insert((seed.id, true));
+    visited.insert((seed.id, false));
     queue.push_back((seed.id, 0, true, args.direction));
 
     while let Some((current_id, depth, expand, direction)) = queue.pop_front() {
@@ -1042,14 +1087,12 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             let heuristic = is_heuristic_edge(edge_kind.as_str(), &edge_provenance);
             edges_raw.push((src, dst, edge_kind.as_str().to_string(), edge_provenance));
 
-            if !visited.contains(&next_id) {
+            if visited.insert((next_id, edge_incoming)) {
                 if let Some(next_node) = store.get_node(next_id)? {
                     if !args.include_noise && is_noise_node(&next_node) {
-                        visited.insert(next_id);
                         continue;
                     }
                 }
-                visited.insert(next_id);
                 tree.push(TreeStep {
                     parent: current_id.0,
                     edge_kind: edge_kind.as_str().to_string(),
@@ -1469,6 +1512,45 @@ mod tests {
         assert!(
             !shown.contains(&caller_other_callee.id.0),
             "a caller's other callee was shown"
+        );
+    }
+
+    /// A node that is both a callee and a caller of the seed (a call cycle)
+    /// still gets its callers walked, even though the callee side reaches it
+    /// first.
+    #[test]
+    fn both_direction_walks_a_cycle_node_on_the_caller_side() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let seed = node("fn:seed", "function", "src/a.ts");
+        let cycle = node("fn:cycle", "function", "src/b.ts");
+        let upstream = node("fn:upstream", "function", "src/c.ts");
+        for n in [&seed, &cycle, &upstream] {
+            store.put_node(n).unwrap();
+        }
+        for (src, dst) in [(&seed, &cycle), (&cycle, &seed), (&upstream, &cycle)] {
+            store
+                .put_edge(&Edge::new(src.id, dst.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "seed".to_string(),
+                path: None,
+                depth: 2,
+                direction: QueryDirection::Both,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            payload
+                .tree
+                .iter()
+                .any(|s| s.incoming && s.parent == cycle.id.0 && s.child == upstream.id.0),
+            "the cycle node's caller was dropped: {:?}",
+            payload.tree
         );
     }
 

@@ -296,9 +296,16 @@ main() {
   case ":${PATH}:" in
     *":${dir}:"*) next="travsr init" ;;
     *)
+      # Absolute, since it is run from the project folder, and single-quoted
+      # when it holds anything a shell would read, so it runs as printed.
       case "$dir" in
-        *" "*) next="\"${dir}/travsr\" init" ;;
-        *) next="${dir}/travsr init" ;;
+        /*) bin_path="${dir}/travsr" ;;
+        *) bin_path="$(pwd)/${dir}/travsr" ;;
+      esac
+      case "$bin_path" in
+        *[!A-Za-z0-9_./-]*)
+          next="'$(printf '%s' "$bin_path" | sed "s/'/'\\\\''/g")' init" ;;
+        *) next="${bin_path} init" ;;
       esac
       ;;
   esac

@@ -251,10 +251,14 @@ pub fn run(
 
     // A struct, enum or type is used, not called: its uses are occurrence rows
     // with no `ref/call` edge (#650), so callers can list none while it has many.
+    // Only for an exact match, whose name `travsr references` takes as typed,
+    // and a walk that ran: `--depth 0` lists no edges at all.
     let uses_not_calls = match &payload.seed {
         Some(seed)
             if !matches!(direction, Direction::Deps)
                 && matches!(format, Format::Tree)
+                && !payload.fuzzy
+                && depth > 0
                 && !payload
                     .edges
                     .iter()
@@ -398,7 +402,7 @@ fn print_tree(payload: &GraphPayload) {
     }
     let mut any_heuristic = false;
     if let Some(seed) = &payload.seed {
-        print_tree_level(seed.id, &labels, &children, "", &mut any_heuristic);
+        print_tree_level(seed.id, None, &labels, &children, "", &mut any_heuristic);
     }
     // Only when a row was actually rendered with the sigil: a legend for a mark
     // that is not on screen is noise. Kept to one line, and off every row, so
@@ -439,8 +443,13 @@ fn tree_labels(payload: &GraphPayload) -> HashMap<u64, String> {
 /// plus one legend line.
 const HEURISTIC_SIGIL: &str = "~";
 
+/// `side` is how `node_id` was reached (`Some(true)` as a caller), `None` for
+/// the seed. Past the seed a node shows only its children on that side: one
+/// reached both ways in a call cycle holds both, and a callee must not list
+/// its other callers.
 fn print_tree_level(
     node_id: u64,
+    side: Option<bool>,
     labels: &HashMap<u64, String>,
     children: &HashMap<u64, Vec<(&str, u64, bool, bool)>>,
     prefix: &str,
@@ -449,6 +458,10 @@ fn print_tree_level(
     let Some(kids) = children.get(&node_id) else {
         return;
     };
+    let kids: Vec<_> = kids
+        .iter()
+        .filter(|(_, _, incoming, _)| side.map_or(true, |s| s == *incoming))
+        .collect();
     for (i, (edge_kind, child_id, incoming, heuristic)) in kids.iter().enumerate() {
         let is_last = i == kids.len() - 1;
         let connector = if is_last { "└── " } else { "├── " };
@@ -475,6 +488,7 @@ fn print_tree_level(
             println!("{prefix}{connector}{edge_kind} {arrow}{mark} {label}");
             print_tree_level(
                 *child_id,
+                Some(*incoming),
                 labels,
                 children,
                 &format!("{prefix}{extension}"),

@@ -296,7 +296,8 @@ pub enum InitProgress {
     /// flush and the search rebuild): 74 s on yugabyte-db with no other event.
     Saving,
     /// Post-index semantic passes (LSIF + Phase B); no granular count.
-    /// Only emitted when `--semantic` is passed or there is no HEAD commit.
+    /// Emitted when Phase B runs inline: every CLI `travsr init`, or a repo
+    /// with no HEAD commit.
     Finalizing,
     /// #755 item 3: heartbeat while the Phase B fan-out blocks. Emitted every
     /// second or so with the analyzers still running and their elapsed wall
@@ -316,8 +317,8 @@ pub enum InitProgress {
         /// gate on the per-language flag before quoting it.
         budget_secs: u64,
     },
-    /// Phase B deferred to the daemon background scheduler. Emitted on the
-    /// normal (non-`--semantic`) path once Phase A completes successfully.
+    /// Phase B deferred to the daemon background scheduler. Emitted only on
+    /// the non-semantic path (the `init_repo` helper) once Phase A completes.
     PhaseBDeferred,
 }
 
@@ -1176,9 +1177,10 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
 }
 
 /// Whether a semantic `init` must run Phase B at a commit it already covered.
-/// `now_ready` is asked only about languages the last run skipped at a gate, so
-/// "install X, then run `travsr init`" works without a new commit. Languages
-/// that ran and found nothing are not re-run: that repeats the same result.
+/// `now_ready` is asked only about languages the last run skipped at a gate or
+/// could not find a bundled tracer for, so "install X (or reinstall travsr),
+/// then run `travsr init`" works without a new commit. Languages that ran and
+/// found nothing are not re-run: that repeats the same result.
 fn phase_b_inline_needed(
     already_done: bool,
     dirty: bool,
@@ -1192,6 +1194,7 @@ fn phase_b_inline_needed(
         "needs_consent",
         "skipped_no_compdb",
         "skipped_no_build_file",
+        "emitter_missing",
     ];
     !already_done
         || dirty
@@ -1979,17 +1982,19 @@ pub fn init_repo_with_progress(
     // Decide whether to run Phase B inline now, defer it, or skip it entirely.
     //
     // Already-done path: `phase_b_commit == HEAD` means Phase B is current for
-    // this commit (e.g. a previous `--semantic` run or a completed background
+    // this commit (e.g. a previous `travsr init` or a completed background
     // refresh). No message, no daemon spawn — silently return a dummy report so
     // the caller knows Phase B is not pending.
     //
-    // Deferred path (default): Phase B runs in the background via the daemon's
+    // Deferred path (`semantic` false, only the `init_repo` helper): Phase B
+    // runs in the background via the daemon's
     // `run_background_phase_b` once the user's IDE / agent starts it. The
     // `phase_b_commit` meta key is intentionally left unset so the daemon's
     // `phase_b_tick` auto-arms the scheduler on startup.
     //
-    // Inline path (`--semantic` flag, or repo has no HEAD commit):
-    //   • `--semantic`: callers (CI, scripts) need call edges before querying.
+    // Inline path (`semantic`, which every CLI `travsr init` passes, or a repo
+    // with no HEAD commit):
+    //   • `semantic`: callers need call edges before querying.
     //     Skipped when Phase B already covers HEAD (`phase_b_inline_needed`).
     //   • No commit: `run_background_phase_b` bails when `last_commit` is empty,
     //     so there is no deferred path available for fresh repos.
@@ -2017,8 +2022,9 @@ pub fn init_repo_with_progress(
                         let resolver = resolver.get_or_init(|| {
                             travsr_plugin_host::resolver::CatalogResolver::for_corpus(&corpus)
                         });
-                        let cap =
-                            gather(entry, repo_root, &corpus, &lang_toml, resolver, &warnings);
+                        // Without the last run's warnings: "ready now" is the
+                        // setup rungs alone, not what that run recorded.
+                        let cap = gather(entry, repo_root, &corpus, &lang_toml, resolver, "");
                         readiness(&cap) == Readiness::Ready
                     })
                 },
@@ -2274,12 +2280,10 @@ pub fn init_repo_with_progress(
             // exists and leaving it set makes `travsr status` report `stale`
             // over a correct graph.
             //
-            // Only reachable with `run_phase_b_inline`, which means
-            // `travsr init --semantic` or a repo with no HEAD commit. Plain
-            // `travsr init` defers Phase B and must NOT clear the flag: the edges
-            // really are still missing, so the flag is honest there. That is why
-            // `status.rs` names `travsr init --semantic` as the remedy rather
-            // than `travsr init`.
+            // Only reachable with `run_phase_b_inline`: every CLI `travsr init`
+            // (it passes `semantic`) or a repo with no HEAD commit. The deferred
+            // path, left only to the `init_repo` helper, must NOT clear the flag:
+            // the edges really are still missing there.
             // Only if nothing marked it dirty while this run was working. A
             // flag that predates this run is stale and safe to clear, which is
             // the #741 fix; one that arrived mid-run describes a real
@@ -6188,6 +6192,14 @@ mod tests {
             false,
             "crashed:java,untrusted_corpus:go",
             &["go"],
+            true,
+        );
+        check(
+            "a bundled tracer found again after a reinstall",
+            true,
+            false,
+            "emitter_missing:typescript",
+            &["typescript"],
             true,
         );
         check(
@@ -16214,7 +16226,10 @@ fn handle_control_message(
                 &phase_b_commit,
                 s.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1"),
                 s.resolved_ref_count().unwrap_or(0),
-                s.pending_ref_count().unwrap_or(0),
+                travsr_mcp::query::pending_refs_in_edited_files(&s)
+                    .iter()
+                    .map(|(_, n)| n)
+                    .sum(),
             );
 
             // Embed progress — per-repo configured model only.
