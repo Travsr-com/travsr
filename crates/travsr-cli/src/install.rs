@@ -1716,6 +1716,10 @@ pub(crate) fn verify_and_extract_zip(
         dest.with_file_name(name)
     };
     let (staging, displaced) = (sibling(".partial"), sibling(".old"));
+    // A run that stopped between the two renames below left only the old copy.
+    if !dest.exists() {
+        let _ = std::fs::rename(&displaced, dest);
+    }
     let _ = std::fs::remove_dir_all(&staging);
     let _ = std::fs::remove_dir_all(&displaced);
     std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
@@ -2026,6 +2030,25 @@ mod extraction_tests {
         assert_eq!(std::fs::read(dest.join("lib/server.jar")).unwrap(), b"new");
         let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(left.len(), 1, "no staging or displaced tree is left behind");
+    }
+
+    /// A run killed between moving the old tree aside and moving the new one
+    /// in leaves only `.old`. The next install must not delete it before its
+    /// own extract has succeeded.
+    #[test]
+    fn a_swap_stopped_midway_keeps_the_old_tree_for_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("kls");
+        std::fs::create_dir_all(dir.path().join("kls.old/lib")).unwrap();
+        std::fs::write(dir.path().join("kls.old/lib/server.jar"), b"old").unwrap();
+
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        w.start_file::<_, ()>("../escaped.txt", opts).unwrap();
+        let broken = w.finish().unwrap().into_inner();
+
+        assert!(super::verify_and_extract_zip(&broken, &dest, None, "server.zip", "1").is_err());
+        assert_eq!(std::fs::read(dest.join("lib/server.jar")).unwrap(), b"old");
     }
 }
 
