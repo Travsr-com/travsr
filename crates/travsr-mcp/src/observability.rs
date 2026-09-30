@@ -1518,6 +1518,42 @@ mod tests {
         assert!(!tmp.path().join(".travsr").join("daemon.lock").exists());
     }
 
+    /// A rust-analyzer that runs, for tests whose rust must read as installed
+    /// on any machine: a rustup shim without the component does not count, and
+    /// CI has only that. The toolchain's own `cargo` answers `--version`, so a
+    /// copy of it under `CARGO_HOME/bin` stands in. Call with `ENV_LOCK` held;
+    /// `CARGO_HOME` is restored when the returned guard drops.
+    fn runnable_rust_analyzer() -> impl Drop {
+        struct Restore {
+            _home: tempfile::TempDir,
+            saved: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.saved.take() {
+                    Some(v) => std::env::set_var("CARGO_HOME", v),
+                    None => std::env::remove_var("CARGO_HOME"),
+                }
+            }
+        }
+        let exe = std::env::consts::EXE_SUFFIX;
+        let out = std::process::Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .expect("rustc --print sysroot");
+        let sysroot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("bin")).unwrap();
+        std::fs::copy(
+            sysroot.join("bin").join(format!("cargo{exe}")),
+            home.path().join("bin").join(format!("rust-analyzer{exe}")),
+        )
+        .expect("copy cargo as rust-analyzer");
+        let saved = std::env::var_os("CARGO_HOME");
+        std::env::set_var("CARGO_HOME", home.path());
+        Restore { _home: home, saved }
+    }
+
     /// Write `pid` into a fresh temp repo's `.travsr/daemon.lock`, returning
     /// the temp dir (kept alive by the caller) and the lock path.
     fn repo_with_lock_pid(pid: &str) -> (tempfile::TempDir, PathBuf) {
@@ -1890,6 +1926,7 @@ mod tests {
         let lang_toml_path = lang_toml.path().join("lang.toml");
         std::fs::write(&lang_toml_path, "registered = []\n").unwrap();
         std::env::set_var("TRAVSR_LANG_TOML", &lang_toml_path);
+        let _ra = runnable_rust_analyzer();
 
         let mut store = SqliteStore::open_in_memory().unwrap();
         store.set_meta("last_commit", "abc123").unwrap();
@@ -1960,6 +1997,10 @@ mod tests {
     fn index_status_phase_b_running_only_while_a_job_is_in_flight() {
         use travsr_core::{Node, VName};
         use travsr_store::Store as _;
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ra = runnable_rust_analyzer();
         let mut store = SqliteStore::open_in_memory().unwrap();
         store.set_meta("last_commit", "abc123").unwrap();
         store.set_meta("phase_b_commit", "old999").unwrap();
