@@ -427,9 +427,9 @@ fn language_json(language: &str, r: &Readiness) -> serde_json::Value {
     o
 }
 
-/// Record the unsandboxed grants init makes for the user (not printed): Rust
-/// where the OS offers no sandbox, and on Windows the languages whose build
-/// tools cannot run inside its isolation.
+/// Record the unsandboxed grants init makes for the user, and say so once when
+/// one is recorded: Rust where the OS offers no sandbox, and on Windows the
+/// languages whose build tools cannot run inside its isolation.
 fn grant_unsandboxed_where_needed(languages: &[String]) {
     use travsr_indexer::sandbox::{build_sandboxed_command, SandboxConfig, SandboxStatus};
     let no_sandbox = matches!(
@@ -442,7 +442,19 @@ fn grant_unsandboxed_where_needed(languages: &[String]) {
                 && travsr_plugin_host::phase_b::lookup(lang)
                     .is_some_and(|e| e.windows_sandbox_unsupported()));
         if needed {
-            let _ = crate::lang::grant_unsandboxed_from_init(lang);
+            match crate::lang::grant_unsandboxed_from_init(lang) {
+                Ok(true) if !cfg!(windows) => eprintln!(
+                    "note: this machine has no sandbox travsr can use, so {lang}'s call \
+                     tracer runs with your permissions. Install bubblewrap (bwrap) to \
+                     sandbox it."
+                ),
+                Ok(true) => eprintln!(
+                    "note: {lang}'s call tracer cannot run in Windows isolation, so it \
+                     runs with your permissions."
+                ),
+                Ok(false) => {}
+                Err(e) => eprintln!("warning: could not save the {lang} setting: {e:#}"),
+            }
         }
     }
 }
