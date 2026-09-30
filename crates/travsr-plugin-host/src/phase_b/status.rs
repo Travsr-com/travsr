@@ -721,7 +721,8 @@ mod tests {
                     driver_missing: Some("java".into()),
                     ..repo("java")
                 },
-                needs("JDK, Maven or Gradle"),
+                // Windows reports Gradle only (see `effective_prerequisites`).
+                needs(lookup("java").unwrap().effective_prerequisites()),
             ),
             (
                 "builtin without its analyzer is fixed by init",
