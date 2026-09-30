@@ -1135,7 +1135,7 @@ fn remove_json_server(path: &Path, top_key: &str) -> Result<Outcome> {
     }
     if root == json!({ top_key: {} }) {
         // Whole file was our server, remove it.
-        std::fs::remove_file(path).ok();
+        std::fs::remove_file(path)?;
         return Ok(Outcome::Removed);
     }
     let pretty = serde_json::to_string_pretty(&root)? + "\n";
@@ -1615,6 +1615,16 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<Connected> {
                                     say!("  skipped {disp}: {reason}")
                                 }
                                 other => say!("  {} {disp}", label(other)),
+                            }
+                            // A folder the removal left empty (`.cursor/`,
+                            // which connect created) goes too.
+                            if matches!(outcome, Outcome::Removed) {
+                                let mut dir = planned.path.parent();
+                                while let Some(d) = dir
+                                    .filter(|d| *d != repo_root && std::fs::remove_dir(d).is_ok())
+                                {
+                                    dir = d.parent();
+                                }
                             }
                             if matches!(planned.content, Content::JsonServer { .. })
                                 && server_in_place(&outcome)
