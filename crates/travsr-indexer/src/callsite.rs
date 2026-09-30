@@ -132,6 +132,17 @@ pub fn occurrence_is_call(line: &str, start_col: u32) -> bool {
     opens_call(&rest[idx_after_ident..])
 }
 
+/// The identifier starting at 0-based UTF-16 `start_col` in `line`, without a
+/// raw-identifier `r#`; `None` when no identifier starts there.
+pub(crate) fn identifier_at(line: &str, start_col: u32) -> Option<&str> {
+    let rest = &line[utf16_col_to_byte(line, start_col)..];
+    let rest = rest.strip_prefix("r#").unwrap_or(rest);
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| &rest[..end])
+}
+
 /// Whether `language` uses parentheses for **all** call expressions, making the
 /// [`occurrence_is_call`] `(`-rule sound. Conservative: languages with
 /// significant paren-less call syntax (Ruby, Scala) and anything unknown return
@@ -200,6 +211,14 @@ impl SourceLines {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifier_at_reads_the_name_at_a_utf16_column() {
+        assert_eq!(identifier_at("pub static BAR: u32 = 3;", 11), Some("BAR"));
+        assert_eq!(identifier_at("fn r#type() {}", 3), Some("type"));
+        assert_eq!(identifier_at("let é = 1; fn f() {}", 14), Some("f"));
+        assert_eq!(identifier_at("    a + b", 2), None);
+    }
 
     #[test]
     fn bare_call_is_a_call() {

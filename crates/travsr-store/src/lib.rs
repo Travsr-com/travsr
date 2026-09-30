@@ -5948,13 +5948,13 @@ LIMIT ?4",
             .iter()
             .map(|p| p.callee_def_path.as_str())
             .collect();
-        let mut span_cache: std::collections::HashMap<&str, Vec<(FnSpan, String)>> =
+        let mut span_cache: std::collections::HashMap<&str, Vec<(FnSpan, String, String)>> =
             std::collections::HashMap::with_capacity(unique_paths.len());
         for path in unique_paths {
             let mut stmt = self
                 .conn
                 .prepare_cached(
-                    "SELECT id, line, end_line, kind FROM nodes \
+                    "SELECT id, line, end_line, kind, signature FROM nodes \
                      WHERE corpus = ?1 AND path = ?2 \
                        AND line IS NOT NULL AND end_line IS NOT NULL \
                      ORDER BY (end_line - line) ASC, id ASC",
@@ -5969,6 +5969,7 @@ LIMIT ?4",
                             end_line: row.get(2)?,
                         },
                         row.get(3)?,
+                        row.get(4)?,
                     ))
                 })
                 .context("resolve_lsif_positional_refs: query")?
@@ -5980,16 +5981,28 @@ LIMIT ?4",
         let mut out = Vec::with_capacity(positional.len());
         for p in positional {
             let def_line = p.callee_def_line as i64;
-            let Some((span, kind)) = span_cache
+            let Some((span, kind, signature)) = span_cache
                 .get(p.callee_def_path.as_str())
                 .and_then(|spans| {
                     spans
                         .iter()
-                        .find(|(s, _)| s.line <= def_line && s.end_line >= def_line)
+                        .find(|(s, ..)| s.line <= def_line && s.end_line >= def_line)
                 })
             else {
                 continue; // fail closed: callee def resolves to no node
             };
+            // The dump's lines can predate the spans: a file edited while
+            // rust-analyzer ran shifts its nodes, and the def line then lands in
+            // a neighbour. Only a node named like the definition is the callee.
+            if let Some(name) = &p.callee_name {
+                let leaf = signature
+                    .split_once(':')
+                    .map_or(signature.as_str(), |(_, r)| r);
+                let leaf = leaf.rsplit('.').next().unwrap_or(leaf);
+                if leaf.strip_prefix("r#").unwrap_or(leaf) != name {
+                    continue;
+                }
+            }
             // A trait or impl that only encloses the definition is its
             // container, not the callee: a required trait method has no node of
             // its own. Fail closed as above. Neither is ever called, so a call
@@ -17706,6 +17719,7 @@ mod tests {
                 callee_def_line: 1,
                 is_call: true,
                 caller_col: None,
+                callee_name: None,
             },
             // Genuine call: occurrence at a.rs:25 (inside g) → callee def b.rs:1 (h).
             travsr_core::LsifPositionalRef {
@@ -17715,6 +17729,7 @@ mod tests {
                 callee_def_line: 1,
                 is_call: true,
                 caller_col: None,
+                callee_name: None,
             },
         ];
 
@@ -17778,6 +17793,7 @@ mod tests {
             callee_def_line: def_line,
             is_call,
             caller_col: None,
+            callee_name: None,
         };
         // `name` defined on line 2 (inside the trait), `Point` on line 9, a
         // mention of the trait on its own line 1, and a call that lands on that
@@ -17790,6 +17806,42 @@ mod tests {
             .unwrap();
         let callees: Vec<_> = refs.iter().map(|r| r.callee_id).collect();
         assert_eq!(callees, vec![point.id, tr.id]);
+    }
+
+    /// rust-analyzer saw `BAR` on line 8, then three lines were added above it
+    /// before the dump was resolved, so line 8 is inside `foo` now. Every use of
+    /// `BAR` became a reference to `foo`, stored as fact until the calling file
+    /// changed again (`CATALOG` uses listed under `effective_prerequisites`).
+    #[test]
+    fn lsif_positional_callee_must_have_the_definition_name() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let foo = Node::new(VName::new(corpus, "", "a.rs", "rust", "fn:foo"), "function")
+            .with_line(5)
+            .with_end_line(10);
+        let bar = Node::new(
+            VName::new(corpus, "", "a.rs", "rust", "static:BAR"),
+            "static",
+        )
+        .with_line(11)
+        .with_end_line(11);
+        store
+            .write_scip_attributed_batch(corpus, &[foo, bar.clone()], &[])
+            .unwrap();
+        let at = |def_line: u32, name: &str| travsr_core::LsifPositionalRef {
+            caller_path: "b.rs".to_string(),
+            caller_line: 3,
+            callee_def_path: "a.rs".to_string(),
+            callee_def_line: def_line,
+            is_call: false,
+            caller_col: None,
+            callee_name: Some(name.to_string()),
+        };
+        let refs = store
+            .resolve_lsif_positional_refs(corpus, &[at(8, "BAR"), at(11, "BAR")])
+            .unwrap();
+        let callees: Vec<_> = refs.iter().map(|r| r.callee_id).collect();
+        assert_eq!(callees, vec![bar.id]);
     }
 
     /// `--fix` remediation for DBs written before the guard: `fsck` counts and

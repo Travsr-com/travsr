@@ -1209,6 +1209,10 @@ pub fn ingest_rust_positional_from_reader(
             else {
                 continue;
             };
+            let callee_name = range_cols.get(trid).and_then(|&col| {
+                let line = src.line(std::path::Path::new(def_abs), def_line0 + 1)?;
+                crate::callsite::identifier_at(line, col).map(str::to_string)
+            });
             out.push(travsr_core::LsifPositionalRef {
                 caller_path: caller_path.clone(),
                 caller_line: caller_line0 + 1,
@@ -1216,6 +1220,7 @@ pub fn ingest_rust_positional_from_reader(
                 callee_def_line: def_line0 + 1,
                 is_call,
                 caller_col,
+                callee_name,
             });
         }
     }
@@ -1533,6 +1538,9 @@ mod rust_lsif_tests {
             !type_ref.is_call,
             "the `let x: Session` type reference must be flagged non-call"
         );
+        // The store checks the resolved node against the name at the def range.
+        assert_eq!(call.callee_name.as_deref(), Some("filter"));
+        assert_eq!(type_ref.callee_name.as_deref(), Some("Session"));
     }
 }
 
