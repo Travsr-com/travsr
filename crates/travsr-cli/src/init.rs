@@ -50,7 +50,15 @@ pub fn run(
                     crate::daemon_client::spawn_background_daemon(&repo_root, &exe, false)
                 })
             });
-            eprintln!("\n{}", interrupt_note(outcome));
+            let note = interrupt_note(outcome);
+            eprintln!("\n{note}");
+            // `--json` readers get a summary on stdout as on a completed run.
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "interrupted": true, "next": note })
+                );
+            }
             std::process::exit(130);
         }
     });
