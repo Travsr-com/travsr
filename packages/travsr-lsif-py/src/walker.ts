@@ -646,9 +646,10 @@ function resolveCallTarget(
     // Otherwise a top-level def or class in this file, but only when nothing
     // else binds the name: a wrong edge is worse than a missing one.
     if (boundInEnclosingFunction(funcNode) || moduleBindings(funcNode) !== 1) return undefined;
-    return (
-      defMap.get(`${relPath}:fn:${funcNode.text}`) ?? defMap.get(`${relPath}:class:${funcNode.text}`)
-    );
+    // That one binding must be the def itself, not `Err = RuntimeError`
+    // beside a nested class of the same name.
+    const kind = moduleDefKind(funcNode);
+    return kind && defMap.get(`${relPath}:${kind}:${funcNode.text}`);
   }
 
   if (funcNode.type === 'attribute') {
@@ -730,14 +731,35 @@ function countBindings(node: SyntaxNode, name: string, nested: boolean, depth = 
   return count;
 }
 
-/** Whether a function around the call binds the called name itself. */
+/** Whether a function around the call binds the called name itself, or the
+ *  class whose body the call sits in directly (a method does not see it). */
 function boundInEnclosingFunction(call: SyntaxNode): boolean {
+  let inFunction = false;
   for (let p = call.parent; p !== null; p = p.parent) {
+    if (p.type === 'class_definition' && !inFunction) {
+      const body = p.childForFieldName('body');
+      if (body !== null && countBindings(body, call.text, false) > 0) return true;
+      continue;
+    }
     if (p.type !== 'function_definition' && p.type !== 'lambda') continue;
+    inFunction = true;
     const own = p.childForFieldName('name')?.text === call.text ? 1 : 0;
     if (countBindings(p, call.text, true) > own) return true;
   }
   return false;
+}
+
+/** `fn` or `class` when a module-level def or class has the called name. */
+function moduleDefKind(call: SyntaxNode): 'fn' | 'class' | undefined {
+  let root = call;
+  while (root.parent !== null) root = root.parent;
+  for (const stmt of namedChildren(root)) {
+    const def = stmt.type === 'decorated_definition' ? stmt.childForFieldName('definition') : stmt;
+    if (def?.childForFieldName('name')?.text !== call.text) continue;
+    if (def.type === 'function_definition') return 'fn';
+    if (def.type === 'class_definition') return 'class';
+  }
+  return undefined;
 }
 
 /** How many module-level statements bind the called name. */

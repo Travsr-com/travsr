@@ -425,6 +425,23 @@ test('a same-file name bound locally does not resolve to the module function', a
   assert.deepStrictEqual(refs, []);
 });
 
+test('a class body sees its own names; its methods see the module function', async () => {
+  const cls = 'def helper():\n    return 0\n\n\nclass C:\n    def helper(self):\n        return 1\n';
+  assert.deepStrictEqual(await refsFrom({ 'app.py': `${cls}    x = helper(None)\n` }, 'app.py'), []);
+  assert.deepStrictEqual(
+    await refsFrom({ 'app.py': `${cls}    def run(self):\n        return helper()\n` }, 'app.py'),
+    [{ path: 'app.py', signature: 'fn:helper' }]
+  );
+});
+
+test('a module binding that is not the def does not resolve to a nested class', async () => {
+  const refs = await refsFrom(
+    { 'app.py': 'class Outer:\n    class Err(Exception):\n        pass\n\n\nErr = RuntimeError\n\n\ndef run():\n    raise Err()\n' },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, []);
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function parseAll(stdout: string): Record<string, unknown>[] {
