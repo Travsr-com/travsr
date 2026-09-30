@@ -520,10 +520,23 @@ fn cmd_list(language: Option<&str>, json: bool) -> Result<()> {
     println!("{:<12} {:<24} STATE", "LANGUAGE", "PREREQUISITES");
     println!("{}", "-".repeat(84));
     let mut fixes: Vec<String> = Vec::new();
+    // Advice only for the languages this repo has: init sets up no other, so
+    // "run travsr init" for one the repo lacks would never go away.
+    let present = if states.is_empty() {
+        Vec::new()
+    } else {
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| crate::repo::find_git_root(&cwd).ok())
+            .map_or_else(Vec::new, |root| detect_languages_in(&root))
+    };
     for entry in CATALOG.iter().filter(|e| selected(e)) {
         let state = match states.get(entry.language) {
             Some(r) => {
-                if let Some(fix) = r.fix() {
+                if let Some(fix) = r
+                    .fix()
+                    .filter(|_| present.iter().any(|l| l == entry.language))
+                {
                     if matches!(
                         r,
                         Readiness::SettingUp | Readiness::Failed | Readiness::PartMissing
