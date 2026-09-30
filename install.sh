@@ -295,7 +295,12 @@ main() {
   # `travsr init` writes absolute paths into the AI tool configs it sets up.
   case ":${PATH}:" in
     *":${dir}:"*) next="travsr init" ;;
-    *) next="${dir}/travsr init" ;;
+    *)
+      case "$dir" in
+        *" "*) next="\"${dir}/travsr\" init" ;;
+        *) next="${dir}/travsr init" ;;
+      esac
+      ;;
   esac
   printf 'Next: in your project folder, run %s\n' "$next"
 }
