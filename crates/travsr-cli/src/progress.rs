@@ -556,6 +556,16 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
             );
         }
     }
+    if !s.quiet {
+        for problem in &s.connected.problems {
+            out.push(format!("  ! {problem}"));
+        }
+        // A no-change run can still write a file the user owns; RFC-026 keeps
+        // such writes visible.
+        if s.no_op && !s.connected.user_files.is_empty() {
+            out.push(format!("  Updated {}.", s.connected.user_files.join(", ")));
+        }
+    }
     out.push(ready_line(s.no_op).to_string());
     for (lang, r) in &s.languages {
         if let Some(line) = crate::status::readiness_line(lang, r) {
@@ -842,6 +852,7 @@ mod tests {
                 needs_approval: true,
                 user_files: vec![".gitignore".into()],
                 one_step: vec!["codex"],
+                problems: vec![],
             },
             travsrignore_created: true,
             gitignore_updated: true,
@@ -861,6 +872,32 @@ mod tests {
             no_commit: false,
             quiet: false,
         }
+    }
+
+    /// PR #940 review: a commented `.mcp.json` left Claude Code unconnected
+    /// with only "Connected to Cursor" to show for it, and a no-change run
+    /// wrote user files without a word. Both now say so, even on that run.
+    #[test]
+    fn a_no_change_run_names_skipped_and_changed_files() {
+        let mut s = summary();
+        s.no_op = true;
+        s.connected.problems = vec![
+            "Left .mcp.json alone for Claude Code: existing file is not strict JSON \
+             (left untouched)."
+                .into(),
+        ];
+        let lines = render_summary(&s);
+        assert_eq!(
+            &lines[..3],
+            &[
+                "  ! Left .mcp.json alone for Claude Code: existing file is not strict JSON \
+                 (left untouched).",
+                "  Updated .gitignore.",
+                "Ready. Nothing changed since the last run.",
+            ]
+        );
+        s.quiet = true;
+        assert!(!render_summary(&s).iter().any(|l| l.contains(".mcp.json")));
     }
 
     /// Plan S9 golden output: the first run, stage by stage, then `Ready`, then
@@ -907,6 +944,8 @@ mod tests {
     fn init_summary_no_change_and_offline() {
         let mut s = summary();
         s.no_op = true;
+        // Nothing written either: a write is named (see the test above).
+        s.connected.user_files.clear();
         let lines = render_summary(&s);
         assert_eq!(lines[0], "Ready. Nothing changed since the last run.");
         assert_eq!(lines.len(), 2, "{lines:?}");

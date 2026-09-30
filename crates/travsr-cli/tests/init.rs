@@ -1003,6 +1003,12 @@ fn a_failed_language_install_shows_its_output_and_init_finishes() {
         "package main\n\nfunc main() {}\n",
     )
     .unwrap();
+    // A Go project, so there is something to set up (no go.mod reads "needs go.mod").
+    std::fs::write(
+        tmp.path().join("go.mod"),
+        "module example.com/m\n\ngo 1.21\n",
+    )
+    .unwrap();
     let out = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
         .env("TRAVSR_DISABLE_REGISTRY", "1")
         .env("CI", "1")

@@ -2359,7 +2359,7 @@ export interface LangInfo {
   statusLine: string;
   /** One-command setup (additive, absent from older CLIs): the language's
    *  readiness in this repo, `ready` | `setting_up` | `needs_toolchain` |
-   *  `unsupported_os` | `failed`. When present it drives the row. */
+   *  `unsupported_os` | `failed` | `no_calls`. When present it drives the row. */
   state?: string;
   /** What to install first, on a `needs_toolchain` row. */
   needs?: string | null;

@@ -802,6 +802,7 @@ fn phase_b_incomplete_reason(store: &SqliteStore, lang: &str) -> Option<String> 
         "needs_approval",
         "needs_consent",
         "skipped_no_compdb",
+        "skipped_no_build_file",
         "zero_nodes",
         "no_references",
         "version_mismatch",
@@ -1556,16 +1557,34 @@ fn resolve_alias(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<C
     let Some(repo_root) = resolve_repo_root(store) else {
         return Vec::new();
     };
-    let pattern = format!("[[:space:]]as[[:space:]]+{symbol}([^[:alnum:]_]|$)");
-    let GrepOutcome::Matches(body) = run_git_grep(&repo_root, &pattern, &[], false) else {
+    // A fixed string, not a regex: it runs on every lookup that finds no
+    // definition, and git searches a fixed string about five times faster
+    // (90 ms against 420 ms on a 3,000-file repo). `alias_originals` checks
+    // each hit exactly.
+    let GrepOutcome::Matches(body) = run_git_grep(&repo_root, &format!("as {symbol}"), &[], true)
+    else {
         return Vec::new();
     };
     let mut originals: Vec<String> = Vec::new();
-    // Each hit is `path:line:col:text`; only the text is a statement.
-    let texts = body.lines().filter_map(|l| l.splitn(4, ':').nth(3));
-    for o in texts.flat_map(|l| alias_originals(l, symbol)) {
-        if !originals.contains(&o) {
-            originals.push(o);
+    // Each hit is `path:line:col:text`.
+    for hit in body.lines() {
+        let mut parts = hit.splitn(4, ':');
+        let (Some(path), Some(line_no), Some(_), Some(text)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let in_list = || {
+            let line_no: usize = line_no.parse().unwrap_or(0);
+            std::fs::read_to_string(repo_root.join(path)).is_ok_and(|file| {
+                let above: Vec<&str> = file.lines().take(line_no.saturating_sub(1)).collect();
+                opens_import_list(&above)
+            })
+        };
+        for o in alias_originals(text, symbol, in_list) {
+            if !originals.contains(&o) {
+                originals.push(o);
+            }
         }
     }
     let mut nodes: Vec<CoreNode> = originals
@@ -1579,8 +1598,10 @@ fn resolve_alias(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<C
 
 /// The identifiers `line` renames to `alias` (`orig as alias`), in order.
 /// Only an import or re-export line renames, or a member line of a list one
-/// spans several lines over; any other `as` is a cast (`req as Handler`).
-fn alias_originals(line: &str, alias: &str) -> Vec<String> {
+/// spans several lines over (`in_import_list`, asked only for such a line);
+/// any other `as` is a cast (`req as Handler`, or `value as Handler,` inside
+/// an array).
+fn alias_originals(line: &str, alias: &str, in_import_list: impl FnOnce() -> bool) -> Vec<String> {
     let is_ident = |c: char| c.is_alphanumeric() || c == '_';
     let stmt = line.trim_start();
     let after_pub = match stmt.strip_prefix("pub") {
@@ -1601,7 +1622,7 @@ fn alias_originals(line: &str, alias: &str) -> Vec<String> {
     let list_member = stmt
         .split_once(" as ")
         .is_some_and(|(head, _)| !head.is_empty() && head.chars().all(|c| is_ident(c) || c == ':'));
-    if !imports && !list_member {
+    if !imports && !(list_member && in_import_list()) {
         return Vec::new();
     }
     let mut out: Vec<String> = Vec::new();
@@ -1625,6 +1646,25 @@ fn alias_originals(line: &str, alias: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether the lines `above` a list member (nearest last) open an import list:
+/// past the other members and comments, the line that opens the list is an
+/// import (`use a::{`, `import {`, `from m import (`, `export {`).
+fn opens_import_list(above: &[&str]) -> bool {
+    let opener =
+        above.iter().rev().map(|l| l.trim()).find(|l| {
+            !(l.is_empty() || l.ends_with(',') || l.starts_with("//") || l.starts_with('#'))
+        });
+    opener.is_some_and(|l| {
+        let l = l
+            .strip_prefix("pub")
+            .map_or(l, |r| r.split_once(' ').map_or(r, |(_, r)| r.trim_start()));
+        (l.ends_with('{') || l.ends_with('('))
+            && ["use ", "import ", "from ", "export "]
+                .iter()
+                .any(|k| l.starts_with(k))
+    })
 }
 
 /// Whether every candidate is a multi-part Objective-C selector of ONE class
@@ -2223,13 +2263,22 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // Dogfooded: `travsr references collect_global` said zero while all 11
         // call sites sat pending in `travsr-mcp/src/tools.rs`; they resolved
         // verbatim once Phase B caught up.
-        let pending_here = store
-            .pending_ref_counts_by_file(PENDING_FILE_CAP)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|(path, _)| path == &target.vname.path)
-            .map(|(_, n)| n)
-            .unwrap_or(0);
+        //
+        // Same gate as `live_overlay_note`: with calls traced at HEAD, what
+        // stays pending is a call no commit resolves, so "changed since the
+        // last commit" would be false and `travsr init` could not clear it.
+        let dirty = store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1");
+        let pending_here = if dirty {
+            store
+                .pending_ref_counts_by_file(PENDING_FILE_CAP)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(path, _)| path == &target.vname.path)
+                .map(|(_, n)| n)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         if pending_here > 0 {
             return format!(
                 "{header}\n0 recorded reference(s), not a definitive zero: \
@@ -11307,36 +11356,57 @@ mod tests {
         assert_eq!(
             alias_originals(
                 "    install_model_blocking as install_rerank_model, model_installed as x,",
-                a
+                a,
+                || true
             ),
             vec!["install_model_blocking"]
         );
         assert_eq!(
             alias_originals(
                 "pub use rerank::install_model_blocking as install_rerank_model;",
-                a
+                a,
+                || true
             ),
             vec!["install_model_blocking"]
         );
         assert_eq!(
-            alias_originals("from m import greet as hello", "hello"),
+            alias_originals("from m import greet as hello", "hello", || true),
             vec!["greet"]
         );
         assert_eq!(
-            alias_originals("import { greet as hello } from './m'", "hello"),
+            alias_originals("import { greet as hello } from './m'", "hello", || true),
             vec!["greet"]
         );
-        assert!(alias_originals("import * as hello from './m'", "hello").is_empty());
-        assert!(alias_originals("let n = x as install_rerank_model_v2;", a).is_empty());
-        assert!(alias_originals("let n = install_rerank_model as u32;", a).is_empty());
+        assert!(alias_originals("import * as hello from './m'", "hello", || true).is_empty());
+        assert!(alias_originals("let n = x as install_rerank_model_v2;", a, || true).is_empty());
+        assert!(alias_originals("let n = install_rerank_model as u32;", a, || true).is_empty());
         // Casts are not renames, even on an `export` line.
-        assert!(alias_originals("export const z = go as Missing;", "Missing").is_empty());
-        assert!(alias_originals("const h = req as unknown as Handler;", "Handler").is_empty());
-        assert!(alias_originals("except ValueError as err:", "err").is_empty());
+        assert!(alias_originals("export const z = go as Missing;", "Missing", || true).is_empty());
+        assert!(
+            alias_originals("const h = req as unknown as Handler;", "Handler", || true).is_empty()
+        );
+        assert!(alias_originals("except ValueError as err:", "err", || true).is_empty());
         assert_eq!(
-            alias_originals("export { greet as hello };", "hello"),
+            alias_originals("export { greet as hello };", "hello", || true),
             vec!["greet"]
         );
+        // PR #940 review: a cast at the start of a line inside an array or
+        // object reads like a list member; only an import list makes it one.
+        assert!(alias_originals("  value as Handler,", "Handler", || false).is_empty());
+        assert!(opens_import_list(&["use rerank::{", "    a as b,"]));
+        assert!(opens_import_list(&["pub use rerank::{"]));
+        assert!(opens_import_list(&[
+            "from m import (",
+            "    # note",
+            "    a as b,"
+        ]));
+        assert!(opens_import_list(&["import {"]));
+        assert!(!opens_import_list(&[
+            "const handlers = [",
+            "  other as Handler,"
+        ]));
+        assert!(!opens_import_list(&["let x = f(", "    y,"]));
+        assert!(!opens_import_list(&[]));
     }
 
     #[test]
@@ -18537,6 +18607,8 @@ mod snippet_tests {
         use travsr_core::{Node, VName};
         use travsr_store::RefResolution;
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // An edit since the last trace is what makes a pending row real.
+        store.set_meta("phase_b_dirty", "1").unwrap();
 
         let caller = Node::new(
             VName::new("", "", "src/svc.rs", "rust", "fn:caller"),
@@ -18580,6 +18652,46 @@ mod snippet_tests {
             out.contains("not a definitive zero"),
             "should soften while a reference in the file is unresolved: {out}"
         );
+    }
+
+    /// PR #940 review: at a clean, fully traced HEAD, `travsr references` on a
+    /// test fn in `observability.rs` said "843 references ... changed since the
+    /// last commit and are not traced yet ... Run `travsr init`". What stays
+    /// pending at HEAD is a call no commit resolves, so no edit happened and
+    /// init cannot clear it.
+    #[test]
+    fn find_references_does_not_blame_an_edit_for_pending_refs_at_head() {
+        use travsr_core::{Node, VName};
+        use travsr_store::RefResolution;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("phase_b_dirty", "0").unwrap();
+        let caller = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:caller"),
+            "function",
+        );
+        let unused = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:unused"),
+            "function",
+        )
+        .with_line(20);
+        store.put_node(&caller).unwrap();
+        store.put_node(&unused).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, unused.id, 5, None)])
+            .unwrap();
+        store
+            .upsert_ref_resolution_states(&[RefResolution {
+                src: caller.id,
+                ref_line: 7,
+                ref_col: 9,
+                name: "join".to_string(),
+                state: "pending",
+                resolved_dst: None,
+            }])
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(!out.contains("not traced yet"), "got: {out}");
     }
 
     /// A watcher reindex drops a file's Phase B call edges without moving HEAD

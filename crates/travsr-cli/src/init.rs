@@ -31,11 +31,6 @@ pub fn run(
     // `travsr lang allow-unsandboxed` grant is the primary path; this covers a
     // one-shot `travsr init`.
     travsr_plugin_host::resolver::set_allow_unsandboxed(allow_unsandboxed_lsif);
-    if allow_unsandboxed_lsif {
-        if let Err(e) = crate::lang::grant_unsandboxed_from_init("rust") {
-            eprintln!("warning: could not save the Rust setting for later runs: {e:#}");
-        }
-    }
 
     // Ctrl-C, or SIGTERM from an editor or an agent's timeout: once indexing
     // is done, hand the rest to the daemon. An interrupted Phase B leaves
@@ -43,6 +38,11 @@ pub fn run(
     let _ = ctrlc::set_handler({
         let repo_root = repo_root.clone();
         move || {
+            // The summary is out: the run is over, and a second JSON object
+            // on stdout would break a `--json` reader.
+            if SUMMARY_PRINTED.load(std::sync::atomic::Ordering::SeqCst) {
+                std::process::exit(130);
+            }
             let indexed = TRACING_CALLS.load(std::sync::atomic::Ordering::SeqCst);
             let ci = std::env::var_os("CI").is_some();
             let outcome = hand_off_on_interrupt(ci, indexed).then(|| {
@@ -78,7 +78,12 @@ pub fn run(
     // (vendor/, testdata/, ...) indexing will, and sets up nothing for them.
     let travsrignore_scaffolded = travsr_daemon::scaffold_travsrignore(&repo_root).unwrap_or(false);
     let languages = crate::lang::detect_languages_in(&repo_root);
-    grant_unsandboxed_where_needed(&languages);
+    if allow_unsandboxed_lsif {
+        if let Err(e) = crate::lang::grant_unsandboxed_from_init("rust", &corpus) {
+            eprintln!("warning: could not save the Rust setting for later runs: {e:#}");
+        }
+    }
+    grant_unsandboxed_where_needed(&languages, &corpus);
     let skip_downloads = std::env::var_os("TRAVSR_SKIP_DOWNLOAD").is_some();
     let mut offline = false;
     if !skip_downloads {
@@ -116,6 +121,12 @@ pub fn run(
             }
             progress.update(ev)
         })?;
+    // Traced here: an interrupt from now on stops what follows (connecting AI
+    // tools), which the daemon does not finish, so it must not say tracing
+    // continues. Left to the background, the hand-off still applies.
+    if stats.phase_b_report.is_some() {
+        TRACING_CALLS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
     stats.travsrignore_scaffolded |= travsrignore_scaffolded;
     let elapsed = progress.elapsed();
     progress.finish();
@@ -215,6 +226,7 @@ pub fn run(
             .collect();
         summary["interrupted"] = false.into();
         summary["next"] = crate::progress::ready_line(no_op).into();
+        SUMMARY_PRINTED.store(true, std::sync::atomic::Ordering::SeqCst);
         println!("{summary}");
         return Ok(());
     }
@@ -253,6 +265,7 @@ pub fn run(
             .is_none(),
         quiet,
     };
+    SUMMARY_PRINTED.store(true, std::sync::atomic::Ordering::SeqCst);
     for line in crate::progress::render_summary(&summary) {
         println!("{line}");
     }
@@ -282,6 +295,9 @@ fn maybe_connect(
 /// Set once indexing is done and call tracing has started: from then on an
 /// interrupted init has work the daemon can finish.
 static TRACING_CALLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set once the summary is printed; an interrupt after it prints nothing.
+static SUMMARY_PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether an interrupted init starts the daemon to finish its work.
 fn hand_off_on_interrupt(ci: bool, tracing_calls: bool) -> bool {
@@ -387,7 +403,7 @@ pub(crate) fn readiness_of(
 ) -> Vec<(String, Readiness)> {
     use travsr_plugin_host::phase_b::status::{gather, readiness};
     let lang_toml = travsr_plugin_host::trust::LangToml::from_disk();
-    let resolver = travsr_plugin_host::resolver::CatalogResolver::new();
+    let resolver = travsr_plugin_host::resolver::CatalogResolver::for_corpus(corpus);
     languages
         .iter()
         .filter_map(|l| {
@@ -425,7 +441,9 @@ pub(crate) fn stored_warnings(db_path: &std::path::Path) -> String {
 fn language_json(language: &str, r: &Readiness) -> serde_json::Value {
     let mut o = serde_json::json!({ "language": language, "state": r.tag() });
     match r {
-        Readiness::NeedsToolchain { needs } => o["needs"] = needs.as_str().into(),
+        Readiness::NeedsToolchain { needs } | Readiness::NeedsBuildFile { needs } => {
+            o["needs"] = needs.as_str().into()
+        }
         Readiness::Unsupported { os } => o["os"] = os.as_str().into(),
         _ => {}
     }
@@ -435,10 +453,11 @@ fn language_json(language: &str, r: &Readiness) -> serde_json::Value {
     o
 }
 
-/// Record the unsandboxed grants init makes for the user, and say so once when
-/// one is recorded: Rust where the OS offers no sandbox, and on Windows the
-/// languages whose build tools cannot run inside its isolation.
-fn grant_unsandboxed_where_needed(languages: &[String]) {
+/// Record the unsandboxed grants init makes for the user in this repo alone
+/// (`corpus`), and say so once when one is recorded: Rust where the OS offers
+/// no sandbox, and on Windows the languages whose build tools cannot run inside
+/// its isolation.
+fn grant_unsandboxed_where_needed(languages: &[String], corpus: &str) {
     use travsr_indexer::sandbox::{build_sandboxed_command, SandboxConfig, SandboxStatus};
     let no_sandbox = matches!(
         build_sandboxed_command("true", &[], &SandboxConfig::default()).1,
@@ -450,7 +469,7 @@ fn grant_unsandboxed_where_needed(languages: &[String]) {
                 && travsr_plugin_host::phase_b::lookup(lang)
                     .is_some_and(|e| e.windows_sandbox_unsupported()));
         if needed {
-            match crate::lang::grant_unsandboxed_from_init(lang) {
+            match crate::lang::grant_unsandboxed_from_init(lang, corpus) {
                 Ok(true) if !cfg!(windows) => eprintln!(
                     "note: this machine has no sandbox travsr can use, so {lang}'s call \
                      tracer runs with your permissions. Install bubblewrap (bwrap) to \

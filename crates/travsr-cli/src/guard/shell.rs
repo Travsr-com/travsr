@@ -114,15 +114,24 @@ fn is_flag(word: &str) -> bool {
     word.starts_with('-') && word != "-"
 }
 
-/// Classify a `Bash` command line: the first part of an `&&` / `||` / `;`
-/// chain that is a single read-only search invocation, or `None`.
+/// Classify a `Bash` command line: the first part of an `&&` / `||` / `;` /
+/// newline chain that is a single read-only search invocation, preferring one
+/// that carries a term (`ls -R && rg Foo` is about `Foo`), or `None`.
 pub fn classify(command: &str) -> Option<SearchCommand> {
-    chain_parts(command).into_iter().find_map(classify_simple)
+    let found: Vec<SearchCommand> = chain_parts(command)
+        .into_iter()
+        .filter_map(classify_simple)
+        .collect();
+    let with_term = found.iter().position(|c| c.term.is_some());
+    found.into_iter().nth(with_term.unwrap_or(0))
 }
 
-/// Split a command line on `&&`, `||` and `;` outside quotes. Anything else
-/// stays inside its part, where [`simple_words`] refuses it.
+/// Split a command line on `&&`, `||`, `;` and newlines outside quotes.
+/// Anything else stays inside its part, where [`simple_words`] refuses it. A
+/// heredoc's body lines are data, so a command with `<<` is not split on
+/// newlines.
 fn chain_parts(command: &str) -> Vec<&str> {
+    let split_lines = !command.contains("<<");
     let bytes = command.as_bytes();
     let mut parts = Vec::new();
     let mut quote: Option<u8> = None;
@@ -134,7 +143,7 @@ fn chain_parts(command: &str) -> Vec<&str> {
             Some(q) if b == q => quote = None,
             Some(_) => {}
             None if b == b'\'' || b == b'"' => quote = Some(b),
-            None if b == b';' => {
+            None if b == b';' || (b == b'\n' && split_lines) => {
                 parts.push(&command[start..i]);
                 start = i + 1;
             }
@@ -355,6 +364,31 @@ mod tests {
             "a quoted && is not a split"
         );
         assert_eq!(classify("cd crates && cargo test"), None);
+    }
+
+    /// PR #940 review: strict mode denied `rg compute_total` but passed
+    /// `ls -R && rg compute_total`, because the termless `ls -R` came first,
+    /// and never looked at a search on its own line.
+    #[test]
+    fn a_later_search_with_a_term_wins_and_lines_are_parts() {
+        assert_eq!(
+            term("ls -R && rg compute_total"),
+            Some("compute_total".into())
+        );
+        assert_eq!(
+            term("find . -type f && grep -rn compute_total ."),
+            Some("compute_total".into())
+        );
+        assert_eq!(
+            term("cd core\nrg compute_total"),
+            Some("compute_total".into())
+        );
+        assert_eq!(kind("ls -R && cargo build"), Some(SearchTool::Files));
+        assert_eq!(
+            classify("cat <<EOF > notes.md\nrg compute_total\nEOF"),
+            None,
+            "a heredoc body line is data"
+        );
     }
 
     /// A part with a pipe, redirect or substitution is still refused: `cargo test

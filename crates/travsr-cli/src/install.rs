@@ -1621,9 +1621,6 @@ pub(crate) fn gunzip_single(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Read the single `*.exe` member out of a zip archive into memory. Used for
-/// upstreams (rust-analyzer on windows) that ship one executable plus debug
-/// side files (`.pdb`) in a zip; the first `.exe` is the binary we install.
 /// Read the one file named `member` out of a `.tar.gz` release asset, in
 /// memory, capped like every other archive here.
 pub(crate) fn tar_gz_single_member(bytes: &[u8], member: &str) -> Result<Vec<u8>> {
@@ -1653,6 +1650,9 @@ pub(crate) fn tar_gz_single_member(bytes: &[u8], member: &str) -> Result<Vec<u8>
     bail!("no {member} in the tar archive")
 }
 
+/// Read the single `*.exe` member out of a zip archive into memory. Used for
+/// upstreams (rust-analyzer on windows) that ship one executable plus debug
+/// side files (`.pdb`) in a zip; the first `.exe` is the binary we install.
 pub(crate) fn zip_extract_single_exe(bytes: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read as _;
     anyhow::ensure!(

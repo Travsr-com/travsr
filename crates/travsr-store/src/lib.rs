@@ -5978,31 +5978,45 @@ LIMIT ?4",
             span_cache.insert(path, spans);
         }
 
+        // The bare name a signature defines: `field:P.x` -> `x`.
+        let leaf_name = |signature: &str| -> String {
+            let leaf = signature.split_once(':').map_or(signature, |(_, r)| r);
+            let leaf = leaf.rsplit('.').next().unwrap_or(leaf);
+            leaf.strip_prefix("r#").unwrap_or(leaf).to_string()
+        };
         let mut out = Vec::with_capacity(positional.len());
         for p in positional {
             let def_line = p.callee_def_line as i64;
-            let Some((span, kind, signature)) = span_cache
+            let containing: Vec<&(FnSpan, String, String)> = span_cache
                 .get(p.callee_def_path.as_str())
-                .and_then(|spans| {
+                .map(|spans| {
                     spans
                         .iter()
-                        .find(|(s, ..)| s.line <= def_line && s.end_line >= def_line)
+                        .filter(|(s, ..)| s.line <= def_line && s.end_line >= def_line)
+                        .collect()
                 })
-            else {
-                continue; // fail closed: callee def resolves to no node
-            };
+                .unwrap_or_default();
             // The dump's lines can predate the spans: a file edited while
             // rust-analyzer ran shifts its nodes, and the def line then lands in
-            // a neighbour. Only a node named like the definition is the callee.
-            if let Some(name) = &p.callee_name {
-                let leaf = signature
-                    .split_once(':')
-                    .map_or(signature.as_str(), |(_, r)| r);
-                let leaf = leaf.rsplit('.').next().unwrap_or(leaf);
-                if leaf.strip_prefix("r#").unwrap_or(leaf) != name {
-                    continue;
-                }
-            }
+            // a neighbour. Only a node named like the definition is the callee,
+            // so the narrowest one with that name wins, not merely the narrowest
+            // (a field on its struct's line lost every reference to the struct
+            // or to itself, whichever sorted second). An enum variant has no
+            // node of its own, so a use of one counts for the enum around it.
+            let found = match &p.callee_name {
+                Some(name) => containing
+                    .iter()
+                    .find(|(_, _, sig)| leaf_name(sig) == *name)
+                    .or_else(|| {
+                        containing
+                            .first()
+                            .filter(|(s, kind, _)| kind == "enum" && s.line < def_line)
+                    }),
+                None => containing.first(),
+            };
+            let Some((span, kind, _)) = found.copied() else {
+                continue; // fail closed: callee def resolves to no node
+            };
             // A trait or impl that only encloses the definition is its
             // container, not the callee: a required trait method has no node of
             // its own. Fail closed as above. Neither is ever called, so a call
@@ -17842,6 +17856,45 @@ mod tests {
             .unwrap();
         let callees: Vec<_> = refs.iter().map(|r| r.callee_id).collect();
         assert_eq!(callees, vec![bar.id]);
+    }
+
+    /// PR #940 review: `pub struct P { pub x: i32 }` puts the struct and its
+    /// field on one line, and the narrowest span won by id alone, so every use
+    /// of whichever sorted second was dropped (`references field:P.x` said 0
+    /// with two uses). A use of an enum variant, which has no node, counts for
+    /// the enum around it.
+    #[test]
+    fn lsif_positional_callee_is_the_named_node_among_those_on_the_line() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let node = |sig: &str, kind: &str, line: u32, end: u32| {
+            Node::new(VName::new(corpus, "", "a.rs", "rust", sig), kind)
+                .with_line(line)
+                .with_end_line(end)
+        };
+        let p = node("struct:P", "struct", 1, 1);
+        let x = node("field:P.x", "field", 1, 1);
+        let shape = node("enum:Shape", "enum", 2, 5);
+        store
+            .write_scip_attributed_batch(corpus, &[p.clone(), x.clone(), shape.clone()], &[])
+            .unwrap();
+        let at = |def_line: u32, name: &str| travsr_core::LsifPositionalRef {
+            caller_path: "b.rs".to_string(),
+            caller_line: 3,
+            callee_def_path: "a.rs".to_string(),
+            callee_def_line: def_line,
+            is_call: false,
+            caller_col: None,
+            callee_name: Some(name.to_string()),
+        };
+        let refs = store
+            .resolve_lsif_positional_refs(
+                corpus,
+                &[at(1, "P"), at(1, "x"), at(3, "Circle"), at(2, "Other")],
+            )
+            .unwrap();
+        let callees: Vec<_> = refs.iter().map(|r| r.callee_id).collect();
+        assert_eq!(callees, vec![p.id, x.id, shape.id]);
     }
 
     /// `--fix` remediation for DBs written before the guard: `fsck` counts and

@@ -50,7 +50,7 @@ impl Plugin for RustPlugin {
         let cfg = SandboxConfig {
             repo_root: req.root.clone(),
             allow_unsandboxed: travsr_indexer::sandbox::allow_unsandboxed_opt_in()
-                || crate::resolver::persisted_unsandboxed_consent("rust"),
+                || crate::resolver::persisted_unsandboxed_consent("rust", &req.corpus),
             ..Default::default()
         };
         match run_ra_lsif(&req.root, &cfg) {

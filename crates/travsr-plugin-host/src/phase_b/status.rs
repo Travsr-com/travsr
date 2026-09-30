@@ -185,11 +185,19 @@ pub enum Readiness {
     NeedsToolchain {
         needs: String,
     },
+    /// The analyzer traces a project, and the repo has no build file for one
+    /// (`needs` names it): loose sources such as test fixtures.
+    NeedsBuildFile {
+        needs: String,
+    },
     Unsupported {
         os: String,
     },
     /// The analyzer ran and produced nothing usable, with no known cause.
     Failed,
+    /// The analyzer ran and found definitions but no calls between them, as a
+    /// lone script or formula has none.
+    NoCalls,
     /// A tracer that ships inside travsr's install was not found (the binary
     /// was copied out of it). Only reinstalling brings it back.
     PartMissing,
@@ -201,7 +209,10 @@ impl Readiness {
         match self {
             Readiness::Ready => "ready",
             Readiness::SettingUp => "setting_up",
-            Readiness::NeedsToolchain { .. } => "needs_toolchain",
+            Readiness::NeedsToolchain { .. } | Readiness::NeedsBuildFile { .. } => {
+                "needs_toolchain"
+            }
+            Readiness::NoCalls => "no_calls",
             Readiness::Unsupported { .. } => "unsupported_os",
             Readiness::Failed | Readiness::PartMissing => "failed",
         }
@@ -212,7 +223,10 @@ impl Readiness {
         match self {
             Readiness::Ready => "ready".into(),
             Readiness::SettingUp => "setting up".into(),
-            Readiness::NeedsToolchain { needs } => format!("needs {needs}"),
+            Readiness::NeedsToolchain { needs } | Readiness::NeedsBuildFile { needs } => {
+                format!("needs {needs}")
+            }
+            Readiness::NoCalls => "no calls found".into(),
             Readiness::Unsupported { os } => format!("not available on {os}"),
             Readiness::Failed => "could not trace calls".into(),
             Readiness::PartMissing => "could not trace calls: part of travsr is missing".into(),
@@ -222,7 +236,10 @@ impl Readiness {
     /// The one next action, in plain words; `None` when there is nothing to do.
     pub fn fix(&self) -> Option<String> {
         match self {
-            Readiness::Ready | Readiness::Unsupported { .. } => None,
+            Readiness::Ready | Readiness::Unsupported { .. } | Readiness::NoCalls => None,
+            Readiness::NeedsBuildFile { .. } => {
+                Some("Its files are read for structure until then.".into())
+            }
             Readiness::SettingUp => Some("Run `travsr init` to finish tracing calls.".into()),
             Readiness::NeedsToolchain { needs } if needs == "compile_commands.json" => Some(
                 "Generate compile_commands.json with your build, then run `travsr init`.".into(),
@@ -247,6 +264,8 @@ pub struct RepoCapability<'a> {
     /// The analyzer must be built here and the installed Go is older than the
     /// build needs, so `travsr init` cannot finish setting it up.
     pub driver_too_old: bool,
+    /// The analyzer needs a build file and the repo has none; names it.
+    pub build_file_missing: Option<&'static str>,
     pub registered: bool,
     pub corpus_trusted: bool,
     pub analyzer_ready: bool,
@@ -258,6 +277,13 @@ pub struct RepoCapability<'a> {
 pub fn readiness(c: &RepoCapability) -> Readiness {
     if let Some(os) = &c.unsupported_on {
         return Readiness::Unsupported { os: os.clone() };
+    }
+    // Before any toolchain: with no project there is nothing to trace, so
+    // nothing is worth installing.
+    if let Some(needs) = c.build_file_missing {
+        return Readiness::NeedsBuildFile {
+            needs: needs.to_string(),
+        };
     }
     let prerequisites = c.entry.effective_prerequisites();
     let known_prerequisite = !prerequisites.is_empty() && prerequisites != "none";
@@ -291,9 +317,9 @@ pub fn readiness(c: &RepoCapability) -> Readiness {
     }
     match c.last_warning {
         Some(
-            "crashed" | "zero_nodes" | "no_references" | "emitter_failed" | "emitter_missing"
-            | "version_mismatch",
+            "crashed" | "zero_nodes" | "emitter_failed" | "emitter_missing" | "version_mismatch",
         ) => Readiness::Failed,
+        Some("no_references") => Readiness::NoCalls,
         // The last run skipped it for want of the unsandboxed permission, which
         // `travsr init` gives (the same reading as the MCP notes).
         Some("needs_consent" | "needs_approval") => Readiness::SettingUp,
@@ -428,21 +454,25 @@ pub fn gather<'a>(
         unsupported_on: super::platform::unsupported_reason(entry),
         driver_missing,
         driver_too_old,
+        build_file_missing: super::catalog::missing_build_file(entry.language, repo_root),
         registered: lang_toml.registered.iter().any(|r| r == entry.language),
         corpus_trusted: lang_toml.trusted_corpora.contains(corpus),
         analyzer_ready,
         // A permission skip the user has since granted no longer holds.
         last_warning: warning_class(warnings, entry.language).filter(|w| {
             !(matches!(*w, "needs_consent" | "needs_approval")
-                && crate::resolver::persisted_unsandboxed_consent(entry.language))
+                && crate::resolver::persisted_unsandboxed_consent(entry.language, corpus))
         }),
     }
 }
 
 /// The installed Go as (major, minor), or `None` when there is no `go`.
 fn installed_go() -> Option<(u32, u32)> {
+    // `local`: Go 1.21+ would otherwise download the toolchain a `go` line in
+    // the current module asks for, and report that one instead.
     let out = std::process::Command::new("go")
         .arg("version")
+        .env("GOTOOLCHAIN", "local")
         .output()
         .ok()?;
     parse_go_version(&String::from_utf8_lossy(&out.stdout))
@@ -650,11 +680,39 @@ mod tests {
             unsupported_on: None,
             driver_missing: None,
             driver_too_old: false,
+            build_file_missing: None,
             registered: true,
             corpus_trusted: true,
             analyzer_ready: true,
             last_warning: None,
         }
+    }
+
+    /// PR #940 review: fixtures with no build file read "could not trace
+    /// calls" after a download, and a lone Homebrew formula made Ruby read
+    /// the same. The first is named before any toolchain, the second is not a
+    /// failure.
+    #[test]
+    fn loose_sources_need_a_build_file_and_no_calls_is_not_failure() {
+        let mut java = repo("java");
+        java.build_file_missing = Some("pom.xml or build.gradle");
+        java.driver_missing = Some("JDK".into());
+        java.analyzer_ready = false;
+        let r = readiness(&java);
+        assert_eq!(
+            r,
+            Readiness::NeedsBuildFile {
+                needs: "pom.xml or build.gradle".into()
+            }
+        );
+        assert_eq!(r.tag(), "needs_toolchain");
+        assert_eq!(r.label(), "needs pom.xml or build.gradle");
+
+        let mut ruby = repo("ruby");
+        ruby.last_warning = Some("no_references");
+        let r = readiness(&ruby);
+        assert_eq!(r, Readiness::NoCalls);
+        assert_eq!((r.tag(), r.fix()), ("no_calls", None));
     }
 
     #[test]

@@ -509,6 +509,13 @@ fn index_paths_parallel(
         let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
         let mut all_ws_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker> = Vec::new();
         let mut calls_changed = false;
+        // Re-parsing a file drops its Phase B call edges, as in `reindex_files`:
+        // record it so a semantic `init` at the same commit runs Phase B again.
+        // Only once Phase B has run: before that there were none to drop. Set
+        // before the batch that drops them, so a failed write or a kill between
+        // batches cannot leave `complete` over calls that are gone.
+        let phase_b_ran = store.get_meta("phase_b_commit").ok().flatten().is_some();
+        let mut dirty_marked = false;
 
         for (done, result) in (1_u64..).zip(rx) {
             let pr = result?;
@@ -530,6 +537,10 @@ fn index_paths_parallel(
             batch.push(pr.file_graph);
 
             if batch.len() >= BATCH_SIZE {
+                if calls_changed && phase_b_ran && !dirty_marked {
+                    let _ = store.set_meta("phase_b_dirty", "1");
+                    dirty_marked = true;
+                }
                 let written = store.write_file_graphs_batch(&batch, bulk)?;
                 counts.nodes_upserted += written.nodes_upserted;
                 counts.edges_upserted += written.edges_upserted;
@@ -546,17 +557,13 @@ fn index_paths_parallel(
 
         // Flush remaining files.
         if !batch.is_empty() {
+            if calls_changed && phase_b_ran && !dirty_marked {
+                let _ = store.set_meta("phase_b_dirty", "1");
+            }
             let written = store.write_file_graphs_batch(&batch, bulk)?;
             counts.nodes_upserted += written.nodes_upserted;
             counts.edges_upserted += written.edges_upserted;
             counts.files_written += written.files_written;
-        }
-
-        // Re-parsing a file drops its Phase B call edges, as in `reindex_files`:
-        // record it so a semantic `init` at the same commit runs Phase B again.
-        // Only once Phase B has run: before that there were none to drop.
-        if calls_changed && store.get_meta("phase_b_commit").ok().flatten().is_some() {
-            let _ = store.set_meta("phase_b_dirty", "1");
         }
 
         // Repo-level FFI resolution (same logic as reindex_files).
@@ -1184,6 +1191,7 @@ fn phase_b_inline_needed(
         "skipped_no_analyzer",
         "needs_consent",
         "skipped_no_compdb",
+        "skipped_no_build_file",
     ];
     !already_done
         || dirty
@@ -1214,8 +1222,11 @@ fn change_can_drop_calls(path: &str) -> bool {
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    Language::from_extension(ext)
-        .is_some_and(|l| travsr_plugin_host::phase_b::lookup(l.as_str()).is_some())
+    // A Gradle build script is Kotlin by extension, but Kotlin traces `.kt`
+    // only, so editing one cannot drop a call.
+    ext != "kts"
+        && Language::from_extension(ext)
+            .is_some_and(|l| travsr_plugin_host::phase_b::lookup(l.as_str()).is_some())
 }
 
 #[cfg(test)]
@@ -1228,7 +1239,13 @@ mod traced_change_tests {
         for path in ["main.go", "src/a.ts", "pkg/b.py"] {
             assert!(super::change_can_drop_calls(path), "{path}");
         }
-        for path in [".cursor/mcp.json", "README.md", ".gitignore", "go.mod"] {
+        for path in [
+            ".cursor/mcp.json",
+            "README.md",
+            ".gitignore",
+            "go.mod",
+            "build.gradle.kts",
+        ] {
             assert!(!super::change_can_drop_calls(path), "{path}");
         }
     }
@@ -1997,8 +2014,9 @@ pub fn init_repo_with_progress(
                 |lang| {
                     use travsr_plugin_host::phase_b::status::{gather, readiness, Readiness};
                     travsr_plugin_host::phase_b::lookup(lang).is_some_and(|entry| {
-                        let resolver = resolver
-                            .get_or_init(travsr_plugin_host::resolver::CatalogResolver::new);
+                        let resolver = resolver.get_or_init(|| {
+                            travsr_plugin_host::resolver::CatalogResolver::for_corpus(&corpus)
+                        });
                         let cap =
                             gather(entry, repo_root, &corpus, &lang_toml, resolver, &warnings);
                         readiness(&cap) == Readiness::Ready
@@ -3527,6 +3545,11 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_needs_consent {
         warnings.push(format!("needs_consent:{lang}"));
     }
+    // rust-analyzer skipped: no OS sandbox, and no grant for this repo. Without
+    // this Rust read ready with no rust-analyzer calls; `travsr init` grants it.
+    if travsr_indexer::sandbox::ra_lsif_sandbox_was_skipped() {
+        warnings.push("needs_consent:rust".to_string());
+    }
     // #449: a language present in the repo whose sidecar is not installed or
     // not registered used to be skipped silently, and the user saw "0 references"
     // with no hint that Phase B never ran. Surface both skip classes so
@@ -3547,6 +3570,9 @@ fn write_phase_b_results(
     // same way as the other user-actionable skip classes above.
     for lang in &pb_outcome.skipped_no_compdb {
         warnings.push(format!("skipped_no_compdb:{lang}"));
+    }
+    for lang in &pb_outcome.skipped_no_build_file {
+        warnings.push(format!("skipped_no_build_file:{lang}"));
     }
     // #878: the TypeScript LSIF pass was due but `travsr-lsif-ts` never ran (or
     // ran and failed). The native pass still ran, so `typescript` is in `ran`

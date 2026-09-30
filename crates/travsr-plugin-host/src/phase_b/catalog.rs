@@ -515,8 +515,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["--output", "{output}", "{root}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "travsr lang install go  (or: go install github.com/scip-code/scip-go/cmd/scip-go@latest)",
-        underlying_tool_hint: "go install github.com/scip-code/scip-go/cmd/scip-go@latest",
+        install_hint: "travsr lang install go  (or: go install github.com/scip-code/scip-go/cmd/scip-go@v0.2.7)",
+        underlying_tool_hint: "go install github.com/scip-code/scip-go/cmd/scip-go@v0.2.7",
         provider_binary: Some("travsr-lang-go"),
         elevated_hosts: &[],
         // scip-go's own release binary, latest tag, checked against its sha256
@@ -534,7 +534,9 @@ pub static CATALOG: &[PhaseBEntry] = &[
             fallback_command: Some(&[
                 "go",
                 "install",
-                "github.com/scip-code/scip-go/cmd/scip-go@latest",
+                // The version whose Go floor `fallback_min_go` states, so the
+                // two cannot drift apart when scip-go needs a newer Go.
+                "github.com/scip-code/scip-go/cmd/scip-go@v0.2.7",
             ]),
             // scip-go v0.2.7's go.mod: `requires go >= 1.25.0`.
             fallback_min_go: Some((1, 25)),
@@ -990,6 +992,69 @@ pub fn build_manifests(language: &str) -> &'static [&'static str] {
     }
 }
 
+/// The build files an analyzer cannot trace calls without, as file names or
+/// `*.ext`, and how to name them to a user. Empty for a language whose tracer
+/// reads the sources alone. Loose sources (test fixtures, a stray file) are no
+/// project: the analyzer finds no symbols in them, so without a build file
+/// there is nothing to download or run.
+pub fn required_build_files(language: &str) -> (&'static [&'static str], &'static str) {
+    const JVM: &[&str] = &[
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+    ];
+    match language {
+        "java" | "kotlin" => (JVM, "pom.xml or build.gradle"),
+        "scala" => (
+            &["build.sbt", "pom.xml", "build.gradle", "build.gradle.kts"],
+            "build.sbt",
+        ),
+        "csharp" => (&["*.csproj", "*.sln"], "a .csproj or .sln file"),
+        "php" => (&["composer.json"], "composer.json"),
+        "go" => (&["go.mod"], "go.mod"),
+        _ => (&[], ""),
+    }
+}
+
+/// How to name `language`'s missing build file when the repo has none of
+/// [`required_build_files`], or `None` when it has one or needs none. Asks git
+/// for tracked and unignored files; when git cannot answer it says nothing,
+/// so a repo is never blocked on a failed probe.
+pub fn missing_build_file(language: &str, repo_root: &std::path::Path) -> Option<&'static str> {
+    let (files, needs) = required_build_files(language);
+    if files.is_empty() {
+        return None;
+    }
+    let mut git = std::process::Command::new("git");
+    git.arg("-C").arg(repo_root).args([
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+    ]);
+    for f in files {
+        git.arg(format!(":(glob)**/{f}"));
+    }
+    let out = git.output().ok().filter(|o| o.status.success())?;
+    (!listed_build_file(&String::from_utf8_lossy(&out.stdout), files)).then_some(needs)
+}
+
+/// Whether a NUL-separated `git ls-files -z` listing holds one of `files`.
+fn listed_build_file(listing: &str, files: &[&str]) -> bool {
+    listing.split('\0').any(|path| {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        !name.is_empty()
+            && files.iter().any(|f| match f.strip_prefix('*') {
+                Some(ext) => name.ends_with(ext),
+                None => name == *f,
+            })
+    })
+}
+
 // ── RFC-025 SidecarSpec impls ───────────────────────────────────────────────
 //
 // The Phase B family joins the embed sidecar under the one shared version
@@ -1148,7 +1213,7 @@ mod vendored_hash_tests {
                 &[
                     "go",
                     "install",
-                    "github.com/scip-code/scip-go/cmd/scip-go@latest"
+                    "github.com/scip-code/scip-go/cmd/scip-go@v0.2.7"
                 ][..]
             )
         );
@@ -1291,5 +1356,54 @@ mod vendored_hash_tests {
             .map(|e| e.wrapper_version_fallback)
             .collect();
         assert_eq!(tags.len(), 1, "{tags:?}");
+    }
+}
+
+#[cfg(test)]
+mod build_file_tests {
+    use super::{listed_build_file, missing_build_file, required_build_files};
+
+    /// PR #940 review: three Java test fixtures with no build file cost a
+    /// scip-java download and then read "could not trace calls". A listing
+    /// with no build file anywhere is what says so first.
+    #[test]
+    fn a_build_file_anywhere_counts_and_a_lookalike_does_not() {
+        let (java, _) = required_build_files("java");
+        assert!(listed_build_file("svc/pom.xml\0", java));
+        assert!(listed_build_file("app/build.gradle.kts\0", java));
+        assert!(!listed_build_file("fixtures/Main.java\0notpom.xml\0", java));
+        assert!(!listed_build_file("", java));
+        let (cs, _) = required_build_files("csharp");
+        assert!(listed_build_file("src/App/App.csproj\0", cs));
+        assert!(!listed_build_file("src/App.cs\0", cs));
+        assert!(required_build_files("rust").0.is_empty());
+        assert!(required_build_files("ruby").0.is_empty());
+    }
+
+    /// The one check against real git: a fixture-only repo is missing its
+    /// build file, the same repo with one is not.
+    #[test]
+    fn git_sees_a_missing_and_a_present_build_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(root.join("fixtures")).expect("mkdir");
+        std::fs::write(root.join("fixtures/Main.java"), "class Main {}").expect("write");
+        assert_eq!(
+            missing_build_file("java", root),
+            Some("pom.xml or build.gradle")
+        );
+        std::fs::create_dir_all(root.join("svc")).expect("mkdir");
+        std::fs::write(root.join("svc/pom.xml"), "<project/>").expect("write");
+        assert_eq!(missing_build_file("java", root), None);
+        assert_eq!(missing_build_file("rust", root), None);
     }
 }

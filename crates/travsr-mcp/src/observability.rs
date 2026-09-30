@@ -329,9 +329,10 @@ pub(crate) fn decode_phase_b_warnings(warnings: &str) -> HashMap<String, (&'stat
         // language, from `Readiness`, so the two surfaces cannot drift. The
         // per-class detail (which analyzer, which rebuild) is `status --verbose`.
         let (state, readiness) = match class {
-            "crashed" | "no_references" | "version_mismatch" | "emitter_failed" | "zero_nodes" => {
+            "crashed" | "version_mismatch" | "emitter_failed" | "zero_nodes" => {
                 ("failed", Readiness::Failed)
             }
+            "no_references" => ("no_calls", Readiness::NoCalls),
             "emitter_missing" => ("failed", Readiness::PartMissing),
             // All of these are what `travsr init` sets up itself: install,
             // registration, trust, the unsandboxed permission (plan 4.4).
@@ -344,6 +345,14 @@ pub(crate) fn decode_phase_b_warnings(warnings: &str) -> HashMap<String, (&'stat
                 "unavailable",
                 Readiness::NeedsToolchain {
                     needs: "compile_commands.json".to_string(),
+                },
+            ),
+            "skipped_no_build_file" => (
+                "unavailable",
+                Readiness::NeedsBuildFile {
+                    needs: travsr_plugin_host::phase_b::catalog::required_build_files(lang)
+                        .1
+                        .to_string(),
                 },
             ),
             _ => continue,
@@ -384,7 +393,7 @@ pub(crate) fn phase_b_availability(
     use travsr_plugin_host::phase_b::status::{gather, readiness, Readiness};
 
     let lang_toml = travsr_plugin_host::trust::LangToml::from_disk();
-    let resolver = travsr_plugin_host::resolver::CatalogResolver::new();
+    let resolver = travsr_plugin_host::resolver::CatalogResolver::for_corpus(corpus);
     let mut out = HashMap::with_capacity(travsr_plugin_host::PHASE_B_CATALOG.len());
     for entry in travsr_plugin_host::PHASE_B_CATALOG {
         // Plan 4.2: the one readiness ladder, with no last-run warnings, so
@@ -2387,6 +2396,7 @@ mod tests {
             "skipped_unregistered",
             "skipped_no_analyzer",
             "skipped_no_compdb",
+            "skipped_no_build_file",
             "untrusted_corpus",
             "no_references",
             "zero_nodes",
@@ -2406,7 +2416,7 @@ mod tests {
                 panic!("class {class:?} is handled by travsr status but falls through here")
             });
             assert!(
-                matches!(*state, "failed" | "unavailable"),
+                matches!(*state, "failed" | "unavailable" | "no_calls"),
                 "class {class:?} must map to a terminal state, got {state:?}"
             );
             assert!(!detail.is_empty(), "class {class:?} must explain itself");

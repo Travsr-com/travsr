@@ -189,6 +189,7 @@ fn every_row_carries_its_readiness() {
         "needs_toolchain",
         "unsupported_os",
         "failed",
+        "no_calls",
     ];
     for row in lang_list_json().as_array().expect("array") {
         let lang = row["language"].as_str().unwrap_or("<unnamed>");

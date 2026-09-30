@@ -228,13 +228,15 @@ fn head_at(cwd: &std::path::Path) -> Option<String> {
 
 /// The default language block: one line per language that is not simply
 /// ready, plus a note for a ready language whose calls are not traced as you
-/// edit. Plain words only (plan 3.0); the details are under `--verbose`.
+/// edit. Plain words only (plan 3.0); the details are under `--verbose`, which
+/// prints them below instead of pointing at itself.
 fn language_lines(
     states: &[(
         String,
         travsr_plugin_host::phase_b::status::Readiness,
         travsr_daemon::EditTracing,
     )],
+    verbose: bool,
 ) -> Vec<String> {
     use travsr_daemon::EditTracing;
     use travsr_plugin_host::phase_b::status::Readiness;
@@ -250,6 +252,9 @@ fn language_lines(
                 }
                 (Readiness::Ready, EditTracing::OffUnavailable) => {
                     "calls update at each commit, not as you edit".to_string()
+                }
+                (Readiness::Failed, _) if verbose => {
+                    "could not trace calls (the reason is below)".to_string()
                 }
                 (r, _) => return readiness_line(lang, r),
             };
@@ -345,7 +350,7 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
                 (lang, r, editing)
             })
             .collect();
-        for line in language_lines(&states) {
+        for line in language_lines(&states, verbose) {
             println!("{line}");
         }
     }
@@ -454,7 +459,7 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
                     // success, which is what makes it worth saying out loud.
                     ["no_references", lang] => {
                         eprintln!(
-                            "warning: '{lang}' analysis produced definitions but no references, so no call edges came from it. The analyzer reported success, so this is its output being incomplete rather than a crash. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --force` to see its own diagnostics"
+                            "note: '{lang}' analysis found definitions but no calls between them, which is expected for a lone script. If this code does make calls, the analyzer's own diagnostics say why: re-run `RUST_LOG=travsr_plugin_host=debug travsr init --force`"
                         );
                     }
                     ["zero_nodes", lang] => {
@@ -521,6 +526,10 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
                     ),
                     // L5a: scip-clang (c/cpp) needs a compile_commands.json at the
                     // repo root — without one it hangs, so it is skipped up front.
+                    ["skipped_no_build_file", lang] => eprintln!(
+                        "note: '{lang}' calls are traced once the project has {}; this repo has none, so its '{lang}' files are read for structure only",
+                        travsr_plugin_host::phase_b::catalog::required_build_files(lang).1
+                    ),
                     ["skipped_no_compdb", lang] => eprintln!(
                         "warning: full '{lang}' analysis needs a compile database (compile_commands.json) at the repo root. Generate one (e.g. `bear -- make`, or CMake's CMAKE_EXPORT_COMPILE_COMMANDS)"
                     ),
@@ -781,7 +790,7 @@ mod tests {
             ),
             ("ruby".to_string(), Readiness::Failed, OffUnavailable),
         ];
-        let lines = language_lines(&states);
+        let lines = language_lines(&states, false);
         assert_eq!(
             lines,
             vec![
@@ -796,6 +805,12 @@ mod tests {
         for line in &lines {
             assert_eq!(jargon_in(line), None, "{line}");
         }
+        // PR #940 review: `status --verbose` told the user to see `status
+        // --verbose`; it prints the reason below instead.
+        assert_eq!(
+            language_lines(&states, true)[3],
+            "  ruby        could not trace calls (the reason is below)"
+        );
     }
 
     fn payload(last: &str, phase_b: &str, dirty: bool) -> StatusPayload {

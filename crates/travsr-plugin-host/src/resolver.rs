@@ -279,10 +279,16 @@ impl CatalogResolver {
     /// Construct by reading `lang.toml` and searching PATH. Fails silently —
     /// missing config or PATH entries produce an empty resolver, not an error.
     pub fn new() -> Self {
-        Self::from_disk_impl()
+        Self::from_disk_impl(None)
     }
 
-    fn from_disk_impl() -> Self {
+    /// As [`Self::new`], also honouring unsandboxed grants made for `corpus`
+    /// alone.
+    pub fn for_corpus(corpus: &str) -> Self {
+        Self::from_disk_impl(Some(corpus))
+    }
+
+    fn from_disk_impl(corpus: Option<&str>) -> Self {
         let registered = registered_languages_from_disk();
         // Load lang.toml once for approval lookups.
         let lang_config = load_lang_config();
@@ -416,7 +422,7 @@ impl CatalogResolver {
             let consent = session_consent
                 || lang_config
                     .as_ref()
-                    .map(|cfg| cfg.has_unsandboxed_consent(lang))
+                    .map(|cfg| cfg.has_unsandboxed_consent(lang, corpus))
                     .unwrap_or(false);
             let unsandboxed =
                 match decide_windows_sandbox(catalog_entry.windows_sandbox, cfg!(windows), consent)
@@ -741,15 +747,21 @@ struct LangConfigFile {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct UnsandboxedConsentRecord {
     language: String,
+    /// The one repo the grant covers, as `travsr init` records it. Absent on a
+    /// `travsr lang allow-unsandboxed` grant, which covers every repo.
+    #[serde(default)]
+    corpus: Option<String>,
     // granted_by / granted_date are recorded for auditability by the CLI; the
     // resolver only needs to know a grant exists, so they are not read here.
 }
 
 impl LangConfigFile {
-    fn has_unsandboxed_consent(&self, language: &str) -> bool {
-        self.unsandboxed_consent
-            .iter()
-            .any(|c| c.language == language)
+    /// A grant for `language` that covers `corpus`: one for every repo, or one
+    /// for this repo. `None` asks only about grants for every repo.
+    fn has_unsandboxed_consent(&self, language: &str, corpus: Option<&str>) -> bool {
+        self.unsandboxed_consent.iter().any(|c| {
+            c.language == language && (c.corpus.is_none() || c.corpus.as_deref() == corpus)
+        })
     }
 }
 
@@ -766,10 +778,11 @@ fn load_lang_config() -> Option<LangConfigFile> {
     toml::from_str(&content).ok()
 }
 
-/// Whether `language` has a recorded unsandboxed grant in lang.toml. Unlike the
-/// process-level opt-in, this reaches the daemon, which never sees `init`'s flags.
-pub(crate) fn persisted_unsandboxed_consent(language: &str) -> bool {
-    load_lang_config().is_some_and(|c| c.has_unsandboxed_consent(language))
+/// Whether `language` has a recorded unsandboxed grant in lang.toml covering
+/// `corpus`. Unlike the process-level opt-in, this reaches the daemon, which
+/// never sees `init`'s flags.
+pub(crate) fn persisted_unsandboxed_consent(language: &str, corpus: &str) -> bool {
+    load_lang_config().is_some_and(|c| c.has_unsandboxed_consent(language, Some(corpus)))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -778,29 +791,25 @@ pub(crate) fn persisted_unsandboxed_consent(language: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// PR #940 review: one `travsr init` grant let rust-analyzer run
+    /// unsandboxed in every Rust repo the daemon later indexed. What init
+    /// records covers its own repo; `travsr lang allow-unsandboxed` still
+    /// covers all.
     #[test]
-    fn persisted_rust_consent_reaches_every_process() {
-        // The daemon is a separate process from `travsr init`, so only what is
-        // on disk reaches it.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let toml = dir.path().join("lang.toml");
-        std::fs::write(
-            &toml,
-            "[[unsandboxed_consent]]\nlanguage = \"rust\"\ngranted_by = \"travsr init\"\n\
-             granted_date = \"2026-09-29\"\n",
+    fn an_init_grant_covers_only_its_repo() {
+        let cfg: LangConfigFile = toml::from_str(
+            "[[unsandboxed_consent]]\nlanguage = \"rust\"\ncorpus = \"github.com/a/one\"\n\
+             granted_by = \"travsr init\"\ngranted_date = \"2026-09-30\"\n\
+             [[unsandboxed_consent]]\nlanguage = \"java\"\n\
+             granted_by = \"travsr lang allow-unsandboxed\"\ngranted_date = \"2026-09-30\"\n",
         )
         .unwrap();
-        std::env::set_var("TRAVSR_LANG_TOML", &toml);
-        let rust = persisted_unsandboxed_consent("rust");
-        let go = persisted_unsandboxed_consent("go");
-        std::env::set_var("TRAVSR_LANG_TOML", dir.path().join("absent.toml"));
-        let none = persisted_unsandboxed_consent("rust");
-        std::env::remove_var("TRAVSR_LANG_TOML");
-        assert!(rust, "rust grant on disk");
-        assert!(!go, "grant is per language");
-        assert!(!none, "no file, no grant");
+        assert!(cfg.has_unsandboxed_consent("rust", Some("github.com/a/one")));
+        assert!(!cfg.has_unsandboxed_consent("rust", Some("github.com/b/two")));
+        assert!(!cfg.has_unsandboxed_consent("rust", None));
+        assert!(cfg.has_unsandboxed_consent("java", Some("github.com/b/two")));
+        assert!(cfg.has_unsandboxed_consent("java", None));
+        assert!(!cfg.has_unsandboxed_consent("go", Some("github.com/a/one")));
     }
 
     // ── Windows-unsandboxed decision ──────────────────────────────────────────

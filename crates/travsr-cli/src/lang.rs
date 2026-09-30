@@ -241,8 +241,12 @@ fn lang_capability_status(
 /// privileges: a recorded per-language grant in lang.toml, or the session-wide
 /// `TRAVSR_ALLOW_UNSANDBOXED` opt-in. Mirrors the resolver so `lang list` /
 /// `status` and the index-time decision cannot disagree.
-fn unsandboxed_consent_present(config: Option<&LangConfig>, language: &str) -> bool {
-    config.is_some_and(|c| c.has_unsandboxed_consent(language))
+fn unsandboxed_consent_present(
+    config: Option<&LangConfig>,
+    language: &str,
+    corpus: Option<&str>,
+) -> bool {
+    config.is_some_and(|c| c.has_unsandboxed_consent(language, corpus))
         || travsr_plugin_host::resolver::session_unsandboxed_opt_in()
 }
 
@@ -466,7 +470,8 @@ fn cmd_list(language: Option<&str>, json: bool) -> Result<()> {
             // The authoritative status every consumer renders. `status` is a stable
             // machine tag; `statusLine` is the exact human wording used in the CLI,
             // so the extension shows the same words without re-deriving them.
-            let consent = unsandboxed_consent_present(config.as_ref(), entry.language);
+            let consent =
+                unsandboxed_consent_present(config.as_ref(), entry.language, corpus.as_deref());
             let status = lang_capability_status(entry, registered, consent);
             // Per-repo enablement for the repo we are being run in (corpus trust
             // gate). The VS Code panel runs `lang list --json` with the target
@@ -482,7 +487,9 @@ fn cmd_list(language: Option<&str>, json: bool) -> Result<()> {
             let readiness = states.get(entry.language);
             let state = readiness.map_or("null".to_string(), |r| json_str(r.tag()));
             let needs = match readiness {
-                Some(Readiness::NeedsToolchain { needs }) => json_str(needs),
+                Some(Readiness::NeedsToolchain { needs } | Readiness::NeedsBuildFile { needs }) => {
+                    json_str(needs)
+                }
                 _ => "null".to_string(),
             };
             let fix = readiness
@@ -552,7 +559,8 @@ fn cmd_list(language: Option<&str>, json: bool) -> Result<()> {
                     .as_ref()
                     .map(|c| c.is_registered(entry.language))
                     .unwrap_or(false);
-                let consent = unsandboxed_consent_present(config.as_ref(), entry.language);
+                let consent =
+                    unsandboxed_consent_present(config.as_ref(), entry.language, corpus.as_deref());
                 lang_capability_status(entry, registered, consent).line()
             }
         };
@@ -889,7 +897,9 @@ fn cmd_install(
     // Windows-only: the analyzer is installed, but it cannot run inside Travsr's
     // isolation here, so full analysis stays off until the user grants the one-time
     // permission. Say that honestly instead of claiming "active".
-    if windows_unsandboxed && !config.has_unsandboxed_consent(language) {
+    if windows_unsandboxed
+        && !config.has_unsandboxed_consent(language, current_repo_corpus().as_deref())
+    {
         eprintln!(
             "'{language}' analyzer is installed. One more step: its build tools can't run \
              inside Travsr's isolation on Windows, so full analysis needs your permission \
@@ -1555,6 +1565,7 @@ fn cmd_detect(yes: bool) -> Result<()> {
     }
 
     let config = load_config();
+    let corpus = current_repo_corpus();
 
     // Partition detected languages by whether full analysis can ever run here.
     // Some analyzers ship only as a prebuilt binary with no build for this
@@ -1569,7 +1580,7 @@ fn cmd_detect(yes: bool) -> Result<()> {
             .as_ref()
             .map(|c| c.is_registered(lang))
             .unwrap_or(false);
-        let consent = unsandboxed_consent_present(config.as_ref(), lang);
+        let consent = unsandboxed_consent_present(config.as_ref(), lang, corpus.as_deref());
         lang_capability_status(entry, registered, consent)
     };
     let mut installable: Vec<&str> = Vec::new();
@@ -1804,7 +1815,7 @@ fn cmd_allow_unsandboxed(
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "user".to_string());
 
-    config.grant_unsandboxed_consent(language, &granted_by);
+    config.grant_unsandboxed_consent(language, &granted_by, None);
     save_config(&config)?;
 
     println!(
@@ -1815,15 +1826,15 @@ fn cmd_allow_unsandboxed(
     Ok(())
 }
 
-/// Record an unsandboxed grant made by `travsr init`, so the daemon, a separate
-/// process that never sees init's flags, honours it too. True when this call
-/// recorded it.
-pub(crate) fn grant_unsandboxed_from_init(language: &str) -> Result<bool> {
+/// Record an unsandboxed grant made by `travsr init` for the repo `corpus`
+/// alone, so the daemon, a separate process that never sees init's flags,
+/// honours it there too. True when this call recorded it.
+pub(crate) fn grant_unsandboxed_from_init(language: &str, corpus: &str) -> Result<bool> {
     let mut config = load_config().unwrap_or_default();
-    if config.has_unsandboxed_consent(language) {
+    if config.has_unsandboxed_consent(language, Some(corpus)) {
         return Ok(false);
     }
-    config.grant_unsandboxed_consent(language, "travsr init");
+    config.grant_unsandboxed_consent(language, "travsr init", Some(corpus));
     save_config(&config)?;
     Ok(true)
 }
@@ -1990,6 +2001,10 @@ pub(crate) struct LangConfig {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct UnsandboxedConsent {
     language: String,
+    /// The one repo a `travsr init` grant covers. Absent on a `travsr lang
+    /// allow-unsandboxed` grant, which covers every repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    corpus: Option<String>,
     /// Who granted the permission (recorded for auditability).
     granted_by: String,
     /// ISO-8601 date the permission was granted.
@@ -2026,16 +2041,26 @@ impl LangConfig {
         }
     }
 
-    fn has_unsandboxed_consent(&self, language: &str) -> bool {
-        self.unsandboxed_consent
-            .iter()
-            .any(|c| c.language == language)
+    /// A grant for `language` that covers `corpus`: one for every repo, or one
+    /// for this repo. `None` asks only about grants for every repo.
+    fn has_unsandboxed_consent(&self, language: &str, corpus: Option<&str>) -> bool {
+        self.unsandboxed_consent.iter().any(|c| {
+            c.language == language && (c.corpus.is_none() || c.corpus.as_deref() == corpus)
+        })
     }
 
-    fn grant_unsandboxed_consent(&mut self, language: &str, granted_by: &str) {
-        self.unsandboxed_consent.retain(|c| c.language != language);
+    /// Record a grant for `language`, for one repo or (`None`) every repo.
+    fn grant_unsandboxed_consent(
+        &mut self,
+        language: &str,
+        granted_by: &str,
+        corpus: Option<&str>,
+    ) {
+        self.unsandboxed_consent
+            .retain(|c| !(c.language == language && c.corpus.as_deref() == corpus));
         self.unsandboxed_consent.push(UnsandboxedConsent {
             language: language.to_string(),
+            corpus: corpus.map(str::to_string),
             granted_by: granted_by.to_string(),
             granted_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
         });
@@ -2179,6 +2204,20 @@ mod tests {
         assert_eq!(super::detect_languages_in(r), vec!["java"]);
         std::fs::write(r.join("Main.kt"), "fun main() {}").unwrap();
         assert_eq!(super::detect_languages_in(r), vec!["java", "kotlin"]);
+    }
+
+    /// PR #940 review: `travsr init` recorded a Rust grant with no repo, so it
+    /// covered every Rust repo. It now records its own repo, a `lang
+    /// allow-unsandboxed` grant still covers all, and both survive a save.
+    #[test]
+    fn an_init_grant_is_recorded_for_its_repo_only() {
+        let mut cfg = super::LangConfig::default();
+        cfg.grant_unsandboxed_consent("rust", "travsr init", Some("github.com/a/one"));
+        cfg.grant_unsandboxed_consent("java", "octocat", None);
+        let cfg: super::LangConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert!(cfg.has_unsandboxed_consent("rust", Some("github.com/a/one")));
+        assert!(!cfg.has_unsandboxed_consent("rust", Some("github.com/b/two")));
+        assert!(cfg.has_unsandboxed_consent("java", Some("github.com/b/two")));
     }
 
     #[test]

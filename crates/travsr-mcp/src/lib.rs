@@ -197,6 +197,18 @@ pub(crate) fn inject_cached_embed_hook(store: &mut SqliteStore, db_path: &Path) 
     }
 }
 
+/// The embed backend the repo holding `db_path` chose with `travsr embed init`
+/// (its `.travsr/embed.toml`), or `None` when it never did. The one rule for
+/// starting a sidecar, shared by this server and the daemon: a machine-wide
+/// default used to start one for every repo, loading the model for an index
+/// that does not exist while `daemon status` said no backend was active.
+pub fn repo_embed_backend(db_path: &Path) -> Option<String> {
+    db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(travsr_plugin_host::repo_backend_id)
+}
+
 /// Wire the active embed backend's KNN hook into `store`, arming the sidecar on
 /// first use for this `db_path` and reusing it on every later call.
 ///
@@ -215,18 +227,6 @@ pub(crate) fn inject_cached_embed_hook(store: &mut SqliteStore, db_path: &Path) 
 /// model resident and nothing referencing it. `build_embed_hooks` only starts
 /// the arming thread, so holding the lock across it does not serialise the
 /// 15-25 s model load.
-/// The embed backend the repo holding `db_path` chose with `travsr embed init`
-/// (its `.travsr/embed.toml`), or `None` when it never did. The one rule for
-/// starting a sidecar, shared by this server and the daemon: a machine-wide
-/// default used to start one for every repo, loading the model for an index
-/// that does not exist while `daemon status` said no backend was active.
-pub fn repo_embed_backend(db_path: &Path) -> Option<String> {
-    db_path
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(travsr_plugin_host::repo_backend_id)
-}
-
 pub(crate) fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     // A poisoned cache degrades to "no hook" rather than bringing down the query.
     let Ok(mut cache) = embed_hook_cache().lock() else {

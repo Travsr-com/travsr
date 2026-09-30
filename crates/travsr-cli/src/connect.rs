@@ -59,6 +59,9 @@ pub struct Connected {
     pub user_files: Vec<String>,
     /// Tools found that need a step of the user's own, by stable id.
     pub one_step: Vec<&'static str>,
+    /// A file this run could not write, in plain words, so a silent report
+    /// does not hide why a tool is missing from `tools`.
+    pub problems: Vec<String>,
 }
 
 /// `connect --print --json`: each AI tool found for `repo` and whether it
@@ -1612,7 +1615,13 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<Connected> {
                         Ok(outcome) => {
                             match &outcome {
                                 Outcome::Skipped(reason) => {
-                                    say!("  skipped {disp}: {reason}")
+                                    say!("  skipped {disp}: {reason}");
+                                    if !opts.remove {
+                                        connected.problems.push(format!(
+                                            "Left {disp} alone for {}: {reason}.",
+                                            display_name(tool.id())
+                                        ));
+                                    }
                                 }
                                 other => say!("  {} {disp}", label(other)),
                             }
@@ -1666,7 +1675,13 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<Connected> {
                             }
                         }
                         // Per-file failure is non-fatal; report and continue.
-                        Err(e) => say!("  error {disp}: {e}"),
+                        Err(e) => {
+                            say!("  error {disp}: {e}");
+                            connected.problems.push(format!(
+                                "Could not write {disp} for {}: {e}.",
+                                display_name(tool.id())
+                            ));
+                        }
                     }
                 }
                 if !opts.remove {
@@ -1799,7 +1814,7 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<Connected> {
                 connected.user_files.push(".gitignore".to_string());
                 say!("  {} .gitignore", label(&Outcome::Written))
             }
-            Ok(Outcome::Removed) => say!("  {} .gitignore", label(&Outcome::Removed)),
+            Ok(Outcome::Removed) => say!("  removed travsr's entries from .gitignore"),
             _ => {}
         }
     }

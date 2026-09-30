@@ -856,6 +856,7 @@ export function buildLanguageRows(
       needs_toolchain: (needs) => `needs ${needs}`,
       unsupported_os: () => `not available on ${osName || "this platform"}`,
       failed: () => "could not trace calls",
+      no_calls: () => "no calls found",
     };
     const state = typeof sent["state"] === "string" ? String(sent["state"]) : undefined;
     if (state !== undefined && state in READY_STATES) {
