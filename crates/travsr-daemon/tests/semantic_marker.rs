@@ -403,45 +403,24 @@ fn last_commit_is_stamped_before_phase_b_starts() {
     assert_eq!(phase_b, None, "Phase B not yet stamped");
 }
 
-fn traced_calls(db: &Path) -> i64 {
-    rusqlite::Connection::open(db)
-        .expect("open graph.db")
-        .query_row(
-            "SELECT count(*) FROM edges WHERE kind = 'ref/call' AND provenance = 'scip'",
-            [],
-            |r| r.get(0),
-        )
-        .expect("count traced calls")
+fn set_meta(db: &Path, key: &str, value: &str) {
+    let mut store = travsr_store::SqliteStore::open(db).expect("open graph.db");
+    store.set_meta(key, value).expect("set meta");
 }
 
-/// Re-reading an edited file drops its traced calls, so `init --semantic` at
-/// the same commit must trace them again rather than trust `phase_b_commit`.
-#[test]
-fn semantic_init_retraces_a_file_it_re_read() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    git_init(root);
-    std::fs::write(root.join("b.py"), "def helper():\n    return 1\n").unwrap();
-    let caller = "from b import helper\n\n\ndef main():\n    return helper()\n";
-    std::fs::write(root.join("a.py"), caller).unwrap();
-    commit_all(root, "seed");
-
-    init_semantic(root);
-    let db = root.join(".travsr/graph.db");
-    let before = traced_calls(&db);
-    assert!(before > 0, "arrangement failed: Phase B traced no call");
-
-    std::fs::write(root.join("a.py"), format!("# edited\n{caller}")).unwrap();
-    init_semantic(root);
-    assert_eq!(traced_calls(&db), before);
+fn head(dir: &Path) -> String {
+    let out = StdCommand::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .expect("git rev-parse");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A new git remote changes every node id and purges the graph, Phase B edges
-/// included, so the next `init --semantic` must run Phase B again.
-#[test]
-fn semantic_init_retraces_after_the_repository_identity_changes() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
+/// A Python pair committed, indexed, and marked as traced at HEAD, the state a
+/// completed Phase B leaves. Plain `init_repo` defers Phase B, so this needs
+/// no call tracer on the machine.
+fn traced_repo(root: &Path) -> std::path::PathBuf {
     git_init(root);
     std::fs::write(root.join("b.py"), "def helper():\n    return 1\n").unwrap();
     std::fs::write(
@@ -450,11 +429,52 @@ fn semantic_init_retraces_after_the_repository_identity_changes() {
     )
     .unwrap();
     commit_all(root, "seed");
-
-    init_semantic(root);
+    disable_registry();
+    travsr_daemon::init_repo(root).expect("init_repo");
     let db = root.join(".travsr/graph.db");
-    let before = traced_calls(&db);
-    assert!(before > 0, "arrangement failed: Phase B traced no call");
+    set_meta(&db, "phase_b_commit", &head(root));
+    set_meta(&db, "phase_b_dirty", "0");
+    db
+}
+
+/// Re-reading an edited file drops its traced calls, so init must mark them
+/// stale rather than trust `phase_b_commit == HEAD`; `init --semantic` then
+/// runs Phase B again on that flag.
+#[test]
+fn init_marks_calls_stale_when_it_re_reads_a_traced_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let db = traced_repo(root);
+
+    std::fs::write(
+        root.join("a.py"),
+        "# edited\nfrom b import helper\n\n\ndef main():\n    return helper()\n",
+    )
+    .unwrap();
+    travsr_daemon::init_repo(root).expect("init_repo");
+    assert!(reads_as_dirty(&db));
+}
+
+/// A first index has no traced calls to drop, so it must not read as stale.
+#[test]
+fn a_first_index_does_not_mark_calls_stale() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    git_init(root);
+    std::fs::write(root.join("b.py"), "def helper():\n    return 1\n").unwrap();
+    commit_all(root, "seed");
+    disable_registry();
+    travsr_daemon::init_repo(root).expect("init_repo");
+    assert!(!reads_as_dirty(&root.join(".travsr/graph.db")));
+}
+
+/// A new git remote changes every node id and purges the graph, traced calls
+/// included, so the Phase B marker must not survive it.
+#[test]
+fn a_repository_identity_change_clears_the_phase_b_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let db = traced_repo(root);
 
     git(
         root,
@@ -465,6 +485,6 @@ fn semantic_init_retraces_after_the_repository_identity_changes() {
             "https://github.com/x/retrace.git",
         ],
     );
-    init_semantic(root);
-    assert_eq!(traced_calls(&db), before);
+    travsr_daemon::init_repo(root).expect("init_repo");
+    assert_eq!(meta(&db, "phase_b_commit"), None);
 }
