@@ -294,6 +294,9 @@ pub fn readiness(c: &RepoCapability) -> Readiness {
             "crashed" | "zero_nodes" | "no_references" | "emitter_failed" | "emitter_missing"
             | "version_mismatch",
         ) => Readiness::Failed,
+        // The last run skipped it for want of the unsandboxed permission, which
+        // `travsr init` gives (the same reading as the MCP notes).
+        Some("needs_consent" | "needs_approval") => Readiness::SettingUp,
         _ => Readiness::Ready,
     }
 }
@@ -428,7 +431,11 @@ pub fn gather<'a>(
         registered: lang_toml.registered.iter().any(|r| r == entry.language),
         corpus_trusted: lang_toml.trusted_corpora.contains(corpus),
         analyzer_ready,
-        last_warning: warning_class(warnings, entry.language),
+        // A permission skip the user has since granted no longer holds.
+        last_warning: warning_class(warnings, entry.language).filter(|w| {
+            !(matches!(*w, "needs_consent" | "needs_approval")
+                && crate::resolver::persisted_unsandboxed_consent(entry.language))
+        }),
     }
 }
 
@@ -487,9 +494,13 @@ pub fn bundled_analyzer_ready(entry: &PhaseBEntry) -> bool {
 /// `lang status`, `lang install`, and the index-time resolver never disagree.
 pub fn analyzer_command_present(entry: &PhaseBEntry) -> bool {
     use travsr_core::exec::tool_available;
-    let command_present = tool_available(entry.command)
-        || (entry.command == "rust-analyzer"
-            && travsr_indexer::ra_runner::resolve_ra_binary().is_some());
+    // A rustup shim for rust-analyzer is on PATH even when the component is
+    // not installed, so rust-analyzer counts only once it runs (#738).
+    let command_present = if entry.command == "rust-analyzer" {
+        travsr_indexer::ra_runner::resolve_ra_binary().is_some()
+    } else {
+        tool_available(entry.command)
+    };
     command_present && entry.runtime_driver.map_or(true, tool_available)
 }
 
@@ -730,6 +741,14 @@ mod tests {
                     registered: false,
                     corpus_trusted: false,
                     analyzer_ready: false,
+                    ..repo("rust")
+                },
+                Readiness::SettingUp,
+            ),
+            (
+                "skipped for want of the unsandboxed permission",
+                RepoCapability {
+                    last_warning: Some("needs_consent"),
                     ..repo("rust")
                 },
                 Readiness::SettingUp,
