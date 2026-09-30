@@ -1561,7 +1561,9 @@ fn resolve_alias(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<C
         return Vec::new();
     };
     let mut originals: Vec<String> = Vec::new();
-    for o in body.lines().flat_map(|l| alias_originals(l, symbol)) {
+    // Each hit is `path:line:col:text`; only the text is a statement.
+    let texts = body.lines().filter_map(|l| l.splitn(4, ':').nth(3));
+    for o in texts.flat_map(|l| alias_originals(l, symbol)) {
         if !originals.contains(&o) {
             originals.push(o);
         }
@@ -1576,8 +1578,32 @@ fn resolve_alias(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<C
 }
 
 /// The identifiers `line` renames to `alias` (`orig as alias`), in order.
+/// Only an import or re-export line renames, or a member line of a list one
+/// spans several lines over; any other `as` is a cast (`req as Handler`).
 fn alias_originals(line: &str, alias: &str) -> Vec<String> {
     let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let stmt = line.trim_start();
+    let after_pub = match stmt.strip_prefix("pub") {
+        Some(rest) => rest.split_once(' ').map_or(rest, |(_, r)| r.trim_start()),
+        None => stmt,
+    };
+    let imports = [
+        "use ",
+        "import ",
+        "from ",
+        "export {",
+        "export type {",
+        "export *",
+        "extern crate ",
+    ]
+    .iter()
+    .any(|k| after_pub.starts_with(k));
+    let list_member = stmt
+        .split_once(" as ")
+        .is_some_and(|(head, _)| !head.is_empty() && head.chars().all(|c| is_ident(c) || c == ':'));
+    if !imports && !list_member {
+        return Vec::new();
+    }
     let mut out: Vec<String> = Vec::new();
     for (i, _) in line.match_indices(" as ") {
         let Some(after) = line[i + 4..].trim_start().strip_prefix(alias) else {
@@ -11303,6 +11329,14 @@ mod tests {
         assert!(alias_originals("import * as hello from './m'", "hello").is_empty());
         assert!(alias_originals("let n = x as install_rerank_model_v2;", a).is_empty());
         assert!(alias_originals("let n = install_rerank_model as u32;", a).is_empty());
+        // Casts are not renames, even on an `export` line.
+        assert!(alias_originals("export const z = go as Missing;", "Missing").is_empty());
+        assert!(alias_originals("const h = req as unknown as Handler;", "Handler").is_empty());
+        assert!(alias_originals("except ValueError as err:", "err").is_empty());
+        assert_eq!(
+            alias_originals("export { greet as hello };", "hello"),
+            vec!["greet"]
+        );
     }
 
     #[test]
