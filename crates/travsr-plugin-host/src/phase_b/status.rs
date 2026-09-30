@@ -308,12 +308,13 @@ pub fn readiness(c: &RepoCapability) -> Readiness {
     }
     // A bundled emitter that could not be found or started ships with travsr,
     // so `travsr init` cannot restore it; send the user to the reason instead.
-    // Absent now (not beside the binary) reads the same, before any run says so.
+    // Absent now (not beside the binary) reads as missing when no run has
+    // said more; a run that found it and saw it fail is Failed.
     if c.entry.analyzer_bundled() {
         match c.last_warning {
-            _ if !c.analyzer_ready => return Readiness::PartMissing,
             Some("emitter_missing") => return Readiness::PartMissing,
             Some("emitter_failed") => return Readiness::Failed,
+            _ if !c.analyzer_ready => return Readiness::PartMissing,
             _ => {}
         }
     }
@@ -1002,16 +1003,19 @@ mod tests {
             };
             assert_eq!(readiness(&cap), want, "{class}");
         }
-        // Absent now, with or without a record: `travsr lang install` cannot
-        // restore it either, so it is part missing, not setting up.
-        for last_warning in [None, Some("emitter_failed")] {
-            let cap = RepoCapability {
-                analyzer_ready: false,
-                last_warning,
-                ..repo("typescript")
-            };
-            assert_eq!(readiness(&cap), Readiness::PartMissing, "{last_warning:?}");
-        }
+        // Absent now with no record: `travsr lang install` cannot restore it
+        // either, so it is part missing, not setting up. A recorded failure
+        // still reads as failed (an emitter given by override, say).
+        let absent = |last_warning| RepoCapability {
+            analyzer_ready: false,
+            last_warning,
+            ..repo("typescript")
+        };
+        assert_eq!(readiness(&absent(None)), Readiness::PartMissing);
+        assert_eq!(
+            readiness(&absent(Some("emitter_failed"))),
+            Readiness::Failed
+        );
     }
 
     #[test]
