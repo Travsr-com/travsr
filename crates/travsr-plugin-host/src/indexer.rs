@@ -1125,25 +1125,22 @@ impl PluginIndexer {
                                                 // and must be visible at
                                                 // default verbosity, stderr
                                                 // head included.
+                                                Err(e)
+                                                    if travsr_indexer::emitter_missing(&e) =>
+                                                {
+                                                    tracing::debug!(
+                                                        "js lsif emitter not available: {e}"
+                                                    )
+                                                }
                                                 Err(e) => {
-                                                    let missing =
-                                                        travsr_indexer::emitter_missing(&e);
-                                                    if missing {
-                                                        tracing::debug!(
-                                                            "js lsif emitter not available: {e}"
-                                                        )
-                                                    } else {
-                                                        tracing::warn!(
-                                                            "js lsif emitter failed: {e:#}"
-                                                        )
-                                                    }
+                                                    tracing::warn!("js lsif emitter failed: {e:#}");
                                                     // With no tsconfig this pass is
                                                     // TypeScript's only one, so its
                                                     // failure is TypeScript's too.
                                                     if covers_ts {
                                                         travsr_indexer::sandbox::record_lsif_emitter_skip(
                                                             "typescript",
-                                                            missing,
+                                                            false,
                                                             format!("{e:#}"),
                                                         );
                                                     }
