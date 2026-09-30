@@ -1059,6 +1059,21 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     if !lines.is_empty() && phase_b_lang_incomplete(store, &seed.vname.language).is_some() {
         lines.push(incomplete_caveat(&seed.vname.language));
     }
+    // A struct, enum or type is used, not called: its uses are occurrence rows
+    // with no `ref/call` edge (#650), so the list above can hold none of them.
+    if !relevant.iter().any(|(e, _)| e.kind == EdgeKind::RefCall) {
+        let uses: usize = seeds
+            .iter()
+            .filter_map(|n| store.reference_sites(n.id).ok())
+            .map(|s| s.len())
+            .sum();
+        if uses > 0 {
+            lines.push(format!(
+                "[note: nothing calls '{symbol}', but it is used at {uses} place(s); \
+                 find_references lists them.]"
+            ));
+        }
+    }
     lines.join("\n")
 }
 
@@ -11412,6 +11427,39 @@ mod tests {
             result.contains("app.ts:5"),
             "the surviving site must be the recorded one: {result}"
         );
+    }
+
+    /// A struct is used, never called, so its uses are occurrence rows with no
+    /// `ref/call` edge. `get_callers` listed only its file and read as unused
+    /// (`LsifPositionalRef`, 12 uses). It says where the uses are instead.
+    #[test]
+    fn get_callers_points_a_used_but_uncalled_symbol_at_find_references() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let point = Node::new(
+            VName::new("", "", "geo.rs", "rust", "struct:Point"),
+            "struct",
+        );
+        let user = Node::new(VName::new("", "", "app.rs", "rust", "fn:draw"), "function")
+            .with_line(1)
+            .with_end_line(4);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&point).unwrap();
+        store.put_node(&user).unwrap();
+        store
+            .record_edge_sites(&[(user.id, point.id, 2, None), (user.id, point.id, 3, None)])
+            .unwrap();
+        let result = get_callers(&store, "Point", None);
+        assert!(
+            result.contains("nothing calls 'Point', but it is used at 2 place(s)"),
+            "{result}"
+        );
+
+        // Once something calls it, the call rows are the answer and no note is added.
+        store
+            .put_edge_lsif(&Edge::new(user.id, point.id, EdgeKind::RefCall))
+            .unwrap();
+        let result = get_callers(&store, "Point", None);
+        assert!(!result.contains("nothing calls"), "{result}");
     }
 
     /// A site whose only backing edge was matched by leaf name must say so.

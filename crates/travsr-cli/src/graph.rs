@@ -249,7 +249,32 @@ pub fn run(
             .as_ref()
             .is_some_and(|s| s.kind == "file" && is_config_manifest_path(&s.path));
 
+    // A struct, enum or type is used, not called: its uses are occurrence rows
+    // with no `ref/call` edge (#650), so callers can list none while it has many.
+    let uses_not_calls = match &payload.seed {
+        Some(seed)
+            if !matches!(direction, Direction::Deps)
+                && matches!(format, Format::Tree)
+                && !payload
+                    .edges
+                    .iter()
+                    .any(|e| e.dst == seed.id && e.kind == "ref/call") =>
+        {
+            daemon_client::open_read_store(&db_path)
+                .ok()
+                .and_then(|s| s.reference_sites(travsr_core::NodeId(seed.id)).ok())
+                .map_or(0, |sites| sites.len())
+        }
+        _ => 0,
+    };
+
     render(payload, format, budget)?;
+    if uses_not_calls > 0 {
+        eprintln!(
+            "note: nothing calls '{query_str}', but it is used at {uses_not_calls} place(s). \
+             List them with `travsr references {query_str}`."
+        );
+    }
     if manifest_dead_end {
         eprintln!(
             "note: manifests are configuration inputs, no source file depends on one, so \
