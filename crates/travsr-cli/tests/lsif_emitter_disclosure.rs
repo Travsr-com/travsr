@@ -238,9 +238,18 @@ fn missing_emitter_is_disclosed_on_init_in_meta_and_in_status() {
         verbose.contains("TRAVSR_LSIF_TS"),
         "status --verbose must name the override that is wrong:\n{verbose}"
     );
+    // PR #940 review: the summary must say one thing about tracing, not two.
+    // TypeScript is the only language here and the forced-missing emitter lands
+    // it in PartMissing, so the stage line "Traced calls" must be suppressed and
+    // the per-language "could not trace calls" line must stand alone; when the
+    // emitter is present instead, the language is ready and only the stage line
+    // shows. Either way exactly one of the two appears, never both.
+    let traced = combined.contains("Traced calls");
+    let failed_line = combined.contains("could not trace calls");
     assert!(
-        combined.contains("Traced calls"),
-        "the native pass did run and may still be reported, just not alone:\n{combined}"
+        traced != failed_line,
+        "exactly one of the trace-stage line and the per-language failure line \
+         must appear, never both:\n{combined}"
     );
     // The marker advances (the native pass is current at HEAD), exactly as it
     // does for a crashed sidecar under #712; `status` is what says "partial".

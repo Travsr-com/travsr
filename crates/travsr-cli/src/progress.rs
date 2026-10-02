@@ -484,7 +484,16 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
             commas(s.files_read),
             if s.files_read == 1 { "" } else { "s" }
         ));
-        stage("Traced calls".to_string());
+        // Not when every Phase B language failed: the per-language lines below
+        // `Ready.` then say calls could not be traced, and an unconditional
+        // "Traced calls" would contradict them (PR #940 review). Partial
+        // success (some language did trace) still earns the line. `tag()`
+        // groups Failed and PartMissing as "failed", as status.rs does.
+        let all_failed =
+            !s.languages.is_empty() && s.languages.iter().all(|(_, r)| r.tag() == "failed");
+        if !all_failed {
+            stage("Traced calls".to_string());
+        }
         if s.keeping_fresh != "not_started" {
             stage("Keeping it fresh on every commit".to_string());
         }
@@ -889,6 +898,50 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("Got language tools")),
             "{lines:#?}"
+        );
+    }
+
+    /// PR #940 review (blocking): "Traced calls" must not claim success when
+    /// every Phase B language failed, since the per-language lines below `Ready.`
+    /// then say calls could not be traced. Partial success still earns the line.
+    #[test]
+    fn traced_calls_is_suppressed_only_when_every_language_failed() {
+        use travsr_plugin_host::phase_b::status::Readiness;
+
+        // One language, Failed: no "Traced calls", and the honest failure line
+        // is the only word on tracing.
+        let mut s = summary();
+        s.languages = vec![("python".into(), Readiness::Failed)];
+        let lines = render_summary(&s);
+        assert!(
+            !lines.iter().any(|l| l.contains("Traced calls")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("could not trace calls")),
+            "{lines:#?}"
+        );
+
+        // PartMissing (the reviewer's own repro) groups as failed too.
+        let mut s = summary();
+        s.languages = vec![("python".into(), Readiness::PartMissing)];
+        assert!(
+            !render_summary(&s)
+                .iter()
+                .any(|l| l.contains("Traced calls")),
+            "part-missing must suppress it too"
+        );
+
+        // Partial success: one language traced, one failed — the line stays.
+        let mut s = summary();
+        s.languages = vec![
+            ("rust".into(), Readiness::Ready),
+            ("python".into(), Readiness::Failed),
+        ];
+        let lines = render_summary(&s);
+        assert!(
+            lines.iter().any(|l| l.contains("Traced calls")),
+            "partial success must keep it:\n{lines:#?}"
         );
     }
 
