@@ -78,22 +78,34 @@ pub fn classify(input: &HookInput) -> Option<Request> {
             }
             Some(Request::Read { path })
         }
-        "Bash" => {
-            let command = args.and_then(|a| a.command.as_deref())?;
-            let found = shell::classify(command)?;
-            match found.kind {
-                SearchTool::Content => Some(Request::Content {
-                    term: found.term,
-                    via: found.program,
-                }),
-                SearchTool::Files => Some(Request::Files {
-                    hint: found.term,
-                    via: found.program,
-                }),
-            }
-        }
+        "Bash" => bash_requests(input).into_iter().next(),
         _ => None,
     }
+}
+
+/// Every search in a `Bash` chain, as requests, in [`shell::classify_chain`]'s
+/// order. Empty for any other tool.
+fn bash_requests(input: &HookInput) -> Vec<Request> {
+    let command = input
+        .tool_input
+        .as_ref()
+        .and_then(|a| a.command.as_deref())
+        .filter(|_| input.tool_name.as_deref() == Some("Bash"));
+    command
+        .map(shell::classify_chain)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|found| match found.kind {
+            SearchTool::Content => Request::Content {
+                term: found.term,
+                via: found.program,
+            },
+            SearchTool::Files => Request::Files {
+                hint: found.term,
+                via: found.program,
+            },
+        })
+        .collect()
 }
 
 /// The search term of a Travsr MCP call, when `tool` is one.
@@ -600,7 +612,12 @@ pub fn decide(input: &HookInput, mode: GuardMode, repo_root: Option<&Path>) -> D
         Err(why) => return pass(&why),
     };
 
-    match (mode, redirect_for(&index, input.cwd.as_deref(), &request)) {
+    // Any search in a chain the graph answers decides it, not only the first:
+    // `find . -name '*.rs' && rg Foo` is about `Foo`.
+    let redirect = std::iter::once(&request)
+        .chain(bash_requests(input).iter().skip(1))
+        .find_map(|r| redirect_for(&index, input.cwd.as_deref(), r));
+    match (mode, redirect) {
         // Strict, and the graph genuinely holds the answer. One redirect per
         // (session, term): the valve releases every repeat, so this can never
         // become a loop the agent cannot leave.

@@ -4711,8 +4711,7 @@ LIMIT ?4",
     /// `fn:Type.method` / `method:Type.method` node, the exact-signature pass
     /// misses it. This precise, index-time fallback recovers the qualified
     /// node by leaf name; the caller resolves only when the match is unique so
-    /// no false edge is created. LIKE metacharacters (`_`, `%`) in identifiers
-    /// are escaped so `announce_all` is matched literally.
+    /// no false edge is created.
     pub fn fn_nodes_by_leaf_name(
         &self,
         names: &[String],
@@ -4720,53 +4719,40 @@ LIMIT ?4",
         if names.is_empty() {
             return Ok(Vec::new());
         }
+        let wanted: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        // The leaf a caller could look `sig` up by: after the last `.` of a
+        // qualified `fn:`/`method:` signature, or the whole name of a bare
+        // `fn:name`.
+        let leaf = |sig: &str| -> Option<String> {
+            let (bare, rest) = match sig.strip_prefix("fn:") {
+                Some(rest) => (true, rest),
+                None => (false, sig.strip_prefix("method:")?),
+            };
+            match rest.rsplit_once('.') {
+                Some((_, leaf)) => Some(leaf.to_string()),
+                None => bare.then(|| rest.to_string()),
+            }
+        };
         (|| -> AnyResult<Vec<(NodeId, String, String, String)>> {
-            // Each name contributes 3 params (exact + 2 LIKE). Chunk so a large
-            // `names` slice never exceeds SQLite's SQLITE_MAX_VARIABLE_NUMBER
-            // (default 999 on older builds) or the expression-tree depth limit:
-            // 300 names → 900 params / 900 OR-terms per statement.
-            const NAMES_PER_CHUNK: usize = 300;
-            let mut out = Vec::new();
-            for chunk in names.chunks(NAMES_PER_CHUNK) {
-                let mut clauses: Vec<&str> = Vec::with_capacity(chunk.len() * 3);
-                let mut params: Vec<String> = Vec::with_capacity(chunk.len() * 3);
-                for name in chunk {
-                    let esc = name
-                        .replace('\\', "\\\\")
-                        .replace('%', "\\%")
-                        .replace('_', "\\_");
-                    clauses.push("signature = ?");
-                    params.push(format!("fn:{name}"));
-                    clauses.push("signature LIKE ? ESCAPE '\\'");
-                    params.push(format!("fn:%.{esc}"));
-                    clauses.push("signature LIKE ? ESCAPE '\\'");
-                    params.push(format!("method:%.{esc}"));
-                }
-                // Kind set matches `fetch_all_fn_spans` (incl. the `fn` kind used
-                // by some Phase A parsers) so leaf-name resolution and span
-                // attribution consider the same node population.
-                let sql = format!(
+            // One scan, matched in Rust. A `LIKE 'fn:%.name'` per name cannot
+            // use an index and re-scanned every node per pattern: minutes on
+            // a 588k-node repo. Kind set matches `fetch_all_fn_spans` (incl.
+            // the `fn` kind used by some Phase A parsers) so leaf-name
+            // resolution and span attribution consider the same nodes.
+            let mut stmt = self
+                .conn
+                .prepare(
                     "SELECT id, signature, path, language FROM nodes \
-                     WHERE kind IN ('function','method','fn') AND ({})",
-                    clauses.join(" OR ")
-                );
-                let mut stmt = self
-                    .conn
-                    .prepare(&sql)
-                    .context("preparing fn_nodes_by_leaf_name")?;
-                let params_vec: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-                let rows = stmt
-                    .query_map(params_vec.as_slice(), |row| {
-                        let id = i64_to_node_id(row.get::<_, i64>(0)?);
-                        let sig: String = row.get(1)?;
-                        let path: String = row.get(2)?;
-                        let lang: String = row.get(3)?;
-                        Ok((id, sig, path, lang))
-                    })
-                    .context("executing fn_nodes_by_leaf_name")?;
-                for row in rows {
-                    out.push(row.context("decoding fn_nodes_by_leaf_name row")?);
+                     WHERE kind IN ('function','method','fn')",
+                )
+                .context("preparing fn_nodes_by_leaf_name")?;
+            let mut rows = stmt.query([]).context("executing fn_nodes_by_leaf_name")?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().context("reading fn_nodes_by_leaf_name row")? {
+                let sig: String = row.get(1)?;
+                if leaf(&sig).is_some_and(|l| wanted.contains(l.as_str())) {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    out.push((id, sig, row.get(2)?, row.get(3)?));
                 }
             }
             Ok(out)
@@ -5962,13 +5948,13 @@ LIMIT ?4",
             .iter()
             .map(|p| p.callee_def_path.as_str())
             .collect();
-        let mut span_cache: std::collections::HashMap<&str, Vec<(FnSpan, String)>> =
+        let mut span_cache: std::collections::HashMap<&str, Vec<(FnSpan, String, String)>> =
             std::collections::HashMap::with_capacity(unique_paths.len());
         for path in unique_paths {
             let mut stmt = self
                 .conn
                 .prepare_cached(
-                    "SELECT id, line, end_line, kind FROM nodes \
+                    "SELECT id, line, end_line, kind, signature FROM nodes \
                      WHERE corpus = ?1 AND path = ?2 \
                        AND line IS NOT NULL AND end_line IS NOT NULL \
                      ORDER BY (end_line - line) ASC, id ASC",
@@ -5983,6 +5969,7 @@ LIMIT ?4",
                             end_line: row.get(2)?,
                         },
                         row.get(3)?,
+                        row.get(4)?,
                     ))
                 })
                 .context("resolve_lsif_positional_refs: query")?
@@ -5991,17 +5978,45 @@ LIMIT ?4",
             span_cache.insert(path, spans);
         }
 
+        // The bare name a signature defines: `field:P.x` -> `x`.
+        let leaf_name = |signature: &str| -> String {
+            let leaf = signature.split_once(':').map_or(signature, |(_, r)| r);
+            let leaf = leaf.rsplit('.').next().unwrap_or(leaf);
+            leaf.strip_prefix("r#").unwrap_or(leaf).to_string()
+        };
         let mut out = Vec::with_capacity(positional.len());
         for p in positional {
             let def_line = p.callee_def_line as i64;
-            let Some((span, kind)) = span_cache
+            let containing: Vec<&(FnSpan, String, String)> = span_cache
                 .get(p.callee_def_path.as_str())
-                .and_then(|spans| {
+                .map(|spans| {
                     spans
                         .iter()
-                        .find(|(s, _)| s.line <= def_line && s.end_line >= def_line)
+                        .filter(|(s, ..)| s.line <= def_line && s.end_line >= def_line)
+                        .collect()
                 })
-            else {
+                .unwrap_or_default();
+            // The dump's lines can predate the spans: a file edited while
+            // rust-analyzer ran shifts its nodes, and the def line then lands in
+            // a neighbour. Only a node named like the definition is the callee,
+            // so the narrowest one with that name wins, not merely the narrowest
+            // (a field on its struct's line lost every reference to the struct
+            // or to itself, whichever sorted second). An enum variant has no
+            // node of its own, so a use of one counts for the enum around it:
+            // below its first line, or on it for a one-line enum
+            // (`enum Mode { Fast, Slow }`).
+            let found = match &p.callee_name {
+                Some(name) => containing
+                    .iter()
+                    .find(|(_, _, sig)| leaf_name(sig) == *name)
+                    .or_else(|| {
+                        containing.first().filter(|(s, kind, _)| {
+                            kind == "enum" && (s.line < def_line || s.line == s.end_line)
+                        })
+                    }),
+                None => containing.first(),
+            };
+            let Some((span, kind, _)) = found.copied() else {
                 continue; // fail closed: callee def resolves to no node
             };
             // A trait or impl that only encloses the definition is its
@@ -10416,8 +10431,16 @@ impl Store for SqliteStore {
                 ],
             )
             .context("inserting node")?;
-            Self::put_node_fts(&tx, node).context("put_node_fts")?;
-            Self::put_node_fts_words(&tx, node).context("put_node_fts_words")?;
+            if self.staging_active {
+                // Bulk init: the node's FTS row may exist only as a map row, which
+                // `put_node_fts` cannot retract. Defer it like the batch path does.
+                Self::put_node_fts_map_only(&tx, node).context("put_node_fts_map_only")?;
+                Self::put_node_fts_words_map_only(&tx, node)
+                    .context("put_node_fts_words_map_only")?;
+            } else {
+                Self::put_node_fts(&tx, node).context("put_node_fts")?;
+                Self::put_node_fts_words(&tx, node).context("put_node_fts_words")?;
+            }
             tx.commit().context("committing put_node transaction")?;
             Ok(())
         })()
@@ -12718,6 +12741,33 @@ mod tests {
 
         // Empty input short-circuits with no query.
         assert!(store.fn_nodes_by_leaf_name(&[]).unwrap().is_empty());
+    }
+
+    /// The leaf is matched exactly, the way the caller looks it up. The old
+    /// `LIKE 'fn:%.name'` (case-insensitive, one scan of every node per
+    /// pattern) took minutes on yugabyte-db's 588k nodes.
+    #[test]
+    fn fn_nodes_by_leaf_name_matches_the_leaf_exactly() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for (sig, kind) in [
+            ("fn:Svc.run", "method"),
+            ("fn:Svc.Run", "method"),
+            ("method:a.b.Svc.run", "method"),
+            ("method:run", "method"),
+            ("fn:Svc.rerun", "function"),
+        ] {
+            let n =
+                travsr_core::Node::new(travsr_core::VName::new("c", "", "a.go", "go", sig), kind);
+            store.put_node(&n).unwrap();
+        }
+        let mut got: Vec<String> = store
+            .fn_nodes_by_leaf_name(&["run".to_string()])
+            .unwrap()
+            .into_iter()
+            .map(|(_, sig, _, _)| sig)
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["fn:Svc.run", "method:a.b.Svc.run"]);
     }
 
     #[test]
@@ -16726,6 +16776,47 @@ mod tests {
         );
     }
 
+    /// The Cargo workspace dependency pass writes its nodes with `put_node`
+    /// while `travsr init` is still in bulk mode, after the manifests that
+    /// name the same dependency nodes went through the bulk path. Every one of
+    /// them failed (65 on yugabyte-db) and was dropped from the index.
+    #[test]
+    fn put_node_during_bulk_init_writes_a_node_the_bulk_path_already_wrote() {
+        let corpus = "ws-dep-test";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.begin_bulk_fts_tracking().unwrap();
+        store.begin_staging_tables().unwrap();
+
+        let dep = Node::new(
+            VName::new(corpus, "", "a/Cargo.toml", "toml", "dep:serde"),
+            "dependency",
+        );
+        let batch = vec![FileGraph {
+            vname_path: "a/Cargo.toml".into(),
+            new_hash: "aaa".into(),
+            nodes: vec![dep.clone()],
+            edges: vec![],
+            source: None,
+        }];
+        store.write_file_graphs_batch(&batch, true).unwrap();
+
+        store
+            .put_node(&dep)
+            .expect("the dependency node must be written");
+
+        store.flush_staging_to_production().unwrap();
+        store.rebuild_fts_from_map().unwrap();
+        assert!(store.get_node(dep.id).unwrap().is_some());
+        assert!(
+            store
+                .search_nodes_fuzzy("serde")
+                .unwrap()
+                .iter()
+                .any(|n| n.id == dep.id),
+            "the dependency node must be searchable"
+        );
+    }
+
     #[test]
     fn staging_nodes_and_edges_reach_production_after_flush() {
         let corpus = "staging-test";
@@ -17644,6 +17735,7 @@ mod tests {
                 callee_def_line: 1,
                 is_call: true,
                 caller_col: None,
+                callee_name: None,
             },
             // Genuine call: occurrence at a.rs:25 (inside g) → callee def b.rs:1 (h).
             travsr_core::LsifPositionalRef {
@@ -17653,6 +17745,7 @@ mod tests {
                 callee_def_line: 1,
                 is_call: true,
                 caller_col: None,
+                callee_name: None,
             },
         ];
 
@@ -17716,6 +17809,7 @@ mod tests {
             callee_def_line: def_line,
             is_call,
             caller_col: None,
+            callee_name: None,
         };
         // `name` defined on line 2 (inside the trait), `Point` on line 9, a
         // mention of the trait on its own line 1, and a call that lands on that
@@ -17728,6 +17822,92 @@ mod tests {
             .unwrap();
         let callees: Vec<_> = refs.iter().map(|r| r.callee_id).collect();
         assert_eq!(callees, vec![point.id, tr.id]);
+    }
+
+    /// rust-analyzer saw `BAR` on line 8, then three lines were added above it
+    /// before the dump was resolved, so line 8 is inside `foo` now. Every use of
+    /// `BAR` became a reference to `foo`, stored as fact until the calling file
+    /// changed again (`CATALOG` uses listed under `effective_prerequisites`).
+    #[test]
+    fn lsif_positional_callee_must_have_the_definition_name() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let foo = Node::new(VName::new(corpus, "", "a.rs", "rust", "fn:foo"), "function")
+            .with_line(5)
+            .with_end_line(10);
+        let bar = Node::new(
+            VName::new(corpus, "", "a.rs", "rust", "static:BAR"),
+            "static",
+        )
+        .with_line(11)
+        .with_end_line(11);
+        store
+            .write_scip_attributed_batch(corpus, &[foo, bar.clone()], &[])
+            .unwrap();
+        let at = |def_line: u32, name: &str| travsr_core::LsifPositionalRef {
+            caller_path: "b.rs".to_string(),
+            caller_line: 3,
+            callee_def_path: "a.rs".to_string(),
+            callee_def_line: def_line,
+            is_call: false,
+            caller_col: None,
+            callee_name: Some(name.to_string()),
+        };
+        let refs = store
+            .resolve_lsif_positional_refs(corpus, &[at(8, "BAR"), at(11, "BAR")])
+            .unwrap();
+        let callees: Vec<_> = refs.iter().map(|r| r.callee_id).collect();
+        assert_eq!(callees, vec![bar.id]);
+    }
+
+    /// PR #940 review: `pub struct P { pub x: i32 }` puts the struct and its
+    /// field on one line, and the narrowest span won by id alone, so every use
+    /// of whichever sorted second was dropped (`references field:P.x` said 0
+    /// with two uses). A use of an enum variant, which has no node, counts for
+    /// the enum around it.
+    #[test]
+    fn lsif_positional_callee_is_the_named_node_among_those_on_the_line() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let node = |sig: &str, kind: &str, line: u32, end: u32| {
+            Node::new(VName::new(corpus, "", "a.rs", "rust", sig), kind)
+                .with_line(line)
+                .with_end_line(end)
+        };
+        let p = node("struct:P", "struct", 1, 1);
+        let x = node("field:P.x", "field", 1, 1);
+        let shape = node("enum:Shape", "enum", 2, 5);
+        let mode = node("enum:Mode", "enum", 7, 7);
+        store
+            .write_scip_attributed_batch(
+                corpus,
+                &[p.clone(), x.clone(), shape.clone(), mode.clone()],
+                &[],
+            )
+            .unwrap();
+        let at = |def_line: u32, name: &str| travsr_core::LsifPositionalRef {
+            caller_path: "b.rs".to_string(),
+            caller_line: 3,
+            callee_def_path: "a.rs".to_string(),
+            callee_def_line: def_line,
+            is_call: false,
+            caller_col: None,
+            callee_name: Some(name.to_string()),
+        };
+        let refs = store
+            .resolve_lsif_positional_refs(
+                corpus,
+                &[
+                    at(1, "P"),
+                    at(1, "x"),
+                    at(3, "Circle"),
+                    at(2, "Other"),
+                    at(7, "Fast"),
+                ],
+            )
+            .unwrap();
+        let callees: Vec<_> = refs.iter().map(|r| r.callee_id).collect();
+        assert_eq!(callees, vec![p.id, x.id, shape.id, mode.id]);
     }
 
     /// `--fix` remediation for DBs written before the guard: `fsck` counts and

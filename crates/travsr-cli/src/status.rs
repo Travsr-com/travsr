@@ -62,16 +62,12 @@ fn live_precision_line(store: &travsr_store::SqliteStore) -> Option<String> {
 /// revert) all restore the file to its committed content, so the working tree
 /// ends up equal to HEAD with the flag still set and the `ref/call` edge still
 /// missing. Telling the user to commit is a dead end there: there is nothing
-/// to stage. Recovery is `travsr init --semantic`, or any later commit that
-/// fires the hook.
+/// to stage. Recovery is `travsr init`, or any later commit that fires the hook.
 ///
-/// The `--semantic` is load-bearing rather than decorative. Plain `travsr init`
-/// defers Phase B to the daemon (`run_phase_b_inline = semantic || !has_commit`),
-/// so on an already-committed repo it re-runs Phase A and returns without
-/// rebuilding the `ref/call` edges this flag is reporting as missing. The flag
-/// therefore survives, and the message would be naming a command that cannot
-/// clear it. Nor can the daemon rescue it here: `arm_phase_b_if_pending` only
-/// arms when `last_commit != phase_b_commit`, and in this state they are equal.
+/// Plain `travsr init` is enough: it always runs Phase B inline, and its
+/// done-guard (`phase_b_inline_needed`) re-runs it when this flag is set even
+/// though the markers are equal. The daemon cannot rescue it here:
+/// `arm_phase_b_if_pending` only arms when `last_commit != phase_b_commit`.
 ///
 /// Clearing the flag on the deferred path instead would be the wrong fix: the
 /// edges genuinely are missing until Phase B re-runs, so the flag is honest and
@@ -80,37 +76,10 @@ fn phase_b_state(payload: &StatusPayload) -> String {
     match payload.phase_b_commit.as_deref() {
         Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => {
             if payload.phase_b_dirty {
-                // A mid-edit reindex dropped the changed region's committed
-                // edges. Whether that is a real degradation depends on the live
-                // overlay, in three cases:
-                //   - live lane inactive (no ref_resolution rows at all: a
-                //     headless daemon with no editor, or a generic-detector
-                //     language with no lexical floor): nothing recovered the
-                //     edit, so it is genuinely stale until a refresh.
-                //   - active with references still pending: name how many are
-                //     unknown until commit.
-                //   - active with nothing pending: the overlay resolved every
-                //     reference it detected, so "stale, re-run init" would be
-                //     wrong advice.
-                // The counts are repo-wide and phase_b_dirty is a single flag,
-                // so this last case cannot prove every dropped edge came back:
-                // an editor-resolved file and a headless generic-language edit
-                // (which leaves no rows at all) both feed one flag, and the
-                // resolved rows may belong only to the first. So it reports the
-                // recovery it can see without claiming a full refresh, which the
-                // commit-gated path is what actually delivers.
-                let live_active = payload.live_refs_resolved > 0 || payload.live_refs_pending > 0;
-                if !live_active {
-                    "stale (run travsr init --semantic to refresh)".to_string()
-                } else if payload.live_refs_pending > 0 {
-                    format!(
-                        "{} reference(s) in uncommitted edits not yet resolved",
-                        payload.live_refs_pending
-                    )
-                } else {
-                    "uncommitted edits resolved where detected; commit for a full refresh"
-                        .to_string()
-                }
+                travsr_mcp::query::dirty_semantic_state(
+                    payload.live_refs_resolved,
+                    payload.live_refs_pending,
+                )
             } else {
                 // #712: the marker now advances even when a language crashed, so
                 // the healthy languages are complete and queryable at HEAD. Name
@@ -257,7 +226,60 @@ fn head_at(cwd: &std::path::Path) -> Option<String> {
     crate::git_bounded::git_stdout_bounded(Some(cwd), ["rev-parse", "--short", "HEAD"])
 }
 
-pub fn run() -> anyhow::Result<()> {
+/// The default language block: one line per language that is not simply
+/// ready, plus a note for a ready language whose calls are not traced as you
+/// edit. Plain words only (plan 3.0); the details are under `--verbose`, which
+/// prints them below instead of pointing at itself.
+fn language_lines(
+    states: &[(
+        String,
+        travsr_plugin_host::phase_b::status::Readiness,
+        travsr_daemon::EditTracing,
+    )],
+    verbose: bool,
+) -> Vec<String> {
+    use travsr_daemon::EditTracing;
+    use travsr_plugin_host::phase_b::status::Readiness;
+    states
+        .iter()
+        .filter_map(|(lang, readiness, editing)| {
+            let text = match (readiness, editing) {
+                (Readiness::Ready, EditTracing::On) => return None,
+                (Readiness::Ready, EditTracing::OffMeasured) => {
+                    "calls update at each commit, not as you edit (edit-time results \
+                     disagreed with commit results here too often)"
+                        .to_string()
+                }
+                (Readiness::Ready, EditTracing::OffUnavailable) => {
+                    "calls update at each commit, not as you edit".to_string()
+                }
+                (Readiness::Failed, _) if verbose => {
+                    "could not trace calls (the reason is below)".to_string()
+                }
+                (r, _) => return readiness_line(lang, r),
+            };
+            Some(format!("  {lang:<11} {text}"))
+        })
+        .collect()
+}
+
+/// One language's state and its one fix, for `status` and the `init` summary;
+/// `None` for a ready language.
+pub(crate) fn readiness_line(
+    lang: &str,
+    r: &travsr_plugin_host::phase_b::status::Readiness,
+) -> Option<String> {
+    if *r == travsr_plugin_host::phase_b::status::Readiness::Ready {
+        return None;
+    }
+    let text = match r.fix() {
+        Some(fix) => format!("{}. {fix}", r.label()),
+        None => r.label(),
+    };
+    Some(format!("  {lang:<11} {text}"))
+}
+
+pub fn run(verbose: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     // `head_at` and `find_git_root` are independent, bounded git queries on the
     // same `cwd` (the latter only shells out in the linked-worktree branch, via
@@ -311,8 +333,36 @@ pub fn run() -> anyhow::Result<()> {
     //
     // Silent when the lane has never claimed anything, which is every repo that
     // has not used it — a counter of zero is not news.
+    //
+    // Plan 3.0: the numbers are a diagnostic, so they are under `--verbose`; the
+    // default says per language, in plain words, where calls are not traced as
+    // you edit.
     if let Ok(store) = daemon_client::open_read_store(&db_path) {
-        if let Some(line) = live_precision_line(&store) {
+        if verbose {
+            if let Some(line) = live_precision_line(&store) {
+                println!("{line}");
+            }
+        }
+        use travsr_plugin_host::phase_b::status::Readiness;
+        // rust-analyzer ran and added no type-resolved calls: not ready, though
+        // no `phase_b_warnings` class records it.
+        let rust_degraded = payload
+            .rust_lsif_degraded
+            .as_deref()
+            .is_some_and(|d| !d.is_empty());
+        let states: Vec<_> = crate::init::repo_language_states(&repo_root)
+            .into_iter()
+            .map(|(lang, r)| {
+                let r = if lang == "rust" && r == Readiness::Ready && rust_degraded {
+                    Readiness::Failed
+                } else {
+                    r
+                };
+                let editing = travsr_daemon::edit_tracing(&store, &lang);
+                (lang, r, editing)
+            })
+            .collect();
+        for line in language_lines(&states, verbose) {
             println!("{line}");
         }
     }
@@ -364,8 +414,9 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     // H3: surface Phase B warnings so the user knows about crashed/mismatched
-    // analyzers without having to re-read the init output.
-    if let Some(warnings) = &payload.phase_b_warnings {
+    // analyzers without having to re-read the init output. Under `--verbose`:
+    // the language block above gives each one's state and fix in plain words.
+    if let Some(warnings) = payload.phase_b_warnings.as_ref().filter(|_| verbose) {
         if !warnings.is_empty() {
             // Trust is per-repo, not per-language: a single `install` enables
             // every language at once, so collapse the "not enabled here" notices
@@ -376,7 +427,7 @@ pub fn run() -> anyhow::Result<()> {
                 .collect();
             if !untrusted.is_empty() {
                 eprintln!(
-                    "warning: semantic analysis is not enabled for this repository yet ({}); run `travsr lang install <lang>` here to enable",
+                    "warning: semantic analysis is not enabled for this repository yet ({}); run `travsr init` here to enable",
                     untrusted.join(", ")
                 );
             }
@@ -388,7 +439,7 @@ pub fn run() -> anyhow::Result<()> {
                     // no-op Phase A can make look like it did nothing; `--force`
                     // purges and rebuilds so the retry is unambiguous.
                     ["crashed", lang] => eprintln!(
-                        "warning: semantic analyzer for '{lang}' crashed, fix the tool (e.g. `travsr lang install {lang}`), then re-run `travsr init --semantic --force` to rebuild"
+                        "warning: semantic analyzer for '{lang}' crashed, fix the tool (e.g. `travsr lang install {lang}`), then re-run `travsr init --force` to rebuild"
                     ),
                     ["version_mismatch", rest] => {
                         let v: Vec<&str> = rest.splitn(3, ':').collect();
@@ -420,7 +471,7 @@ pub fn run() -> anyhow::Result<()> {
                     // success, which is what makes it worth saying out loud.
                     ["no_references", lang] => {
                         eprintln!(
-                            "warning: '{lang}' analysis produced definitions but no references, so no call edges came from it. The analyzer reported success, so this is its output being incomplete rather than a crash. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see its own diagnostics"
+                            "note: '{lang}' analysis found definitions but no calls between them, which is expected for a lone script. If this code does make calls, the analyzer's own diagnostics say why: re-run `RUST_LOG=travsr_plugin_host=debug travsr init --force`"
                         );
                     }
                     ["zero_nodes", lang] => {
@@ -433,7 +484,7 @@ pub fn run() -> anyhow::Result<()> {
                             // agent `=warn` for this same condition. Two
                             // surfaces naming two levels for one problem is how
                             // the advice starts drifting.
-                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help. The cause is in the analyzer's own output: re-run `RUST_LOG=travsr_plugin_host=warn travsr init --semantic --force` to see it. It may be this project (a missing SDK, an unbuildable project, or a build that skips part of its sources), or it may be how travsr invoked the analyzer"
+                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help. The cause is in the analyzer's own output: re-run `RUST_LOG=travsr_plugin_host=warn travsr init --force` to see it. It may be this project (a missing SDK, an unbuildable project, or a build that skips part of its sources), or it may be how travsr invoked the analyzer"
                         );
                         // Name the concrete thing to check rather than leaving
                         // the possible causes as the only clue: the catalog
@@ -487,6 +538,10 @@ pub fn run() -> anyhow::Result<()> {
                     ),
                     // L5a: scip-clang (c/cpp) needs a compile_commands.json at the
                     // repo root — without one it hangs, so it is skipped up front.
+                    ["skipped_no_build_file", lang] => eprintln!(
+                        "note: '{lang}' calls are traced once the project has {}; this repo has none, so its '{lang}' files are read for structure only",
+                        travsr_plugin_host::phase_b::catalog::required_build_files(lang).1
+                    ),
                     ["skipped_no_compdb", lang] => eprintln!(
                         "warning: full '{lang}' analysis needs a compile database (compile_commands.json) at the repo root. Generate one (e.g. `bear -- make`, or CMake's CMAKE_EXPORT_COMPILE_COMMANDS)"
                     ),
@@ -504,12 +559,12 @@ pub fn run() -> anyhow::Result<()> {
                     // analyzer that is not installed is a capability question
                     // `travsr lang list` answers rather than a failed run.
                     ["emitter_missing", lang] => eprintln!(
-                        "warning: full '{lang}' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) could not be started, so cross-file call and reference edges are missing. This happens when the travsr binary is run from outside its install layout. Set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr), then re-run `travsr init --semantic --force`"
+                        "warning: full '{lang}' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) could not be started, so cross-file call and reference edges are missing. This happens when the travsr binary is run from outside its install layout. Set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr), then re-run `travsr init --force`"
                     ),
                     ["emitter_failed", lang] => {
                         let analyzer = travsr_daemon::lsif_analyzer_name(lang);
                         eprintln!(
-                            "warning: full '{lang}' analysis is incomplete: {analyzer} started but failed, so cross-file call and reference edges are missing. Re-run `RUST_LOG=travsr_daemon=warn,travsr_plugin_host=warn travsr init --semantic --force` to see its error"
+                            "warning: full '{lang}' analysis is incomplete: {analyzer} started but failed, so cross-file call and reference edges are missing. Re-run `RUST_LOG=travsr_daemon=warn,travsr_plugin_host=warn travsr init --force` to see its error"
                         )
                     }
                     // E6: SCIP definitions that did not unify onto their Phase A
@@ -536,7 +591,7 @@ pub fn run() -> anyhow::Result<()> {
                             missed,
                         );
                         let tail = if rows.is_empty() {
-                            "run `travsr init --semantic` once to record which definitions they are"
+                            "run `travsr init` once to record which definitions they are"
                         } else {
                             "the unreconciled definitions are listed below"
                         };
@@ -558,7 +613,10 @@ pub fn run() -> anyhow::Result<()> {
     // this is where "the Android SDK was not found" reaches the user without
     // a RUST_LOG re-run. Printed after the classes so it reads as the reason
     // for the warning above it.
-    for d in sidecar_diagnostics(&payload) {
+    for d in sidecar_diagnostics(&payload)
+        .into_iter()
+        .filter(|_| verbose)
+    {
         eprintln!("warning: '{}' analysis: {} [{}]", d.lang, d.message, d.code);
     }
 
@@ -567,7 +625,7 @@ pub fn run() -> anyhow::Result<()> {
     // (bubblewrap); Windows and macOS have none to add here, so the only path
     // to full edges is the trusted-repo opt-in. `cfg!` (not `#[cfg]`) keeps
     // every platform's wording compiled and checked.
-    if let Some(reason) = &payload.rust_lsif_degraded {
+    if let Some(reason) = payload.rust_lsif_degraded.as_ref().filter(|_| verbose) {
         match reason.as_str() {
             "sandbox_unavailable" => {
                 let remedy = if cfg!(target_os = "linux") {
@@ -587,8 +645,8 @@ pub fn run() -> anyhow::Result<()> {
                 "warning: Rust is on basic analysis, rust-analyzer produced \
                  references but none could be matched to indexed symbols, so no \
                  type-resolved call edges were added (structural call edges are \
-                 unaffected). Re-run `travsr init --force --allow-unsandboxed \
-                 --semantic`; if it persists, please report it."
+                 unaffected). Re-run `travsr init --force --allow-unsandboxed`; \
+                 if it persists, please report it."
             ),
             _ => {}
         }
@@ -610,7 +668,9 @@ pub fn run() -> anyhow::Result<()> {
     // RFC-025 §8: sidecar version health (installed vs required vs latest), with
     // the exact remedy. Computed offline; the `latest` note is present only when
     // the local cache is warm. Prints nothing when no sidecar is installed.
-    crate::sidecar_health::print_block();
+    if verbose {
+        crate::sidecar_health::print_block();
+    }
 
     // #712 F: the embed sidecar can be installed while no backend is active, so
     // the semantic path silently runs without embeddings. Nudge to enable it.
@@ -705,6 +765,67 @@ mod tests {
     }
     use super::*;
 
+    /// `--semantic` does nothing any more, so no advice may name it: a user who
+    /// copies `travsr init --semantic --force` gets `travsr init --force` at
+    /// best, and a hidden flag in a remedy reads as the step that mattered.
+    /// Any mention, not only `init --semantic`: advice wraps across lines.
+    #[test]
+    fn no_advice_names_the_retired_semantic_flag() {
+        let flag = concat!("--", "semantic");
+        for (file, src) in [
+            ("status.rs", include_str!("status.rs")),
+            ("lang.rs", include_str!("lang.rs")),
+            ("faq.txt", include_str!("faq.txt")),
+        ] {
+            for line in src.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                assert!(!line.contains(flag), "{file}: {line}");
+            }
+        }
+    }
+
+    /// The default language block: one plain line per language that is not
+    /// simply ready, and a note where calls are not traced as you edit. Never
+    /// a line for a ready language traced as you edit.
+    #[test]
+    fn language_lines_are_plain_and_only_for_what_needs_saying() {
+        use travsr_daemon::EditTracing::{OffMeasured, OffUnavailable, On};
+        use travsr_plugin_host::phase_b::status::{jargon_in, Readiness};
+        let states = vec![
+            ("typescript".to_string(), Readiness::Ready, On),
+            ("rust".to_string(), Readiness::Ready, OffMeasured),
+            ("scala".to_string(), Readiness::Ready, OffUnavailable),
+            (
+                "c".to_string(),
+                Readiness::NeedsToolchain {
+                    needs: "compile_commands.json".into(),
+                },
+                On,
+            ),
+            ("ruby".to_string(), Readiness::Failed, OffUnavailable),
+        ];
+        let lines = language_lines(&states, false);
+        assert_eq!(
+            lines,
+            vec![
+                "  rust        calls update at each commit, not as you edit \
+                 (edit-time results disagreed with commit results here too often)",
+                "  scala       calls update at each commit, not as you edit",
+                "  c           needs compile_commands.json. Generate compile_commands.json \
+                 with your build, then run `travsr init`.",
+                "  ruby        could not trace calls. See `travsr status --verbose`.",
+            ]
+        );
+        for line in &lines {
+            assert_eq!(jargon_in(line), None, "{line}");
+        }
+        // PR #940 review: `status --verbose` told the user to see `status
+        // --verbose`; it prints the reason below instead.
+        assert_eq!(
+            language_lines(&states, true)[3],
+            "  ruby        could not trace calls (the reason is below)"
+        );
+    }
+
     fn payload(last: &str, phase_b: &str, dirty: bool) -> StatusPayload {
         StatusPayload {
             nodes: 1,
@@ -760,7 +881,7 @@ mod tests {
         // old logic said `complete`, but the file's `ref/call` edges are gone.
         assert_eq!(
             phase_b_state(&payload("abc", "abc", true)),
-            "stale (run travsr init --semantic to refresh)"
+            "stale (run travsr init to refresh)"
         );
     }
 
@@ -776,7 +897,7 @@ mod tests {
         p.live_refs_pending = 0;
         assert_eq!(
             phase_b_state(&p),
-            "uncommitted edits resolved where detected; commit for a full refresh"
+            "edits not yet committed were traced where found; commit for a full refresh"
         );
     }
 
@@ -789,7 +910,7 @@ mod tests {
         p.live_refs_pending = 3;
         assert_eq!(
             phase_b_state(&p),
-            "3 reference(s) in uncommitted edits not yet resolved"
+            "3 reference(s) in edits not yet committed are not traced yet"
         );
     }
 
@@ -802,7 +923,7 @@ mod tests {
         p.live_refs_pending = 4;
         assert_eq!(
             phase_b_state(&p),
-            "4 reference(s) in uncommitted edits not yet resolved"
+            "4 reference(s) in edits not yet committed are not traced yet"
         );
     }
 

@@ -79,6 +79,8 @@ fn indexed_repo() -> tempfile::TempDir {
 fn travsr(dir: &Path) -> Command {
     let mut c = Command::cargo_bin("travsr").unwrap();
     c.env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         // The guard reads `guard.mode` through the normal layering, which
         // includes `~/.travsr/config.toml`. Point HOME at the fixture so a
         // developer's own global config cannot decide a test.

@@ -117,6 +117,7 @@ fn mcp_get_context(repo: &Path, query: &str) -> String {
     use std::io::{BufRead as _, BufReader, Write as _};
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("CI", "1") // no background daemon from `travsr mcp`
         .arg("mcp")
         .current_dir(repo)
         .stdin(std::process::Stdio::piped())
@@ -195,6 +196,8 @@ fn model_switch_lifecycle_end_to_end() {
     Command::cargo_bin("travsr")
         .unwrap()
         .current_dir(repo.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         // #893: keep this tempdir out of the developer's real
         // ~/.travsr/registry.json.

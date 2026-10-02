@@ -28,6 +28,7 @@ travsr-retrieval = { path = "../travsr-retrieval" }
 travsr-plugin-sdk  = { path = "../travsr-plugin-sdk" }
 travsr-plugin-host = { path = "../travsr-plugin-host" }
 walkdir = { workspace = true }
+ignore = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

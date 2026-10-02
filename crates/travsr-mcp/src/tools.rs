@@ -227,8 +227,9 @@ fn phase_b_pending(store: &SqliteStore) -> bool {
 /// never disagree about completeness. Returns the note to append, or `None`
 /// when Phase B is complete for the current commit.
 pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
-    const PENDING: &str = "[note: call-graph index incomplete; semantic analysis has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
-    const STALE: &str = "[note: call-graph edges degraded; a background re-index dropped call edges since the last semantic analysis run; empty results are not authoritative. Run `travsr init` to rebuild.]";
+    // Plan 3.0/3.4: plain words and the one remedy, `travsr init`.
+    const PENDING: &str = "[note: calls are still being traced for this commit, so some may be missing and an empty result is not final. Run `travsr init` to finish now.]";
+    const STALE: &str = "[note: a background update dropped some calls since they were last traced, so an empty result is not final. Run `travsr init` to trace them again.]";
     let phase_b = store
         .get_meta("phase_b_commit")
         .ok()
@@ -260,21 +261,24 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
             //     still warns lightly that a few edges may be missing until the
             //     commit, rather than falling through to "results current".
             let resolved = store.resolved_ref_count().unwrap_or(0);
-            let pending = store.pending_ref_count().unwrap_or(0);
+            let pending: u64 = crate::query::pending_refs_in_edited_files(store)
+                .iter()
+                .map(|(_, n)| n)
+                .sum();
             if resolved == 0 && pending == 0 {
                 Some(STALE.to_string())
             } else if pending == 0 {
                 Some(
-                    "[note: a background re-index dropped some call edges; \
-                     uncommitted edits were re-resolved where detected, but a few \
-                     edges may still be missing until the next commit.]"
+                    "[note: a background update dropped some calls; edits not yet \
+                     committed were traced again where found, but a few calls may \
+                     be missing until the next commit.]"
                         .to_string(),
                 )
             } else {
                 Some(format!(
-                    "[note: {pending} reference(s) in uncommitted edits are not \
-                     yet resolved, so a few call edges may be missing until the \
-                     next commit; other results are current.]"
+                    "[note: {pending} reference(s) in edits not yet committed are \
+                     not traced yet, so a few calls may be missing until the next \
+                     commit; other results are current.]"
                 ))
             }
         }
@@ -282,14 +286,6 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
         _ => phase_b_unanalyzed_note(store),
     }
 }
-
-/// Files considered when scoping a pending-reference count. Beyond this the
-/// report is advisory anyway, and the cap is what keeps the group-by bounded.
-///
-/// Shared by [`live_overlay_note`] and `find_references`' zero gate on purpose:
-/// the note and the answer it decorates must describe the same file set, or
-/// they can contradict each other (#895).
-const PENDING_FILE_CAP: usize = 64;
 
 /// RFC-027 section 10: tell a reader that this answer includes un-ratified
 /// edges, and where the remaining gaps are.
@@ -319,9 +315,8 @@ const PENDING_FILE_CAP: usize = 64;
 /// drawn from, not of any one file in it.
 fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
     let live = store.count_edges_with_provenance("live").ok().unwrap_or(0);
-    let pending: u64 = store
-        .pending_ref_counts_by_file(PENDING_FILE_CAP)
-        .unwrap_or_default()
+    // Only files edited since HEAD: the same count `travsr status` gives.
+    let pending: u64 = crate::query::pending_refs_in_edited_files(store)
         .into_iter()
         .filter(|(path, _)| answer.contains(path.as_str()))
         .map(|(_, n)| n)
@@ -329,21 +324,27 @@ fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
     if live == 0 && pending == 0 {
         return None;
     }
+    // Plan 3.0: plain words, and no claim that tracing as you edit is on: a
+    // pending count is also what a language with it off reports.
     let mut parts = Vec::new();
     if live > 0 {
         parts.push(format!(
-            "{live} edge{} resolved from uncommitted edits and not yet ratified (repo-wide)",
-            if live == 1 { "" } else { "s" }
+            "{live} call{} found in edits not yet committed {} included and marked `live` \
+             (repo-wide)",
+            if live == 1 { "" } else { "s" },
+            if live == 1 { "is" } else { "are" }
         ));
     }
     if pending > 0 {
         parts.push(format!(
-            "{pending} reference{} in the files above detected but not resolved",
-            if pending == 1 { "" } else { "s" }
+            "{pending} reference{} in the files above changed since the last commit and {} \
+             not traced yet",
+            if pending == 1 { "" } else { "s" },
+            if pending == 1 { "is" } else { "are" }
         ));
     }
     Some(format!(
-        "[note: live overlay active: {}. These resolve deterministically at the next commit; filter to provenance != live for ratified truth only.]",
+        "[note: {}. The next commit confirms them.]",
         parts.join("; ")
     ))
 }
@@ -396,19 +397,23 @@ fn phase_b_unanalyzed_note(store: &SqliteStore) -> Option<String> {
     if langs.is_empty() {
         return None;
     }
-    // "or not all of them": the #878 classes leave a language with some call
-    // edges (native) but not the compiler-derived rest, so "no call edges" alone
-    // would overstate the gap while a short answer is still not authoritative.
+    // "not fully": the #878 classes leave a language with some calls traced
+    // but not the rest. Each language gets the line `travsr status` prints.
+    let decoded = crate::observability::decode_phase_b_warnings(&warnings);
+    let details: Vec<String> = langs
+        .iter()
+        .filter_map(|l| decoded.get(*l).map(|(_, d)| d.clone()))
+        .collect();
     Some(format!(
-        "[note: no call edges, or not all of them, were produced for {} on the last \
-         semantic analysis run, so an empty or short result here is not authoritative \
-         for {}. Run `travsr status` for the reason and the fix.]",
+        "[note: calls were not fully traced for {} on the last run, so an empty or short \
+         result here is not final for {}. {}]",
         langs.join(", "),
         if langs.len() == 1 {
             "that language"
         } else {
             "those languages"
-        }
+        },
+        details.join(" ")
     ))
 }
 
@@ -662,7 +667,7 @@ pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     // No-commit repos (both keys absent) and fully-indexed repos (both keys
     // present) fall through to the normal path.
     if phase_b_pending(store) {
-        return phase_b_pending_json("Semantic call-edge index");
+        return phase_b_pending_json();
     }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
     // Use the larger find-output limit, not the 4 KiB scalar cap: this tool
@@ -760,86 +765,68 @@ fn phase_b_lang_incomplete(store: &SqliteStore, lang: &str) -> Option<&'static s
 fn phase_b_incomplete_reason(store: &SqliteStore, lang: &str) -> Option<String> {
     // Rust-specific: rust-analyzer never ran, or ran and lost every ref.
     if lang == "rust" {
-        match store
+        if let Some("sandbox_unavailable" | "all_refs_dropped") = store
             .get_meta("rust_lsif_degraded")
             .ok()
             .flatten()
             .as_deref()
         {
-            Some("sandbox_unavailable") => {
-                return Some("Rust analysis did not run (no OS sandbox)".to_string())
-            }
-            Some("all_refs_dropped") => {
-                return Some("no Rust reference resolved to an indexed symbol".to_string())
-            }
-            _ => {}
+            return Some(
+                "Calls in 'rust' were not fully traced here. See `travsr status --verbose`."
+                    .to_string(),
+            );
         }
     }
-    // Per-language classes: the analyzer was missing, skipped, or is waiting on
-    // a one-time approval, so this language has no call edges from that run.
-    // The full set travsr-daemon writes as `<class>:{lang}`, minus the three
-    // (`crashed`, `emitter_missing`, `emitter_failed`) the caller softens ahead
-    // of this gate. Any daemon class not accounted for in one of the two places
-    // would let its language keep the definitive zero, so this list tracks the
-    // daemon's, not `phase_b_unanalyzed_note`'s narrower banner set.
-    const CLASSES: &[(&str, &str)] = &[
-        ("skipped_no_analyzer", "no analyzer is installed"),
-        ("needs_approval", "its analyzer is waiting on approval"),
-        ("needs_consent", "its analyzer is waiting on consent"),
-        ("skipped_no_compdb", "it has no compilation database"),
-        ("zero_nodes", "its analyzer produced no symbols"),
-        (
-            "no_references",
-            "no reference resolved to an indexed symbol",
-        ),
-        ("version_mismatch", "its analyzer is a mismatched version"),
-        ("skipped_unregistered", "its analyzer is not registered"),
-        (
-            "untrusted_corpus",
-            "this corpus is not trusted for analysis",
-        ),
+    // Per-language classes: every class travsr-daemon writes as `<class>:{lang}`,
+    // minus the three (`crashed`, `emitter_missing`, `emitter_failed`) the
+    // caller softens ahead of this gate. Any daemon class not accounted for in
+    // one of the two places would let its language keep the definitive zero, so
+    // this list tracks the daemon's, not `phase_b_unanalyzed_note`'s narrower
+    // banner set. The sentence is the one `travsr status` prints (plan 3.0).
+    const CLASSES: &[&str] = &[
+        "skipped_no_analyzer",
+        "needs_approval",
+        "needs_consent",
+        "skipped_no_compdb",
+        "skipped_no_build_file",
+        "zero_nodes",
+        "no_references",
+        "version_mismatch",
+        "skipped_unregistered",
+        "untrusted_corpus",
     ];
     if let Some(warnings) = store.get_meta("phase_b_warnings").ok().flatten() {
+        let decoded = crate::observability::decode_phase_b_warnings(&warnings);
         for entry in warnings.split(',') {
             let mut parts = entry.trim().splitn(3, ':');
             let (Some(class), Some(entry_lang)) = (parts.next(), parts.next()) else {
                 continue;
             };
-            if entry_lang != lang {
+            if entry_lang != lang || !CLASSES.contains(&class) {
                 continue;
             }
-            if let Some((_, why)) = CLASSES.iter().find(|(c, _)| *c == class) {
-                return Some(format!("'{lang}' was not analysed, {why}"));
+            if let Some((_, detail)) = decoded.get(lang) {
+                return Some(detail.clone());
             }
         }
     }
     // Repo-wide (#583): a mid-edit reindex dropped call edges without moving
     // HEAD. Cleared to "0" by the next Phase B run, so this does not latch.
     if store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1") {
-        return Some("a re-index dropped call edges and they are not rebuilt yet".to_string());
+        return Some(
+            "A background update dropped some calls and they are not traced again yet.".to_string(),
+        );
     }
     None
 }
 
 /// The one-line caveat appended to a get_callers / find_references answer when
-/// [`phase_b_lang_incomplete`] holds for the target language. The `crashed`
-/// wording is unchanged from #715; the #878 classes name the skipped analyzer.
-fn incomplete_caveat(lang: &str, class: &str) -> String {
-    let cause = match class {
-        "emitter_missing" => {
-            "the TypeScript analyzer (travsr-lsif-ts) could not be started on its last run"
-        }
-        "emitter_failed" => "the TypeScript analyzer (travsr-lsif-ts) failed on its last run",
-        _ => "crashed on its last run",
-    };
-    let subject = if class == "crashed" {
-        format!("semantic analysis for '{lang}' {cause}")
-    } else {
-        format!("semantic analysis for '{lang}' is incomplete: {cause}")
-    };
+/// [`phase_b_lang_incomplete`] holds for the target language: one plain line
+/// for every class, with the reason under `travsr status --verbose`.
+fn incomplete_caveat(lang: &str) -> String {
     format!(
-        "note: {subject}, so these results may be incomplete. Run `travsr status` for \
-         detail or `travsr init --semantic --force` to rebuild."
+        "note: calls in '{lang}' could not be fully traced on the last run, so these \
+         results may be incomplete. See `travsr status --verbose`."
     )
 }
 
@@ -1056,9 +1043,22 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     // Phase B run leaves partial coverage while the marker reads complete, so
     // this list may be missing callers. Attach the caveat to the confident
     // (non-empty) answer.
-    if !lines.is_empty() {
-        if let Some(class) = phase_b_lang_incomplete(store, &seed.vname.language) {
-            lines.push(incomplete_caveat(&seed.vname.language, class));
+    if !lines.is_empty() && phase_b_lang_incomplete(store, &seed.vname.language).is_some() {
+        lines.push(incomplete_caveat(&seed.vname.language));
+    }
+    // A struct, enum or type is used, not called: its uses are occurrence rows
+    // with no `ref/call` edge (#650), so the list above can hold none of them.
+    if !relevant.iter().any(|(e, _)| e.kind == EdgeKind::RefCall) {
+        let uses: usize = seeds
+            .iter()
+            .filter_map(|n| store.reference_sites(n.id).ok())
+            .map(|s| s.len())
+            .sum();
+        if uses > 0 {
+            lines.push(format!(
+                "[note: nothing calls '{symbol}', but it is used at {uses} place(s); \
+                 find_references lists them.]"
+            ));
         }
     }
     lines.join("\n")
@@ -1491,6 +1491,9 @@ pub(crate) fn resolve_reference_targets(
     path: Option<&str>,
 ) -> RefTarget {
     let mut candidates = resolve_symbol_nodes(store, symbol, path);
+    if candidates.is_empty() {
+        candidates = resolve_alias(store, symbol, path);
+    }
 
     // C/C++ split a symbol into a header declaration and a source definition
     // (`utils.h` decl + `utils.c` def). They share the simple name, so both
@@ -1525,6 +1528,189 @@ pub(crate) fn resolve_reference_targets(
             .unwrap_or(RefTarget::None),
         _ => RefTarget::Ambiguous(candidates),
     }
+}
+
+/// Definitions a name reaches only as an `as` alias (`pub use a::b as c`,
+/// `from m import b as c`, `import { b as c }`). Parsers index the original
+/// name, so a lookup by the alias found nothing although its calls are in the
+/// graph under the original. One bounded text search over the indexed files,
+/// run only when the name has no definition of its own; an original that
+/// resolves to no definition (a cast like `x as u32`) is dropped.
+fn resolve_alias(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<CoreNode> {
+    if symbol.is_empty() || !symbol.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return Vec::new();
+    }
+    let Some(repo_root) = resolve_repo_root(store) else {
+        return Vec::new();
+    };
+    // A fixed string, not a regex: it runs on every lookup that finds no
+    // definition, and git searches a fixed string about five times faster
+    // (90 ms against 420 ms on a 3,000-file repo). `alias_originals` checks
+    // each hit exactly.
+    let GrepOutcome::Matches(body) = run_git_grep(&repo_root, &format!("as {symbol}"), &[], true)
+    else {
+        return Vec::new();
+    };
+    // Each original with the import line that names its module.
+    let mut originals: Vec<(String, String)> = Vec::new();
+    // Each hit is `path:line:col:text`.
+    for hit in body.lines() {
+        let mut parts = hit.splitn(4, ':');
+        let (Some(path), Some(line_no), Some(_), Some(text)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        // A list member's module is on the line that opens the list.
+        let mut opener: Option<String> = None;
+        let in_list = || {
+            let line_no: usize = line_no.parse().unwrap_or(0);
+            opener = std::fs::read_to_string(repo_root.join(path))
+                .ok()
+                .and_then(|file| {
+                    let above: Vec<&str> = file.lines().take(line_no.saturating_sub(1)).collect();
+                    import_list_opener(&above).map(str::to_string)
+                });
+            opener.is_some()
+        };
+        for o in alias_originals(text, symbol, in_list) {
+            let import = opener.clone().unwrap_or_else(|| text.to_string());
+            if !originals.iter().any(|(seen, _)| *seen == o) {
+                originals.push((o, import));
+            }
+        }
+    }
+    // Aliasing usually exists to avoid a clash with a local name, so a
+    // same-named definition elsewhere is the wrong answer unless the import
+    // names where it lives (`use std::process::Command as StdCommand` is not
+    // this repo's `Command`).
+    let mut nodes: Vec<CoreNode> = originals
+        .iter()
+        .flat_map(|(o, import)| {
+            resolve_symbol_nodes(store, o, path)
+                .into_iter()
+                .filter(|n| import_names_home(import, &n.vname.path))
+        })
+        .collect();
+    nodes.sort_by_key(|n| n.id.0);
+    nodes.dedup_by_key(|n| n.id);
+    nodes
+}
+
+/// The identifiers `line` renames to `alias` (`orig as alias`), in order.
+/// Only an import or re-export line renames, or a member line of a list one
+/// spans several lines over (`in_import_list`, asked only for such a line);
+/// any other `as` is a cast (`req as Handler`, or `value as Handler,` inside
+/// an array).
+fn alias_originals(line: &str, alias: &str, in_import_list: impl FnOnce() -> bool) -> Vec<String> {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let stmt = line.trim_start();
+    let after_pub = match stmt.strip_prefix("pub") {
+        Some(rest) => rest.split_once(' ').map_or(rest, |(_, r)| r.trim_start()),
+        None => stmt,
+    };
+    let imports = [
+        "use ",
+        "import ",
+        "from ",
+        "export {",
+        "export type {",
+        "export *",
+        "extern crate ",
+    ]
+    .iter()
+    .any(|k| after_pub.starts_with(k));
+    let list_member = stmt
+        .split_once(" as ")
+        .is_some_and(|(head, _)| !head.is_empty() && head.chars().all(|c| is_ident(c) || c == ':'));
+    if !imports && !(list_member && in_import_list()) {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (i, _) in line.match_indices(" as ") {
+        let Some(after) = line[i + 4..].trim_start().strip_prefix(alias) else {
+            continue;
+        };
+        if after.starts_with(is_ident) {
+            continue;
+        }
+        let before = line[..i].trim_end();
+        let start = before
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| is_ident(*c))
+            .last()
+            .map_or(before.len(), |(j, _)| j);
+        let orig = &before[start..];
+        if !orig.is_empty() && orig != alias && !out.iter().any(|o| o == orig) {
+            out.push(orig.to_string());
+        }
+    }
+    out
+}
+
+/// The line that opens the import list the lines `above` a list member
+/// (nearest last) end inside: past the other members and comments, the line
+/// that opens the list is an import (`use a::{`, `import {`, `from m import (`,
+/// `export {`). `None` when that line is not an import.
+fn import_list_opener<'a>(above: &[&'a str]) -> Option<&'a str> {
+    let opener =
+        above.iter().rev().map(|l| l.trim()).find(|l| {
+            !(l.is_empty() || l.ends_with(',') || l.starts_with("//") || l.starts_with('#'))
+        });
+    opener.filter(|l| {
+        let l = l
+            .strip_prefix("pub")
+            .map_or(*l, |r| r.split_once(' ').map_or(r, |(_, r)| r.trim_start()));
+        (l.ends_with('{') || l.ends_with('('))
+            && ["use ", "import ", "from ", "export {", "export type {"]
+                .iter()
+                .any(|k| l.starts_with(k))
+    })
+}
+
+/// Whether `import` names where `def_path` lives: one of its module words
+/// (`travsr_core`, `graph`, `'./button'`) is a folder or file name on the path.
+/// An import naming none (`use super::x as y`, `from . import x as y`) is this
+/// folder's own code, so it passes.
+fn import_names_home(import: &str, def_path: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "use", "pub", "import", "from", "export", "type", "extern", "crate", "self", "super",
+    ];
+    let norm = |w: &str| w.to_ascii_lowercase().replace('-', "_");
+    let mut module = import.trim();
+    // `from m import a as b`: the names after `import` are not the module.
+    if let Some((head, _)) = module
+        .split_once(" import ")
+        .filter(|_| module.starts_with("from "))
+    {
+        module = head;
+    }
+    // Drop the listed names (`{a as b}`, `(a as b)`), then a lone `a as b`.
+    let mut outside = String::new();
+    let mut depth = 0usize;
+    for c in module.chars() {
+        match c {
+            '{' | '(' => depth += 1,
+            '}' | ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => outside.push(c),
+            _ => {}
+        }
+    }
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    let outside = match outside.split_once(" as ") {
+        Some((head, _)) => head.trim_end_matches(is_ident).to_string(),
+        None => outside,
+    };
+    let folders: Vec<String> = def_path
+        .split('/')
+        .map(|c| norm(c.split('.').next().unwrap_or(c)))
+        .collect();
+    let mut words = outside
+        .split(|c: char| !is_ident(c))
+        .filter(|w| !w.is_empty() && !KEYWORDS.contains(w))
+        .peekable();
+    words.peek().is_none() || words.any(|w| folders.contains(&norm(w)))
 }
 
 /// Whether every candidate is a multi-part Objective-C selector of ONE class
@@ -1635,9 +1821,13 @@ fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
 /// One function rather than three literals because the three tools drifted:
 /// `find_references`, `get_callers` and `get_execution_path` each carried their
 /// own copy, so fixing one left the other two telling users the same falsehood.
-fn phase_b_pending_json(index_name: &str) -> String {
-    format!(
-        r#"{{"status":"pending","message":"{index_name} has not finished. It is built by the daemon: check `travsr daemon status` and start one with `travsr daemon start` if none is running, or build it now with `travsr init --semantic`. `travsr status` shows progress."}}"#
+///
+/// Plan 3.4: the one remedy in plain words, inside the `<travsr-data>`
+/// envelope every other answer carries (the VS Code extension strips it before
+/// parsing, as it does for them).
+fn phase_b_pending_json() -> String {
+    wrap_envelope(
+        r#"{"status":"pending","message":"Calls are still being traced for this commit. Run `travsr init` to finish now, then ask again."}"#,
     )
 }
 
@@ -1660,7 +1850,7 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
         }
     }
     if phase_b_pending(store) {
-        return phase_b_pending_json("Semantic occurrence index");
+        return phase_b_pending_json();
     }
     // SEC-001: sanitize before returning. Use the larger find-output limit (not
     // the 4 KiB scalar cap) so a capped 500-site list and its truncation notice
@@ -1767,8 +1957,8 @@ pub fn find_references_structured(
     if phase_b_pending(store) {
         out.status = "pending";
         out.note = Some(
-            "Semantic occurrence index is still building, results are not yet \
-             authoritative. Run `travsr status` to check progress."
+            "Calls are still being traced for this commit, so results are not final \
+             yet. Run `travsr init` to finish now."
                 .to_string(),
         );
         return out;
@@ -1836,8 +2026,8 @@ pub fn find_references_structured(
             // or a skipped LSIF pass, leaves partial coverage under a complete
             // marker, so even a non-empty site list may be short. Surface the
             // same caveat instead of `note: None`.
-            if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
-                out.note = Some(incomplete_caveat(&target.vname.language, class));
+            if phase_b_lang_incomplete(store, &target.vname.language).is_some() {
+                out.note = Some(incomplete_caveat(&target.vname.language));
             }
         }
         _ => {
@@ -1991,8 +2181,8 @@ fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String 
             // #715 / #878: a crashed last run, or a skipped LSIF pass, leaves
             // partial coverage under a complete marker, so this occurrence list
             // may be short.
-            if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
-                lines.push(incomplete_caveat(&target.vname.language, class));
+            if phase_b_lang_incomplete(store, &target.vname.language).is_some() {
+                lines.push(incomplete_caveat(&target.vname.language));
             }
             lines.join("\n")
         }
@@ -2037,18 +2227,11 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // per-file / language-wide coverage gates below — those key on whether
         // occurrences exist, not on whether the run finished. Soften first so
         // neither is ever reported as a clean zero.
-        if let Some(class) = phase_b_lang_incomplete(store, lang) {
-            let cause = match class {
-                "crashed" => format!("Semantic analysis for '{lang}' crashed on its last run"),
-                _ => format!(
-                    "The TypeScript analyzer (travsr-lsif-ts) did not run for '{lang}' \
-                     on the last semantic analysis run"
-                ),
-            };
+        if phase_b_lang_incomplete(store, lang).is_some() {
             return format!(
-                "{header}\n0 recorded reference(s), not a definitive zero. {cause}, so its \
-                 occurrence coverage is partial. Run `travsr status` for detail, `travsr init \
-                 --semantic --force` to rebuild, or `find_pattern` for a textual search."
+                "{header}\n0 recorded reference(s), not a definitive zero: calls in '{lang}' \
+                 could not be fully traced on the last run. See `travsr status --verbose`, or \
+                 use `find_pattern` for a text search."
             );
         }
         let index_built_for_lang = store.language_has_edge_sites(lang).unwrap_or(false);
@@ -2057,11 +2240,9 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
             // Phase B did not run / failed / its provider records no occurrence
             // lines. This is a coverage gap, not a "zero references" answer.
             return format!(
-                "{header}\nOccurrence index unavailable for '{lang}': semantic \
-                 analysis recorded no reference occurrences for this \
-                 language in this repo; the result below is not a definitive \
-                 zero. Run `travsr status` to check progress, or use `find_pattern` \
-                 for a textual search."
+                "{header}\n0 recorded reference(s), not a definitive zero: calls in '{lang}' \
+                 are not traced in this repo yet. Run `travsr status` to see why, or use \
+                 `find_pattern` for a text search."
             );
         }
         // #450: the language has *some* occurrence data, but "some" is not
@@ -2091,12 +2272,10 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                 store.language_occurrence_coverage(lang).unwrap_or((0, 0));
             let coverage_pct = (100 * files_with_occ).checked_div(files_total).unwrap_or(0) as u32;
             return format!(
-                "{header}\n0 recorded reference(s), not a definitive zero. No \
-                 reference occurrences are recorded for '{}' itself, so semantic \
-                 analysis may never have covered this file ({files_with_occ} of \
-                 {files_total} '{lang}' files in this repo carry occurrence data, \
-                 {coverage_pct}%). Run `travsr status` to check Phase B, or use \
-                 `find_pattern` for a textual search.",
+                "{header}\n0 recorded reference(s), not a definitive zero: calls were not \
+                 traced in '{}' ({files_with_occ} of {files_total} '{lang}' files here \
+                 have traced calls, {coverage_pct}%). Run `travsr status` to see why, or \
+                 use `find_pattern` for a text search.",
                 target.vname.path
             );
         }
@@ -2130,21 +2309,21 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // Dogfooded: `travsr references collect_global` said zero while all 11
         // call sites sat pending in `travsr-mcp/src/tools.rs`; they resolved
         // verbatim once Phase B caught up.
-        let pending_here = store
-            .pending_ref_counts_by_file(PENDING_FILE_CAP)
-            .unwrap_or_default()
+        //
+        // Same count as `live_overlay_note`: only files edited since HEAD, so
+        // "changed since the last commit" is true of the file it names.
+        let pending_here = crate::query::pending_refs_in_edited_files(store)
             .into_iter()
             .find(|(path, _)| path == &target.vname.path)
             .map(|(_, n)| n)
             .unwrap_or(0);
         if pending_here > 0 {
             return format!(
-                "{header}\n0 recorded reference(s), not a definitive zero. \
-                 {pending_here} reference{} in '{}' {} detected but not yet \
-                 resolved, so uses of this symbol may be among them. They \
-                 resolve deterministically at the next commit; run `travsr init \
-                 --semantic` to resolve them now, or use `find_pattern` for a \
-                 textual search.",
+                "{header}\n0 recorded reference(s), not a definitive zero: \
+                 {pending_here} reference{} in '{}' changed since the last commit and \
+                 {} not traced yet, so uses of this symbol may be among them. Run \
+                 `travsr init` to trace them now, or use `find_pattern` for a text \
+                 search.",
                 if pending_here == 1 { "" } else { "s" },
                 target.vname.path,
                 if pending_here == 1 { "is" } else { "are" },
@@ -2171,8 +2350,8 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // healthy run, so a complete analysis still earns the definitive zero.
         if let Some(reason) = phase_b_incomplete_reason(store, lang) {
             return format!(
-                "{header}\n0 reference(s) recorded, but not a definitive zero: {reason}. \
-                 Run `travsr status`, or `find_pattern` for a textual search."
+                "{header}\n0 reference(s) recorded, but not a definitive zero. {reason} \
+                 Use `find_pattern` for a text search."
             );
         }
         // Analysis for this language ran to completion and this symbol has
@@ -2215,8 +2394,8 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
     // #715 / #878: these structural caller definitions can also be short if the
     // language's last Phase B run crashed before indexing every file, or if its
     // LSIF pass never ran.
-    if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
-        lines.push(incomplete_caveat(&target.vname.language, class));
+    if phase_b_lang_incomplete(store, &target.vname.language).is_some() {
+        lines.push(incomplete_caveat(&target.vname.language));
     }
     lines.join("\n")
 }
@@ -4967,6 +5146,19 @@ pub fn get_subsystem_brief(
 /// JSON is returned unsanitised — it is parsed by first-party TypeScript code,
 /// not fed to an LLM.
 pub fn get_lang_status(store: &SqliteStore, file: &str) -> String {
+    // Plan 8.5: no file means "every language here", one entry each in the
+    // same shape as a file query, rather than "not a supported language".
+    if file.is_empty() {
+        let entries: Vec<String> = store
+            .language_distribution()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(lang, _)| travsr_plugin_host::phase_b::catalog::lookup(&lang))
+            .filter_map(|e| e.extensions.first())
+            .map(|ext| get_lang_status_raw(store, &format!("file{ext}")))
+            .collect();
+        return format!("[{}]", entries.join(","));
+    }
     if let Err(reason) = validate_mcp_arg(file) {
         tracing::warn!("get_lang_status rejected invalid arg: {reason}");
         return UNKNOWN_LANG_JSON.to_string();
@@ -5047,7 +5239,7 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
         LangStatus::Active
     } else {
         let next = if analyzer_installed(meta.language) {
-            "travsr init --semantic --force".to_string()
+            "travsr init --force".to_string()
         } else {
             install_step(meta.language)
         };
@@ -5079,13 +5271,46 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
         r#"{{"language":"{lang}","status":"{status_tag}","statusLine":"{status_line}","builtin":{builtin},"semantic_available":{sem},"install_hint":"{hint}","prerequisites":"{prereq}","phase_b_commit":{pbc}}}"#,
         lang = meta.language,
         status_tag = status.tag(),
-        status_line = status.line(),
+        status_line = match status {
+            LangStatus::Partial { .. } => plain_partial_line(store, meta.language),
+            _ => status.line(),
+        },
         builtin = meta.builtin,
         sem = semantic_available,
         hint = install_hint,
         prereq = meta.effective_prerequisites(),
         pbc = phase_b_commit,
     )
+}
+
+/// A partial language's line in plain words (plan 3.0): what the readiness
+/// ladder says, else what the last run recorded, else "setting up". The
+/// same lines `travsr status` and `get_index_status` give, from `Readiness`.
+fn plain_partial_line(store: &SqliteStore, lang: &str) -> String {
+    use travsr_plugin_host::phase_b::status::Readiness;
+    let prefix = format!("{lang}: ");
+    let warnings = store
+        .get_meta("phase_b_warnings")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let from_run = crate::observability::decode_phase_b_warnings(&warnings)
+        .remove(lang)
+        .map(|(_, d)| d);
+    let from_ladder = store.resolve_repo_root().and_then(|root| {
+        let corpus = store.get_meta("corpus").ok().flatten().unwrap_or_default();
+        crate::observability::phase_b_availability(Some(&root), &corpus, &warnings)
+            .remove(lang)
+            .flatten()
+    });
+    let detail = from_ladder.or(from_run).unwrap_or_else(|| {
+        let r = Readiness::SettingUp;
+        format!("{lang}: {}. {}", r.label(), r.fix().unwrap_or_default())
+    });
+    detail
+        .strip_prefix(&prefix)
+        .map(str::to_string)
+        .unwrap_or(detail)
 }
 
 /// Global variant of `get_lang_status` — opens the first matched repo store.
@@ -6054,7 +6279,7 @@ pub fn repos_remove(name: &str) -> String {
 pub fn get_execution_path(store: &SqliteStore, source: &str, sink: &str) -> String {
     // Phase B deferred: execution paths require call edges which are not yet indexed.
     if phase_b_pending(store) {
-        return phase_b_pending_json("Semantic call-edge index");
+        return phase_b_pending_json();
     }
     get_execution_path_with_filter(store, source, sink, &OpenFilter)
 }
@@ -6977,7 +7202,7 @@ pub(crate) fn build_context_signals(
 /// PF-M4: accepts `phase_b_pending` as a pre-computed bool so callers can
 /// hoist the two `get_meta` queries out of the hot path and compute once.
 ///
-/// `embed_initialized` = embed.db exists (Phase 1 has run at some point).
+/// `embed_initialized` = embed.db exists and the repo turned embedding on.
 /// When `!has_embed && embed_initialized` the daemon hasn't injected the KNN hook yet
 /// (e.g. Phase 1 just completed, daemon restarting) — show "in progress" instead of "init needed".
 #[allow(clippy::too_many_arguments)]
@@ -7010,30 +7235,33 @@ fn build_context_signals_with_r2(
     }
     if embed_warming {
         parts.push(
-            "[note: semantic embeddings still warming up (sidecar starting); this result is lexical-only; retry in a few seconds for full semantic ranking]",
+            "[note: meaning-based search is still starting; this result uses text match only; ask again in a few seconds]",
         );
     } else if embed_disabled {
         // Arming finished with no hook installed, so unlike `warming` this will
         // not resolve on a retry. Most often the index was built with a
         // different embedding model than the one installed.
         parts.push(
-            "[note: semantic search unavailable (the embedding sidecar did not start, or the index was built with a different model); results are lexical only. Run `travsr embed status` to check, then `travsr embed reindex` if the model changed]",
+            "[note: meaning-based search could not start (often the index was built with a different model); results use text match only. Run `travsr embed status` to check, then `travsr embed reindex` if the model changed]",
         );
     } else if has_embed && knn_degraded {
         parts.push(
-            "[note: semantic search degraded, KNN timed out or returned empty; results are lexical only]",
+            "[note: meaning-based search timed out or found nothing; results use text match only]",
         );
     } else if !has_embed && embed_initialized {
         // Phase 1 has run (embed.db exists) but KNN hook not yet active.
         parts.push(
-            "[note: embedding in progress; run `travsr embed status` to check; results improve as index builds]",
+            "[note: meaning-based search is still being built; run `travsr embed status` to check; results improve as it finishes]",
         );
     } else if !has_embed {
-        parts.push("[note: semantic search disabled; run `travsr embed init` for better results]");
+        // Plan 8.5: optional and off by default (decision 3), so not a fault.
+        parts.push(
+            "[note: meaning-based search is optional and off here; results use text match. Run `travsr embed init` to add it]",
+        );
     }
     if phase_b_pending {
         parts.push(
-            "[note: call traversal limited; run `travsr lang install <lang>` to enable call-graph edges]",
+            "[note: calls are still being traced for this commit; run `travsr init` to finish now]",
         );
     }
     parts.join("\n")
@@ -7685,7 +7913,11 @@ fn get_context_body(
     // Capture embed presence before embed_knn is consumed by the seed-lookup block.
     let has_embed = embed_knn.is_some();
     // Distinguish "Phase 1 done, hook not yet active" from "embed never initialized".
-    let embed_initialized = store.has_embed_db();
+    // Only a repo that turned meaning-based search on (`travsr embed init`,
+    // `.travsr/embed.toml`) ever gets it built; a bare embed.db does not.
+    let embed_initialized = store.has_embed_db()
+        && resolve_repo_root(store)
+            .is_some_and(|r| travsr_plugin_host::repo_backend_id(&r).is_some());
     // PF-M4: compute once here so neither include_snippets branch calls get_meta twice.
     let phase_b = phase_b_pending(store);
 
@@ -10082,7 +10314,7 @@ mod tests {
             "caller still listed: {crashed}"
         );
         assert!(
-            crashed.contains("semantic analysis for 'rust' crashed on its last run"),
+            crashed.contains("calls in 'rust' could not be fully traced on the last run"),
             "a crashed language must carry the incompleteness caveat: {crashed}"
         );
     }
@@ -10114,9 +10346,7 @@ mod tests {
         let out = get_callers_raw(&store, "charge", None);
         assert!(out.contains("fn:process"), "caller still listed: {out}");
         assert!(
-            out.contains("is incomplete")
-                && out.contains("travsr-lsif-ts")
-                && out.contains("may be incomplete"),
+            out.contains("could not be fully traced") && out.contains("may be incomplete"),
             "a skipped LSIF pass must carry the incompleteness caveat: {out}"
         );
         assert!(
@@ -10455,7 +10685,7 @@ mod tests {
         store.set_meta("phase_b_warnings", "crashed:rust").unwrap();
         let crashed = find_references_raw(&store, "charge", None);
         assert!(
-            crashed.contains("semantic analysis for 'rust' crashed on its last run"),
+            crashed.contains("calls in 'rust' could not be fully traced on the last run"),
             "crashed language caveat on the occurrence path: {crashed}"
         );
     }
@@ -11157,6 +11387,81 @@ mod tests {
         }
     }
 
+    /// A name that exists only as an `as` alias resolves through the name it
+    /// renames: Rust re-exports (one line or inside a `{}` group), Python and
+    /// TypeScript imports. A glob, a cast to a type, or a longer name that only
+    /// starts with the alias yield nothing.
+    #[test]
+    fn an_alias_line_names_the_original() {
+        let a = "install_rerank_model";
+        assert_eq!(
+            alias_originals(
+                "    install_model_blocking as install_rerank_model, model_installed as x,",
+                a,
+                || true
+            ),
+            vec!["install_model_blocking"]
+        );
+        assert_eq!(
+            alias_originals(
+                "pub use rerank::install_model_blocking as install_rerank_model;",
+                a,
+                || true
+            ),
+            vec!["install_model_blocking"]
+        );
+        assert_eq!(
+            alias_originals("from m import greet as hello", "hello", || true),
+            vec!["greet"]
+        );
+        assert_eq!(
+            alias_originals("import { greet as hello } from './m'", "hello", || true),
+            vec!["greet"]
+        );
+        assert!(alias_originals("import * as hello from './m'", "hello", || true).is_empty());
+        assert!(alias_originals("let n = x as install_rerank_model_v2;", a, || true).is_empty());
+        assert!(alias_originals("let n = install_rerank_model as u32;", a, || true).is_empty());
+        // Casts are not renames, even on an `export` line.
+        assert!(alias_originals("export const z = go as Missing;", "Missing", || true).is_empty());
+        assert!(
+            alias_originals("const h = req as unknown as Handler;", "Handler", || true).is_empty()
+        );
+        assert!(alias_originals("except ValueError as err:", "err", || true).is_empty());
+        assert_eq!(
+            alias_originals("export { greet as hello };", "hello", || true),
+            vec!["greet"]
+        );
+        // PR #940 review: a cast at the start of a line inside an array or
+        // object reads like a list member; only an import list makes it one.
+        assert!(alias_originals("  value as Handler,", "Handler", || false).is_empty());
+        // An alias is followed only to a definition where its import points.
+        let std_cmd = "use std::process::Command as StdCommand;";
+        assert!(!import_names_home(std_cmd, "crates/travsr-cli/src/main.rs"));
+        let anyhow = "use anyhow::{Context, Result as AnyResult};";
+        assert!(!import_names_home(anyhow, "fixtures/go/kubectl_sample.go"));
+        let core = "use travsr_core::{Node as CoreNode, VName};";
+        assert!(import_names_home(core, "crates/travsr-core/src/lib.rs"));
+        assert!(import_names_home("use super::render as r;", "src/any.rs"));
+        let ts = "import { greet as hello } from './greeter'";
+        assert!(import_names_home(ts, "src/greeter.ts"));
+        assert!(!import_names_home(ts, "src/other.ts"));
+        let py = "from app.models import User as U";
+        assert!(import_names_home(py, "app/models.py"));
+        assert!(!import_names_home(
+            "import numpy.random as npr",
+            "src/random.py"
+        ));
+        // A call that spans lines is not an import list, even after `export`.
+        assert!(!import_list_opener(&["export const store = createStore("]).is_some());
+        assert!(import_list_opener(&["use rerank::{", "    a as b,"]).is_some());
+        assert!(import_list_opener(&["pub use rerank::{"]).is_some());
+        assert!(import_list_opener(&["from m import (", "    # note", "    a as b,"]).is_some());
+        assert!(import_list_opener(&["import {"]).is_some());
+        assert!(!import_list_opener(&["const handlers = [", "  other as Handler,"]).is_some());
+        assert!(!import_list_opener(&["let x = f(", "    y,"]).is_some());
+        assert!(!import_list_opener(&[]).is_some());
+    }
+
     #[test]
     fn simple_name_strips_kind_and_scope() {
         assert_eq!(simple_name("fn:SyncPod"), "SyncPod");
@@ -11279,6 +11584,39 @@ mod tests {
             result.contains("app.ts:5"),
             "the surviving site must be the recorded one: {result}"
         );
+    }
+
+    /// A struct is used, never called, so its uses are occurrence rows with no
+    /// `ref/call` edge. `get_callers` listed only its file and read as unused
+    /// (`LsifPositionalRef`, 12 uses). It says where the uses are instead.
+    #[test]
+    fn get_callers_points_a_used_but_uncalled_symbol_at_find_references() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let point = Node::new(
+            VName::new("", "", "geo.rs", "rust", "struct:Point"),
+            "struct",
+        );
+        let user = Node::new(VName::new("", "", "app.rs", "rust", "fn:draw"), "function")
+            .with_line(1)
+            .with_end_line(4);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&point).unwrap();
+        store.put_node(&user).unwrap();
+        store
+            .record_edge_sites(&[(user.id, point.id, 2, None), (user.id, point.id, 3, None)])
+            .unwrap();
+        let result = get_callers(&store, "Point", None);
+        assert!(
+            result.contains("nothing calls 'Point', but it is used at 2 place(s)"),
+            "{result}"
+        );
+
+        // Once something calls it, the call rows are the answer and no note is added.
+        store
+            .put_edge_lsif(&Edge::new(user.id, point.id, EdgeKind::RefCall))
+            .unwrap();
+        let result = get_callers(&store, "Point", None);
+        assert!(!result.contains("nothing calls"), "{result}");
     }
 
     /// A site whose only backing edge was matched by leaf name must say so.
@@ -11911,6 +12249,61 @@ mod tests {
         );
     }
 
+    /// Plan 8.5: called with no file, it used to answer "not a supported
+    /// language". It now lists every language in this repo, one entry each, in
+    /// the same shape a file query returns.
+    #[test]
+    fn get_lang_status_without_a_file_lists_the_repo_languages() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for (path, lang) in [("src/a.ts", "typescript"), ("src/b.go", "go")] {
+            store
+                .put_node(&CoreNode::new(
+                    travsr_core::VName::new("c", "", path, lang, "fn:f"),
+                    "function",
+                ))
+                .unwrap();
+        }
+        let json = get_lang_status(&store, "");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let langs: Vec<&str> = parsed
+            .as_array()
+            .expect("an array without a file")
+            .iter()
+            .filter_map(|e| e["language"].as_str())
+            .collect();
+        assert!(
+            langs.contains(&"typescript") && langs.contains(&"go"),
+            "{json}"
+        );
+        assert!(!json.contains("not a supported language"), "{json}");
+    }
+
+    /// A partial language's line is the one `travsr status` prints for it, from
+    /// the last run's record, never an internal rebuild flag (plan 3.0).
+    /// Not on Windows, where C has no analyzer build at all.
+    #[cfg(not(windows))]
+    #[test]
+    fn get_lang_status_partial_line_is_the_plain_readiness_line() {
+        let mut store = make_store(&[], &[]);
+        store
+            .set_meta("phase_b_warnings", "skipped_no_compdb:c")
+            .unwrap();
+        let json = get_lang_status(&store, "src/a.c");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["status"], "partial", "{json}");
+        let line = v["statusLine"].as_str().unwrap();
+        assert_eq!(
+            line,
+            "needs compile_commands.json. Generate compile_commands.json with your build, \
+             then run `travsr init`."
+        );
+        assert_eq!(
+            travsr_plugin_host::phase_b::status::jargon_in(line),
+            None,
+            "{line}"
+        );
+    }
+
     /// get_lang_status returns valid JSON for a known extension with no RefCall data,
     /// and reports the honest `partial` status (structure works, full analysis not live).
     #[test]
@@ -11991,11 +12384,11 @@ mod tests {
         assert!(json.contains(r#""builtin":false"#));
         assert!(json.contains(r#""semantic_available":false"#));
         assert!(
-            json.contains("travsr lang install go")
-                || json.contains("travsr init --semantic --force"),
+            json.contains("travsr lang install go") || json.contains(r#""travsr init --force""#),
             "non-builtin go must surface a concrete next step (install when the \
              analyzer is absent, rebuild when it is already installed): {json}"
         );
+        assert!(!json.contains("--semantic"), "a retired flag: {json}");
     }
 
     /// Rust is not special: with no cross-file edges it reads `partial` and points
@@ -14206,6 +14599,55 @@ mod snippet_tests {
     use std::path::Path;
     use travsr_core::VName;
 
+    /// Plan 3.0: every note an agent reads by default is plain words, the one
+    /// remedy, and no placeholder. Rendered from real stores so a new branch
+    /// that reintroduces an internal word fails here.
+    #[test]
+    fn default_notes_read_plainly() {
+        use travsr_plugin_host::phase_b::status::jargon_in;
+        let mut notes: Vec<String> = Vec::new();
+        let at = |pairs: &[(&str, &str)]| {
+            let mut s = SqliteStore::open_in_memory().unwrap();
+            for (k, v) in pairs {
+                s.set_meta(k, v).unwrap();
+            }
+            s
+        };
+        for store in [
+            at(&[("last_commit", "b")]),
+            at(&[("last_commit", "b"), ("phase_b_commit", "a")]),
+            at(&[
+                ("last_commit", "a"),
+                ("phase_b_commit", "a"),
+                ("phase_b_dirty", "1"),
+            ]),
+            at(&[
+                ("last_commit", "a"),
+                ("phase_b_commit", "a"),
+                (
+                    "phase_b_warnings",
+                    "crashed:go,skipped_no_analyzer:php,zero_nodes:java",
+                ),
+            ]),
+        ] {
+            notes.extend(phase_b_degraded_note(&store));
+            for (has_embed, warming, degraded) in [
+                (false, false, false),
+                (true, true, false),
+                (true, false, true),
+            ] {
+                notes.push(build_context_signals(
+                    &store, has_embed, warming, degraded, None, None,
+                ));
+            }
+        }
+        notes.push(phase_b_pending_json());
+        notes.push(incomplete_caveat("go"));
+        for note in &notes {
+            assert_eq!(jargon_in(note), None, "{note}");
+        }
+    }
+
     // ── helper: build a Node with explicit line/end_line ─────────────────────
 
     fn make_fn_node(path: &str, sig: &str, line: u32, end_line: u32) -> CoreNode {
@@ -15602,7 +16044,7 @@ mod snippet_tests {
         // We do NOT set phase_b_commit so both notes could fire; only test the embed note.
         let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, None);
         assert!(
-            result.contains("semantic search disabled"),
+            result.contains("meaning-based search is optional and off"),
             "must emit embed-missing note when embed_knn=None; got: {result}"
         );
     }
@@ -15617,7 +16059,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "abc123").unwrap();
         let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, None);
         assert!(
-            result.contains("call traversal limited"),
+            result.contains("calls are still being traced for this commit; run"),
             "must emit phase-B-pending note when phase_b_commit absent; got: {result}"
         );
     }
@@ -15660,7 +16102,7 @@ mod snippet_tests {
             "header must report warming while sidecar is cold; got: {result}"
         );
         assert!(
-            result.contains("still warming up"),
+            result.contains("is still starting"),
             "must emit warming note; got: {result}"
         );
     }
@@ -15715,7 +16157,7 @@ mod snippet_tests {
             "retrieval tier must not claim semantic; got: {result}"
         );
         assert!(
-            result.contains("semantic search unavailable"),
+            result.contains("meaning-based search could not start"),
             "must emit the unavailable note; got: {result}"
         );
         assert!(
@@ -15746,7 +16188,10 @@ mod snippet_tests {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store.set_meta("last_commit", "abc").unwrap();
         let note = phase_b_degraded_note(&store).expect("must flag pending");
-        assert!(note.contains("call-graph index incomplete"), "got: {note}");
+        assert!(
+            note.contains("calls are still being traced for this commit"),
+            "got: {note}"
+        );
     }
 
     #[test]
@@ -15757,7 +16202,10 @@ mod snippet_tests {
         store.set_meta("last_commit", "def456").unwrap();
         store.set_meta("phase_b_commit", "abc123").unwrap();
         let note = phase_b_degraded_note(&store).expect("must flag pending");
-        assert!(note.contains("call-graph index incomplete"), "got: {note}");
+        assert!(
+            note.contains("calls are still being traced for this commit"),
+            "got: {note}"
+        );
     }
 
     #[test]
@@ -15768,7 +16216,10 @@ mod snippet_tests {
         store.set_meta("phase_b_commit", "abc").unwrap();
         store.set_meta("phase_b_dirty", "1").unwrap();
         let note = phase_b_degraded_note(&store).expect("must flag stale");
-        assert!(note.contains("call-graph edges degraded"), "got: {note}");
+        assert!(
+            note.contains("dropped some calls since they were last traced"),
+            "got: {note}"
+        );
     }
 
     #[test]
@@ -15814,11 +16265,31 @@ mod snippet_tests {
         );
     }
 
+    /// A git repo holding `files` uncommitted, recorded as `store`'s root, so
+    /// pending rows in them count as edits since HEAD.
+    fn edited_repo(store: &mut travsr_store::SqliteStore, files: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        for f in files {
+            std::fs::write(tmp.path().join(f), "").unwrap();
+        }
+        store
+            .set_meta("repo_root", &tmp.path().to_string_lossy())
+            .unwrap();
+        tmp
+    }
+
     #[test]
     fn phase_b_note_names_pending_references_instead_of_run_init() {
         // dirty with an unresolved reference: name the gap honestly, without the
         // heavy "run travsr init".
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let _repo = edited_repo(&mut store, &["a.rs"]);
         store.set_meta("last_commit", "abc").unwrap();
         store.set_meta("phase_b_commit", "abc").unwrap();
         store.set_meta("phase_b_dirty", "1").unwrap();
@@ -15844,7 +16315,7 @@ mod snippet_tests {
             .unwrap();
         let note = phase_b_degraded_note(&store).expect("a pending overlay must note the gap");
         assert!(
-            note.contains("not yet resolved") && !note.contains("travsr init"),
+            note.contains("not traced yet") && !note.contains("travsr init"),
             "got: {note}"
         );
     }
@@ -16029,7 +16500,7 @@ mod snippet_tests {
         // ...and the caller is at yet another commit ⇒ head note also fires.
         let out = append_read_notes(&store, "body".to_string(), Some("chk1111"));
         assert!(
-            out.contains("call-graph index incomplete"),
+            out.contains("calls are still being traced for this commit"),
             "phase-b note: {out}"
         );
         assert!(out.contains("chk1111"), "head note: {out}");
@@ -16062,9 +16533,12 @@ mod snippet_tests {
             .unwrap();
 
         let note = live_overlay_note(&store, "a.ts").expect("an overlay must be announced");
-        assert!(note.contains("1 edge resolved"), "singular form: {note}");
         assert!(
-            note.contains("provenance != live"),
+            note.contains("1 call found in edits not yet committed is included"),
+            "singular form: {note}"
+        );
+        assert!(
+            note.contains("marked `live`"),
             "a reader must be told how to get ratified-only truth: {note}"
         );
     }
@@ -16075,6 +16549,7 @@ mod snippet_tests {
     #[test]
     fn the_live_overlay_note_reports_abstentions_as_well_as_resolutions() {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let repo = edited_repo(&mut store, &["a.ts"]);
         let a = node_with("fn:a", "function", "a.ts");
         store.put_node(&a).unwrap();
         store
@@ -16092,10 +16567,18 @@ mod snippet_tests {
             )
             .unwrap();
 
+        // Calls are traced at HEAD: what is still pending is a call no commit
+        // resolves (`Vec::new`), so "the next commit confirms them" is false.
+        assert!(
+            live_overlay_note(&store, "callers in a.ts:3").is_none(),
+            "no pending note while no edit awaits tracing"
+        );
+
+        store.set_meta("phase_b_dirty", "1").unwrap();
         let note = live_overlay_note(&store, "callers in a.ts:3")
             .expect("a pending reference must be announced");
         assert!(
-            note.contains("1 reference in the files above detected but not resolved"),
+            note.contains("1 reference in the files above changed since the last commit and is not traced yet"),
             "the abstention must be visible: {note}"
         );
 
@@ -16104,6 +16587,25 @@ mod snippet_tests {
         assert!(
             live_overlay_note(&store, "callers in unrelated.ts:9").is_none(),
             "the pending half must not fire for a file the answer never names"
+        );
+
+        // A pending row in a file unchanged since HEAD is a call no commit
+        // resolves, whatever else was edited: no "changed since" claim.
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .status()
+                .unwrap()
+        };
+        git(&["add", "a.ts"]);
+        git(&["commit", "-q", "-m", "a"]);
+        std::fs::write(repo.path().join("other.ts"), "").unwrap();
+        assert!(
+            live_overlay_note(&store, "callers in a.ts:3").is_none(),
+            "a committed file's pending rows were reported as changed"
         );
     }
 
@@ -16209,13 +16711,13 @@ mod snippet_tests {
             .unwrap();
 
         let prose = append_read_notes(&store, "body".to_string(), None);
-        assert!(prose.contains("live overlay active"), "prose: {prose}");
+        assert!(prose.contains("marked `live`"), "prose: {prose}");
 
         let signals = read_note_signals(&store, None, "a.ts");
         assert!(
             signals
                 .iter()
-                .any(|s| s.as_str().unwrap_or("").contains("live overlay active")),
+                .any(|s| s.as_str().unwrap_or("").contains("marked `live`")),
             "json signals: {signals:?}"
         );
 
@@ -16250,7 +16752,7 @@ mod snippet_tests {
             "got: {out}"
         );
         assert!(
-            !out.contains("call-graph index incomplete"),
+            !out.contains("calls are still being traced for this commit"),
             "head-only wrapper must not carry the Phase-B note: {out}"
         );
 
@@ -16333,7 +16835,7 @@ mod snippet_tests {
             "existing edges must still be reported; got: {result}"
         );
         assert!(
-            result.contains("call-graph index incomplete"),
+            result.contains("calls are still being traced for this commit"),
             "must append pending note; got: {result}"
         );
     }
@@ -16349,7 +16851,7 @@ mod snippet_tests {
         store.set_meta("phase_b_dirty", "1").unwrap();
         let result = get_blast_radius(&store, "src/missing.ts", AnalysisMode::TreeSitter);
         assert!(
-            result.contains("call-graph edges degraded"),
+            result.contains("dropped some calls since they were last traced"),
             "empty result must surface the stale note; got: {result}"
         );
     }
@@ -16362,7 +16864,7 @@ mod snippet_tests {
         store.set_meta("phase_b_commit", "abc123").unwrap();
         let result = get_execution_path(&store, "alpha", "beta");
         assert!(
-            result.contains("call-graph index incomplete"),
+            result.contains("calls are still being traced for this commit"),
             "disconnected/no-result path must carry the pending note; got: {result}"
         );
     }
@@ -16392,7 +16894,7 @@ mod snippet_tests {
             signals.iter().any(|s| s
                 .as_str()
                 .unwrap_or("")
-                .contains("call-graph edges degraded")),
+                .contains("dropped some calls since they were last traced")),
             "graph JSON must carry the degraded signal; got: {raw}"
         );
     }
@@ -17441,7 +17943,7 @@ mod snippet_tests {
         );
         let overflow_pos = result.find("[overflow msg]").unwrap();
         let seed_pos = result.find("[seed cap msg]").unwrap();
-        let note_pos = result.find("[note: semantic search").unwrap();
+        let note_pos = result.find("[note: meaning-based search").unwrap();
         assert!(overflow_pos < seed_pos, "overflow must precede seed-cap");
         assert!(seed_pos < note_pos, "seed-cap must precede degraded notes");
     }
@@ -18009,8 +18511,8 @@ mod snippet_tests {
             "a language Phase B skipped must soften the claim: {out}"
         );
         assert!(
-            out.contains("no analyzer is installed"),
-            "should name the recorded reason: {out}"
+            out.contains("setting up"),
+            "should name the recorded state: {out}"
         );
         assert!(
             !out.contains("No uses of this symbol are recorded"),
@@ -18047,7 +18549,7 @@ mod snippet_tests {
             .unwrap();
         let out = find_references(&store, "unused", None);
         assert!(
-            out.contains("'rust' was not analysed") && out.contains("waiting on approval"),
+            out.contains("rust: setting up"),
             "must select the target language's own warning: {out}"
         );
         // The softening REASON is target-scoped: it must name rust and no other
@@ -18073,7 +18575,7 @@ mod snippet_tests {
 
         let out = find_references(&store, "unused", None);
         assert!(
-            out.contains("not a definitive zero") && out.contains("no OS sandbox"),
+            out.contains("not a definitive zero") && out.contains("not fully traced here"),
             "a degraded Rust LSIF run must soften and explain: {out}"
         );
     }
@@ -18086,7 +18588,7 @@ mod snippet_tests {
 
         let out = find_references(&store, "unused", None);
         assert!(
-            out.contains("not a definitive zero") && out.contains("dropped call edges"),
+            out.contains("not a definitive zero") && out.contains("dropped some calls"),
             "dropped edges must soften the claim: {out}"
         );
     }
@@ -18173,7 +18675,7 @@ mod snippet_tests {
         assert!(got.references.is_empty());
         let note = got.note.expect("softened answer must carry a note");
         assert!(
-            note.contains("not a definitive zero") && note.contains("no analyzer is installed"),
+            note.contains("not a definitive zero") && note.contains("setting up"),
             "note should carry the softened wording: {note}"
         );
         assert!(
@@ -18198,6 +18700,8 @@ mod snippet_tests {
         use travsr_core::{Node, VName};
         use travsr_store::RefResolution;
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // An edit since the last trace is what makes a pending row real.
+        store.set_meta("phase_b_dirty", "1").unwrap();
 
         let caller = Node::new(
             VName::new("", "", "src/svc.rs", "rust", "fn:caller"),
@@ -18243,6 +18747,46 @@ mod snippet_tests {
         );
     }
 
+    /// PR #940 review: at a clean, fully traced HEAD, `travsr references` on a
+    /// test fn in `observability.rs` said "843 references ... changed since the
+    /// last commit and are not traced yet ... Run `travsr init`". What stays
+    /// pending at HEAD is a call no commit resolves, so no edit happened and
+    /// init cannot clear it.
+    #[test]
+    fn find_references_does_not_blame_an_edit_for_pending_refs_at_head() {
+        use travsr_core::{Node, VName};
+        use travsr_store::RefResolution;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("phase_b_dirty", "0").unwrap();
+        let caller = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:caller"),
+            "function",
+        );
+        let unused = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:unused"),
+            "function",
+        )
+        .with_line(20);
+        store.put_node(&caller).unwrap();
+        store.put_node(&unused).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, unused.id, 5, None)])
+            .unwrap();
+        store
+            .upsert_ref_resolution_states(&[RefResolution {
+                src: caller.id,
+                ref_line: 7,
+                ref_col: 9,
+                name: "join".to_string(),
+                state: "pending",
+                resolved_dst: None,
+            }])
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(!out.contains("not traced yet"), "got: {out}");
+    }
+
     /// A watcher reindex drops a file's Phase B call edges without moving HEAD
     /// (#583), so `find_references` on a symbol whose only caller sat in that
     /// file answers `0` from an evidence set that is temporarily gone. The head
@@ -18267,7 +18811,7 @@ mod snippet_tests {
 
         let out = find_references(&store, "orphaned", None);
         assert!(
-            out.contains("not authoritative"),
+            out.contains("not a definitive zero"),
             "a zero served while Phase B is dirty must not read as fact: {out}"
         );
     }
@@ -19821,13 +20365,13 @@ mod snippet_tests {
     /// first three each did.
     #[test]
     fn the_phase_b_pending_answer_never_promises_a_time() {
-        let msg = super::phase_b_pending_json("Semantic occurrence index");
+        let msg = super::phase_b_pending_json();
         assert!(
             !msg.contains("minute") && !msg.contains("~"),
             "pending answer must not carry an ETA: {msg}"
         );
         assert!(
-            msg.contains("travsr daemon start"),
+            msg.contains("Run `travsr init` to finish now"),
             "pending answer must name what actually produces the index: {msg}"
         );
         assert!(
@@ -19884,11 +20428,11 @@ mod issue_755_tests {
             "the note must name the language; got: {note}"
         );
         assert!(
-            note.contains("no call edges"),
+            note.contains("not fully traced"),
             "the note must say what is missing, not just that something is; got: {note}"
         );
         assert!(
-            note.contains("not authoritative"),
+            note.contains("not final"),
             "the note exists to stop an empty result being trusted; got: {note}"
         );
         assert!(
@@ -19916,10 +20460,10 @@ mod issue_755_tests {
                 phase_b_degraded_note(&store).unwrap_or_else(|| panic!("{warn} must be surfaced"));
             assert!(note.contains("typescript"), "got: {note}");
             assert!(
-                note.contains("or not all of them") && note.contains("short result"),
+                note.contains("not fully traced") && note.contains("short result"),
                 "a partial language must be described as partial, not empty; got: {note}"
             );
-            assert!(note.contains("not authoritative"), "got: {note}");
+            assert!(note.contains("not final"), "got: {note}");
         }
     }
 
@@ -19943,9 +20487,8 @@ mod issue_755_tests {
         let store = with_warnings("skipped_no_analyzer:php,crashed:php,needs_approval:java");
         let note = phase_b_degraded_note(&store).expect("must fire");
         assert!(note.contains("php") && note.contains("java"), "got: {note}");
-        assert_eq!(
-            note.matches("php").count(),
-            1,
+        assert!(
+            note.contains("for php, java on the last run") && note.matches("php:").count() == 1,
             "a language named by two classes must still appear once; got: {note}"
         );
         assert!(
@@ -20039,7 +20582,10 @@ mod issue_755_tests {
             .set_meta("phase_b_warnings", "skipped_no_analyzer:php")
             .unwrap();
         let note = phase_b_degraded_note(&behind).expect("must fire");
-        assert!(note.contains("call-graph index incomplete"), "got: {note}");
+        assert!(
+            note.contains("calls are still being traced for this commit"),
+            "got: {note}"
+        );
 
         let mut dirty = store_at_head();
         dirty.set_meta("phase_b_dirty", "1").unwrap();
@@ -20047,7 +20593,10 @@ mod issue_755_tests {
             .set_meta("phase_b_warnings", "skipped_no_analyzer:php")
             .unwrap();
         let note = phase_b_degraded_note(&dirty).expect("must fire");
-        assert!(note.contains("call-graph edges degraded"), "got: {note}");
+        assert!(
+            note.contains("dropped some calls since they were last traced"),
+            "got: {note}"
+        );
     }
 
     /// The note has to reach an actual query, not just the helper: this is the
@@ -20065,7 +20614,7 @@ mod issue_755_tests {
         // #878 widened the wording to "no call edges, or not all of them", so
         // pin the language attribution and the verdict rather than one phrase.
         assert!(
-            out.contains("were produced for php") && out.contains("not authoritative"),
+            out.contains("not fully traced for php") && out.contains("not final"),
             "an empty caller list must say why; got: {out}"
         );
     }

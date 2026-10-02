@@ -5,6 +5,7 @@
  */
 
 import * as fs from "fs";
+import * as path from "path";
 import * as cp from "child_process";
 import * as vscode from "vscode";
 import { StdioMcpClient } from "./mcp";
@@ -44,6 +45,8 @@ import {
   envelopeBody,
   probeLangListContract,
   contractSkewMessage,
+  shouldOfferSetup,
+  setUpRepo,
 } from "./commands";
 import { ContextExplorerPanel, getSymbolAtCursor } from "./contextExplorer";
 import { registerMcpServerCommand } from "./mcpRegister";
@@ -216,7 +219,31 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // First-run welcome page (VSCODE-204)
-  showWelcomeIfFirstRun(context);
+  showWelcomeIfFirstRun(context, workspaceRoot);
+
+  // One-command setup (plan 3.5): offer it once for a git folder with no index.
+  // The graph.db watcher above reconnects once it exists.
+  if (workspaceRoot) {
+    const OFFERED = "travsr.setupOffered";
+    const offer = shouldOfferSetup(
+      fs.existsSync(path.join(workspaceRoot, ".git")),
+      fs.existsSync(path.join(workspaceRoot, ".travsr", "graph.db")),
+      context.workspaceState.get<boolean>(OFFERED, false)
+    );
+    if (offer) {
+      void context.workspaceState.update(OFFERED, true);
+      void vscode.window
+        .showInformationMessage("Set up Travsr for this folder?", "Set up")
+        .then(async (pick) => {
+          if (pick !== "Set up") return;
+          const { out, cancelled, code } = await setUpRepo(workspaceRoot);
+          if (!cancelled && code === 0) {
+            const ready = out.split("\n").find((l) => l.startsWith("Ready."));
+            void vscode.window.showInformationMessage(`Travsr: ${ready ?? "set up."}`);
+          }
+        });
+    }
+  }
 
   // ── Commands ─────────────────────────────────────────────────────────────
 
@@ -452,7 +479,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("travsr.showWelcome", () => showWelcome())
+    vscode.commands.registerCommand("travsr.showWelcome", () => showWelcome(workspaceRoot))
   );
 
   // Graph panel (VSCODE-245)
@@ -1004,11 +1031,11 @@ interface FileListOpts {
 /** Strip the `<travsr-data>…</travsr-data>` MCP envelope and return trimmed non-empty lines. */
 export function parseEnvelope(raw: string): string[] {
   // Every caller counts the lines as results, so drop what is not one: a note
-  // the server appends after `</travsr-data>`, and the `~ =` legend.
+  // the server appends after `</travsr-data>` or inside it, and the `~ =` legend.
   return envelopeBody(raw)
     .split("\n")
     .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("~ = "));
+    .filter((l) => l && !l.startsWith("~ = ") && !/^\[?note:/.test(l));
 }
 
 export function buildFileListHtml(

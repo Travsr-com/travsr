@@ -796,7 +796,8 @@ fn dispatch_tool_call(
             json!({
                 "protocolVersion": crate::PROTOCOL_VERSION,
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": crate::SERVER_NAME, "version": crate::SERVER_VERSION }
+                "serverInfo": { "name": crate::SERVER_NAME, "version": crate::SERVER_VERSION },
+                "instructions": crate::INSTRUCTIONS
             }),
         ),
         "tools/call" => {

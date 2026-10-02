@@ -197,6 +197,43 @@ pub fn reset_lsif_analyzer_failures() {
     if let Ok(mut failures) = LSIF_ANALYZER_FAILURES.lock() {
         failures.clear();
     }
+    if let Ok(mut skips) = LSIF_EMITTER_SKIPS.lock() {
+        skips.clear();
+    }
+}
+
+/// An analyzer that did not produce results this run, with its own error text,
+/// which the user needs to fix it. `missing` means it could not be started.
+#[derive(Clone, Debug)]
+pub struct LsifEmitterSkip {
+    pub language: &'static str,
+    pub missing: bool,
+    pub detail: String,
+}
+
+static LSIF_EMITTER_SKIPS: std::sync::Mutex<Vec<LsifEmitterSkip>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record that `language`'s LSIF analyzer could not be started (`missing`) or
+/// ran and failed in this run.
+pub fn record_lsif_emitter_skip(language: &'static str, missing: bool, detail: String) {
+    if let Ok(mut skips) = LSIF_EMITTER_SKIPS.lock() {
+        if !skips.iter().any(|s| s.language == language) {
+            skips.push(LsifEmitterSkip {
+                language,
+                missing,
+                detail,
+            });
+        }
+    }
+}
+
+/// The skips recorded by [`record_lsif_emitter_skip`] this run.
+pub fn lsif_emitter_skips() -> Vec<LsifEmitterSkip> {
+    LSIF_EMITTER_SKIPS
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_default()
 }
 
 /// The LSIF analyzer failures recorded during the current Phase B run,

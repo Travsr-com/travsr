@@ -21,8 +21,7 @@ use ignore::WalkBuilder;
 use travsr_analysis::skeleton::{embed_texts_for_file, EmbedRichness};
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
-    hash_bytes, ingest_lsif, link_imports, link_imports_go, link_imports_python_fs,
-    link_imports_rust, run_lsif_emitter, FfiMarker,
+    hash_bytes, link_imports, link_imports_go, link_imports_python_fs, link_imports_rust, FfiMarker,
 };
 use travsr_plugin_host::PluginIndexer;
 use travsr_retrieval::compute_kcore;
@@ -45,14 +44,10 @@ pub use hook::{
 /// The **long-lived daemon** (git-hook / file-watcher incremental reindex path)
 /// is a separate process that never calls this setter, so
 /// `ALLOW_UNSANDBOXED_BY_CLI` stays `false` on every daemon-triggered reindex.
-/// This is intentional: the daemon always fails closed unless the operator sets
-/// `TRAVSR_ALLOW_UNSANDBOXED_LSIF=1` in the daemon's process environment — a
-/// deliberate, auditable, per-environment decision that cannot be silently
-/// inherited from a one-time `init` invocation.
-///
-/// If you need the daemon to run RA unconfined, set
-/// `TRAVSR_ALLOW_UNSANDBOXED_LSIF=1` in the environment where the daemon is
-/// launched (e.g. your shell profile or systemd unit file).
+/// The daemon runs RA unconfined only when `TRAVSR_ALLOW_UNSANDBOXED_LSIF=1` is
+/// in its environment, or when a `rust` entry is recorded under
+/// `unsandboxed_consent` in lang.toml, which `init --allow-unsandboxed-lsif`
+/// writes. Either way the sandbox must be unavailable first.
 pub fn set_allow_unsandboxed_lsif(val: bool) {
     travsr_indexer::sandbox::set_cli_allow_unsandboxed(val);
 }
@@ -297,8 +292,12 @@ pub enum InitProgress {
         total: u64,
         workers: usize,
     },
+    /// Heartbeat while what was read is saved and made searchable (the staging
+    /// flush and the search rebuild): 74 s on yugabyte-db with no other event.
+    Saving,
     /// Post-index semantic passes (LSIF + Phase B); no granular count.
-    /// Only emitted when `--semantic` is passed or there is no HEAD commit.
+    /// Emitted when Phase B runs inline: every CLI `travsr init`, or a repo
+    /// with no HEAD commit.
     Finalizing,
     /// #755 item 3: heartbeat while the Phase B fan-out blocks. Emitted every
     /// second or so with the analyzers still running and their elapsed wall
@@ -318,8 +317,8 @@ pub enum InitProgress {
         /// gate on the per-language flag before quoting it.
         budget_secs: u64,
     },
-    /// Phase B deferred to the daemon background scheduler. Emitted on the
-    /// normal (non-`--semantic`) path once Phase A completes successfully.
+    /// Phase B deferred to the daemon background scheduler. Emitted only on
+    /// the non-semantic path (the `init_repo` helper) once Phase A completes.
     PhaseBDeferred,
 }
 
@@ -510,6 +509,14 @@ fn index_paths_parallel(
         let mut batch: Vec<FileGraph> = Vec::with_capacity(BATCH_SIZE);
         let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
         let mut all_ws_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker> = Vec::new();
+        let mut calls_changed = false;
+        // Re-parsing a file drops its Phase B call edges, as in `reindex_files`:
+        // record it so a semantic `init` at the same commit runs Phase B again.
+        // Only once Phase B has run: before that there were none to drop. Set
+        // before the batch that drops them, so a failed write or a kill between
+        // batches cannot leave `complete` over calls that are gone.
+        let phase_b_ran = store.get_meta("phase_b_commit").ok().flatten().is_some();
+        let mut dirty_marked = false;
 
         for (done, result) in (1_u64..).zip(rx) {
             let pr = result?;
@@ -525,11 +532,16 @@ fn index_paths_parallel(
                 continue;
             }
 
+            calls_changed |= change_can_drop_calls(&pr.file_graph.vname_path);
             all_ffi_markers.extend(pr.ffi_markers);
             all_ws_markers.extend(pr.workspace_dep_markers);
             batch.push(pr.file_graph);
 
             if batch.len() >= BATCH_SIZE {
+                if calls_changed && phase_b_ran && !dirty_marked {
+                    let _ = store.set_meta("phase_b_dirty", "1");
+                    dirty_marked = true;
+                }
                 let written = store.write_file_graphs_batch(&batch, bulk)?;
                 counts.nodes_upserted += written.nodes_upserted;
                 counts.edges_upserted += written.edges_upserted;
@@ -546,6 +558,9 @@ fn index_paths_parallel(
 
         // Flush remaining files.
         if !batch.is_empty() {
+            if calls_changed && phase_b_ran && !dirty_marked {
+                let _ = store.set_meta("phase_b_dirty", "1");
+            }
             let written = store.write_file_graphs_batch(&batch, bulk)?;
             counts.nodes_upserted += written.nodes_upserted;
             counts.edges_upserted += written.edges_upserted;
@@ -630,7 +645,7 @@ const DEFAULT_TRAVSRIGNORE_RULE_COUNT: usize = 8;
 ///
 /// Idempotent: never overwrites an existing file.  Reports whether the file was
 /// freshly created so `init_repo` can mention it in the summary.
-fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
+pub fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
     let path = repo_root.join(".travsrignore");
     if path.exists() {
         return Ok(false);
@@ -714,128 +729,6 @@ fn travsr_dir_tracked(repo_root: &Path) -> bool {
         .output()
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false)
-}
-
-/// Top-level directory names that are well-known source roots, never dep/vendor dirs.
-/// Auto-exclusion never fires for these regardless of file count.
-const KNOWN_SOURCE_DIRS: &[&str] = &[
-    "src",
-    "lib",
-    "pkg",
-    "internal",
-    "cmd",
-    "api",
-    "test",
-    "tests",
-    "app",
-    "apps",
-    "plugins",
-    "modules",
-    "services",
-    "components",
-    "core",
-    "common",
-    "shared",
-    "utils",
-    "crates",
-    "staging",
-    "hack",
-    "cluster",
-    "docs",
-    "examples",
-    "samples",
-    // Standard source root for static-site generators (Hugo, Jekyll, Gatsby,
-    // Next.js content collections) — the entire doc corpus of a docs-only
-    // repo commonly lives here. Without this, `travsr init` on such a repo
-    // auto-excludes essentially all of it as a false-positive "large dep
-    // dir", silently (non-TTY runs only log the decision via tracing::info!,
-    // never in the command's own visible output) — found indexing
-    // kubernetes/website while measuring #376 lifecycle plan L4.
-    "content",
-];
-
-/// Heuristic: a single directory holding ≥ 1 000 source-language files AND
-/// ≥ 15 % of the total discovered source files is flagged as a "large dep dir",
-/// unless the directory name is in `KNOWN_SOURCE_DIRS`.
-///
-/// Returns `(dir_name, file_count, total_count)` for the first such directory
-/// that is not already excluded by the walker (SKIP_DIRS or .travsrignore).
-fn detect_large_dep_dir(indexable: &[PathBuf], repo_root: &Path) -> Option<(String, u64, u64)> {
-    use std::collections::HashMap;
-
-    let total = indexable.len() as u64;
-    if total == 0 {
-        return None;
-    }
-
-    let mut top_counts: HashMap<String, u64> = HashMap::new();
-    for p in indexable {
-        if let Some(first) = p.strip_prefix(repo_root).ok().and_then(|r| {
-            r.components()
-                .next()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        }) {
-            *top_counts.entry(first).or_insert(0) += 1;
-        }
-    }
-
-    for (dir, count) in top_counts {
-        if KNOWN_SOURCE_DIRS.contains(&dir.as_str()) {
-            continue;
-        }
-        let pct = count * 100 / total;
-        if count >= 1_000 && pct >= 15 {
-            return Some((dir, count, total));
-        }
-    }
-    None
-}
-
-/// If stderr is a TTY, prompt the user once to exclude a detected large dep dir.
-/// If non-TTY / CI, auto-exclude and log the decision without blocking.
-///
-/// Appends the rule to `.travsrignore` if the user accepts (or in CI mode).
-/// Returns `true` if a rule was appended (caller should re-build the walker).
-fn maybe_prompt_large_dep(repo_root: &Path, dir: &str, count: u64, total: u64) -> bool {
-    use std::io::{IsTerminal, Write};
-
-    let pct = count * 100 / total;
-    let is_tty = std::io::stderr().is_terminal();
-
-    let exclude = if is_tty {
-        let mut err = std::io::stderr().lock();
-        let _ = write!(
-            err,
-            "\nDetected {dir}/ ({count} files, ~{pct}% of repo). \
-             Exclude from index? [Y/n] "
-        );
-        let _ = err.flush();
-        drop(err);
-        let mut line = String::new();
-        let _ = std::io::stdin().read_line(&mut line);
-        let answer = line.trim().to_ascii_lowercase();
-        answer.is_empty() || answer == "y" || answer == "yes"
-    } else {
-        tracing::info!(
-            dir = %dir,
-            count,
-            pct,
-            "non-TTY: auto-excluding large dep dir from index (add !{dir}/ to .travsrignore to override)"
-        );
-        true
-    };
-
-    if exclude {
-        let path = repo_root.join(".travsrignore");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&path)
-        {
-            let _ = writeln!(f, "{dir}/");
-        }
-    }
-    exclude
 }
 
 /// File count above which an embed pass announces itself before starting.
@@ -1283,6 +1176,156 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     init_repo_with_progress(repo_root, None, false, false, &mut |_| {})
 }
 
+/// Whether a semantic `init` must run Phase B at a commit it already covered.
+/// `now_ready` is asked only about languages the last run skipped at a gate or
+/// could not find a bundled tracer for, so "install X (or reinstall travsr),
+/// then run `travsr init`" works without a new commit. Languages that ran and
+/// found nothing are not re-run: that repeats the same result.
+fn phase_b_inline_needed(
+    already_done: bool,
+    dirty: bool,
+    warnings: &str,
+    now_ready: impl Fn(&str) -> bool,
+) -> bool {
+    const GATE_SKIPS: &[&str] = &[
+        "skipped_unregistered",
+        "untrusted_corpus",
+        "skipped_no_analyzer",
+        "needs_consent",
+        "skipped_no_compdb",
+        "skipped_no_build_file",
+        "emitter_missing",
+    ];
+    !already_done
+        || dirty
+        || warnings
+            .split(',')
+            .filter_map(|w| w.trim().split_once(':'))
+            .any(|(class, lang)| GATE_SKIPS.contains(&class) && now_ready(lang))
+}
+
+/// Counter incremented every time a reindex marks Phase B dirty.
+///
+/// Paired with `phase_b_dirty`, which says *whether* the graph is degraded.
+/// This says *when*, well enough for `init` to distinguish a flag that predates
+/// its run from one that arrived while it was working: the first is stale and
+/// safe to clear, the second describes a real degradation this Phase B did not
+/// cover.
+const PHASE_B_DIRTY_SEQ: &str = "phase_b_dirty_seq";
+
+/// Whether git is in the middle of a rebase: its state directory exists.
+fn rebase_in_progress(git_dir: &Path) -> bool {
+    git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir()
+}
+
+/// Whether reindexing `path` can drop committed call edges: only a file in a
+/// language whose calls are traced.
+fn change_can_drop_calls(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    // A Gradle build script is Kotlin by extension, but Kotlin traces `.kt`
+    // only, so editing one cannot drop a call.
+    ext != "kts"
+        && Language::from_extension(ext)
+            .is_some_and(|l| travsr_plugin_host::phase_b::lookup(l.as_str()).is_some())
+}
+
+#[cfg(test)]
+mod traced_change_tests {
+    /// Reindexing a file whose language has no traced calls cannot drop a
+    /// call edge, so it must not mark the index stale: `init`'s own
+    /// `.cursor/mcp.json` write did, right after a complete run.
+    #[test]
+    fn only_a_file_with_traced_calls_can_leave_calls_stale() {
+        for path in ["main.go", "src/a.ts", "pkg/b.py"] {
+            assert!(super::change_can_drop_calls(path), "{path}");
+        }
+        for path in [
+            ".cursor/mcp.json",
+            "README.md",
+            ".gitignore",
+            "go.mod",
+            "build.gradle.kts",
+        ] {
+            assert!(!super::change_can_drop_calls(path), "{path}");
+        }
+    }
+}
+
+/// `daemon status`'s `semantic:` value. An edit reindexed at an unchanged
+/// HEAD reads exactly as `travsr status` says it.
+fn semantic_line(
+    running: bool,
+    debouncing: bool,
+    last_commit: &str,
+    phase_b_commit: &str,
+    dirty: bool,
+    live_resolved: u64,
+    live_pending: u64,
+) -> String {
+    if running {
+        "running".to_string()
+    } else if debouncing {
+        "pending (debounce)".to_string()
+    } else if last_commit.is_empty() {
+        "not run (no commits yet)".to_string()
+    } else if phase_b_commit.is_empty() {
+        "pending".to_string()
+    } else if phase_b_commit == last_commit && dirty {
+        travsr_mcp::query::dirty_semantic_state(live_resolved, live_pending)
+    } else if phase_b_commit == last_commit {
+        "complete".to_string()
+    } else {
+        "stale (new commits since last run)".to_string()
+    }
+}
+
+#[cfg(test)]
+mod daemon_semantic_line_tests {
+    use super::semantic_line;
+
+    /// `daemon status` said "complete" while `travsr status` said "stale" for
+    /// the same index: it ignored the flag a mid-edit reindex sets.
+    #[test]
+    fn daemon_status_reads_the_edit_flag_like_travsr_status() {
+        assert_eq!(
+            semantic_line(false, false, "0b0492a", "0b0492a", false, 0, 0),
+            "complete"
+        );
+        assert_eq!(
+            semantic_line(false, false, "0b0492a", "0b0492a", true, 0, 0),
+            travsr_mcp::query::dirty_semantic_state(0, 0)
+        );
+        assert_eq!(
+            semantic_line(false, false, "0b0492a", "0b0492a", true, 0, 3),
+            travsr_mcp::query::dirty_semantic_state(0, 3)
+        );
+        assert_eq!(semantic_line(true, false, "a", "a", true, 0, 0), "running");
+    }
+}
+
+#[cfg(test)]
+mod rebase_tests {
+    /// Git leaves `REBASE_HEAD` behind after a rebase finishes, so it is not
+    /// evidence of one in progress; the state directories are (#L13).
+    #[test]
+    fn only_a_rebase_state_directory_means_a_rebase_is_in_progress() {
+        let git = tempfile::tempdir().unwrap();
+        std::fs::write(git.path().join("REBASE_HEAD"), "0b0492a\n").unwrap();
+        assert!(
+            !super::rebase_in_progress(git.path()),
+            "leftover REBASE_HEAD"
+        );
+        for dir in ["rebase-merge", "rebase-apply"] {
+            let g = tempfile::tempdir().unwrap();
+            std::fs::create_dir(g.path().join(dir)).unwrap();
+            assert!(super::rebase_in_progress(g.path()), "{dir}");
+        }
+    }
+}
+
 /// Like [`init_repo`], but reports progress via `on_progress` so the CLI can
 /// show that a long indexing run is alive (issue #293). The callback is invoked
 /// on the indexing thread; keep it cheap.
@@ -1298,15 +1341,6 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
 /// the existing graph so every file is re-parsed from scratch, even when no file
 /// content changed. Needed because config that affects *semantic* output (e.g.
 /// `--allow-unsandboxed-lsif` toggling whether Rust LSIF edges are built) is not
-/// Counter incremented every time a reindex marks Phase B dirty.
-///
-/// Paired with `phase_b_dirty`, which says *whether* the graph is degraded.
-/// This says *when*, well enough for `init` to distinguish a flag that predates
-/// its run from one that arrived while it was working: the first is stale and
-/// safe to clear, the second describes a real degradation this Phase B did not
-/// cover.
-const PHASE_B_DIRTY_SEQ: &str = "phase_b_dirty_seq";
-
 /// part of the per-file hash delta, so a plain re-init would report "up to date"
 /// without actually rebuilding those edges.
 pub fn init_repo_with_progress(
@@ -1537,6 +1571,10 @@ pub fn init_repo_with_progress(
             .reconcile(&empty_walked, &purge_policy, repo_root, &stored_corpus)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("corpus-change global-invalidation purge")?;
+        // Same as the `--force` purge below: no Phase B edge survived it.
+        store
+            .delete_meta("phase_b_commit")
+            .context("clearing the Phase B marker after the identity change")?;
         tracing::info!("identity-change purge complete, rebuilding from scratch");
     }
 
@@ -1699,56 +1737,15 @@ pub fn init_repo_with_progress(
         }
     }
     reclassify_objc_headers(&mut present_languages, &indexable_paths);
+    drop_build_script_only_kotlin(&mut present_languages, &indexable_paths);
 
     // L13: warn if a rebase is in progress — init during rebase risks indexing
     // conflict-marker noise into graph.db; the user should finish rebasing first.
-    if repo_root.join(".git").join("REBASE_HEAD").exists() {
+    if rebase_in_progress(&repo_root.join(".git")) {
         eprintln!(
             "warning: a git rebase is in progress, consider finishing or aborting it \
              before running `travsr init` to avoid indexing conflict markers"
         );
-    }
-
-    // T4 (1c): detect a large un-excluded dep dir and prompt/auto-exclude it.
-    // If the user accepts, re-discover so the excluded files are dropped.
-    if let Some((dir, count, total)) = detect_large_dep_dir(&indexable_paths, repo_root) {
-        let appended = maybe_prompt_large_dep(repo_root, &dir, count, total);
-        if appended {
-            // Re-build the walker and re-discover now that .travsrignore is updated.
-            let walker2 = WalkBuilder::new(repo_root)
-                .hidden(false)
-                .git_ignore(true)
-                .follow_links(false)
-                .add_custom_ignore_filename(".travsrignore")
-                .build();
-            indexable_paths.clear();
-            present_languages.clear();
-            for entry in walker2.flatten() {
-                if !entry.file_type().is_some_and(|t| t.is_file()) {
-                    continue;
-                }
-                let p = entry.into_path();
-                let rel = p.strip_prefix(repo_root).unwrap_or(&p);
-                if rel.components().any(|c| {
-                    crate::watcher::SKIP_DIRS
-                        .iter()
-                        .any(|skip| c.as_os_str() == *skip)
-                }) {
-                    continue;
-                }
-                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if let Some(lang) = Language::from_extension(ext) {
-                    present_languages.insert(lang.as_str().to_string());
-                    indexable_paths.push(p);
-                } else if travsr_core::is_manifest_file(
-                    p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
-                ) {
-                    // Name-recognized manifest (go.mod, *.csproj): unmapped ext.
-                    indexable_paths.push(p);
-                }
-            }
-            reclassify_objc_headers(&mut present_languages, &indexable_paths);
-        }
     }
 
     // M10: warn before spending minutes indexing when the file count is unusually
@@ -1827,35 +1824,55 @@ pub fn init_repo_with_progress(
         "TIMING: index_paths_parallel done"
     );
 
-    // Flush staging tables → production in one deduplicating GROUP BY pass.
-    // Must happen before rebuild_fts_from_map, which reads nodes_fts_map rows
-    // written during the staging phase and joins them against production nodes.
-    let t_flush = std::time::Instant::now();
-    if index_result.is_ok() {
-        let (nodes_written, edges_written) = store
-            .flush_staging_to_production()
-            .context("flushing staging tables to production")?;
-        tracing::info!(
-            elapsed_ms = t_flush.elapsed().as_millis(),
-            nodes = nodes_written,
-            edges = edges_written,
-            "TIMING: flush_staging_to_production done"
-        );
-    }
+    // Both steps below block this thread for over a minute on a large repo,
+    // with no event of their own: a heartbeat keeps the progress line alive,
+    // as the Phase B fan-out does.
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let hb_progress: &mut (dyn FnMut(InitProgress) + Send) = &mut *on_progress;
+    std::thread::scope(|s| -> anyhow::Result<()> {
+        let hb_done = &done;
+        let hb = s.spawn(move || {
+            while !hb_done.load(std::sync::atomic::Ordering::Relaxed) {
+                hb_progress(InitProgress::Saving);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+        let saved = (|| -> anyhow::Result<()> {
+            // Flush staging tables → production in one deduplicating GROUP BY pass.
+            // Must happen before rebuild_fts_from_map, which reads nodes_fts_map rows
+            // written during the staging phase and joins them against production nodes.
+            let t_flush = std::time::Instant::now();
+            if index_result.is_ok() {
+                let (nodes_written, edges_written) = store
+                    .flush_staging_to_production()
+                    .context("flushing staging tables to production")?;
+                tracing::info!(
+                    elapsed_ms = t_flush.elapsed().as_millis(),
+                    nodes = nodes_written,
+                    edges = edges_written,
+                    "TIMING: flush_staging_to_production done"
+                );
+            }
 
-    // Rebuild FTS + vocab in one pass now that all nodes are written.
-    // Do this before restoring pragmas so the rebuild benefits from the
-    // expanded cache and synchronous=OFF.
-    let t_fts = std::time::Instant::now();
-    if index_result.is_ok() {
-        store
-            .rebuild_fts_from_map()
-            .context("rebuilding FTS after bulk init")?;
-    }
-    tracing::info!(
-        elapsed_ms = t_fts.elapsed().as_millis(),
-        "TIMING: rebuild_fts_from_map done"
-    );
+            // Rebuild FTS + vocab in one pass now that all nodes are written.
+            // Do this before restoring pragmas so the rebuild benefits from the
+            // expanded cache and synchronous=OFF.
+            let t_fts = std::time::Instant::now();
+            if index_result.is_ok() {
+                store
+                    .rebuild_fts_from_map()
+                    .context("rebuilding FTS after bulk init")?;
+            }
+            tracing::info!(
+                elapsed_ms = t_fts.elapsed().as_millis(),
+                "TIMING: rebuild_fts_from_map done"
+            );
+            Ok(())
+        })();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = hb.join();
+        saved
+    })?;
 
     // Always restore pragmas — even on error — so the store is left in a
     // consistent state if the caller catches the error and continues.
@@ -1965,17 +1982,20 @@ pub fn init_repo_with_progress(
     // Decide whether to run Phase B inline now, defer it, or skip it entirely.
     //
     // Already-done path: `phase_b_commit == HEAD` means Phase B is current for
-    // this commit (e.g. a previous `--semantic` run or a completed background
+    // this commit (e.g. a previous `travsr init` or a completed background
     // refresh). No message, no daemon spawn — silently return a dummy report so
     // the caller knows Phase B is not pending.
     //
-    // Deferred path (default): Phase B runs in the background via the daemon's
+    // Deferred path (`semantic` false, only the `init_repo` helper): Phase B
+    // runs in the background via the daemon's
     // `run_background_phase_b` once the user's IDE / agent starts it. The
     // `phase_b_commit` meta key is intentionally left unset so the daemon's
     // `phase_b_tick` auto-arms the scheduler on startup.
     //
-    // Inline path (`--semantic` flag, or repo has no HEAD commit):
-    //   • `--semantic`: callers (CI, scripts) need call edges before querying.
+    // Inline path (`semantic`, which every CLI `travsr init` passes, or a repo
+    // with no HEAD commit):
+    //   • `semantic`: callers need call edges before querying.
+    //     Skipped when Phase B already covers HEAD (`phase_b_inline_needed`).
     //   • No commit: `run_background_phase_b` bails when `last_commit` is empty,
     //     so there is no deferred path available for fresh repos.
     let current_sha = read_head_commit_sha(repo_root).unwrap_or_default();
@@ -1986,7 +2006,30 @@ pub fn init_repo_with_progress(
         .flatten()
         .unwrap_or_default();
     let phase_b_already_done = !current_sha.is_empty() && phase_b_commit_stored == current_sha;
-    let run_phase_b_inline = semantic || !has_commit;
+    let run_phase_b_inline = !has_commit
+        || (semantic && {
+            let meta = |key| store.get_meta(key).ok().flatten().unwrap_or_default();
+            let warnings = meta("phase_b_warnings");
+            let lang_toml = travsr_plugin_host::trust::LangToml::from_disk();
+            let resolver = std::cell::OnceCell::new();
+            phase_b_inline_needed(
+                phase_b_already_done,
+                meta("phase_b_dirty") == "1",
+                &warnings,
+                |lang| {
+                    use travsr_plugin_host::phase_b::status::{gather, readiness, Readiness};
+                    travsr_plugin_host::phase_b::lookup(lang).is_some_and(|entry| {
+                        let resolver = resolver.get_or_init(|| {
+                            travsr_plugin_host::resolver::CatalogResolver::for_corpus(&corpus)
+                        });
+                        // Without the last run's warnings: "ready now" is the
+                        // setup rungs alone, not what that run recorded.
+                        let cap = gather(entry, repo_root, &corpus, &lang_toml, resolver, "");
+                        readiness(&cap) == Readiness::Ready
+                    })
+                },
+            )
+        });
 
     // Observed before Phase B starts, compared after it finishes. `init.lock`
     // serialises two `travsr init` invocations, but not the daemon's watcher,
@@ -2003,19 +2046,14 @@ pub fn init_repo_with_progress(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
 
+    // Stamped here as well as at the end, so an init interrupted during Phase B
+    // leaves last_commit ahead of phase_b_commit: the daemon arms on that gap.
+    if has_commit {
+        let _ = store.set_meta("last_commit", &current_sha);
+    }
+
     let phase_b_report = if run_phase_b_inline {
         on_progress(InitProgress::Finalizing);
-
-        // LSIF semantic pass — adds RefCall edges on top of structural edges.
-        // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
-        // #878: a skipped pass is carried into `write_phase_b_results` below,
-        // not just logged, so the summary and `travsr status` disclose it.
-        let t_lsif = std::time::Instant::now();
-        let lsif_skip = run_lsif_pass(repo_root, &corpus, &mut store);
-        tracing::info!(
-            elapsed_ms = t_lsif.elapsed().as_millis(),
-            "TIMING: run_lsif_pass done"
-        );
 
         // Phase B — deep semantic analysis via sidecar plugins (RFC-011 §3).
         let t_phase_b = std::time::Instant::now();
@@ -2127,7 +2165,6 @@ pub fn init_repo_with_progress(
                 pb_refs,
                 pb_outcome,
                 (lsif_parsed, lsif_resolved),
-                lsif_skip.as_ref(),
             );
             // WS-2: flag Dart packages indexed without resolved dependencies.
             record_dart_resolution_state(&mut store, repo_root, present_languages.contains("dart"));
@@ -2176,7 +2213,7 @@ pub fn init_repo_with_progress(
         Some(report)
     } else if phase_b_already_done {
         // Phase B is current for this commit — nothing to do, no message.
-        // Return Some(empty) so init.rs skips the daemon spawn.
+        // Return Some(empty): Phase B is not pending.
         Some(PhaseBReport::default())
     } else {
         on_progress(InitProgress::PhaseBDeferred);
@@ -2237,19 +2274,16 @@ pub fn init_repo_with_progress(
             //
             // The flag is set by `reindex_files` on the watcher and hook paths,
             // because rewriting a file's Phase A nodes drops its `ref/call` edges
-            // (#583). Init's own indexing does not route through `reindex_files`,
-            // so the flag reaching here was set by an earlier watcher or hook
-            // reindex, not by this run. Phase B has just rebuilt those edges, so
+            // (#583). Init's own re-parse sets it the same way, before Phase B
+            // starts. Phase B has just rebuilt those edges, so
             // by this point the flag describes a degradation that no longer
             // exists and leaving it set makes `travsr status` report `stale`
             // over a correct graph.
             //
-            // Only reachable with `run_phase_b_inline`, which means
-            // `travsr init --semantic` or a repo with no HEAD commit. Plain
-            // `travsr init` defers Phase B and must NOT clear the flag: the edges
-            // really are still missing, so the flag is honest there. That is why
-            // `status.rs` names `travsr init --semantic` as the remedy rather
-            // than `travsr init`.
+            // Only reachable with `run_phase_b_inline`: every CLI `travsr init`
+            // (it passes `semantic`) or a repo with no HEAD commit. The deferred
+            // path, left only to the `init_repo` helper, must NOT clear the flag:
+            // the edges really are still missing there.
             // Only if nothing marked it dirty while this run was working. A
             // flag that predates this run is stale and safe to clear, which is
             // the #741 fix; one that arrived mid-run describes a real
@@ -3344,10 +3378,6 @@ fn write_phase_b_results(
     // Windows path bug where every ref parsed but none matched a Phase A node —
     // so `rust_lsif_degraded` reflects surviving edges, not just "did ra run".
     lsif_stats: (usize, usize),
-    // #878: `Some` when the TypeScript LSIF pass was due (tsconfig.json present)
-    // but `travsr-lsif-ts` could not run. Recorded in `phase_b_warnings` and on
-    // the report so the language is never reported as cleanly complete.
-    lsif_skip: Option<&LsifSkip>,
 ) -> (
     PhaseBReport,
     std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId>,
@@ -3519,6 +3549,11 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_needs_consent {
         warnings.push(format!("needs_consent:{lang}"));
     }
+    // rust-analyzer skipped: no OS sandbox, and no grant for this repo. Without
+    // this Rust read ready with no rust-analyzer calls; `travsr init` grants it.
+    if travsr_indexer::sandbox::ra_lsif_sandbox_was_skipped() {
+        warnings.push("needs_consent:rust".to_string());
+    }
     // #449: a language present in the repo whose sidecar is not installed or
     // not registered used to be skipped silently, and the user saw "0 references"
     // with no hint that Phase B never ran. Surface both skip classes so
@@ -3540,14 +3575,17 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_no_compdb {
         warnings.push(format!("skipped_no_compdb:{lang}"));
     }
+    for lang in &pb_outcome.skipped_no_build_file {
+        warnings.push(format!("skipped_no_build_file:{lang}"));
+    }
     // #878: the TypeScript LSIF pass was due but `travsr-lsif-ts` never ran (or
     // ran and failed). The native pass still ran, so `typescript` is in `ran`
     // and the marker advances; this is what keeps `travsr status` from reading
     // `complete` over an index missing most of the language's call edges.
-    // The TypeScript skip arrives as an argument (its pass runs in this crate);
-    // rust and python are recorded by their own runners in travsr-indexer and
-    // drained here, so all three land in one place with one vocabulary.
-    let lsif_skips = collect_lsif_skips(lsif_skip);
+    // All three analyzers record their skips in travsr-indexer (TypeScript's
+    // from the native pass) and are drained here, so they land in one place
+    // with one vocabulary.
+    let lsif_skips = collect_lsif_skips();
     for skip in &lsif_skips {
         warnings.push(format!("{}:{}", skip.warning_class(), skip.language));
     }
@@ -3593,7 +3631,17 @@ fn write_phase_b_results(
     // and a class alone (`zero_nodes:java`) cannot name the Android SDK.
     // Bounded and sanitized by the indexer before it reaches here. Written
     // on every run, so a stale diagnostic does not outlive its fix.
-    let diagnostics_json = serde_json::to_string(&pb_outcome.diagnostics).unwrap_or_default();
+    // An emitter that could not run says why here too, so `init` can keep to
+    // the plain line and `status --verbose` still has the emitter's own words.
+    let mut diagnostics = pb_outcome.diagnostics.clone();
+    diagnostics.extend(lsif_skips.iter().map(|skip| {
+        travsr_plugin_host::indexer::SidecarDiagnostic {
+            lang: skip.language.clone(),
+            code: skip.warning_class().to_string(),
+            message: skip.detail.clone(),
+        }
+    }));
+    let diagnostics_json = serde_json::to_string(&diagnostics).unwrap_or_default();
     let _ = store.set_meta("phase_b_diagnostics", &diagnostics_json);
 
     // M1 degradation flag: surfaced by `travsr status` so the user knows Rust
@@ -3749,6 +3797,7 @@ fn collect_present_languages_and_paths(
     }
 
     reclassify_objc_headers(&mut langs, &paths);
+    drop_build_script_only_kotlin(&mut langs, &paths);
 
     (langs, paths)
 }
@@ -3781,6 +3830,19 @@ fn reclassify_objc_headers(langs: &mut std::collections::HashSet<String>, paths:
         if !has_c_source {
             langs.remove(Language::C.as_str());
         }
+    }
+}
+
+/// Kotlin's language tools run only when a `.kt` file exists. `.kts` is
+/// Kotlin syntax, so it is parsed and indexed, but a repo whose only Kotlin is
+/// its Gradle build scripts has no calls there worth a language server's
+/// minutes. Called beside [`reclassify_objc_headers`] by every builder.
+fn drop_build_script_only_kotlin(langs: &mut std::collections::HashSet<String>, paths: &[PathBuf]) {
+    if !paths
+        .iter()
+        .any(|p| p.extension().and_then(|e| e.to_str()) == Some("kt"))
+    {
+        langs.remove(Language::Kotlin.as_str());
     }
 }
 
@@ -5023,6 +5085,33 @@ fn live_lane_enabled_for(store: &SqliteStore, language: &str) -> bool {
     LIVE_LANE_SHIPPED.iter().any(|(l, _)| *l == language) || live_lane_measure_forced(language)
 }
 
+/// Whether calls in a language are traced as the user edits, for `status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditTracing {
+    On,
+    /// Shipped, but its measured precision here fell below the bar.
+    OffMeasured,
+    /// Not available for this language (not on [`LIVE_LANE_SHIPPED`]).
+    OffUnavailable,
+}
+
+/// [`live_lane_enabled_for`] with the reason when it is off. Takes a catalog
+/// language; `javascript` files are metered as `typescript`.
+pub fn edit_tracing(store: &SqliteStore, language: &str) -> EditTracing {
+    let language = if language == "javascript" {
+        "typescript"
+    } else {
+        language
+    };
+    if live_lane_enabled_for(store, language) {
+        EditTracing::On
+    } else if LIVE_LANE_SHIPPED.iter().any(|(l, _)| *l == language) {
+        EditTracing::OffMeasured
+    } else {
+        EditTracing::OffUnavailable
+    }
+}
+
 /// RFC-027 section 8.3: retire the live overlay and clear resolved pendings.
 ///
 /// Extracted so the convergence property test can drive ratification directly
@@ -5158,15 +5247,13 @@ fn open_daemon_store(
 /// - JavaScript has no `nodes.language` of its own. `Language::from_extension`
 ///   maps `.js`/`.jsx` to `TypeScript`, so a run that analysed JavaScript
 ///   ratifies rows labeled `typescript`.
-/// - The LSIF pass is TypeScript's and is not represented in `report.ran`, so
-///   `typescript` is added whenever it produced edges.
 ///
 /// A language absent from this set keeps its live edges. That is the #712
 /// partial-success case: the marker advances because *something* progressed,
 /// but a crashed sidecar's truth was never re-derived, and discarding its
 /// overlay would take away precision without replacing it.
-fn ratified_languages(report: &PhaseBReport, lsif_ran: bool) -> Vec<String> {
-    let mut langs: Vec<String> = Vec::with_capacity(report.ran.len() + 1);
+fn ratified_languages(report: &PhaseBReport) -> Vec<String> {
+    let mut langs: Vec<String> = Vec::with_capacity(report.ran.len());
     for lang in &report.ran {
         // JavaScript nodes are labeled `typescript`; see above.
         let mapped = if lang == "javascript" {
@@ -5178,10 +5265,13 @@ fn ratified_languages(report: &PhaseBReport, lsif_ran: bool) -> Vec<String> {
             langs.push(mapped.to_string());
         }
     }
-    if lsif_ran && !langs.iter().any(|l| l == "typescript") {
-        langs.push("typescript".to_string());
-    }
     langs
+}
+
+/// Whether a `travsr init` holds this repo's `init.lock`.
+pub fn init_running(repo_root: &Path) -> bool {
+    std::fs::File::open(repo_root.join(".travsr").join("init.lock"))
+        .is_ok_and(|f| fs2::FileExt::try_lock_exclusive(&f).is_err())
 }
 
 fn run_background_phase_b_inner(
@@ -5207,18 +5297,18 @@ fn run_background_phase_b_inner(
         }
         (corpus, last)
     };
+    // A `travsr init` is running Phase B inline for this commit; doing it here
+    // too repeats the same work. The next tick runs it if that init is
+    // interrupted, since the markers still differ once it releases the lock.
+    if init_running(repo_root) {
+        return phase_b_sched::RunOutcome::Success;
+    }
 
     tracing::info!(
         event = "phase_b.start",
         commit = %target_sha,
         "semantic call and reference indexing starting"
     );
-
-    // ── LSIF pass (TypeScript compiler — expensive, runs lock-free) ───────────
-    // Collect edges into a Vec first; write them under the store lock below.
-    // This mirrors the SCIP sidecar pattern and keeps queries warm throughout.
-    // #878: a skipped pass is recorded, not just logged (see the inline path).
-    let (lsif_edges, lsif_skip) = run_lsif_pass_collect(repo_root, &corpus);
 
     // ── SCIP sidecar pass (all languages in parallel, lock-free) ─────────────
     // P6 (#329): single walk yields both present_languages and indexable_paths
@@ -5275,13 +5365,6 @@ fn run_background_phase_b_inner(
         "semantic analysis cross-reference resolution complete"
     );
 
-    // Write LSIF edges first (pre-collected lock-free above).
-    for edge in &lsif_edges {
-        if let Err(e) = s.put_edge_lsif(edge) {
-            tracing::warn!("lsif edge write error: {e}");
-        }
-    }
-
     let (report, alias_map, dropped) = write_phase_b_results(
         &mut s,
         &corpus,
@@ -5290,7 +5373,6 @@ fn run_background_phase_b_inner(
         pb_refs,
         pb_outcome,
         (lsif_parsed, lsif_resolved),
-        lsif_skip.as_ref(),
     );
     // WS-2: flag Dart packages indexed without resolved dependencies.
     record_dart_resolution_state(&mut s, repo_root, dart_present);
@@ -5325,15 +5407,13 @@ fn run_background_phase_b_inner(
     // `travsr status` reports `partial (crashed: <lang>)` and the query tools
     // stop emitting the "building in the background" note that previously never
     // resolved. The marker is left behind ONLY when a language crashed AND nothing
-    // else made progress (`!crashed.is_empty()` with both `ran` and `lsif_edges`
-    // empty), so the all-crash retry cap can keep trying that broken sidecar until
+    // else made progress (`!crashed.is_empty()` with `ran` empty), so the all-crash retry cap can keep trying that broken sidecar until
     // its tool is fixed. The no-op case — nothing ran and nothing crashed, e.g. no
     // analyzer is installed for any language in this repo — stamps the marker,
     // because there is nothing to wait for. A persistently crashing language is
     // retried on the next commit or an explicit `travsr reindex --semantic
     // --force`, not on an endless background loop.
-    let made_progress =
-        report.crashed.is_empty() || !report.ran.is_empty() || !lsif_edges.is_empty();
+    let made_progress = report.crashed.is_empty() || !report.ran.is_empty();
 
     // RFC-027 section 8.3: ratify the live overlay.
     //
@@ -5351,7 +5431,7 @@ fn run_background_phase_b_inner(
     // catch mid-flight is a superset of the ratified graph, never a gap. The
     // hazard the RFC worried about was the gap; the ordering dissolves it.
     if made_progress {
-        ratify_live_overlay(&mut s, &ratified_languages(&report, !lsif_edges.is_empty()));
+        ratify_live_overlay(&mut s, &ratified_languages(&report));
     }
 
     if made_progress {
@@ -5367,9 +5447,7 @@ fn run_background_phase_b_inner(
         commit = %target_sha,
         event = "phase_b.complete",
         ran = report.ran.len(),
-        lsif_edges = lsif_edges.len(),
-        // #878: `lsif_edges = 0` alone cannot distinguish "no tsconfig" from
-        // "the emitter never ran"; the class says which.
+        // #878: the class says whether an analyzer never ran or failed.
         lsif_skipped = ?report
             .lsif_skipped
             .iter()
@@ -5605,6 +5683,9 @@ pub fn reindex_files_reporting(
     // instead of degrading them to the `@workspace` sentinel.
     let mut member_manifests: Vec<PathBuf> = Vec::new();
     let mut any_changed = false;
+    // A change that can drop committed call edges (#583), as opposed to one to
+    // a file whose language has no traced calls.
+    let mut calls_changed = false;
     // Accumulate Tier-0 dirty callers across all files in this batch.
     let mut callers_all = travsr_core::DirtySet::default();
     // RFC-027 #813 P2: per-file changed-definition committed occurrences, for the
@@ -5653,6 +5734,7 @@ pub fn reindex_files_reporting(
                             callers_all.extend(callers);
                         }
                         any_changed = true;
+                        calls_changed |= change_can_drop_calls(&vname_path);
                     }
                     Err(e) => tracing::warn!(path = %vname_path, err = %e, "delete_file failed"),
                 }
@@ -5748,6 +5830,7 @@ pub fn reindex_files_reporting(
                     ));
                 }
                 any_changed = true;
+                calls_changed |= change_can_drop_calls(&vname_path);
                 written_paths.push(vname_path.clone());
                 // Collect FFI markers for the repo-level pass (RFC-005).
                 all_ffi_markers.extend(out.ffi_markers);
@@ -5830,20 +5913,23 @@ pub fn reindex_files_reporting(
         // so the two markers stay equal while the graph is degraded below the
         // committed snapshot. Record that here so `travsr status` can say so
         // instead of reporting `complete`. Cleared by the next completed Phase
-        // B run, which is still commit-gated on purpose.
-        let _ = store.set_meta("phase_b_dirty", "1");
-        // A monotonic counter beside the flag, so a run that clears the flag can
-        // tell whether anything marked it dirty *while that run was working*.
-        // The flag alone cannot answer that: it is already "1" in the case that
-        // matters, so a before/after comparison of its value sees no change and
-        // clears a degradation that arrived mid-run (#742 review).
-        let seq = store
-            .get_meta(PHASE_B_DIRTY_SEQ)
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-        let _ = store.set_meta(PHASE_B_DIRTY_SEQ, &seq.wrapping_add(1).to_string());
+        // B run, which is still commit-gated on purpose. A file with no traced
+        // calls (a config file `connect` wrote) cannot drop one.
+        if calls_changed {
+            let _ = store.set_meta("phase_b_dirty", "1");
+            // A monotonic counter beside the flag, so a run that clears the flag can
+            // tell whether anything marked it dirty *while that run was working*.
+            // The flag alone cannot answer that: it is already "1" in the case that
+            // matters, so a before/after comparison of its value sees no change and
+            // clears a degradation that arrived mid-run (#742 review).
+            let seq = store
+                .get_meta(PHASE_B_DIRTY_SEQ)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let _ = store.set_meta(PHASE_B_DIRTY_SEQ, &seq.wrapping_add(1).to_string());
+        }
 
         // Recompute k-core shell numbers so they stay fresh after every commit.
         // O(V + E) — fast enough to run inline on the hook path at MVP scale.
@@ -5911,93 +5997,22 @@ pub fn reindex_files(
     reindex_files_reporting(paths, repo_root, store).map(|(callers, _, _)| callers)
 }
 
-/// Run the LSIF semantic pass if `tsconfig.json` is present at the repo root,
-/// writing edges directly into `store`.
-///
-/// Used by the inline path (`--semantic` or no-commit repos). For the deferred
-/// path use [`run_lsif_pass_collect`] + write under the store lock.
-///
-/// Failures never fail the overall index, but they are not silent either:
-/// `Some(skip)` is returned when the pass was due and the emitter could not
-/// run, for the caller to hand to `write_phase_b_results` (#878).
-fn run_lsif_pass(repo_root: &Path, corpus: &str, store: &mut SqliteStore) -> Option<LsifSkip> {
-    let (edges, skip) = run_lsif_pass_collect(repo_root, corpus);
-    for edge in &edges {
-        if let Err(e) = store.put_edge_lsif(edge) {
-            tracing::warn!("lsif edge write error: {e}");
-        }
-    }
-    tracing::debug!("lsif pass: {} RefCall edges persisted", edges.len());
-    skip
-}
-
-/// Collect LSIF RefCall edges without holding the store lock.
-///
-/// Returns `(edges, skip)`. `edges` is empty when `tsconfig.json` is absent or
-/// the emitter failed; `skip` is `Some` in the second case only, so a repo
-/// without a tsconfig is not reported as degraded (#878). The caller writes the
-/// edges under the store lock. This split lets `run_background_phase_b` hold
-/// the lock only for the final write batch while the expensive TS compiler
-/// runs lock-free.
-fn run_lsif_pass_collect(
-    repo_root: &Path,
-    corpus: &str,
-) -> (Vec<travsr_core::Edge>, Option<LsifSkip>) {
-    let tsconfig = repo_root.join("tsconfig.json");
-    if !tsconfig.exists() {
-        return (Vec::new(), None);
-    }
-
-    let dump = match run_lsif_emitter(&tsconfig) {
-        Ok(d) => d,
-        Err(e) => {
-            // #878: this used to be the only trace of the skip, and only under
-            // RUST_LOG. The class is what the user-facing surfaces key on.
-            let reason = if travsr_indexer::emitter_missing(&e) {
+/// The LSIF analyzer skips recorded during this Phase B pass: analyzers that
+/// could not be started, then analyzers that ran and failed. Each runner
+/// latches its own outcome in travsr-indexer for exactly this drain.
+fn collect_lsif_skips() -> Vec<LsifSkip> {
+    let mut out: Vec<LsifSkip> = travsr_indexer::sandbox::lsif_emitter_skips()
+        .into_iter()
+        .map(|s| LsifSkip {
+            language: s.language.to_string(),
+            reason: if s.missing {
                 LsifSkipReason::EmitterMissing
             } else {
                 LsifSkipReason::EmitterFailed
-            };
-            tracing::warn!("lsif emitter skipped: {e:#}");
-            return (
-                Vec::new(),
-                Some(LsifSkip {
-                    language: "typescript".to_string(),
-                    reason,
-                    detail: format!("{e:#}"),
-                }),
-            );
-        }
-    };
-
-    match ingest_lsif(&dump, corpus) {
-        Ok(out) => {
-            tracing::debug!("lsif pass: collected {} RefCall edges", out.edges.len());
-            (out.edges, None)
-        }
-        Err(e) => {
-            tracing::warn!("lsif ingest error: {e:#}");
-            (
-                Vec::new(),
-                Some(LsifSkip {
-                    language: "typescript".to_string(),
-                    reason: LsifSkipReason::EmitterFailed,
-                    detail: format!("travsr-lsif-ts ran but its output could not be read: {e:#}"),
-                }),
-            )
-        }
-    }
-}
-
-/// Merge the TypeScript LSIF skip with the rust/python analyzer failures
-/// recorded by their runners during this Phase B pass.
-///
-/// The two sources exist because the passes do: TypeScript's runs here in the
-/// daemon (so it is handed in), while rust-analyzer and travsr-lsif-py are
-/// invoked from travsr-indexer, which latches its failures for exactly this
-/// drain.
-fn collect_lsif_skips(ts_skip: Option<&LsifSkip>) -> Vec<LsifSkip> {
-    let mut out: Vec<LsifSkip> = ts_skip.into_iter().cloned().collect();
+            },
+            detail: s.detail,
+        })
+        .collect();
     for language in travsr_indexer::sandbox::lsif_analyzer_failures() {
         let detail = format!(
             "{} ran and failed, so {language} kept only its structural call edges",
@@ -6014,7 +6029,7 @@ fn collect_lsif_skips(ts_skip: Option<&LsifSkip>) -> Vec<LsifSkip> {
 
 /// Derive the canonical corpus for `repo_root` by reading `git remote get-url origin`.
 /// Falls back to `local/<basename>` if no remote is configured or git fails.
-fn detect_corpus(repo_root: &Path) -> String {
+pub fn detect_corpus(repo_root: &Path) -> String {
     let output = std::process::Command::new("git")
         .args([
             "-C",
@@ -6134,6 +6149,78 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
+
+    #[test]
+    fn init_running_follows_init_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        assert!(!init_running(tmp.path()), "no lock file, no init");
+        let held = std::fs::File::create(tmp.path().join(".travsr/init.lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        assert!(init_running(tmp.path()), "an init holds the lock");
+        fs2::FileExt::unlock(&held).unwrap();
+        assert!(!init_running(tmp.path()), "released");
+    }
+
+    #[test]
+    fn phase_b_inline_needed_table() {
+        let check = |name: &str, done: bool, dirty: bool, warnings: &str, ready: &[&str], want| {
+            let got = phase_b_inline_needed(done, dirty, warnings, |l| ready.contains(&l));
+            assert_eq!(got, want, "{name}");
+        };
+        check("done, nothing new", true, false, "", &["go"], false);
+        check("not done at this commit", false, false, "", &[], true);
+        check(
+            "done but a later edit dropped calls",
+            true,
+            true,
+            "",
+            &[],
+            true,
+        );
+        check(
+            "skipped, still not ready",
+            true,
+            false,
+            "skipped_unregistered:go",
+            &[],
+            false,
+        );
+        check(
+            "skipped language now ready",
+            true,
+            false,
+            "crashed:java,untrusted_corpus:go",
+            &["go"],
+            true,
+        );
+        check(
+            "a bundled tracer found again after a reinstall",
+            true,
+            false,
+            "emitter_missing:typescript",
+            &["typescript"],
+            true,
+        );
+        check(
+            "every gate-skip class counts",
+            true,
+            false,
+            "skipped_no_analyzer:go,skipped_no_compdb:c,needs_consent:java",
+            &["go"],
+            true,
+        );
+        // Re-running a language that ran and found nothing only repeats the
+        // same result; it is not a gate skip.
+        check(
+            "no symbols is not a gate skip",
+            true,
+            false,
+            "zero_nodes:go,crashed:go,no_references:go",
+            &["go"],
+            false,
+        );
+    }
 
     /// Run `body` under a subscriber filtered by `directive`, and return the
     /// (target, level) of every event that actually reached it.
@@ -6471,6 +6558,22 @@ mod tests {
             !langs.contains("objectivec"),
             "must not enroll objectivec without any .m/.mm, got {langs:?}"
         );
+    }
+
+    // A Gradle build script alone is not Kotlin source: tracing it cost
+    // yugabyte-db minutes for 5 calls. A real .kt file still enrolls kotlin.
+    #[test]
+    fn collect_present_languages_and_paths_ignores_build_script_only_kotlin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("build.gradle.kts"), "plugins { java }\n").unwrap();
+        std::fs::write(dir.path().join("App.java"), "class App {}\n").unwrap();
+        let (langs, paths) = collect_present_languages_and_paths(dir.path());
+        assert!(!langs.contains("kotlin"), "got {langs:?}");
+        assert_eq!(paths.len(), 2, "the script is still indexed: {paths:?}");
+
+        std::fs::write(dir.path().join("Main.kt"), "fun main() {}\n").unwrap();
+        let (langs, _paths) = collect_present_languages_and_paths(dir.path());
+        assert!(langs.contains("kotlin"), "got {langs:?}");
     }
 
     // L5b: a mixed C + Obj-C repo (genuine .c files alongside .m) must enroll
@@ -8487,7 +8590,6 @@ mod tests {
             pb_refs,
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
-            None,
         );
 
         // Literal repro from issue #449: "ClassA (Swift class instantiated via
@@ -8911,7 +9013,6 @@ mod tests {
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
-            None,
         );
         assert!(
             !linked(&store),
@@ -8927,7 +9028,6 @@ mod tests {
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
-            None,
         );
         assert!(
             linked(&store),
@@ -8956,16 +9056,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let (report, _, _) = write_phase_b_results(
-            &mut store,
-            "test",
-            vec![],
-            vec![],
-            vec![],
-            outcome,
-            (0, 0),
-            None,
-        );
+        let (report, _, _) =
+            write_phase_b_results(&mut store, "test", vec![], vec![], vec![], outcome, (0, 0));
         assert_eq!(report.diagnostics.len(), 1);
         assert_eq!(report.diagnostics[0].code, "java.android-sdk-missing");
         let persisted: Vec<travsr_plugin_host::SidecarDiagnostic> = serde_json::from_str(
@@ -8986,7 +9078,6 @@ mod tests {
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
-            None,
         );
         assert_eq!(
             store
@@ -9025,7 +9116,6 @@ mod tests {
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
-            None,
         );
         assert_eq!(
             store
@@ -9046,7 +9136,6 @@ mod tests {
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
-            None,
         );
 
         let warnings = store
@@ -9112,7 +9201,6 @@ mod tests {
                 vec![],
                 travsr_plugin_host::PhaseBOutcome::default(),
                 stats,
-                None,
             );
         };
 
@@ -9787,41 +9875,30 @@ mod tests {
         );
     }
 
-    /// L4 (#376 lifecycle plan): found indexing kubernetes/website, whose
-    /// entire doc corpus lives under `content/` — the standard source root
-    /// for Hugo/Jekyll/Gatsby-style static sites. Before `content` was added
-    /// to `KNOWN_SOURCE_DIRS`, a single top-level `content/` directory large
-    /// enough to dominate the repo (>=1000 files, >=15% of the total) was
-    /// flagged as a false-positive "large dep dir" and auto-excluded in
-    /// non-TTY runs with no visible warning in the command's own output —
-    /// silently discarding the repo's actual content.
+    /// A folder that holds most of the repo is not evidence it is a dependency:
+    /// init asked `[Y/n]` about it on a terminal and silently excluded it
+    /// everywhere else, and in yugabyte-db that folder (`managed/`) is the
+    /// platform's own code. Dependency folders are left out by the default
+    /// `.travsrignore`; everything else is indexed.
     #[test]
-    fn detect_large_dep_dir_does_not_flag_content() {
-        let repo_root = std::path::Path::new("/repo");
-        let mut files: Vec<PathBuf> = (0..1200)
-            .map(|i| repo_root.join(format!("content/en/docs/page-{i}.md")))
-            .collect();
-        files.push(repo_root.join("go.mod"));
-        assert_eq!(
-            detect_large_dep_dir(&files, repo_root),
-            None,
-            "content/ is a known source dir and must never be auto-excluded"
-        );
-    }
+    fn a_dominant_folder_is_indexed_not_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir(tmp.path().join("managed")).unwrap();
+        for i in 0..1200 {
+            std::fs::write(tmp.path().join(format!("managed/c{i}.yaml")), "a: 1\n").unwrap();
+        }
+        std::fs::write(tmp.path().join("go.mod"), "module m\n").unwrap();
 
-    #[test]
-    fn detect_large_dep_dir_still_flags_an_unknown_large_dir() {
-        let repo_root = std::path::Path::new("/repo");
-        let mut files: Vec<PathBuf> = (0..1200)
-            .map(|i| repo_root.join(format!("node_modules/pkg-{i}/index.js")))
-            .collect();
-        files.push(repo_root.join("go.mod"));
-        let detected = detect_large_dep_dir(&files, repo_root);
-        assert_eq!(
-            detected.map(|(dir, ..)| dir),
-            Some("node_modules".to_string()),
-            "an unknown, dominant top-level dir must still be flagged"
+        let stats = init_repo(tmp.path()).unwrap();
+
+        assert!(
+            stats.files_indexed >= 1200,
+            "indexed {}",
+            stats.files_indexed
         );
+        let ignore = std::fs::read_to_string(tmp.path().join(".travsrignore")).unwrap_or_default();
+        assert!(!ignore.contains("managed"), "{ignore}");
     }
 
     #[test]
@@ -9837,7 +9914,7 @@ mod tests {
             .status()
             .unwrap();
         std::process::Command::new("git")
-            .args(["commit", "-m", "init"])
+            .args(["-c", "core.hooksPath=/dev/null", "commit", "-m", "init"])
             .current_dir(tmp.path())
             .status()
             .unwrap();
@@ -10241,6 +10318,8 @@ mod tests {
                 "user.email=t@t",
                 "-c",
                 "user.name=t",
+                "-c",
+                "core.hooksPath=/dev/null",
                 "commit",
                 "-qm",
                 "edit",
@@ -10498,6 +10577,8 @@ mod tests {
                     "user.email=t@t",
                     "-c",
                     "user.name=t",
+                    "-c",
+                    "core.hooksPath=/dev/null",
                     "commit",
                     "-qm",
                     msg,
@@ -10649,6 +10730,23 @@ mod tests {
             live_lane_enabled_for(&store, "typescript"),
             "the gate must be scoped per language, not corpus-wide"
         );
+    }
+
+    /// `travsr status` says why calls are not traced as you edit: measured off
+    /// here, or never available for the language. `javascript` is metered as
+    /// `typescript`, the same node language its files carry.
+    #[test]
+    fn edit_tracing_names_why_it_is_off() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        assert_eq!(edit_tracing(&store, "rust"), EditTracing::On);
+        assert_eq!(edit_tracing(&store, "javascript"), EditTracing::On);
+        assert_eq!(edit_tracing(&store, "ruby"), EditTracing::OffUnavailable);
+        store.set_meta("live_precision.rust", "18,5,3").unwrap();
+        assert_eq!(edit_tracing(&store, "rust"), EditTracing::OffMeasured);
+        store
+            .set_meta("live_precision.typescript", "18,5,3")
+            .unwrap();
+        assert_eq!(edit_tracing(&store, "javascript"), EditTracing::OffMeasured);
     }
 
     /// RFC-027 section 8.7.6: an unmeasured, un-vouched language ships DISABLED.
@@ -11507,36 +11605,26 @@ mod tests {
 
     /// `ratified_languages` maps analyzer names onto how nodes are labeled.
     #[test]
-    fn ratified_languages_maps_javascript_and_the_lsif_pass_onto_typescript() {
+    fn ratified_languages_maps_javascript_onto_typescript() {
         let js_only = PhaseBReport {
             ran: vec!["javascript".to_string()],
             ..PhaseBReport::default()
         };
         assert_eq!(
-            ratified_languages(&js_only, false),
+            ratified_languages(&js_only),
             vec!["typescript".to_string()],
             "JavaScript nodes are labeled typescript, so that is what ratifies"
         );
 
-        // The LSIF pass is TypeScript's and never appears in `ran`.
-        let nothing_ran = PhaseBReport::default();
-        assert_eq!(
-            ratified_languages(&nothing_ran, true),
-            vec!["typescript".to_string()]
-        );
+        // Nothing ran: sweep nothing at all.
+        assert!(ratified_languages(&PhaseBReport::default()).is_empty());
 
-        // Nothing ran and no LSIF edges: sweep nothing at all.
-        assert!(ratified_languages(&nothing_ran, false).is_empty());
-
-        // No duplicate when both signals point at typescript.
+        // No duplicate when both point at typescript.
         let both = PhaseBReport {
             ran: vec!["typescript".to_string(), "javascript".to_string()],
             ..PhaseBReport::default()
         };
-        assert_eq!(
-            ratified_languages(&both, true),
-            vec!["typescript".to_string()]
-        );
+        assert_eq!(ratified_languages(&both), vec!["typescript".to_string()]);
     }
 
     /// Append a second caller to `order.ts` and re-index it, the way a save
@@ -12762,76 +12850,6 @@ mod tests {
         );
     }
 
-    /// #526: hook injection must prefer a repo's own `.travsr/embed.toml`
-    /// override over the machine-wide `~/.travsr/embed.toml` default, the
-    /// same resolution order `resolve_backend` (travsr-plugin-host) uses.
-    #[test]
-    fn hook_backend_id_prefers_repo_config_over_global() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
-
-        std::fs::create_dir_all(home.path().join(".travsr")).unwrap();
-        std::fs::write(
-            home.path().join(".travsr").join("embed.toml"),
-            "active = \"global-backend\"\n",
-        )
-        .unwrap();
-
-        let repo_travsr = repo.path().join(".travsr");
-        std::fs::create_dir_all(&repo_travsr).unwrap();
-        std::fs::write(
-            repo_travsr.join("embed.toml"),
-            "active = \"repo-backend\"\n",
-        )
-        .unwrap();
-
-        let resolved = hook_backend_id(&repo_travsr.join("graph.db"));
-
-        match old_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-
-        assert_eq!(
-            resolved.as_deref(),
-            Some("repo-backend"),
-            "repo's .travsr/embed.toml must win over the machine-wide default"
-        );
-    }
-
-    #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see crates/travsr-cli/tests/embed_switch.rs's module doc comment"
-    )]
-    fn hook_backend_id_falls_back_to_global_when_repo_unconfigured() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
-
-        std::fs::create_dir_all(home.path().join(".travsr")).unwrap();
-        std::fs::write(
-            home.path().join(".travsr").join("embed.toml"),
-            "active = \"global-backend\"\n",
-        )
-        .unwrap();
-
-        // No repo .travsr/embed.toml written at all.
-        let resolved = hook_backend_id(&repo.path().join(".travsr").join("graph.db"));
-
-        match old_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-
-        assert_eq!(resolved.as_deref(), Some("global-backend"));
-    }
-
     /// Set shell_number = `shell` on every embeddable node (kind not in the
     /// exclusion list). This simulates Phase B having run and computed k-core
     /// without requiring the Phase B toolchain to be installed.
@@ -12993,7 +13011,7 @@ mod tests {
             .status()
             .unwrap();
         StdCommand::new("git")
-            .args(["commit", "-q", "-m", msg])
+            .args(["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", msg])
             .current_dir(dir)
             .status()
             .unwrap();
@@ -16201,19 +16219,18 @@ fn handle_control_message(
             let edges = s.edge_count().unwrap_or(0);
 
             // Live Phase B activity from the scheduler.
-            let phase_b_activity = if phase_b_scheduler.is_running() {
-                "running".to_string()
-            } else if phase_b_scheduler.is_pending() {
-                "pending (debounce)".to_string()
-            } else if last_commit.is_empty() {
-                "not run (no commits yet)".to_string()
-            } else if phase_b_commit.is_empty() {
-                "pending".to_string()
-            } else if phase_b_commit == last_commit {
-                "complete".to_string()
-            } else {
-                "stale (new commits since last run)".to_string()
-            };
+            let phase_b_activity = semantic_line(
+                phase_b_scheduler.is_running(),
+                phase_b_scheduler.is_pending(),
+                &last_commit,
+                &phase_b_commit,
+                s.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1"),
+                s.resolved_ref_count().unwrap_or(0),
+                travsr_mcp::query::pending_refs_in_edited_files(&s)
+                    .iter()
+                    .map(|(_, n)| n)
+                    .sum(),
+            );
 
             // Embed progress — per-repo configured model only.
             let embed_line = if let Some(backend_id) =
@@ -16412,22 +16429,6 @@ fn run_query(
     }
 }
 
-/// Resolve the embed backend id to use for hook injection at `db_path`,
-/// preferring the repo's own `.travsr/embed.toml` override over the
-/// machine-wide `~/.travsr/embed.toml` default. Mirrors `resolve_backend`'s
-/// resolution order in travsr-plugin-host — hook injection is a per-repo
-/// embedding decision, so it must not resolve on `active_backend_id()` alone
-/// (#526: a repo-level `travsr embed switch` was silently ignored, causing
-/// the daemon to spawn the wrong sidecar model and disable Step 4).
-fn hook_backend_id(db_path: &Path) -> Option<String> {
-    use travsr_plugin_host::{active_backend_id, repo_backend_id};
-
-    let repo_root = db_path.parent().and_then(|p| p.parent());
-    repo_root
-        .and_then(repo_backend_id)
-        .or_else(active_backend_id)
-}
-
 /// Try to start an embed plugin supervisor and inject its KNN hook into `store`.
 ///
 /// Wire the embed KNN hook into the daemon stores.
@@ -16449,23 +16450,18 @@ pub fn try_inject_embed_hook(
     write_store: &mut SqliteStore,
     db_path: &Path,
 ) -> Option<travsr_plugin_host::EmbedSupervisor> {
-    use travsr_plugin_host::{embed_backends, lookup_embed_backend, EmbedSupervisor};
+    use travsr_plugin_host::{lookup_embed_backend, EmbedSupervisor};
 
     let Some(home) = dirs::home_dir() else {
         tracing::debug!("embed hook: HOME not set, skipping");
         return None;
     };
 
-    // Prefer the repo's own `.travsr/embed.toml` override, then the user's
-    // machine-wide active backend from ~/.travsr/embed.toml, then the catalog
-    // default so a fresh install without `travsr embed switch` still works.
-    // Mirrors `resolve_backend`'s resolution order (travsr-plugin-host) — this
-    // is a per-repo embedding decision, not an install/list/hint path, so it
-    // must not resolve on `active_backend_id()` alone (#526).
-    let backend = hook_backend_id(db_path)
+    // Only a repo that ran `travsr embed init` has a backend (#526); the same
+    // rule `daemon status` reports and the MCP server applies.
+    let backend = travsr_mcp::repo_embed_backend(db_path)
         .as_deref()
         .and_then(lookup_embed_backend)
-        .or_else(|| embed_backends().first())
         .cloned()?;
 
     let binary = home

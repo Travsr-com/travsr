@@ -847,6 +847,41 @@ export function buildLanguageRows(
     // One action per row, and it has to be the right one: an install where the
     // analyzer is already on the machine downloads nothing and changes nothing.
     let fix: LanguageRow["fix"] = "none";
+    // One-command setup: a current CLI states the language's readiness, and
+    // everything it can fix is one `travsr init` (plan 3.5). Older CLIs send no
+    // `state` and keep the per-language actions below.
+    const READY_STATES: Record<string, (needs: string) => string> = {
+      ready: () => "ready",
+      setting_up: () => "setting up",
+      needs_toolchain: (needs) => `needs ${needs}`,
+      unsupported_os: () => `not available on ${osName || "this platform"}`,
+      failed: () => "could not trace calls",
+      no_calls: () => "no calls found",
+    };
+    const state = typeof sent["state"] === "string" ? String(sent["state"]) : undefined;
+    if (state !== undefined && state in READY_STATES) {
+      const needs = typeof sent["needs"] === "string" ? String(sent["needs"]) : "";
+      const canSetUp =
+        availableHere && inRepo && ["setting_up", "needs_toolchain", "failed"].includes(state);
+      return {
+        language: l.language,
+        analysis,
+        full,
+        // The CLI's own words when it sends them; the map is for older binaries.
+        statusLine: typeof sent["label"] === "string" ? String(sent["label"]) : READY_STATES[state](needs),
+        flagged,
+        installed,
+        repoState,
+        availableHere,
+        osName,
+        prerequisites,
+        builtin,
+        inRepo,
+        fix: canSetUp ? "setup" : "none",
+        fixText: typeof sent["fix"] === "string" ? String(sent["fix"]) : undefined,
+        canDisable: availableHere && full && !builtin,
+      };
+    }
     if (!availableHere || !inRepo) fix = "none";
     else if (l.status === "needs_consent") fix = "permission";
     else if (!installed || repoState === "needs_analyzer") fix = "install";
@@ -1790,7 +1825,7 @@ export function registerShowGraphStats(
         : (logFiles.files[0]?.name ?? "");
     const log = root && selected !== "" ? readDaemonLogFile(root, selected, logLines) : [];
     const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
-    // readDiagnostics spawns `travsr status`.
+    // readDiagnostics spawns `travsr status --verbose`.
     const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
     // Drift, straight from the daemon. An older binary does not serve this tool
     // and the client answers "" for an unknown tool, which parseIndexHealth
@@ -1839,10 +1874,9 @@ export function registerShowGraphStats(
       installEmbed: ["embed", "init"],
       runFsck: ["fsck"],
       compact: ["fsck", "--fix"],
-      // Without `--yes` this prompts per language. That is deliberate: it runs
-      // in a real terminal where the prompt works, and `--yes` would have the
-      // panel download several analyzers off one click.
-      detectLangs: ["lang", "detect"],
+      // One-command setup: `init` detects the languages and sets up every one
+      // it can, with no prompts (plan 3.5).
+      detectLangs: ["init"],
     };
     const argv = TERMINAL_ACTIONS[msg.command];
     if (argv !== undefined) {
@@ -1958,20 +1992,8 @@ export function registerShowGraphStats(
         void vscode.window.showWarningMessage("Travsr: open a folder to index it.");
         return;
       }
-      const binary =
-        vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
-      const { cancelled, code } = await spawnManagedInstall(
-        binary,
-        ["init"],
-        repo,
-        "Travsr: indexing this repository…"
-      );
+      const { cancelled } = await setUpRepo(repo);
       if (cancelled) return;
-      if (code !== 0) {
-        void vscode.window.showErrorMessage(
-          `Travsr: indexing failed (exit ${code ?? "unknown"}). See the daemon log.`
-        );
-      }
       await refresh();
       return;
     }
@@ -2112,7 +2134,7 @@ export function registerShowGraphStats(
               `${name} is enabled for this repository. Full analysis runs on the next semantic index.`,
               "Re-index now"
             );
-            if (pick === "Re-index now") runTravsrCommand(["init", "--semantic", "--force"], repo);
+            if (pick === "Re-index now") runTravsrCommand(["init", "--force"], repo);
           }
           return;
         }
@@ -2143,7 +2165,7 @@ export function registerShowGraphStats(
             );
             return;
           }
-          const { cancelled } = await spawnManagedInstall(bin, ["init", "--semantic", "--force"], repo, `Enabling ${name}…`);
+          const { cancelled } = await spawnManagedInstall(bin, ["init", "--force"], repo, `Enabling ${name}…`);
           await refresh();
           void (cancelled
             ? vscode.window.showWarningMessage(`Enabling ${name} was cancelled before analysis finished. Refresh to check its state.`)
@@ -2151,8 +2173,19 @@ export function registerShowGraphStats(
           return;
         }
         case "semantic":
-          runTravsrCommand(["init", "--semantic", "--force"], repo);
+          runTravsrCommand(["init", "--force"], repo);
           return;
+        case "setup": {
+          // One-command setup: `travsr init` installs what it can, traces
+          // calls, and names what the user must install first. Cancellable,
+          // because the first run downloads.
+          const { out, cancelled } = await spawnManagedInstall(bin, ["init"], repo, "Travsr: setting up…");
+          await refresh();
+          if (!cancelled) {
+            void vscode.window.showInformationMessage(lastLine(out) || "Travsr: set up.");
+          }
+          return;
+        }
         default:
           return;
       }
@@ -2458,7 +2491,12 @@ export function registerShowExecutionPath(
  * which wants a file to attach to.
  */
 export async function readDiagnostics(binary: string, cwd: string): Promise<Diagnostic[]> {
-  const out = await spawnLangCommand(binary, ["status"], cwd);
+  // `warning:` lines print only with --verbose; plain status is plain words.
+  // A binary older than --verbose printed them by default.
+  let out = await spawnLangCommand(binary, ["status", "--verbose"], cwd);
+  if (out.includes("unexpected argument '--verbose'")) {
+    out = await spawnLangCommand(binary, ["status"], cwd);
+  }
   const found: Diagnostic[] = [];
   for (const line of out.split("\n")) {
     const m = /^\s*warning:\s*(.+)$/.exec(line);
@@ -2519,6 +2557,26 @@ function spawnLangCommandResult(
 
 function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutMs = 4_000): Promise<string> {
   return spawnLangCommandResult(binary, args, cwd, timeoutMs).then((r) => r.out);
+}
+
+/** Whether to offer one-command setup on opening a folder (plan 3.5): a git
+ *  repository with no index yet, asked once per workspace. */
+export function shouldOfferSetup(isGitRepo: boolean, hasIndex: boolean, alreadyOffered: boolean): boolean {
+  return isGitRepo && !hasIndex && !alreadyOffered;
+}
+
+/** Run `travsr init` for `repo` under cancellable progress: the one setup
+ *  command (plan 3.5). The first run downloads, so it must be cancellable, and
+ *  a failure names where to look. Returns the run for callers that refresh. */
+export async function setUpRepo(repo: string): Promise<{ out: string; cancelled: boolean; code: number | null }> {
+  const binary = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
+  const run = await spawnManagedInstall(binary, ["init"], repo, "Travsr: setting up this repository…");
+  if (!run.cancelled && run.code !== 0) {
+    void vscode.window.showErrorMessage(
+      `Travsr: setup failed (exit ${run.code ?? "unknown"}). ${lastLine(run.out) || "See the daemon log."}`
+    );
+  }
+  return run;
 }
 
 /** The last non-empty line of CLI output, the final status the command printed

@@ -6,6 +6,8 @@
 //! protocol version skew, transport error, malformed payload) falls back to
 //! [`open_read_store`], which itself prefers the read-only fast path.
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
@@ -24,6 +26,12 @@ pub(crate) enum SpawnOutcome {
     /// We spawned a child but it never came up (spawn error, or it died during
     /// startup — e.g. a control-socket bind failure, see [`crate::daemon_start_error`]).
     Failed,
+}
+
+/// Whether `travsr mcp` should start a daemon: none is running and no
+/// `travsr init` is under way (init starts one itself when it finishes).
+pub(crate) fn lazy_daemon_wanted(repo_root: &Path) -> bool {
+    !daemon_lock_held(repo_root) && !travsr_daemon::init_running(repo_root)
 }
 
 /// True iff a **live** daemon currently holds this repo's exclusive lock.
@@ -82,9 +90,13 @@ pub(crate) fn spawn_background_daemon(repo_root: &Path, exe: &Path, verbose: boo
 
     // Re-exec ourselves as the long-lived foreground worker (which re-acquires the
     // lock — the last-line-of-defense guard for the tight spawn race).
+    // Its own process group, like CREATE_NEW_PROCESS_GROUP below: Ctrl-C, a
+    // closed terminal or a harness killing init's group must not take the
+    // daemon with it.
     #[cfg(unix)]
     let spawned: std::io::Result<()> = std::process::Command::new(exe)
         .args(["daemon", "start", "--foreground"])
+        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -351,6 +363,22 @@ mod lock_tests {
             !travsr.join("daemon.lock").exists(),
             "probing must not create .travsr/daemon.lock"
         );
+    }
+
+    /// `travsr mcp` from an editor reconnects the moment `init` creates the
+    /// index, and used to start a daemon while `init` was still running; the
+    /// daemon then watched init's own config writes. `init` starts it itself.
+    #[test]
+    fn no_lazy_daemon_while_init_runs() {
+        use fs2::FileExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        assert!(lazy_daemon_wanted(tmp.path()), "nothing running");
+        let lock = std::fs::File::create(tmp.path().join(".travsr/init.lock")).unwrap();
+        lock.lock_exclusive().unwrap();
+        assert!(!lazy_daemon_wanted(tmp.path()), "init holds its lock");
+        fs2::FileExt::unlock(&lock).unwrap();
+        assert!(lazy_daemon_wanted(tmp.path()), "init finished");
     }
 
     /// The singleton semantics the probe exists for are unchanged: an

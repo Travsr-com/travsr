@@ -1360,6 +1360,10 @@ fn go_access() -> ToolchainAccess {
         env.push(("GOMODCACHE".to_string(), p.to_string_lossy().into_owned()));
     }
     if let Some(p) = &gocache {
+        // Go creates its cache on first build, but inside the sandbox only the
+        // cache itself is writable, not its parent, so create it here as `go`
+        // would. Missing on a HOME where Go never built anything.
+        let _ = std::fs::create_dir_all(p);
         read_paths.push(p.clone());
         write_paths.push(p.clone()); // `go build` writes compiled artifacts here
         env.push(("GOCACHE".to_string(), p.to_string_lossy().into_owned()));
@@ -1396,12 +1400,53 @@ fn go_access() -> ToolchainAccess {
         exec_paths.push(p.join("bin"));
     }
 
-    ToolchainAccess {
-        read_paths,
-        write_paths,
-        exec_paths,
-        env,
+    // The scip-go the presence check finds (PATH, then $GOBIN, $GOPATH/bin),
+    // which need not be the one the wrapper finds: it looks only on PATH and
+    // under $HOME. Without this `lang list` says ready while the wrapper
+    // inside the sandbox cannot see scip-go.
+    let scip_go_dir = travsr_core::exec::tool_path("scip-go").and_then(|exe| {
+        std::fs::canonicalize(&exe)
+            .unwrap_or(exe)
+            .parent()
+            .map(Path::to_path_buf)
+    });
+    let off_path = travsr_core::exec::resolve_executable("scip-go")
+        .is_none()
+        .then(|| std::env::var_os("PATH").unwrap_or_default());
+    grant_bin_dir(
+        ToolchainAccess {
+            read_paths,
+            write_paths,
+            exec_paths,
+            env,
+        },
+        scip_go_dir,
+        off_path,
+    )
+}
+
+/// Read and execute on a tool's bin dir, the same grant scala gives sbt. A
+/// tool found off PATH also puts its dir first on the sandbox PATH (`off_path`
+/// is the host PATH to extend), or the analyzer's own lookup would miss it.
+fn grant_bin_dir(
+    mut access: ToolchainAccess,
+    dir: Option<PathBuf>,
+    off_path: Option<std::ffi::OsString>,
+) -> ToolchainAccess {
+    let Some(dir) = dir else {
+        return access;
+    };
+    if let Some(path) = off_path {
+        let dirs = std::iter::once(dir.clone()).chain(std::env::split_paths(&path));
+        if let Ok(joined) = std::env::join_paths(dirs) {
+            access
+                .env
+                .push(("PATH".to_string(), joined.to_string_lossy().into_owned()));
+        }
     }
+    access.read_paths.push(dir.clone());
+    access.exec_paths.push(dir);
+    access
 }
 
 #[cfg(test)]
@@ -1512,6 +1557,36 @@ mod tests {
         assert!(well_known_dotnet_roots()
             .iter()
             .any(|p| p.ends_with("opt/homebrew/opt/dotnet/libexec")));
+    }
+
+    #[test]
+    fn an_analyzer_found_on_path_is_granted_read_and_execute() {
+        let bin = PathBuf::from("/Users/someone/go/bin");
+        let access = super::grant_bin_dir(Default::default(), Some(bin.clone()), None);
+        assert_eq!(access.read_paths, vec![bin.clone()]);
+        assert_eq!(access.exec_paths, vec![bin]);
+        assert!(access.env.is_empty(), "already on PATH: PATH untouched");
+        let none = super::grant_bin_dir(Default::default(), None, Some("/usr/bin".into()));
+        assert!(none.read_paths.is_empty() && none.exec_paths.is_empty() && none.env.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_analyzer_found_off_path_goes_first_on_the_sandbox_path() {
+        let bin = PathBuf::from("/Users/someone/gobin");
+        let access = super::grant_bin_dir(
+            Default::default(),
+            Some(bin.clone()),
+            Some("/usr/bin:/bin".into()),
+        );
+        assert_eq!(access.exec_paths, vec![bin]);
+        assert_eq!(
+            access.env,
+            vec![(
+                "PATH".to_string(),
+                "/Users/someone/gobin:/usr/bin:/bin".to_string()
+            )]
+        );
     }
 
     #[test]

@@ -371,6 +371,80 @@ test('a method inherited from an imported base class resolves on a typed local',
   );
 });
 
+/** In-process walk of `files`; the travsr vnames referenced from `fromFile`. */
+async function refsFrom(files: Record<string, string>, fromFile: string): Promise<unknown[]> {
+  await init();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-lsif-py-same-file-'));
+  for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(tmp, name), text);
+  const lines: string[] = [];
+  const sink = new Writable({
+    write(chunk: Buffer, _enc, cb) {
+      lines.push(...chunk.toString().split('\n').filter(Boolean));
+      cb();
+    },
+  });
+  walk(tmp, new Emitter(sink));
+  const all = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+  const doc = all.find((o) => o['label'] === 'document' && String(o['uri']).endsWith(fromFile));
+  const target = new Map(all.filter((o) => o['label'] === 'next').map((o) => [o['outV'], o['inV']]));
+  const vname = new Map(
+    all.filter((o) => o['label'] === 'resultSet').map((o) => [o['id'], o['travsr_vname']])
+  );
+  return all
+    .filter((o) => o['label'] === 'item' && o['property'] === 'references' && o['document'] === doc?.['id'])
+    .flatMap((o) => o['inVs'] as unknown[])
+    .map((rangeId) => vname.get(target.get(rangeId)));
+}
+
+test('a call to a function defined in the same file resolves', async () => {
+  const refs = await refsFrom(
+    { 'app.py': 'def local():\n    return 2\n\n\nclass C:\n    pass\n\n\ndef run():\n    return local(), C()\n' },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, [
+    { path: 'app.py', signature: 'fn:local' },
+    { path: 'app.py', signature: 'class:C' },
+  ]);
+});
+
+test('a same-file name bound locally does not resolve to the module function', async () => {
+  for (const body of [
+    'def run(local):\n    return local()\n',
+    'def run():\n    local = print\n    return local()\n',
+    'def run():\n    for local in []:\n        local()\n',
+    'def run():\n    def local():\n        return 3\n    return local()\n',
+    'def run(ev):\n    match ev:\n        case {"h": local}:\n            return local()\n',
+    'def run(ev):\n    match ev:\n        case local:\n            return local()\n',
+    'def run(ev):\n    match ev:\n        case [x] as local:\n            return local()\n',
+  ]) {
+    const refs = await refsFrom({ 'app.py': `def local():\n    return 2\n\n\n${body}` }, 'app.py');
+    assert.deepStrictEqual(refs, [], body);
+  }
+  // Rebound at module level: which binding a call sees depends on run order.
+  const refs = await refsFrom(
+    { 'app.py': 'def local():\n    return 2\n\n\nlocal = print\n\n\ndef run():\n    return local()\n' },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, []);
+});
+
+test('a class body sees its own names; its methods see the module function', async () => {
+  const cls = 'def helper():\n    return 0\n\n\nclass C:\n    def helper(self):\n        return 1\n';
+  assert.deepStrictEqual(await refsFrom({ 'app.py': `${cls}    x = helper(None)\n` }, 'app.py'), []);
+  assert.deepStrictEqual(
+    await refsFrom({ 'app.py': `${cls}    def run(self):\n        return helper()\n` }, 'app.py'),
+    [{ path: 'app.py', signature: 'fn:helper' }]
+  );
+});
+
+test('a module binding that is not the def does not resolve to a nested class', async () => {
+  const refs = await refsFrom(
+    { 'app.py': 'class Outer:\n    class Err(Exception):\n        pass\n\n\nErr = RuntimeError\n\n\ndef run():\n    raise Err()\n' },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, []);
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function parseAll(stdout: string): Record<string, unknown>[] {

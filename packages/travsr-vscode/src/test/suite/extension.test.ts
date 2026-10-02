@@ -5,7 +5,7 @@ import {
   BLAST_RADIUS_SELECTOR,
 } from "../../codelens";
 import { CallersHoverProvider } from "../../hover";
-import { showWelcome } from "../../welcome";
+import { showWelcome, welcomeToolLines } from "../../welcome";
 import { StdioMcpClient } from "../../mcp";
 import { parseEnvelope } from "../../extension";
 
@@ -21,6 +21,14 @@ suite("parseEnvelope returns result rows only", () => {
     assert.deepStrictEqual(parseEnvelope(raw), [
       "[call] fn:blastCommand (function) — src/codelens.ts:67 ~",
     ]);
+  });
+
+  test("drops a note inside the envelope, which is not a caller", () => {
+    const raw =
+      "<travsr-data>\n" +
+      "[note: nothing calls 'Point', but it is used at 2 place(s); find_references lists them.]\n" +
+      "</travsr-data>";
+    assert.deepStrictEqual(parseEnvelope(raw), []);
   });
 });
 
@@ -248,6 +256,35 @@ suite("VSCODE-208: showWelcome dedup, re-running command reveals existing panel"
     // In the test environment WebviewPanel is fully stubbed; calling showWelcome
     // twice exercises the currentPanel branch without crashing.
     assert.doesNotThrow(() => { showWelcome(); showWelcome(); });
+  });
+});
+
+// ── Welcome page names the AI tools this machine actually has ─────────────
+
+suite("welcome: tools line follows `connect --print --json`", () => {
+  const cc = { tool: "claude-code", name: "Claude Code", setup: "automatic" };
+  const cursor = { tool: "cursor", name: "Cursor", setup: "automatic" };
+  const codex = { tool: "codex", name: "Codex", setup: "one_step" };
+
+  test("before the answer arrives it stays generic", () => {
+    assert.deepStrictEqual(welcomeToolLines(undefined), [
+      "Wait for <strong>Ready.</strong> The AI tools Travsr finds are connected for you.",
+    ]);
+  });
+  test("names the tools it connects, and each one that needs a step", () => {
+    assert.deepStrictEqual(welcomeToolLines([cc, cursor, codex]), [
+      "Wait for <strong>Ready.</strong> Travsr connects Claude Code and Cursor for you.",
+      "Codex needs one step from you: after setup, run <code>travsr connect --tool codex</code> to see it.",
+    ]);
+  });
+  test("says so when no AI tool is found", () => {
+    assert.deepStrictEqual(welcomeToolLines([]), [
+      "Wait for <strong>Ready.</strong> No AI coding tool found yet: install one, then run <strong>Travsr: Re-index Now</strong>.",
+    ]);
+  });
+  test("names are escaped", () => {
+    const odd = { tool: "x", name: "<b>X</b>", setup: "automatic" };
+    assert.ok(welcomeToolLines([odd])[0].includes("&lt;b&gt;X&lt;/b&gt;"));
   });
 });
 

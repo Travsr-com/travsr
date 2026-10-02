@@ -202,7 +202,12 @@ pub fn build_unsandboxed_command(
         // the wrapper shells out to) resolve, matching the isolated path's PATH
         // handling.
         let travsr_bin = home.join(".travsr").join("bin");
-        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let existing = access
+            .env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| std::ffi::OsString::from(v))
+            .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
         let mut dirs_vec = vec![travsr_bin];
         dirs_vec.extend(std::env::split_paths(&existing));
         if let Ok(joined) = std::env::join_paths(dirs_vec) {

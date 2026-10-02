@@ -46,14 +46,16 @@
 curl -fsSL https://travsr.com/install.sh | sh   # shell installer, no Node needed
 npm install -g @travsr.com/travsr               # npm
 
-# 2. Initialize your repo (requires git)
+# 2. Set up your project (any git repository)
 cd your-project
-git init          # skip if already a git repo
-travsr init       # indexes every tracked file → .travsr/graph.db
-                  # auto-registers in ~/.travsr/registry.json
-
-# 3. Connect to Claude Desktop (set once, works for all repos)
+travsr init
 ```
+
+`travsr init` reads your code, gets the language tools it needs, traces calls,
+keeps the index fresh on every commit, and connects the AI tools it finds
+(Claude Code, Cursor, and others). It asks no questions, and its last line
+starts with `Ready.`; any language that needs something installed first is
+listed after it with the one thing to do.
 
 The shell installer supports `--version <tag>` to install a specific release
 instead of latest stable (e.g. `sh -s -- --version v1.2.1`), `--system`
@@ -65,6 +67,9 @@ GitHub fallback URL:
 `https://github.com/Travsr-com/travsr/releases/latest/download/install.sh`.
 See [SECURITY.md](SECURITY.md) for what the script verifies before installing.
 
+### Other tools
+
+Claude Desktop reads one config for every project, so it is set up by hand once.
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
@@ -145,7 +150,7 @@ symbol, it searches all registered repos and prefixes results with
 Travsr speaks [MCP](https://modelcontextprotocol.io), the open standard for
 connecting AI agents to tools.
 
-### Claude Desktop / global mode (recommended)
+### Claude Desktop / global mode
 
 ```json
 {

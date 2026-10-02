@@ -46,6 +46,74 @@ pub enum Report {
     Silent,
 }
 
+/// What a connect run did, for `travsr init`'s one-line summary (plan 3.2).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Connected {
+    /// Tools whose server config ended the run in place, by stable id
+    /// (`claude-code`), the tag `--json` reports; see [`display_name`].
+    pub tools: Vec<&'static str>,
+    /// Claude Code was wired and still asks once to trust the project (#829).
+    pub needs_approval: bool,
+    /// Files the user owns that this run changed (RFC-026: such writes stay
+    /// visible), repo-relative.
+    pub user_files: Vec<String>,
+    /// Tools found that need a step of the user's own, by stable id.
+    pub one_step: Vec<&'static str>,
+    /// A file this run could not write, in plain words, so a silent report
+    /// does not hide why a tool is missing from `tools`.
+    pub problems: Vec<String>,
+}
+
+/// `connect --print --json`: each AI tool found for `repo` and whether it
+/// connects by itself (`automatic`) or needs a step of the user's own.
+pub fn found_tools_json(repo: &Path) -> Value {
+    tools_json(&found_tools(
+        repo,
+        dirs::home_dir().as_deref(),
+        &McpCommand::resolve(),
+    ))
+}
+
+fn tools_json(found: &[(&'static str, bool)]) -> Value {
+    found
+        .iter()
+        .map(|(id, by_itself)| {
+            serde_json::json!({
+                "tool": id,
+                "name": display_name(id),
+                "setup": if *by_itself { "automatic" } else { "one_step" },
+            })
+        })
+        .collect()
+}
+
+/// Every AI tool found for `repo`, by stable id, with whether `connect` wires
+/// it by itself (it writes the tool's server config) or the user must add
+/// travsr in the tool's own settings. Nothing is written.
+fn found_tools(repo: &Path, home: Option<&Path>, cmd: &McpCommand) -> Vec<(&'static str, bool)> {
+    Tool::ALL
+        .iter()
+        .filter_map(|tool| match tool.detect(repo, home) {
+            Detection::Auto => Some((
+                tool.id(),
+                tool.plan(repo, cmd, None)
+                    .iter()
+                    .any(|p| matches!(p.content, Content::JsonServer { .. })),
+            )),
+            Detection::Print => Some((tool.id(), false)),
+            Detection::None => None,
+        })
+        .collect()
+}
+
+/// The name the user knows a tool by, from its stable id (`claude-code`).
+pub fn display_name(id: &str) -> &'static str {
+    Tool::ALL
+        .iter()
+        .find(|t| t.id() == id)
+        .map_or("an AI tool", Tool::display)
+}
+
 /// Options controlling a connect run. `auto()` is the zero-config path used by
 /// `travsr init`.
 pub struct ConnectOpts {
@@ -96,7 +164,9 @@ struct McpCommand {
 
 impl McpCommand {
     /// Prefer the bare `travsr` command when `~/.travsr/bin` is on PATH (portable,
-    /// no username leak); fall back to the absolute current exe otherwise.
+    /// no username leak); fall back to the absolute current exe otherwise. The
+    /// absolute path is complete on its own (G2: the user never edits PATH), and
+    /// re-running `travsr init` rewrites it if travsr moves.
     fn resolve() -> Self {
         let command = if crate::install::path_contains_travsr_bin() {
             "travsr".to_string()
@@ -110,10 +180,6 @@ impl McpCommand {
             command,
             args: vec!["mcp".to_string(), "--stdio".to_string()],
         }
-    }
-
-    fn on_path(&self) -> bool {
-        self.command == "travsr"
     }
 }
 
@@ -222,8 +288,8 @@ fn zed_instruction_file(repo: &Path) -> PathBuf {
 ///
 /// A pipe-separated list of exact tool names, which the host documents as
 /// matching each of them exactly. `Bash` is unavoidably broad (every shell
-/// command reaches the guard), which is why `guard::shell` refuses to recognise
-/// anything but a single read-only search invocation.
+/// command reaches the guard), which is why `guard::shell` recognises only a
+/// single read-only search invocation, alone or as one part of a chain.
 ///
 /// The travsr MCP tools are here so the guard can *see* that the agent has
 /// queried the graph; that observation is what releases the strict-mode valve
@@ -473,8 +539,8 @@ enum Tool {
 }
 
 /// How a tool was detected, which decides whether we auto-write project files or
-/// just print a snippet (never auto-write into a repo for a tool only known from a
-/// global/home marker).
+/// just print a snippet. A home marker writes only for Claude Code and Cursor,
+/// whose project config is a gitignored `.mcp.json` (plan Q1).
 enum Detection {
     /// Project-local marker present, safe to write project-scoped config.
     Auto,
@@ -548,6 +614,20 @@ impl Tool {
         Tool::Zed,
     ];
 
+    /// The name the user knows the tool by.
+    fn display(&self) -> &'static str {
+        match self {
+            Tool::ClaudeCode => "Claude Code",
+            Tool::Cursor => "Cursor",
+            Tool::VsCodeCopilot => "VS Code Copilot",
+            Tool::GeminiCli => "Gemini CLI",
+            Tool::Antigravity => "Antigravity",
+            Tool::Codex => "Codex",
+            Tool::Windsurf => "Windsurf",
+            Tool::Zed => "Zed",
+        }
+    }
+
     fn id(&self) -> &'static str {
         match self {
             Tool::ClaudeCode => "claude-code",
@@ -564,20 +644,22 @@ impl Tool {
     fn detect(&self, repo: &Path, home: Option<&Path>) -> Detection {
         let has = |p: PathBuf| p.exists();
         match self {
+            // Plan Q1: a home marker is enough for these two, because what gets
+            // written is this project's own gitignored `.mcp.json` (and the
+            // managed block), never the tool's global config.
             Tool::ClaudeCode => {
-                if has(repo.join(".claude")) || has(repo.join("CLAUDE.md")) {
+                if has(repo.join(".claude"))
+                    || has(repo.join("CLAUDE.md"))
+                    || home.is_some_and(|h| has(h.join(".claude")))
+                {
                     Detection::Auto
-                } else if home.is_some_and(|h| has(h.join(".claude"))) {
-                    Detection::Print
                 } else {
                     Detection::None
                 }
             }
             Tool::Cursor => {
-                if has(repo.join(".cursor")) {
+                if has(repo.join(".cursor")) || home.is_some_and(|h| has(h.join(".cursor"))) {
                     Detection::Auto
-                } else if home.is_some_and(|h| has(h.join(".cursor"))) {
-                    Detection::Print
                 } else {
                     Detection::None
                 }
@@ -866,21 +948,13 @@ impl Tool {
     fn snippet(&self, repo: &Path, cmd: &McpCommand) -> String {
         let server = indent(&mcp_servers_json(cmd));
         match self {
-            Tool::Antigravity => format!(
-                "  add to ~/.gemini/config/mcp_config.json:\n{server}\n  \
-                 and put the Travsr guidance in {}/GEMINI.md",
-                repo.display()
-            ),
+            Tool::Antigravity => format!("  add to ~/.gemini/config/mcp_config.json:\n{server}"),
             Tool::Codex => format!(
-                "  add [mcp_servers.travsr] to ~/.codex/config.toml, and put the Travsr \
-                 guidance in {}/AGENTS.md",
-                repo.display()
+                "  add to ~/.codex/config.toml:\n    \
+                 [mcp_servers.travsr]\n    command = \"{}\"\n    args = [\"mcp\", \"--stdio\"]",
+                cmd.command
             ),
-            Tool::Windsurf => format!(
-                "  add to ~/.codeium/windsurf/mcp_config.json:\n{server}\n  \
-                 and create {}/.windsurf/rules/travsr.md with the Travsr guidance",
-                repo.display()
-            ),
+            Tool::Windsurf => format!("  add to ~/.codeium/windsurf/mcp_config.json:\n{server}"),
             // Both destinations, because which one the user picks is what
             // decides whether an approval is pending: a project `.mcp.json` is
             // gated behind the one-time trust prompt `approval_hint` names
@@ -1061,6 +1135,11 @@ fn remove_json_server(path: &Path, top_key: &str) -> Result<Outcome> {
         .unwrap_or(false);
     if !removed {
         return Ok(Outcome::Absent);
+    }
+    if root == json!({ top_key: {} }) {
+        // Whole file was our server, remove it.
+        std::fs::remove_file(path)?;
+        return Ok(Outcome::Removed);
     }
     let pretty = serde_json::to_string_pretty(&root)? + "\n";
     write_atomic(path, &pretty)?;
@@ -1348,7 +1427,8 @@ fn rel(repo: &Path, path: &Path) -> Option<String> {
 /// Detect AI tools under `repo_root` and wire each to Travsr. Never returns an
 /// error to the caller for routine skips; the bool indicates whether anything was
 /// detected. Used by both `travsr init` and `travsr connect`.
-pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
+pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<Connected> {
+    let mut connected = Connected::default();
     let home = dirs::home_dir();
     let cmd = McpCommand::resolve();
     let verb = if opts.remove { "removed" } else { "configured" };
@@ -1535,14 +1615,35 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                         Ok(outcome) => {
                             match &outcome {
                                 Outcome::Skipped(reason) => {
-                                    say!("  skipped {disp}: {reason}")
+                                    say!("  skipped {disp}: {reason}");
+                                    if !opts.remove {
+                                        connected.problems.push(format!(
+                                            "Left {disp} alone for {}: {reason}.",
+                                            display_name(tool.id())
+                                        ));
+                                    }
                                 }
                                 other => say!("  {} {disp}", label(other)),
+                            }
+                            // A folder the removal left empty (`.cursor/`,
+                            // which connect created) goes too.
+                            if matches!(outcome, Outcome::Removed) {
+                                let mut dir = planned.path.parent();
+                                while let Some(d) = dir
+                                    .filter(|d| *d != repo_root && std::fs::remove_dir(d).is_ok())
+                                {
+                                    dir = d.parent();
+                                }
                             }
                             if matches!(planned.content, Content::JsonServer { .. })
                                 && server_in_place(&outcome)
                             {
                                 wired = true;
+                            }
+                            // A shared file the user owns (never git-ignored)
+                            // that this run actually changed.
+                            if !planned.gitignore && matches!(outcome, Outcome::Written) {
+                                connected.user_files.push(disp.clone());
                             }
                             if matches!(planned.content, Content::JsonHook { .. })
                                 && matches!(outcome, Outcome::Written | Outcome::Unchanged)
@@ -1574,7 +1675,13 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                             }
                         }
                         // Per-file failure is non-fatal; report and continue.
-                        Err(e) => say!("  error {disp}: {e}"),
+                        Err(e) => {
+                            say!("  error {disp}: {e}");
+                            connected.problems.push(format!(
+                                "Could not write {disp} for {}: {e}.",
+                                display_name(tool.id())
+                            ));
+                        }
                     }
                 }
                 if !opts.remove {
@@ -1588,7 +1695,9 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                     // there is nothing to approve and the hint would send the
                     // user at the wrong fix.
                     if wired {
+                        connected.tools.push(tool.id());
                         if let Some(hint) = tool.approval_hint() {
+                            connected.needs_approval = true;
                             say!("{hint}");
                         }
                     }
@@ -1664,6 +1773,12 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
              not detected here, so no hook was installed. guard.mode is recorded; \
              re-run `travsr connect` once it is."
         );
+        // `init` runs connect silently and shows only `problems`.
+        connected.problems.push(
+            "No guard hook installed: it is a Claude Code feature and Claude Code was not \
+             found. Run `travsr connect` once it is installed."
+                .to_string(),
+        );
     }
 
     if !detected {
@@ -1671,7 +1786,10 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
             "tip: no AI coding tool detected. Run `travsr connect` after installing \
              Claude Code, Cursor, Copilot, Gemini CLI, Codex, Windsurf, or Zed"
         );
-        return Ok(());
+        connected.problems.push(
+            "No AI coding tool found. Run `travsr connect` after installing one.".to_string(),
+        );
+        return Ok(connected);
     }
 
     // What is left after the refusal above: a tracked config that already holds
@@ -1694,14 +1812,28 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         }
     } else {
         match ensure_gitignored(repo_root, &gitignore, &unignore) {
-            Ok(Outcome::Written) if already_tracked.is_empty() => say!(
-                "  {} .gitignore (generated files are local-only)",
-                label(&Outcome::Written)
-            ),
-            Ok(Outcome::Written) => say!("  {} .gitignore", label(&Outcome::Written)),
-            Ok(Outcome::Removed) => say!("  {} .gitignore", label(&Outcome::Removed)),
+            Ok(Outcome::Written) if already_tracked.is_empty() => {
+                connected.user_files.push(".gitignore".to_string());
+                say!(
+                    "  {} .gitignore (generated files are local-only)",
+                    label(&Outcome::Written)
+                )
+            }
+            Ok(Outcome::Written) => {
+                connected.user_files.push(".gitignore".to_string());
+                say!("  {} .gitignore", label(&Outcome::Written))
+            }
+            Ok(Outcome::Removed) => say!("  removed travsr's entries from .gitignore"),
             _ => {}
         }
+    }
+
+    if !opts.remove && opts.only.is_none() {
+        connected.one_step = found_tools(repo_root, home.as_deref(), &cmd)
+            .into_iter()
+            .filter(|(_, by_itself)| !by_itself)
+            .map(|(id, _)| id)
+            .collect();
     }
 
     for r in &already_tracked {
@@ -1712,14 +1844,7 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         );
     }
 
-    if !opts.remove && !cmd.on_path() {
-        say!(
-            "note: `travsr` is not on PATH, so configs use an absolute path. Add \
-             ~/.travsr/bin to PATH so the wiring survives moves."
-        );
-    }
-
-    Ok(())
+    Ok(connected)
 }
 
 /// Whether a server config file ended the run actually carrying our entry: the
@@ -1858,6 +1983,30 @@ mod tests {
         ));
     }
 
+    /// A config file that held only travsr's server is travsr's to take back,
+    /// as `remove_block` does for a file that was only our block: leaving
+    /// `{"mcpServers": {}}` behind is clutter the user did not write.
+    #[test]
+    fn remove_json_server_deletes_a_file_left_with_nothing_else() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join(".mcp.json");
+        std::fs::write(&p, r#"{"mcpServers":{"travsr":{"command":"travsr"}}}"#).unwrap();
+        assert!(matches!(
+            remove_json_server(&p, "mcpServers").unwrap(),
+            Outcome::Removed
+        ));
+        assert!(!p.exists(), "an emptied config must be deleted");
+
+        // Any other content, even a top-level key, keeps the file.
+        std::fs::write(
+            &p,
+            r#"{"inputs":[],"mcpServers":{"travsr":{"command":"travsr"}}}"#,
+        )
+        .unwrap();
+        remove_json_server(&p, "mcpServers").unwrap();
+        assert!(p.exists(), "a file with the user's own keys stays");
+    }
+
     #[test]
     fn managed_block_appends_with_separator_and_is_idempotent() {
         let dir = tempdir().unwrap();
@@ -1898,6 +2047,54 @@ mod tests {
         assert!(matches!(Tool::Cursor.detect(repo, None), Detection::None));
         std::fs::create_dir(repo.join(".cursor")).unwrap();
         assert!(matches!(Tool::Cursor.detect(repo, None), Detection::Auto));
+    }
+
+    /// Plan Q1 (project scope): Claude Code or Cursor installed for the user
+    /// (`~/.claude`, `~/.cursor`) is enough to wire this project, because what is
+    /// written is the project's own gitignored `.mcp.json`. It used to only print
+    /// a snippet, so a fresh repo got no connection from `travsr init`.
+    #[test]
+    fn a_home_marker_wires_claude_code_and_cursor_for_the_project() {
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".claude")).unwrap();
+        std::fs::create_dir(home.path().join(".cursor")).unwrap();
+        for tool in [Tool::ClaudeCode, Tool::Cursor] {
+            assert!(
+                matches!(tool.detect(repo.path(), Some(home.path())), Detection::Auto),
+                "{}",
+                tool.id()
+            );
+        }
+    }
+
+    /// What `init` can promise per tool: Claude Code is wired into the project,
+    /// while Codex (home marker) and Windsurf (project marker, but its MCP
+    /// servers live in a global file travsr never writes) need a step of the
+    /// user's own.
+    #[test]
+    fn found_tools_says_which_connect_by_themselves() {
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".claude")).unwrap();
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+        std::fs::create_dir(repo.path().join(".windsurf")).unwrap();
+        assert_eq!(
+            found_tools(repo.path(), Some(home.path()), &cmd()),
+            vec![("claude-code", true), ("codex", false), ("windsurf", false)]
+        );
+    }
+
+    /// `connect --print --json`, which the VS Code welcome page reads.
+    #[test]
+    fn found_tools_as_json() {
+        assert_eq!(
+            tools_json(&[("claude-code", true), ("codex", false)]),
+            serde_json::json!([
+                {"tool": "claude-code", "name": "Claude Code", "setup": "automatic"},
+                {"tool": "codex", "name": "Codex", "setup": "one_step"},
+            ])
+        );
     }
 
     #[test]
@@ -2337,6 +2534,20 @@ mod tests {
         // A tool whose snippet names no destination must not claim either.
         let generic = Tool::Cursor.snippet(dir.path(), &cmd());
         assert!(!generic.contains("approval"), "{generic}");
+    }
+
+    /// `init` sends the user to `travsr connect --tool <id>` for a tool it
+    /// cannot wire, so what that prints must be pasteable: Codex said only
+    /// "add [mcp_servers.travsr]" with nothing to add, and each asked for
+    /// "Travsr guidance" it never printed.
+    #[test]
+    fn every_one_step_snippet_carries_the_config_to_paste() {
+        let dir = tempdir().unwrap();
+        for tool in Tool::ALL {
+            let snippet = tool.snippet(dir.path(), &cmd());
+            assert!(snippet.contains("\"travsr\""), "{}: {snippet}", tool.id());
+            assert!(!snippet.contains("guidance"), "{}: {snippet}", tool.id());
+        }
     }
 
     #[test]

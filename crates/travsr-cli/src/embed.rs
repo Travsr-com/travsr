@@ -814,10 +814,6 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
             backend.binary_name,
             path.display()
         );
-
-        if !crate::install::path_contains_travsr_bin() {
-            println!("\n{}", crate::install::path_hint());
-        }
     }
 
     // Before the model download, not after: model files run to 1.3 GB, and
@@ -2528,7 +2524,7 @@ pub fn hint_activate_if_installed(repo_root: &Path) {
     }
     if embed_binary_installed() {
         println!(
-            "tip: embeddings are installed but not enabled for this repo; run `travsr embed init` to turn on semantic search here"
+            "tip: meaning-based search is installed but off for this repo; run `travsr embed init` to turn it on here"
         );
     }
 }

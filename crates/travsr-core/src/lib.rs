@@ -796,6 +796,12 @@ pub struct LsifPositionalRef {
     /// shipped, in which case the daemon name-searches the line (no regression).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_col: Option<u32>,
+    /// The identifier at the callee's definition position, read from the file
+    /// on disk. The store drops a ref whose resolved node has another name: a
+    /// file edited while rust-analyzer ran moves the node spans away from the
+    /// dump's lines. `None` when the line could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callee_name: Option<String>,
 }
 
 /// A single reference occurrence returned by `find_references` (issue #299):

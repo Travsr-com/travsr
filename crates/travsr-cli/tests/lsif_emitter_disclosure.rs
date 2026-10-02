@@ -17,8 +17,9 @@ use std::process::{Command, Output};
 
 use travsr_store::SqliteStore;
 
-/// The line `init` prints when the LSIF pass was skipped (progress.rs).
-const INCOMPLETE_LINE: &str = "typescript semantic analysis is incomplete";
+/// The `init` summary's line for a language whose calls could not be traced
+/// (plan 3.0: plain words at default, the detail under `status --verbose`).
+const INCOMPLETE_LINE: &str = "typescript  could not trace calls";
 
 fn git(dir: &Path, args: &[&str]) {
     let ok = Command::new("git")
@@ -67,6 +68,8 @@ fn in_place_binary() -> PathBuf {
 fn run(bin: &Path, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(bin);
     cmd.env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .env_remove("TRAVSR_LSIF_TS")
         .env_remove("RUST_LOG")
         .current_dir(dir)
@@ -159,14 +162,22 @@ fn stub_emitter(dir: &Path, body: &str) -> String {
 /// Everything the user can see after a skipped LSIF pass, asserted together so
 /// one surface cannot quietly stop agreeing with the others.
 fn assert_disclosed(bin: &Path, repo: &Path, out: &Output, class: &str) {
+    // A missing emitter ships with travsr, so only a reinstall brings it back;
+    // one that started and failed is explained under `--verbose`.
+    let line = if class.starts_with("emitter_missing") {
+        "typescript  could not trace calls: part of travsr is missing. \
+         Reinstall travsr, then run `travsr init`."
+    } else {
+        "typescript  could not trace calls. See `travsr status --verbose`."
+    };
     let combined = text(out);
     assert!(
         combined.contains(INCOMPLETE_LINE),
         "init must say the TypeScript analysis is incomplete at default verbosity:\n{combined}"
     );
     assert!(
-        combined.contains("travsr init --semantic --force"),
-        "init must name the retry:\n{combined}"
+        combined.contains(line),
+        "init must give the next step:\n{combined}"
     );
     assert!(
         warnings(repo).split(',').any(|w| w == class),
@@ -178,9 +189,16 @@ fn assert_disclosed(bin: &Path, repo: &Path, out: &Output, class: &str) {
         status.contains("semantic: partial (incomplete: typescript)"),
         "status must downgrade the semantic field:\n{status}"
     );
+    // Plan 3.0: the default names the language and where to look, in plain
+    // words; the explanation itself is under `--verbose`.
     assert!(
-        status.contains("warning: full 'typescript' analysis is incomplete"),
-        "status must explain the downgrade:\n{status}"
+        status.contains(line),
+        "status must name the language that could not be traced:\n{status}"
+    );
+    let verbose = text(&run(bin, repo, &["status", "--verbose"], &[]));
+    assert!(
+        verbose.contains("warning: full 'typescript' analysis is incomplete"),
+        "status --verbose must explain the downgrade:\n{verbose}"
     );
 }
 
@@ -208,14 +226,30 @@ fn missing_emitter_is_disclosed_on_init_in_meta_and_in_status() {
         text(&out)
     );
     assert_disclosed(&bin, repo.path(), &out, "emitter_missing:typescript");
+    // Plan 3.0: an env var name is not for default output; `--verbose` names
+    // the override that is wrong.
     let combined = text(&out);
     assert!(
-        combined.contains("TRAVSR_LSIF_TS"),
-        "the summary must name the override that is wrong:\n{combined}"
+        !combined.contains("TRAVSR_LSIF_TS"),
+        "init must not name an env var by default:\n{combined}"
     );
+    let verbose = text(&run(&bin, repo.path(), &["status", "--verbose"], &[]));
     assert!(
-        combined.contains("semantic analysis produced symbols for: typescript"),
-        "the native pass did run and may still be reported, just not alone:\n{combined}"
+        verbose.contains("TRAVSR_LSIF_TS"),
+        "status --verbose must name the override that is wrong:\n{verbose}"
+    );
+    // PR #940 review: the summary must say one thing about tracing, not two.
+    // TypeScript is the only language here and the forced-missing emitter lands
+    // it in PartMissing, so the stage line "Traced calls" must be suppressed and
+    // the per-language "could not trace calls" line must stand alone; when the
+    // emitter is present instead, the language is ready and only the stage line
+    // shows. Either way exactly one of the two appears, never both.
+    let traced = combined.contains("Traced calls");
+    let failed_line = combined.contains("could not trace calls");
+    assert!(
+        traced != failed_line,
+        "exactly one of the trace-stage line and the per-language failure line \
+         must appear, never both:\n{combined}"
     );
     // The marker advances (the native pass is current at HEAD), exactly as it
     // does for a crashed sidecar under #712; `status` is what says "partial".
@@ -258,10 +292,12 @@ fn failing_emitter_is_disclosed_as_failed() {
     let out = init_semantic(&bin, repo.path(), &[("TRAVSR_LSIF_TS", &stub)]);
     assert!(out.status.success(), "{}", text(&out));
     assert_disclosed(&bin, repo.path(), &out, "emitter_failed:typescript");
-    let combined = text(&out);
+    // Plan 3.0: init keeps to the plain line; the emitter's own error is
+    // under `status --verbose`.
+    let verbose = text(&run(&bin, repo.path(), &["status", "--verbose"], &[]));
     assert!(
-        combined.contains("failed") && combined.contains("boom"),
-        "the summary must carry the emitter's own error:\n{combined}"
+        verbose.contains("boom"),
+        "status --verbose must carry the emitter's own error:\n{verbose}"
     );
 }
 
@@ -487,4 +523,79 @@ fn a_relocated_binary_uses_the_bundled_emitter() {
         "travsr-lib beside the binary must clear the missing-emitter warning, got {:?}",
         warnings(repo.path())
     );
+}
+
+/// A call is made by a function, never by a file. The TypeScript compiler pass
+/// used to also write `file -> callee` edges beside the function-level ones,
+/// so every callee listed its own file as an extra caller.
+#[test]
+fn no_call_edge_starts_at_a_file() {
+    let Some(emitter) = bundled_emitter().filter(|_| node_available()) else {
+        eprintln!("SKIP: node or the built emitter not available");
+        return;
+    };
+    let repo = seed_ts_repo();
+    let bin = in_place_binary();
+    let out = init_semantic(
+        &bin,
+        repo.path(),
+        &[("TRAVSR_LSIF_TS", emitter.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let conn = rusqlite::Connection::open(db(repo.path())).unwrap();
+    let from_file: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id = e.src \
+             WHERE e.kind = 'ref/call' AND n.kind = 'file'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(from_file, 0, "ref/call edges from a file node");
+    assert!(!has_emitter_warning(&warnings(repo.path())));
+}
+
+/// Without a tsconfig, TypeScript files still get the compiler's cross-file
+/// resolution, the way plain JavaScript already does (#833).
+#[test]
+fn typescript_without_a_tsconfig_is_still_resolved_by_the_compiler() {
+    let Some(emitter) = bundled_emitter().filter(|_| node_available()) else {
+        eprintln!("SKIP: node or the built emitter not available");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/a.ts"),
+        "export function helper(): number { return 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/b.ts"),
+        "import { helper } from './a'\nexport function main(): number { return helper() }\n",
+    )
+    .unwrap();
+    git(root, &["-c", "init.defaultBranch=main", "init", "-q"]);
+    git(root, &["config", "user.email", "qa@travsr.test"]);
+    git(root, &["config", "user.name", "QA Bot"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "seed"]);
+    let out = init_semantic(
+        &in_place_binary(),
+        root,
+        &[("TRAVSR_LSIF_TS", emitter.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let conn = rusqlite::Connection::open(db(root)).unwrap();
+    let resolved: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst \
+             WHERE e.kind = 'ref/call' AND e.provenance = 'scip' \
+             AND s.signature = 'fn:main' AND d.signature = 'fn:helper'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(resolved, 1, "main -> helper resolved by the compiler");
 }

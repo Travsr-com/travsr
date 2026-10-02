@@ -60,15 +60,12 @@ enum Command {
         /// Number of parallel parse workers (default: available CPU cores).
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
-        /// Build full cross-file analysis (call edges) synchronously before returning.
-        /// By default it runs in the background via the daemon.
-        /// Use this in CI or scripts that query call edges immediately after init.
-        #[arg(long)]
+        /// No effect: init always traces calls before returning. Kept so
+        /// existing scripts and the VS Code extension keep working.
+        #[arg(long, hide = true)]
         semantic: bool,
         /// Force a full rebuild, bypassing the incremental "up to date" skip.
-        /// Re-parses every file even when nothing changed on disk — use it after
-        /// changing a flag that affects semantic output (e.g. --allow-unsandboxed-lsif)
-        /// which the per-file change detection does not otherwise pick up.
+        /// Re-parses every file even when nothing changed on disk.
         #[arg(long, visible_alias = "rebuild")]
         force: bool,
         /// Allow rust-analyzer to run without OS sandboxing (bubblewrap on Linux,
@@ -78,8 +75,9 @@ enum Command {
         ///
         /// Only set this when you fully trust the repository being indexed.
         /// This flag cannot be set by repository contents (.env, Cargo.toml,
-        /// tsconfig, etc.) — it must be an explicit, per-invocation decision.
-        #[arg(long, visible_alias = "allow-unsandboxed")]
+        /// tsconfig, etc.). It is remembered in ~/.travsr/lang.toml, so later
+        /// runs and background updates keep Rust's full analysis.
+        #[arg(long, alias = "allow-unsandboxed", hide = true)]
         allow_unsandboxed_lsif: bool,
         /// Skip auto-detecting AI coding tools and wiring them to Travsr.
         #[arg(long)]
@@ -122,6 +120,11 @@ enum Command {
         /// Show what would change without writing anything.
         #[arg(long)]
         print: bool,
+        /// With --print: list the AI tools found as JSON, each with whether it
+        /// connects by itself (`automatic`) or needs a step of your own
+        /// (`one_step`).
+        #[arg(long, requires = "print")]
+        json: bool,
         /// Remove previously generated Travsr config.
         #[arg(long)]
         remove: bool,
@@ -211,7 +214,11 @@ enum Command {
         json: bool,
     },
     /// Print index and graph status.
-    Status,
+    Status {
+        /// Also print each language's diagnostics, measurements and tool versions.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Ask a natural-language question about the codebase (graph-grounded
     /// retrieval). Also accepts a bare symbol name.
     Ask {
@@ -878,7 +885,7 @@ async fn run(cli: Cli) -> Result<()> {
             quiet,
             json,
             jobs,
-            semantic,
+            semantic: _,
             force,
             allow_unsandboxed_lsif,
             no_connect,
@@ -887,7 +894,6 @@ async fn run(cli: Cli) -> Result<()> {
             quiet,
             json,
             jobs,
-            semantic,
             force,
             allow_unsandboxed_lsif,
             no_connect,
@@ -903,6 +909,7 @@ async fn run(cli: Cli) -> Result<()> {
             commit,
             rules,
             guard,
+            json,
         } => {
             let cwd = std::env::current_dir()?;
             // Write command: `connect` creates files in the resolved root, so it
@@ -911,6 +918,10 @@ async fn run(cli: Cli) -> Result<()> {
             // which would drop this checkout's AI config into a different one.
             // `travsr init` already wires connect through the write resolver.
             let repo_root = repo::find_git_root_for_write(&cwd)?;
+            if json {
+                println!("{}", connect::found_tools_json(&repo_root));
+                return Ok(());
+            }
             connect::run(
                 &repo_root,
                 &connect::ConnectOpts {
@@ -1402,6 +1413,36 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("{err_msg}");
                     anyhow::bail!("not initialized; run `travsr init` first");
                 }
+                // Plan 4.10: an agent connecting is exactly when the index must
+                // be kept fresh, so start the daemon if none is running (after a
+                // reboot, a killed `init`, or a crash). On a thread, so startup
+                // never waits for it; its output goes nowhere near the JSON-RPC
+                // stdout. `CI` opts out, as it does for `travsr init`. Only when
+                // the daemon, which sets up the repo it is started in, would
+                // keep this index fresh: a linked worktree reading the main
+                // repo's index would get an empty index of its own instead.
+                let own_index = |root: &std::path::Path| {
+                    std::env::current_dir()
+                        .ok()
+                        .and_then(|cwd| repo::find_git_root_for_write(&cwd).ok())
+                        .is_some_and(|write_root| write_root == root)
+                };
+                if std::env::var_os("CI").is_none() {
+                    if let Some(root) = db_path
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .filter(|root| own_index(root))
+                    {
+                        let root = root.to_path_buf();
+                        std::thread::spawn(move || {
+                            if daemon_client::lazy_daemon_wanted(&root) {
+                                if let Ok(exe) = std::env::current_exe() {
+                                    daemon_client::spawn_background_daemon(&root, &exe, false);
+                                }
+                            }
+                        });
+                    }
+                }
                 travsr_mcp::serve_stdio(&db_path)?;
             }
         }
@@ -1415,7 +1456,7 @@ async fn run(cli: Cli) -> Result<()> {
             remove,
             json,
         } => repos::run(prune, remove.as_deref(), json)?,
-        Command::Status => status::run()?,
+        Command::Status { verbose } => status::run(verbose)?,
         Command::Ask {
             query,
             format,

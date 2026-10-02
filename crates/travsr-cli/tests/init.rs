@@ -25,6 +25,9 @@ fn travsr_init(dir: &std::path::Path) -> assert_cmd::assert::Assert {
     Command::cargo_bin("travsr")
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
+        // init installs language tools and starts a daemon; tests want neither.
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .current_dir(dir)
         .arg("init")
         .assert()
@@ -69,6 +72,8 @@ fn init_fails_outside_git_repo() {
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         .output()
         .unwrap();
@@ -340,6 +345,8 @@ fn travsr_init_semantic(dir: &std::path::Path, force: bool) {
     let mut cmd = Command::cargo_bin("travsr").unwrap();
     cmd.env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(dir)
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .args(["init", "--semantic"]);
     if force {
         cmd.arg("--force");
@@ -529,6 +536,8 @@ fn travsr_init_isolated(dir: &std::path::Path, home: &std::path::Path) -> String
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .env("HOME", home)
         .current_dir(dir)
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         .assert()
         .success()
@@ -769,4 +778,260 @@ fn hook_run_after_reset_hard_prunes_the_discarded_file() {
             .unwrap()
             .unwrap_or_default()
     ));
+}
+
+#[test]
+fn allow_unsandboxed_lsif_is_recorded_for_the_daemon() {
+    // The daemon is a separate process and never sees init's flags, so the
+    // grant must land in lang.toml, where the daemon reads it.
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(tmp.path().join("lib.rs"), "fn a() {}\n").unwrap();
+    let lang_toml = tmp.path().join("lang.toml");
+
+    Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("TRAVSR_LANG_TOML", &lang_toml)
+        .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .args(["init", "--allow-unsandboxed-lsif"])
+        .assert()
+        .success();
+
+    let toml: toml::Value = toml::from_str(&std::fs::read_to_string(&lang_toml).unwrap()).unwrap();
+    let granted: Vec<&str> = toml["unsandboxed_consent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["language"].as_str())
+        .collect();
+    assert_eq!(granted, ["rust"]);
+}
+
+fn ts_repo() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function helper() { return 1 }\nexport function main() { return helper() }\n",
+    )
+    .unwrap();
+    tmp
+}
+
+#[test]
+fn init_json_is_one_object_and_never_reads_stdin() {
+    let tmp = ts_repo();
+    let out = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("TRAVSR_LANG_TOML", tmp.path().join("lang.toml"))
+        .current_dir(tmp.path())
+        .args(["init", "--json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is one JSON object");
+    // Existing keys stay for scripts and the VS Code extension.
+    for key in ["files_indexed", "nodes_written", "phase_b", "db_path"] {
+        assert!(v.get(key).is_some(), "missing {key}");
+    }
+    let ts = v["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["language"] == "typescript")
+        .expect("typescript listed");
+    assert!(ts["state"].is_string());
+    assert!(["installed", "skipped"].contains(&v["search_ranking"].as_str().unwrap()));
+    assert_eq!(v["keeping_fresh"], "not_started", "CI is set");
+    assert_eq!(v["next"], "Ready. Ask your AI about this code.");
+    assert!(
+        v["one_step"].is_array(),
+        "tools needing a step of the user's own"
+    );
+
+    // `next` is the line the text summary ends with, so a re-run with nothing
+    // to do says so here too.
+    let again = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("TRAVSR_LANG_TOML", tmp.path().join("lang.toml"))
+        .current_dir(tmp.path())
+        .args(["init", "--json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(v["next"], "Ready. Nothing changed since the last run.");
+}
+
+/// Stops the repo's daemon when dropped, so a failed assert never leaks one.
+struct StopDaemon<'a>(&'a std::path::Path);
+impl Drop for StopDaemon<'_> {
+    fn drop(&mut self) {
+        let _ = Command::cargo_bin("travsr")
+            .unwrap()
+            .env("TRAVSR_DISABLE_REGISTRY", "1")
+            .current_dir(self.0)
+            .args(["daemon", "stop"])
+            .output();
+    }
+}
+
+#[test]
+fn init_outside_ci_keeps_a_daemon_running_without_a_terminal() {
+    let tmp = ts_repo();
+    let _stop = StopDaemon(tmp.path());
+    let out = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env_remove("CI")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("TRAVSR_LANG_TOML", tmp.path().join("lang.toml"))
+        .current_dir(tmp.path())
+        .args(["init", "--json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["keeping_fresh"], "started");
+    let status = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .current_dir(tmp.path())
+        .args(["daemon", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("daemon: running"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+/// Plan S7 / G2: a machine with Claude Code installed for the user (only
+/// `~/.claude`, nothing in the repo) gets this project wired by `init` alone,
+/// through the project's own `.mcp.json`, and is never told to edit PATH: the
+/// config carries the absolute path.
+///
+/// Not on Windows: `dirs::home_dir` asks Windows for the profile folder and
+/// ignores `HOME`, so the test cannot give it a home with `.claude` in it.
+#[cfg(not(windows))]
+#[test]
+fn init_wires_claude_code_from_a_home_marker_without_a_path_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(home.path().join(".claude")).unwrap();
+    // Codex keeps its servers in a global file travsr never writes.
+    std::fs::create_dir(home.path().join(".codex")).unwrap();
+    git_init(tmp.path());
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("HOME", home.path())
+        .env("TRAVSR_LANG_TOML", home.path().join("lang.toml"))
+        .current_dir(tmp.path())
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mcp: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".mcp.json"))
+            .unwrap_or_else(|e| panic!("init must write .mcp.json ({e}):\n{text}")),
+    )
+    .unwrap();
+    assert!(
+        mcp["mcpServers"]["travsr"]["command"].is_string(),
+        "the project config must carry the travsr server: {mcp}"
+    );
+    assert!(!text.contains("PATH"), "no PATH instruction (G2):\n{text}");
+    assert!(
+        text.contains("Codex needs one step from you: run `travsr connect --tool codex`"),
+        "{text}"
+    );
+}
+
+/// Setup output stays hidden unless an install fails. Here every download is
+/// refused, so the install fails and `init` shows what it printed, then carries
+/// on offline and still finishes.
+///
+/// Not on Windows: there is no scip-go download there, only `go install`,
+/// which needs a newer Go than the runner may have (then nothing installs).
+#[cfg(not(windows))]
+#[test]
+fn a_failed_language_install_shows_its_output_and_init_finishes() {
+    // Go's tools install only where Go is: without it, Go reads "needs Go
+    // toolchain" and no install runs to fail.
+    let go = StdCommand::new("go").arg("version").output();
+    if !go.is_ok_and(|o| o.status.success()) {
+        eprintln!("SKIP: go not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(
+        tmp.path().join("main.go"),
+        "package main\n\nfunc main() {}\n",
+    )
+    .unwrap();
+    // A Go project, so there is something to set up (no go.mod reads "needs go.mod").
+    std::fs::write(
+        tmp.path().join("go.mod"),
+        "module example.com/m\n\ngo 1.21\n",
+    )
+    .unwrap();
+    let out = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env_remove("TRAVSR_SKIP_DOWNLOAD")
+        .env("HOME", home.path())
+        .env("TRAVSR_LANG_TOML", home.path().join("lang.toml"))
+        .env("TRAVSR_LANG_RELEASES_BASE", "http://127.0.0.1:9")
+        .env("TRAVSR_LANG_API_URL", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .current_dir(tmp.path())
+        .arg("init")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Could not get the language tools for Go. What went wrong:"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("  error:"),
+        "the install's own output: {stderr}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Ready"));
 }

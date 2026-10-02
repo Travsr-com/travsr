@@ -48,6 +48,8 @@ fn init_repo() -> tempfile::TempDir {
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         .assert()
         .success();

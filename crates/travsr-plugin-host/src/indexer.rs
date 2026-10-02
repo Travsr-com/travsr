@@ -48,13 +48,18 @@ fn may_report_zero_occurrences(lang: &str) -> bool {
 /// Classify one language's Phase B result. Split out so it can be tested
 /// directly: the behaviour this adds had no assertion, only the helper it calls
 /// did (#752 review).
+///
+/// A native analyzer (see [`may_report_zero_occurrences`]) is never flagged: it
+/// emits no definitions of its own and extracts call sites in-process, so an
+/// empty result there means the files have no calls. A broken type-checked pass
+/// still leaves those call sites and is reported by its own `emitter_*` class.
 fn classify_empty_output(lang: &str, nodes_empty: bool, no_occurrences: bool) -> EmptyOutput {
-    if nodes_empty && no_occurrences {
-        EmptyOutput::NoNodes
-    } else if no_occurrences && !may_report_zero_occurrences(lang) {
-        EmptyOutput::NoReferences
-    } else {
+    if may_report_zero_occurrences(lang) || !no_occurrences {
         EmptyOutput::Fine
+    } else if nodes_empty {
+        EmptyOutput::NoNodes
+    } else {
+        EmptyOutput::NoReferences
     }
 }
 
@@ -85,6 +90,9 @@ pub struct PhaseBOutcome {
     /// compile_commands.json (e.g. via `bear` or CMake's
     /// `CMAKE_EXPORT_COMPILE_COMMANDS`).
     pub skipped_no_compdb: Vec<String>,
+    /// Languages whose analyzer traces a project skipped because the repo has
+    /// no build file for one (loose sources such as test fixtures).
+    pub skipped_no_build_file: Vec<String>,
     /// Vestigial since elevated access became auto-granted for local use
     /// (ADR-017 Amendment A5): RequiresElevated languages are no longer gated on
     /// a PSE approval, so the resolver never populates this. Retained as contract
@@ -488,7 +496,7 @@ impl PluginIndexer {
             .collect();
 
         // H5: collect needs_approval before boxing so we can surface it in outcome.
-        let catalog = crate::resolver::CatalogResolver::new();
+        let catalog = crate::resolver::CatalogResolver::for_corpus(&self.corpus);
         let needs_approval_langs: Vec<String> = catalog.needs_approval().to_vec();
         // Windows-only: analyzers that cannot run isolated here and have no
         // permission on record are skipped before spawn. Surface repo-present ones
@@ -585,11 +593,14 @@ impl PluginIndexer {
                 .indexable_paths
                 .iter()
                 .filter(|p| {
-                    p.extension()
-                        .and_then(|e| e.to_str())
-                        .and_then(Language::from_extension)
+                    let ext = p.extension().and_then(|e| e.to_str());
+                    ext.and_then(Language::from_extension)
                         .map(|l| l.as_str() == lang_name)
                         .unwrap_or(false)
+                        // Gradle build scripts are Kotlin by extension, but the
+                        // catalog traces `.kt` only: they hold no calls worth
+                        // minutes of language server time.
+                        && !(lang_name == "kotlin" && ext == Some("kts"))
                 })
                 .filter_map(|p| {
                     p.strip_prefix(repo_root)
@@ -713,6 +724,11 @@ impl PluginIndexer {
                     "Phase B skipped, scip-clang requires compile_commands.json"
                 );
                 outcome.skipped_no_compdb.push(lang.clone());
+                continue;
+            }
+            if crate::phase_b::catalog::missing_build_file(&lang, repo_root).is_some() {
+                tracing::debug!(lang = %lang, "Phase B skipped, no build file in the repo");
+                outcome.skipped_no_build_file.push(lang.clone());
                 continue;
             }
 
@@ -864,7 +880,8 @@ impl PluginIndexer {
                                 // fallback so it works even when daemon PATH is stripped.
                                 let cfg = SandboxConfig {
                                     repo_root: repo_root.to_path_buf(),
-                                    allow_unsandboxed: travsr_indexer::sandbox::allow_unsandboxed_opt_in(),
+                                    allow_unsandboxed: travsr_indexer::sandbox::allow_unsandboxed_opt_in()
+                                        || crate::resolver::persisted_unsandboxed_consent("rust", corpus),
                                     ..Default::default()
                                 };
                                 // E3 (W3b) — positional, fail-closed rust-analyzer
@@ -878,24 +895,37 @@ impl PluginIndexer {
                                 // node — 100% dangling (18,530 dead edges here).
                                 let mut positional_refs: Vec<travsr_core::LsifPositionalRef> =
                                     Vec::new();
-                                match travsr_indexer::run_ra_lsif(repo_root, &cfg) {
-                                    Ok(Some(dump)) => {
-                                        let prefs = travsr_indexer::ingest_rust_positional(
-                                            &dump,
-                                            &repo_root.to_string_lossy(),
-                                        );
-                                        tracing::debug!(
-                                            positional_refs = prefs.len(),
-                                            "Phase B: rust-analyzer LSIF positional refs parsed"
-                                        );
-                                        positional_refs = prefs;
+                                // Every cargo project, as TypeScript does for
+                                // tsconfig: a repo whose only Cargo.toml files
+                                // sit below the root got "no projects" here.
+                                let mut ra_roots = build_roots(
+                                    repo_root,
+                                    item.files.as_deref().unwrap_or(&[]),
+                                    crate::phase_b::catalog::build_manifests("rust"),
+                                );
+                                if ra_roots.is_empty() {
+                                    ra_roots.push(repo_root.to_path_buf());
+                                }
+                                for ra_root in &ra_roots {
+                                    match travsr_indexer::run_ra_lsif(ra_root, &cfg) {
+                                        Ok(Some(dump)) => {
+                                            let prefs = travsr_indexer::ingest_rust_positional(
+                                                &dump,
+                                                &repo_root.to_string_lossy(),
+                                            );
+                                            tracing::debug!(
+                                                positional_refs = prefs.len(),
+                                                "Phase B: rust-analyzer LSIF positional refs parsed"
+                                            );
+                                            positional_refs.extend(prefs);
+                                        }
+                                        Ok(None) => {
+                                            tracing::debug!(
+                                                "rust-analyzer not available, native phase_b only"
+                                            )
+                                        }
+                                        Err(e) => tracing::warn!("rust-analyzer failed: {e}"),
                                     }
-                                    Ok(None) => {
-                                        tracing::debug!(
-                                            "rust-analyzer not available, native phase_b only"
-                                        )
-                                    }
-                                    Err(e) => tracing::warn!("rust-analyzer failed: {e}"),
                                 }
                                 nodes.sort_unstable_by_key(|n| n.id);
                                 nodes.dedup_by_key(|n| n.id);
@@ -997,16 +1027,23 @@ impl PluginIndexer {
                                                 Err(e) => tracing::warn!("ts lsif ingest: {e}"),
                                             }
                                         }
-                                        // #878: only a failure to *start* the emitter
-                                        // is "not available" (the daemon's own LSIF
-                                        // pass records that skip in the outcome). An
-                                        // emitter that ran and failed is a real fault
-                                        // and must be visible at default verbosity,
-                                        // matching the JS pass below.
-                                        Err(e) if travsr_indexer::emitter_missing(&e) => {
-                                            tracing::debug!("ts lsif emitter not available: {e}")
+                                        // #878: a failure to *start* the emitter and
+                                        // one that ran and failed have different
+                                        // fixes, so they are recorded apart; the
+                                        // daemon turns both into the disclosed skip.
+                                        Err(e) => {
+                                            let missing = travsr_indexer::emitter_missing(&e);
+                                            if missing {
+                                                tracing::debug!("ts lsif emitter not available: {e}");
+                                            } else {
+                                                tracing::warn!("ts lsif emitter failed: {e:#}");
+                                            }
+                                            travsr_indexer::sandbox::record_lsif_emitter_skip(
+                                                "typescript",
+                                                missing,
+                                                format!("{e:#}"),
+                                            );
                                         }
-                                        Err(e) => tracing::warn!("ts lsif emitter failed: {e:#}"),
                                     }
                                 }
 
@@ -1018,8 +1055,10 @@ impl PluginIndexer {
                                 // Run a second pass over a synthesized allowJs
                                 // tsconfig covering exactly this repo's JS files so
                                 // they get real cross-file semantic refs instead of
-                                // only tree-sitter heuristics. The pass is a no-op
-                                // when there are no JS files (pure-TS repos), and
+                                // only tree-sitter heuristics. With no project
+                                // tsconfig at all, the TypeScript files join the
+                                // same pass, or they would get no compiler pass.
+                                // It is a no-op when nothing is left to cover, and
                                 // its writes are idempotent where a real allowJs
                                 // tsconfig already covered them.
                                 //
@@ -1036,10 +1075,19 @@ impl PluginIndexer {
                                                 .and_then(|e| e.to_str())
                                                 .is_some_and(|e| {
                                                     travsr_indexer::JS_EXTENSIONS.contains(&e)
+                                                        || (ts_roots.is_empty()
+                                                            && ["ts", "tsx", "mts", "cts"]
+                                                                .contains(&e))
                                                 })
                                         })
                                         .map(|r| repo_root.join(r))
                                         .collect();
+                                    let covers_ts = ts_roots.is_empty()
+                                        && js_abs.iter().any(|p| {
+                                            p.extension().and_then(|e| e.to_str()).is_some_and(
+                                                |e| ["ts", "tsx", "mts", "cts"].contains(&e),
+                                            )
+                                        });
                                     match travsr_indexer::synthesize_js_tsconfig(&js_abs) {
                                         Ok(Some((_scratch, synth_tsconfig))) => {
                                             match travsr_indexer::run_lsif_emitter_with_root(
@@ -1058,7 +1106,14 @@ impl PluginIndexer {
                                                             refs.extend(g2.refs);
                                                         }
                                                         Err(e) => {
-                                                            tracing::warn!("js lsif ingest: {e}")
+                                                            tracing::warn!("js lsif ingest: {e}");
+                                                            if covers_ts {
+                                                                travsr_indexer::sandbox::record_lsif_emitter_skip(
+                                                                    "typescript",
+                                                                    false,
+                                                                    format!("{e:#}"),
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1077,9 +1132,19 @@ impl PluginIndexer {
                                                         "js lsif emitter not available: {e}"
                                                     )
                                                 }
-                                                Err(e) => tracing::warn!(
-                                                    "js lsif emitter failed: {e:#}"
-                                                ),
+                                                Err(e) => {
+                                                    tracing::warn!("js lsif emitter failed: {e:#}");
+                                                    // With no tsconfig this pass is
+                                                    // TypeScript's only one, so its
+                                                    // failure is TypeScript's too.
+                                                    if covers_ts {
+                                                        travsr_indexer::sandbox::record_lsif_emitter_skip(
+                                                            "typescript",
+                                                            false,
+                                                            format!("{e:#}"),
+                                                        );
+                                                    }
+                                                }
                                             }
                                         }
                                         Ok(None) => {}
@@ -1625,11 +1690,32 @@ fn build_roots(repo_root: &Path, files: &[String], manifests: &[&str]) -> Vec<Pa
     found.sort();
     let mut roots: Vec<PathBuf> = Vec::new();
     for dir in found {
-        if !roots.iter().any(|root| dir.starts_with(root)) {
+        if !roots.iter().any(|root| dir.starts_with(root)) || is_own_cargo_workspace(&dir) {
             roots.push(dir);
         }
     }
     roots
+}
+
+/// A `Cargo.toml` with its own `[workspace]` table is a separate cargo project
+/// even inside another one, which rust-analyzer run at the outer root never
+/// loads. Only one that uses nothing outside its folder gets a run of its own:
+/// cargo-fuzz's `fuzz/` depends on the crates above it, so a second run there
+/// re-reads them all (41 s and a 70 MB dump on travsr, for four fuzz targets).
+fn is_own_cargo_workspace(dir: &Path) -> bool {
+    fn reaches_out(v: &toml::Value) -> bool {
+        match v {
+            toml::Value::Table(t) => t.iter().any(|(k, v)| {
+                (k == "path" && v.as_str().is_some_and(|p| p.starts_with(".."))) || reaches_out(v)
+            }),
+            toml::Value::Array(a) => a.iter().any(reaches_out),
+            _ => false,
+        }
+    }
+    std::fs::read_to_string(dir.join("Cargo.toml"))
+        .ok()
+        .and_then(|s| s.parse::<toml::Value>().ok())
+        .is_some_and(|t| t.get("workspace").is_some() && !reaches_out(&t))
 }
 
 /// Locate the repo whose `.travsr/config.toml` governs `abs_path`, by walking
@@ -1672,15 +1758,21 @@ mod tests {
     fn an_empty_result_is_classified_by_what_the_analyzer_could_have_produced() {
         use super::{classify_empty_output, EmptyOutput};
 
-        // #712, unchanged: nothing at all, from anyone.
+        // #712: nothing at all from an analyzer that emits its own definitions.
         assert_eq!(
             classify_empty_output("java", true, true),
             EmptyOutput::NoNodes
         );
-        assert_eq!(
-            classify_empty_output("rust", true, true),
-            EmptyOutput::NoNodes
-        );
+        // A native analyzer never emits definitions and extracts call sites
+        // in-process, so nothing at all means the files have no calls. A repo
+        // like that was told its calls could not be traced.
+        for native in ["rust", "typescript", "javascript", "python"] {
+            assert_eq!(
+                classify_empty_output(native, true, true),
+                EmptyOutput::Fine,
+                "{native}: no calls is not a failure"
+            );
+        }
 
         // #724: definitions and no occurrences, from an analyzer that cannot
         // legitimately return that. This is scip-java's shape.
@@ -1840,6 +1932,77 @@ mod tests {
         assert_eq!(
             build_roots(root, &files, TSCONFIG),
             vec![root.join("javascript"), root.join("typescript")]
+        );
+    }
+
+    /// yugabyte-db's Rust is two cargo workspaces under
+    /// `src/postgres/third-party-extensions/` with no `Cargo.toml` at the repo
+    /// root, so rust-analyzer handed the root said "no projects" and Rust got
+    /// no cross-file calls. Each outermost cargo directory is a root instead.
+    #[test]
+    fn rust_roots_are_the_outermost_cargo_directories() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for dir in ["ext/pgrx/pgrx-macros/src", "ext/pgrx/src", "ext/gw/src"] {
+            std::fs::create_dir_all(root.join(dir)).expect("mkdir");
+        }
+        for manifest in ["ext/pgrx", "ext/pgrx/pgrx-macros", "ext/gw"] {
+            std::fs::write(root.join(manifest).join("Cargo.toml"), "").expect("write");
+        }
+        let files = vec![
+            "ext/pgrx/pgrx-macros/src/lib.rs".to_string(),
+            "ext/pgrx/src/lib.rs".to_string(),
+            "ext/gw/src/main.rs".to_string(),
+        ];
+        assert_eq!(
+            build_roots(
+                root,
+                &files,
+                crate::phase_b::catalog::build_manifests("rust")
+            ),
+            vec![root.join("ext/gw"), root.join("ext/pgrx")]
+        );
+    }
+
+    /// PR #940 review: a nested cargo project with its own `[workspace]` is
+    /// not loaded by rust-analyzer at the outer root, so it needs a root of its
+    /// own. A plain member does not, and neither does cargo-fuzz's `fuzz/`,
+    /// which reaches into the crates above it.
+    #[test]
+    fn a_nested_cargo_workspace_is_its_own_rust_root() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for dir in ["src", "core/src", "fuzz/fuzz_targets", "tool/src"] {
+            std::fs::create_dir_all(root.join(dir)).expect("mkdir");
+        }
+        let write = |rel: &str, text: &str| std::fs::write(root.join(rel), text).expect("write");
+        write("Cargo.toml", "[workspace]\nmembers = [\"core\"]\n");
+        write("core/Cargo.toml", "[package]\nname = \"core\"\n");
+        write(
+            "fuzz/Cargo.toml",
+            "[package]\nname = \"fuzz\"\n[dependencies]\ncore = { path = \"../core\" }\n\
+             [workspace]\nmembers = [\".\"]\n[[bin]]\nname = \"a\"\npath = \"fuzz_targets/a.rs\"\n",
+        );
+        write(
+            "tool/Cargo.toml",
+            "[package]\nname = \"tool\"\n[workspace]\n",
+        );
+        let files = vec![
+            "core/src/lib.rs".to_string(),
+            "fuzz/fuzz_targets/a.rs".to_string(),
+            "tool/src/main.rs".to_string(),
+        ];
+        assert_eq!(
+            build_roots(
+                root,
+                &files,
+                crate::phase_b::catalog::build_manifests("rust")
+            ),
+            vec![root.to_path_buf(), root.join("tool")]
         );
     }
 

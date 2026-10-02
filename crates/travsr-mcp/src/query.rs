@@ -163,6 +163,9 @@ pub struct GraphPayload {
     /// Ambiguous candidates, if the query resolves to multiple definitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<NodeEntry>>,
+    /// No definition has the queried name: `seed` is the closest name match.
+    #[serde(default)]
+    pub fuzzy: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -301,6 +304,74 @@ pub struct StatusPayload {
 
 // ── status ────────────────────────────────────────────────────────────────────
 
+/// The semantic state when a mid-edit reindex set `phase_b_dirty` while HEAD
+/// did not move, from the live overlay's `resolved` and `pending` reference
+/// counts. One wording for `travsr status` and `travsr daemon status`.
+///
+/// A mid-edit reindex dropped the changed region's committed edges. Whether
+/// that is a real degradation depends on the live overlay, in three cases:
+///   - live lane inactive (no ref_resolution rows at all: a headless daemon
+///     with no editor, or a generic-detector language with no lexical floor):
+///     nothing recovered the edit, so it is genuinely stale until a refresh.
+///   - active with references still pending: name how many are unknown until
+///     commit.
+///   - active with nothing pending: the overlay resolved every reference it
+///     detected, so "stale, re-run init" would be wrong advice.
+///
+/// The counts are repo-wide and phase_b_dirty is a single flag, so this last
+/// case cannot prove every dropped edge came back: an editor-resolved file and
+/// a headless generic-language edit (which leaves no rows at all) both feed
+/// one flag, and the resolved rows may belong only to the first. So it reports
+/// the recovery it can see without claiming a full refresh, which the
+/// commit-gated path is what actually delivers.
+/// Unresolved references per file, only in files that differ from HEAD and
+/// only while an edit awaits (`phase_b_dirty`). A pending row in an untouched
+/// file is a call no commit resolves (`Vec::new`, `join`), not an edit waiting
+/// to be traced, so counting it would say "changed since the last commit" of a
+/// file nobody changed.
+pub fn pending_refs_in_edited_files(store: &SqliteStore) -> Vec<(String, u64)> {
+    let dirty = store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1");
+    let Some(root) = store.resolve_repo_root().filter(|_| dirty) else {
+        return Vec::new();
+    };
+    let git_paths = |args: &[&str]| -> Vec<String> {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let edited: HashSet<String> = git_paths(&["diff", "--name-only", "HEAD"])
+        .into_iter()
+        .chain(git_paths(&["ls-files", "--others", "--exclude-standard"]))
+        .collect();
+    store
+        .pending_ref_counts_by_file(usize::MAX)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(path, _)| edited.contains(path))
+        .collect()
+}
+
+pub fn dirty_semantic_state(resolved: u64, pending: u64) -> String {
+    if resolved == 0 && pending == 0 {
+        "stale (run travsr init to refresh)".to_string()
+    } else if pending > 0 {
+        format!("{pending} reference(s) in edits not yet committed are not traced yet")
+    } else {
+        "edits not yet committed were traced where found; commit for a full refresh".to_string()
+    }
+}
+
 pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
     let nodes = store.node_count()?;
     // L11: detect FTS/nodes skew — indicates a partial write or a bad migration.
@@ -310,7 +381,10 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
     // recovered reads as live-fresh rather than a blanket "stale". A read error
     // degrades to zero, which keeps the conservative signal.
     let resolved_refs = store.resolved_ref_count().unwrap_or(0);
-    let pending_refs = store.pending_ref_count().unwrap_or(0);
+    let pending_refs = pending_refs_in_edited_files(store)
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
     Ok(StatusPayload {
         nodes,
         fts_nodes: fts_count,
@@ -890,6 +964,7 @@ fn coverage_for(store: &SqliteStore, language: &str) -> Coverage {
 /// discovery order; `tree` holds the spanning-tree expansion steps.
 pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result<GraphPayload> {
     let mut candidates: Option<Vec<NodeEntry>> = None;
+    let mut fuzzy = false;
     let seed =
         match crate::tools::resolve_reference_targets(store, &args.query, args.path.as_deref()) {
             crate::tools::RefTarget::Unique(n) => Some(n),
@@ -940,6 +1015,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                     // is a precise miss, not an invitation to guess a first hit.
                     _ => {
                         if args.path.is_none() {
+                            fuzzy = !matches.is_empty();
                             matches
                                 .iter()
                                 .find(|n| n.kind == "file")
@@ -962,6 +1038,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             coverage: None,
             last_commit: store.get_meta("last_commit").ok().flatten(),
             candidates,
+            fuzzy: false,
         });
     };
 
@@ -969,13 +1046,20 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
     let mut node_index: HashSet<NodeId> = HashSet::new();
     let mut edges_raw: Vec<(NodeId, NodeId, String, String)> = Vec::new();
     let mut tree: Vec<TreeStep> = Vec::new();
-    let mut visited: HashSet<NodeId> = HashSet::new();
-    let mut queue: VecDeque<(NodeId, u8, bool)> = VecDeque::new();
+    // Keyed by node and side (`true` = reached as a caller), so a node that is
+    // both a caller and a callee of the seed, as in a call cycle, is walked on
+    // each side instead of only on the side that reached it first.
+    let mut visited: HashSet<(NodeId, bool)> = HashSet::new();
+    // Each node carries the direction it was reached in. `Both` applies to the
+    // seed only; past it a caller keeps walking up and a dependency down, so the
+    // tree never shows a callee's other callers or a caller's other callees.
+    let mut queue: VecDeque<(NodeId, u8, bool, QueryDirection)> = VecDeque::new();
 
-    visited.insert(seed.id);
-    queue.push_back((seed.id, 0, true));
+    visited.insert((seed.id, true));
+    visited.insert((seed.id, false));
+    queue.push_back((seed.id, 0, true, args.direction));
 
-    while let Some((current_id, depth, expand)) = queue.pop_front() {
+    while let Some((current_id, depth, expand, direction)) = queue.pop_front() {
         if let Some(node) = store.get_node(current_id)? {
             if node_index.insert(current_id) {
                 nodes.push(node_entry(&node, depth));
@@ -990,13 +1074,9 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             continue;
         }
 
-        for (edge_kind, next_id, child_expand, edge_incoming, edge_provenance) in next_edges(
-            store,
-            current_id,
-            args.direction,
-            args.edge_mode,
-            depth == 0,
-        )? {
+        for (edge_kind, next_id, child_expand, edge_incoming, edge_provenance) in
+            next_edges(store, current_id, direction, args.edge_mode, depth == 0)?
+        {
             // #564: orient from the edge itself, not the direction flag — in
             // `Both` mode a single expansion mixes incoming and outgoing edges.
             let (src, dst) = if edge_incoming {
@@ -1007,14 +1087,12 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             let heuristic = is_heuristic_edge(edge_kind.as_str(), &edge_provenance);
             edges_raw.push((src, dst, edge_kind.as_str().to_string(), edge_provenance));
 
-            if !visited.contains(&next_id) {
+            if visited.insert((next_id, edge_incoming)) {
                 if let Some(next_node) = store.get_node(next_id)? {
                     if !args.include_noise && is_noise_node(&next_node) {
-                        visited.insert(next_id);
                         continue;
                     }
                 }
-                visited.insert(next_id);
                 tree.push(TreeStep {
                     parent: current_id.0,
                     edge_kind: edge_kind.as_str().to_string(),
@@ -1022,7 +1100,12 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                     incoming: edge_incoming,
                     heuristic,
                 });
-                queue.push_back((next_id, depth + 1, child_expand));
+                let onward = if edge_incoming {
+                    QueryDirection::Callers
+                } else {
+                    QueryDirection::Deps
+                };
+                queue.push_back((next_id, depth + 1, child_expand, onward));
             }
         }
     }
@@ -1039,6 +1122,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
         coverage: Some(coverage),
         last_commit: store.get_meta("last_commit")?,
         candidates,
+        fuzzy,
     })
 }
 
@@ -1070,6 +1154,7 @@ pub fn graph_all_payload(store: &SqliteStore) -> anyhow::Result<GraphPayload> {
         coverage: None,
         last_commit: store.get_meta("last_commit")?,
         candidates: None,
+        fuzzy: false,
     })
 }
 
@@ -1282,6 +1367,28 @@ mod tests {
         assert_eq!(payload.nodes.len(), before);
     }
 
+    /// `travsr graph run_phase_b` rooted itself on a test named
+    /// `..._does_not_run_phase_b` without saying the name did not match. The
+    /// payload flags a guess so the caller can say so.
+    #[test]
+    fn a_graph_rooted_on_a_guess_says_so() {
+        let (store, _, _, _) = seeded_store();
+        let args = |query: &str| GraphQueryArgs {
+            query: query.to_string(),
+            path: None,
+            depth: 1,
+            direction: QueryDirection::Both,
+            edge_mode: QueryEdgeMode::All,
+            include_noise: true,
+        };
+        assert!(!graph_query(&store, &args("PaymentService")).unwrap().fuzzy);
+        let guess = graph_query(&store, &args("PaymentServ")).unwrap();
+        assert!(
+            guess.seed.is_some() && guess.fuzzy,
+            "a partial name is a guess"
+        );
+    }
+
     // ── #564: every direction mode must preserve true edge orientation ───────
 
     #[test]
@@ -1351,6 +1458,99 @@ mod tests {
         assert!(
             !call_step.incoming,
             "Deps: outgoing call step wrongly tagged incoming"
+        );
+    }
+
+    /// `both` is callers upward plus deps downward from the seed. A callee's
+    /// other callers and a caller's other callees answer neither question and
+    /// turned a 10-line view into 200+ lines.
+    #[test]
+    fn both_direction_keeps_each_branch_going_one_way() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let seed = node("fn:seed", "function", "src/a.ts");
+        let caller = node("fn:caller", "function", "src/b.ts");
+        let callee = node("fn:callee", "function", "src/c.ts");
+        let callee_other_caller = node("fn:elsewhere", "function", "src/d.ts");
+        let caller_other_callee = node("fn:unrelated", "function", "src/e.ts");
+        for n in [
+            &seed,
+            &caller,
+            &callee,
+            &callee_other_caller,
+            &caller_other_callee,
+        ] {
+            store.put_node(n).unwrap();
+        }
+        for (src, dst) in [
+            (&caller, &seed),
+            (&seed, &callee),
+            (&callee_other_caller, &callee),
+            (&caller, &caller_other_callee),
+        ] {
+            store
+                .put_edge(&Edge::new(src.id, dst.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "seed".to_string(),
+                path: None,
+                depth: 3,
+                direction: QueryDirection::Both,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        let shown: HashSet<u64> = payload.nodes.iter().map(|n| n.id).collect();
+        assert!(shown.contains(&caller.id.0) && shown.contains(&callee.id.0));
+        assert!(
+            !shown.contains(&callee_other_caller.id.0),
+            "a callee's other caller was shown"
+        );
+        assert!(
+            !shown.contains(&caller_other_callee.id.0),
+            "a caller's other callee was shown"
+        );
+    }
+
+    /// A node that is both a callee and a caller of the seed (a call cycle)
+    /// still gets its callers walked, even though the callee side reaches it
+    /// first.
+    #[test]
+    fn both_direction_walks_a_cycle_node_on_the_caller_side() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let seed = node("fn:seed", "function", "src/a.ts");
+        let cycle = node("fn:cycle", "function", "src/b.ts");
+        let upstream = node("fn:upstream", "function", "src/c.ts");
+        for n in [&seed, &cycle, &upstream] {
+            store.put_node(n).unwrap();
+        }
+        for (src, dst) in [(&seed, &cycle), (&cycle, &seed), (&upstream, &cycle)] {
+            store
+                .put_edge(&Edge::new(src.id, dst.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "seed".to_string(),
+                path: None,
+                depth: 2,
+                direction: QueryDirection::Both,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            payload
+                .tree
+                .iter()
+                .any(|s| s.incoming && s.parent == cycle.id.0 && s.child == upstream.id.0),
+            "the cycle node's caller was dropped: {:?}",
+            payload.tree
         );
     }
 

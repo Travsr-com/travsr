@@ -25,6 +25,8 @@ fn git(dir: &Path, args: &[&str]) {
 fn travsr(dir: &Path) -> Command {
     let mut c = Command::cargo_bin("travsr").unwrap();
     c.env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .env_remove("TRAVSR_NO_WORKTREE_NOTE")
         .current_dir(dir);
     c
@@ -47,9 +49,10 @@ fn stderr_of(cmd: &mut Command, args: &[&str]) -> String {
 /// linked worktree with no `.travsr/` of its own so its reads redirect to the
 /// main index (the #302 `PreferLocalElseMain` path).
 ///
-/// `travsr init` runs Phase A only, so the resulting index is genuinely Phase B
-/// degraded (`semantic: not run`). That is a precondition rather than an
-/// accident, so the tests below assert it rather than assume it — without it the
+/// `travsr init` traces calls, so a later commit reindexed by the git hook with
+/// no daemon running leaves the index genuinely Phase B degraded. That is a
+/// precondition rather than an accident, so the tests below assert it rather
+/// than assume it: without it the
 /// degraded-caveat test would pass while proving nothing.
 fn main_and_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
@@ -65,6 +68,13 @@ fn main_and_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
     git(main, &["add", "-A"]);
     git(main, &["commit", "-qm", "init"]);
     travsr(main).arg("init").assert().success();
+    std::fs::write(main.join("b.ts"), "export function later() { return 1; }\n").unwrap();
+    git(main, &["add", "-A"]);
+    git(main, &["commit", "-qm", "later"]);
+    travsr(main)
+        .args(["hook-run", "--from-hook"])
+        .assert()
+        .success();
 
     let wt = main.join("wt");
     git(main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
@@ -95,7 +105,7 @@ fn the_degraded_caveat_reaches_only_commands_that_ride_call_edges() {
     // fails here rather than letting the assertions below pass vacuously.
     let control = stderr_of(&mut travsr(main), &["references", "hello"]);
     assert!(
-        control.contains("has not caught up"),
+        control.contains("still being traced"),
         "precondition: the main index must be Phase B degraded, got: {control}"
     );
 

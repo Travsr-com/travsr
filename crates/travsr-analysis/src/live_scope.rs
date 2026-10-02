@@ -140,13 +140,28 @@ const PYTHON_BINDERS: &str = "
 (for_statement left: (identifier) @bind)
 ";
 
-/// `let` bindings, function parameters and closure parameters. Nested `fn`
-/// items and `struct`s are omitted for the same reason as TypeScript's: Phase A
-/// indexes them.
+/// `let` bindings, function parameters and closure parameters, and every name a
+/// pattern binds (`if let Some(x)`, match arms, `for (a, b)`, struct fields,
+/// `ref`/`mut`, `x @ ..`). Nested `fn` items and `struct`s are omitted for the
+/// same reason as TypeScript's: Phase A indexes them. A unit variant or const in
+/// a match arm (`None =>`) is collected too; that costs recall, never precision.
 const RUST_BINDERS: &str = "
 (let_declaration pattern: (identifier) @bind)
 (parameter pattern: (identifier) @bind)
 (closure_parameters (identifier) @bind)
+(let_condition pattern: (identifier) @bind)
+(for_expression pattern: (identifier) @bind)
+(match_pattern (identifier) @bind)
+(tuple_struct_pattern \"(\" (identifier) @bind)
+(tuple_pattern (identifier) @bind)
+(slice_pattern (identifier) @bind)
+(or_pattern (identifier) @bind)
+(ref_pattern (identifier) @bind)
+(reference_pattern (identifier) @bind)
+(mut_pattern (identifier) @bind)
+(captured_pattern (identifier) @bind)
+(field_pattern name: (shorthand_field_identifier) @bind)
+(field_pattern pattern: (identifier) @bind)
 ";
 
 fn collect(
@@ -242,6 +257,40 @@ mod tests {
         );
         assert!(found.contains("local"), "got {found:?}");
         assert!(found.contains("param"), "got {found:?}");
+    }
+
+    /// Names bound inside a pattern are locals too. `Some(hook) => hook(q)` was
+    /// resolved to an unrelated `fn:hook` in another crate, a wrong live edge
+    /// the meter scores as unverifiable (Phase B records no site for a closure
+    /// call), so it never counted against the lane.
+    #[test]
+    fn rust_pattern_bindings_are_binders() {
+        let found = names(
+            Language::Rust,
+            "fn f(o: Option<fn()>, v: Vec<(u8, u8)>, s: S) {\n\
+             if let Some(hook) = o { hook() }\n\
+             match o { Some(arm) => arm(), None => {} }\n\
+             for (a, b) in v { a(); b(); }\n\
+             for each in v { each(); }\n\
+             let S { field, other: renamed } = s;\n\
+             let (ref r, mut m) = (1, 2);\n\
+             let whole @ Some(_) = o else { return };\n\
+             while let Some(w) = o { w() }\n\
+             for &hook2 in HOOKS { hook2() }\n\
+             v.iter().for_each(|&cb| cb());\n\
+             if let Some(&h2) = o { h2() }\n\
+             }",
+        );
+        for n in [
+            "hook", "arm", "a", "b", "each", "field", "renamed", "r", "m", "whole", "w", "hook2",
+            "cb", "h2",
+        ] {
+            assert!(found.contains(n), "{n} missing from {found:?}");
+        }
+        assert!(
+            !found.contains("Some"),
+            "a variant is not a binder: {found:?}"
+        );
     }
 
     /// `use` is Rust's import form and must stay out of the set.

@@ -5,6 +5,7 @@
  * at any time via the travsr.showWelcome command.
  */
 
+import * as cp from "child_process";
 import * as vscode from "vscode";
 
 const WELCOME_SHOWN_KEY = "travsr.welcomeShown";
@@ -12,13 +13,47 @@ const WELCOME_SHOWN_KEY = "travsr.welcomeShown";
 // Module-level ref so re-running the command reveals the existing panel.
 let currentPanel: vscode.WebviewPanel | undefined;
 
-export function showWelcomeIfFirstRun(context: vscode.ExtensionContext): void {
+export function showWelcomeIfFirstRun(context: vscode.ExtensionContext, root?: string): void {
   if (context.globalState.get<boolean>(WELCOME_SHOWN_KEY, false)) return;
   void context.globalState.update(WELCOME_SHOWN_KEY, true);
-  showWelcome();
+  showWelcome(root);
 }
 
-export function showWelcome(): void {
+/** One row of `travsr connect --print --json`. */
+export interface FoundTool {
+  tool: string;
+  name: string;
+  /** `automatic`: setup connects it. `one_step`: the user adds Travsr in the tool. */
+  setup: string;
+}
+
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function joinNames(names: string[]): string {
+  return names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/** The "Get started" lines about AI tools, from what this machine has.
+ *  `undefined` until the CLI answers (or when it cannot): stay generic. */
+export function welcomeToolLines(tools: FoundTool[] | undefined): string[] {
+  const ready = "Wait for <strong>Ready.</strong>";
+  if (!tools) return [`${ready} The AI tools Travsr finds are connected for you.`];
+  if (tools.length === 0) {
+    return [`${ready} No AI coding tool found yet: install one, then run <strong>Travsr: Re-index Now</strong>.`];
+  }
+  const automatic = tools.filter((t) => t.setup === "automatic").map((t) => esc(t.name));
+  const lines = [automatic.length ? `${ready} Travsr connects ${joinNames(automatic)} for you.` : ready];
+  for (const t of tools.filter((t) => t.setup !== "automatic")) {
+    lines.push(
+      `${esc(t.name)} needs one step from you: after setup, run <code>travsr connect --tool ${esc(t.tool)}</code> to see it.`
+    );
+  }
+  return lines;
+}
+
+export function showWelcome(root?: string): void {
   if (currentPanel) {
     currentPanel.reveal(vscode.ViewColumn.One);
     return;
@@ -30,10 +65,22 @@ export function showWelcome(): void {
     { localResourceRoots: [], enableScripts: false }
   );
   currentPanel.onDidDispose(() => { currentPanel = undefined; });
-  currentPanel.webview.html = getHtml();
+  currentPanel.webview.html = getHtml(undefined);
+  if (!root) return;
+  // Read-only: names the tools found without writing anything.
+  const panel = currentPanel;
+  const binary = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
+  cp.execFile(binary, ["connect", "--print", "--json"], { cwd: root, timeout: 10_000 }, (err, stdout) => {
+    if (err || panel !== currentPanel) return;
+    try {
+      panel.webview.html = getHtml(JSON.parse(stdout) as FoundTool[]);
+    } catch {
+      // Keep the generic line.
+    }
+  });
 }
 
-function getHtml(): string {
+function getHtml(tools: FoundTool[] | undefined): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -64,15 +111,6 @@ function getHtml(): string {
       font-family: var(--vscode-editor-font-family);
       font-size: 13px;
     }
-    .command-block {
-      background: var(--vscode-textCodeBlock-background);
-      border-left: 3px solid var(--vscode-textLink-foreground);
-      padding: 10px 14px;
-      margin: 12px 0;
-      border-radius: 0 4px 4px 0;
-      font-family: var(--vscode-editor-font-family);
-      font-size: 13px;
-    }
     .links { margin-top: 36px; display: flex; gap: 20px; flex-wrap: wrap; }
     a { color: var(--vscode-textLink-foreground); text-decoration: none; }
     a:hover { text-decoration: underline; }
@@ -81,28 +119,30 @@ function getHtml(): string {
 </head>
 <body>
   <h1>Travsr</h1>
-  <p class="tagline">The code graph that lives next to git.</p>
+  <p class="tagline">Your AI sees how your code connects.</p>
 
   <p>
-    Travsr builds a deterministic graph of your codebase on every git commit.
-    Instead of guessing from text chunks, your AI tools traverse real structure,
-    call edges, import edges, type references, and return exactly the context
-    they need.
+    Travsr reads your project and keeps track of what calls what. Your AI asks
+    it instead of guessing from text, and it stays up to date on every commit.
   </p>
 
-  <h2>Features in this extension</h2>
+  <h2>Get started</h2>
   <ul>
-    <li><strong>Status bar</strong>, live graph health at the bottom of VS Code</li>
-    <li><strong>Blast radius code lens</strong>, how many files break if this file changes</li>
-    <li><strong>Callers hover</strong>, hover any symbol to see what calls it</li>
-    <li><strong>Graph panel</strong>, Activity Bar view with live dependencies and callers for the active symbol</li>
+    <li>Open a folder that is a Git project.</li>
+    <li>Click <strong>Set up</strong> when Travsr asks, or run <strong>Travsr: Re-index Now</strong> from the Command Palette.</li>
+    ${welcomeToolLines(tools).map((l) => `<li>${l}</li>`).join("\n    ")}
+  </ul>
+  <p>If a language needs something installed first, <strong>Travsr: Health</strong> lists it with the one thing to do.</p>
+
+  <h2>In the editor</h2>
+  <ul>
+    <li><strong>Status bar</strong>: whether this project is ready and up to date</li>
+    <li><strong>Above each file</strong>: how many files are affected if it changes</li>
+    <li><strong>Hover a function</strong>: what calls it</li>
+    <li><strong>Travsr view in the Activity Bar</strong>: what the current function calls and what calls it</li>
   </ul>
 
-  <h2>Getting started</h2>
-  <p>Install the Travsr CLI and initialise your repo:</p>
-  <div class="command-block">npm install -g @travsr.com/travsr</div>
-  <div class="command-block">cd your-repo &amp;&amp; travsr init</div>
-  <p>The status bar turns green when the graph is ready. The Activity Bar panel updates as you move your cursor.</p>
+  <p>Prefer the terminal? Run <code>travsr init</code> in your project.</p>
 
   <hr>
 

@@ -62,13 +62,15 @@ pub fn resolve_ra_binary() -> Option<std::path::PathBuf> {
     // non-zero. `.status().is_ok()` (process ran at all) treated that as
     // "available" and later spawned `rust-analyzer lsif`, which the shim
     // rejected with "Unknown binary ..." — silently skipping LSIF.
-    let on_path = std::process::Command::new("rust-analyzer")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if on_path {
+    let runs = |ra: &std::path::Path| {
+        std::process::Command::new(ra)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if runs(std::path::Path::new("rust-analyzer")) {
         return Some(std::path::PathBuf::from("rust-analyzer"));
     }
     // 2–4. Explicit home-relative fallbacks survive daemon PATH stripping.
@@ -101,7 +103,8 @@ pub fn resolve_ra_binary() -> Option<std::path::PathBuf> {
         }),
     ];
     for candidate in candidates.into_iter().flatten() {
-        if candidate.exists() {
+        // The same #738 shim sits in `~/.cargo/bin`, so run it, as on PATH.
+        if runs(&candidate) {
             tracing::info!(
                 path = %candidate.display(),
                 "rust-analyzer found off-PATH (cargo home or ~/.travsr/bin)"
