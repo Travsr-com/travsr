@@ -313,6 +313,9 @@ impl Breaker {
         let mask = limits.mask();
         // The closure never returns `None`, so `fetch_update` always yields the
         // previous window; the `else` is unreachable but keeps this panic-free.
+        // `allow(deprecated)`: newer stable renames this to `try_update`, which
+        // is not on our MSRV (1.88); the suppression bridges both toolchains.
+        #[allow(deprecated)]
         let Ok(prev) = self
             .recent_over_budget
             .fetch_update(Relaxed, Relaxed, |w| Some(((w << 1) | bit) & mask))
