@@ -445,6 +445,80 @@ test('a module binding that is not the def does not resolve to a nested class', 
   assert.deepStrictEqual(refs, []);
 });
 
+test('self.attr.method() resolves via an annotated constructor parameter', async () => {
+  const refs = await refsFrom(
+    {
+      'app.py':
+        'class App:\n    def add_url_rule(self, rule):\n        return rule\n\n\n' +
+        'class State:\n    def __init__(self, app: App):\n        self.app = app\n\n' +
+        '    def register(self, rule):\n        return self.app.add_url_rule(rule)\n',
+    },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, [{ path: 'app.py', signature: 'method:App.add_url_rule' }]);
+});
+
+test('self.attr.method() resolves via an inline attribute annotation', async () => {
+  const refs = await refsFrom(
+    {
+      'app.py':
+        'class App:\n    def run(self):\n        return 1\n\n\n' +
+        'class State:\n    def __init__(self, a):\n        self.app: App = a\n\n' +
+        '    def go(self):\n        return self.app.run()\n',
+    },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, [{ path: 'app.py', signature: 'method:App.run' }]);
+});
+
+test('self.attr.method() resolves across files with a TYPE_CHECKING import', async () => {
+  // The dominant modern-Python shape (Flask's BlueprintSetupState): the type is
+  // imported only under `if TYPE_CHECKING:` beside `from __future__ import
+  // annotations`.
+  const refs = await refsFrom(
+    {
+      '__init__.py': '',
+      'app.py': 'class App:\n    def add_url_rule(self, rule):\n        return rule\n',
+      'state.py':
+        'from __future__ import annotations\n\nimport typing as t\n\n' +
+        'if t.TYPE_CHECKING:\n    from .app import App\n\n\n' +
+        'class State:\n    def __init__(self, app: App):\n        self.app = app\n\n' +
+        '    def register(self, rule):\n        return self.app.add_url_rule(rule)\n',
+    },
+    'state.py'
+  );
+  assert.deepStrictEqual(refs, [{ path: 'app.py', signature: 'method:App.add_url_rule' }]);
+});
+
+test('self.attr.method() stays unresolved without a first-party annotation', async () => {
+  // No annotation on `app` → the attribute type is unknown → no edge, rather
+  // than a guessed one.
+  const refs = await refsFrom(
+    {
+      'app.py':
+        'class App:\n    def add_url_rule(self, rule):\n        return rule\n\n\n' +
+        'class State:\n    def __init__(self, app):\n        self.app = app\n\n' +
+        '    def register(self, rule):\n        return self.app.add_url_rule(rule)\n',
+    },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, []);
+});
+
+test('a method call on a type-annotated local resolves', async () => {
+  // `local: App = a` — the annotation names the type even though the RHS is
+  // neither a constructor call nor itself resolvable.
+  const refs = await refsFrom(
+    {
+      'app.py':
+        'class App:\n    def add_url_rule(self, rule):\n        return rule\n\n\n' +
+        'def build(a):\n    local: App = a\n    return local.add_url_rule("/")\n',
+    },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, [{ path: 'app.py', signature: 'method:App.add_url_rule' }]);
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function parseAll(stdout: string): Record<string, unknown>[] {

@@ -352,23 +352,45 @@ fn extract_file_edges(
 ///
 /// Accepted: `self`/`cls` resolve via the enclosing class; a plain identifier
 /// resolves via the nearest preceding `name = Type(...)` assignment or annotated
-/// parameter of that name. Anything else — attribute chains (`self.x.method()`),
-/// subscripts, temporaries — returns `None`, keeping the daemon on its
+/// parameter of that name; and `self.<attr>` resolves via the attribute's
+/// explicit annotation in the enclosing class (annotated ctor param, inline
+/// `self.attr: Type`, or class-body field). Anything else (deeper chains like
+/// `a.b.c()`, subscripts, temporaries) returns `None`, keeping the daemon on its
 /// fail-closed unique-leaf path. `None` is always the safe answer.
 fn resolve_receiver_type_py(
     recv: tree_sitter::Node<'_>,
     source: &[u8],
     enclosing_class: &Option<String>,
 ) -> Option<String> {
-    if recv.kind() != "identifier" {
-        return None;
+    match recv.kind() {
+        "identifier" => {
+            let name = recv.utf8_text(source).ok()?;
+            if name == "self" || name == "cls" {
+                return enclosing_class.clone();
+            }
+            let enclosing_fn = enclosing_function_def_py(recv)?;
+            nearest_preceding_binding_type_py(enclosing_fn, source, name, recv.start_byte())
+        }
+        // `self.<attr>.method()`: recover the attribute's annotated class type
+        // from the enclosing class, matching the committed walker's self-attr
+        // resolution. Only `self`/`cls` receivers with an explicit annotation;
+        // anything deeper stays `None`.
+        "attribute" => {
+            let obj = recv.child_by_field_name("object")?;
+            if obj.kind() != "identifier"
+                || !matches!(obj.utf8_text(source), Ok("self") | Ok("cls"))
+            {
+                return None;
+            }
+            let attr = recv.child_by_field_name("attribute")?;
+            if attr.kind() != "identifier" {
+                return None;
+            }
+            let attr_name = attr.utf8_text(source).ok()?;
+            self_attr_type_py(recv, source, attr_name)
+        }
+        _ => None,
     }
-    let name = recv.utf8_text(source).ok()?;
-    if name == "self" || name == "cls" {
-        return enclosing_class.clone();
-    }
-    let enclosing_fn = enclosing_function_def_py(recv)?;
-    nearest_preceding_binding_type_py(enclosing_fn, source, name, recv.start_byte())
 }
 
 /// Walk up to the nearest enclosing `function_definition` node itself (as opposed
@@ -504,6 +526,162 @@ fn assign_ctor_type_py(assign: tree_sitter::Node<'_>, source: &[u8]) -> Option<S
     let t = func.utf8_text(source).ok()?;
     t.starts_with(|c: char| c.is_uppercase())
         .then(|| t.to_string())
+}
+
+/// Class type of `self.<attr>` within the enclosing class, from an EXPLICIT
+/// annotation only (precision-first, resolved by name against the node table by
+/// the daemon): a class-body field `attr: Type`, an annotated self-assignment
+/// `self.attr: Type`, or `self.attr = p` where `p` is an annotated parameter
+/// `p: Type` of the assigning method. Only a bare class name is accepted (via
+/// `type_name_py`); generics / unions / dotted names yield `None`. Last match
+/// wins, mirroring the file-local best-effort contract of the identifier path.
+fn self_attr_type_py(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    attr_name: &str,
+) -> Option<String> {
+    let class_node = enclosing_class_def_py(node)?;
+    let body = class_node.child_by_field_name("body")?;
+    let mut found: Option<String> = None;
+    let mut c = body.walk();
+    for stmt in body.children(&mut c) {
+        let def = if stmt.kind() == "decorated_definition" {
+            stmt.child_by_field_name("definition").unwrap_or(stmt)
+        } else {
+            stmt
+        };
+        match def.kind() {
+            // class-body field annotation: `attr: Type [= ...]`
+            "expression_statement" => {
+                if let Some(a) = def.named_child(0) {
+                    if let Some(t) = class_field_type_py(a, source, attr_name) {
+                        found = Some(t);
+                    }
+                }
+            }
+            // method bodies: `self.attr: Type = ...` and `self.attr = <param>`
+            "function_definition" => {
+                if let Some(body) = def.child_by_field_name("body") {
+                    scan_self_attr_assigns_py(body, source, def, attr_name, &mut found);
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// A class-body `assignment` of the form `attr: Type [= ...]`: its bare type.
+fn class_field_type_py(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    attr_name: &str,
+) -> Option<String> {
+    if node.kind() != "assignment" {
+        return None;
+    }
+    let left = node.child_by_field_name("left")?;
+    if left.kind() != "identifier" || left.utf8_text(source).ok()? != attr_name {
+        return None;
+    }
+    type_name_py(node.child_by_field_name("type")?, source)
+}
+
+/// Recurse through a method body for `self.<attr_name>` assignments, recording
+/// the bare class type from an inline annotation (`self.attr: Type`) or, failing
+/// that, from an annotated parameter named on the RHS (`self.attr = p`, `p:
+/// Type`). Does not descend into nested functions. Last match wins.
+fn scan_self_attr_assigns_py(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    fn_node: tree_sitter::Node<'_>,
+    attr_name: &str,
+    found: &mut Option<String>,
+) {
+    if node.kind() == "assignment" {
+        if let Some(left) = node.child_by_field_name("left") {
+            if is_self_attr_py(left, source, attr_name) {
+                if let Some(t) = node
+                    .child_by_field_name("type")
+                    .and_then(|t| type_name_py(t, source))
+                {
+                    *found = Some(t);
+                } else if let Some(right) = node.child_by_field_name("right") {
+                    if right.kind() == "identifier" {
+                        if let Ok(pname) = right.utf8_text(source) {
+                            if let Some(t) = param_type_py(fn_node, source, pname) {
+                                *found = Some(t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if node.kind() == "function_definition" {
+        return;
+    }
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        scan_self_attr_assigns_py(child, source, fn_node, attr_name, found);
+    }
+}
+
+/// Whether `attr` is `self.<attr_name>` / `cls.<attr_name>`.
+fn is_self_attr_py(attr: tree_sitter::Node<'_>, source: &[u8], attr_name: &str) -> bool {
+    if attr.kind() != "attribute" {
+        return false;
+    }
+    let (Some(obj), Some(a)) = (
+        attr.child_by_field_name("object"),
+        attr.child_by_field_name("attribute"),
+    ) else {
+        return false;
+    };
+    obj.kind() == "identifier"
+        && matches!(obj.utf8_text(source), Ok("self") | Ok("cls"))
+        && a.kind() == "identifier"
+        && a.utf8_text(source) == Ok(attr_name)
+}
+
+/// Bare class type of an annotated parameter `param_name: Type` of `fn_node`.
+fn param_type_py(
+    fn_node: tree_sitter::Node<'_>,
+    source: &[u8],
+    param_name: &str,
+) -> Option<String> {
+    let params = fn_node.child_by_field_name("parameters")?;
+    let mut c = params.walk();
+    for p in params.children(&mut c) {
+        let name_node = match p.kind() {
+            "typed_parameter" => p.child(0),
+            "typed_default_parameter" => p.child_by_field_name("name"),
+            _ => None,
+        };
+        if name_node.and_then(|n| n.utf8_text(source).ok()) != Some(param_name) {
+            continue;
+        }
+        if let Some(t) = p
+            .child_by_field_name("type")
+            .and_then(|t| type_name_py(t, source))
+        {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Walk up to the nearest enclosing `class_definition` node.
+fn enclosing_class_def_py(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let mut cur = node.parent()?;
+    loop {
+        match cur.kind() {
+            "class_definition" => return Some(cur),
+            "module" => return None,
+            _ => {}
+        }
+        cur = cur.parent()?;
+    }
 }
 
 // ── AST helpers ───────────────────────────────────────────────────────────────
@@ -812,13 +990,84 @@ def handle(self, session: Session):
     }
 
     #[test]
-    fn recv_attribute_chain_is_none() {
-        // `self.other.run()` — receiver is an attribute chain, not a plain
-        // identifier or `self`. Must NOT resolve (no false self-class edge).
+    fn recv_untyped_self_attr_is_none() {
+        // `self.other` has no annotation anywhere in the class, so its type is
+        // unknown. Must NOT resolve (no false edge), even though self.attr
+        // receivers are otherwise supported.
         let source = br#"
 class App:
     def run(self):
         self.other.run()
+"#;
+        assert_eq!(recv_type_for_call(source, "run"), None);
+    }
+
+    #[test]
+    fn recv_self_attr_from_annotated_param() {
+        // `self.app = app` with `app: App` -> self.app.add_url_rule() resolves to App.
+        let source = br#"
+class State:
+    def __init__(self, app: App):
+        self.app = app
+
+    def register(self, rule):
+        self.app.add_url_rule(rule)
+"#;
+        assert_eq!(
+            recv_type_for_call(source, "add_url_rule"),
+            Some("App".to_string())
+        );
+    }
+
+    #[test]
+    fn recv_self_attr_from_inline_annotation() {
+        let source = br#"
+class State:
+    def __init__(self, a):
+        self.app: App = a
+
+    def go(self):
+        self.app.run()
+"#;
+        assert_eq!(recv_type_for_call(source, "run"), Some("App".to_string()));
+    }
+
+    #[test]
+    fn recv_self_attr_from_class_field() {
+        let source = br#"
+class State:
+    app: App = None
+
+    def go(self):
+        self.app.run()
+"#;
+        assert_eq!(recv_type_for_call(source, "run"), Some("App".to_string()));
+    }
+
+    #[test]
+    fn recv_self_attr_non_bare_annotation_is_none() {
+        // `Optional[App]` is a subscript, not a bare class name -> None.
+        let source = br#"
+class State:
+    def __init__(self, app: Optional[App]):
+        self.app = app
+
+    def go(self):
+        self.app.run()
+"#;
+        assert_eq!(recv_type_for_call(source, "run"), None);
+    }
+
+    #[test]
+    fn recv_deeper_chain_is_none() {
+        // Two-level chain `self.a.b.run()` is not supported -> None.
+        let source = br#"
+class State:
+    def __init__(self, a: App):
+        self.a = a
+
+    def go(self):
+        self.a.b.run()
 "#;
         assert_eq!(recv_type_for_call(source, "run"), None);
     }

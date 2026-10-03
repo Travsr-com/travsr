@@ -185,6 +185,9 @@ export function walk(rootDir: string, emitter: Emitter): void {
     // #299 P1: track local variable types (`x = SomeClass()`) so method calls on
     // locals (`x.method()`), and `self.method()`, resolve to `method:Class.method`.
     const localTypes = buildLocalTypes(tree.rootNode, importTable, defMap, relPath);
+    // #1: per-class `self.<attr>` → class type, from explicit annotations, so
+    // `self.attr.method()` resolves to the attribute class's method.
+    const selfAttrTypes = buildSelfAttrTypes(tree.rootNode, importTable, defMap, relPath);
     visitRefs(
       tree.rootNode,
       docId,
@@ -195,7 +198,8 @@ export function walk(rootDir: string, emitter: Emitter): void {
       relPath,
       null,
       localTypes,
-      classBases
+      classBases,
+      selfAttrTypes
     );
     emitter.emitContains(docId, refRangeIds);
   }
@@ -394,7 +398,7 @@ function buildImportTable(
 ): Map<string, ImportEntry> {
   const table = new Map<string, ImportEntry>();
 
-  for (const child of namedChildren(rootNode)) {
+  const process = (child: SyntaxNode): void => {
     if (child.type === 'import_statement') {
       for (const importedNode of namedChildren(child)) {
         if (importedNode.type === 'dotted_name') {
@@ -415,7 +419,7 @@ function buildImportTable(
       }
     } else if (child.type === 'import_from_statement') {
       const moduleNameNode = child.childForFieldName('module_name');
-      if (!moduleNameNode) continue;
+      if (!moduleNameNode) return;
 
       let moduleCandidates: string[];
       if (moduleNameNode.type === 'relative_import') {
@@ -436,9 +440,32 @@ function buildImportTable(
         }
       }
     }
+  };
+
+  for (const child of namedChildren(rootNode)) {
+    process(child);
+    // #1: type-only imports live under `if TYPE_CHECKING:` (paired with
+    // `from __future__ import annotations`, the dominant idiom for annotation
+    // imports). Read them so annotation types resolve; they only name classes,
+    // never add a runtime call edge on their own.
+    if (child.type === 'if_statement' && isTypeCheckingCond(child.childForFieldName('condition'))) {
+      const block = child.childForFieldName('consequence');
+      if (block) for (const stmt of namedChildren(block)) process(stmt);
+    }
   }
 
   return table;
+}
+
+/** `TYPE_CHECKING` or `<mod>.TYPE_CHECKING` — the guard whose block holds
+ *  type-only imports. */
+function isTypeCheckingCond(cond: SyntaxNode | null): boolean {
+  if (!cond) return false;
+  if (cond.type === 'identifier') return cond.text === 'TYPE_CHECKING';
+  if (cond.type === 'attribute') {
+    return cond.childForFieldName('attribute')?.text === 'TYPE_CHECKING';
+  }
+  return false;
 }
 
 function extractImportedNames(
@@ -528,6 +555,7 @@ function visitRefs(
   enclosingClass: string | null,
   localTypes: Map<string, LocalType>,
   classBases: Map<string, LocalType[]>,
+  selfAttrTypes: Map<string, Map<string, LocalType>>,
   depth = 0
 ): void {
   // PY-H2: bail out before the JS call stack overflows on deeply nested ASTs.
@@ -543,7 +571,8 @@ function visitRefs(
         relPath,
         enclosingClass,
         localTypes,
-        classBases
+        classBases,
+        selfAttrTypes
       );
       if (info) {
         const rangeId = emitter.emitRange(funcNode);
@@ -572,16 +601,18 @@ function visitRefs(
       nextClass,
       localTypes,
       classBases,
+      selfAttrTypes,
       depth + 1
     );
   }
 }
 
 /**
- * Scan a file for `var = SomeClass(...)` assignments and record `var`'s class
- * type when `SomeClass` resolves to a first-party class (same file or a direct
- * import). File-scoped and last-write-wins — sufficient for the common case
- * without full flow analysis.
+ * Scan a file for `var: SomeClass = ...` annotations and `var = SomeClass(...)`
+ * constructor assignments, recording `var`'s class type when `SomeClass`
+ * resolves to a first-party class (same file or a direct import). File-scoped
+ * and last-write-wins — sufficient for the common case without full flow
+ * analysis.
  */
 function buildLocalTypes(
   rootNode: SyntaxNode,
@@ -594,12 +625,26 @@ function buildLocalTypes(
     if (depth >= MAX_AST_DEPTH) return;
     if (node.type === 'assignment') {
       const left = node.childForFieldName('left');
-      const right = node.childForFieldName('right');
-      if (left?.type === 'identifier' && right?.type === 'call') {
-        const fn = right.childForFieldName('function');
-        if (fn?.type === 'identifier') {
-          const cls = resolveClassName(fn.text, importTable, defMap, relPath);
-          if (cls) types.set(left.text, cls);
+      if (left?.type === 'identifier') {
+        // `x: App = ...` — an explicit annotation wins over any RHS.
+        const annotated = typeAnnotationClass(
+          node.childForFieldName('type'),
+          importTable,
+          defMap,
+          relPath
+        );
+        if (annotated) {
+          types.set(left.text, annotated);
+        } else {
+          // `x = SomeClass()` — infer from a first-party constructor call.
+          const right = node.childForFieldName('right');
+          if (right?.type === 'call') {
+            const fn = right.childForFieldName('function');
+            if (fn?.type === 'identifier') {
+              const cls = resolveClassName(fn.text, importTable, defMap, relPath);
+              if (cls) types.set(left.text, cls);
+            }
+          }
         }
       }
     }
@@ -627,6 +672,135 @@ function resolveClassName(
   return undefined;
 }
 
+/**
+ * A `type` annotation node that is a single bare identifier naming a first-party
+ * class → its LocalType. Generics, unions, dotted and builtin names deliberately
+ * return undefined (precision-first).
+ */
+function typeAnnotationClass(
+  typeNode: SyntaxNode | null,
+  importTable: Map<string, ImportEntry>,
+  defMap: DefMap,
+  relPath: string
+): LocalType | undefined {
+  if (!typeNode || typeNode.type !== 'type') return undefined;
+  const kids = namedChildren(typeNode);
+  if (kids.length !== 1 || kids[0]!.type !== 'identifier') return undefined;
+  return resolveClassName(kids[0]!.text, importTable, defMap, relPath);
+}
+
+/** Annotated parameters of a function: param name → first-party class type. */
+function paramTypes(
+  fn: SyntaxNode,
+  importTable: Map<string, ImportEntry>,
+  defMap: DefMap,
+  relPath: string
+): Map<string, LocalType> {
+  const out = new Map<string, LocalType>();
+  const params = fn.childForFieldName('parameters');
+  if (!params) return out;
+  for (const p of namedChildren(params)) {
+    if (p.type !== 'typed_parameter') continue;
+    const nameNode = namedChildren(p).find((c) => c.type === 'identifier');
+    if (!nameNode) continue;
+    const t = typeAnnotationClass(p.childForFieldName('type'), importTable, defMap, relPath);
+    if (t) out.set(nameNode.text, t);
+  }
+  return out;
+}
+
+/**
+ * Walk a method body for `self.<attr>` assignments and record the attribute's
+ * class type from either an inline annotation (`self.attr: App = ...`) or an
+ * annotated parameter (`self.attr = app` where `app: App`). Last write wins.
+ */
+function collectSelfAssigns(
+  node: SyntaxNode,
+  params: Map<string, LocalType>,
+  typeOf: (t: SyntaxNode | null) => LocalType | undefined,
+  attrs: Map<string, LocalType>,
+  depth = 0
+): void {
+  if (depth >= MAX_AST_DEPTH) return;
+  if (node.type === 'assignment') {
+    const left = node.childForFieldName('left');
+    if (left?.type === 'attribute') {
+      const obj = left.childForFieldName('object');
+      const attr = left.childForFieldName('attribute');
+      if (obj?.type === 'identifier' && obj.text === 'self' && attr?.type === 'identifier') {
+        const annotated = typeOf(node.childForFieldName('type'));
+        if (annotated) {
+          attrs.set(attr.text, annotated);
+        } else {
+          const right = node.childForFieldName('right');
+          if (right?.type === 'identifier') {
+            const pt = params.get(right.text);
+            if (pt) attrs.set(attr.text, pt);
+          }
+        }
+      }
+    }
+  }
+  for (const child of namedChildren(node)) {
+    collectSelfAssigns(child, params, typeOf, attrs, depth + 1);
+  }
+}
+
+/**
+ * Per-class map of `self.<attr>` → the attribute's class type, from EXPLICIT
+ * annotations only (precision-first). Sources, each resolved to a first-party
+ * class via resolveClassName:
+ *   - class-body field annotation:  `attr: App` / `attr: App = ...`
+ *   - annotated self-assignment:    `self.attr: App = ...`
+ *   - self-assignment from a param: `def __init__(self, app: App): self.attr = app`
+ */
+function buildSelfAttrTypes(
+  rootNode: SyntaxNode,
+  importTable: Map<string, ImportEntry>,
+  defMap: DefMap,
+  relPath: string
+): Map<string, Map<string, LocalType>> {
+  const perClass = new Map<string, Map<string, LocalType>>();
+  const typeOf = (t: SyntaxNode | null): LocalType | undefined =>
+    typeAnnotationClass(t, importTable, defMap, relPath);
+
+  for (const top of namedChildren(rootNode)) {
+    const cls = top.type === 'decorated_definition' ? top.lastNamedChild : top;
+    if (cls?.type !== 'class_definition') continue;
+    const className = cls.childForFieldName('name')?.text;
+    const body = cls.childForFieldName('body');
+    if (!className || !body) continue;
+
+    const attrs = perClass.get(className) ?? new Map<string, LocalType>();
+
+    for (const stmt of namedChildren(body)) {
+      // class-body field annotation: `attr: App [= ...]`
+      if (stmt.type === 'expression_statement') {
+        const inner = stmt.firstNamedChild;
+        if (inner?.type === 'assignment') {
+          const left = inner.childForFieldName('left');
+          if (left?.type === 'identifier') {
+            const t = typeOf(inner.childForFieldName('type'));
+            if (t) attrs.set(left.text, t);
+          }
+        }
+        continue;
+      }
+
+      // method bodies: `self.attr: App = ...` and `self.attr = <annotated param>`
+      const fn = stmt.type === 'decorated_definition' ? stmt.lastNamedChild : stmt;
+      if (fn?.type !== 'function_definition') continue;
+      const fnBody = fn.childForFieldName('body');
+      if (!fnBody) continue;
+      collectSelfAssigns(fnBody, paramTypes(fn, importTable, defMap, relPath), typeOf, attrs);
+    }
+
+    if (attrs.size > 0) perClass.set(className, attrs);
+  }
+
+  return perClass;
+}
+
 function resolveCallTarget(
   funcNode: SyntaxNode,
   importTable: Map<string, ImportEntry>,
@@ -634,7 +808,8 @@ function resolveCallTarget(
   relPath: string,
   enclosingClass: string | null,
   localTypes: Map<string, LocalType>,
-  classBases: Map<string, LocalType[]>
+  classBases: Map<string, LocalType[]>,
+  selfAttrTypes: Map<string, Map<string, LocalType>>
 ): SymbolInfo | undefined {
   if (funcNode.type === 'identifier') {
     // foo() — simple direct call: look up the name in the import table.
@@ -657,6 +832,24 @@ function resolveCallTarget(
     const objNode = funcNode.childForFieldName('object');
     const attrNode = funcNode.childForFieldName('attribute');
     if (!objNode || !attrNode) return undefined;
+
+    // #1: `self.<attr>.<method>()` resolves via the attribute's annotated class
+    // type (buildSelfAttrTypes). Any other chained form (a.b.c(), foo().bar())
+    // stays unresolved — a wrong edge is worse than a missing one.
+    if (objNode.type === 'attribute') {
+      if (!enclosingClass) return undefined;
+      const innerObj = objNode.childForFieldName('object');
+      const innerAttr = objNode.childForFieldName('attribute');
+      if (
+        innerObj?.type === 'identifier' &&
+        innerObj.text === 'self' &&
+        innerAttr?.type === 'identifier'
+      ) {
+        const t = selfAttrTypes.get(enclosingClass)?.get(innerAttr.text);
+        if (t) return lookupMethod(t, attrNode.text, defMap, classBases);
+      }
+      return undefined;
+    }
 
     // Only handle simple identifier objects (not chained calls like a.b.c()).
     if (objNode.type !== 'identifier') return undefined;
