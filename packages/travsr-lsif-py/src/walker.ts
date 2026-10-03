@@ -608,10 +608,11 @@ function visitRefs(
 }
 
 /**
- * Scan a file for `var = SomeClass(...)` assignments and record `var`'s class
- * type when `SomeClass` resolves to a first-party class (same file or a direct
- * import). File-scoped and last-write-wins — sufficient for the common case
- * without full flow analysis.
+ * Scan a file for `var: SomeClass = ...` annotations and `var = SomeClass(...)`
+ * constructor assignments, recording `var`'s class type when `SomeClass`
+ * resolves to a first-party class (same file or a direct import). File-scoped
+ * and last-write-wins — sufficient for the common case without full flow
+ * analysis.
  */
 function buildLocalTypes(
   rootNode: SyntaxNode,
@@ -624,12 +625,26 @@ function buildLocalTypes(
     if (depth >= MAX_AST_DEPTH) return;
     if (node.type === 'assignment') {
       const left = node.childForFieldName('left');
-      const right = node.childForFieldName('right');
-      if (left?.type === 'identifier' && right?.type === 'call') {
-        const fn = right.childForFieldName('function');
-        if (fn?.type === 'identifier') {
-          const cls = resolveClassName(fn.text, importTable, defMap, relPath);
-          if (cls) types.set(left.text, cls);
+      if (left?.type === 'identifier') {
+        // `x: App = ...` — an explicit annotation wins over any RHS.
+        const annotated = typeAnnotationClass(
+          node.childForFieldName('type'),
+          importTable,
+          defMap,
+          relPath
+        );
+        if (annotated) {
+          types.set(left.text, annotated);
+        } else {
+          // `x = SomeClass()` — infer from a first-party constructor call.
+          const right = node.childForFieldName('right');
+          if (right?.type === 'call') {
+            const fn = right.childForFieldName('function');
+            if (fn?.type === 'identifier') {
+              const cls = resolveClassName(fn.text, importTable, defMap, relPath);
+              if (cls) types.set(left.text, cls);
+            }
+          }
         }
       }
     }

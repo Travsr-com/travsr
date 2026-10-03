@@ -505,6 +505,20 @@ test('self.attr.method() stays unresolved without a first-party annotation', asy
   assert.deepStrictEqual(refs, []);
 });
 
+test('a method call on a type-annotated local resolves', async () => {
+  // `local: App = a` — the annotation names the type even though the RHS is
+  // neither a constructor call nor itself resolvable.
+  const refs = await refsFrom(
+    {
+      'app.py':
+        'class App:\n    def add_url_rule(self, rule):\n        return rule\n\n\n' +
+        'def build(a):\n    local: App = a\n    return local.add_url_rule("/")\n',
+    },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, [{ path: 'app.py', signature: 'method:App.add_url_rule' }]);
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function parseAll(stdout: string): Record<string, unknown>[] {
