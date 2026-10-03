@@ -8,6 +8,13 @@
 //! another process is the wrong build and replacing it, which nothing short of
 //! running it can show. `TRAVSR_BUILD_VERSION_OVERRIDE` lets the first daemon
 //! claim an old version without a second, separately versioned build.
+//!
+//! The observable is `.travsr/daemon-restart.lock`: the restart path creates it
+//! (and only it) when, and only when, it detects skew, so its presence after a
+//! command distinguishes "restarted" from "left alone" on every platform. The
+//! daemon's own PID file (`daemon.lock`) is deliberately not read here: the
+//! daemon holds it exclusively locked for its whole life, so reading it fails on
+//! Windows by design (see `daemon_lock_pid`).
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -36,25 +43,27 @@ impl Drop for StopDaemon<'_> {
     }
 }
 
-/// The PID the running daemon recorded in its lock file. `None` during the brief
-/// open→write window, so callers poll.
-fn read_pid(repo: &Path) -> Option<u32> {
-    std::fs::read_to_string(repo.join(".travsr").join("daemon.lock"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+/// The breadcrumb the version-skew restart leaves: `try_lock_restart` creates it
+/// the moment skew is detected, and nothing else touches it.
+fn restart_lock(repo: &Path) -> std::path::PathBuf {
+    repo.join(".travsr").join("daemon-restart.lock")
 }
 
-fn wait_for_pid(repo: &Path, deadline: Instant) -> Option<u32> {
+/// Poll `daemon status` until it reports the daemon running, or time out.
+fn wait_running(repo: &Path, lang_toml: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Some(p) = read_pid(repo) {
-            return Some(p);
+        let out = travsr(repo, lang_toml)
+            .args(["daemon", "status"])
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&out.stdout).contains("running") {
+            return true;
         }
         if Instant::now() > deadline {
-            return None;
+            return false;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -108,36 +117,38 @@ fn a_skewed_daemon_is_restarted_on_the_next_command() {
         .output()
         .unwrap();
     assert!(start.status.success(), "{start:?}");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let pid_old = wait_for_pid(&repo, deadline).expect("the stale daemon must record a PID");
+    assert!(wait_running(&repo, &lang_toml), "the stale daemon must come up");
+    assert!(
+        !restart_lock(&repo).exists(),
+        "nothing should have restarted anything yet"
+    );
 
     // Any daemon-routed command, run by THIS binary (no override), detects the
     // skew and restarts the daemon before answering.
-    let status = travsr(&repo, &lang_toml).args(["status"]).output().unwrap();
+    let status = travsr(&repo, &lang_toml)
+        .args(["status"])
+        .output()
+        .unwrap();
     assert!(status.status.success(), "{status:?}");
-
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let pid_new = loop {
-        if let Some(p) = read_pid(&repo) {
-            if p != pid_old {
-                break p;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the stale daemon (pid {pid_old}) was never replaced"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    assert_ne!(pid_new, pid_old, "a skewed daemon must be restarted");
+    assert!(
+        restart_lock(&repo).exists(),
+        "a skewed daemon must trigger the restart path"
+    );
+    assert!(
+        wait_running(&repo, &lang_toml),
+        "a daemon must be running again after the restart"
+    );
 
     // The replacement is this binary's version, so a second command leaves it
-    // alone — no restart loop.
-    let status2 = travsr(&repo, &lang_toml).args(["status"]).output().unwrap();
+    // alone: clear the breadcrumb, run again, and it must not come back.
+    std::fs::remove_file(restart_lock(&repo)).unwrap();
+    let status2 = travsr(&repo, &lang_toml)
+        .args(["status"])
+        .output()
+        .unwrap();
     assert!(status2.status.success(), "{status2:?}");
-    assert_eq!(
-        read_pid(&repo),
-        Some(pid_new),
+    assert!(
+        !restart_lock(&repo).exists(),
         "a current-version daemon must not be restarted again"
     );
 }
@@ -154,15 +165,20 @@ fn a_current_daemon_is_left_running() {
         .output()
         .unwrap();
     assert!(start.status.success(), "{start:?}");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let pid = wait_for_pid(&repo, deadline).expect("the daemon must record a PID");
+    assert!(wait_running(&repo, &lang_toml), "the daemon must come up");
 
     // A routed command must not disturb a matching daemon.
-    let status = travsr(&repo, &lang_toml).args(["status"]).output().unwrap();
+    let status = travsr(&repo, &lang_toml)
+        .args(["status"])
+        .output()
+        .unwrap();
     assert!(status.status.success(), "{status:?}");
-    assert_eq!(
-        read_pid(&repo),
-        Some(pid),
+    assert!(
+        !restart_lock(&repo).exists(),
         "a matching daemon must be reused, not restarted"
+    );
+    assert!(
+        wait_running(&repo, &lang_toml),
+        "the daemon must still be running"
     );
 }
