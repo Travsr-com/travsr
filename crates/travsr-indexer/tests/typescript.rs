@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use travsr_core::EdgeKind;
-use travsr_indexer::{hash_file, link_imports, link_imports_aliased, Indexer};
+use travsr_indexer::{
+    hash_file, link_imports, link_imports_aliased, parse_tsconfig_path_aliases, Indexer,
+};
 
 fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -346,6 +348,57 @@ fn link_imports_skips_bare_specifiers_without_aliases() {
         edges.is_empty(),
         "no alias table: @/... must not resolve: {edges:?}"
     );
+}
+
+/// `parse_tsconfig_path_aliases` reads `compilerOptions.paths` wildcard entries
+/// and resolves each target against `baseUrl` (default `"."`). Only the
+/// single-target wildcard form is handled; non-wildcard and missing-config
+/// cases yield no aliases. Locks the contract the daemon threads into
+/// `link_imports_aliased`.
+#[test]
+fn parse_tsconfig_path_aliases_reads_wildcard_paths() {
+    fn aliases_for(tsconfig: &str) -> Vec<(String, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), tsconfig).unwrap();
+        parse_tsconfig_path_aliases(dir.path())
+    }
+
+    // The create-next-app default: "@/*" -> ["./src/*"] with baseUrl ".".
+    assert_eq!(
+        aliases_for(r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["./src/*"]}}}"#),
+        vec![("@/".to_string(), "src/".to_string())],
+    );
+
+    // baseUrl defaults to "." when absent.
+    assert_eq!(
+        aliases_for(r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#),
+        vec![("@/".to_string(), "src/".to_string())],
+    );
+
+    // A non-"." baseUrl prefixes the target: "@/*" -> ["*"], baseUrl "src".
+    assert_eq!(
+        aliases_for(r#"{"compilerOptions":{"baseUrl":"src","paths":{"@/*":["*"]}}}"#),
+        vec![("@/".to_string(), "src/".to_string())],
+    );
+
+    // Non-wildcard entries are skipped; nothing to resolve by prefix.
+    assert!(aliases_for(r#"{"compilerOptions":{"paths":{"@/foo":["./src/foo.ts"]}}}"#).is_empty());
+
+    // No `paths`, and a comment-bearing (JSONC) config, both yield nothing. The
+    // JSONC case matches the strict serde_json parsing the rest of the indexer
+    // uses for tsconfig; aliasing is best-effort and empty is the safe default.
+    assert!(aliases_for(r#"{"compilerOptions":{"strict":true}}"#).is_empty());
+    assert!(aliases_for(
+        "{\n  // comment\n  \"compilerOptions\":{\"paths\":{\"@/*\":[\"./src/*\"]}}\n}"
+    )
+    .is_empty());
+}
+
+/// A missing tsconfig.json yields no aliases rather than erroring.
+#[test]
+fn parse_tsconfig_path_aliases_empty_without_tsconfig() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(parse_tsconfig_path_aliases(dir.path()).is_empty());
 }
 
 #[test]
