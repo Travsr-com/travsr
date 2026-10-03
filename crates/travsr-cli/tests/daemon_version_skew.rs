@@ -117,7 +117,10 @@ fn a_skewed_daemon_is_restarted_on_the_next_command() {
         .output()
         .unwrap();
     assert!(start.status.success(), "{start:?}");
-    assert!(wait_running(&repo, &lang_toml), "the stale daemon must come up");
+    assert!(
+        wait_running(&repo, &lang_toml),
+        "the stale daemon must come up"
+    );
     assert!(
         !restart_lock(&repo).exists(),
         "nothing should have restarted anything yet"
@@ -125,10 +128,7 @@ fn a_skewed_daemon_is_restarted_on_the_next_command() {
 
     // Any daemon-routed command, run by THIS binary (no override), detects the
     // skew and restarts the daemon before answering.
-    let status = travsr(&repo, &lang_toml)
-        .args(["status"])
-        .output()
-        .unwrap();
+    let status = travsr(&repo, &lang_toml).args(["status"]).output().unwrap();
     assert!(status.status.success(), "{status:?}");
     assert!(
         restart_lock(&repo).exists(),
@@ -142,10 +142,7 @@ fn a_skewed_daemon_is_restarted_on_the_next_command() {
     // The replacement is this binary's version, so a second command leaves it
     // alone: clear the breadcrumb, run again, and it must not come back.
     std::fs::remove_file(restart_lock(&repo)).unwrap();
-    let status2 = travsr(&repo, &lang_toml)
-        .args(["status"])
-        .output()
-        .unwrap();
+    let status2 = travsr(&repo, &lang_toml).args(["status"]).output().unwrap();
     assert!(status2.status.success(), "{status2:?}");
     assert!(
         !restart_lock(&repo).exists(),
@@ -168,10 +165,7 @@ fn a_current_daemon_is_left_running() {
     assert!(wait_running(&repo, &lang_toml), "the daemon must come up");
 
     // A routed command must not disturb a matching daemon.
-    let status = travsr(&repo, &lang_toml)
-        .args(["status"])
-        .output()
-        .unwrap();
+    let status = travsr(&repo, &lang_toml).args(["status"]).output().unwrap();
     assert!(status.status.success(), "{status:?}");
     assert!(
         !restart_lock(&repo).exists(),
