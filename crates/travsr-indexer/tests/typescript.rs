@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use travsr_core::EdgeKind;
-use travsr_indexer::{hash_file, link_imports, Indexer};
+use travsr_indexer::{hash_file, link_imports, link_imports_aliased, Indexer};
 
 fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -296,6 +296,56 @@ fn link_imports_empty_for_file_with_no_imports() {
     let out = indexer().parse_file(&fixture("empty.ts")).unwrap();
     let edges = link_imports(&out.nodes, "fixtures/ts-small/empty.ts", "");
     assert!(edges.is_empty());
+}
+
+/// A tsconfig `paths` alias such as `"@/*": ["./src/*"]` resolves against the
+/// repo root, not the importer's directory. Before this, every `@/...` import
+/// was skipped, so get_dependencies dead-ended at the alias boundary.
+#[test]
+fn link_imports_aliased_resolves_tsconfig_path_alias() {
+    let importer = "src/app/page.tsx";
+    let aliases = [("@/".to_string(), "src/".to_string())];
+    let edges = link_imports_aliased(
+        &[travsr_analysis::emit::import_node(
+            "",
+            importer,
+            "@/lib/auth",
+        )],
+        importer,
+        "",
+        &aliases,
+    );
+    let want = travsr_analysis::emit::file_node("", "src/lib/auth.ts").id;
+    assert!(
+        edges.iter().any(|e| e.dst == want),
+        "@/lib/auth should resolve to src/lib/auth.ts: {edges:?}"
+    );
+    // Resolves against the repo root, never relative to the importer's dir.
+    let wrong = travsr_analysis::emit::file_node("", "src/app/lib/auth.ts").id;
+    assert!(
+        !edges.iter().any(|e| e.dst == wrong),
+        "an alias target must not be importer-relative"
+    );
+}
+
+/// With no alias table (the `link_imports` wrapper), a non-relative specifier
+/// is still skipped: only `./` and `../` resolve.
+#[test]
+fn link_imports_skips_bare_specifiers_without_aliases() {
+    let importer = "src/app/page.tsx";
+    let edges = link_imports(
+        &[travsr_analysis::emit::import_node(
+            "",
+            importer,
+            "@/lib/auth",
+        )],
+        importer,
+        "",
+    );
+    assert!(
+        edges.is_empty(),
+        "no alias table: @/... must not resolve: {edges:?}"
+    );
 }
 
 #[test]
