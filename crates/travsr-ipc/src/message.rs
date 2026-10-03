@@ -323,6 +323,13 @@ pub struct ControlResponse {
     /// request was a successful [`ControlMessage::Query`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+    /// The daemon's build version (`travsr_daemon::build_version`), set on the
+    /// [`ControlMessage::Status`] reply so a client can detect that the running
+    /// daemon was built from a different binary than itself. `None` on every
+    /// other op, and on a reply from a daemon that predates this field — which
+    /// a client reads as "older than me", the case this exists to catch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
 }
 
 impl ControlResponse {
@@ -332,6 +339,7 @@ impl ControlResponse {
             message: message.into(),
             protocol: None,
             result: None,
+            daemon_version: None,
         }
     }
 
@@ -341,6 +349,7 @@ impl ControlResponse {
             message: Some(message.into()),
             protocol: None,
             result: None,
+            daemon_version: None,
         }
     }
 
@@ -351,6 +360,7 @@ impl ControlResponse {
             message: None,
             protocol: Some(QUERY_PROTOCOL_VERSION),
             result: Some(result),
+            daemon_version: None,
         }
     }
 }
@@ -376,6 +386,30 @@ mod tests {
             }
             other => panic!("expected Query, got {other:?}"),
         }
+    }
+
+    // A Status reply from a daemon built before `daemon_version` existed omits
+    // the field, and must deserialize to `None` — which the client reads as
+    // "older than me, restart it". A reply that carries it round-trips.
+    #[test]
+    fn control_response_daemon_version_is_backward_compatible() {
+        // Old daemon: no `daemon_version` key on the wire.
+        let old = r#"{"ok":true,"message":"nodes: 1 | edges: 0"}"#;
+        let parsed: ControlResponse =
+            serde_json::from_str(old).expect("a pre-field reply must still parse");
+        assert_eq!(parsed.daemon_version, None);
+
+        // Current daemon: the field is present and round-trips.
+        let mut resp = ControlResponse::ok(Some("nodes: 1 | edges: 0".to_string()));
+        resp.daemon_version = Some("1.2.3".to_string());
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains(r#""daemon_version":"1.2.3""#), "{line}");
+        let back: ControlResponse = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.daemon_version.as_deref(), Some("1.2.3"));
+
+        // A non-Status reply never carries it, so it is not serialized.
+        let bare = serde_json::to_string(&ControlResponse::ok(None)).unwrap();
+        assert!(!bare.contains("daemon_version"), "{bare}");
     }
 
     // #688: the extension hand-builds this line in TypeScript

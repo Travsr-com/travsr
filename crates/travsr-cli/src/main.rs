@@ -630,7 +630,15 @@ async fn async_main() {
     // reports the same string as `travsr --version` instead of its own workspace
     // crate version (0.7.0). The background daemon is a re-exec of this same
     // binary, so it runs this too.
-    travsr_daemon::set_build_version(env!("CARGO_PKG_VERSION"));
+    //
+    // `TRAVSR_BUILD_VERSION_OVERRIDE` lets a test spawn a daemon that reports a
+    // different version than this binary, so the version-skew auto-restart can be
+    // exercised without two separately versioned builds. Nothing sets it in
+    // production (the daemon is a re-exec that does not carry it forward).
+    match std::env::var("TRAVSR_BUILD_VERSION_OVERRIDE") {
+        Ok(v) if !v.is_empty() => travsr_daemon::set_build_version(&v),
+        _ => travsr_daemon::set_build_version(env!("CARGO_PKG_VERSION")),
+    }
 
     // Parse CLI args BEFORE initialising any subsystems.
     // Clap exits immediately for --version and --help via process::exit, so
@@ -1435,9 +1443,16 @@ async fn run(cli: Cli) -> Result<()> {
                     {
                         let root = root.to_path_buf();
                         std::thread::spawn(move || {
-                            if daemon_client::lazy_daemon_wanted(&root) {
-                                if let Ok(exe) = std::env::current_exe() {
+                            if let Ok(exe) = std::env::current_exe() {
+                                if daemon_client::lazy_daemon_wanted(&root) {
                                     daemon_client::spawn_background_daemon(&root, &exe, false);
+                                } else {
+                                    // A daemon is already running (it holds the
+                                    // lock, so lazy start is skipped). If it was
+                                    // built from an older binary than this one,
+                                    // restart it so the index it keeps fresh is
+                                    // maintained by current code.
+                                    daemon_client::restart_if_version_skewed(&root, &exe);
                                 }
                             }
                         });

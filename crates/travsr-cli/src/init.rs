@@ -175,6 +175,11 @@ pub fn run(
         // Race-free: spawns only if no daemon holds the lock, so a re-`init` over
         // an already-running daemon never forks a doomed child.
         let exe = std::env::current_exe().context("finding current exe path")?;
+        // A re-`init` after a binary upgrade is a natural moment to retire a
+        // daemon still running the old image; if its version differs from ours,
+        // restart it before the spawn below (which would otherwise just report
+        // the stale daemon as already running).
+        crate::daemon_client::restart_if_version_skewed(&repo_root, &exe);
         match crate::daemon_client::spawn_background_daemon(&repo_root, &exe, false) {
             SpawnOutcome::AlreadyRunning => "running",
             SpawnOutcome::Started | SpawnOutcome::Starting => "started",

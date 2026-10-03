@@ -16263,7 +16263,13 @@ fn handle_control_message(
                  semantic: {phase_b_activity}\n\
                  {embed_line}"
             );
-            (ControlResponse::ok(Some(msg)), false)
+            // Advertise the version this daemon was built from so a newer client
+            // can notice the skew and restart it (the daemon runs the binary
+            // image it was spawned with for its whole life; installing a new
+            // binary does not touch it).
+            let mut resp = ControlResponse::ok(Some(msg));
+            resp.daemon_version = Some(build_version().to_string());
+            (resp, false)
         }
         Ok(ControlMessage::Shutdown) => (ControlResponse::ok(None), true),
         // WS3 (#420): pause auto-reindex and gracefully cancel any in-flight run.

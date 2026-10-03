@@ -188,6 +188,101 @@ pub fn send_daemon_command(
     }
 }
 
+/// How long to wait for a stale daemon to release the repo lock after it is
+/// asked to stop, before giving up and leaving it to the caller's fallback.
+/// Matches `daemon restart`'s own stop budget (`STOP_EXIT_TIMEOUT`).
+const RESTART_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// This binary's build version — the one a daemon it spawns will report via
+/// [`travsr_daemon::build_version`] on a Status reply.
+fn our_build_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Whether a daemon advertising `daemon_version` (as read from a Status reply,
+/// where `None` means a daemon built before that field existed) is a different
+/// build than `our_version`. An exact match is the only non-skewed case; `None`
+/// is treated as skewed, because a daemon that old predates this binary.
+fn version_is_skewed(daemon_version: Option<&str>, our_version: &str) -> bool {
+    daemon_version != Some(our_version)
+}
+
+/// Acquire the single-flight restart lock, or `None` when another process
+/// already holds it (i.e. is mid-restart). The returned handle must be kept for
+/// the whole restart; dropping it releases the lock. Self-healing: the OS drops
+/// an flock when its holder dies, so a crashed restarter never wedges this.
+fn try_lock_restart(repo_root: &Path) -> Option<std::fs::File> {
+    use fs2::FileExt as _;
+    let path = repo_root.join(".travsr").join("daemon-restart.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // used only as an flock handle; its bytes are irrelevant
+        .open(&path)
+        .ok()?;
+    file.try_lock_exclusive().ok()?;
+    Some(file)
+}
+
+/// Restart the running daemon if it was built from a different binary than this
+/// one, so queries and background reindexing are served by current code.
+///
+/// The daemon runs the image it was spawned with for its entire life; installing
+/// a new binary (npm, `travsr install`) leaves the old daemon serving old code
+/// until someone restarts it. This closes that gap automatically, at the point
+/// any entry first talks to the daemon.
+///
+/// Best-effort throughout: a daemon it cannot reach, or a restart it cannot
+/// complete, leaves the old daemon running — a stale-but-live daemon beats none.
+/// Reuses the exact stop-then-respawn sequence `daemon restart` runs.
+pub(crate) fn restart_if_version_skewed(repo_root: &Path, exe: &Path) {
+    // Only a running daemon can be stale; with none holding the lock the
+    // caller's own spawn path brings up a current one.
+    if !daemon_lock_held(repo_root) {
+        return;
+    }
+    let Ok(resp) = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status) else {
+        return; // transiently unreachable (starting, busy pipe) — leave it be
+    };
+    if !version_is_skewed(resp.daemon_version.as_deref(), our_build_version()) {
+        return;
+    }
+    // Single-flight: only the lock holder performs the swap, so two concurrent
+    // clients (an editor's `mcp` and a terminal query) never both send Shutdown
+    // — the second would otherwise kill the replacement the first just started.
+    let Some(_restart_lock) = try_lock_restart(repo_root) else {
+        return;
+    };
+    // Re-check under the lock: another client may have already restarted it in
+    // the window between our Status read above and taking this lock.
+    if let Ok(r) = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status) {
+        if !version_is_skewed(r.daemon_version.as_deref(), our_build_version()) {
+            return;
+        }
+    }
+    // Stop the stale daemon, then wait for it to release the repo lock (as
+    // `daemon restart` does) so the spawn never races its shutdown.
+    let _ = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Shutdown);
+    let cutoff = std::time::Instant::now() + RESTART_STOP_BUDGET;
+    while daemon_lock_held(repo_root) && std::time::Instant::now() < cutoff {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = spawn_background_daemon(repo_root, exe, false);
+}
+
+/// Run [`restart_if_version_skewed`] at most once per process, on the first
+/// daemon-routed query. Keeps a multi-query command or a long-running `travsr
+/// mcp` from re-checking on every call (after one restart the daemon matches,
+/// so the check is a no-op anyway, but the Status round-trip is not free).
+fn ensure_daemon_version_current(repo_root: &Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Ok(exe) = std::env::current_exe() {
+            restart_if_version_skewed(repo_root, &exe);
+        }
+    });
+}
+
 /// Route one query to a running daemon. `None` means "use the direct path" —
 /// no daemon listening, version skew (old/new daemon), or a payload the CLI
 /// cannot parse. Never errors: daemon routing is best-effort by design.
@@ -196,6 +291,10 @@ pub fn try_query<T: DeserializeOwned>(
     tool: &str,
     args: serde_json::Value,
 ) -> Option<T> {
+    // Before serving from it, make sure the running daemon is this binary's
+    // version; a stale one is transparently restarted so the answer comes from
+    // current code rather than the image it was spawned with.
+    ensure_daemon_version_current(repo_root);
     let msg = travsr_ipc::ControlMessage::Query {
         protocol: travsr_ipc::QUERY_PROTOCOL_VERSION,
         tool: tool.to_string(),
@@ -338,6 +437,38 @@ pub fn warn_if_cross_checkout(db_path: &Path, reads_call_edges: bool) -> bool {
 #[cfg(test)]
 mod lock_tests {
     use super::*;
+
+    /// The skew decision is the whole policy: a matching version is the only
+    /// case left alone; a different version restarts, and a `None` (a daemon
+    /// older than this field) counts as different, so upgrading *to* the first
+    /// version that has this feature still auto-restarts the old daemon.
+    #[test]
+    fn version_skew_truth_table() {
+        assert!(!version_is_skewed(Some("1.2.3"), "1.2.3"), "exact match");
+        assert!(version_is_skewed(Some("1.2.2"), "1.2.3"), "older daemon");
+        assert!(version_is_skewed(Some("1.3.0"), "1.2.3"), "newer daemon");
+        assert!(version_is_skewed(None, "1.2.3"), "pre-field daemon");
+    }
+
+    /// Single-flight: while one process holds the restart lock, a second cannot,
+    /// so only one ever sends Shutdown. The lock frees on drop (and, in prod,
+    /// when the holder dies, since it is an flock).
+    #[test]
+    fn restart_lock_is_single_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+
+        let first = try_lock_restart(tmp.path()).expect("first acquire");
+        assert!(
+            try_lock_restart(tmp.path()).is_none(),
+            "a second restarter must be locked out while the first holds it"
+        );
+        drop(first);
+        assert!(
+            try_lock_restart(tmp.path()).is_some(),
+            "the lock must be free once the holder drops it"
+        );
+    }
 
     #[test]
     fn lock_not_held_on_empty_repo() {
