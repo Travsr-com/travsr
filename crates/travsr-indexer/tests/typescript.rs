@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use travsr_core::EdgeKind;
-use travsr_indexer::{hash_file, link_imports, Indexer};
+use travsr_indexer::{
+    hash_file, link_imports, link_imports_aliased, parse_tsconfig_path_aliases, Indexer,
+};
 
 fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -296,6 +298,135 @@ fn link_imports_empty_for_file_with_no_imports() {
     let out = indexer().parse_file(&fixture("empty.ts")).unwrap();
     let edges = link_imports(&out.nodes, "fixtures/ts-small/empty.ts", "");
     assert!(edges.is_empty());
+}
+
+/// A tsconfig `paths` alias such as `"@/*": ["./src/*"]` resolves against the
+/// repo root, not the importer's directory. Before this, every `@/...` import
+/// was skipped, so get_dependencies dead-ended at the alias boundary.
+#[test]
+fn link_imports_aliased_resolves_tsconfig_path_alias() {
+    let importer = "src/app/page.tsx";
+    let aliases = [("@/".to_string(), "src/".to_string())];
+    let edges = link_imports_aliased(
+        &[travsr_analysis::emit::import_node(
+            "",
+            importer,
+            "@/lib/auth",
+        )],
+        importer,
+        "",
+        &aliases,
+    );
+    let want = travsr_analysis::emit::file_node("", "src/lib/auth.ts").id;
+    assert!(
+        edges.iter().any(|e| e.dst == want),
+        "@/lib/auth should resolve to src/lib/auth.ts: {edges:?}"
+    );
+    // Resolves against the repo root, never relative to the importer's dir.
+    let wrong = travsr_analysis::emit::file_node("", "src/app/lib/auth.ts").id;
+    assert!(
+        !edges.iter().any(|e| e.dst == wrong),
+        "an alias target must not be importer-relative"
+    );
+}
+
+/// With no alias table (the `link_imports` wrapper), a non-relative specifier
+/// is still skipped: only `./` and `../` resolve.
+#[test]
+fn link_imports_skips_bare_specifiers_without_aliases() {
+    let importer = "src/app/page.tsx";
+    let edges = link_imports(
+        &[travsr_analysis::emit::import_node(
+            "",
+            importer,
+            "@/lib/auth",
+        )],
+        importer,
+        "",
+    );
+    assert!(
+        edges.is_empty(),
+        "no alias table: @/... must not resolve: {edges:?}"
+    );
+}
+
+/// `parse_tsconfig_path_aliases` reads `compilerOptions.paths` wildcard entries
+/// and resolves each target against `baseUrl` (default `"."`). Only the
+/// single-target wildcard form is handled; non-wildcard and missing-config
+/// cases yield no aliases. Locks the contract the daemon threads into
+/// `link_imports_aliased`.
+#[test]
+fn parse_tsconfig_path_aliases_reads_wildcard_paths() {
+    fn aliases_for(tsconfig: &str) -> Vec<(String, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), tsconfig).unwrap();
+        parse_tsconfig_path_aliases(dir.path())
+    }
+
+    // The create-next-app default: "@/*" -> ["./src/*"] with baseUrl ".".
+    assert_eq!(
+        aliases_for(r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["./src/*"]}}}"#),
+        vec![("@/".to_string(), "src/".to_string())],
+    );
+
+    // baseUrl defaults to "." when absent.
+    assert_eq!(
+        aliases_for(r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#),
+        vec![("@/".to_string(), "src/".to_string())],
+    );
+
+    // A non-"." baseUrl prefixes the target: "@/*" -> ["*"], baseUrl "src".
+    assert_eq!(
+        aliases_for(r#"{"compilerOptions":{"baseUrl":"src","paths":{"@/*":["*"]}}}"#),
+        vec![("@/".to_string(), "src/".to_string())],
+    );
+
+    // Non-wildcard entries are skipped; nothing to resolve by prefix.
+    assert!(aliases_for(r#"{"compilerOptions":{"paths":{"@/foo":["./src/foo.ts"]}}}"#).is_empty());
+
+    // No `paths`, and a comment-bearing (JSONC) config, both yield nothing. The
+    // JSONC case matches the strict serde_json parsing the rest of the indexer
+    // uses for tsconfig; aliasing is best-effort and empty is the safe default.
+    assert!(aliases_for(r#"{"compilerOptions":{"strict":true}}"#).is_empty());
+    assert!(aliases_for(
+        "{\n  // comment\n  \"compilerOptions\":{\"paths\":{\"@/*\":[\"./src/*\"]}}\n}"
+    )
+    .is_empty());
+}
+
+/// A missing tsconfig.json yields no aliases rather than erroring.
+#[test]
+fn parse_tsconfig_path_aliases_empty_without_tsconfig() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(parse_tsconfig_path_aliases(dir.path()).is_empty());
+}
+
+/// A JS-only repo (jsconfig.json, no tsconfig) gets the same alias resolution:
+/// jsconfig.json is the JavaScript convention for the identical schema, and the
+/// create-next-app JS template ships one. tsconfig wins when both are present.
+#[test]
+fn parse_tsconfig_path_aliases_falls_back_to_jsconfig() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("jsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["./src/*"]}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        parse_tsconfig_path_aliases(dir.path()),
+        vec![("@/".to_string(), "src/".to_string())],
+    );
+
+    // tsconfig.json takes precedence over jsconfig.json when both exist.
+    std::fs::write(
+        dir.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"paths":{"~/*":["./app/*"]}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        parse_tsconfig_path_aliases(dir.path()),
+        vec![("~/".to_string(), "app/".to_string())],
+    );
 }
 
 #[test]

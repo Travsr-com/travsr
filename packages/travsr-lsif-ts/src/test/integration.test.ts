@@ -73,6 +73,47 @@ test('dump contains referenceResult vertices (RefCall / RefImports edges)', () =
   );
 });
 
+// ── RefJsx: JSX element usages must be recorded as references ─────────────────
+//
+// <Greeter /> is a usage of the Greeter component, but the TS AST models it as
+// a JsxSelfClosingElement, not a CallExpression, so without a dedicated arm the
+// emitter recorded only the import of a component and never its render sites.
+// find_references / get_callers were then blind on every <Component/>.
+const JSX_TSCONFIG = path.join(__dirname, '../../fixtures/jsx/tsconfig.json');
+
+test('a JSX element usage is emitted as a reference range (RefJsx)', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', JSX_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+
+  // range id -> start line (0-based). In app.tsx the import is on line 0 and
+  // the <Greeter /> render is on line 3.
+  const lineById = new Map<number, number>();
+  for (const v of parseVertices(result.stdout)) {
+    if (v['label'] === 'range') {
+      const start = v['start'] as { line: number } | undefined;
+      if (start) lineById.set(v['id'] as number, start.line);
+    }
+  }
+
+  // Every range a reference item points at.
+  const refLines = new Set<number>();
+  for (const e of parseEdges(result.stdout)) {
+    if (e['label'] === 'item' && e['property'] === 'references') {
+      for (const inV of (e['inVs'] as number[]) ?? []) {
+        const line = lineById.get(inV);
+        if (line !== undefined) refLines.add(line);
+      }
+    }
+  }
+
+  assert.ok(
+    refLines.has(3),
+    `expected a reference range on the <Greeter /> line (0-based 3); got ${JSON.stringify([...refLines])}`
+  );
+});
+
 test('dump contains implementationResult vertices (IsImplementation edges)', () => {
   const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
     encoding: 'utf-8',

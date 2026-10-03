@@ -171,9 +171,47 @@ pub fn phase_b_native_python(
 /// Call this after [`Indexer::parse_file_with_vname`] and persist the
 /// returned edges alongside the parse output.
 pub fn link_imports(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge> {
+    link_imports_aliased(nodes, vname_path, corpus, &[])
+}
+
+/// Like [`link_imports`] but also resolves tsconfig `paths` aliases. `aliases`
+/// is a list of `(prefix, base)` pairs where `prefix` is the alias head with
+/// its trailing slash (e.g. `"@/"`) and `base` is the repo-root-relative
+/// replacement directory with its trailing slash (e.g. `"src/"`). An aliased
+/// specifier such as `@/lib/auth` resolves against the repo root; relative
+/// specifiers resolve against the importer's directory exactly as before.
+///
+/// Aliases come from [`parse_tsconfig_path_aliases`]; passing `&[]` reproduces
+/// the relative-only behaviour of [`link_imports`].
+pub fn link_imports_aliased(
+    nodes: &[Node],
+    vname_path: &str,
+    corpus: &str,
+    aliases: &[(String, String)],
+) -> Vec<Edge> {
     let parent = match std::path::Path::new(vname_path).parent() {
         Some(p) => p,
         None => return Vec::new(),
+    };
+
+    // #610: only `ts`/`tsx` used to be tried, so no JavaScript import ever
+    // resolved — `./animal` from a `.js` file produced candidates for
+    // `animal.ts` and `animal.tsx`, neither of which exists in a JS project.
+    // That broke JS dependency traversal for *both* module styles, not only
+    // CommonJS.
+    //
+    // Candidates are scoped by the importer's own extension rather than
+    // emitting the whole family for everyone: each one is a speculative edge
+    // whose target node may never be created, and `fsck` counts those as
+    // orphans. A TypeScript file still gets `js` too, since `allowJs` interop
+    // is common in real projects. (Loop-invariant: computed once here.)
+    let importer_ext = std::path::Path::new(vname_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let candidates: &[&str] = match importer_ext {
+        "js" | "jsx" | "mjs" | "cjs" => &["js", "jsx", "mjs", "cjs"],
+        _ => &["ts", "tsx", "js"],
     };
 
     let mut edges = Vec::new();
@@ -185,31 +223,17 @@ pub fn link_imports(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge>
         let Some(module) = node.vname.signature.strip_prefix("import:") else {
             continue;
         };
-        if !module.starts_with("./") && !module.starts_with("../") {
+
+        // Resolve to a repo-relative path with no extension. Relative specifiers
+        // (`./x`, `../x`) resolve against the importer's directory; a tsconfig
+        // `paths` alias (`@/x`) resolves against the repo root. Anything else
+        // (bare package imports like `react`) does not point at a project file.
+        let normalized = if module.starts_with("./") || module.starts_with("../") {
+            normalize_vname_path(&parent.join(module))
+        } else if let Some(rewritten) = rewrite_import_alias(module, aliases) {
+            normalize_vname_path(std::path::Path::new(&rewritten))
+        } else {
             continue;
-        }
-
-        let raw = parent.join(module);
-        let normalized = normalize_vname_path(&raw);
-
-        // #610: only `ts`/`tsx` used to be tried, so no JavaScript import ever
-        // resolved — `./animal` from a `.js` file produced candidates for
-        // `animal.ts` and `animal.tsx`, neither of which exists in a JS
-        // project. That broke JS dependency traversal for *both* module styles,
-        // not only CommonJS.
-        //
-        // Candidates are scoped by the importer's own extension rather than
-        // emitting the whole family for everyone: each one is a speculative
-        // edge whose target node may never be created, and `fsck` counts those
-        // as orphans. A TypeScript file still gets `js` too, since `allowJs`
-        // interop is common in real projects.
-        let importer_ext = std::path::Path::new(vname_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let candidates: &[&str] = match importer_ext {
-            "js" | "jsx" | "mjs" | "cjs" => &["js", "jsx", "mjs", "cjs"],
-            _ => &["ts", "tsx", "js"],
         };
 
         for ext in candidates.iter().copied() {
@@ -221,6 +245,74 @@ pub fn link_imports(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge>
     }
 
     edges
+}
+
+/// Rewrite a tsconfig-aliased module specifier to a repo-root-relative path, or
+/// `None` when no alias prefix matches. With `("@/", "src/")`, `@/lib/auth`
+/// becomes `src/lib/auth`. The first matching prefix wins.
+fn rewrite_import_alias(module: &str, aliases: &[(String, String)]) -> Option<String> {
+    for (prefix, base) in aliases {
+        if let Some(rest) = module.strip_prefix(prefix.as_str()) {
+            return Some(format!("{base}{rest}"));
+        }
+    }
+    None
+}
+
+/// Read `{repo_root}/tsconfig.json` (or `jsconfig.json` when no tsconfig is
+/// present) and return its `compilerOptions.paths` wildcard aliases as
+/// `(prefix, base)` pairs, resolved against `baseUrl` (default `"."`). Only the
+/// common single-target wildcard form is handled:
+///
+/// ```text
+/// "paths": { "@/*": ["./src/*"] }   baseUrl "."   ->   ("@/", "src/")
+/// ```
+///
+/// `jsconfig.json` is the JavaScript convention for the same schema (a JS
+/// `create-next-app` ships one and no tsconfig), so a JS-only repo gets alias
+/// resolution too. tsconfig wins when both exist.
+///
+/// Returns empty on a missing, unreadable, or malformed config, or one with
+/// no `paths`. serde_json is strict, so a config carrying comments yields no
+/// aliases, matching how the rest of the indexer reads tsconfig. Non-wildcard
+/// and multi-target entries are skipped.
+pub fn parse_tsconfig_path_aliases(repo_root: &Path) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(repo_root.join("tsconfig.json"))
+        .or_else(|_| std::fs::read_to_string(repo_root.join("jsconfig.json")))
+    else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let opts = &json["compilerOptions"];
+    let base_url = opts["baseUrl"].as_str().unwrap_or(".");
+    let Some(paths) = opts["paths"].as_object() else {
+        return Vec::new();
+    };
+
+    let mut aliases = Vec::new();
+    for (key, targets) in paths {
+        let (Some(key_prefix), Some(first_target)) = (
+            key.strip_suffix('*'),
+            targets
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let Some(target_prefix) = first_target.strip_suffix('*') else {
+            continue;
+        };
+        let joined = normalize_vname_path(&Path::new(base_url).join(target_prefix));
+        let mut base = joined.to_string_lossy().replace('\\', "/");
+        if !base.is_empty() && !base.ends_with('/') {
+            base.push('/');
+        }
+        aliases.push((key_prefix.to_string(), base));
+    }
+    aliases
 }
 
 /// Resolve within-crate Rust `use` paths and file-module declarations to

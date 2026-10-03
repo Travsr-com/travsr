@@ -21,7 +21,8 @@ use ignore::WalkBuilder;
 use travsr_analysis::skeleton::{embed_texts_for_file, EmbedRichness};
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
-    hash_bytes, link_imports, link_imports_go, link_imports_python_fs, link_imports_rust, FfiMarker,
+    hash_bytes, link_imports_aliased, link_imports_go, link_imports_python_fs, link_imports_rust,
+    parse_tsconfig_path_aliases, FfiMarker,
 };
 use travsr_plugin_host::PluginIndexer;
 use travsr_retrieval::compute_kcore;
@@ -403,6 +404,9 @@ fn index_paths_parallel(
 
             scope.spawn(move || {
                 let mut indexer = PluginIndexer::new(&corpus);
+                // tsconfig `paths` aliases (e.g. @/* -> src/*) for TS/JS import
+                // resolution; read once per shard, empty for repos without one.
+                let ts_aliases = parse_tsconfig_path_aliases(&repo);
                 for abs_path in shard {
                     let vname_path = abs_path
                         .strip_prefix(&repo)
@@ -461,7 +465,7 @@ fn index_paths_parallel(
                     // Import resolution (read-only FS, no store access).
                     let import_edges = match Language::from_extension(ext) {
                         Some(Language::TypeScript) => {
-                            link_imports(&out.nodes, &vname_path, &corpus)
+                            link_imports_aliased(&out.nodes, &vname_path, &corpus, &ts_aliases)
                         }
                         Some(Language::Rust) => {
                             link_imports_rust(&out.nodes, &vname_path, &corpus)
@@ -5707,6 +5711,10 @@ pub fn reindex_files_reporting(
         .any(|p| p.extension().and_then(|e| e.to_str()) == Some("h"))
         && repo_has_objc_sources(repo_root);
 
+    // tsconfig `paths` aliases (e.g. @/* -> src/*) for TS/JS import resolution;
+    // read once per batch, empty for repos without one.
+    let ts_aliases = parse_tsconfig_path_aliases(repo_root);
+
     for abs_path in paths {
         let vname_path = abs_path
             .strip_prefix(repo_root)
@@ -5775,7 +5783,9 @@ pub fn reindex_files_reporting(
 
         // Build import-resolver edges before the atomic reindex_replace call.
         let import_edges = match Language::from_extension(ext) {
-            Some(Language::TypeScript) => link_imports(&out.nodes, &vname_path, &corpus),
+            Some(Language::TypeScript) => {
+                link_imports_aliased(&out.nodes, &vname_path, &corpus, &ts_aliases)
+            }
             Some(Language::Rust) => link_imports_rust(&out.nodes, &vname_path, &corpus),
             Some(Language::Python) => {
                 link_imports_python_fs(&out.nodes, &vname_path, &corpus, repo_root)
