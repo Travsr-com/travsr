@@ -259,20 +259,27 @@ fn rewrite_import_alias(module: &str, aliases: &[(String, String)]) -> Option<St
     None
 }
 
-/// Read `{repo_root}/tsconfig.json` and return its `compilerOptions.paths`
-/// wildcard aliases as `(prefix, base)` pairs, resolved against `baseUrl`
-/// (default `"."`). Only the common single-target wildcard form is handled:
+/// Read `{repo_root}/tsconfig.json` (or `jsconfig.json` when no tsconfig is
+/// present) and return its `compilerOptions.paths` wildcard aliases as
+/// `(prefix, base)` pairs, resolved against `baseUrl` (default `"."`). Only the
+/// common single-target wildcard form is handled:
 ///
 /// ```text
 /// "paths": { "@/*": ["./src/*"] }   baseUrl "."   ->   ("@/", "src/")
 /// ```
 ///
-/// Returns empty on a missing, unreadable, or malformed tsconfig, or one with
-/// no `paths`. serde_json is strict, so a tsconfig carrying comments yields no
+/// `jsconfig.json` is the JavaScript convention for the same schema (a JS
+/// `create-next-app` ships one and no tsconfig), so a JS-only repo gets alias
+/// resolution too. tsconfig wins when both exist.
+///
+/// Returns empty on a missing, unreadable, or malformed config, or one with
+/// no `paths`. serde_json is strict, so a config carrying comments yields no
 /// aliases, matching how the rest of the indexer reads tsconfig. Non-wildcard
 /// and multi-target entries are skipped.
 pub fn parse_tsconfig_path_aliases(repo_root: &Path) -> Vec<(String, String)> {
-    let Ok(text) = std::fs::read_to_string(repo_root.join("tsconfig.json")) else {
+    let Ok(text) = std::fs::read_to_string(repo_root.join("tsconfig.json"))
+        .or_else(|_| std::fs::read_to_string(repo_root.join("jsconfig.json")))
+    else {
         return Vec::new();
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {

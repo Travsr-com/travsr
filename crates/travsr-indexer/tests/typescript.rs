@@ -401,6 +401,34 @@ fn parse_tsconfig_path_aliases_empty_without_tsconfig() {
     assert!(parse_tsconfig_path_aliases(dir.path()).is_empty());
 }
 
+/// A JS-only repo (jsconfig.json, no tsconfig) gets the same alias resolution:
+/// jsconfig.json is the JavaScript convention for the identical schema, and the
+/// create-next-app JS template ships one. tsconfig wins when both are present.
+#[test]
+fn parse_tsconfig_path_aliases_falls_back_to_jsconfig() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("jsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["./src/*"]}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        parse_tsconfig_path_aliases(dir.path()),
+        vec![("@/".to_string(), "src/".to_string())],
+    );
+
+    // tsconfig.json takes precedence over jsconfig.json when both exist.
+    std::fs::write(
+        dir.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"paths":{"~/*":["./app/*"]}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        parse_tsconfig_path_aliases(dir.path()),
+        vec![("~/".to_string(), "app/".to_string())],
+    );
+}
+
 #[test]
 fn hash_file_is_deterministic() {
     let h1 = hash_file(&fixture("a.ts")).unwrap();
