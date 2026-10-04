@@ -10169,7 +10169,7 @@ mod tests {
 
     #[test]
     fn init_repo_skips_registry_when_env_var_set() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
         std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
@@ -10205,7 +10205,7 @@ mod tests {
         // #454: registration happens before a single file is indexed, so only a
         // stamp written on the success path can tell a deleted index apart from
         // one that was never built.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
         std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
@@ -10231,7 +10231,7 @@ mod tests {
 
     #[test]
     fn claude_directory_is_skipped_during_init() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
 
@@ -10256,7 +10256,7 @@ mod tests {
 
     #[test]
     fn init_repo_purges_ghost_nodes_from_skip_dirs() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Pre-populate the DB with a ghost node that looks like it came from a
         // previous run that indexed .claude/ before it was added to SKIP_DIRS.
         // Verifies that init_repo tombstones it even though the file no longer
@@ -10332,7 +10332,7 @@ mod tests {
 
     #[test]
     fn init_repo_stamps_last_commit_on_rerun_when_no_files_changed() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
         std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
@@ -10363,7 +10363,7 @@ mod tests {
 
     #[test]
     fn init_repo_returns_nonzero_total_counts_on_rerun() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
         std::fs::write(tmp.path().join("app.ts"), "export class App { run() {} }").unwrap();
