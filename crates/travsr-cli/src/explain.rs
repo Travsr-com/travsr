@@ -32,6 +32,27 @@ fn print_leg(name: &str, leg: Option<&ExplainLeg>) {
 fn print_disposition(label: &str, d: &ExplainDisposition) {
     println!("  {label}:");
     println!("    confidence:  {}", d.confidence);
+    // #822: the confidence verdict is computed from these, not from the per-token
+    // idf shown above. A token just under `idf_coverage_min` still reads
+    // `resolved=true` but contributes 0 to `n_resolved`, which turns `coverage_ok`
+    // off; without these lines that is invisible and the output reads as though
+    // the token counted. Same `value / threshold` shape as the thresholds block.
+    println!(
+        "    coverage:    {:.3}  ({} token(s) at/above idf_coverage_min)",
+        d.coverage, d.n_resolved
+    );
+    println!(
+        "    gates:       coverage_ok={}  exact_anchor_present={}",
+        d.coverage_ok, d.exact_anchor_present
+    );
+    match d.max_rerank_score {
+        Some(r) => println!("    max_rerank:  {r:.4}"),
+        None => println!("    max_rerank:  (none, reranker absent or skipped)"),
+    }
+    println!(
+        "    anchor rescue fired: {}  (None -> weak when all gates pass)",
+        d.anchor_rescued
+    );
     if d.in_seed_set {
         println!(
             "    in seed set: yes (rank {}, weight {:.4}, source {})",

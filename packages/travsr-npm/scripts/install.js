@@ -12,7 +12,7 @@ ensureBinary().catch(err => {
     `\nTravsr: binary download failed: ${err.message}\n` +
     `The binary was not installed now, but will be downloaded automatically ` +
     `the first time you run \`travsr\`. To install it now instead, re-run:\n` +
-    `  npm install -g travsr\n` +
+    `  npm install -g @travsr.com/travsr\n` +
     `Or set TRAVSR_BINARY=/path/to/travsr to use a local build.\n`
   );
 });

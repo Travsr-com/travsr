@@ -62,13 +62,15 @@ pub fn resolve_ra_binary() -> Option<std::path::PathBuf> {
     // non-zero. `.status().is_ok()` (process ran at all) treated that as
     // "available" and later spawned `rust-analyzer lsif`, which the shim
     // rejected with "Unknown binary ..." — silently skipping LSIF.
-    let on_path = std::process::Command::new("rust-analyzer")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if on_path {
+    let runs = |ra: &std::path::Path| {
+        std::process::Command::new(ra)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if runs(std::path::Path::new("rust-analyzer")) {
         return Some(std::path::PathBuf::from("rust-analyzer"));
     }
     // 2–4. Explicit home-relative fallbacks survive daemon PATH stripping.
@@ -101,7 +103,8 @@ pub fn resolve_ra_binary() -> Option<std::path::PathBuf> {
         }),
     ];
     for candidate in candidates.into_iter().flatten() {
-        if candidate.exists() {
+        // The same #738 shim sits in `~/.cargo/bin`, so run it, as on PATH.
+        if runs(&candidate) {
             tracing::info!(
                 path = %candidate.display(),
                 "rust-analyzer found off-PATH (cargo home or ~/.travsr/bin)"
@@ -169,6 +172,10 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
     let ra_path = match ra_binary_path() {
         Some(p) => p,
         None => {
+            // Not recorded as a failure: an absent rust-analyzer is a missing
+            // prerequisite, which `travsr lang list` already reports as
+            // `partial` for rust. Only an analyzer that ran and broke is a
+            // failure to disclose here.
             tracing::info!("rust-analyzer not found, skipping Rust's full cross-file analysis");
             return Ok(None);
         }
@@ -176,7 +183,20 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
     let ra_str = ra_path.to_string_lossy().into_owned();
     let repo_str = repo_root.to_string_lossy();
     let (cmd, status) = build_sandboxed_command(ra_str.as_str(), &["lsif", repo_str.as_ref()], cfg);
-    spawn_or_skip_ra(cmd, status, repo_root, cfg)
+    let out = spawn_or_skip_ra(cmd, status, repo_root, cfg);
+    // An `Ok(None)` here is the sandbox fail-closed skip, which already has its
+    // own `rust_lsif_degraded=sandbox_unavailable` disclosure, so only the error
+    // path is recorded: rust-analyzer ran and failed.
+    //
+    // Gated on the pass being DUE, exactly as #878 gates the TypeScript one on a
+    // root `tsconfig.json`. `rust-analyzer lsif` exits non-zero with "no
+    // projects" on a directory that merely contains `.rs` files, and a repo that
+    // is not a cargo project is not a broken analyzer: reporting `semantic:
+    // partial (incomplete: rust)` there would name a remedy that cannot help.
+    if out.is_err() && repo_root.join("Cargo.toml").is_file() {
+        crate::sandbox::record_lsif_analyzer_failure("rust");
+    }
+    out
 }
 
 /// Guard + spawn logic for `run_ra_lsif`, extracted so tests can inject a

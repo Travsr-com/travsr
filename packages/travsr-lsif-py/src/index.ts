@@ -11,9 +11,9 @@
 
 import path from 'path';
 import { Emitter } from './emitter';
-import { walk } from './walker';
+import { init, walk } from './walker';
 
-function main(): void {
+async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const rootIdx = args.indexOf('--root');
 
@@ -26,6 +26,7 @@ function main(): void {
   const emitter = new Emitter(process.stdout);
 
   try {
+    await init();
     walk(projectRoot, emitter);
   } catch (err) {
     process.stderr.write(`travsr-lsif-py: ${(err as Error).message}\n`);
@@ -33,4 +34,4 @@ function main(): void {
   }
 }
 
-main();
+void main();

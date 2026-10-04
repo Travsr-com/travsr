@@ -113,6 +113,114 @@ fn fuzzy_correct_jaccard() -> f64 {
         .unwrap_or(0.7)
 }
 
+/// Strip ONE regular English inflectional suffix, or `None` when the token
+/// carries none.
+///
+/// This is not a stemmer in the Porter sense and must not become one. It exists
+/// for a single measured failure: an English query says "grouped", "parsed",
+/// "queries", and the symbol is `groupBy`, `parseAll`, `query`. The inflected
+/// form is not a segment of any signature, so whole-word resolution finds
+/// nothing and the query abstains against a symbol that is plainly there.
+///
+/// Why not widen the #709 typo corrector instead: it compares whole leaf names
+/// by byte-trigram Jaccard, and `grouped` vs `groupby` scores 0.429 against a
+/// 0.7 floor. Reaching it would mean lowering the floor to where unrelated
+/// salad words ground, which is exactly what that floor is defending.
+///
+/// This is the cheaper and safer lever because it stays EXACT. The stem is fed
+/// back through the same whole-segment boundary predicate as any other token,
+/// so `grouped` -> `group` resolves only because `group` is a real segment of
+/// `groupBy`. A stem that matches nothing changes nothing.
+///
+/// Rules, applied in order, first hit wins:
+///   `-ies`/`-ied` -> `y`   (queries -> query, specified -> specify)
+///   `-ing`        -> strip (grouping -> group)
+///   `-ed`         -> strip (grouped -> group, parsed -> pars… see below)
+///   `-es`         -> strip, only after a sibilant (matches -> match)
+///   `-s`          -> strip, never `-ss` (callers -> caller)
+///
+/// The stem must be at least 4 characters, so short words cannot collapse into
+/// generic fragments. An arm that strips its suffix whole also eats a stem-final
+/// `e` (`parsed` -> `pars`); [`inflectional_stem_restoring_e`] makes the second
+/// exact attempt for those, and a stem that resolves to nothing is discarded.
+fn inflectional_stem(token: &str) -> Option<String> {
+    const MIN_STEM: usize = 4;
+    let t = token;
+    if t.len() < 5 || !t.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    let stem = if let Some(base) = lower
+        .strip_suffix("ies")
+        .or_else(|| lower.strip_suffix("ied"))
+    {
+        format!("{base}y")
+    } else if let Some(base) = lower.strip_suffix("ing") {
+        base.to_string()
+    } else if let Some(base) = lower.strip_suffix("ed") {
+        base.to_string()
+    } else if let Some(base) = lower.strip_suffix("es").filter(|b| {
+        // Only a sibilant stem takes `-es`. Otherwise the `e` belongs to the
+        // word, so this arm must DECLINE rather than answer: `names` is `name`
+        // plus `s`, and taking `-es` here would yield `nam`. Declining lets the
+        // plain `-s` arm below handle it.
+        b.ends_with(['s', 'x', 'z']) || b.ends_with("ch") || b.ends_with("sh")
+    }) {
+        base.to_string()
+    } else if lower.ends_with('s') && !lower.ends_with("ss") {
+        lower[..lower.len() - 1].to_string()
+    } else {
+        return None;
+    };
+    if stem.len() < MIN_STEM || stem == lower {
+        return None;
+    }
+    Some(stem)
+}
+
+/// The second exact attempt for a stem one of the whole-suffix arms produced:
+/// `stem` + `e`.
+///
+/// The sibilant test in [`inflectional_stem`] is applied to the base AFTER
+/// `-es` is stripped, so a word whose real stem ends in `e` preceded by a
+/// sibilant takes that arm and the correct `-s` arm below it is unreachable
+/// (the arms are an `else if` chain, and the MIN_STEM check at the end returns
+/// `None` rather than falling through). `responses` yielded `respons`, and the
+/// query abstained against `ok_response` and `error_response`, which the
+/// singular `response` finds. Same class: `caches` -> `cach`, `phases` ->
+/// `phas`, `databases` -> `databas`, `parses` -> `pars`, `releases` ->
+/// `releas`.
+///
+/// The `-ed` and `-ing` arms lose the same `e` for the same reason, and this
+/// repo is full of the result: `cached` -> `cach` misses `cache`,
+/// `parsed`/`parsing` -> `pars` misses `parse`, `stored` -> `stor`, `merged`
+/// -> `merg`, `encoded` -> `encod`, `routing` -> `rout`. One `e` separates each
+/// of those from the symbol the query named.
+///
+/// `None` unless one of those three arms produced `stem`, so nothing else
+/// changes. Used only when `stem` itself resolved to nothing, and fed through
+/// the same whole-segment boundary predicate: still one more EXACT attempt, not
+/// fuzzy matching.
+///
+/// Residual risk, accepted: a stem is served through that exact predicate, so
+/// one that happens to be a real segment of unrelated code becomes a confident
+/// wrong anchor. `signed` -> `sign` lands on release signing, `missing` ->
+/// `miss` on cache misses. There is deliberately no stoplist for this: a
+/// hand-kept word list rots faster than it earns its keep. The 4-character
+/// floor and the ASCII-alphabetic gate in [`inflectional_stem`] already remove
+/// the worst of the class (`fixed` -> `fix`, `based` -> `bas`).
+fn inflectional_stem_restoring_e(token: &str, stem: &str) -> Option<String> {
+    let lower = token.to_ascii_lowercase();
+    // Only the arms that strip their suffix whole can eat a stem-final `e`.
+    // `-ies`/`-ied` rewrite to `y` and `-s` leaves the `e` in place, so a stem
+    // either of those produced never equals one of these bases.
+    ["es", "ed", "ing"]
+        .iter()
+        .filter_map(|suffix| lower.strip_suffix(suffix))
+        .any(|base| base == stem)
+        .then(|| format!("{stem}e"))
+}
+
 /// RRF k constant — controls how sharply the top ranks dominate.
 fn rrf_k() -> f32 {
     std::env::var("TRAVSR_RRF_K")
@@ -464,10 +572,24 @@ pub(crate) struct SeedSet {
     pub seeds: Vec<Seed>,
     pub terms: Vec<ResolvedTerm>,
     /// Fraction of content tokens that resolved to at least one anchor: [0.0, 1.0].
-    /// Reserved for future response annotation.
-    #[allow(dead_code)]
     pub coverage: f32,
+    /// Numerator of [`SeedSet::coverage`]: the number of content tokens that both
+    /// resolved AND cleared the IDF-specificity bar (`idf_w >= idf_coverage_min`).
+    /// This is the count the abstention gate actually reads, which is why the
+    /// response envelope reports it: a bare `t.resolved` count can be several
+    /// times larger (every token that matched anything at all, however generic),
+    /// so an agent shown that number cannot predict whether it will get an answer.
+    pub n_resolved_gated: usize,
     pub confidence: Confidence,
+    /// #822 WS4-rescue gate inputs, recorded so `travsr explain` / `seed_trace`
+    /// can show WHY a query grounded or abstained. Reading them off the tokens
+    /// is not possible: `coverage_ok` has a second, no-reranker branch and
+    /// `exact_anchor_present` is the post-reordering anchor set, not a term's
+    /// raw `top_node`. Diagnostics only; nothing in retrieval reads them back.
+    pub exact_anchor_present: bool,
+    pub coverage_ok: bool,
+    pub max_rerank_score: Option<f32>,
+    pub anchor_rescued: bool,
     /// Top raw BM25 score (positive) from the lexical FTS path; 0.0 if no FTS results.
     /// Reserved for future response annotation.
     #[allow(dead_code)]
@@ -792,7 +914,7 @@ pub(crate) type DocKnnFn<'a> = &'a dyn Fn(&str, u32) -> Vec<(NodeId, f32)>;
 //
 // `doc_lane_candidates` fetches a larger, unfiltered pool; the caller
 // (`tools::build_docs_section`) reranks it and falls back to `doc_floor`-style
-// cosine filtering when the reranker is unavailable/disabled/over-budget —
+// cosine filtering when the reranker is unavailable/disabled/breaker-open —
 // same fail-open contract as the code lane's `crate::rerank::rerank`.
 
 /// Candidate pool size for doc-lane reranking — the doc-corpus analogue of
@@ -1415,14 +1537,55 @@ fn rerank_recall_floor() -> f32 {
     floor_env("TRAVSR_RERANK_RECALL_FLOOR").unwrap_or(0.15)
 }
 
+/// #822 follow-up: abstain on a query that has no content tokens at all.
+///
+/// `coverage` deliberately falls back to a neutral 0.5 when `n_content == 0` so a
+/// very short query can still be judged on BM25 and seed count. For a query that is
+/// nothing BUT stop-words that backfires: there is no lexical evidence to judge, yet
+/// the neutral 0.5 reads to the lexical lattice as half-covered and returns Weak.
+/// Measured on this repo with `TRAVSR_NO_RERANK=1`, every one of these grounded:
+/// `the of and is` (bench D2), `the`, `what is it`, `how do I do this`, `does it`.
+///
+/// Narrow by measurement, not by taste: a query with zero content tokens has nothing
+/// to retrieve ON, which is a different thing from a query whose tokens simply do not
+/// resolve here (`asdfqwerzxcv qqzzxxjjkk plughxyzzy` already abstains via
+/// `n_resolved == 0`). Every legitimate short query measured (`PPR`, `ask`, `io`,
+/// `fn`, `knapsack`) keeps at least one content token and is untouched, so this
+/// cannot refuse a real conceptual query.
+///
+/// Applies only when no rerank score exists. With a reranker the cross-encoder has
+/// its own opinion of the raw query string and already abstains on these, so leaving
+/// that branch alone keeps the reranked path byte-for-byte identical.
+fn contentless_query_confidence(
+    base: Confidence,
+    max_rerank: Option<f32>,
+    has_content_tokens: bool,
+) -> Confidence {
+    if max_rerank.is_none() && !has_content_tokens {
+        Confidence::None
+    } else {
+        base
+    }
+}
+
 /// #462 WS4: apply the anchor-gated rerank recall-floor rescue to a base verdict.
 ///
 /// Rescues `None → Weak` iff **all** hold: the base verdict abstained; the query is
 /// not a `g1_bypass` deterministic-path query; the query has non-zero grounded
 /// coverage (`coverage_ok` — at least one resolved token clears the IDF-coverage
-/// bar); a genuine exact lexical anchor grounds the query (`exact_anchor_present`);
-/// and the best rerank score clears `recall_floor`. Never promotes to Strong, and
+/// bar, checked only when a rerank score exists — see #822 below); a genuine exact
+/// lexical anchor grounds the query (`exact_anchor_present`); and the best rerank
+/// score, if there is one, clears `recall_floor`. Never promotes to Strong, and
 /// never touches a non-`None` verdict. Pure, so it is unit-testable without a store.
+///
+/// #822: `max_rerank: None` means the cross-encoder had no opinion at all (backend
+/// absent or disabled), not that it judged the query irrelevant. Gating the rescue on
+/// a score that was never produced made `ask "MatchSource"` abstain with no reranker
+/// installed, on a symbol `travsr references` resolves three definitions for. A
+/// missing score therefore gates nothing; the caller widens `coverage_ok` for a
+/// single-content-token query, where naming a real symbol IS the whole of the
+/// lexical evidence. Multi-token queries keep the IDF-coverage bar on both paths,
+/// so the D5 guarantee below is unchanged.
 ///
 /// RFC-022 D5 (RC-5): `coverage_ok` closes the WS4 over-rescue. Generic tokens
 /// (`get`/`map`/`handle`) still emit an exact anchor (`idf_w >= 0.15`) yet count
@@ -1442,7 +1605,10 @@ fn anchor_rescued_confidence(
         && !g1_bypass
         && coverage_ok
         && exact_anchor_present
-        && max_rerank.is_some_and(|r| r >= recall_floor)
+        // Not `is_none_or`: workspace MSRV is 1.88, so it would compile, but
+        // `clippy.toml`'s msrv deliberately lags at 1.75 (ADR-001) and
+        // `clippy::incompatible_msrv` fails `-D warnings` on a 1.82 API.
+        && max_rerank.map_or(true, |r| r >= recall_floor)
     {
         Confidence::Weak
     } else {
@@ -1668,8 +1834,10 @@ fn sort_seeds_post_rerank(seeds: &mut [Seed], weak_floor: f32) {
 ///   `g1_bypass`, also using it to skip rerank inference entirely on bypassed
 ///   queries (RFC-021 F2), since the model's opinion is unused either way.
 /// - **Reranker unavailable (`rerank_score: None`):** model absent, disabled
-///   (`TRAVSR_NO_RERANK`), load failed, panicked, or ran over budget — fall
-///   back to the identical pre-RFC-021 gate. No regression, no partial state.
+///   (`TRAVSR_NO_RERANK`), load failed, panicked, or skipped because the circuit
+///   breaker is open — fall back to the identical pre-RFC-021 gate. No
+///   regression, no partial state. An over-budget call is no longer in this list:
+///   it keeps its scores and only feeds the breaker (see `rerank::rerank`).
 ///
 /// Otherwise the four-arm absolute-floor gate is embeddings-independent by
 /// construction (embeddings remain a candidate *source* into RRF fusion, never
@@ -2203,12 +2371,42 @@ pub(crate) fn build_seed_set(
     // call. `fuzzy_correct_symbols` costs one distinct-signature scan whatever
     // the token count, so batching keeps a query carrying several unresolved
     // tokens at a single scan rather than one scan per token on this hot path.
+    //
+    // A token that resolves to nothing gets one more exact attempt before the
+    // fuzzy corrector sees it: its inflectional stem. An English question says
+    // "grouped" where the symbol is `groupBy`, and the inflected form is not a
+    // segment of any signature, so the direct pass finds nothing at all. The
+    // stem goes through this same `boundary` predicate, so it is still a
+    // whole-segment match against a real symbol, not a loosening of the gate.
+    // Ordered ahead of the #709 correction deliberately: an exact match on a
+    // known-regular suffix is stronger evidence than a trigram near-miss, and it
+    // keeps the corrector's strict 0.7 floor intact.
     let by_token: Vec<(String, Vec<CoreNode>, bool)> = content_tokens
         .iter()
         .map(|token| {
             let nodes = store.search_nodes_by_name(token).unwrap_or_default();
-            let has_direct = nodes.iter().any(|n| boundary(token, n));
-            (token.clone(), nodes, has_direct)
+            if nodes.iter().any(|n| boundary(token, n)) {
+                return (token.clone(), nodes, true);
+            }
+            if let Some(stem) = inflectional_stem(token) {
+                let stem_nodes = store.search_nodes_by_name(&stem).unwrap_or_default();
+                if stem_nodes.iter().any(|n| boundary(&stem, n)) {
+                    // Carry the stem forward as the token: frequency, IDF and the
+                    // anchor's own label must all measure the form that actually
+                    // exists in the index, exactly as the #709 correction does.
+                    return (stem, stem_nodes, true);
+                }
+                // The `-es`, `-ed` and `-ing` arms strip their suffix whole, so
+                // a stem one of them produced that resolves to nothing gets the
+                // `e` restored before we give up.
+                if let Some(alt) = inflectional_stem_restoring_e(token, &stem) {
+                    let alt_nodes = store.search_nodes_by_name(&alt).unwrap_or_default();
+                    if alt_nodes.iter().any(|n| boundary(&alt, n)) {
+                        return (alt, alt_nodes, true);
+                    }
+                }
+            }
+            (token.clone(), nodes, false)
         })
         .collect();
     let missed: Vec<&str> = by_token
@@ -3000,6 +3198,7 @@ pub(crate) fn build_seed_set(
         g1_bypass, // G1: rare exact-symbol queries stay deterministic
         max_rerank_score,
     );
+    let confidence = contentless_query_confidence(confidence, max_rerank_score, !terms.is_empty());
 
     // #462 WS4: anchor-gated rerank recall-floor rescue. `early_exact_ids` is the
     // exact-anchor set that fed RRF — every id in it came from a token that cleared the
@@ -3011,15 +3210,37 @@ pub(crate) fn build_seed_set(
     // when the query is clearly anchored.) Rescues an otherwise-`None` prose query so
     // grounded when the cross-encoder still sees moderate relevance. See
     // [`anchor_rescued_confidence`].
+    let exact_anchor_present = !early_exact_ids.is_empty();
+    // RFC-022 D5: gate the rescue on non-zero grounded coverage. `n_resolved`
+    // counts only tokens clearing the IDF-coverage bar, so `coverage_ok` is
+    // false for an all-generic query (`get map handle`) that emits anchors but
+    // resolves no specific token — those must stay abstained.
+    // #822: with no cross-encoder score the IDF-coverage bar is the wrong
+    // instrument. `MatchSource` (idf 0.533), `LangResult` (0.522), `SeedSet`
+    // (0.502) and `TestRole` (0.438) all sit just UNDER `idf_coverage_min`
+    // (0.550), so `n_resolved` is 0 and `ask "MatchSource"` abstained on a
+    // symbol `references` resolves three definitions for. Every one of those is
+    // a query of ONE content token that names a real symbol here, which is the
+    // whole of the lexical evidence the query offers, so scope the widening to
+    // exactly that shape.
+    //
+    // It must NOT be `terms.iter().all(|t| t.resolved)`: `resolved` is
+    // `!boundary_matched.is_empty()` (computed above, before the IDF cut), so
+    // any token naming any symbol anywhere sets it. For an all-generic query
+    // every content token qualifies, and `coverage_ok` would go true with
+    // `n_resolved == 0` - reopening exactly the D5 over-rescue this gate exists
+    // to close. Measured on this repo with `TRAVSR_NO_RERANK=1`, the `all`
+    // form flipped `name path kind`, `line kind path name` and `file path line`
+    // from ABSTAIN to GROUNDED; single-token scoping keeps all three abstained
+    // and still recovers 4 of the 4 reported symbols.
+    //
+    // Only widened when no score exists, so the reranked path keeps D5 exactly.
+    let coverage_ok =
+        n_resolved >= 1 || (max_rerank_score.is_none() && terms.len() == 1 && terms[0].resolved);
+    let base_confidence = confidence;
     let confidence = if anchor_rescue_enabled() {
-        let exact_anchor_present = !early_exact_ids.is_empty();
-        // RFC-022 D5: gate the rescue on non-zero grounded coverage. `n_resolved`
-        // counts only tokens clearing the IDF-coverage bar, so `coverage_ok` is
-        // false for an all-generic query (`get map handle`) that emits anchors but
-        // resolves no specific token — those must stay abstained.
-        let coverage_ok = n_resolved >= 1;
         anchor_rescued_confidence(
-            confidence,
+            base_confidence,
             g1_bypass,
             max_rerank_score,
             exact_anchor_present,
@@ -3027,8 +3248,11 @@ pub(crate) fn build_seed_set(
             rerank_recall_floor(),
         )
     } else {
-        confidence
+        base_confidence
     };
+    // #822: `travsr explain` reports this so a reader can tell a rescued verdict
+    // from one the lexical lattice reached on its own.
+    let anchor_rescued = confidence != base_confidence;
 
     // RFC-022 Phase 0: seed-pipeline diagnostic behind `tracing::debug!`
     // (target `travsr::seed`), replacing the temporary `TRAVSR_DEBUG_SEED`
@@ -3071,7 +3295,12 @@ pub(crate) fn build_seed_set(
         seeds,
         terms,
         coverage,
+        n_resolved_gated: n_resolved,
         confidence,
+        exact_anchor_present,
+        coverage_ok,
+        max_rerank_score,
+        anchor_rescued,
         top_bm25,
     }
 }
@@ -3139,6 +3368,16 @@ pub struct ExplainDisposition {
     pub source: Option<&'static str>,
     pub rerank_score: Option<f32>,
     pub confidence: &'static str,
+    /// #822: the gate inputs the confidence verdict is actually computed from.
+    /// Without these `explain` showed a token's `idf` next to `idf_coverage_min`
+    /// and nothing else, so a reader could not tell that a token just under the
+    /// bar contributes 0 to `n_resolved` and turns `coverage_ok` off.
+    pub n_resolved: usize,
+    pub coverage: f32,
+    pub coverage_ok: bool,
+    pub exact_anchor_present: bool,
+    pub max_rerank_score: Option<f32>,
+    pub anchor_rescued: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3269,6 +3508,12 @@ pub(crate) fn explain_seed_set(
             source: seed.as_ref().map(|(_, s)| s.source.label()),
             rerank_score: seed.as_ref().and_then(|(_, s)| s.rerank_score),
             confidence: set.confidence.label(),
+            n_resolved: set.n_resolved_gated,
+            coverage: set.coverage,
+            coverage_ok: set.coverage_ok,
+            exact_anchor_present: set.exact_anchor_present,
+            max_rerank_score: set.max_rerank_score,
+            anchor_rescued: set.anchor_rescued,
         }
     };
 
@@ -3516,11 +3761,50 @@ mod tests {
     }
 
     #[test]
-    fn ws4_inert_without_a_rerank_score() {
-        // No cross-encoder signal (model absent / g1_bypass skip / over budget) → the
-        // rescue reads no relevance evidence and leaves the verdict untouched.
+    fn contentless_query_abstains_without_a_reranker_822() {
+        // #822 follow-up: "the of and is" tokenizes to zero content tokens, so
+        // `coverage` takes its neutral 0.5 fallback and the lexical lattice returned
+        // Weak on a query with no lexical evidence at all. With no rerank score to
+        // judge on instead, abstain.
+        assert_eq!(
+            contentless_query_confidence(Confidence::Weak, None, false),
+            Confidence::None,
+        );
+        // A query WITH content tokens is untouched, however short: `PPR`, `fn` and
+        // `knapsack` all keep one content token and must keep their verdict.
+        assert_eq!(
+            contentless_query_confidence(Confidence::Strong, None, true),
+            Confidence::Strong,
+        );
+        // The reranked path is left exactly as it was: the cross-encoder judges the
+        // raw query string itself and already abstains on these.
+        assert_eq!(
+            contentless_query_confidence(Confidence::Weak, Some(0.9), false),
+            Confidence::Weak,
+        );
+    }
+
+    #[test]
+    fn ws4_rescues_an_exact_anchor_with_no_reranker_822() {
+        // #822: with no cross-encoder backend the score is `None` because nothing was
+        // ever computed, not because the model judged the query irrelevant. Gating on
+        // it made `ask "MatchSource"` abstain on a symbol `references` resolves three
+        // definitions for. A missing score gates nothing, so a grounded exact anchor
+        // rescues on the lexical evidence alone.
         assert_eq!(
             anchor_rescued_confidence(Confidence::None, false, None, true, true, 0.15),
+            Confidence::Weak,
+        );
+        // ...but a missing score is NOT a licence to ground an unanchored query: the
+        // salad/no-anchor case still abstains with no reranker present.
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, false, None, false, true, 0.15),
+            Confidence::None,
+        );
+        // ...nor an all-generic query with no coverage (`get map handle`), scored or
+        // not: RFC-022 D5 still holds on both branches.
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, false, None, true, false, 0.15),
             Confidence::None,
         );
     }
@@ -3861,6 +4145,74 @@ mod tests {
         for norm in [0.05f32, 0.5, 1.0] {
             assert!(scope_gate_drops(true, false, norm, 2.0));
         }
+    }
+
+    /// The stemmer must reach the measured misses and nothing looser. Each
+    /// accepted case is a real query form whose symbol exists under another
+    /// inflection; each rejection is a shape that would have widened the gate.
+    #[test]
+    fn inflectional_stem_covers_regular_suffixes_only() {
+        // The measured misses.
+        assert_eq!(inflectional_stem("grouped").as_deref(), Some("group"));
+        assert_eq!(inflectional_stem("grouping").as_deref(), Some("group"));
+        assert_eq!(inflectional_stem("queries").as_deref(), Some("query"));
+        assert_eq!(inflectional_stem("specified").as_deref(), Some("specify"));
+        assert_eq!(inflectional_stem("callers").as_deref(), Some("caller"));
+        assert_eq!(inflectional_stem("matches").as_deref(), Some("match"));
+
+        // No recognised suffix: unchanged tokens must never be rewritten.
+        assert_eq!(inflectional_stem("group"), None);
+        assert_eq!(inflectional_stem("parser"), None);
+
+        // `-es` only after a sibilant. `names` is `name` + `s`, and taking the
+        // `-es` arm would yield `nam`.
+        assert_eq!(inflectional_stem("names").as_deref(), Some("name"));
+
+        // `-ss` is not a plural.
+        assert_eq!(inflectional_stem("address"), None);
+        assert_eq!(inflectional_stem("process"), None);
+
+        // Short input, and a stem that would fall under the length floor.
+        // `tries` -> `try` is a correct stem but only 3 characters, and a
+        // fragment that short is exactly what the floor is there to reject.
+        assert_eq!(inflectional_stem("used"), None);
+        assert_eq!(inflectional_stem("tries"), None);
+        assert_eq!(inflectional_stem("cars"), None);
+
+        // Non-alphabetic tokens are identifiers, not English words.
+        assert_eq!(inflectional_stem("get_callers"), None);
+        assert_eq!(inflectional_stem("node_ids"), None);
+    }
+
+    /// The `-es`, `-ed` and `-ing` arms all strip their suffix whole, so a word
+    /// whose real stem ends in `e` loses it and the chain cannot fall through.
+    #[test]
+    fn restoring_e_recovers_the_stem_a_whole_suffix_arm_ate() {
+        for (word, shadowed, real) in [
+            ("responses", "respons", "response"),
+            ("caches", "cach", "cache"),
+            ("databases", "databas", "database"),
+            ("releases", "releas", "release"),
+            ("cached", "cach", "cache"),
+            ("parsed", "pars", "parse"),
+            ("stored", "stor", "store"),
+            ("merged", "merg", "merge"),
+            ("encoded", "encod", "encode"),
+            ("parsing", "pars", "parse"),
+            ("routing", "rout", "route"),
+        ] {
+            assert_eq!(inflectional_stem(word).as_deref(), Some(shadowed));
+            assert_eq!(
+                inflectional_stem_restoring_e(word, shadowed).as_deref(),
+                Some(real)
+            );
+        }
+
+        // `queries` takes the `-ies` arm, which rewrites to `y` rather than
+        // stripping, so its stem is not one of the three bases.
+        assert_eq!(inflectional_stem_restoring_e("queries", "query"), None);
+        // `names` takes the `-s` arm, which leaves the `e` in place.
+        assert_eq!(inflectional_stem_restoring_e("names", "name"), None);
     }
 
     #[test]
@@ -6106,6 +6458,107 @@ mod tests {
                 .map(|s| (s.node, s.source))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// #822 review: RFC-022 D5 must stay closed on the no-reranker branch.
+    ///
+    /// The first cut of the #822 widening was
+    /// `terms.iter().all(|t| t.resolved)`. `resolved` is `!boundary_matched
+    /// .is_empty()`, computed before the IDF cut, so every content token of an
+    /// all-generic query sets it: `coverage_ok` went true with `n_resolved ==
+    /// 0` and the WS4 rescue grounded a query with zero grounded coverage.
+    /// Measured on this repo with `TRAVSR_NO_RERANK=1`, that flipped `name path
+    /// kind`, `line kind path name` and `file path line` from ABSTAIN to
+    /// GROUNDED.
+    ///
+    /// This asserts the COMPUTED `coverage_ok` that `build_seed_set` puts on
+    /// the `SeedSet`, not a literal handed to `anchor_rescued_confidence`, so
+    /// it guards the call site the regression lived at. The three tokens are
+    /// made genuinely generic the way a real corpus makes them: ~60 bearers
+    /// each against the `n_total` floor of 1 000 puts `idf_w` near 0.40, inside
+    /// `[anchor_emit_cut 0.15, idf_coverage_min 0.55)` - specific enough to emit
+    /// an anchor, too generic to count toward coverage. `TRAVSR_NO_RERANK` is
+    /// the documented escape hatch for the no-reranker case (`score_fn` is the
+    /// KNN leg, not the cross-encoder), and it is set under
+    /// [`crate::rerank::RERANK_ENV_LOCK`]: `rerank.rs`'s own tests
+    /// `remove_var` that same variable, both modules compile into one test
+    /// binary, and `reranker()` reads it live on every call, so an unlocked
+    /// `set_var` here races them on any machine with a model installed.
+    #[test]
+    fn all_generic_multi_token_query_keeps_coverage_ok_false_822() {
+        use travsr_core::{Node, VName};
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        for tok in ["get", "map", "handle"] {
+            for i in 0..60 {
+                let node = Node::new(
+                    VName::new(
+                        "corpus",
+                        "",
+                        format!("crates/travsr-demo/src/{tok}_{i}.rs"),
+                        "rust",
+                        format!("fn:{tok}_payload_{i}"),
+                    ),
+                    "function",
+                );
+                store.put_node(&node).unwrap();
+            }
+        }
+
+        let seed_set = build_seed_set(
+            &store,
+            "get map handle",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        // Preconditions: this is the over-rescue shape, not a query that simply
+        // failed to anchor. Every token resolved, an anchor was emitted, and no
+        // token cleared the coverage bar.
+        assert!(
+            seed_set.terms.len() > 1 && seed_set.terms.iter().all(|t| t.resolved),
+            "setup: every content token must resolve, terms: {:?}",
+            seed_set
+                .terms
+                .iter()
+                .map(|t| (&t.token, t.idf_w, t.resolved))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            seed_set.exact_anchor_present,
+            "setup: an exact anchor must be emitted, or the rescue is gated \
+             by `exact_anchor_present` instead and this proves nothing"
+        );
+        assert_eq!(
+            seed_set.n_resolved_gated,
+            0,
+            "setup: no token may clear idf_coverage_min, terms: {:?}",
+            seed_set
+                .terms
+                .iter()
+                .map(|t| (&t.token, t.idf_w))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            seed_set.max_rerank_score.is_none(),
+            "setup: this is the no-reranker branch"
+        );
+
+        assert!(
+            !seed_set.coverage_ok,
+            "all-generic multi-token query must keep coverage_ok false (RFC-022 D5)"
+        );
+        assert!(
+            !seed_set.anchor_rescued,
+            "and therefore must not be anchor-rescued"
+        );
+        std::env::remove_var("TRAVSR_NO_RERANK");
     }
 
     /// Found via CI (not local dev, where an installed embed backend masked

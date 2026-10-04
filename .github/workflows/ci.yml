@@ -87,6 +87,10 @@ jobs:
       - name: Install bubblewrap (Linux sandbox enforcement tests)
         if: runner.os == 'Linux'
         run: |
+          # The runner image's package index goes stale when Ubuntu ships a new
+          # bubblewrap build and pulls the old .deb from the mirrors (404), so
+          # refresh it before installing.
+          sudo apt-get update
           sudo apt-get install -y bubblewrap
           # Ubuntu 24.04+ ships an AppArmor profile that blocks bwrap from creating
           # mount/user namespaces even with sudo. Unload the profile so our sandbox
@@ -136,6 +140,115 @@ jobs:
 
       - name: Test
         run: npm test
+
+  emitter-bundle:
+    name: emitter bundle (build + smoke) (${{ matrix.os }})
+    # release.yml runs the bundle step on all five release targets, so the
+    # script has to work on every runner OS, not just Linux. Matrixed here for
+    # the same reason `test` is: a tag build is the wrong place to discover
+    # that Git Bash on windows-latest cannot run part of the script.
+    #
+    # Do not put an `if:` on this job. A skipped matrix job reports its name
+    # with the expression un-interpolated, and release.yml's preflight matches
+    # the three rendered names with `grep -qxF`, so a skip breaks the release
+    # gate with three check names that do not exist anywhere.
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # shell: bash on every run step that can execute on windows-latest,
+      # where the default is pwsh: pwsh reports only the last command's exit
+      # code in a multi-line run, so an npm failure here would pass as green.
+      # It also brings `-eo pipefail`, so no `set` line is needed. The docker
+      # step below is the exception, being Linux-only and already setting its
+      # own `set -euo pipefail`.
+      - name: travsr-lsif-py build + test
+        working-directory: packages/travsr-lsif-py
+        shell: bash
+        run: |
+          npm ci
+          npm run build
+          npm test
+
+      # Linux only: npm audit reads the lockfile, not the installed tree, so
+      # on every runner it audits all 32 entries including the 24 @esbuild
+      # platform packages, only one of which is ever installed. The result is
+      # identical on all three legs, so the other two would buy no signal while
+      # tripling the exposure to a registry hiccup.
+      - name: Audit npm dependencies
+        if: runner.os == 'Linux'
+        working-directory: packages/travsr-lsif-py
+        shell: bash
+        run: npm audit --audit-level=high
+
+      # release.yml only runs on a tag push, so before this job nothing ever
+      # exercised the bundling step on a PR: a release could ship a travsr-lib
+      # that did not load. The script smoke-runs both bundles from the staged
+      # directory, which is the relocated layout an installed binary sees.
+      - name: Bundle both emitters and smoke them
+        shell: bash
+        run: bash scripts/bundle-emitters.sh dist
+
+      # The bundle runs under the user's own node, so the two ways a payload
+      # can be right on this runner and wrong on a user's machine are an older
+      # glibc/libstdc++ and musl. bullseye is below every libstdc++ floor an
+      # LTS distro ships and alpine is musl; the images are pulled the same way
+      # install-sh-alpine already does rather than through a container: job.
+      # Linux only: both images are Linux, and the hosted macOS and Windows
+      # runners have no usable Docker daemon.
+      - name: Smoke the bundle on an old glibc and on musl
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          for image in node:20-bullseye-slim node:20-alpine; do
+            echo "==> ${image}"
+            docker run --rm -v "$PWD:/w" -w /w "$image" \
+              node dist/travsr-lib/travsr-lsif-py \
+              --root packages/travsr-lsif-py/fixtures/simple > dump.lsif
+            grep -q '"label":"referenceResult"' dump.lsif
+          done
+
+      # Asserts one narrow thing: the --omit=dev tree carries no native addon.
+      # That is what keeps tree-sitter-python a devDependency, since
+      # copy-wasm.mjs only reads a .wasm file out of it at build time and
+      # nothing else here installs this package with --omit=dev. It is not a
+      # check on the manifest: a runtime require() added without moving the
+      # entry back still passes, and a dependency shipping a plain executable
+      # rather than a .node (esbuild) would not be seen either.
+      #
+      # Not Linux-only like the audit above, though today that buys nothing:
+      # the prod tree is the single pure-JS web-tree-sitter and is identical
+      # on all three runners. --omit=dev does resolve per-platform optionals,
+      # so the answer can start differing by runner the moment a prod
+      # dependency ships them (sharp and swc do), and these three are every
+      # platform npm installs on in this repo anyway, since release.yml builds
+      # its five artifacts on the same three. The concrete thing it buys now
+      # is putting `find` under Git Bash on trial. Costs about a second.
+      # Runs last because it leaves node_modules prod-only.
+      - name: Runtime dependencies must stay addon-free
+        working-directory: packages/travsr-lsif-py
+        shell: bash
+        run: |
+          npm ci --omit=dev
+          found=$(find node_modules \( -name '*.node' -o -name binding.gyp \) -print)
+          if [ -n "$found" ]; then
+            echo "ERROR: the --omit=dev tree contains a native addon:" >&2
+            echo "$found" >&2
+            exit 1
+          fi
 
   msrv:
     name: MSRV (rust 1.88)
@@ -400,6 +513,36 @@ jobs:
       - uses: actions/checkout@v4
       - name: verify release matrix and installer target maps agree (#576)
         run: node .github/scripts/check-target-maps.mjs
+
+  release-gates:
+    name: release promotion gate policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: verify the gate verdict policy and its release.yml wiring (#871)
+        run: bash .github/scripts/test-release-gates.sh
+
+  vscode-version-gate:
+    name: vscode version gate (shell tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck if missing
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y shellcheck
+          fi
+
+      - name: shellcheck the version gate (#882)
+        run: shellcheck .github/scripts/vscode-version-gate.sh .github/scripts/test-vscode-version-gate.sh
+
+      # The gate decides whether a release can be cut and whether a pull
+      # request goes red, and its interesting cases are all states that are
+      # awkward to reach on purpose (a gallery outage, a WAF page, a release
+      # PR mid-flight). The test stubs gh and curl and drives them.
+      - name: version gate behaviour (#882)
+        run: bash .github/scripts/test-vscode-version-gate.sh
 
   install-sh-lint:
     name: "install.sh (shellcheck)"

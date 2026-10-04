@@ -3,7 +3,7 @@ use crate::dispatcher::Dispatcher;
 use crate::plugins::response_to_output;
 use crate::registry::register_builtins;
 use crate::resolver::PluginResolver;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use travsr_core::Language;
 use travsr_error::IndexError;
@@ -48,13 +48,18 @@ fn may_report_zero_occurrences(lang: &str) -> bool {
 /// Classify one language's Phase B result. Split out so it can be tested
 /// directly: the behaviour this adds had no assertion, only the helper it calls
 /// did (#752 review).
+///
+/// A native analyzer (see [`may_report_zero_occurrences`]) is never flagged: it
+/// emits no definitions of its own and extracts call sites in-process, so an
+/// empty result there means the files have no calls. A broken type-checked pass
+/// still leaves those call sites and is reported by its own `emitter_*` class.
 fn classify_empty_output(lang: &str, nodes_empty: bool, no_occurrences: bool) -> EmptyOutput {
-    if nodes_empty && no_occurrences {
-        EmptyOutput::NoNodes
-    } else if no_occurrences && !may_report_zero_occurrences(lang) {
-        EmptyOutput::NoReferences
-    } else {
+    if may_report_zero_occurrences(lang) || !no_occurrences {
         EmptyOutput::Fine
+    } else if nodes_empty {
+        EmptyOutput::NoNodes
+    } else {
+        EmptyOutput::NoReferences
     }
 }
 
@@ -77,13 +82,17 @@ pub struct PhaseBOutcome {
     /// Their external tooling is never spawned. User-actionable: re-run
     /// `travsr lang install <lang>` inside the repo, which auto-grants trust.
     pub skipped_untrusted_corpus: Vec<String>,
-    /// Languages that require a `compile_commands.json` at the repo root
-    /// (scip-clang, for `c`/`cpp`) but don't have one. Without this gate the
-    /// scip-clang invoke hangs with no compilation database until the 300s
-    /// invoke timeout, then reports as `crashed`. User-actionable: generate a
+    /// Languages that require a `compile_commands.json` at the repo root or in
+    /// a directory above their sources (scip-clang, for `c`/`cpp`) but don't
+    /// have one. Without this gate the scip-clang invoke hangs with no
+    /// compilation database until the 300s invoke timeout, then reports as
+    /// `crashed`. User-actionable: generate a
     /// compile_commands.json (e.g. via `bear` or CMake's
     /// `CMAKE_EXPORT_COMPILE_COMMANDS`).
     pub skipped_no_compdb: Vec<String>,
+    /// Languages whose analyzer traces a project skipped because the repo has
+    /// no build file for one (loose sources such as test fixtures).
+    pub skipped_no_build_file: Vec<String>,
     /// Vestigial since elevated access became auto-granted for local use
     /// (ADR-017 Amendment A5): RequiresElevated languages are no longer gated on
     /// a PSE approval, so the resolver never populates this. Retained as contract
@@ -118,7 +127,31 @@ pub struct PhaseBOutcome {
     /// Languages whose sidecar binary responded with a mismatched protocol
     /// version. User-actionable: `travsr lang install <lang>` to upgrade.
     pub version_mismatch: Vec<(String, u32, u32)>,
+    /// #904: warning diagnostics the sidecars sent with their results. Until
+    /// now these were logged by the transport and dropped, so a sidecar that
+    /// knew exactly why it produced nothing (the Android SDK was missing)
+    /// could not say so anywhere the user looks, and `travsr status` fell
+    /// back to the generic "found no symbols". Bounded and sanitized here.
+    pub diagnostics: Vec<SidecarDiagnostic>,
 }
+
+/// A warning a Phase B sidecar attached to its result, kept for `travsr
+/// status` and the `init` summary (#904).
+///
+/// The sidecar is untrusted, so the host owns the shape: `code` is either a
+/// valid dotted identifier or the neutral placeholder the transport also logs
+/// under, and `message` is control-character-free and capped, exactly as the
+/// transport treats the same record before logging it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SidecarDiagnostic {
+    pub lang: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// Cap on the diagnostics kept per run. Enough for every language to say one
+/// or two things; a sidecar cannot grow the meta table by being chatty.
+const MAX_PERSISTED_DIAGNOSTICS: usize = 16;
 
 /// Inputs for [`PluginIndexer::invoke_phase_b_all`].
 ///
@@ -463,7 +496,7 @@ impl PluginIndexer {
             .collect();
 
         // H5: collect needs_approval before boxing so we can surface it in outcome.
-        let catalog = crate::resolver::CatalogResolver::new();
+        let catalog = crate::resolver::CatalogResolver::for_corpus(&self.corpus);
         let needs_approval_langs: Vec<String> = catalog.needs_approval().to_vec();
         // Windows-only: analyzers that cannot run isolated here and have no
         // permission on record are skipped before spawn. Surface repo-present ones
@@ -535,8 +568,10 @@ impl PluginIndexer {
             NativeTypescript,
             /// Python: run in-process for same reason as NativeRust.
             NativePython,
-            /// All other languages: spawn a sidecar subprocess.
-            Sidecar(crate::resolver::PluginSpec),
+            /// All other languages: spawn a sidecar subprocess, once per
+            /// directory to hand it as `InvokeRequest.root` (#724 Finding 5).
+            /// Always at least one entry.
+            Sidecar(crate::resolver::PluginSpec, Vec<PathBuf>),
         }
 
         struct WorkItem {
@@ -558,11 +593,14 @@ impl PluginIndexer {
                 .indexable_paths
                 .iter()
                 .filter(|p| {
-                    p.extension()
-                        .and_then(|e| e.to_str())
-                        .and_then(Language::from_extension)
+                    let ext = p.extension().and_then(|e| e.to_str());
+                    ext.and_then(Language::from_extension)
                         .map(|l| l.as_str() == lang_name)
                         .unwrap_or(false)
+                        // Gradle build scripts are Kotlin by extension, but the
+                        // catalog traces `.kt` only: they hold no calls worth
+                        // minutes of language server time.
+                        && !(lang_name == "kotlin" && ext == Some("kts"))
                 })
                 .filter_map(|p| {
                     p.strip_prefix(repo_root)
@@ -659,15 +697,28 @@ impl PluginIndexer {
                 continue;
             }
 
-            // L5a: scip-clang (c/cpp) requires a compile_commands.json at the repo
-            // root (`--compdb-path` in its catalog args). Without one it hangs
-            // with no compilation database until the invoke timeout fires and the
-            // whole batch reports `crashed`, blocking phase_b_commit forever.
-            // Detect the dependency from the catalog entry rather than hardcoding
-            // language names, so any future scip-clang-based language is covered.
+            // L5a: scip-clang (c/cpp) requires a compile_commands.json in the
+            // directory it runs in (`--compdb-path` in its catalog args). Without
+            // one it hangs with no compilation database until the invoke timeout
+            // fires and the whole batch reports `crashed`, blocking
+            // phase_b_commit forever. Detect the dependency from the catalog
+            // entry rather than hardcoding language names, so any future
+            // scip-clang-based language is covered. The compdb may sit at the
+            // repo root or below it: any build root found for the sources counts
+            // (the root probe also covers a call with no path list).
+            let files = lang_files(&lang);
             let needs_compdb = crate::phase_b::catalog::lookup(lang.as_str())
                 .is_some_and(|entry| entry.command == "scip-clang");
-            if needs_compdb && !inputs.repo_root.join("compile_commands.json").exists() {
+            let sources = root_sources(files.as_deref().unwrap_or(&[]));
+            if needs_compdb
+                && !repo_root.join("compile_commands.json").exists()
+                && build_roots(
+                    repo_root,
+                    &sources,
+                    crate::phase_b::catalog::build_manifests(lang.as_str()),
+                )
+                .is_empty()
+            {
                 tracing::debug!(
                     lang = %lang,
                     "Phase B skipped, scip-clang requires compile_commands.json"
@@ -675,14 +726,32 @@ impl PluginIndexer {
                 outcome.skipped_no_compdb.push(lang.clone());
                 continue;
             }
+            if crate::phase_b::catalog::missing_build_file(&lang, repo_root).is_some() {
+                tracing::debug!(lang = %lang, "Phase B skipped, no build file in the repo");
+                outcome.skipped_no_build_file.push(lang.clone());
+                continue;
+            }
 
             match resolver.resolve(&lang) {
                 Some(spec) => {
                     tracing::debug!(lang = %lang, program = %spec.program, "Phase B: resolved spec");
-                    let files = lang_files(&lang);
+                    // #724 Finding 5: a build-system-driven analyzer indexes the
+                    // directory it is handed, so a project whose manifest sits
+                    // below the repo root fails outright ("No build tool detected
+                    // in workspace"). Hand it the build roots instead, one invoke
+                    // each. Languages with no manifest list keep getting a single
+                    // invoke at the repo root.
+                    let mut invoke_roots = build_roots(
+                        repo_root,
+                        &sources,
+                        crate::phase_b::catalog::build_manifests(lang.as_str()),
+                    );
+                    if invoke_roots.is_empty() {
+                        invoke_roots.push(repo_root.to_path_buf());
+                    }
                     work_items.push(WorkItem {
                         lang,
-                        work: LangWork::Sidecar(spec),
+                        work: LangWork::Sidecar(spec, invoke_roots),
                         files,
                     });
                 }
@@ -709,6 +778,8 @@ impl PluginIndexer {
             /// Some((expected, got)) when the sidecar binary's protocol version
             /// does not match the daemon's PROTOCOL_VERSION.
             version_mismatch: Option<(u32, u32)>,
+            /// #904: warnings the sidecar sent alongside its result.
+            diagnostics: Vec<travsr_plugin_protocol::PluginDiagnostic>,
         }
 
         // P2: fan out per-language work in parallel. Each thread owns its work
@@ -734,7 +805,7 @@ impl PluginIndexer {
                         // call `phase_b_native_*` in-process with no ceiling, and
                         // a surface that quotes one for them states a limit that
                         // does not exist.
-                        let is_sidecar = matches!(item.work, LangWork::Sidecar(_));
+                        let is_sidecar = matches!(item.work, LangWork::Sidecar(..));
                         let _mark = LivenessMark::new(liveness, &lang, is_sidecar);
                         let result = match item.work {
                             LangWork::Dart => {
@@ -757,6 +828,7 @@ impl PluginIndexer {
                                             skipped_no_analyzer: false,
                                             crashed: false,
                                             version_mismatch: None,
+                                            diagnostics: Vec::new(),
                                         }
                                     }
                                     Err(e) => {
@@ -774,6 +846,7 @@ impl PluginIndexer {
                                             skipped_no_analyzer: false,
                                             crashed: true,
                                             version_mismatch: None,
+                                            diagnostics: Vec::new(),
                                         }
                                     }
                                 }
@@ -807,7 +880,8 @@ impl PluginIndexer {
                                 // fallback so it works even when daemon PATH is stripped.
                                 let cfg = SandboxConfig {
                                     repo_root: repo_root.to_path_buf(),
-                                    allow_unsandboxed: travsr_indexer::sandbox::allow_unsandboxed_opt_in(),
+                                    allow_unsandboxed: travsr_indexer::sandbox::allow_unsandboxed_opt_in()
+                                        || crate::resolver::persisted_unsandboxed_consent("rust", corpus),
                                     ..Default::default()
                                 };
                                 // E3 (W3b) — positional, fail-closed rust-analyzer
@@ -821,24 +895,37 @@ impl PluginIndexer {
                                 // node — 100% dangling (18,530 dead edges here).
                                 let mut positional_refs: Vec<travsr_core::LsifPositionalRef> =
                                     Vec::new();
-                                match travsr_indexer::run_ra_lsif(repo_root, &cfg) {
-                                    Ok(Some(dump)) => {
-                                        let prefs = travsr_indexer::ingest_rust_positional(
-                                            &dump,
-                                            &repo_root.to_string_lossy(),
-                                        );
-                                        tracing::debug!(
-                                            positional_refs = prefs.len(),
-                                            "Phase B: rust-analyzer LSIF positional refs parsed"
-                                        );
-                                        positional_refs = prefs;
+                                // Every cargo project, as TypeScript does for
+                                // tsconfig: a repo whose only Cargo.toml files
+                                // sit below the root got "no projects" here.
+                                let mut ra_roots = build_roots(
+                                    repo_root,
+                                    item.files.as_deref().unwrap_or(&[]),
+                                    crate::phase_b::catalog::build_manifests("rust"),
+                                );
+                                if ra_roots.is_empty() {
+                                    ra_roots.push(repo_root.to_path_buf());
+                                }
+                                for ra_root in &ra_roots {
+                                    match travsr_indexer::run_ra_lsif(ra_root, &cfg) {
+                                        Ok(Some(dump)) => {
+                                            let prefs = travsr_indexer::ingest_rust_positional(
+                                                &dump,
+                                                &repo_root.to_string_lossy(),
+                                            );
+                                            tracing::debug!(
+                                                positional_refs = prefs.len(),
+                                                "Phase B: rust-analyzer LSIF positional refs parsed"
+                                            );
+                                            positional_refs.extend(prefs);
+                                        }
+                                        Ok(None) => {
+                                            tracing::debug!(
+                                                "rust-analyzer not available, native phase_b only"
+                                            )
+                                        }
+                                        Err(e) => tracing::warn!("rust-analyzer failed: {e}"),
                                     }
-                                    Ok(None) => {
-                                        tracing::debug!(
-                                            "rust-analyzer not available, native phase_b only"
-                                        )
-                                    }
-                                    Err(e) => tracing::warn!("rust-analyzer failed: {e}"),
                                 }
                                 nodes.sort_unstable_by_key(|n| n.id);
                                 nodes.dedup_by_key(|n| n.id);
@@ -876,6 +963,7 @@ impl PluginIndexer {
                                     skipped_no_analyzer: false,
                                     crashed: false,
                                     version_mismatch: None,
+                                    diagnostics: Vec::new(),
                                 }
                             }
                             LangWork::NativeTypescript => {
@@ -908,9 +996,25 @@ impl PluginIndexer {
                                 // tree-sitter node id, so it reconciles without an alias
                                 // pass, and write_scip_attributed_batch records edge_sites.
                                 let mut refs: Vec<travsr_core::ScipRef> = Vec::new();
-                                let tsconfig = repo_root.join("tsconfig.json");
-                                if tsconfig.exists() {
-                                    match travsr_indexer::run_lsif_emitter(&tsconfig) {
+                                // Every project's own tsconfig, not only a root one:
+                                // `typescript/tsconfig.json` (or a CommonJS
+                                // `javascript/tsconfig.json` whose `module` settings
+                                // the synthesized pass below lacks) one level down
+                                // was never read. Nested projects under a root
+                                // tsconfig collapse onto it, as build roots do.
+                                let mut ts_roots = build_roots(
+                                    repo_root,
+                                    item.files.as_deref().unwrap_or(&[]),
+                                    TSCONFIG,
+                                );
+                                if ts_roots.is_empty() && repo_root.join("tsconfig.json").exists() {
+                                    ts_roots.push(repo_root.to_path_buf());
+                                }
+                                for ts_root in &ts_roots {
+                                    let tsconfig = ts_root.join("tsconfig.json");
+                                    match travsr_indexer::run_lsif_emitter_with_root(
+                                        &tsconfig, repo_root,
+                                    ) {
                                         Ok(dump) => {
                                             match travsr_indexer::ingest_lsif_g2(&dump, corpus) {
                                                 Ok(g2) => {
@@ -923,8 +1027,129 @@ impl PluginIndexer {
                                                 Err(e) => tracing::warn!("ts lsif ingest: {e}"),
                                             }
                                         }
+                                        // #878: a failure to *start* the emitter and
+                                        // one that ran and failed have different
+                                        // fixes, so they are recorded apart; the
+                                        // daemon turns both into the disclosed skip.
                                         Err(e) => {
-                                            tracing::debug!("ts lsif emitter not available: {e}")
+                                            let missing = travsr_indexer::emitter_missing(&e);
+                                            if missing {
+                                                tracing::debug!("ts lsif emitter not available: {e}");
+                                            } else {
+                                                tracing::warn!("ts lsif emitter failed: {e:#}");
+                                            }
+                                            travsr_indexer::sandbox::record_lsif_emitter_skip(
+                                                "typescript",
+                                                missing,
+                                                format!("{e:#}"),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // #833: `.js`/`.jsx`/`.mjs`/`.cjs` classify as
+                                // TypeScript, so they arrive in this work item. The
+                                // project tsconfig above (if any) only resolves them
+                                // when it sets `allowJs`, which plain-JS / CommonJS
+                                // repos never do — and most ship no tsconfig at all.
+                                // Run a second pass over a synthesized allowJs
+                                // tsconfig covering exactly this repo's JS files so
+                                // they get real cross-file semantic refs instead of
+                                // only tree-sitter heuristics. With no project
+                                // tsconfig at all, the TypeScript files join the
+                                // same pass, or they would get no compiler pass.
+                                // It is a no-op when nothing is left to cover, and
+                                // its writes are idempotent where a real allowJs
+                                // tsconfig already covered them.
+                                //
+                                // `item.files` is None only on the legacy
+                                // "sidecar walks itself" protocol path; every
+                                // `init --semantic` supplies indexable_paths,
+                                // so the JS pass simply does not run there.
+                                if let Some(rel_files) = item.files.as_ref() {
+                                    let js_abs: Vec<std::path::PathBuf> = rel_files
+                                        .iter()
+                                        .filter(|r| {
+                                            std::path::Path::new(r.as_str())
+                                                .extension()
+                                                .and_then(|e| e.to_str())
+                                                .is_some_and(|e| {
+                                                    travsr_indexer::JS_EXTENSIONS.contains(&e)
+                                                        || (ts_roots.is_empty()
+                                                            && ["ts", "tsx", "mts", "cts"]
+                                                                .contains(&e))
+                                                })
+                                        })
+                                        .map(|r| repo_root.join(r))
+                                        .collect();
+                                    let covers_ts = ts_roots.is_empty()
+                                        && js_abs.iter().any(|p| {
+                                            p.extension().and_then(|e| e.to_str()).is_some_and(
+                                                |e| ["ts", "tsx", "mts", "cts"].contains(&e),
+                                            )
+                                        });
+                                    match travsr_indexer::synthesize_js_tsconfig(&js_abs) {
+                                        Ok(Some((_scratch, synth_tsconfig))) => {
+                                            match travsr_indexer::run_lsif_emitter_with_root(
+                                                &synth_tsconfig,
+                                                repo_root,
+                                            ) {
+                                                Ok(dump) => {
+                                                    match travsr_indexer::ingest_lsif_g2(
+                                                        &dump, corpus,
+                                                    ) {
+                                                        Ok(g2) => {
+                                                            tracing::debug!(
+                                                                refs = g2.refs.len(),
+                                                                "Phase B: js synthesized-tsconfig lsif refs merged"
+                                                            );
+                                                            refs.extend(g2.refs);
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!("js lsif ingest: {e}");
+                                                            if covers_ts {
+                                                                travsr_indexer::sandbox::record_lsif_emitter_skip(
+                                                                    "typescript",
+                                                                    false,
+                                                                    format!("{e:#}"),
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                // Only a failure to *start* the
+                                                // emitter is "not available".
+                                                // One that ran and failed (a
+                                                // pre-`--root` emitter hits
+                                                // SEC-003 here) is a real fault
+                                                // and must be visible at
+                                                // default verbosity, stderr
+                                                // head included.
+                                                Err(e)
+                                                    if travsr_indexer::emitter_missing(&e) =>
+                                                {
+                                                    tracing::debug!(
+                                                        "js lsif emitter not available: {e}"
+                                                    )
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("js lsif emitter failed: {e:#}");
+                                                    // With no tsconfig this pass is
+                                                    // TypeScript's only one, so its
+                                                    // failure is TypeScript's too.
+                                                    if covers_ts {
+                                                        travsr_indexer::sandbox::record_lsif_emitter_skip(
+                                                            "typescript",
+                                                            false,
+                                                            format!("{e:#}"),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => {
+                                            tracing::warn!("js synthetic tsconfig: {e}")
                                         }
                                     }
                                 }
@@ -958,6 +1183,7 @@ impl PluginIndexer {
                                     skipped_no_analyzer: false,
                                     crashed: false,
                                     version_mismatch: None,
+                                    diagnostics: Vec::new(),
                                 }
                             }
                             LangWork::NativePython => {
@@ -1037,138 +1263,146 @@ impl PluginIndexer {
                                     skipped_no_analyzer: false,
                                     crashed: false,
                                     version_mismatch: None,
+                                    diagnostics: Vec::new(),
                                 }
                             }
-                            LangWork::Sidecar(spec) => {
-                                // #388: both the spawn handshake and the invoke
-                                // round-trip are now watchdog-guarded inside the
-                                // transport (HANDSHAKE_TIMEOUT_SECS / INVOKE_TIMEOUT_SECS),
-                                // so a wedged plugin is killed and surfaced as a
-                                // crash instead of hanging this scoped thread — no
-                                // bespoke timeout needed here.
-                                let req = travsr_plugin_protocol::InvokeRequest {
-                                    // Strip the Windows `\\?\` verbatim prefix ONCE here,
-                                    // for every sidecar: the daemon's repo_root is
-                                    // canonicalized (extended-length) on Windows, and
-                                    // analyzers that build a URI / working-directory from
-                                    // it (scip-dotnet, sbt, KLS) choke on the prefix. This
-                                    // is the systemic counterpart to the per-wrapper strips
-                                    // (kotlin K7, scala S7, csharp) — belt and suspenders.
-                                    root: crate::sandbox::toolchain::strip_windows_verbatim(
-                                        repo_root.to_path_buf(),
-                                    ),
-                                    corpus: corpus.to_string(),
-                                    scratch: std::path::PathBuf::default(),
-                                    // P6 (#329): forward pre-walked file list so the
-                                    // sidecar skips its own directory walk.
-                                    files: item.files,
+                            LangWork::Sidecar(spec, invoke_roots) => {
+                                // #724 Finding 5: one invoke per build root, in
+                                // sequence. Sibling projects are separate builds,
+                                // so each gets its own analyzer run, and each
+                                // reports paths relative to its own root. The
+                                // per-root outcomes fold into one result here so
+                                // the merge below still sees one entry per
+                                // language.
+                                let mut acc = LangResult {
+                                    lang: lang.clone(),
+                                    nodes: Vec::new(),
+                                    edges: Vec::new(),
+                                    refs: Vec::new(),
+                                    unresolved_calls: Vec::new(),
+                                    positional_refs: Vec::new(),
+                                    ran: false,
+                                    skipped_no_analyzer: false,
+                                    crashed: false,
+                                    version_mismatch: None,
+                                    diagnostics: Vec::new(),
                                 };
-                                match crate::transport::Sidecar::spawn(&spec, repo_root) {
-                                    Ok(sidecar) => {
-                                        let result = match crate::transport::Transport::invoke_phase_b(
-                                            &sidecar, req,
-                                        ) {
-                                            Ok(resp) => {
-                                                tracing::debug!(
-                                                    lang = %lang,
-                                                    nodes = resp.nodes.len(),
-                                                    edges = resp.edges.len(),
-                                                    refs = resp.refs.len(),
-                                                    unresolved_calls = resp.unresolved_calls.len(),
-                                                    "Phase B: invoke complete"
-                                                );
-                                                LangResult {
-                                                    lang,
-                                                    nodes: resp.nodes,
-                                                    edges: resp.edges,
-                                                    refs: resp.refs,
-                                                    unresolved_calls: resp.unresolved_calls,
-                                                    positional_refs: Vec::new(),
-                                                    ran: true,
-                                                    skipped_no_analyzer: false,
-                                                    crashed: false,
-                                                    version_mismatch: None,
-                                                }
-                                            }
-                                            Err(travsr_error::IndexError::PhaseNotSupported) => {
-                                                tracing::debug!(
-                                                    lang = %lang,
-                                                    "Phase B: PhaseNotSupported (sidecar declined)"
-                                                );
-                                                LangResult {
-                                                    lang,
-                                                    nodes: Vec::new(),
-                                                    edges: Vec::new(),
-                                                    refs: Vec::new(),
-                                                    unresolved_calls: Vec::new(),
-                                                    positional_refs: Vec::new(),
-                                                    ran: false,
-                                                    skipped_no_analyzer: true,
-                                                    crashed: false,
-                                                    version_mismatch: None,
-                                                }
-                                            }
-                                            // H4: version mismatch is actionable — surface it
-                                            // separately from generic crashes so the user knows
-                                            // to run `travsr lang install <lang>` to upgrade.
-                                            Err(travsr_error::IndexError::ProtocolVersionMismatch {
-                                                expected,
-                                                got,
-                                            }) => {
-                                                tracing::warn!(
-                                                    lang = %lang,
-                                                    expected,
-                                                    got,
-                                                    "Phase B: protocol version mismatch; run `travsr lang install {lang}` to upgrade"
-                                                );
-                                                LangResult {
-                                                    lang,
-                                                    nodes: Vec::new(),
-                                                    edges: Vec::new(),
-                                                    refs: Vec::new(),
-                                                    unresolved_calls: Vec::new(),
-                                                    positional_refs: Vec::new(),
-                                                    ran: false,
-                                                    skipped_no_analyzer: false,
-                                                    crashed: false,
-                                                    version_mismatch: Some((expected, got)),
-                                                }
-                                            }
+                                let mut declined = 0usize;
+                                for invoke_root in &invoke_roots {
+                                    // What this root reports paths relative to.
+                                    // Empty when it IS the repo root, which is
+                                    // every language that drives no build system.
+                                    let path_prefix = invoke_root
+                                        .strip_prefix(repo_root)
+                                        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                                        .unwrap_or_default();
+                                    // Only this root's own sources: the others are
+                                    // covered by their own invoke, and naming them
+                                    // here would index them twice.
+                                    let under = format!("{path_prefix}/");
+                                    let files = item.files.as_ref().map(|all| {
+                                        all.iter()
+                                            .filter(|p| {
+                                                path_prefix.is_empty() || p.starts_with(&under)
+                                            })
+                                            .cloned()
+                                            .collect()
+                                    });
+                                    // #388: both the spawn handshake and the invoke
+                                    // round-trip are now watchdog-guarded inside the
+                                    // transport (HANDSHAKE_TIMEOUT_SECS / INVOKE_TIMEOUT_SECS),
+                                    // so a wedged plugin is killed and surfaced as a
+                                    // crash instead of hanging this scoped thread. The
+                                    // ceiling is per invoke, so N roots cost up to N
+                                    // times the single-root budget.
+                                    let req = travsr_plugin_protocol::InvokeRequest {
+                                        // Strip the Windows `\\?\` verbatim prefix ONCE here,
+                                        // for every sidecar: the daemon's repo_root is
+                                        // canonicalized (extended-length) on Windows, and
+                                        // analyzers that build a URI / working-directory from
+                                        // it (scip-dotnet, sbt, KLS) choke on the prefix. This
+                                        // is the systemic counterpart to the per-wrapper strips
+                                        // (kotlin K7, scala S7, csharp) — belt and suspenders.
+                                        root: crate::sandbox::toolchain::strip_windows_verbatim(
+                                            invoke_root.clone(),
+                                        ),
+                                        corpus: corpus.to_string(),
+                                        scratch: std::path::PathBuf::default(),
+                                        // P6 (#329): forward pre-walked file list so the
+                                        // sidecar skips its own directory walk.
+                                        files,
+                                    };
+                                    // The sandbox is anchored at the root the
+                                    // analyzer runs in, a subtree of the repo, so
+                                    // a repo-write grant (scip-php's `index.scip`,
+                                    // sbt's `target/`) lands where the analyzer
+                                    // writes. At the repo root, `php/index.scip`
+                                    // was denied and the index silently empty.
+                                    let sidecar =
+                                        match crate::transport::Sidecar::spawn(&spec, invoke_root) {
+                                            Ok(sidecar) => sidecar,
                                             Err(e) => {
-                                                tracing::warn!("Phase B {lang}: {e}");
-                                                LangResult {
-                                                    lang,
-                                                    nodes: Vec::new(),
-                                                    edges: Vec::new(),
-                                                    refs: Vec::new(),
-                                                    unresolved_calls: Vec::new(),
-                                                    positional_refs: Vec::new(),
-                                                    ran: false,
-                                                    skipped_no_analyzer: false,
-                                                    crashed: true,
-                                                    version_mismatch: None,
-                                                }
+                                                // Resolver confirmed the binary exists — spawn failure is a crash.
+                                                tracing::warn!("Phase B sidecar spawn {lang}: {e}");
+                                                acc.crashed = true;
+                                                continue;
                                             }
                                         };
-                                        result
-                                    }
-                                    Err(e) => {
-                                        // Resolver confirmed the binary exists — spawn failure is a crash.
-                                        tracing::warn!("Phase B sidecar spawn {lang}: {e}");
-                                        LangResult {
-                                            lang,
-                                            nodes: Vec::new(),
-                                            edges: Vec::new(),
-                                            refs: Vec::new(),
-                                            unresolved_calls: Vec::new(),
-                                            positional_refs: Vec::new(),
-                                            ran: false,
-                                            skipped_no_analyzer: false,
-                                            crashed: true,
-                                            version_mismatch: None,
+                                    match crate::transport::Transport::invoke_phase_b(&sidecar, req)
+                                    {
+                                        Ok(mut resp) => {
+                                            if !path_prefix.is_empty() {
+                                                rebase_to_repo_root(&mut resp, &path_prefix);
+                                            }
+                                            tracing::debug!(
+                                                lang = %lang,
+                                                root = %invoke_root.display(),
+                                                nodes = resp.nodes.len(),
+                                                edges = resp.edges.len(),
+                                                refs = resp.refs.len(),
+                                                unresolved_calls = resp.unresolved_calls.len(),
+                                                "Phase B: invoke complete"
+                                            );
+                                            acc.ran = true;
+                                            acc.nodes.extend(resp.nodes);
+                                            acc.edges.extend(resp.edges);
+                                            acc.refs.extend(resp.refs);
+                                            acc.unresolved_calls.extend(resp.unresolved_calls);
+                                            acc.diagnostics.extend(resp.diagnostics);
+                                        }
+                                        Err(travsr_error::IndexError::PhaseNotSupported) => {
+                                            declined += 1;
+                                            tracing::debug!(
+                                                lang = %lang,
+                                                "Phase B: PhaseNotSupported (sidecar declined)"
+                                            );
+                                        }
+                                        // H4: version mismatch is actionable — surface it
+                                        // separately from generic crashes so the user knows
+                                        // to run `travsr lang install <lang>` to upgrade.
+                                        Err(travsr_error::IndexError::ProtocolVersionMismatch {
+                                            expected,
+                                            got,
+                                        }) => {
+                                            tracing::warn!(
+                                                lang = %lang,
+                                                expected,
+                                                got,
+                                                "Phase B: protocol version mismatch; run `travsr lang install {lang}` to upgrade"
+                                            );
+                                            acc.version_mismatch.get_or_insert((expected, got));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Phase B {lang}: {e}");
+                                            acc.crashed = true;
                                         }
                                     }
                                 }
+                                // "No analyzer" only when EVERY root declined: one
+                                // root answering proves the sidecar implements
+                                // Phase B for this language.
+                                acc.skipped_no_analyzer = declined == invoke_roots.len();
+                                acc
                             }
                         };
                         // No explicit `finish` here: `_mark` runs it on the way
@@ -1193,6 +1427,7 @@ impl PluginIndexer {
                         skipped_no_analyzer: false,
                         crashed: true,
                         version_mismatch: None,
+                        diagnostics: Vec::new(),
                     })
                 })
                 .collect()
@@ -1209,7 +1444,49 @@ impl PluginIndexer {
         let mut all_unresolved: Vec<travsr_core::UnresolvedCall> = Vec::new();
         let mut all_positional_refs: Vec<travsr_core::LsifPositionalRef> = Vec::new();
 
-        for r in lang_results {
+        for mut r in lang_results {
+            // #904: keep the sidecar's own account of the run. Warnings only:
+            // an `Info` record is advice for the log, not a state of the index.
+            // Sanitized and bounded the way the transport treats a record
+            // before logging it, since this copy outlives the run. One record
+            // per (language, code): with N build roots and one missing SDK the
+            // sidecar reports the same thing N times, which would print N times
+            // and could fill the cap ahead of another language's record.
+            for d in std::mem::take(&mut r.diagnostics) {
+                if outcome.diagnostics.len() >= MAX_PERSISTED_DIAGNOSTICS {
+                    break;
+                }
+                if matches!(d.severity, travsr_plugin_protocol::DiagnosticSeverity::Info) {
+                    continue;
+                }
+                let code = if crate::transport::is_diagnostic_code(&d.code) {
+                    d.code.clone()
+                } else {
+                    "plugin.invalid-code".to_string()
+                };
+                if outcome
+                    .diagnostics
+                    .iter()
+                    .any(|kept| kept.lang == r.lang && kept.code == code)
+                {
+                    continue;
+                }
+                outcome.diagnostics.push(SidecarDiagnostic {
+                    lang: r.lang.clone(),
+                    code,
+                    message: crate::transport::sanitize_diagnostic(
+                        &d.message,
+                        crate::transport::MAX_DIAGNOSTIC_MESSAGE_BYTES,
+                    ),
+                });
+            }
+            // #724 Finding 5: with N build roots one can fail while another
+            // succeeds, so `crashed` is recorded outside the `else` ladder and a
+            // partial run reports as both ran and crashed rather than clean
+            // (#877). One root behaves exactly as before: never both.
+            if r.crashed {
+                outcome.crashed.push(r.lang.clone());
+            }
             if r.ran {
                 // #712: Phase B only invokes languages present in the repo, so a
                 // clean run that yields nothing means the analyzer indexed
@@ -1241,8 +1518,6 @@ impl PluginIndexer {
                 outcome.version_mismatch.push((r.lang, expected, got));
             } else if r.skipped_no_analyzer {
                 outcome.skipped_no_analyzer.push(r.lang);
-            } else if r.crashed {
-                outcome.crashed.push(r.lang);
             }
             all_nodes.extend(r.nodes);
             all_edges.extend(r.edges);
@@ -1320,6 +1595,129 @@ impl PluginIndexer {
     }
 }
 
+/// Re-express a sidecar response's paths against the repo root.
+///
+/// A sidecar invoked at a nested build root reports paths relative to THAT
+/// directory, so `src/main/java/App.java` names a file the graph knows as
+/// `screengrab/src/main/java/App.java` and unifies with no Phase A node.
+/// Prefixing restores the repo-root-relative form every other producer emits.
+///
+/// A node's id is derived from its VName, so correcting the path changes the id:
+/// every id in the response that pointed at a rewritten node is remapped with
+/// it, keeping the batch internally consistent.
+fn rebase_to_repo_root(resp: &mut travsr_plugin_protocol::InvokeResponse, prefix: &str) {
+    let mut remap: HashMap<travsr_core::NodeId, travsr_core::NodeId> = HashMap::new();
+    for node in &mut resp.nodes {
+        let before = node.id;
+        node.vname.path = format!("{prefix}/{}", node.vname.path);
+        node.id = node.vname.id();
+        remap.insert(before, node.id);
+    }
+    for edge in &mut resp.edges {
+        if let Some(id) = remap.get(&edge.src) {
+            edge.src = *id;
+        }
+        if let Some(id) = remap.get(&edge.dst) {
+            edge.dst = *id;
+        }
+    }
+    for scip_ref in &mut resp.refs {
+        scip_ref.caller_path = format!("{prefix}/{}", scip_ref.caller_path);
+        if let Some(id) = remap.get(&scip_ref.callee_id) {
+            scip_ref.callee_id = *id;
+        }
+    }
+    for call in &mut resp.unresolved_calls {
+        if let Some(id) = remap.get(&call.src) {
+            call.src = *id;
+        }
+    }
+}
+
+/// The manifest that makes a directory a TypeScript/JavaScript project root.
+const TSCONFIG: &[&str] = &["tsconfig.json"];
+
+/// The directories a build-system-driven analyzer should be invoked in: every
+/// directory at or below `repo_root` that holds one of `manifests`, is an
+/// ancestor of one of `files` (repo-root-relative paths), and is not itself
+/// inside another such directory.
+///
+/// Outermost wins, so a multi-module build is handed its aggregator manifest
+/// once rather than once per module: invoking `a/module1` as well as `a` would
+/// index the same sources twice. Sibling projects with no manifest above them
+/// (`a/pom.xml` and `b/pom.xml`) are genuinely separate builds, so both are
+/// returned and the caller invokes the analyzer once per root.
+///
+/// Empty when `manifests` is empty (the language does not drive a build), when
+/// there is no pre-walked file list, or when nothing qualifies; the caller then
+/// falls back to the repo root, which is the behaviour that shipped.
+/// The files that may mark a build root. A `.h` is language `c` by extension,
+/// but a header alone does not make its directory a C project: headers in a
+/// `cpp/` or `objc/` project made those C roots, and the c analyzer then ran on
+/// their compilation databases until it timed out.
+fn root_sources(files: &[String]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| !f.ends_with(".h"))
+        .cloned()
+        .collect()
+}
+
+fn build_roots(repo_root: &Path, files: &[String], manifests: &[&str]) -> Vec<PathBuf> {
+    if manifests.is_empty() {
+        return Vec::new();
+    }
+    let mut walked: HashSet<PathBuf> = HashSet::new();
+    let mut found: Vec<PathBuf> = Vec::new();
+    for rel in files {
+        let mut dir = repo_root.join(rel);
+        // First `pop` drops the file name; the walk then stops once it steps
+        // above `repo_root`, so discovery never leaves the indexed repo.
+        while dir.pop() && dir.starts_with(repo_root) {
+            // Every ancestor of an already-walked directory is walked too, so
+            // this bounds the whole scan to one manifest probe per directory.
+            if !walked.insert(dir.clone()) {
+                break;
+            }
+            if manifests.iter().any(|m| dir.join(m).is_file()) {
+                found.push(dir.clone());
+            }
+        }
+    }
+    // Sorting puts every ancestor immediately before the directories it
+    // contains, so one pass keeps the outermost of each nest and drops the
+    // rest. It also makes the invoke order deterministic.
+    found.sort();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for dir in found {
+        if !roots.iter().any(|root| dir.starts_with(root)) || is_own_cargo_workspace(&dir) {
+            roots.push(dir);
+        }
+    }
+    roots
+}
+
+/// A `Cargo.toml` with its own `[workspace]` table is a separate cargo project
+/// even inside another one, which rust-analyzer run at the outer root never
+/// loads. Only one that uses nothing outside its folder gets a run of its own:
+/// cargo-fuzz's `fuzz/` depends on the crates above it, so a second run there
+/// re-reads them all (41 s and a 70 MB dump on travsr, for four fuzz targets).
+fn is_own_cargo_workspace(dir: &Path) -> bool {
+    fn reaches_out(v: &toml::Value) -> bool {
+        match v {
+            toml::Value::Table(t) => t.iter().any(|(k, v)| {
+                (k == "path" && v.as_str().is_some_and(|p| p.starts_with(".."))) || reaches_out(v)
+            }),
+            toml::Value::Array(a) => a.iter().any(reaches_out),
+            _ => false,
+        }
+    }
+    std::fs::read_to_string(dir.join("Cargo.toml"))
+        .ok()
+        .and_then(|s| s.parse::<toml::Value>().ok())
+        .is_some_and(|t| t.get("workspace").is_some() && !reaches_out(&t))
+}
+
 /// Locate the repo whose `.travsr/config.toml` governs `abs_path`, by walking
 /// up from the file being indexed until a `.travsr` directory appears (#376 O1).
 ///
@@ -1360,15 +1758,21 @@ mod tests {
     fn an_empty_result_is_classified_by_what_the_analyzer_could_have_produced() {
         use super::{classify_empty_output, EmptyOutput};
 
-        // #712, unchanged: nothing at all, from anyone.
+        // #712: nothing at all from an analyzer that emits its own definitions.
         assert_eq!(
             classify_empty_output("java", true, true),
             EmptyOutput::NoNodes
         );
-        assert_eq!(
-            classify_empty_output("rust", true, true),
-            EmptyOutput::NoNodes
-        );
+        // A native analyzer never emits definitions and extracts call sites
+        // in-process, so nothing at all means the files have no calls. A repo
+        // like that was told its calls could not be traced.
+        for native in ["rust", "typescript", "javascript", "python"] {
+            assert_eq!(
+                classify_empty_output(native, true, true),
+                EmptyOutput::Fine,
+                "{native}: no calls is not a failure"
+            );
+        }
 
         // #724: definitions and no occurrences, from an analyzer that cannot
         // legitimately return that. This is scip-java's shape.
@@ -1397,6 +1801,261 @@ mod tests {
         for lang in ["java", "rust", "dart", "go"] {
             assert_eq!(classify_empty_output(lang, false, false), EmptyOutput::Fine);
         }
+    }
+
+    /// An sbt project one level down is handed its own directory, so the
+    /// SemanticDB paths it reports are rebased to the repo root. Invoked at the
+    /// repo root, they landed as `src/Animal.scala` ghost nodes.
+    #[test]
+    fn scala_is_invoked_at_its_sbt_directory() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("scala/src")).expect("mkdir");
+        std::fs::write(root.join("scala/build.sbt"), "").expect("write");
+        let files = vec!["scala/src/Animal.scala".to_string()];
+        assert_eq!(
+            build_roots(
+                root,
+                &files,
+                crate::phase_b::catalog::build_manifests("scala")
+            ),
+            vec![root.join("scala")]
+        );
+    }
+
+    /// A Go module one level down is handed its own directory: scip-go invoked
+    /// at the repo root emitted an empty index for `go/go.mod`, and status
+    /// blamed a missing Go toolchain.
+    #[test]
+    fn go_is_invoked_at_its_module_directory() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("go")).expect("mkdir");
+        std::fs::write(root.join("go/go.mod"), "module x\n").expect("write");
+        let files = vec!["go/main.go".to_string()];
+        assert_eq!(
+            build_roots(root, &files, crate::phase_b::catalog::build_manifests("go")),
+            vec![root.join("go")]
+        );
+    }
+
+    /// scip-php reads `composer.json` from the directory it runs in; invoked at
+    /// the repo root it failed on `<repo>/composer.json` for a `php/` project.
+    #[test]
+    fn php_is_invoked_at_its_composer_directory() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("php/src")).expect("mkdir");
+        std::fs::write(root.join("php/composer.json"), "{}").expect("write");
+        let files = vec!["php/src/main.php".to_string()];
+        assert_eq!(
+            build_roots(
+                root,
+                &files,
+                crate::phase_b::catalog::build_manifests("php")
+            ),
+            vec![root.join("php")]
+        );
+    }
+
+    /// scip-clang reads the compile_commands.json of the directory it runs in;
+    /// a `c/` project with its own compdb was skipped because only the repo
+    /// root was probed. The outermost compdb wins over a build-dir copy, and a
+    /// repo with no compdb anywhere has no root, which is what skips it.
+    #[test]
+    fn c_is_invoked_at_its_compile_commands_directory() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let files = vec!["c/src/main.c".to_string()];
+        let c = crate::phase_b::catalog::build_manifests("c");
+        std::fs::create_dir_all(root.join("c/src")).expect("mkdir");
+        std::fs::create_dir_all(root.join("c/build")).expect("mkdir");
+        assert!(build_roots(root, &files, c).is_empty());
+
+        std::fs::write(root.join("c/compile_commands.json"), "[]").expect("write");
+        std::fs::write(root.join("c/build/compile_commands.json"), "[]").expect("write");
+        assert_eq!(build_roots(root, &files, c), vec![root.join("c")]);
+    }
+
+    /// A `.h` is language `c` by extension, so headers in `cpp/` and `objc/`
+    /// made those directories C build roots too, and the c sidecar ran on the
+    /// Objective-C compilation database until the invoke timeout (`crashed:c`).
+    /// A header alone does not mark a C project.
+    #[test]
+    fn a_header_alone_does_not_make_a_c_build_root() {
+        use super::{build_roots, root_sources};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for d in ["c/src", "objc/App"] {
+            std::fs::create_dir_all(root.join(d)).expect("mkdir");
+        }
+        for f in ["c/compile_commands.json", "objc/compile_commands.json"] {
+            std::fs::write(root.join(f), "[]").expect("write");
+        }
+        let files = vec!["c/src/main.c".to_string(), "objc/App/Animal.h".to_string()];
+        assert_eq!(
+            build_roots(
+                root,
+                &root_sources(&files),
+                crate::phase_b::catalog::build_manifests("c")
+            ),
+            vec![root.join("c")]
+        );
+    }
+
+    /// Each TypeScript/JavaScript project is handed its own tsconfig: a
+    /// `typescript/tsconfig.json` or a CommonJS `javascript/tsconfig.json` one
+    /// level down was never read, so neither project got LSIF references.
+    #[test]
+    fn each_tsconfig_directory_is_a_typescript_root() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for d in ["typescript", "javascript"] {
+            std::fs::create_dir_all(root.join(d).join("src")).expect("mkdir");
+            std::fs::write(root.join(d).join("tsconfig.json"), "{}").expect("write");
+        }
+        let files = vec![
+            "typescript/src/main.ts".to_string(),
+            "javascript/src/main.js".to_string(),
+        ];
+        assert_eq!(
+            build_roots(root, &files, TSCONFIG),
+            vec![root.join("javascript"), root.join("typescript")]
+        );
+    }
+
+    /// yugabyte-db's Rust is two cargo workspaces under
+    /// `src/postgres/third-party-extensions/` with no `Cargo.toml` at the repo
+    /// root, so rust-analyzer handed the root said "no projects" and Rust got
+    /// no cross-file calls. Each outermost cargo directory is a root instead.
+    #[test]
+    fn rust_roots_are_the_outermost_cargo_directories() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for dir in ["ext/pgrx/pgrx-macros/src", "ext/pgrx/src", "ext/gw/src"] {
+            std::fs::create_dir_all(root.join(dir)).expect("mkdir");
+        }
+        for manifest in ["ext/pgrx", "ext/pgrx/pgrx-macros", "ext/gw"] {
+            std::fs::write(root.join(manifest).join("Cargo.toml"), "").expect("write");
+        }
+        let files = vec![
+            "ext/pgrx/pgrx-macros/src/lib.rs".to_string(),
+            "ext/pgrx/src/lib.rs".to_string(),
+            "ext/gw/src/main.rs".to_string(),
+        ];
+        assert_eq!(
+            build_roots(
+                root,
+                &files,
+                crate::phase_b::catalog::build_manifests("rust")
+            ),
+            vec![root.join("ext/gw"), root.join("ext/pgrx")]
+        );
+    }
+
+    /// PR #940 review: a nested cargo project with its own `[workspace]` is
+    /// not loaded by rust-analyzer at the outer root, so it needs a root of its
+    /// own. A plain member does not, and neither does cargo-fuzz's `fuzz/`,
+    /// which reaches into the crates above it.
+    #[test]
+    fn a_nested_cargo_workspace_is_its_own_rust_root() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for dir in ["src", "core/src", "fuzz/fuzz_targets", "tool/src"] {
+            std::fs::create_dir_all(root.join(dir)).expect("mkdir");
+        }
+        let write = |rel: &str, text: &str| std::fs::write(root.join(rel), text).expect("write");
+        write("Cargo.toml", "[workspace]\nmembers = [\"core\"]\n");
+        write("core/Cargo.toml", "[package]\nname = \"core\"\n");
+        write(
+            "fuzz/Cargo.toml",
+            "[package]\nname = \"fuzz\"\n[dependencies]\ncore = { path = \"../core\" }\n\
+             [workspace]\nmembers = [\".\"]\n[[bin]]\nname = \"a\"\npath = \"fuzz_targets/a.rs\"\n",
+        );
+        write(
+            "tool/Cargo.toml",
+            "[package]\nname = \"tool\"\n[workspace]\n",
+        );
+        let files = vec![
+            "core/src/lib.rs".to_string(),
+            "fuzz/fuzz_targets/a.rs".to_string(),
+            "tool/src/main.rs".to_string(),
+        ];
+        assert_eq!(
+            build_roots(
+                root,
+                &files,
+                crate::phase_b::catalog::build_manifests("rust")
+            ),
+            vec![root.to_path_buf(), root.join("tool")]
+        );
+    }
+
+    /// #724 Finding 5: the directory a build-driven analyzer is handed.
+    #[test]
+    fn build_roots_are_the_outermost_manifest_directories_above_the_source_files() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let java = ["pom.xml"];
+        let no_roots: Vec<std::path::PathBuf> = Vec::new();
+
+        // No manifest anywhere: the caller falls back to the repo root.
+        std::fs::create_dir_all(root.join("screengrab/src/main/java")).expect("mkdir");
+        let files = vec!["screengrab/src/main/java/App.java".to_string()];
+        assert_eq!(build_roots(root, &files, &java), no_roots);
+
+        // Manifest one level down: that directory, not the repo root.
+        std::fs::write(root.join("screengrab/pom.xml"), "").expect("write");
+        assert_eq!(
+            build_roots(root, &files, &java),
+            vec![root.join("screengrab")]
+        );
+
+        // A module manifest below it does not add a second root: the aggregator
+        // drives its own modules, so invoking both would index them twice.
+        std::fs::write(root.join("screengrab/src/pom.xml"), "").expect("write");
+        assert_eq!(
+            build_roots(root, &files, &java),
+            vec![root.join("screengrab")]
+        );
+
+        // A language with no manifest list is never rebased.
+        assert_eq!(build_roots(root, &files, &[]), no_roots);
+
+        // Siblings with nothing above them are separate builds: one root each.
+        std::fs::create_dir_all(root.join("a/src")).expect("mkdir");
+        std::fs::create_dir_all(root.join("b/src")).expect("mkdir");
+        std::fs::write(root.join("a/pom.xml"), "").expect("write");
+        std::fs::write(root.join("b/pom.xml"), "").expect("write");
+        let siblings = vec!["a/src/App.java".to_string(), "b/src/App.java".to_string()];
+        assert_eq!(
+            build_roots(root, &siblings, &java),
+            vec![root.join("a"), root.join("b")]
+        );
+
+        // A manifest at the repo root subsumes both siblings again.
+        std::fs::write(root.join("pom.xml"), "").expect("write");
+        assert_eq!(
+            build_roots(root, &siblings, &java),
+            vec![root.to_path_buf()]
+        );
     }
 
     use super::*;

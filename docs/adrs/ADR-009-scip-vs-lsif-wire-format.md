@@ -1,5 +1,7 @@
 # ADR-009: SCIP vs LSIF as Wire Format for Semantic Indexing
 
+> **Amended in part (2026-09-16):** pyright has never had LSIF output, and the `pyright --outputjson` adapter that stood in for it has been removed as dead code. Python's Phase B is native in-process analysis plus a bundled emitter. Every mention of pyright as a Python LSIF emitter below is the original text and is now wrong. See [Amendment (2026-09-16): the pyright Python path was removed](#amendment-2026-09-16-the-pyright-python-path-was-removed) at the end of this document.
+
 **Date:** 2026-05-27
 **Status:** Proposed
 **Phase:** 4 (Sprint 14)
@@ -212,3 +214,39 @@ The Principal Security Engineer's sign-off on `travsr-ingest` (per ADR-010 §sec
 - [SCIP `scip.proto`](https://github.com/sourcegraph/scip/blob/main/scip.proto)
 - [LSIF 0.6.0 specification](https://microsoft.github.io/language-server-protocol/specifications/lsif/0.6.0/specification/)
 - [prost protobuf library](https://github.com/tokio-rs/prost)
+
+---
+
+## Amendment (2026-09-16): the pyright Python path was removed
+
+pyright emits no LSIF and never has. What Travsr actually shipped for Python was
+an adapter over `pyright --outputjson` in
+`crates/travsr-indexer/src/python_lsif.rs`, and that adapter always returned an
+empty `ParseOutput`: `pyright --outputjson` carries only `version`, `time`,
+`generalDiagnostics` and `summary`, and `generalDiagnostics` entries are
+`{file, message, range, rule, severity}`. There are no symbols anywhere in that
+payload, so no node and no edge could ever be built from it. The adapter, its
+fuzz target, its CI setup action and its hash-locked pyright install have all
+been deleted.
+
+The original decision body above is kept as the decision record and is not
+retro-edited, so it still carries the wrong claim. Matched by text rather than
+line number, since line numbers move:
+
+| Stale text above | Correct today |
+|---|---|
+| "ships with three LSIF emitters ... and `pyright`'s LSIF output for Python" | two LSIF emitters (`tsc --lsif`, `rust-analyzer lsif`); Python never had one |
+| "`python.rs     ← LsifInvoker for pyright LSIF`" | no pyright invoker; Python does not go through an LSIF invoker at all |
+
+**What provides Python Phase B instead.** Two things, neither of them pyright:
+
+1. `crates/travsr-analysis/src/phase_b_python.rs`, native in-process tree-sitter
+   analysis with no spawned process, which produces `RefCall` and
+   `IsImplementation` edges.
+2. `packages/travsr-lsif-py`, a first-party bundled Node LSIF emitter, merged on
+   top when present.
+
+**The ADR's actual decision is unaffected.** This amendment corrects a factual
+claim in the Context section about what Python shipped with. It does not touch
+the SCIP versus LSIF choice, the dual-parser design, or the invoker dispatch
+model, all of which stand as written.

@@ -135,6 +135,31 @@ impl<Req: Send + 'static, Resp: Send + 'static> HookWorker<Req, Resp> {
     }
 }
 
+/// #510: how many times a sidecar has started serving this process's KNN hooks.
+///
+/// The daemon's warm `ask` cache needs a key component that moves when the
+/// served HNSW index is replaced. That index lives in the sidecar's memory, so
+/// no file the daemon can stat and no pragma it can read observes the swap; the
+/// host is the only party that knows, because the host performs it.
+///
+/// Process-global for the same reason [`crate::embed_paused`] is: the reader is
+/// the daemon's `handle_control_message`, which holds no supervisor. A process
+/// hosting sidecars for several repos would invalidate all their caches on any
+/// one respawn, which is conservative rather than wrong.
+static SERVING_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record that a freshly spawned sidecar is now the one answering KNN calls.
+fn note_sidecar_now_serving() {
+    SERVING_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// #510: the current serving generation. `0` until a sidecar has served, so it
+/// also separates "no embeddings configured" from "a sidecar has run here".
+/// Monotonic and compared for equality only.
+pub fn embed_serving_generation() -> u64 {
+    SERVING_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Manages the embed plugin subprocess for one daemon session.
 ///
 /// Created once at daemon startup. If the binary is not installed or the
@@ -177,6 +202,7 @@ impl EmbedSupervisor {
 
         match EmbedSidecar::spawn(binary, db_path, model_id) {
             Ok(sidecar) => {
+                note_sidecar_now_serving();
                 let model_id = sidecar.caps.model_id.clone();
                 tracing::info!(
                     model_id = %model_id,
@@ -456,6 +482,7 @@ impl EmbedSupervisor {
 
         match EmbedSidecar::spawn(binary, db_path, model_id) {
             Ok(new_sidecar) => {
+                note_sidecar_now_serving();
                 let mid = new_sidecar.caps.model_id.clone();
                 tracing::info!(model_id = %mid, attempt = self.respawn_count, "embed sidecar respawned");
                 self.model_id = Some(mid);
@@ -664,6 +691,45 @@ mod hook_worker_tests {
             (1..=4).contains(&HOOK_QUEUE_DEPTH),
             "HOOK_QUEUE_DEPTH is {HOOK_QUEUE_DEPTH}; deeper than a few slots means \
              queueing work whose caller has already timed out"
+        );
+    }
+}
+
+#[cfg(test)]
+mod serving_generation_tests {
+    use super::{embed_serving_generation, note_sidecar_now_serving, EmbedSupervisor};
+    use std::path::Path;
+
+    /// #510: the counter must advance exactly when a sidecar starts serving, and
+    /// not otherwise. Both halves live in one test because the counter is
+    /// process-global: split across two tests they would race each other.
+    ///
+    /// The negative half is the load-bearing one. `try_start` with no binary
+    /// installed serves nothing, so bumping there would move the `ask` cache key
+    /// on every daemon start of every machine without an embed plugin, for no
+    /// change in any answer.
+    #[test]
+    fn the_serving_generation_advances_only_when_a_sidecar_starts_serving() {
+        let before = embed_serving_generation();
+        note_sidecar_now_serving();
+        assert!(
+            embed_serving_generation() > before,
+            "a sidecar taking over the KNN hooks must move the generation, or a \
+             warm ask entry built from the previous HNSW index keeps hitting"
+        );
+
+        let quiet = embed_serving_generation();
+        let inactive = EmbedSupervisor::try_start(
+            Path::new("/nonexistent/travsr-embed-absent"),
+            Path::new("/nonexistent/.travsr/graph.db"),
+            "no-such-model",
+        );
+        assert!(!inactive.is_active());
+        assert_eq!(
+            embed_serving_generation(),
+            quiet,
+            "a supervisor that never started serves nothing and must not move \
+             the generation"
         );
     }
 }

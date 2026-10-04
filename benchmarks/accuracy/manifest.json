@@ -30,8 +30,8 @@
         },
         {
           "class": "caller-set",
-          "name": "callers of PaymentService",
-          "args": ["graph", "PaymentService", "--direction", "callers", "--format", "json", "--budget", "0"],
+          "name": "callers of PaymentService.charge",
+          "args": ["graph", "PaymentService.charge", "--direction", "callers", "--format", "json", "--budget", "0"],
           "self_path": "service.ts",
           "expect_files": ["controller.ts"]
         },

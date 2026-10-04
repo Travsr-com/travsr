@@ -28,7 +28,7 @@ jobs:
           - fuzz_lsif_ingest
           - fuzz_treesitter_indexer
           - fuzz_go_parser
-          - fuzz_pyright_lsif_parser
+          - fuzz_python_parser
           - fuzz_pcst_session
           # #376: the markdown chunker is hand-written string processing over
           # untrusted repo content (no grammar, no subprocess) and sits on the
@@ -95,7 +95,7 @@ jobs:
           fi
           gh issue create \
             --title "[fuzz] ${{ matrix.target }} found a panic ($(date -u +%Y-%m-%d))" \
-            --body "Fuzz target \`${{ matrix.target }}\` crashed during the nightly fuzz run.
+            --body "Fuzz target \`${{ matrix.target }}\` crashed in the \`${{ github.workflow }}\` workflow (event: ${{ github.event_name }}, ref: \`${{ github.ref_name }}\`). When the workflow is \`Release\`, this ran as a release-promotion gate for that tag, not as the nightly.
 
           **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 

@@ -205,7 +205,7 @@ fn extract_cargo_deps(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, V
     let root_doc: toml::Value = root_text.parse().context("parsing root Cargo.toml")?;
 
     // Collect all member Cargo.toml paths
-    let cargo_paths: Vec<PathBuf> = if let Some(members) = root_doc
+    let mut cargo_paths: Vec<PathBuf> = if let Some(members) = root_doc
         .get("workspace")
         .and_then(|w| w.get("members"))
         .and_then(|m| m.as_array())
@@ -237,8 +237,15 @@ fn extract_cargo_deps(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, V
             })
             .collect()
     } else {
-        vec![root_cargo]
+        vec![root_cargo.clone()]
     };
+
+    // A workspace root may also declare its own [package] (#893 C2). Without
+    // this the root package is never parsed, so it is emitted with an empty
+    // path and is indistinguishable from an external dependency.
+    if root_doc.get("package").is_some() && !cargo_paths.contains(&root_cargo) {
+        cargo_paths.push(root_cargo);
+    }
 
     // Parse each Cargo.toml: (pkg_name, rel_cargo_path, dep_names)
     let pkg_data: Vec<(String, String, Vec<String>)> = cargo_paths
@@ -354,6 +361,7 @@ fn extract_file_call_edges(
 
             // 1-based call-site line (issue #299). tree-sitter rows are 0-based.
             let occ_line = cap.node.start_position().row.saturating_add(1) as u32;
+            let occ_col = cap.node.start_position().column as u32;
 
             let Some((caller_fn, caller_impl)) = find_enclosing_fn(cap.node, source.as_slice())
             else {
@@ -405,6 +413,7 @@ fn extract_file_call_edges(
                         alt_callee_sig: None,
                         hint_crate: None,
                         caller_line: occ_line,
+                        caller_col: Some(occ_col),
                         is_method_call: true,
                         recv_type,
                     });
@@ -426,17 +435,18 @@ fn extract_file_call_edges(
                             // in another file, so a path-bound guessed id orphaned.
                             // Emit an UnresolvedCall with the precise qualified sig and
                             // let the daemon match `fn:{Type}.{method}` across all files.
-                            if !NOISE_NAMES.contains(&callee_name) {
-                                unresolved.push(UnresolvedCall {
-                                    src: caller_id,
-                                    callee_sig: format!("method:{qual}.{callee_name}"),
-                                    alt_callee_sig: None,
-                                    hint_crate: None,
-                                    caller_line: occ_line,
-                                    is_method_call: false,
-                                    recv_type: None,
-                                });
-                            }
+                            // No NOISE_NAMES filter here: the type makes even `new` or
+                            // `from` precise, and `Box::new` names no repo node.
+                            unresolved.push(UnresolvedCall {
+                                src: caller_id,
+                                callee_sig: format!("method:{qual}.{callee_name}"),
+                                alt_callee_sig: None,
+                                hint_crate: None,
+                                caller_line: occ_line,
+                                caller_col: Some(occ_col),
+                                is_method_call: false,
+                                recv_type: None,
+                            });
                         }
                         Some(ref qual) => {
                             // Lowercase qualifier → likely a crate/module path; emit UnresolvedCall
@@ -447,6 +457,7 @@ fn extract_file_call_edges(
                                     alt_callee_sig: None,
                                     hint_crate: Some(qual.clone()),
                                     caller_line: occ_line,
+                                    caller_col: Some(occ_col),
                                     is_method_call: false,
                                     recv_type: None,
                                 });
@@ -461,6 +472,7 @@ fn extract_file_call_edges(
                                     alt_callee_sig: None,
                                     hint_crate: None,
                                     caller_line: occ_line,
+                                    caller_col: Some(occ_col),
                                     is_method_call: false,
                                     recv_type: None,
                                 });
@@ -478,6 +490,7 @@ fn extract_file_call_edges(
                         alt_callee_sig: None,
                         hint_crate: None,
                         caller_line: occ_line,
+                        caller_col: Some(occ_col),
                         is_method_call: false,
                         recv_type: None,
                     });
@@ -524,6 +537,7 @@ fn extract_file_call_edges(
                         alt_callee_sig: None,
                         hint_crate: None,
                         caller_line: occ_line,
+                        caller_col: Some(occ_col),
                         is_method_call: false,
                         recv_type,
                     });
@@ -581,6 +595,7 @@ fn extract_macro_calls(
                 continue;
             }
             let occ_line = name_node.start_position().row.saturating_add(1) as u32;
+            let occ_col = name_node.start_position().column as u32;
             let Some((caller_fn, caller_impl)) = find_enclosing_fn(name_node, source) else {
                 continue;
             };
@@ -621,6 +636,7 @@ fn extract_macro_calls(
                 alt_callee_sig: None,
                 hint_crate: None,
                 caller_line: occ_line,
+                caller_col: Some(occ_col),
                 is_method_call,
                 // Macro-token recovery has no receiver AST node to inspect
                 // (it scans the raw token stream, not a parsed expression) —
@@ -628,12 +644,155 @@ fn extract_macro_calls(
                 recv_type: None,
             });
         }
+
+        // #864: Rust inline format captures (`info!("{CONST} rules")`). The
+        // rust-analyzer LSIF path emits no occurrence for a name that appears
+        // only inside a format string, so such a symbol reads as a definitive
+        // zero from `find_references` even on a fully analysed index. The
+        // literal is right here in the token stream, so Phase A recovers what
+        // LSIF drops, under the same fail-closed contract as the call recovery
+        // above: the name is resolved against the real node table and anything
+        // that matches nothing is dropped, never guessed at.
+        //
+        // Known precision limit: this scans every string literal in the
+        // token_tree, not only format-string arguments, because the macro name
+        // is not in scope here (the top-level `macro_invocation` is several
+        // parents up) and a name-keyed allowlist would have to enumerate every
+        // format macro — `tracing::info!` included, which is this PR's own repro
+        // — and silently regress the fix whenever it missed one. So a data
+        // literal that happens to hold `{NAME}` (`vec!["{MAX_LEN}"]`) can
+        // fabricate a reference when `NAME` is a real const. This trades a narrow
+        // false-positive for not regressing the headline recall fix; the
+        // fail-closed drop only removes captures that resolve to nothing.
+        for child in &children {
+            // Raw strings are a distinct node kind but are ordinary format
+            // strings: `println!(r"{CONST}")`, common for path/regex messages
+            // that carry backslashes. `utf8_text` returns the whole node
+            // including the `r`/`r#"` prefix and `capture_position` measures from
+            // the node start, so the recovered offsets stay aligned with source.
+            if !matches!(child.kind(), "string_literal" | "raw_string_literal") {
+                continue;
+            }
+            let Ok(lit) = child.utf8_text(source) else {
+                continue;
+            };
+            let captures = format_captures(lit);
+            if captures.is_empty() {
+                continue;
+            }
+            let Some((caller_fn, caller_impl)) = find_enclosing_fn(*child, source) else {
+                continue;
+            };
+            let caller_id = match &caller_impl {
+                Some(t) => VName::new(
+                    corpus,
+                    "",
+                    vname_path,
+                    "rust",
+                    format!("method:{t}.{caller_fn}"),
+                )
+                .id(),
+                None => VName::new(corpus, "", vname_path, "rust", format!("fn:{caller_fn}")).id(),
+            };
+            for (offset, name) in captures {
+                let (line, col) = capture_position(lit, offset, child.start_position());
+                out.push(UnresolvedCall {
+                    src: caller_id,
+                    // Only a const or static can be named here and also be a
+                    // graph node: an inline capture takes a value, so a `fn`
+                    // item is not a candidate, and a local has no node at all.
+                    callee_sig: format!("const:{name}"),
+                    alt_callee_sig: Some(format!("static:{name}")),
+                    hint_crate: None,
+                    caller_line: line,
+                    caller_col: Some(col),
+                    is_method_call: false,
+                    recv_type: None,
+                });
+            }
+        }
     }
 
     let mut c = node.walk();
     for child in node.children(&mut c) {
         extract_macro_calls(child, source, corpus, vname_path, out);
     }
+}
+
+/// Identifiers captured inline by a Rust format string, as `(byte offset of the
+/// name within `lit`, name)`.
+///
+/// Rust's inline captures take a bare identifier and nothing else (`{name}`,
+/// `{name:?}`) — never an expression — so this is a literal scan rather than a
+/// parse: `{{` is an escaped brace, `{}` and `{0}` are positional and name
+/// nothing, and a name runs to the closing `}` or to the `:` that opens a
+/// format spec. Anything that does not fit that shape is skipped, not guessed.
+///
+/// Only names carrying an uppercase letter are returned. A capture can only
+/// resolve to a `const:` or `static:` node, and rustc's `non_upper_case_globals`
+/// lint makes those SCREAMING_SNAKE_CASE; an all-lowercase capture is a local,
+/// which has no node and would fail closed anyway. On this repo that is 3395 of
+/// 3487 captures (97%), so the filter is what keeps the extractor from emitting
+/// thousands of resolutions per index that cannot succeed. The cost is a
+/// lowercase `const`, which rustc warns about; such a use stays unrecorded,
+/// exactly as it is today.
+///
+/// O(n) over the literal.
+fn format_captures(lit: &str) -> Vec<(usize, &str)> {
+    let b = lit.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        // `{{` is an escaped brace, and consuming both stops the second one
+        // from being read as the start of a capture.
+        if b.get(i + 1) == Some(&b'{') {
+            i += 2;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            j += 1;
+        }
+        let name = &lit[start..j];
+        // A capture name is a Rust identifier, so it cannot start with a digit:
+        // that is what separates `{name}` from the positional `{0}`.
+        if j > start
+            && !b[start].is_ascii_digit()
+            && matches!(b.get(j), Some(b'}') | Some(b':'))
+            && name.bytes().any(|c| c.is_ascii_uppercase())
+        {
+            out.push((start, name));
+        }
+        i = j.max(start);
+    }
+    out
+}
+
+/// 1-based line and 0-based byte column of the capture at `offset` inside a
+/// literal beginning at `start`.
+///
+/// Not simply the literal's own position: a format string wrapped with `\` line
+/// continuations is still a single `string_literal`, so a capture on its third
+/// line must report that line, or `find_references` hands back a `path:line`
+/// pointing at the wrong source. The column is offset from the literal's own
+/// start only on the first line; after a newline it is measured from that
+/// newline, matching tree-sitter's byte-based `Point::column`.
+fn capture_position(lit: &str, offset: usize, start: tree_sitter::Point) -> (u32, u32) {
+    let prefix = &lit.as_bytes()[..offset];
+    let newlines = prefix.iter().filter(|&&c| c == b'\n').count();
+    let col = match prefix.iter().rposition(|&c| c == b'\n') {
+        Some(nl) => offset - nl - 1,
+        None => start.column + offset,
+    };
+    (
+        start.row.saturating_add(newlines).saturating_add(1) as u32,
+        col as u32,
+    )
 }
 
 /// Walk up from `node` to the nearest enclosing `function_item` node itself
@@ -873,18 +1032,70 @@ const WRAPPER_CONSTRUCTOR_NAMES: &[&str] = &[
     "Option", "Arc", "Box", "Rc", "RefCell", "Mutex", "RwLock", "Cell", "Weak",
 ];
 
+/// Result/Option adapters that hand back the very value the constructor call
+/// produced, so an initializer wrapped in them carries exactly the evidence
+/// the bare constructor call does. Closed list on purpose: a name outside it
+/// stops the peel in [`peel_result_adapters`] and the initializer falls
+/// through to `None`, which is the safe answer.
+const TRANSPARENT_RESULT_ADAPTERS: &[&str] = &["unwrap", "expect", "context", "with_context"];
+
+/// Peel `?` and the [`TRANSPARENT_RESULT_ADAPTERS`] off a `let` initializer so
+/// `let s = T::open(p).with_context(|| ..)?` reaches the same `T::open(p)`
+/// constructor call that `let s = T::open(p)` already resolves through. Each
+/// step descends into a child node, so the loop always terminates.
+///
+/// Nothing else is peeled: `T::open(p).into_inner()` or `T::builder().build()`
+/// stop here and resolve to `None`, keeping the inference to shapes whose
+/// result type is the constructor's own.
+fn peel_result_adapters<'a>(
+    mut value: tree_sitter::Node<'a>,
+    source: &[u8],
+) -> tree_sitter::Node<'a> {
+    loop {
+        match value.kind() {
+            "try_expression" => match value.named_child(0) {
+                Some(inner) => value = inner,
+                None => return value,
+            },
+            "call_expression" => {
+                let Some(func) = value.child_by_field_name("function") else {
+                    return value;
+                };
+                if func.kind() != "field_expression" {
+                    return value;
+                }
+                let Some(field) = func.child_by_field_name("field") else {
+                    return value;
+                };
+                let Ok(name) = field.utf8_text(source) else {
+                    return value;
+                };
+                if !TRANSPARENT_RESULT_ADAPTERS.contains(&name) {
+                    return value;
+                }
+                match func.child_by_field_name("value") {
+                    Some(recv) => value = recv,
+                    None => return value,
+                }
+            }
+            _ => return value,
+        }
+    }
+}
+
 /// Resolve a `let_declaration`'s bound type per §4.5 bullet 2: prefer an
 /// explicit `type:` annotation; otherwise infer from a capitalized
 /// constructor call (`SqliteStore::open(..)`) or struct literal
-/// (`SqliteStore { .. }`) on the right-hand side. Anything else (a plain
-/// identifier, a method chain, a literal) is `None` — inferring through an
-/// arbitrary expression is exactly the unbounded problem #529 rejected doing
-/// with a denylist; only these two syntactically unambiguous shapes are used.
+/// (`SqliteStore { .. }`) on the right-hand side, after peeling any
+/// `?`/`unwrap`/`expect`/`context` adapters wrapped around it. Anything else
+/// (a plain identifier, an arbitrary method chain, a literal) is `None` —
+/// inferring through an arbitrary expression is exactly the unbounded problem
+/// #529 rejected doing with a denylist; only these shapes are used.
 fn extract_type_from_let(let_decl: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     if let Some(ty) = let_decl.child_by_field_name("type") {
         return extract_receiver_type_name(ty, source);
     }
-    let value = let_decl.child_by_field_name("value")?;
+    let value = peel_result_adapters(let_decl.child_by_field_name("value")?, source);
     match value.kind() {
         "call_expression" => {
             let func = value.child_by_field_name("function")?;
@@ -1009,6 +1220,165 @@ fn walk(root: &Path, dir: &Path, exts: &[&str], out: &mut Vec<(PathBuf, String)>
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // ── #864: inline format captures ─────────────────────────────────────────
+
+    #[test]
+    fn format_captures_reads_plain_and_specced_names() {
+        assert_eq!(format_captures("\"{MAX_LEN}\""), vec![(2, "MAX_LEN")]);
+        assert_eq!(format_captures("\"{MAX_LEN:?}\""), vec![(2, "MAX_LEN")]);
+        assert_eq!(
+            format_captures("\"a {FIRST} b {SECOND} c\""),
+            vec![(4, "FIRST"), (14, "SECOND")]
+        );
+    }
+
+    #[test]
+    fn format_captures_skips_what_names_nothing() {
+        // Positional and empty carry no name; `{{` is an escaped brace, and the
+        // second `{` must not then be read as opening a capture.
+        assert!(format_captures("\"{}\"").is_empty());
+        assert!(format_captures("\"{0}\"").is_empty());
+        assert!(format_captures("\"{{MAX_LEN}}\"").is_empty());
+        assert!(
+            format_captures("\"{1MAX}\"").is_empty(),
+            "must not start with a digit"
+        );
+        assert!(format_captures("\"{unclosed\"").is_empty());
+        // All-lowercase is a local, which has no node: see the doc comment.
+        assert!(format_captures("\"{count} of {total}\"").is_empty());
+    }
+
+    #[test]
+    fn format_captures_offsets_point_at_the_name() {
+        let lit = "\"wrote ({RULE_COUNT} default rules)\"";
+        let got = format_captures(lit);
+        assert_eq!(got.len(), 1);
+        let (offset, name) = got[0];
+        assert_eq!(&lit[offset..offset + name.len()], "RULE_COUNT");
+    }
+
+    #[test]
+    fn capture_position_follows_a_wrapped_literal() {
+        // A `\`-continued format string is ONE string_literal, so a capture on
+        // its later lines must not report the literal's opening line.
+        let lit = "\"first \\\n     second {MAX_LEN} \\\n     third\"";
+        let offset = lit.find("MAX_LEN").unwrap();
+        let at = |o: usize| capture_position(lit, o, tree_sitter::Point { row: 9, column: 4 });
+        assert_eq!(at(offset).0, 11, "0-based row 9 + 2 newlines + 1");
+        assert_eq!(at(1).0, 10, "a capture on the opening line");
+        // The column is offset from the literal's own start only before a
+        // newline; after one it is measured from that newline.
+        assert_eq!(at(1).1, 5, "literal start column 4, plus 1");
+        assert_eq!(
+            at(offset).1,
+            (offset - lit[..offset].rfind('\n').unwrap() - 1) as u32
+        );
+    }
+
+    #[test]
+    fn type_qualified_constructor_is_emitted_despite_its_noise_leaf() {
+        // `new` is noise as a bare or method-call leaf, but `Dog::new()` names
+        // its type, so `method:Dog.new` is precise. Dropping it lost every
+        // constructor call mid-edit. `Box::new` still names no repo node.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.rs");
+        std::fs::write(
+            &path,
+            "fn main() {\n    let d = Dog::new();\n    let b = Box::new(1);\n}\n",
+        )
+        .unwrap();
+        let files = vec![(path, "src/main.rs".to_string())];
+        let (_, _, unresolved, _) = extract_native_phase_b("c", dir.path(), Some(&files)).unwrap();
+        let sigs: Vec<&str> = unresolved.iter().map(|u| u.callee_sig.as_str()).collect();
+        assert!(sigs.contains(&"method:Dog.new"), "got {sigs:?}");
+    }
+
+    #[test]
+    fn macro_format_capture_becomes_an_unresolved_const_ref() {
+        // The #864 repro shape: a constant whose ONLY use is inside an inline
+        // format capture. Before this, rust-analyzer emitted no occurrence and
+        // the symbol reported a definitive zero.
+        let source = br#"
+const DEFAULT_RULE_COUNT: usize = 5;
+fn scaffold() {
+    tracing::info!("wrote .travsrignore ({DEFAULT_RULE_COUNT} default rules)");
+}
+"#;
+        let tree = parse_rust(source);
+        let mut out = Vec::new();
+        extract_macro_calls(tree.root_node(), source, "c", "src/lib.rs", &mut out);
+
+        let hit = out
+            .iter()
+            .find(|u| u.callee_sig == "const:DEFAULT_RULE_COUNT")
+            .expect("the format capture must be recovered as a reference");
+        assert_eq!(hit.caller_line, 4, "must point at the macro's line");
+        assert_eq!(
+            hit.alt_callee_sig.as_deref(),
+            Some("static:DEFAULT_RULE_COUNT"),
+            "a static is the other node kind a capture can name"
+        );
+        assert!(!hit.is_method_call);
+        assert_eq!(
+            hit.src,
+            VName::new("c", "", "src/lib.rs", "rust", "fn:scaffold").id(),
+            "attributed to the enclosing function"
+        );
+    }
+
+    #[test]
+    fn macro_format_capture_ignores_locals_and_escapes() {
+        // Locals dominate real code (97% of captures here) and can never
+        // resolve; emitting them would be pure waste. `{{ESCAPED}}` is a
+        // literal brace, not a use.
+        let source = br#"
+fn f(count: usize) {
+    tracing::info!("{count} items, literal {{BRACED}} here");
+}
+"#;
+        let tree = parse_rust(source);
+        let mut out = Vec::new();
+        extract_macro_calls(tree.root_node(), source, "c", "src/lib.rs", &mut out);
+        assert!(
+            !out.iter().any(|u| u.callee_sig.starts_with("const:")),
+            "no const refs expected, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn macro_format_capture_is_recovered_from_a_raw_string() {
+        // Raw strings are a distinct tree-sitter node kind but are ordinary
+        // format strings, and are exactly how a format message carrying
+        // backslashes or quotes is written (`r"C:\{DIR}\x"`). The #864 defect is
+        // fully present for them until the scan accepts `raw_string_literal`.
+        let source = br##"
+fn scaffold() {
+    println!(r"C:\{RULE_DIR}\rules");
+    println!(r#"cache at {CACHE_DIR} now"#);
+}
+"##;
+        let tree = parse_rust(source);
+        let mut out = Vec::new();
+        extract_macro_calls(tree.root_node(), source, "c", "src/lib.rs", &mut out);
+
+        assert!(
+            out.iter().any(|u| u.callee_sig == "const:RULE_DIR")
+                && out.iter().any(|u| u.callee_sig == "const:CACHE_DIR"),
+            "both raw format strings must yield a capture, got {out:?}"
+        );
+
+        // The reported column indexes the name in the source line, so an
+        // off-by-prefix (the `r` / `r#"` prefix, included in the node text)
+        // cannot pass.
+        let line3 = "    println!(r\"C:\\{RULE_DIR}\\rules\");";
+        let rule = out
+            .iter()
+            .find(|u| u.callee_sig == "const:RULE_DIR")
+            .expect("RULE_DIR capture present");
+        let col = rule.caller_col.expect("capture carries a column") as usize;
+        assert_eq!(&line3[col..col + "RULE_DIR".len()], "RULE_DIR");
+    }
 
     fn parse_rust(source: &[u8]) -> tree_sitter::Tree {
         let language = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
@@ -1272,6 +1642,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn t4d_constructor_behind_result_adapters_resolves() {
+        // Real repro (#877 follow-up): `travsr-daemon`'s init_repo_with_progress
+        // binds its store as
+        //   `let mut store = SqliteStore::open(&db_path).with_context(|| ..)?;`
+        // Before the adapter peel this returned None, so every `store.method()`
+        // in that function was emitted with `recv_type: None` and dropped by the
+        // daemon's #604 fail-closed gate, leaving those call edges to the
+        // fail-open rust-analyzer LSIF path alone.
+        let source =
+            b"fn f() { let mut store = SqliteStore::open(&p).with_context(|| x)?; store.begin_staging_tables(); }";
+        assert_eq!(
+            recv_type_for_call(source, "begin_staging_tables"),
+            Some("SqliteStore".to_string())
+        );
+        for src in [
+            &b"fn f() { let s = SqliteStore::open(&p)?; s.node_count(); }"[..],
+            &b"fn f() { let s = SqliteStore::open(&p).unwrap(); s.node_count(); }"[..],
+            &b"fn f() { let s = SqliteStore::open(&p).expect(\"m\"); s.node_count(); }"[..],
+            &b"fn f() { let s = SqliteStore::open(&p).context(\"m\")?; s.node_count(); }"[..],
+        ] {
+            assert_eq!(
+                recv_type_for_call(src, "node_count"),
+                Some("SqliteStore".to_string()),
+                "adapter-wrapped constructor must resolve: {}",
+                String::from_utf8_lossy(src)
+            );
+        }
+    }
+
+    #[test]
+    fn t4e_non_transparent_adapter_still_resolves_to_none() {
+        // Only adapters that return the constructor's own value are peeled. A
+        // chain that transforms the type (`.build()`, `.to_str()`) carries no
+        // evidence of the binding's type and must stay None.
+        let source = b"fn f() { let s = SqliteStore::builder().build(); s.node_count(); }";
+        assert_eq!(recv_type_for_call(source, "node_count"), None);
+        let source2 = b"fn f() { let s = PathBuf::from(&p).to_str().unwrap(); s.node_count(); }";
+        assert_eq!(recv_type_for_call(source2, "node_count"), None);
+    }
+
     /// Manual measurement tool for #529 Phase 0 (plan §6.1 R-2/R-3/R-4) — not
     /// part of the regular suite (`#[ignore]`). Walks this repo's own `.rs`
     /// files with the real extraction path and dumps every method-call site's
@@ -1396,6 +1807,18 @@ fn run(z: &Zoo) {
             .expect("bare call recovered from macro");
         assert_eq!(greet.caller_line, 5);
 
+        // RFC-027 #813 P2: the captured byte column points at the callee
+        // identifier itself, so the editor resolves the exact occurrence.
+        let src_str = std::str::from_utf8(source).unwrap();
+        let col_points_at = |u: &UnresolvedCall, leaf: &str| {
+            let line = src_str.lines().nth((u.caller_line - 1) as usize).unwrap();
+            let col = u.caller_col.expect("occurrence column captured") as usize;
+            line[col..].starts_with(leaf)
+        };
+        assert!(col_points_at(describe, "describe"));
+        assert!(col_points_at(speak, "speak"));
+        assert!(col_points_at(greet, "greet"));
+
         // No guessed callee ids: every recovered call is attributed to `run`.
         let run_id = VName::new("c", "", "main.rs", "rust", "fn:run").id();
         for u in &out {
@@ -1421,6 +1844,81 @@ fn run() {
             out.is_empty(),
             "expected no calls, got {:?}",
             out.iter().map(|u| &u.callee_sig).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Cargo dep anchoring (#893 C2) ─────────────────────────────────────────
+
+    /// Writes `Cargo.toml` files under a fresh temp dir and runs the extractor.
+    /// Returns (crate signature -> path) for every emitted `crate` node.
+    fn cargo_crate_paths(files: &[(&str, &str)]) -> HashMap<String, String> {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, body) in files {
+            let path = dir.path().join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, body).unwrap();
+        }
+        let (nodes, _edges) = extract_cargo_deps("c", dir.path()).unwrap();
+        nodes
+            .iter()
+            .filter(|n| n.kind == "crate")
+            .map(|n| (n.vname.signature.clone(), n.vname.path.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn cargo_deps_anchor_root_package_in_a_workspace_root() {
+        // A root Cargo.toml that declares BOTH [package] and [workspace] members
+        // must still anchor its own package to the root manifest (#893 C2).
+        let paths = cargo_crate_paths(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"rootpkg\"\n\n[workspace]\nmembers = [\"sub\"]\n\n[dependencies]\nclap = \"4\"\n",
+            ),
+            (
+                "sub/Cargo.toml",
+                "[package]\nname = \"subpkg\"\n\n[dependencies]\nrootpkg = { path = \"..\" }\n",
+            ),
+        ]);
+        assert_eq!(
+            paths.get("crate:rootpkg").map(String::as_str),
+            Some("Cargo.toml"),
+            "root package lost its manifest anchor; got {paths:?}"
+        );
+        assert_eq!(
+            paths.get("crate:subpkg").map(String::as_str),
+            Some("sub/Cargo.toml"),
+            "member package anchor regressed; got {paths:?}"
+        );
+        assert_eq!(
+            paths.get("crate:clap").map(String::as_str),
+            Some(""),
+            "external dependency must stay unanchored; got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_deps_virtual_workspace_emits_members_only() {
+        // A virtual workspace has no root [package], so no crate node may be
+        // anchored to the root manifest.
+        let paths = cargo_crate_paths(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n"),
+            ("a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("b/Cargo.toml", "[package]\nname = \"b\"\n"),
+        ]);
+        assert_eq!(
+            paths.get("crate:a").map(String::as_str),
+            Some("a/Cargo.toml")
+        );
+        assert_eq!(
+            paths.get("crate:b").map(String::as_str),
+            Some("b/Cargo.toml")
+        );
+        assert!(
+            !paths.values().any(|p| p == "Cargo.toml"),
+            "virtual workspace must not anchor anything to the root manifest; got {paths:?}"
         );
     }
 }

@@ -10,11 +10,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-// `Command` (unqualified) is only referenced from the Unix/macOS process-control
-// paths (`kill`, `sysctl`, `vm_stat`); the cross-platform spawn sites use the
-// fully-qualified `std::process::Command`. Gate the import to Unix so a Windows
-// build does not warn about it being unused.
-#[cfg(unix)]
+// `Command` (unqualified) is only referenced from the macOS process-control
+// paths (`sysctl`, `vm_stat`); the cross-platform spawn sites use the
+// fully-qualified `std::process::Command`. Gate the import to macOS so
+// Linux and Windows builds do not warn about it being unused (#759).
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -404,7 +404,7 @@ impl EmbedOpLock {
                  its holder dies)"
             );
         }
-        std::fs::write(&info_path, format!("{}\t{op}", std::process::id()))
+        write_info_without_following_a_symlink(&info_path, op)
             .context("writing embed.lock.info")?;
         Ok(Some(EmbedOpLock { file, info_path }))
     }
@@ -538,6 +538,31 @@ impl std::fmt::Display for Contended {
 
 impl std::error::Error for Contended {}
 
+/// Record the holder's pid and op, replacing whatever is at `info_path`
+/// rather than writing through it.
+///
+/// `.travsr/` is a repo-local directory, so a clone can ship
+/// `embed.lock.info` as a symlink, and `std::fs::write` would follow it and
+/// truncate the target: a daemon tick's reindex turning into a clobber of
+/// `~/.bashrc`, with no user action. Unlinking first drops the link, never
+/// its target, and `create_new` then refuses anything that reappears at the
+/// path, so a lost race fails the acquire instead of writing somewhere else.
+/// The unlink is safe because we already hold the exclusive lock: no other
+/// holder can legitimately own this file.
+fn write_info_without_following_a_symlink(info_path: &Path, op: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    match std::fs::remove_file(info_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(info_path)?;
+    write!(file, "{}\t{op}", std::process::id())
+}
+
 impl Drop for EmbedOpLock {
     fn drop(&mut self) {
         // Remove the metadata BEFORE releasing the lock: while we still hold
@@ -642,15 +667,16 @@ fn sidecar_supports_cancel(bin_path: &Path) -> bool {
 }
 
 /// True if a process with `pid` is currently alive (no signal sent).
+///
+/// #759: delegates to [`crate::unix_pid_is_alive`] so that `EPERM` (process
+/// exists, this user may not signal it) is correctly reported as alive.
+/// The previous `kill -0` shell-out collapsed `EPERM` and `ESRCH` into the
+/// same non-zero exit, causing a sidecar running under a different uid to
+/// read as dead — `terminate_inflight_reindex` would then log a false
+/// "drained gracefully" and orphan the sidecar without sending SIGTERM.
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    crate::unix_pid_is_alive(pid)
 }
 /// #500: real liveness probe (OpenProcess + GetExitCodeProcess, no signal).
 /// The previous hardcoded `false` made `!pid_alive(pid)` in the grace poll
@@ -2177,6 +2203,19 @@ mod tests {
         );
     }
 
+    /// #759 regression: pid_alive must report a process alive even when
+    /// the calling user cannot signal it (EPERM). PID 1 is the canonical
+    /// hermetic case — always alive and (outside a root-run container)
+    /// always returns EPERM from kill(1, 0) for non-root callers.
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_eperm_reads_as_alive_not_dead() {
+        assert!(
+            pid_alive(1),
+            "PID 1 is alive; EPERM from kill(1,0) must not be misread as dead (#759)"
+        );
+    }
+
     // ── TC-FT-M4: RAII single-flight guard ───────────────────────────────────
 
     #[test]
@@ -3415,6 +3454,35 @@ mod stale_lock_tests {
                 "must not advise stopping an unidentified holder ({contents:?}): {msg}"
             );
         }
+    }
+
+    /// #525 item 4: `embed.lock.info` is written into `.travsr/`, which a repo
+    /// can ship as tracked content. A symlink there must not turn a
+    /// daemon-triggered reindex into a write to whatever it points at.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_info_file_is_replaced_rather_than_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::create_dir_all(repo.join(".travsr")).unwrap();
+        let victim = repo.join("victim");
+        std::fs::write(&victim, "precious\n").unwrap();
+        std::os::unix::fs::symlink(&victim, repo.join(".travsr/embed.lock.info")).unwrap();
+
+        let lock = super::EmbedOpLock::try_acquire(repo, "reindex")
+            .expect("acquire must not fail on a symlinked info file");
+        assert!(lock.is_some(), "the lock itself is free and must be taken");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "precious\n",
+            "the symlink target must be untouched"
+        );
+        let written = std::fs::read_to_string(repo.join(".travsr/embed.lock.info")).unwrap();
+        assert!(
+            written.starts_with(&format!("{}\t", std::process::id())),
+            "the holder's own metadata must still be recorded: {written:?}"
+        );
     }
 
     #[cfg(unix)]

@@ -10,8 +10,8 @@ use anyhow::{bail, Context as _, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use travsr_plugin_host::sidecar_version::{
-    below_floor_message, floor_status, unreadable_message, write_cached_latest, FloorStatus,
-    SidecarSpec,
+    below_floor_message, floor_status, read_cached_latest, unreadable_message, write_cached_latest,
+    FloorStatus, SidecarSpec,
 };
 
 const RELEASES_BASE_ENV: &str = "TRAVSR_LANG_RELEASES_BASE";
@@ -219,27 +219,6 @@ pub fn travsr_bin_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The "add ~/.travsr/bin to your PATH" hint, in the host's own shell syntax.
-///
-/// #588: every call site printed `export PATH="$HOME/.travsr/bin:$PATH"` and
-/// told the user to edit `~/.zshrc`. On Windows that is three pieces of advice
-/// none of which apply, printed at the one moment the user has just installed a
-/// binary they now need to find.
-pub fn path_hint() -> String {
-    if cfg!(windows) {
-        "hint: add %USERPROFILE%\\.travsr\\bin to your PATH:\n\n\
-         \t$env:PATH = \"$env:USERPROFILE\\.travsr\\bin;$env:PATH\"\n\n\
-         To make it permanent (new terminals only):\n\n\
-         \tsetx PATH \"%USERPROFILE%\\.travsr\\bin;%PATH%\"\n"
-            .to_string()
-    } else {
-        "hint: add ~/.travsr/bin to your PATH:\n\n\
-         \texport PATH=\"$HOME/.travsr/bin:$PATH\"\n\n\
-         Add this line to your ~/.zshrc or ~/.bashrc to make it permanent.\n"
-            .to_string()
-    }
-}
-
 /// Returns true if ~/.travsr/bin is present in the PATH environment variable.
 pub fn path_contains_travsr_bin() -> bool {
     let Some(home) = dirs::home_dir() else {
@@ -289,10 +268,11 @@ pub async fn fetch_latest_version_for_repo(repo: &str) -> Result<String> {
 ///   floor, print a WARN with the reinstall remedy. The *hard* refuse stays at
 ///   spawn/reindex (Point A) - init only warns, so the user is left in a
 ///   runnable state and the fix is one command away.
-/// - **Leg 2 (network, cached 24h).** Fetch the latest release; if it is newer
-///   than what is installed, print an advisory. Offline -> silent. The fetched
-///   tag is cached in `~/.travsr/.sidecar-latest.json` so the daemon can
-///   re-surface staleness without ever fetching (local-first).
+/// - **Leg 2 (network).** Fetch the latest release unless one fetched in the
+///   last day is cached; if it is newer than what is installed, print an
+///   advisory. Offline -> silent. The fetched tag is written to
+///   `~/.travsr/.sidecar-latest.json`, which the daemon and `status --verbose`
+///   read to re-surface staleness without ever fetching (local-first).
 ///
 /// `reinstall_remedy` is the exact command surfaced to the user, e.g.
 /// `"travsr embed init --reinstall"`.
@@ -332,12 +312,14 @@ pub fn advise_installed_sidecar(spec: &dyn SidecarSpec, bin_path: &Path, reinsta
         return;
     }
     let repo = spec.github_repo().to_string();
-    let Ok(latest_tag) =
-        crate::lang::run_async(async move { fetch_latest_version_for_repo(&repo).await })
-    else {
+    let Some((latest, fetched)) = latest_release(read_cached_latest(install_name), || {
+        crate::lang::run_async(async move { fetch_latest_version_for_repo(&repo).await }).ok()
+    }) else {
         return; // offline / fetch failed -> silent, never fails the command
     };
-    write_cached_latest(install_name, &latest_tag);
+    if let Some(tag) = fetched {
+        write_cached_latest(install_name, &tag);
+    }
 
     // Reuse the version already read by the floor probe above; only the states
     // that carry a readable version can be compared against `latest`.
@@ -348,12 +330,22 @@ pub fn advise_installed_sidecar(spec: &dyn SidecarSpec, bin_path: &Path, reinsta
         | FloorStatus::UnreadableNoFloor
         | FloorStatus::ProbeTimeout { .. } => return,
     };
-    let Some(latest) = travsr_plugin_host::Semver::parse(&latest_tag) else {
-        return;
-    };
     if latest > installed {
-        println!("  newer {install_name} v{latest} available - run: {reinstall_remedy}");
+        eprintln!("  newer {install_name} v{latest} available - run: {reinstall_remedy}");
     }
+}
+
+/// Leg 2's comparison target: the cached latest release while it is fresh,
+/// with no network, else a fetch whose tag is returned so the caller caches it.
+fn latest_release(
+    cached: Option<travsr_plugin_host::Semver>,
+    fetch: impl FnOnce() -> Option<String>,
+) -> Option<(travsr_plugin_host::Semver, Option<String>)> {
+    if let Some(v) = cached {
+        return Some((v, None));
+    }
+    let tag = fetch()?;
+    Some((travsr_plugin_host::Semver::parse(&tag)?, Some(tag)))
 }
 
 /// Fetches the latest version tag for the travsr-lang releases.
@@ -423,6 +415,12 @@ pub async fn download_scip_binary(
     };
     let label = format!("{asset_name} at {tag}");
     let bin_bytes = fetch_verified(&client, &bin_url, &label, SCIP_SIZE_LIMIT, integrity).await?;
+    // Verified as published, then the binary taken out of a tarball asset.
+    let bin_bytes = if asset_name.ends_with(".tar.gz") {
+        tar_gz_single_member(&bin_bytes, install_name)?
+    } else {
+        bin_bytes
+    };
 
     let dest_dir = travsr_bin_dir()?;
     let dest = dest_dir.join(install_name);
@@ -708,10 +706,29 @@ pub async fn download_and_install_wrapper(
     Ok(dest)
 }
 
+/// Fetches `<binary_name>-share.tar.gz` and its published `.sha256`, and returns
+/// the bytes only if they match.
+///
+/// `base` is a parameter rather than a read of `TRAVSR_LANG_RELEASES_BASE` for
+/// the same reason as [`fetch_and_verify_binary`]: the URL shape stays testable
+/// without mutating process-global state.
+async fn fetch_share_tarball(base: &str, version: &str, binary_name: &str) -> Result<Vec<u8>> {
+    let asset = share_asset_name(binary_name);
+    let url = format!("{base}/download/{version}/{asset}");
+    let client = download_http_client()?;
+
+    fetch_verified(&client, &url, &asset, SIZE_LIMIT, Integrity::Sidecar).await
+}
+
+fn share_asset_name(binary_name: &str) -> String {
+    format!("{binary_name}-share.tar.gz")
+}
+
 /// Downloads `<binary_name>-share.tar.gz` from the same travsr-lang release and
 /// extracts it into `~/.travsr/share/<binary_name>/`. Used for sidecars that
 /// spawn an external script (e.g. dart's emit.dart) rather than a compiled binary.
 /// The tarball is platform-independent (source + metadata only, no binaries).
+/// Verified against its published `.sha256` before any entry is written.
 pub async fn install_share_assets(version: &str, binary_name: &str) -> Result<()> {
     if std::env::var(SKIP_DOWNLOAD_ENV).is_ok() {
         return Ok(());
@@ -720,25 +737,8 @@ pub async fn install_share_assets(version: &str, binary_name: &str) -> Result<()
     let base =
         std::env::var(RELEASES_BASE_ENV).unwrap_or_else(|_| DEFAULT_RELEASES_BASE.to_string());
 
-    let asset = format!("{binary_name}-share.tar.gz");
-    let url = format!("{base}/download/{version}/{asset}");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building HTTP client")?;
-
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .context("fetching share assets")?;
-    if !resp.status().is_success() {
-        bail!("share asset download failed ({}): {url}", resp.status());
-    }
-
-    let bytes = resp.bytes().await.context("reading share asset body")?;
+    let asset = share_asset_name(binary_name);
+    let bytes = fetch_share_tarball(&base, version, binary_name).await?;
 
     // Extract into ~/.travsr/share/<binary_name>/
     let home =
@@ -934,7 +934,6 @@ pub async fn download_zip_and_extract(
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
         .join(".travsr")
         .join(extract_dir);
-    std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
 
     verify_and_extract_zip(&bytes, &dest, expected_sha256, asset_name, tag)?;
 
@@ -1026,6 +1025,26 @@ fn parse_sha256_line(line: &str) -> Result<String> {
 mod tests {
     use super::*;
     use travsr_plugin_host::phase_b::platform::WRAPPER_RELEASE_TARGETS;
+
+    /// A second repo's `init` found the tool installed and still asked GitHub
+    /// for its latest release, although the answer from minutes before was
+    /// cached. A fresh cached answer must not reach for the network.
+    #[test]
+    fn a_fresh_cached_latest_skips_the_fetch() {
+        let cached = travsr_plugin_host::Semver::parse("0.4.7");
+        let (latest, fetched) =
+            latest_release(cached, || panic!("must not fetch")).expect("cached");
+        assert_eq!(Some(latest), cached);
+        assert_eq!(fetched, None);
+
+        let (latest, fetched) = latest_release(None, || Some("v0.4.8".into())).unwrap();
+        assert_eq!(Some(latest), travsr_plugin_host::Semver::parse("0.4.8"));
+        assert_eq!(fetched.as_deref(), Some("v0.4.8"), "a fetch is cached");
+        assert!(
+            latest_release(None, || None).is_none(),
+            "offline stays silent"
+        );
+    }
 
     // ── #506: replace_file — displace-aside self-update dance ──────────────
 
@@ -1514,6 +1533,9 @@ pub(crate) fn extract_tar_gz(bytes: &[u8], dest: &std::path::Path) -> Result<()>
     );
     let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
+    // `set_mask` takes the bits to clear, and `unpack` already drops the
+    // setuid/setgid/sticky bits it is not asked to preserve.
+    archive.set_mask(0o777 & !EXTRACTED_MODE_MASK);
     for entry in archive.entries().context("reading tar entries")? {
         let mut entry = entry.context("reading a tar entry")?;
         let kind = entry.header().entry_type();
@@ -1547,6 +1569,27 @@ pub(crate) fn extract_tar_gz(bytes: &[u8], dest: &std::path::Path) -> Result<()>
     Ok(())
 }
 
+/// The only permission bits either extractor lets an archive set on what it
+/// unpacks: the owner's, plus read and execute for group and other. Everything
+/// else is dropped, so a release asset can ship an executable launcher (#835)
+/// but can neither hand out setuid/setgid nor leave a tool travsr later runs
+/// writable by another local user.
+const EXTRACTED_MODE_MASK: u32 = 0o755;
+
+#[cfg(unix)]
+fn apply_entry_mode(target: &std::path::Path, mode: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(mode) = mode else { return Ok(()) };
+    let permissions = std::fs::Permissions::from_mode(mode & EXTRACTED_MODE_MASK);
+    std::fs::set_permissions(target, permissions)
+        .with_context(|| format!("setting permissions on {}", target.display()))
+}
+
+#[cfg(not(unix))]
+fn apply_entry_mode(_target: &std::path::Path, _mode: Option<u32>) -> Result<()> {
+    Ok(())
+}
+
 /// Extract a zip archive into `dest`, in-process.
 pub(crate) fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
     anyhow::ensure!(
@@ -1574,10 +1617,15 @@ pub(crate) fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
+        // A previous extraction may have left the target read-only, which makes
+        // `File::create` fail rather than truncate. `tar::Entry::unpack` does the
+        // same before writing.
+        let _ = std::fs::remove_file(&target);
         let mut out = std::fs::File::create(&target)
             .with_context(|| format!("creating {}", target.display()))?;
         std::io::copy(&mut file, &mut out)
             .with_context(|| format!("writing {}", target.display()))?;
+        apply_entry_mode(&target, file.unix_mode())?;
     }
     Ok(())
 }
@@ -1602,6 +1650,35 @@ pub(crate) fn gunzip_single(bytes: &[u8]) -> Result<Vec<u8>> {
         "decompressed binary exceeds the {MAX_ARCHIVE_BYTES}-byte limit"
     );
     Ok(out)
+}
+
+/// Read the one file named `member` out of a `.tar.gz` release asset, in
+/// memory, capped like every other archive here.
+pub(crate) fn tar_gz_single_member(bytes: &[u8], member: &str) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    anyhow::ensure!(
+        bytes.len() <= MAX_ARCHIVE_BYTES,
+        "archive is {} bytes, over the {MAX_ARCHIVE_BYTES}-byte limit",
+        bytes.len()
+    );
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+    for entry in archive.entries().context("reading tar archive")? {
+        let mut entry = entry.context("reading a tar entry")?;
+        let is_member = entry
+            .path()
+            .ok()
+            .is_some_and(|p| p.file_name() == Some(member.as_ref()));
+        if entry.header().entry_type().is_file() && is_member {
+            anyhow::ensure!(
+                entry.size() <= MAX_ARCHIVE_BYTES as u64,
+                "tar member exceeds the {MAX_ARCHIVE_BYTES}-byte limit"
+            );
+            let mut out = Vec::with_capacity(entry.size() as usize);
+            entry.read_to_end(&mut out).context("reading tar member")?;
+            return Ok(out);
+        }
+    }
+    bail!("no {member} in the tar archive")
 }
 
 /// Read the single `*.exe` member out of a zip archive into memory. Used for
@@ -1662,7 +1739,35 @@ pub(crate) fn verify_and_extract_zip(
             );
         }
     }
-    extract_zip(bytes, dest).with_context(|| format!("extracting {asset_name}"))
+    // Extract beside `dest` and swap it in only once complete, so an install
+    // that stops partway never leaves a half-written tree behind a wrapper.
+    let sibling = |suffix: &str| {
+        let mut name = dest.file_name().unwrap_or_default().to_os_string();
+        name.push(suffix);
+        dest.with_file_name(name)
+    };
+    let (staging, displaced) = (sibling(".partial"), sibling(".old"));
+    // A run that stopped between the two renames below left only the old copy.
+    if !dest.exists() {
+        let _ = std::fs::rename(&displaced, dest);
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_dir_all(&displaced);
+    std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
+    if let Err(e) = extract_zip(bytes, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e).with_context(|| format!("extracting {asset_name}"));
+    }
+    if dest.exists() {
+        std::fs::rename(dest, &displaced)
+            .with_context(|| format!("moving aside {}", dest.display()))?;
+    }
+    if let Err(e) = std::fs::rename(&staging, dest) {
+        let _ = std::fs::rename(&displaced, dest);
+        return Err(e).with_context(|| format!("moving {} into place", staging.display()));
+    }
+    let _ = std::fs::remove_dir_all(&displaced);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1754,9 +1859,13 @@ mod extraction_tests {
     /// writer, so a test that could only build well-formed names would never
     /// exercise the case the extractor exists to reject.
     fn tar_gz_with(name: &str, body: &[u8]) -> Vec<u8> {
+        tar_gz_with_mode(name, body, 0o644)
+    }
+
+    fn tar_gz_with_mode(name: &str, body: &[u8], mode: u32) -> Vec<u8> {
         let mut header = tar::Header::new_ustar();
         header.set_size(body.len() as u64);
-        header.set_mode(0o644);
+        header.set_mode(mode);
         header.set_entry_type(tar::EntryType::Regular);
         {
             let raw = header.as_old_mut();
@@ -1798,6 +1907,25 @@ mod extraction_tests {
             std::fs::read_to_string(dest.join("share/data.txt")).unwrap(),
             "hello"
         );
+    }
+
+    /// The tar path unpacks through `tar::Entry::unpack`, which applies the
+    /// header mode already. Pinned here because the zip path is now expected to
+    /// match it.
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_tar_entry_stays_executable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        extract_tar_gz(&tar_gz_with_mode("bin/tool", b"binary", 0o755), &dest).unwrap();
+        let mode = std::fs::metadata(dest.join("bin/tool"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     #[test]
@@ -1902,6 +2030,164 @@ mod extraction_tests {
         extract_zip(&bytes, &dest).unwrap();
         assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"binary");
     }
+
+    /// Build a one-entry zip whose central directory records `mode` verbatim.
+    ///
+    /// `SimpleFileOptions::unix_permissions` masks the mode down to `0o777`, so
+    /// the setuid/setgid case is written straight into the central directory's
+    /// external-attributes field instead.
+    #[cfg(unix)]
+    fn zip_entry_with_mode(name: &str, body: &[u8], mode: u32) -> Vec<u8> {
+        const CENTRAL_HEADER_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+        const EXTERNAL_ATTRIBUTES_OFFSET: usize = 38;
+        const S_IFREG: u32 = 0o100_000;
+
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file::<_, ()>(
+            name,
+            zip::write::SimpleFileOptions::default().unix_permissions(mode & 0o777),
+        )
+        .unwrap();
+        std::io::Write::write_all(&mut w, body).unwrap();
+        let mut bytes = w.finish().unwrap().into_inner();
+
+        let header = bytes
+            .windows(CENTRAL_HEADER_SIGNATURE.len())
+            .position(|w| w == CENTRAL_HEADER_SIGNATURE)
+            .expect("central directory header");
+        let at = header + EXTERNAL_ATTRIBUTES_OFFSET;
+        bytes[at..at + 4].copy_from_slice(&((mode | S_IFREG) << 16).to_le_bytes());
+        bytes
+    }
+
+    #[cfg(unix)]
+    fn extract_and_read_mode(bytes: &[u8], entry: &str) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        extract_zip(bytes, &dest).unwrap();
+        std::fs::metadata(dest.join(entry))
+            .unwrap()
+            .permissions()
+            .mode()
+    }
+
+    /// #835: the KLS launcher ships 0755 inside `server.zip`; unpacked without
+    /// its mode the wrapper's `exec` gets EACCES and Phase B silently yields
+    /// zero symbols.
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_zip_entry_stays_executable() {
+        let bytes = zip_entry_with_mode("server/bin/kotlin-language-server", b"#!/bin/sh\n", 0o755);
+        let mode = extract_and_read_mode(&bytes, "server/bin/kotlin-language-server");
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setuid_and_setgid_bits_in_a_zip_entry_are_dropped() {
+        let bytes = zip_entry_with_mode("bin/tool", b"binary", 0o6755);
+        let mode = extract_and_read_mode(&bytes, "bin/tool");
+        assert_eq!(mode & 0o7000, 0, "no setuid, setgid or sticky bit");
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    /// Reinstalling over an earlier install must not trip over a read-only file
+    /// the earlier install created.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_zip_entry_extracts_twice() {
+        let bytes = zip_entry_with_mode("bin/tool", b"binary", 0o444);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        extract_zip(&bytes, &dest).unwrap();
+        extract_zip(&bytes, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"binary");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_and_world_write_bits_in_a_zip_entry_are_dropped() {
+        let bytes = zip_entry_with_mode("bin/tool", b"binary", 0o777);
+        assert_eq!(extract_and_read_mode(&bytes, "bin/tool") & 0o777, 0o755);
+    }
+
+    /// scip-go ships `scip-go-<os>-<arch>.tar.gz` holding the binary and a
+    /// LICENSE; only the binary is installed.
+    #[test]
+    fn tar_gz_single_member_pulls_the_named_binary() {
+        let mut b = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (name, body) in [("LICENSE", &b"text"[..]), ("scip-go", &b"binary"[..])] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, name, body).unwrap();
+        }
+        let bytes = b.into_inner().unwrap().finish().unwrap();
+        assert_eq!(
+            super::tar_gz_single_member(&bytes, "scip-go").unwrap(),
+            b"binary"
+        );
+        assert!(super::tar_gz_single_member(&bytes, "scip-java").is_err());
+    }
+
+    /// A reinstall that stops partway (Ctrl-C, or here a bad second entry) used
+    /// to leave the first entry overwritten while the wrapper still pointed at
+    /// the tree: kotlin's server jar ended up 0 bytes and `init` kept calling
+    /// it installed. The old tree must stay whole until the new one is complete.
+    #[test]
+    fn a_reinstall_that_fails_partway_keeps_the_old_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("kls");
+        std::fs::create_dir_all(dest.join("lib")).unwrap();
+        std::fs::write(dest.join("lib/server.jar"), b"old").unwrap();
+
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        w.start_file::<_, ()>("lib/server.jar", opts).unwrap();
+        std::io::Write::write_all(&mut w, b"new").unwrap();
+        w.start_file::<_, ()>("../escaped.txt", opts).unwrap();
+        let broken = w.finish().unwrap().into_inner();
+
+        assert!(super::verify_and_extract_zip(&broken, &dest, None, "server.zip", "1").is_err());
+        assert_eq!(std::fs::read(dest.join("lib/server.jar")).unwrap(), b"old");
+
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file::<_, ()>("lib/server.jar", opts).unwrap();
+        std::io::Write::write_all(&mut w, b"new").unwrap();
+        let good = w.finish().unwrap().into_inner();
+
+        super::verify_and_extract_zip(&good, &dest, None, "server.zip", "1").unwrap();
+        assert_eq!(std::fs::read(dest.join("lib/server.jar")).unwrap(), b"new");
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(left.len(), 1, "no staging or displaced tree is left behind");
+    }
+
+    /// A run killed between moving the old tree aside and moving the new one
+    /// in leaves only `.old`. The next install must not delete it before its
+    /// own extract has succeeded.
+    #[test]
+    fn a_swap_stopped_midway_keeps_the_old_tree_for_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("kls");
+        std::fs::create_dir_all(dir.path().join("kls.old/lib")).unwrap();
+        std::fs::write(dir.path().join("kls.old/lib/server.jar"), b"old").unwrap();
+
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        w.start_file::<_, ()>("../escaped.txt", opts).unwrap();
+        let broken = w.finish().unwrap().into_inner();
+
+        assert!(super::verify_and_extract_zip(&broken, &dest, None, "server.zip", "1").is_err());
+        assert_eq!(std::fs::read(dest.join("lib/server.jar")).unwrap(), b"old");
+    }
 }
 
 /// #410 T1 — the download half, against a local fixture server.
@@ -1918,7 +2204,8 @@ mod extraction_tests {
 #[cfg(test)]
 mod download_tests {
     use super::{
-        fetch_and_verify_binary, fetch_verified, hex_encode_sha256, Integrity, SIZE_LIMIT,
+        fetch_and_verify_binary, fetch_share_tarball, fetch_verified, hex_encode_sha256, Integrity,
+        SIZE_LIMIT,
     };
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
@@ -2309,6 +2596,91 @@ mod download_tests {
         assert!(
             err.contains("exceeds the download size limit"),
             "a lengthless oversize body must be refused mid-stream: {err}"
+        );
+    }
+
+    // ── the share tarball (#410 M1) ──────────────────────────────────────────
+    //
+    // The share tarball is unpacked into ~/.travsr/share and run by the
+    // emitter, so it needs the same anchor as the wrapper binary published
+    // beside it under the same tag.
+
+    fn share_path() -> String {
+        format!("/download/{VERSION}/{BIN}-share.tar.gz")
+    }
+
+    fn share_sha_path() -> String {
+        format!("{}.sha256", share_path())
+    }
+
+    fn share_sha_line(body: &[u8]) -> Vec<u8> {
+        format!("{}  {BIN}-share.tar.gz\n", hex_encode_sha256(body)).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_share_tarball_matching_its_published_sha256_is_returned() {
+        let body = b"\x1f\x8b a plausible share tarball".to_vec();
+        let base = serve(vec![
+            route(&share_path(), 200, body.clone()),
+            route(&share_sha_path(), 200, share_sha_line(&body)),
+        ]);
+
+        let got = fetch_share_tarball(&base, VERSION, BIN).await.unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[tokio::test]
+    async fn a_share_tarball_swapped_after_publication_is_refused() {
+        // The failure has to happen here, before any entry is written: the
+        // extractor's traversal and mode guards bound what a hostile archive
+        // can do, they do not decide whether it should be unpacked at all.
+        let published = b"the tarball that was published".to_vec();
+        let swapped = b"the tarball that was served instead".to_vec();
+        let base = serve(vec![
+            route(&share_path(), 200, swapped),
+            route(&share_sha_path(), 200, share_sha_line(&published)),
+        ]);
+
+        let err = fetch_share_tarball(&base, VERSION, BIN)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SHA256 mismatch"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_share_tarball_without_a_sidecar_is_not_extracted_unverified() {
+        let body = b"plausible tarball".to_vec();
+        let base = serve(vec![route(&share_path(), 200, body)]);
+
+        let err = fetch_share_tarball(&base, VERSION, BIN)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sha256 sidecar"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_share_tarball_is_refused_before_its_body_is_read() {
+        let body = b"x".to_vec();
+        let base = serve(vec![
+            Route {
+                path: share_path(),
+                status: 200,
+                body: body.clone(),
+                advertised_len: Some(SIZE_LIMIT + 1),
+                omit_content_length: false,
+            },
+            route(&share_sha_path(), 200, share_sha_line(&body)),
+        ]);
+
+        let err = fetch_share_tarball(&base, VERSION, BIN)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("{} bytes > {SIZE_LIMIT}", SIZE_LIMIT + 1)),
+            "unexpected error: {err}"
         );
     }
 }

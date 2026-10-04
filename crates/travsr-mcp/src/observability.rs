@@ -311,14 +311,8 @@ fn error_payload(reason: &str) -> serde_json::Value {
 /// can be reported as a terminal `done` (#636 round-5 review, which is how
 /// `untrusted_corpus` was missed). `phase_b_warning_classes_match_the_cli`
 /// pins the set, not just one string.
-///
-/// `corpus` is the store's `corpus` meta, needed only by the
-/// `untrusted_corpus` arm, whose remediation names the corpus to trust.
-/// Empty when unknown, matching what the CLI prints in that case.
-fn decode_phase_b_warnings(
-    warnings: &str,
-    corpus: &str,
-) -> HashMap<String, (&'static str, String)> {
+pub(crate) fn decode_phase_b_warnings(warnings: &str) -> HashMap<String, (&'static str, String)> {
+    use travsr_plugin_host::phase_b::status::Readiness;
     let mut out = HashMap::new();
     for warn in warnings.split(',') {
         let warn = warn.trim();
@@ -329,165 +323,54 @@ fn decode_phase_b_warnings(
         let (Some(class), Some(rest)) = (parts.next(), parts.next()) else {
             continue;
         };
-        match class {
-            "crashed" => {
-                out.insert(
-                    rest.to_string(),
-                    (
-                        "failed",
-                        // Wording tracks `travsr status` (travsr-cli/src/
-                        // status.rs), which #673 changed from "phase B
-                        // analyzer" to "semantic analyzer" when it dropped
-                        // internal vocabulary from user-facing output. #673
-                        // merged first, so this side owns the sync, as
-                        // called out in this PR's description. The comma is
-                        // deliberate where the CLI uses an em-dash: em-dashes
-                        // are forbidden in this repo's content.
-                        format!(
-                            "semantic analyzer for '{rest}' crashed, re-run \
-                             `travsr init --semantic` to retry"
-                        ),
-                    ),
-                );
+        // `version_mismatch` carries `lang:expected:got`; the rest just `lang`.
+        let lang = rest.split(':').next().unwrap_or(rest);
+        // Plan 3.0: the same label and fix `travsr status` prints for the
+        // language, from `Readiness`, so the two surfaces cannot drift. The
+        // per-class detail (which analyzer, which rebuild) is `status --verbose`.
+        let (state, readiness) = match class {
+            "crashed" | "version_mismatch" | "emitter_failed" | "zero_nodes" => {
+                ("failed", Readiness::Failed)
             }
-            // #752 review: `zero_nodes` and `needs_consent` were handled by
-            // `travsr status` and fell through here, which is the exact failure
-            // this list's own doc describes: they reached the availability
-            // ladder and could surface as a terminal `done`. Both predate this
-            // change; `zero_nodes` is the class `no_references` is modelled on,
-            // so shipping its sibling while leaving it silent made no sense.
-            "zero_nodes" => {
-                out.insert(
-                    rest.to_string(),
-                    (
-                        "failed",
-                        format!(
-                            "semantic analyzer for '{rest}' ran but found no symbols despite \
-                             '{rest}' sources being present, re-run \
-                             `travsr init --semantic --force` after fixing the project setup"
-                        ),
-                    ),
-                );
-            }
-            "needs_consent" => {
-                out.insert(
-                    rest.to_string(),
-                    (
-                        "unavailable",
-                        format!(
-                            "'{rest}' analysis needs security approval before it can run, \
-                             run `travsr lang install {rest}` interactively to grant it"
-                        ),
-                    ),
-                );
-            }
-            // #724: the analyzer succeeded and returned definitions, but not one
-            // reference occurrence, so no call edge can be derived from it. An
-            // agent asking whether the index is healthy was told it is, which is
-            // the silence this class exists to break (#752 review).
-            "no_references" => {
-                out.insert(
-                    rest.to_string(),
-                    (
-                        "failed",
-                        format!(
-                            "semantic analyzer for '{rest}' produced definitions but no \
-                             references, so no call edges came from it, re-run \
-                             `travsr init --semantic --force` to retry"
-                        ),
-                    ),
-                );
-            }
-            "version_mismatch" => {
-                let v: Vec<&str> = rest.splitn(3, ':').collect();
-                if let [lang, expected, got] = v[..] {
-                    out.insert(
-                        lang.to_string(),
-                        (
-                            "failed",
-                            format!(
-                                "'{lang}' sidecar protocol v{got} != expected v{expected}, \
-                                 run `travsr lang install {lang}`"
-                            ),
-                        ),
-                    );
-                }
-            }
-            "needs_approval" => {
-                // Vestigial class: elevated access is auto-granted for local use
-                // (ADR-017 Amendment A5), so this build never writes it. It can
-                // still be read from meta written by a pre-upgrade index; the
-                // actionable fix is to reindex, not the deleted `lang approve`.
-                out.insert(
-                    rest.to_string(),
-                    (
-                        "unavailable",
-                        format!(
-                            "'{rest}' was skipped by a previous index, \
-                             run `travsr lang install {rest}` to enable and reindex it"
-                        ),
-                    ),
-                );
-            }
-            "skipped_unregistered" => {
-                out.insert(
-                    rest.to_string(),
-                    (
-                        "unavailable",
-                        format!(
-                            "'{rest}' sources found but semantic indexing is not set up. \
-                             Run `travsr lang install {rest}`"
-                        ),
-                    ),
-                );
-            }
-            "skipped_no_analyzer" => {
-                out.insert(
-                    rest.to_string(),
-                    (
-                        "unavailable",
-                        format!(
-                            "'{rest}' is registered but its analyzer binary is missing. \
-                             Run `travsr lang install {rest}`"
-                        ),
-                    ),
-                );
-            }
-            "skipped_no_compdb" => {
-                out.insert(
-                    rest.to_string(),
-                    (
-                        "unavailable",
-                        format!(
-                            "'{rest}' semantic indexing needs a compile_commands.json at the \
-                             repo root. Generate one (e.g. `bear -- make`, or CMake's \
-                             CMAKE_EXPORT_COMPILE_COMMANDS) to enable it"
-                        ),
-                    ),
-                );
-            }
-            // ADR-017 Rule 3 trust gate (#414): the daemon records this when
-            // it declines to spawn a sidecar for a language because the
-            // repository's corpus is not trusted. Wording tracks
-            // `travsr status` (status.rs), which reads the same `corpus` meta
-            // to name what to trust.
-            "untrusted_corpus" => {
-                out.insert(
-                    rest.to_string(),
-                    (
-                        "unavailable",
-                        format!(
-                            "'{rest}' is registered but this repository's corpus is not \
-                             trusted for semantic indexing. Run `travsr lang add {rest} \
-                             --corpus {corpus}` to trust it"
-                        ),
-                    ),
-                );
-            }
-            _ => {}
-        }
+            "no_references" => ("no_calls", Readiness::NoCalls),
+            "emitter_missing" => ("failed", Readiness::PartMissing),
+            // All of these are what `travsr init` sets up itself: install,
+            // registration, trust, the unsandboxed permission (plan 4.4).
+            "needs_consent"
+            | "needs_approval"
+            | "skipped_unregistered"
+            | "skipped_no_analyzer"
+            | "untrusted_corpus" => ("unavailable", Readiness::SettingUp),
+            "skipped_no_compdb" => (
+                "unavailable",
+                Readiness::NeedsToolchain {
+                    needs: "compile_commands.json".to_string(),
+                },
+            ),
+            "skipped_no_build_file" => (
+                "unavailable",
+                Readiness::NeedsBuildFile {
+                    needs: travsr_plugin_host::phase_b::catalog::required_build_files(lang)
+                        .1
+                        .to_string(),
+                },
+            ),
+            _ => continue,
+        };
+        // The first warning for a language wins, as in `travsr status`
+        // (`warning_class`), so both surfaces report the same state.
+        out.entry(lang.to_string())
+            .or_insert_with(|| (state, plain_detail(lang, &readiness)));
     }
     out
+}
+
+/// `"<lang>: <label>. <fix>"`, the line `travsr status` prints for it.
+fn plain_detail(lang: &str, r: &travsr_plugin_host::phase_b::status::Readiness) -> String {
+    match r.fix() {
+        Some(fix) => format!("{lang}: {}. {fix}", r.label()),
+        None => format!("{lang}: {}.", r.label()),
+    }
 }
 
 /// Whether each Phase-B-catalog language can produce Phase B edges *for this
@@ -498,82 +381,48 @@ fn decode_phase_b_warnings(
 /// Catalog membership alone is the wrong predicate (#636 round-2 review): a
 /// language with sources in the repo but no analyzer installed emits no
 /// ref/call edges and never will, so classifying it by "has edges yet" leaves
-/// it permanently non-terminal. What actually decides it is the skip ladder
-/// `travsr_plugin_host::indexer` runs, and this mirrors that ladder in the
-/// same order rather than inventing a second one:
-///   1. builtin (bundled in the travsr binary) -> always available
-///   2. non-builtin not registered in lang.toml -> `skipped_unregistered`
-///   3. scip-clang-based with no `compile_commands.json` at the repo root ->
-///      `skipped_no_compdb` (only checked when the root is known)
-///   4. resolver cannot resolve the analyzer -> `skipped_no_analyzer`
+/// it permanently non-terminal. What decides it is the readiness ladder
+/// (`travsr_plugin_host::phase_b::status::readiness`), the same one `travsr
+/// init`, `status` and `lang list` use, and the detail is its plain label and
+/// fix, so this tool and `travsr status` never disagree.
 ///
-/// The detail strings reuse the exact wording `decode_phase_b_warnings`
-/// produces for those same classes, so this tool and `travsr status` never
-/// disagree about why a language is degraded.
-///
-/// Everything here is read-only: `registered_languages_from_disk` reads
-/// `lang.toml` (honouring `TRAVSR_LANG_TOML`) and `CatalogResolver::new`
-/// reads it plus probes `PATH`. Nothing is written, nothing is downloaded.
-/// The resolver is built once per payload, not once per language.
-fn phase_b_availability(
+/// Read-only: `LangToml::from_disk` reads `lang.toml` (honouring
+/// `TRAVSR_LANG_TOML`) and `CatalogResolver::new` reads it plus probes `PATH`.
+/// Nothing is written, nothing is downloaded.
+pub(crate) fn phase_b_availability(
     root: Option<&Path>,
     corpus: &str,
+    warnings: &str,
 ) -> HashMap<&'static str, Option<String>> {
-    use travsr_plugin_host::resolver::PluginResolver as _;
+    use travsr_plugin_host::phase_b::status::{gather, readiness, Readiness};
 
-    // `LangToml::from_disk` rather than `registered_languages_from_disk`: the
-    // trust rung below needs the `trusted_corpora` half of the same file, and
-    // reading it once keeps the two halves consistent with each other.
     let lang_toml = travsr_plugin_host::trust::LangToml::from_disk();
-    let registered = lang_toml.registered.clone();
-    let trust = lang_toml.trust_config();
-    let resolver = travsr_plugin_host::resolver::CatalogResolver::new();
-    let has_compdb = root.map(|r| r.join("compile_commands.json").exists());
-
+    let resolver = travsr_plugin_host::resolver::CatalogResolver::for_corpus(corpus);
     let mut out = HashMap::with_capacity(travsr_plugin_host::PHASE_B_CATALOG.len());
     for entry in travsr_plugin_host::PHASE_B_CATALOG {
-        let lang = entry.language;
-        let detail = if entry.builtin {
-            None
-        } else if !registered.iter().any(|r| r == lang) {
-            Some(format!(
-                "'{lang}' sources found but semantic indexing is not set up. \
-                 Run `travsr lang install {lang}`"
-            ))
-        } else if !trust.is_trusted(corpus) {
-            // ADR-017 Rule 3 trust gate (#414). Sits exactly here because the
-            // indexer's own ladder does (`travsr-plugin-host/src/indexer.rs`:
-            // between the registration check and the compdb check), and
-            // builtins are exempt there for the same reason as above. Without
-            // this rung a language whose sidecar the gate declined to spawn,
-            // and which therefore has no recorded warning yet, falls through
-            // to "available" and is then reported as a terminal `done`
-            // (#636 round-5 review).
-            Some(format!(
-                "'{lang}' is registered but this repository's corpus is not trusted \
-                 for semantic indexing. Run `travsr lang add {lang} --corpus {corpus}` \
-                 to trust it"
-            ))
-        } else if entry.command == "scip-clang" && has_compdb == Some(false) {
-            Some(format!(
-                "'{lang}' semantic indexing needs a compile_commands.json at the \
-                 repo root. Generate one (e.g. `bear -- make`, or CMake's \
-                 CMAKE_EXPORT_COMPILE_COMMANDS) to enable it"
-            ))
-        } else if lang == "dart" {
-            // The indexer queues dart straight after the registration check
-            // (its emitter runs in-process, never through the resolver), so
-            // registration is the whole test for it.
-            None
-        } else if resolver.resolve(lang).is_none() {
-            Some(format!(
-                "'{lang}' is registered but its analyzer binary is missing. \
-                 Run `travsr lang install {lang}`"
-            ))
-        } else {
-            None
+        // Plan 4.2: the one readiness ladder, fed the stored warnings, so the
+        // line is the one `travsr status` prints for the language.
+        let cap = gather(
+            entry,
+            root.unwrap_or_else(|| Path::new("")),
+            corpus,
+            &lang_toml,
+            &resolver,
+            warnings,
+        );
+        let detail = match readiness(&cap) {
+            Readiness::Ready => None,
+            // Without a known root there is no project to look for a compile
+            // database or a build file in, so do not claim one is missing.
+            Readiness::NeedsToolchain { needs }
+                if root.is_none() && needs == "compile_commands.json" =>
+            {
+                None
+            }
+            Readiness::NeedsBuildFile { .. } if root.is_none() => None,
+            r => Some(plain_detail(entry.language, &r)),
         };
-        out.insert(lang, detail);
+        out.insert(entry.language, detail);
     }
     out
 }
@@ -631,6 +480,45 @@ fn semantic_block(store: &SqliteStore, root: Option<&Path>) -> serde_json::Value
     })
 }
 
+/// The single user-facing note for a graph built by an older travsr, or
+/// `None` when this database was written by the running binary's format.
+///
+/// Same RFC-014 #317 re-index policy the CLI reports, and deliberately the
+/// same sentence as `travsr status` (travsr-cli/src/status.rs), so the CLI,
+/// `get_index_status` and `get_graph_health` all say the same thing and point
+/// at the same fix; the only difference is that an unreadable version reads
+/// `format unknown` rather than `format vN`. An agent only ever sees the
+/// observability tools, so without this it kept answering from a graph the
+/// running binary can no longer reproduce, with no way to find out.
+fn stale_format_note(store: &SqliteStore) -> Option<String> {
+    // Gate on "Phase A has completed at least once", the same `last_commit`
+    // evidence `phase_a_state` below uses. A database that has never been
+    // indexed still reads back format 0 (the v3 migration's default, stamped
+    // only by a full index), and reporting "built with an older version" there
+    // would be a warning that fires on a healthy index, the same class of
+    // false alarm as the old `behind_by: 0, is_stale: true` (#636 round-4
+    // review). `phase_a.state` already reports "pending" for that case.
+    store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())?;
+
+    let current = travsr_core::SIGNATURE_FORMAT_VERSION;
+    let stored = match store.get_signature_format_version() {
+        Ok(v) if v == current => return None,
+        Ok(v) => format!("v{v}"),
+        // A read failure counts as drift, exactly as the daemon treats it
+        // before a reindex (travsr-daemon `reindex_files_reporting`):
+        // rebuilding is the recoverable direction, and staying silent leaves
+        // an agent trusting a graph nobody could verify.
+        Err(_) => "unknown".to_string(),
+    };
+    Some(format!(
+        "this index was built with an older version of travsr (format {stored}, current v{current}); run `travsr init` to rebuild it"
+    ))
+}
+
 /// Build the `get_index_status` JSON payload. `repo_label` is the value to
 /// report as `repo` (registry key in global mode, `corpus` meta in stdio
 /// mode); `root` is the repo's working-tree root when known (`None` disables
@@ -681,6 +569,11 @@ fn index_status_payload(
         None => commits_known_and_differ,
     };
     let dirty = root.and_then(working_tree_dirty);
+    // Reported inside `staleness` rather than as a new top-level key: it is
+    // the same question that object already answers ("is what I would read
+    // out of here current?"), just measured against the running binary
+    // instead of against git.
+    let rebuild_note = stale_format_note(store);
 
     let node_count = store.node_count().unwrap_or(0);
     let edge_count = store.edge_count().unwrap_or(0);
@@ -709,7 +602,7 @@ fn index_status_payload(
         .flatten()
         .unwrap_or_default();
     let corpus_meta = store.get_meta("corpus").ok().flatten().unwrap_or_default();
-    let decoded_warnings = decode_phase_b_warnings(&warnings_raw, &corpus_meta);
+    let decoded_warnings = decode_phase_b_warnings(&warnings_raw);
     // #636 A4: no persisted "job in flight" signal exists; derive it from the
     // live daemon-lock probe plus a commit mismatch. Best-effort, documented
     // on the field, not tested by any acceptance criterion.
@@ -727,7 +620,7 @@ fn index_status_payload(
     // hand-maintained copy: that copy is missing `objectivec`, which is a
     // real Phase B language, so it was excluded from `phase_b.languages`
     // entirely. It is now reported like any other catalog language.
-    let availability = phase_b_availability(root, &corpus_meta);
+    let availability = phase_b_availability(root, &corpus_meta, &warnings_raw);
     let languages = store.language_distribution().unwrap_or_default();
     let languages: Vec<(String, u64)> = languages
         .into_iter()
@@ -743,8 +636,11 @@ fn index_status_payload(
         // with them, so an agent polling for readiness never got an answer).
         let (state, detail) = if let Some((cls, msg)) = decoded_warnings.get(lang) {
             // 1. A recorded warning still wins: it is what actually happened
-            //    on the last run, more specific than any static prediction.
-            (*cls, Some(msg.clone()))
+            //    on the last run. The line is the ladder's when it has one, so
+            //    it matches `travsr status` (a missing build file, say, comes
+            //    before what the last run recorded).
+            let line = availability.get(lang.as_str()).cloned().flatten();
+            (*cls, Some(line.unwrap_or_else(|| msg.clone())))
         } else if store.has_refcall_edges_for_language(lang) {
             // 2. Edges exist: Phase B produced output for this language.
             ("done", None)
@@ -777,13 +673,15 @@ fn index_status_payload(
     }
 
     let degraded = |s: &&str| *s == "failed" || *s == "unavailable";
+    // A tracer that ran and found no calls is finished, not still running.
+    let finished = |s: &&str| *s == "done" || *s == "no_calls";
     let phase_b_state = if lang_states.is_empty() {
         "pending"
-    } else if lang_states.iter().all(|s| *s == "done") {
+    } else if lang_states.iter().all(finished) {
         "done"
     } else if lang_states.iter().all(degraded) {
         "failed"
-    } else if lang_states.contains(&"done") && lang_states.iter().any(degraded) {
+    } else if lang_states.iter().any(finished) && lang_states.iter().any(degraded) {
         "partial"
     } else if lang_states.contains(&"pending") {
         "pending"
@@ -791,7 +689,7 @@ fn index_status_payload(
         "running"
     };
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "repo": repo,
         "schema_version": schema_version,
         "indexed_commit": last_commit,
@@ -800,6 +698,7 @@ fn index_status_payload(
             "behind_by": behind_by,
             "is_stale": is_stale,
             "working_tree_dirty": dirty,
+            "rebuild_required": rebuild_note.is_some(),
         },
         "counts": { "nodes": node_count, "edges": edge_count },
         "phase_a": { "state": phase_a_state },
@@ -809,7 +708,11 @@ fn index_status_payload(
             "languages": lang_entries,
         },
         "semantic": semantic_block(store, root),
-    })
+    });
+    if let Some(note) = rebuild_note {
+        payload["staleness"]["rebuild_note"] = serde_json::json!(note);
+    }
+    payload
 }
 
 /// Index freshness / completeness snapshot for the caller's own repo
@@ -1404,9 +1307,18 @@ fn graph_health_payload(store: &SqliteStore, repo_label: &str, root: &Path) -> s
     let healthy =
         report.orphan_edges_detected == 0 && ghost_count == 0 && parity_ok && self_ref_count == 0;
 
+    // Carried beside `healthy` instead of folded into it: `healthy` is defined
+    // by the integrity scan (the report half of `travsr fsck`), and an index
+    // written by an older travsr can be perfectly intact. It still cannot be
+    // trusted to match what the running binary would produce, and this tool is
+    // where an agent asks about the graph's health, so it is reported here too
+    // rather than left only in `travsr status` (RFC-014 #317).
+    let rebuild_note = stale_format_note(store);
+
     let mut payload = serde_json::json!({
         "repo": repo,
         "healthy": healthy,
+        "rebuild_required": rebuild_note.is_some(),
         "node_count": report.node_count,
         "edge_count": report.edge_count,
         "ghost_paths": { "count": ghost_count, "sample": sample },
@@ -1433,6 +1345,9 @@ fn graph_health_payload(store: &SqliteStore, repo_label: &str, root: &Path) -> s
                 "run `travsr init` to rebuild the lexical index"
             };
         payload["recommendation"] = serde_json::json!(recommendation);
+    }
+    if let Some(note) = rebuild_note {
+        payload["rebuild_note"] = serde_json::json!(note);
     }
     payload
 }
@@ -1620,6 +1535,42 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
         assert!(!daemon_running(tmp.path()));
         assert!(!tmp.path().join(".travsr").join("daemon.lock").exists());
+    }
+
+    /// A rust-analyzer that runs, for tests whose rust must read as installed
+    /// on any machine: a rustup shim without the component does not count, and
+    /// CI has only that. The toolchain's own `cargo` answers `--version`, so a
+    /// copy of it under `CARGO_HOME/bin` stands in. Call with `ENV_LOCK` held;
+    /// `CARGO_HOME` is restored when the returned guard drops.
+    fn runnable_rust_analyzer() -> impl Drop {
+        struct Restore {
+            _home: tempfile::TempDir,
+            saved: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.saved.take() {
+                    Some(v) => std::env::set_var("CARGO_HOME", v),
+                    None => std::env::remove_var("CARGO_HOME"),
+                }
+            }
+        }
+        let exe = std::env::consts::EXE_SUFFIX;
+        let out = std::process::Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .expect("rustc --print sysroot");
+        let sysroot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("bin")).unwrap();
+        std::fs::copy(
+            sysroot.join("bin").join(format!("cargo{exe}")),
+            home.path().join("bin").join(format!("rust-analyzer{exe}")),
+        )
+        .expect("copy cargo as rust-analyzer");
+        let saved = std::env::var_os("CARGO_HOME");
+        std::env::set_var("CARGO_HOME", home.path());
+        Restore { _home: home, saved }
     }
 
     /// Write `pid` into a fresh temp repo's `.travsr/daemon.lock`, returning
@@ -1983,6 +1934,38 @@ mod tests {
     /// `TRAVSR_LANG_TOML` points at an empty registry so the result does not
     /// depend on which analyzers the developer running the suite happens to
     /// have installed.
+    /// Two warnings for one language: MCP must pick the one `travsr status`
+    /// picks (the first), or the two surfaces disagree.
+    #[test]
+    fn decode_keeps_the_first_warning_like_travsr_status() {
+        let decoded = decode_phase_b_warnings("crashed:rust,needs_consent:rust");
+        assert_eq!(decoded["rust"].0, "failed");
+    }
+
+    /// A language whose tracer found no calls is finished, so the aggregate
+    /// must not read "running" with no job in flight.
+    #[test]
+    fn index_status_no_calls_is_a_finished_aggregate() {
+        use travsr_core::{Node, VName};
+        use travsr_store::Store as _;
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        store
+            .set_meta("phase_b_warnings", "no_references:ruby")
+            .unwrap();
+        let node = Node::new(
+            VName::new("corpus", "main", "src/f.rb", "ruby", "fn:b"),
+            "function",
+        );
+        store.put_node(&node).unwrap();
+
+        let payload = index_status_payload(&store, "repo", None);
+
+        assert_eq!(payload["phase_b"]["languages"][0]["state"], "no_calls");
+        assert_eq!(payload["phase_b"]["state"], "done", "got: {payload}");
+    }
+
     #[test]
     fn index_status_phase_b_always_reaches_a_terminal_state() {
         use travsr_core::{Node, VName};
@@ -1994,6 +1977,7 @@ mod tests {
         let lang_toml_path = lang_toml.path().join("lang.toml");
         std::fs::write(&lang_toml_path, "registered = []\n").unwrap();
         std::env::set_var("TRAVSR_LANG_TOML", &lang_toml_path);
+        let _ra = runnable_rust_analyzer();
 
         let mut store = SqliteStore::open_in_memory().unwrap();
         store.set_meta("last_commit", "abc123").unwrap();
@@ -2029,11 +2013,14 @@ mod tests {
         // running, and says how to fix it.
         let ruby = langs.iter().find(|l| l["language"] == "ruby").unwrap();
         assert_eq!(ruby["state"], "unavailable", "got: {payload}");
+        // Windows has no ruby analyzer build, so it says that instead.
+        let fix = if cfg!(windows) {
+            "not available on windows"
+        } else {
+            "travsr init"
+        };
         assert!(
-            ruby["detail"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("travsr lang install"),
+            ruby["detail"].as_str().unwrap_or_default().contains(fix),
             "got: {payload}"
         );
         // Installed analyzer, Phase B complete at this commit, no warning and
@@ -2061,6 +2048,10 @@ mod tests {
     fn index_status_phase_b_running_only_while_a_job_is_in_flight() {
         use travsr_core::{Node, VName};
         use travsr_store::Store as _;
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ra = runnable_rust_analyzer();
         let mut store = SqliteStore::open_in_memory().unwrap();
         store.set_meta("last_commit", "abc123").unwrap();
         store.set_meta("phase_b_commit", "old999").unwrap();
@@ -2088,6 +2079,8 @@ mod tests {
     /// only fires when the repo root is known. Deterministic on any machine:
     /// the compdb check sits *above* the resolver, so whether `scip-clang`
     /// happens to be installed cannot change either half of this test.
+    /// Not on Windows, where C has no analyzer build at all.
+    #[cfg(not(windows))]
     #[test]
     fn phase_b_unavailable_names_compile_commands_json_only_when_the_root_lacks_one() {
         use travsr_core::{Node, VName};
@@ -2337,6 +2330,50 @@ mod tests {
         assert_eq!(payload["phase_a"]["state"], "done", "got: {payload}");
     }
 
+    /// An index stamped by the running binary must NOT carry the rebuild
+    /// warning: a warning that fires on a healthy index is worse than none.
+    #[test]
+    fn index_status_current_format_reports_no_rebuild() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+
+        let payload = index_status_payload(&store, "repo", None);
+        assert_eq!(payload["staleness"]["rebuild_required"], false);
+        assert!(payload["staleness"].get("rebuild_note").is_none());
+    }
+
+    /// A graph written before the format bump must tell an agent what to do
+    /// about it, in the same words `travsr status` uses.
+    #[test]
+    fn index_status_older_format_reports_rebuild_with_actionable_note() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION - 1)
+            .unwrap();
+
+        let payload = index_status_payload(&store, "repo", None);
+        assert_eq!(payload["staleness"]["rebuild_required"], true);
+        let note = payload["staleness"]["rebuild_note"].as_str().unwrap();
+        assert!(note.contains("older version of travsr"), "{note}");
+        assert!(note.contains("run `travsr init` to rebuild it"), "{note}");
+    }
+
+    /// A database nobody has indexed yet reads back format 0 by migration
+    /// default. That is "not indexed", not "indexed by an older travsr", and
+    /// `phase_a.state` already reports it, so no rebuild warning.
+    #[test]
+    fn index_status_never_indexed_store_does_not_claim_an_older_format() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let payload = index_status_payload(&store, "repo", None);
+        assert_eq!(payload["phase_a"]["state"], "pending");
+        assert_eq!(payload["staleness"]["rebuild_required"], false);
+        assert!(payload["staleness"].get("rebuild_note").is_none());
+    }
+
     // ── get_daemon_logs parsing / caps ────────────────────────────────────
 
     /// A real line off this machine's `.travsr/daemon.log.2026-08-12`, which
@@ -2363,19 +2400,23 @@ mod tests {
     /// across crates at compile time, which is exactly why it is pinned here.
     #[test]
     fn phase_b_warning_wording_tracks_the_cli() {
-        let decoded = decode_phase_b_warnings("crashed:go", "");
+        // The same label and fix `travsr status` prints for the language.
+        let decoded = decode_phase_b_warnings("crashed:go");
         let (state, detail) = decoded.get("go").expect("go must decode");
         assert_eq!(*state, "failed");
-        assert!(
-            detail.starts_with("semantic analyzer for 'go' crashed"),
-            "must match travsr status's wording, got: {detail}"
+        assert_eq!(
+            detail,
+            "go: could not trace calls. See `travsr status --verbose`."
         );
-        assert!(
-            !detail.contains("phase B analyzer"),
-            "internal vocabulary must not reappear: {detail}"
+
+        // needs_consent is the unsandboxed permission, which `travsr init`
+        // now grants itself (plan 4.4).
+        let decoded = decode_phase_b_warnings("needs_consent:go");
+        let (_, detail) = decoded.get("go").expect("go must decode");
+        assert_eq!(
+            detail,
+            "go: setting up. Run `travsr init` to finish tracing calls."
         );
-        // The repo forbids em-dashes, so the CLI's dash is a comma here.
-        assert!(!detail.contains('\u{2014}'), "em-dash: {detail}");
     }
 
     /// #636 round-5 review: pinning one string's wording was not enough. The
@@ -2387,41 +2428,52 @@ mod tests {
     /// missed. Every class listed here is one the daemon writes.
     #[test]
     fn phase_b_warning_classes_match_the_cli() {
-        // The per-language classes `travsr status` handles (status.rs).
+        // #760: iterate the single source rather than a third hand-maintained
+        // copy. A class added there that this decoder does not handle fails here
+        // instead of silently falling through to a terminal `done`.
         // `scip_unification_misses` is deliberately absent: it is a repo-wide
-        // rate, not a per-language state, and neither surface treats it as one.
-        for class in [
-            "crashed",
-            "version_mismatch",
-            "needs_approval",
-            "skipped_unregistered",
-            "skipped_no_analyzer",
-            "skipped_no_compdb",
-            "untrusted_corpus",
-            "no_references",
-            "zero_nodes",
-            "needs_consent",
-        ] {
+        // rate, not a per-language state (see PHASE_B_REPO_WIDE_WARNING_CLASSES),
+        // and neither surface treats it as one.
+        for class in travsr_core::PHASE_B_PER_LANGUAGE_WARNING_CLASSES
+            .iter()
+            .copied()
+        {
             // `version_mismatch` carries `lang:expected:got`, the rest `lang`.
             let warning = if class == "version_mismatch" {
                 format!("{class}:go:2:1")
             } else {
                 format!("{class}:go")
             };
-            let decoded = decode_phase_b_warnings(&warning, "github.com/acme/repo");
+            let decoded = decode_phase_b_warnings(&warning);
             let (state, detail) = decoded.get("go").unwrap_or_else(|| {
                 panic!("class {class:?} is handled by travsr status but falls through here")
             });
             assert!(
-                matches!(*state, "failed" | "unavailable"),
+                matches!(*state, "failed" | "unavailable" | "no_calls"),
                 "class {class:?} must map to a terminal state, got {state:?}"
             );
             assert!(!detail.is_empty(), "class {class:?} must explain itself");
+            assert_eq!(
+                travsr_plugin_host::phase_b::status::jargon_in(detail),
+                None,
+                "class {class:?} must read plainly: {detail}"
+            );
             assert!(
                 !detail.contains('\u{2014}'),
                 "em-dash in {class:?}: {detail}"
             );
         }
+    }
+
+    /// A run with no symbols proves nothing is missing: `travsr status` says
+    /// "needs" only for a tool it found absent, so this must not claim one.
+    #[test]
+    fn zero_nodes_does_not_claim_a_missing_tool() {
+        let decoded = decode_phase_b_warnings("zero_nodes:java");
+        assert_eq!(
+            decoded.get("java").map(|(_, d)| d.as_str()),
+            Some("java: could not trace calls. See `travsr status --verbose`.")
+        );
     }
 
     /// The blocking half of #636 round-5: a trust-gated language must never
@@ -2460,7 +2512,7 @@ mod tests {
             rust["detail"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("travsr lang add rust --corpus github.com/acme/repo"),
+                .contains("Run `travsr init`"),
             "must name the remediation the CLI names: {payload}"
         );
         assert_ne!(
@@ -2970,6 +3022,40 @@ mod tests {
         let payload = graph_health_payload(&store, "repo", tmp.path());
         assert_eq!(payload["healthy"], true);
         assert!(payload.get("recommendation").is_none());
+    }
+
+    /// Integrity-clean AND written by the running binary: no rebuild warning.
+    #[test]
+    fn graph_health_current_format_reports_no_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+
+        let payload = graph_health_payload(&store, "repo", tmp.path());
+        assert_eq!(payload["rebuild_required"], false);
+        assert!(payload.get("rebuild_note").is_none());
+    }
+
+    /// An intact graph can still have been built by an older travsr: `healthy`
+    /// stays true (nothing is corrupt) but the rebuild note must be there.
+    #[test]
+    fn graph_health_older_format_reports_rebuild_with_actionable_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION - 1)
+            .unwrap();
+
+        let payload = graph_health_payload(&store, "repo", tmp.path());
+        assert_eq!(payload["healthy"], true);
+        assert_eq!(payload["rebuild_required"], true);
+        let note = payload["rebuild_note"].as_str().unwrap();
+        assert!(note.contains("older version of travsr"), "{note}");
+        assert!(note.contains("run `travsr init` to rebuild it"), "{note}");
     }
 
     #[test]

@@ -18,7 +18,7 @@ node benchmarks/accuracy/run.js
 | `import-set` | what a file imports | recall + precision |
 | `seed-resolution` | query resolves to the right node | exact match |
 | `token-budget` | `--budget` caps output and reports truncation | invariant |
-| perf (#295-T6) | cold `travsr init` wall time, node/edge counts | threshold |
+| perf (#295-T6) | cold `travsr init --semantic` wall time (Phase A + Phase B), node/edge counts | threshold |
 | latency | every timed CLI invocation | p50 / p95 |
 
 Thresholds live in `manifest.json`; any violation fails the run (exit 1), so a
@@ -42,5 +42,6 @@ as a workflow artifact for trend inspection.
 Add fixture files (or a pinned `clone` spec), then append to
 `manifest.json`: `expected_definitions` drives `method-recall`; each entry in
 `cases` declares its `class`, the exact CLI `args`, and the expectation. The
-runner copies the corpus into a temp git repo, runs `travsr init`, and asserts
+runner copies the corpus into a temp git repo, runs `travsr init --semantic`
+(so `init_seconds` times Phase A plus Phase B), and asserts
 on the `--format json` output - no store internals are touched.

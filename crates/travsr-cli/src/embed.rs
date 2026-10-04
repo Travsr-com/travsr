@@ -814,10 +814,6 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
             backend.binary_name,
             path.display()
         );
-
-        if !crate::install::path_contains_travsr_bin() {
-            println!("\n{}", crate::install::path_hint());
-        }
     }
 
     // Before the model download, not after: model files run to 1.3 GB, and
@@ -2005,6 +2001,15 @@ fn model_files_installed(b: &EmbedBackend) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `id` can only ever name a file directly inside the index
+/// directory. A `model_id` comes from `embed.db` rather than from the
+/// catalog, and `gc` passes it to `remove_file`, so one that resolves to a
+/// parent or an absolute path would delete outside `.travsr/`.
+fn names_a_file_in_this_dir(id: &str) -> bool {
+    let mut parts = Path::new(id).components();
+    matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none()
+}
+
 /// The HNSW index files (code + docs space) that exist on disk for a set of
 /// models, keyed off `db_path`'s directory the same way `cmd_status` locates
 /// the active model's own index (`{model}.hnsw.usearch`, `embed.rs:~1533`).
@@ -2012,6 +2017,7 @@ fn reclaimable_hnsw_paths(db_path: &Path, models: &[(String, u64, u64)]) -> Vec<
     let dir = db_path.parent().unwrap_or(db_path);
     models
         .iter()
+        .filter(|(id, _, _)| names_a_file_in_this_dir(id))
         .flat_map(|(id, _, _)| {
             [
                 dir.join(format!("{id}.hnsw.usearch")),
@@ -2528,7 +2534,7 @@ pub fn hint_activate_if_installed(repo_root: &Path) {
     }
     if embed_binary_installed() {
         println!(
-            "tip: embeddings are installed but not enabled for this repo; run `travsr embed init` to turn on semantic search here"
+            "tip: meaning-based search is installed but off for this repo; run `travsr embed init` to turn it on here"
         );
     }
 }
@@ -2856,6 +2862,75 @@ mod embed_ux_tests {
         assert_eq!(parse_cpu_choice("xyz", ""), None);
     }
 
+    /// #862: the raw counts `embed status` prints come from `query_embed_stats`.
+    /// A vector on an ineligible node (a `field` with no `embed_text`) must not
+    /// lift `embedded` above `total_symbols`, and the derived Phase 2 figures
+    /// must follow. Exercised here rather than only through the binary because
+    /// `cmd_status` gates the progress section on an installed backend, which
+    /// the integration test can fake on Unix only.
+    #[test]
+    fn query_embed_stats_counts_only_eligible_vectors() {
+        use travsr_store::Store as _;
+        const MODEL: &str = "bge-small-en-v1.5";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let node = |kind: &str, sig: String| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/lib.ts", "typescript", sig),
+                kind,
+            )
+        };
+        let mut vectors: Vec<i64> = Vec::new();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            for i in 0..10 {
+                let n = node("function", format!("fn:f{i}"));
+                store.put_node(&n).unwrap();
+                if i < 8 {
+                    vectors.push(n.id.0 as i64); // two functions still pending
+                }
+            }
+            for i in 0..3 {
+                let n = node("field", format!("field:T.f{i}"));
+                store.put_node(&n).unwrap();
+                vectors.push(n.id.0 as i64); // ineligible, yet embedded
+            }
+        }
+        let conn = rusqlite::Connection::open(tmp.path().join(".travsr/embed.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE node_embeddings (
+                 node_id INTEGER NOT NULL, model_id TEXT NOT NULL,
+                 embedding BLOB NOT NULL, text_hash TEXT,
+                 PRIMARY KEY (node_id, model_id)) WITHOUT ROWID;",
+        )
+        .unwrap();
+        for id in &vectors {
+            conn.execute(
+                "INSERT INTO node_embeddings (node_id, model_id, embedding) VALUES (?1, ?2, X'00')",
+                rusqlite::params![id, MODEL],
+            )
+            .unwrap();
+        }
+        let raw: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, 11, "precondition: the unfiltered count is inflated");
+
+        let EmbedStatsWithThreshold { stats, .. } = query_embed_stats(&db_path, MODEL).unwrap();
+        assert_eq!(stats.total_symbols, 10);
+        assert_eq!(stats.embedded, 8, "eight eligible vectors, not eleven rows");
+        assert!(stats.embedded <= stats.total_symbols);
+        // No k-core data: Phase 1 is empty and everything is Phase 2.
+        assert_eq!((stats.phase1_total, stats.phase1_done), (0, 0));
+        assert_eq!((stats.phase2_total, stats.phase2_done), (10, 8));
+        assert_eq!(
+            stats.phase2_total - stats.phase2_done,
+            2,
+            "the two functions without a vector are the pending work"
+        );
+    }
+
     /// F4: a lagging tier denominator can make `done > total`; the displayed
     /// percentage must never exceed 100%. Raw counts stay honest elsewhere.
     #[test]
@@ -2864,5 +2939,50 @@ mod embed_ux_tests {
         assert_eq!(pct_display(0, 0), 100.0); // empty tier => nothing to do
         assert_eq!(pct_display(50, 100), 50.0); // normal case
         assert_eq!(pct_display(0, 100), 0.0);
+    }
+}
+
+/// #525 item 3: `gc` turns `node_embeddings.model_id` into a filename it then
+/// deletes. That column is whatever was written to `embed.db`, so the id has
+/// to be treated as untrusted input rather than as a name.
+#[cfg(test)]
+mod gc_path_tests {
+    use super::*;
+
+    /// `db_path`'s directory with one index file per given id, plus a file
+    /// one level above it that no id may ever reach.
+    fn index_dir_with(ids: &[&str]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".travsr");
+        std::fs::create_dir_all(&dir).unwrap();
+        for id in ids {
+            std::fs::write(dir.join(format!("{id}.hnsw.usearch")), b"idx").unwrap();
+        }
+        let outside = root.path().join("outside.hnsw.usearch");
+        std::fs::write(&outside, b"not ours").unwrap();
+        (root, dir.join("embed.db"), outside)
+    }
+
+    fn models(ids: &[&str]) -> Vec<(String, u64, u64)> {
+        ids.iter().map(|id| ((*id).to_string(), 1, 1)).collect()
+    }
+
+    #[test]
+    fn a_model_id_that_escapes_the_index_dir_reclaims_nothing() {
+        let (_root, db_path, outside) = index_dir_with(&[]);
+        let paths = reclaimable_hnsw_paths(&db_path, &models(&["../outside"]));
+        assert!(
+            paths.is_empty(),
+            "an id naming a path outside the index dir must not become a deletion target: {paths:?}"
+        );
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn an_ordinary_model_id_still_reclaims_its_index_files() {
+        let (_root, db_path, _outside) = index_dir_with(&["bge-small-en-v1.5"]);
+        let paths = reclaimable_hnsw_paths(&db_path, &models(&["bge-small-en-v1.5"]));
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("bge-small-en-v1.5.hnsw.usearch"));
     }
 }

@@ -3,12 +3,11 @@ import {
   buildSynonymsHtml,
   buildReposHtml,
   buildStatsHtml,
-  buildLanguagesHtml,
   highlightJson,
   looksLikeSourceRef,
   renderDetail,
 } from "../../webviews";
-import type { Diagnostic, LangCount, LangInfo, LogEntry, StatsView } from "../../webviews";
+import type { Diagnostic, LogEntry, StatsView } from "../../webviews";
 
 // Shared fixtures. Values are arbitrary: they exist to drive each builder
 // down a branch, and nothing asserts on them.
@@ -18,25 +17,6 @@ const STATS: StatsView = {
   schemaVersion: "1",
   dbSize: "1 B",
   lastIndexed: "just now",
-};
-const LANG: LangInfo = {
-  language: "rust",
-  package: "@travsr-plugin/rust",
-  sandbox: "Standard",
-  status: "active",
-  statusLine: "active",
-  repoState: "enabled",
-  installed: true,
-  registered: true,
-  builtin: false,
-  needsApproval: false,
-  availableOnThisPlatform: true,
-  unavailableTarget: null,
-  scipInstallType: "GithubBinary",
-  installHint: "travsr lang install rust",
-  underlyingToolHint: "",
-  prerequisites: "Rust toolchain (cargo)",
-  elevatedHosts: [],
 };
 const LOG: LogEntry[] = [
   { time: "01:00:00", level: "INFO", target: "daemon", message: "started", event: "daemon.ready", detail: "pid=1", iso: "2026-08-14T01:00:00Z", raw: "{}" },
@@ -103,174 +83,6 @@ suite("VSCODE-247: buildReposHtml", () => {
   });
 });
 
-suite("VSCODE-247: buildLanguagesHtml", () => {
-  const indexed: LangCount[] = [
-    { language: "typescript", count: 3200 },
-    { language: "rust", count: 840 },
-  ];
-  const available: LangInfo[] = [
-    {
-      language: "rust", package: "scip-rust", sandbox: "Standard",
-      status: "active", statusLine: "active", repoState: "always_on",
-      installed: true, registered: true, builtin: true, needsApproval: false,
-      availableOnThisPlatform: true, unavailableTarget: null,
-      scipInstallType: "Command", installHint: "travsr lang install rust",
-      underlyingToolHint: "", prerequisites: "", elevatedHosts: [],
-    },
-    {
-      language: "java", package: "scip-java", sandbox: "Elevated",
-      status: "partial", statusLine: "partial (run: travsr lang install java for full analysis)",
-      repoState: "not_enabled",
-      installed: false, registered: false, builtin: false, needsApproval: false,
-      availableOnThisPlatform: true, unavailableTarget: null,
-      scipInstallType: "GithubBinary", installHint: "travsr lang install java",
-      underlyingToolHint: "", prerequisites: "JDK, Maven or Gradle", elevatedHosts: ["repo1.maven.org"],
-    },
-    {
-      language: "scala", package: "scip-scala", sandbox: "Elevated",
-      status: "partial", statusLine: "partial (run: travsr lang install scala for full analysis)",
-      repoState: "not_enabled",
-      installed: false, registered: false, builtin: false, needsApproval: false,
-      availableOnThisPlatform: true, unavailableTarget: null,
-      scipInstallType: "Manual", installHint: "travsr lang install scala",
-      underlyingToolHint: "https://docs.scala-lang.org/scip", prerequisites: "JDK, sbt", elevatedHosts: [],
-    },
-    {
-      language: "swift", package: "scip-swift", sandbox: "Standard",
-      status: "unsupported", statusLine: "partial (full analysis not available on windows)",
-      repoState: "not_enabled",
-      installed: false, registered: false, builtin: false, needsApproval: false,
-      availableOnThisPlatform: false, unavailableTarget: "windows",
-      scipInstallType: "GithubBinary", installHint: "travsr lang install swift",
-      underlyingToolHint: "", prerequisites: "", elevatedHosts: [],
-    },
-    {
-      language: "java", package: "scip-java", sandbox: "Elevated",
-      status: "needs_consent", statusLine: "partial (full analysis needs your permission; run: travsr lang allow-unsandboxed java)",
-      repoState: "needs_analyzer",
-      installed: true, registered: true, builtin: false, needsApproval: false,
-      availableOnThisPlatform: true, unavailableTarget: null,
-      scipInstallType: "GithubBinary", installHint: "travsr lang install java",
-      underlyingToolHint: "", prerequisites: "JDK + Gradle", elevatedHosts: ["repo1.maven.org"],
-    },
-  ];
-
-  test("renders indexed section with node counts", () => {
-    const html = buildLanguagesHtml(indexed, []);
-    assert.ok(html.includes("typescript") && html.includes("rust"));
-    assert.ok(html.includes("3,200") || html.includes("3200"), "node count visible");
-    assert.ok(html.includes("Indexed in this repo"));
-  });
-  test("renders available tools with correct action cells", () => {
-    const html = buildLanguagesHtml([], available);
-    // rust: active built-in analyzer → "on" badge, no Disable button for builtins
-    assert.ok(html.includes(">on<"), "active builtin shows an 'on' badge");
-    assert.ok(!html.includes('onclick="removeLang'), "builtin has no Disable onclick");
-    // java (elevated, auto-granted): a plain Install button — no consent form,
-    // no approveLang message, no "Grant" text.
-    assert.ok(html.includes("installLang(this,'java')"), "elevated java shows a plain Install");
-    assert.ok(!html.includes("approveLang"), "no consent-form approve action");
-    assert.ok(!html.includes("Grant &amp; Install"), "no Grant & Install consent form");
-    // scala (Manual install type): a plain Install button now — never a docs
-    // redirect. The Prerequisites column names the tool it needs instead.
-    assert.ok(html.includes("installLang(this,'scala')"), "scala shows a plain Install, not a docs link");
-    assert.ok(!html.includes("docs.scala-lang.org"), "no redirect to a docs site");
-    assert.ok(!html.includes("Install guide"), "no 'Install guide' link");
-    // swift (unsupported here): no install offered, honest 'Not available' cell.
-    assert.ok(html.includes("Not available on Windows"), "unsupported language shows a disabled 'Not available' cell");
-    assert.ok(!html.includes("installLang(this,'swift')"), "never offers to install an unavailable language");
-    // java (needs_consent): one-click permission, no command echoed.
-    assert.ok(html.includes("grantPermission(this,'java')"), "needs_consent shows an Allow & enable action");
-    assert.ok(html.includes("Allow"), "permission action is labelled in plain words");
-  });
-  test("undetected+inactive languages are gated behind not-here disclosure", () => {
-    // java and scala are not in indexed → get <details class="not-here"> wrapper
-    const html = buildLanguagesHtml([], available);
-    assert.ok(html.includes('<details class="not-here">'), "disclosure element present for undetected languages");
-  });
-  test("detected language gets direct action, not gated", () => {
-    // rust is in indexed → Install button should appear directly, no not-here disclosure
-    const indexedWithRust: LangCount[] = [{ language: "rust", count: 10 }];
-    const uninstalledRust: LangInfo[] = [{
-      language: "rust", package: "scip-rust", sandbox: "Standard",
-      status: "partial", statusLine: "partial (run: travsr lang install rust for full analysis)",
-      repoState: "always_on",
-      installed: false, registered: false, builtin: false, needsApproval: false,
-      availableOnThisPlatform: true, unavailableTarget: null,
-      scipInstallType: "Command", installHint: "travsr lang install rust",
-      underlyingToolHint: "", prerequisites: "", elevatedHosts: [],
-    }];
-    const html = buildLanguagesHtml(indexedWithRust, uninstalledRust);
-    assert.ok(html.includes("installLang") && html.includes("Install"));
-    assert.ok(!html.includes('<details class="not-here">'), "detected language skips the disclosure gate");
-  });
-  test("analysis badge shows the CLI's computed status, no jargon", () => {
-    const html = buildLanguagesHtml(indexed, available);
-    // rust: active → "active" badge
-    assert.ok(html.includes(">active<"), "active badge for a live language");
-    // scala/java: partial → "partial"; the installed java fixture is needs_consent.
-    assert.ok(html.includes(">partial<"), "partial badge for a language on structure only");
-    assert.ok(html.includes(">needs permission<"), "needs-consent badge");
-    // The plain statusLine is the tooltip; no internal jargon leaks. The
-    // needs_consent line the CLI emits names `allow-unsandboxed`; the panel must
-    // render its own plain wording, never that command.
-    assert.ok(html.includes("full analysis"), "plain statusLine used as tooltip");
-    assert.ok(
-      !/SCIP|LSIF|Phase B|sandbox|corpus|Built-in to the travsr/i.test(html),
-      "no internal jargon in the panel"
-    );
-    assert.ok(html.includes("Semantic"), "Semantic column header present");
-  });
-  test("This repo column shows per-repo enablement with the CLI's tag", () => {
-    const html = buildLanguagesHtml(indexed, available);
-    assert.ok(html.includes("This repo"), "This repo column header present");
-    // rust is builtin -> always on; java/scala are not_enabled in the mocks.
-    assert.ok(html.includes(">always on<"), "builtin shows 'always on' for the repo");
-    assert.ok(html.includes(">not enabled<"), "an off-for-this-repo language shows 'not enabled'");
-    // The not-enabled badge tooltip states the per-repo remedy explicitly.
-    assert.ok(
-      html.includes("Full analysis is off for this repo"),
-      "not-enabled tooltip explains per-repo enablement"
-    );
-  });
-  test("builtin without its analyzer shows 'no analyzer', not a green 'always on'", () => {
-    // rust is builtin but its analyzer (rust-analyzer) can be missing: the CLI
-    // then sends repoState=needs_analyzer with status=partial. The panel must not
-    // render a green "always on" that contradicts the "partial" analysis badge.
-    const rustNoAnalyzer: LangInfo[] = [{
-      language: "rust", package: "scip-rust", sandbox: "Standard",
-      status: "partial", statusLine: "partial (run: travsr lang install rust for full analysis)",
-      repoState: "needs_analyzer",
-      installed: false, registered: true, builtin: true, needsApproval: false,
-      availableOnThisPlatform: true, unavailableTarget: null,
-      scipInstallType: "Command", installHint: "travsr lang install rust",
-      underlyingToolHint: "", prerequisites: "", elevatedHosts: [],
-    }];
-    const html = buildLanguagesHtml([], rustNoAnalyzer);
-    assert.ok(html.includes(">no analyzer<"), "shows 'no analyzer' for a builtin missing its analyzer");
-    assert.ok(!html.includes(">always on<"), "must not claim 'always on' while analysis is partial");
-    assert.ok(
-      html.includes("only structural analysis runs until it is"),
-      "no-analyzer tooltip explains the analyzer is missing"
-    );
-  });
-  test("detects empty indexed section", () => {
-    const html = buildLanguagesHtml([], []);
-    assert.ok(html.includes("No language metadata"));
-    assert.ok(html.includes('id="initBtn"'), "Initialize button element present in empty state");
-    assert.ok(html.includes('onclick="initRepo(this)"'), "Initialize button onclick wired");
-  });
-  test("detect and refresh buttons present", () => {
-    const html = buildLanguagesHtml(indexed, available);
-    assert.ok(html.includes("detectLangs") && html.includes("Detect"));
-    assert.ok(html.includes("doRefresh") && html.includes("Refresh"));
-  });
-  test("acquireVsCodeApi bridge wired", () => {
-    const html = buildLanguagesHtml(indexed, available);
-    assert.ok(html.includes("acquireVsCodeApi"));
-  });
-});
-
 suite("VSCODE-247: buildStatsHtml", () => {
   test("renders metric cards", () => {
     const html = buildStatsHtml({
@@ -320,9 +132,6 @@ suite("codicon syntax never reaches webview HTML", () => {
     ["stats, offline", buildStatsHtml(STATS)],
     ["stats, all clear", buildStatsHtml(STATS, LOG)],
     ["stats, with diagnostics", buildStatsHtml(STATS, LOG, DIAGS)],
-    ["languages, indexed and available", buildLanguagesHtml([{ language: "rust", count: 1 }], [LANG])],
-    ["languages, available but not indexed", buildLanguagesHtml([], [LANG])],
-    ["languages, empty", buildLanguagesHtml([], [])],
   ];
 
   test("no panel builder emits a codicon, on any branch", () => {
@@ -396,7 +205,6 @@ suite("every panel renders", () => {
       ["stats, with diagnostics", () => buildStatsHtml(STATS, LOG, DIAGS)],
       ["synonyms", () => buildSynonymsHtml([{ term: "auth", alias: "login" }])],
       ["repos", () => buildReposHtml([{ name: "demo", path: "/tmp/d", exists: true }])],
-      ["languages", () => buildLanguagesHtml([{ language: "rust", count: 1 }], [])],
     ];
     for (const [name, build] of cases) {
       let html = "";

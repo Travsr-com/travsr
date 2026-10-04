@@ -184,7 +184,59 @@ pub static KEYS: &[KeySpec] = &[
         default_display: "(none)",
         validate: validate_string_list,
     },
+    // #871-adjacent: the daemon writes `daemon.log` at `info` and had no switch
+    // but `RUST_LOG`. That is an environment variable on a process nobody
+    // launches by hand — the daemon is spawned in the background by `init` or
+    // the editor — so the level it was started with was whatever happened to be
+    // exported in that shell, and it held for the daemon's whole lifetime.
+    // Registering it here makes the choice a stored setting instead: durable
+    // across restarts, per-repo or global, and settable from the Health panel.
+    //
+    // `RUST_LOG` still wins when set. It is strictly more expressive (per-target
+    // directives like `travsr_plugin_host=debug`), and every troubleshooting
+    // message in the CLI tells people to use it, so a key that silently
+    // overrode it would break the documented path.
+    // #916: the PreToolUse guard's enforcement level. Policy lives here rather
+    // than in `.claude/settings.json` so `travsr guard` and the installed hook
+    // cannot disagree: the hook entry only names the binary to run, and one
+    // `travsr config set guard.mode ...` (or the `TRAVSR_GUARD` env var, which
+    // is the documented escape hatch) changes what that binary decides.
+    //
+    // Default `off`: a plain `travsr init` must never start denying an agent's
+    // tool calls in a repo where nobody asked for it.
+    KeySpec {
+        key: "guard.mode",
+        description:
+            "Claude Code PreToolUse guard: off | advisory | strict. advisory nudges toward the graph, strict denies graph-answerable reads.",
+        env: Some("TRAVSR_GUARD"),
+        default_display: "off",
+        validate: validate_guard_mode,
+    },
+    KeySpec {
+        key: "log.level",
+        description:
+            "Daemon log verbosity written to daemon.log: error | warn | info | debug | trace. RUST_LOG overrides it.",
+        env: Some("TRAVSR_LOG_LEVEL"),
+        default_display: "info",
+        validate: validate_log_level,
+    },
 ];
+
+/// The values [`validate_guard_mode`] accepts, least enforcing first. Also the
+/// order `travsr init --guard=<mode>` documents them in.
+pub const GUARD_MODES: &[&str] = &["off", "advisory", "strict"];
+
+/// Default guard mode when no layer sets one: the guard is opt-in (#916).
+pub const DEFAULT_GUARD_MODE: &str = "off";
+
+/// The levels [`validate_log_level`] accepts, coarsest first. Also the order the
+/// Health panel's Level control lists them in.
+pub const LOG_LEVELS: &[&str] = &["error", "warn", "info", "debug", "trace"];
+
+/// Default daemon log level when no layer sets one. Kept beside the levels it
+/// belongs to rather than spelled again at each call site; the daemon's
+/// fallback and this key's `default_display` are both this value.
+pub const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// Look up a key spec by its dotted name.
 pub fn spec(key: &str) -> Option<&'static KeySpec> {
@@ -217,6 +269,44 @@ fn validate_positive_int(s: &str) -> Result<toml::Value> {
         bail!("value must be >= 1, got {n}");
     }
     Ok(toml::Value::Integer(n))
+}
+
+/// A single tracing level word, lowercased. Deliberately NOT a full `RUST_LOG`
+/// directive string: this key exists to be driven by a dropdown and by
+/// `config set`, and accepting `travsr_daemon=debug,hyper=off` here would put a
+/// filter grammar behind a five-item control, with per-target typos silently
+/// discarded by `EnvFilter` at parse time. Anyone who needs that grammar has
+/// `RUST_LOG`, which takes precedence and is what the CLI's own troubleshooting
+/// messages already print.
+fn validate_log_level(s: &str) -> Result<toml::Value> {
+    let t = s.trim().to_ascii_lowercase();
+    if LOG_LEVELS.contains(&t.as_str()) {
+        return Ok(toml::Value::String(t));
+    }
+    bail!(
+        "log level must be one of: {} (got '{s}')",
+        LOG_LEVELS.join(", ")
+    )
+}
+
+/// One of the three guard modes, lowercased. Deliberately a closed set rather
+/// than a boolean: "on" would still have to choose between nudging and
+/// blocking, and those differ enough that the choice has to be written down.
+///
+/// The same spellings are accepted from `TRAVSR_GUARD`, which is how the
+/// documented `TRAVSR_GUARD=off` escape hatch works without a second code path:
+/// it is the env layer of this key. A value this build does not recognise is
+/// rejected by `set` and, at read time, falls back to [`DEFAULT_GUARD_MODE`]:
+/// the guard must never block because its own configuration was mistyped.
+fn validate_guard_mode(s: &str) -> Result<toml::Value> {
+    let t = s.trim().to_ascii_lowercase();
+    if GUARD_MODES.contains(&t.as_str()) {
+        return Ok(toml::Value::String(t));
+    }
+    bail!(
+        "guard mode must be one of: {} (got '{s}')",
+        GUARD_MODES.join(", ")
+    )
 }
 
 fn validate_priority(s: &str) -> Result<toml::Value> {
@@ -461,6 +551,87 @@ pub fn effective_bool(key: &str, repo_root: Option<&Path>) -> Option<bool> {
     }
 }
 
+/// Which layer decided the daemon's log filter. Reported in the daemon's own
+/// first log line, because "why is this file at debug" is otherwise answered by
+/// guessing at an environment nobody typed: the daemon is spawned in the
+/// background, so its `RUST_LOG` is inherited rather than chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFilterSource {
+    /// `RUST_LOG` was set and is used verbatim, directives and all.
+    RustLog,
+    /// The `log.level` key, from its env var or either config file.
+    Config,
+    /// Nothing set it; [`DEFAULT_LOG_LEVEL`].
+    Default,
+}
+
+impl LogFilterSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            LogFilterSource::RustLog => "RUST_LOG",
+            LogFilterSource::Config => "log.level",
+            LogFilterSource::Default => "default",
+        }
+    }
+}
+
+/// The tracing filter directive the daemon should install, and where it came
+/// from. Precedence, most specific first:
+///
+/// 1. `RUST_LOG`, verbatim. More expressive than this key can be (per-target
+///    directives), and it is what every `RUST_LOG=travsr_plugin_host=debug …`
+///    message the CLI prints tells people to use.
+/// 2. `log.level`, through the normal layering: `TRAVSR_LOG_LEVEL`, then the
+///    repo's `config.toml`, then the global one.
+/// 3. [`DEFAULT_LOG_LEVEL`].
+///
+/// A `log.level` this build does not recognise (hand-edited file, or a value
+/// written by a newer travsr) falls back to the default rather than being
+/// passed through: `EnvFilter` reads an unknown bare word as a *target* name
+/// with no level, which silently changes what is recorded instead of failing.
+pub fn resolve_log_filter(repo_root: Option<&Path>) -> (String, LogFilterSource) {
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let configured = effective("log.level", repo_root);
+    decide_log_filter(rust_log.as_deref(), configured.as_deref())
+}
+
+/// The stored setting alone, with `RUST_LOG` deliberately not consulted.
+///
+/// For a durable file written by a process whose environment nobody chose: the
+/// global stdio MCP server is spawned by an editor, so an inherited `RUST_LOG`
+/// there is an accident of whoever launched the editor rather than an
+/// instruction about that file. Honouring it let `RUST_LOG=error` empty the
+/// log, and a per-target directive with no bare level disable every other
+/// target in it.
+///
+/// [`resolve_log_filter`] remains the right call for a process a person starts
+/// and whose stderr they are reading.
+pub fn resolve_log_level_setting(repo_root: Option<&Path>) -> (String, LogFilterSource) {
+    decide_log_filter(None, effective("log.level", repo_root).as_deref())
+}
+
+/// The precedence itself, with both inputs passed in.
+///
+/// Split out from [`resolve_log_filter`] so it can be tested: the real function
+/// reads a process-global environment variable and the developer's own config
+/// files, neither of which a parallel test can own.
+fn decide_log_filter(
+    rust_log: Option<&str>,
+    configured: Option<&str>,
+) -> (String, LogFilterSource) {
+    // An empty or all-whitespace RUST_LOG is treated as unset. `RUST_LOG= travsr
+    // daemon start` is how a shell unsets it for one command, and taking it
+    // literally would hand `EnvFilter` an empty directive that silences the file
+    // entirely — the opposite of what the person typing it meant.
+    if let Some(raw) = rust_log.map(str::trim).filter(|s| !s.is_empty()) {
+        return (raw.to_string(), LogFilterSource::RustLog);
+    }
+    match configured.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if LOG_LEVELS.contains(&v.as_str()) => (v, LogFilterSource::Config),
+        _ => (DEFAULT_LOG_LEVEL.to_string(), LogFilterSource::Default),
+    }
+}
+
 /// [`effective`], split on commas into the list form list-typed keys round-trip
 /// through (see [`value_display`]). Absent and empty both yield an empty `Vec`,
 /// which is the "no extra patterns" case.
@@ -623,6 +794,86 @@ mod tests {
         }
         assert!(validate_priority("high").is_err());
         assert!(validate_priority("").is_err());
+    }
+
+    #[test]
+    fn validate_log_level_accepts_only_the_five_levels() {
+        for ok in LOG_LEVELS {
+            assert_eq!(
+                validate_log_level(ok).unwrap(),
+                toml::Value::String((*ok).to_string()),
+                "{ok}"
+            );
+        }
+        // Case and surrounding space are normalised, so a value typed into a
+        // shell round-trips to the same stored word a dropdown would write.
+        assert_eq!(
+            validate_log_level("  DEBUG ").unwrap(),
+            toml::Value::String("debug".to_string())
+        );
+        // Not a level: `verbose` and `all` are the words people reach for, and
+        // `EnvFilter` would read either as a target name rather than reject it.
+        for bad in ["verbose", "all", "off", "", "travsr_daemon=debug", "2"] {
+            assert!(validate_log_level(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    /// The whole point of #871-adjacent work: the level is a stored setting, and
+    /// an inherited `RUST_LOG` still wins because it is the more specific
+    /// instruction and the one every troubleshooting message prints.
+    #[test]
+    fn log_filter_precedence() {
+        // Nothing set anywhere: info, and the file says so.
+        assert_eq!(
+            decide_log_filter(None, None),
+            ("info".to_string(), LogFilterSource::Default)
+        );
+        // The setting alone.
+        assert_eq!(
+            decide_log_filter(None, Some("debug")),
+            ("debug".to_string(), LogFilterSource::Config)
+        );
+        // RUST_LOG beats the setting, and is passed through verbatim so its
+        // per-target grammar survives.
+        assert_eq!(
+            decide_log_filter(Some("travsr_plugin_host=debug"), Some("error")),
+            (
+                "travsr_plugin_host=debug".to_string(),
+                LogFilterSource::RustLog
+            )
+        );
+        // `RUST_LOG=` (the shell's way of unsetting it for one command) is not
+        // an instruction to silence the log.
+        assert_eq!(
+            decide_log_filter(Some("   "), Some("warn")),
+            ("warn".to_string(), LogFilterSource::Config)
+        );
+        // A level this build does not know (hand-edited file, or written by a
+        // newer travsr) falls back rather than reaching EnvFilter, where a bare
+        // unknown word parses as a target name and silently changes what is
+        // recorded.
+        assert_eq!(
+            decide_log_filter(None, Some("verbose")),
+            ("info".to_string(), LogFilterSource::Default)
+        );
+    }
+
+    /// Every level the panel and `config set` offer must be one `EnvFilter`
+    /// actually accepts. Catches a level added to `LOG_LEVELS` that tracing does
+    /// not know, which would otherwise only surface as a silently wrong filter
+    /// in a daemon nobody is watching.
+    #[test]
+    fn every_level_parses_as_a_tracing_directive() {
+        for level in LOG_LEVELS {
+            assert!(
+                level.parse::<tracing::level_filters::LevelFilter>().is_ok(),
+                "{level} is offered but is not a tracing level"
+            );
+        }
+        assert!(
+            LOG_LEVELS.contains(&DEFAULT_LOG_LEVEL),
+            "the default must be one of the offered levels"
+        );
     }
 
     #[test]
