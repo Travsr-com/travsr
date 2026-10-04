@@ -24,6 +24,13 @@ fn init_test_repo(tmp: &Path) {
     Command::new(cargo_bin("travsr"))
         .arg("init")
         .current_dir(tmp)
+        // Plan 4.5: `init` starts no daemon and downloads nothing in tests.
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        // #893: without this, `travsr init` appends this tempdir to the
+        // developer's real ~/.travsr/registry.json and leaves the entry there
+        // after `tempfile` deletes the directory.
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -35,6 +42,7 @@ fn init_test_repo(tmp: &Path) {
 fn run_mcp(cwd: &Path, messages: &[&str]) -> Vec<serde_json::Value> {
     let mut child = Command::new(cargo_bin("travsr"))
         .args(["mcp", "--stdio"])
+        .env("CI", "1") // no background daemon from `travsr mcp`
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -564,6 +572,11 @@ fn mcp_get_context_result_is_not_an_error_for_empty_graph() {
     std::process::Command::new(cargo_bin("travsr"))
         .arg("init")
         .current_dir(tmp.path())
+        // Plan 4.5: `init` starts no daemon and downloads nothing in tests.
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        // #893: keep this tempdir out of the developer's real registry.
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

@@ -63,6 +63,14 @@ crates/*/examples/probe_*.rs
 crates/*/examples/*_probe.rs
 crates/*/examples/calib_*.rs
 
+# Generated benchmark dumps and intermediates (never committed). The `_` prefix
+# is the existing convention for them: no `bench/_*` file is tracked, while every
+# committed bench input and harness is named without it. Untracked-but-unignored
+# they were reaching `find_pattern`, which searches with
+# `git grep --untracked --exclude-standard` so it can see a file the graph
+# already indexes before it is `git add`ed.
+bench/_*
+
 # travsr:begin (generated AI-tool config, `travsr connect --remove` to undo)
 /.mcp.json
 # travsr:end

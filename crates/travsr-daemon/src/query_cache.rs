@@ -6,13 +6,15 @@
 //! is SQLite's `PRAGMA data_version` as seen by the daemon's read connection,
 //! which increments on *any* write to `graph.db` from another connection —
 //! including out-of-band writers such as `travsr fsck --fix` that never touch
-//! the commit markers (#464). `embed_data_version` is the same pragma on the
-//! sibling `embed.db`: `ask` results depend on stored embeddings (KNN +
-//! RFC-019 cosine oracle), and an embed reindex rewrites embed.db without any
-//! graph.db write, so graph state alone cannot see it. The daemon passes
-//! `None` both while no embed.db exists and for tools that never read
-//! embed.db (`graph`, `status`), so the embed sidecar's batched writes cannot
-//! thrash entries that don't depend on them.
+//! the commit markers (#464). `embed_data_version` is the sibling `embed.db`'s
+//! freshness token: that same pragma mixed with the identity of the file it was
+//! read from, so a delete-and-recreate of embed.db moves it even though the
+//! pragma on its own cannot see one (#509). `ask` results depend on stored
+//! embeddings (KNN + RFC-019 cosine oracle), and an embed reindex rewrites
+//! embed.db without any graph.db write, so graph state alone cannot see it.
+//! The daemon passes `None` both while no embed.db exists and for tools that
+//! never read embed.db (`graph`, `status`), so the embed sidecar's batched
+//! writes cannot thrash entries that don't depend on them.
 //! Together, any graph or embed mutation changes the key. That makes
 //! invalidation structural: stale entries simply stop matching and age out via
 //! LRU eviction — there is no explicit `invalidate()` to forget to call on a
@@ -28,10 +30,12 @@ use std::collections::HashMap;
 pub struct DataVersions {
     /// graph.db's `data_version` as seen by the daemon's read connection.
     pub graph: u64,
-    /// embed.db's `data_version`. `None` while no embed.db exists (FTS-only
-    /// mode) and for tools that never read embed.db; `Some(version)` for
-    /// embed-dependent tools once the sidecar has created it. The two states
-    /// must not collide, so this stays an `Option` rather than a sentinel.
+    /// embed.db's freshness token (its `data_version` mixed with the identity
+    /// of the file it came from, #509). Compared for equality only, never
+    /// ordered. `None` while no embed.db exists (FTS-only mode) and for tools
+    /// that never read embed.db; `Some(token)` for embed-dependent tools once
+    /// the sidecar has created it. The two states must not collide, so this
+    /// stays an `Option` rather than a sentinel.
     pub embed: Option<u64>,
 }
 

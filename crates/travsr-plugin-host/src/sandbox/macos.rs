@@ -24,7 +24,7 @@ pub fn build_sandboxed_command(
     // Per-language toolchain grants: a build-tool analyzer (scip-go, …) must read
     // its module/build caches and see its env, or it resolves zero packages and
     // emits an empty index. Empty for languages with no out-of-repo needs.
-    let tc = crate::sandbox::toolchain::toolchain_access(language);
+    let tc = crate::sandbox::toolchain::toolchain_access(language, repo_root);
     let canon_path =
         |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let tc_read_rule = tc

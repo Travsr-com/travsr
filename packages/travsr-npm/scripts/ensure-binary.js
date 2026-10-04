@@ -150,6 +150,17 @@ async function ensureBinary() {
   // flags.
   const binName = process.platform === 'win32' ? 'travsr.exe' : 'travsr';
   execFileSync('tar', ['-xzf', tarName, binName], { cwd: BIN_DIR, stdio: 'inherit' });
+
+  // travsr-lib carries the bundled TypeScript, JavaScript and Python LSIF
+  // emitters, which no release before it shipped: without them those languages
+  // resolve no emitter and produce structural edges only, while `lang list`
+  // reports them active. Extracted separately and tolerantly, because a tarball
+  // that predates it has no such member and tar treats that as a hard error.
+  try {
+    execFileSync('tar', ['-xzf', tarName, 'travsr-lib'], { cwd: BIN_DIR, stdio: 'ignore' });
+  } catch {
+    console.log('travsr: this release ships no bundled LSIF emitters');
+  }
   fs.unlinkSync(tmpTar);
 
   if (process.platform !== 'win32') fs.chmodSync(destBin, 0o755);

@@ -7,6 +7,38 @@ pub mod windows;
 
 pub use policy::{SandboxPolicy, SandboxUnavailable};
 
+/// The scratch directory as the SIDECAR will see it, given the host path the
+/// daemon created.
+///
+/// The two differ on Linux, and only on Linux. bwrap binds the host directory
+/// at the fixed [`linux::SCRATCH_MOUNT`] rather than at its own path, and
+/// nothing maps the host path into the namespace: `/tmp` is not bound and the
+/// root is a fresh tmpfs. A sidecar handed the host path therefore finds
+/// nothing there and every write through it fails, silently, as a zero-node
+/// index. macOS grants the canonical host path in its Seatbelt profile and
+/// Windows ACLs that same path, so on both the host path is the real one and is
+/// returned unchanged.
+///
+/// The Linux remap is unconditional rather than conditional on having
+/// sandboxed: `Sidecar::build_cmd` routes every Linux spawn through
+/// `linux::build_sandboxed_command`, which fails closed when bwrap is missing,
+/// and the unsandboxed path is Windows-only. So a Linux sidecar that is running
+/// at all is inside the namespace where this name resolves.
+///
+/// This reports the truth about an existing bind; it grants nothing new. The
+/// mount and the child's `TMPDIR` already pointed here.
+pub fn sidecar_scratch_path(host: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = host;
+        std::path::PathBuf::from(linux::SCRATCH_MOUNT)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        host.to_path_buf()
+    }
+}
+
 /// How a single stdio stream is configured for a sandboxed process.
 #[derive(Clone, Copy)]
 pub enum StdioCfg {
@@ -120,6 +152,7 @@ impl SandboxedChild {
 pub fn build_unsandboxed_command(
     program: &str,
     args: &[&str],
+    repo_root: &std::path::Path,
     scratch: &std::path::Path,
     language: &str,
 ) -> SandboxedSpawn {
@@ -140,7 +173,7 @@ pub fn build_unsandboxed_command(
         }
     }
 
-    let access = toolchain::toolchain_access(language);
+    let access = toolchain::toolchain_access(language, repo_root);
     for (k, v) in &access.env {
         cmd.env(k, v);
     }
@@ -169,7 +202,12 @@ pub fn build_unsandboxed_command(
         // the wrapper shells out to) resolve, matching the isolated path's PATH
         // handling.
         let travsr_bin = home.join(".travsr").join("bin");
-        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let existing = access
+            .env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| std::ffi::OsString::from(v))
+            .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
         let mut dirs_vec = vec![travsr_bin];
         dirs_vec.extend(std::env::split_paths(&existing));
         if let Ok(joined) = std::env::join_paths(dirs_vec) {
@@ -305,6 +343,43 @@ impl SandboxedSpawn {
 mod tests {
     use super::*;
 
+    /// The value a sidecar is handed has to be a name IT can open. On Linux the
+    /// host path is not one: bwrap binds the scratch directory at
+    /// [`linux::SCRATCH_MOUNT`] and nothing maps the host path into the
+    /// namespace, so sending it made every write through `InvokeRequest::scratch`
+    /// fail and the language report zero nodes with no error. ruby, c and cpp
+    /// all consumed the field directly and were all affected.
+    #[test]
+    fn sidecar_scratch_path_is_the_mount_on_linux_and_the_host_path_elsewhere() {
+        let host = std::path::Path::new("/tmp/.tmpHostOnly123");
+        let got = sidecar_scratch_path(host);
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                got,
+                std::path::Path::new(linux::SCRATCH_MOUNT),
+                "a sandboxed Linux sidecar can only reach scratch by its mount point"
+            );
+            assert_ne!(
+                got, host,
+                "the host path resolves to nothing inside the namespace"
+            );
+        } else {
+            assert_eq!(
+                got, host,
+                "macOS grants the canonical host path and Windows ACLs it, so it is the real one"
+            );
+        }
+    }
+
+    /// The mount point is shared by three places that must agree: the `--bind`
+    /// target, the child's `TMPDIR`, and what the sidecar is told. Pinned as a
+    /// literal so changing it stays a deliberate edit rather than something that
+    /// silently desynchronises the three.
+    #[test]
+    fn scratch_mount_is_the_documented_path() {
+        assert_eq!(linux::SCRATCH_MOUNT, "/travsr-scratch");
+    }
+
     /// Process env is shared, so a test that sets/removes vars must not run
     /// concurrently with another that reads them. Hold this across every
     /// env-touching test in this binary (recovering from a poisoned guard, since
@@ -340,7 +415,7 @@ mod tests {
         std::env::set_var("TRAVSR_TEST_FAKE_SECRET", "s3cr3t");
         std::env::set_var("SYSTEMROOT", "C:\\Windows");
         let scratch = std::env::temp_dir();
-        let spawn = build_unsandboxed_command("java", &["-version"], &scratch, "java");
+        let spawn = build_unsandboxed_command("java", &["-version"], &scratch, &scratch, "java");
         // Off Windows, `SandboxedSpawn` has only the `Wrapped` variant
         // (AppContainer is windows-only), so this pattern is irrefutable and rustc
         // flags the `else` as unreachable. It is refutable on Windows, so allow the

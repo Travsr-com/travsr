@@ -30,9 +30,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Setup pyright
-        uses: ./.github/actions/setup-pyright
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
