@@ -126,7 +126,8 @@ const FIXTURES: &[Fixture] = &[
             case("fn:test_connection_pool", TestRole::None),
         ],
     },
-    // TypeScript: whole test file is a Support scope; no EntryPoint in v1.
+    // TypeScript: whole test file is a Support scope (the #479 path fallback,
+    // still the only rule for a declaration no `describe` encloses).
     Fixture {
         lang: Language::TypeScript,
         file: "typescript_entry.ts",
@@ -134,6 +135,37 @@ const FIXTURES: &[Fixture] = &[
         cases: &[
             case("class:CalibrationSuite", TestRole::Support),
             case("fn:setupFixture", TestRole::Support),
+        ],
+    },
+    // #674: BDD callbacks are their own nodes, so `it`/`test` is a real
+    // EntryPoint and a helper inside `describe` is Support. Under a production
+    // path, which proves the AST rule stands without the path fallback.
+    Fixture {
+        lang: Language::TypeScript,
+        file: "typescript_bdd.ts",
+        vname_path: "src/checkout.ts",
+        cases: &[
+            case("suite:Payments", TestRole::Support),
+            case("test:Payments.charges the card", TestRole::EntryPoint),
+            case("suite:Payments.refunds", TestRole::Support),
+            case(
+                "test:Payments.refunds.refunds the card",
+                TestRole::EntryPoint,
+            ),
+            case("fn:buildCart", TestRole::Support),
+            case("fn:calibrateFloors", TestRole::None),
+        ],
+    },
+    // #674: the same file under a test path. The whole-file Support scope is
+    // still applied, and entry still wins over scope for the callbacks.
+    Fixture {
+        lang: Language::TypeScript,
+        file: "typescript_bdd.ts",
+        vname_path: "src/checkout.test.ts",
+        cases: &[
+            case("test:Payments.charges the card", TestRole::EntryPoint),
+            case("fn:buildCart", TestRole::Support),
+            case("fn:calibrateFloors", TestRole::Support),
         ],
     },
     Fixture {
@@ -263,6 +295,30 @@ fn golden_test_roles() {
             );
         }
     }
+}
+
+/// #674: a VName signature is node identity, so a callback only earns a node
+/// when its name is a plain string literal. The BDD fixture's template-literal
+/// `it` must therefore contribute no node at all, or every commit that changed
+/// the interpolated value would churn the graph.
+#[test]
+fn a_template_literal_test_name_contributes_no_node() {
+    let f = FIXTURES
+        .iter()
+        .find(|f| f.file == "typescript_bdd.ts")
+        .expect("bdd fixture");
+    let out = parse_fixture(f);
+    let named: Vec<&str> = out
+        .nodes
+        .iter()
+        .map(|n| n.vname.signature.as_str())
+        .filter(|s| s.starts_with("test:") || s.starts_with("suite:"))
+        .collect();
+    assert!(
+        !named.iter().any(|s| s.contains("renders")),
+        "template-literal name leaked into a signature: {named:?}"
+    );
+    assert_eq!(named.len(), 4, "expected 2 suites + 2 cases, got {named:?}");
 }
 
 // ── Coverage gate (§7.2) ─────────────────────────────────────────────────────

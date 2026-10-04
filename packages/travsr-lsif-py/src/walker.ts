@@ -25,12 +25,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import Parser from 'tree-sitter';
-import Python from 'tree-sitter-python';
+import { Language, Parser, type Node as SyntaxNode } from 'web-tree-sitter';
 import { Emitter } from './emitter';
 import { assertPathsContained, isUnderRoot, resolveRoot } from './security';
-
-type SyntaxNode = Parser.SyntaxNode;
 
 interface SymbolInfo {
   resultSetId: number;
@@ -72,7 +69,29 @@ const SKIP_DIRS = new Set([
   'eggs',
 ]);
 
+// web-tree-sitter types namedChildren as (Node | null)[], mirroring the C API.
+// Dropping the nulls here keeps every walk site free of a guard.
+function namedChildren(node: SyntaxNode): SyntaxNode[] {
+  return node.namedChildren.filter((c): c is SyntaxNode => c !== null);
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
+
+let parser: Parser | null = null;
+
+/**
+ * Load the tree-sitter WASM runtime and the Python grammar.  Must be awaited
+ * once before walk(); both .wasm files sit beside this file (see
+ * scripts/copy-wasm.mjs).
+ */
+export async function init(): Promise<void> {
+  if (parser !== null) return;
+  await Parser.init({ locateFile: () => path.join(__dirname, 'tree-sitter.wasm') });
+  const python = await Language.load(path.join(__dirname, 'tree-sitter-python.wasm'));
+  const p = new Parser();
+  p.setLanguage(python);
+  parser = p;
+}
 
 export function walk(rootDir: string, emitter: Emitter): void {
   const repoRoot = resolveRoot(rootDir);
@@ -101,8 +120,8 @@ export function walk(rootDir: string, emitter: Emitter): void {
   }
   emitter.emitContains(projectId, Array.from(documentIds.values()));
 
-  const parser = new Parser();
-  parser.setLanguage(Python);
+  const py = parser;
+  if (py === null) throw new Error('init() must be awaited before walk()');
 
   const defMap: DefMap = new Map();
 
@@ -115,10 +134,38 @@ export function walk(rootDir: string, emitter: Emitter): void {
     const source = safeReadFile(absPath);
     if (source === null) continue;
 
-    const tree = parser.parse(source);
+    const tree = py.parse(source);
+    if (tree === null) continue;
     const defRangeIds: number[] = [];
     visitDefs(tree.rootNode, relPath, null, docId, defMap, emitter, defRangeIds);
     emitter.emitContains(docId, defRangeIds);
+  }
+
+  // ── Class bases: `class Dog(Animal)` → Animal, resolved per file so an
+  // inherited `d.describe()` can walk up to the defining class in Pass 2.
+  const classBases = new Map<string, LocalType[]>();
+  for (const absPath of pyFiles) {
+    const relPath = toRelPath(absPath, repoRoot);
+    const source = safeReadFile(absPath);
+    if (source === null) continue;
+    const tree = py.parse(source);
+    if (tree === null) continue;
+    const fileDir = path.dirname(relPath).replace(/\\/g, '/');
+    const importTable = buildImportTable(tree.rootNode, fileDir, defMap);
+    for (const top of namedChildren(tree.rootNode)) {
+      const cls = top.type === 'decorated_definition' ? top.lastNamedChild : top;
+      if (cls?.type !== 'class_definition') continue;
+      const name = cls.childForFieldName('name')?.text;
+      const supers = cls.childForFieldName('superclasses');
+      if (!name || !supers) continue;
+      const bases: LocalType[] = [];
+      for (const arg of namedChildren(supers)) {
+        if (arg.type !== 'identifier') continue;
+        const base = resolveClassName(arg.text, importTable, defMap, relPath);
+        if (base) bases.push(base);
+      }
+      classBases.set(`${relPath}:class:${name}`, bases);
+    }
   }
 
   // ── Pass 2: references ─────────────────────────────────────────────────────
@@ -130,13 +177,17 @@ export function walk(rootDir: string, emitter: Emitter): void {
     const source = safeReadFile(absPath);
     if (source === null) continue;
 
-    const tree = parser.parse(source);
+    const tree = py.parse(source);
+    if (tree === null) continue;
     const refRangeIds: number[] = [];
     const fileDir = path.dirname(relPath).replace(/\\/g, '/');
     const importTable = buildImportTable(tree.rootNode, fileDir, defMap);
     // #299 P1: track local variable types (`x = SomeClass()`) so method calls on
     // locals (`x.method()`), and `self.method()`, resolve to `method:Class.method`.
     const localTypes = buildLocalTypes(tree.rootNode, importTable, defMap, relPath);
+    // #1: per-class `self.<attr>` → class type, from explicit annotations, so
+    // `self.attr.method()` resolves to the attribute class's method.
+    const selfAttrTypes = buildSelfAttrTypes(tree.rootNode, importTable, defMap, relPath);
     visitRefs(
       tree.rootNode,
       docId,
@@ -146,7 +197,9 @@ export function walk(rootDir: string, emitter: Emitter): void {
       refRangeIds,
       relPath,
       null,
-      localTypes
+      localTypes,
+      classBases,
+      selfAttrTypes
     );
     emitter.emitContains(docId, refRangeIds);
   }
@@ -233,7 +286,7 @@ function visitDefs(
   // PY-H2: guard against pathologically nested Python ASTs (e.g. deeply nested
   // class definitions in generated code) that could overflow the JS call stack.
   if (depth >= MAX_AST_DEPTH) return;
-  for (const child of node.namedChildren) {
+  for (const child of namedChildren(node)) {
     visitDefsNode(child, relPath, enclosingClass, docId, defMap, emitter, defRangeIds, depth + 1);
   }
 }
@@ -345,9 +398,9 @@ function buildImportTable(
 ): Map<string, ImportEntry> {
   const table = new Map<string, ImportEntry>();
 
-  for (const child of rootNode.namedChildren) {
+  const process = (child: SyntaxNode): void => {
     if (child.type === 'import_statement') {
-      for (const importedNode of child.namedChildren) {
+      for (const importedNode of namedChildren(child)) {
         if (importedNode.type === 'dotted_name') {
           const modulePath = importedNode.text;
           // `import a.b.c` — only the first segment is in scope as a name.
@@ -366,7 +419,7 @@ function buildImportTable(
       }
     } else if (child.type === 'import_from_statement') {
       const moduleNameNode = child.childForFieldName('module_name');
-      if (!moduleNameNode) continue;
+      if (!moduleNameNode) return;
 
       let moduleCandidates: string[];
       if (moduleNameNode.type === 'relative_import') {
@@ -387,9 +440,32 @@ function buildImportTable(
         }
       }
     }
+  };
+
+  for (const child of namedChildren(rootNode)) {
+    process(child);
+    // #1: type-only imports live under `if TYPE_CHECKING:` (paired with
+    // `from __future__ import annotations`, the dominant idiom for annotation
+    // imports). Read them so annotation types resolve; they only name classes,
+    // never add a runtime call edge on their own.
+    if (child.type === 'if_statement' && isTypeCheckingCond(child.childForFieldName('condition'))) {
+      const block = child.childForFieldName('consequence');
+      if (block) for (const stmt of namedChildren(block)) process(stmt);
+    }
   }
 
   return table;
+}
+
+/** `TYPE_CHECKING` or `<mod>.TYPE_CHECKING` — the guard whose block holds
+ *  type-only imports. */
+function isTypeCheckingCond(cond: SyntaxNode | null): boolean {
+  if (!cond) return false;
+  if (cond.type === 'identifier') return cond.text === 'TYPE_CHECKING';
+  if (cond.type === 'attribute') {
+    return cond.childForFieldName('attribute')?.text === 'TYPE_CHECKING';
+  }
+  return false;
 }
 
 function extractImportedNames(
@@ -398,13 +474,16 @@ function extractImportedNames(
 ): Array<{ localName: string; importedName: string }> {
   const results: Array<{ localName: string; importedName: string }> = [];
 
-  for (const child of importFromNode.namedChildren) {
-    if (child === moduleNameNode) continue;
+  for (const child of namedChildren(importFromNode)) {
+    // Compare by node id, not by reference: every web-tree-sitter accessor
+    // hands back a fresh wrapper, so `===` would never skip the module name
+    // and `from socket import X` would rebind `socket` itself.
+    if (child.id === moduleNameNode.id) continue;
     if (child.type === 'wildcard_import') return []; // skip *
 
     if (child.type === 'import_list') {
       // Parenthesized list: from x import (y, z)
-      for (const item of child.namedChildren) {
+      for (const item of namedChildren(child)) {
         const entry = extractSingleName(item);
         if (entry) results.push(entry);
       }
@@ -475,6 +554,8 @@ function visitRefs(
   relPath: string,
   enclosingClass: string | null,
   localTypes: Map<string, LocalType>,
+  classBases: Map<string, LocalType[]>,
+  selfAttrTypes: Map<string, Map<string, LocalType>>,
   depth = 0
 ): void {
   // PY-H2: bail out before the JS call stack overflows on deeply nested ASTs.
@@ -489,7 +570,9 @@ function visitRefs(
         defMap,
         relPath,
         enclosingClass,
-        localTypes
+        localTypes,
+        classBases,
+        selfAttrTypes
       );
       if (info) {
         const rangeId = emitter.emitRange(funcNode);
@@ -506,7 +589,7 @@ function visitRefs(
       ? (node.childForFieldName('name')?.text ?? enclosingClass)
       : enclosingClass;
 
-  for (const child of node.namedChildren) {
+  for (const child of namedChildren(node)) {
     visitRefs(
       child,
       docId,
@@ -517,16 +600,19 @@ function visitRefs(
       relPath,
       nextClass,
       localTypes,
+      classBases,
+      selfAttrTypes,
       depth + 1
     );
   }
 }
 
 /**
- * Scan a file for `var = SomeClass(...)` assignments and record `var`'s class
- * type when `SomeClass` resolves to a first-party class (same file or a direct
- * import). File-scoped and last-write-wins — sufficient for the common case
- * without full flow analysis.
+ * Scan a file for `var: SomeClass = ...` annotations and `var = SomeClass(...)`
+ * constructor assignments, recording `var`'s class type when `SomeClass`
+ * resolves to a first-party class (same file or a direct import). File-scoped
+ * and last-write-wins — sufficient for the common case without full flow
+ * analysis.
  */
 function buildLocalTypes(
   rootNode: SyntaxNode,
@@ -539,16 +625,30 @@ function buildLocalTypes(
     if (depth >= MAX_AST_DEPTH) return;
     if (node.type === 'assignment') {
       const left = node.childForFieldName('left');
-      const right = node.childForFieldName('right');
-      if (left?.type === 'identifier' && right?.type === 'call') {
-        const fn = right.childForFieldName('function');
-        if (fn?.type === 'identifier') {
-          const cls = resolveClassName(fn.text, importTable, defMap, relPath);
-          if (cls) types.set(left.text, cls);
+      if (left?.type === 'identifier') {
+        // `x: App = ...` — an explicit annotation wins over any RHS.
+        const annotated = typeAnnotationClass(
+          node.childForFieldName('type'),
+          importTable,
+          defMap,
+          relPath
+        );
+        if (annotated) {
+          types.set(left.text, annotated);
+        } else {
+          // `x = SomeClass()` — infer from a first-party constructor call.
+          const right = node.childForFieldName('right');
+          if (right?.type === 'call') {
+            const fn = right.childForFieldName('function');
+            if (fn?.type === 'identifier') {
+              const cls = resolveClassName(fn.text, importTable, defMap, relPath);
+              if (cls) types.set(left.text, cls);
+            }
+          }
         }
       }
     }
-    for (const child of node.namedChildren) visit(child, depth + 1);
+    for (const child of namedChildren(node)) visit(child, depth + 1);
   };
   visit(rootNode);
   return types;
@@ -572,13 +672,144 @@ function resolveClassName(
   return undefined;
 }
 
+/**
+ * A `type` annotation node that is a single bare identifier naming a first-party
+ * class → its LocalType. Generics, unions, dotted and builtin names deliberately
+ * return undefined (precision-first).
+ */
+function typeAnnotationClass(
+  typeNode: SyntaxNode | null,
+  importTable: Map<string, ImportEntry>,
+  defMap: DefMap,
+  relPath: string
+): LocalType | undefined {
+  if (!typeNode || typeNode.type !== 'type') return undefined;
+  const kids = namedChildren(typeNode);
+  if (kids.length !== 1 || kids[0]!.type !== 'identifier') return undefined;
+  return resolveClassName(kids[0]!.text, importTable, defMap, relPath);
+}
+
+/** Annotated parameters of a function: param name → first-party class type. */
+function paramTypes(
+  fn: SyntaxNode,
+  importTable: Map<string, ImportEntry>,
+  defMap: DefMap,
+  relPath: string
+): Map<string, LocalType> {
+  const out = new Map<string, LocalType>();
+  const params = fn.childForFieldName('parameters');
+  if (!params) return out;
+  for (const p of namedChildren(params)) {
+    if (p.type !== 'typed_parameter') continue;
+    const nameNode = namedChildren(p).find((c) => c.type === 'identifier');
+    if (!nameNode) continue;
+    const t = typeAnnotationClass(p.childForFieldName('type'), importTable, defMap, relPath);
+    if (t) out.set(nameNode.text, t);
+  }
+  return out;
+}
+
+/**
+ * Walk a method body for `self.<attr>` assignments and record the attribute's
+ * class type from either an inline annotation (`self.attr: App = ...`) or an
+ * annotated parameter (`self.attr = app` where `app: App`). Last write wins.
+ */
+function collectSelfAssigns(
+  node: SyntaxNode,
+  params: Map<string, LocalType>,
+  typeOf: (t: SyntaxNode | null) => LocalType | undefined,
+  attrs: Map<string, LocalType>,
+  depth = 0
+): void {
+  if (depth >= MAX_AST_DEPTH) return;
+  if (node.type === 'assignment') {
+    const left = node.childForFieldName('left');
+    if (left?.type === 'attribute') {
+      const obj = left.childForFieldName('object');
+      const attr = left.childForFieldName('attribute');
+      if (obj?.type === 'identifier' && obj.text === 'self' && attr?.type === 'identifier') {
+        const annotated = typeOf(node.childForFieldName('type'));
+        if (annotated) {
+          attrs.set(attr.text, annotated);
+        } else {
+          const right = node.childForFieldName('right');
+          if (right?.type === 'identifier') {
+            const pt = params.get(right.text);
+            if (pt) attrs.set(attr.text, pt);
+          }
+        }
+      }
+    }
+  }
+  for (const child of namedChildren(node)) {
+    collectSelfAssigns(child, params, typeOf, attrs, depth + 1);
+  }
+}
+
+/**
+ * Per-class map of `self.<attr>` → the attribute's class type, from EXPLICIT
+ * annotations only (precision-first). Sources, each resolved to a first-party
+ * class via resolveClassName:
+ *   - class-body field annotation:  `attr: App` / `attr: App = ...`
+ *   - annotated self-assignment:    `self.attr: App = ...`
+ *   - self-assignment from a param: `def __init__(self, app: App): self.attr = app`
+ */
+function buildSelfAttrTypes(
+  rootNode: SyntaxNode,
+  importTable: Map<string, ImportEntry>,
+  defMap: DefMap,
+  relPath: string
+): Map<string, Map<string, LocalType>> {
+  const perClass = new Map<string, Map<string, LocalType>>();
+  const typeOf = (t: SyntaxNode | null): LocalType | undefined =>
+    typeAnnotationClass(t, importTable, defMap, relPath);
+
+  for (const top of namedChildren(rootNode)) {
+    const cls = top.type === 'decorated_definition' ? top.lastNamedChild : top;
+    if (cls?.type !== 'class_definition') continue;
+    const className = cls.childForFieldName('name')?.text;
+    const body = cls.childForFieldName('body');
+    if (!className || !body) continue;
+
+    const attrs = perClass.get(className) ?? new Map<string, LocalType>();
+
+    for (const stmt of namedChildren(body)) {
+      // class-body field annotation: `attr: App [= ...]`
+      if (stmt.type === 'expression_statement') {
+        const inner = stmt.firstNamedChild;
+        if (inner?.type === 'assignment') {
+          const left = inner.childForFieldName('left');
+          if (left?.type === 'identifier') {
+            const t = typeOf(inner.childForFieldName('type'));
+            if (t) attrs.set(left.text, t);
+          }
+        }
+        continue;
+      }
+
+      // method bodies: `self.attr: App = ...` and `self.attr = <annotated param>`
+      const fn = stmt.type === 'decorated_definition' ? stmt.lastNamedChild : stmt;
+      if (fn?.type !== 'function_definition') continue;
+      const fnBody = fn.childForFieldName('body');
+      if (!fnBody) continue;
+      collectSelfAssigns(fnBody, paramTypes(fn, importTable, defMap, relPath), typeOf, attrs);
+    }
+
+    if (attrs.size > 0) perClass.set(className, attrs);
+  }
+
+  return perClass;
+}
+
 function resolveCallTarget(
   funcNode: SyntaxNode,
   importTable: Map<string, ImportEntry>,
   defMap: DefMap,
   relPath: string,
   enclosingClass: string | null,
-  localTypes: Map<string, LocalType>
+  localTypes: Map<string, LocalType>,
+  classBases: Map<string, LocalType[]>,
+  selfAttrTypes: Map<string, Map<string, LocalType>>
 ): SymbolInfo | undefined {
   if (funcNode.type === 'identifier') {
     // foo() — simple direct call: look up the name in the import table.
@@ -586,7 +817,14 @@ function resolveCallTarget(
     if (entry?.kind === 'direct') {
       return defMap.get(entry.key);
     }
-    return undefined;
+    if (entry) return undefined;
+    // Otherwise a top-level def or class in this file, but only when nothing
+    // else binds the name: a wrong edge is worse than a missing one.
+    if (boundInEnclosingFunction(funcNode) || moduleBindings(funcNode) !== 1) return undefined;
+    // That one binding must be the def itself, not `Err = RuntimeError`
+    // beside a nested class of the same name.
+    const kind = moduleDefKind(funcNode);
+    return kind && defMap.get(`${relPath}:${kind}:${funcNode.text}`);
   }
 
   if (funcNode.type === 'attribute') {
@@ -594,6 +832,24 @@ function resolveCallTarget(
     const objNode = funcNode.childForFieldName('object');
     const attrNode = funcNode.childForFieldName('attribute');
     if (!objNode || !attrNode) return undefined;
+
+    // #1: `self.<attr>.<method>()` resolves via the attribute's annotated class
+    // type (buildSelfAttrTypes). Any other chained form (a.b.c(), foo().bar())
+    // stays unresolved — a wrong edge is worse than a missing one.
+    if (objNode.type === 'attribute') {
+      if (!enclosingClass) return undefined;
+      const innerObj = objNode.childForFieldName('object');
+      const innerAttr = objNode.childForFieldName('attribute');
+      if (
+        innerObj?.type === 'identifier' &&
+        innerObj.text === 'self' &&
+        innerAttr?.type === 'identifier'
+      ) {
+        const t = selfAttrTypes.get(enclosingClass)?.get(innerAttr.text);
+        if (t) return lookupMethod(t, attrNode.text, defMap, classBases);
+      }
+      return undefined;
+    }
 
     // Only handle simple identifier objects (not chained calls like a.b.c()).
     if (objNode.type !== 'identifier') return undefined;
@@ -614,7 +870,8 @@ function resolveCallTarget(
     // #299 P1: `self.method()` inside a class body resolves to the enclosing
     // class's method.
     if (objNode.text === 'self' && enclosingClass) {
-      const info = defMap.get(`${relPath}:method:${enclosingClass}.${attrNode.text}`);
+      const self = { relpath: relPath, className: enclosingClass };
+      const info = lookupMethod(self, attrNode.text, defMap, classBases);
       if (info) return info;
     }
 
@@ -622,13 +879,110 @@ function resolveCallTarget(
     // to that class's method.
     const lt = localTypes.get(objNode.text);
     if (lt) {
-      const info = defMap.get(`${lt.relpath}:method:${lt.className}.${attrNode.text}`);
+      const info = lookupMethod(lt, attrNode.text, defMap, classBases);
       if (info) return info;
     }
 
     return undefined;
   }
 
+  return undefined;
+}
+
+/** Field holding the names each binding construct introduces. */
+const BINDING_FIELDS: Record<string, string> = {
+  assignment: 'left',
+  augmented_assignment: 'left',
+  for_statement: 'left',
+  for_in_clause: 'left',
+  named_expression: 'name',
+  as_pattern: 'alias',
+};
+/** Constructs every identifier of which counts as bound (parameters, imports,
+ *  globals, `case` patterns). A class name in a pattern (`case Point(x=0)`)
+ *  counts too, which costs recall, never precision. */
+const BINDING_WHOLE = new Set([
+  'parameters',
+  'lambda_parameters',
+  'case_pattern',
+  'import_statement',
+  'import_from_statement',
+  'global_statement',
+  'nonlocal_statement',
+]);
+
+/** How many times `node`'s subtree binds `name`; `nested` also walks into defs. */
+function countBindings(node: SyntaxNode, name: string, nested: boolean, depth = 0): number {
+  if (depth >= MAX_AST_DEPTH) return 1; // unknown: treat as bound
+  const hasName = (n: SyntaxNode | null): boolean =>
+    n !== null && (n.type === 'identifier' ? n.text === name : namedChildren(n).some(hasName));
+  if (BINDING_WHOLE.has(node.type)) return hasName(node) ? 1 : 0;
+  let count = 0;
+  const field = BINDING_FIELDS[node.type];
+  if (field && hasName(node.childForFieldName(field))) count++;
+  const isDef = node.type === 'function_definition' || node.type === 'class_definition';
+  if (isDef && node.childForFieldName('name')?.text === name) count++;
+  if (isDef && !nested) return count; // a def's body is its own scope
+  for (const child of namedChildren(node)) count += countBindings(child, name, nested, depth + 1);
+  return count;
+}
+
+/** Whether a function around the call binds the called name itself, or the
+ *  class whose body the call sits in directly (a method does not see it). */
+function boundInEnclosingFunction(call: SyntaxNode): boolean {
+  let inFunction = false;
+  for (let p = call.parent; p !== null; p = p.parent) {
+    if (p.type === 'class_definition' && !inFunction) {
+      const body = p.childForFieldName('body');
+      if (body !== null && countBindings(body, call.text, false) > 0) return true;
+      continue;
+    }
+    if (p.type !== 'function_definition' && p.type !== 'lambda') continue;
+    inFunction = true;
+    const own = p.childForFieldName('name')?.text === call.text ? 1 : 0;
+    if (countBindings(p, call.text, true) > own) return true;
+  }
+  return false;
+}
+
+/** `fn` or `class` when a module-level def or class has the called name. */
+function moduleDefKind(call: SyntaxNode): 'fn' | 'class' | undefined {
+  let root = call;
+  while (root.parent !== null) root = root.parent;
+  for (const stmt of namedChildren(root)) {
+    const def = stmt.type === 'decorated_definition' ? stmt.childForFieldName('definition') : stmt;
+    if (def?.childForFieldName('name')?.text !== call.text) continue;
+    if (def.type === 'function_definition') return 'fn';
+    if (def.type === 'class_definition') return 'class';
+  }
+  return undefined;
+}
+
+/** How many module-level statements bind the called name. */
+function moduleBindings(call: SyntaxNode): number {
+  let root = call;
+  while (root.parent !== null) root = root.parent;
+  return namedChildren(root).reduce((n, stmt) => n + countBindings(stmt, call.text, false), 0);
+}
+
+/** `cls.method`, or the first base class (breadth-first) that defines it. */
+function lookupMethod(
+  cls: LocalType,
+  method: string,
+  defMap: DefMap,
+  classBases: Map<string, LocalType[]>
+): SymbolInfo | undefined {
+  const queue = [cls];
+  const seen = new Set<string>();
+  for (let i = 0; i < queue.length && i < 32; i++) {
+    const c = queue[i];
+    const key = `${c.relpath}:class:${c.className}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const info = defMap.get(`${c.relpath}:method:${c.className}.${method}`);
+    if (info) return info;
+    queue.push(...(classBases.get(key) ?? []));
+  }
   return undefined;
 }
 

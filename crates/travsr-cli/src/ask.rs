@@ -5,7 +5,7 @@
 //! store is opened directly (read-only fast path).
 
 use anyhow::Context as _;
-use tabled::{Table, Tabled};
+use tabled::{settings::Style, Table, Tabled};
 use travsr_mcp::query::{self, AskPayload};
 
 use crate::daemon_client;
@@ -19,16 +19,38 @@ pub enum OutputFormat {
     Json,
 }
 
+/// One rendered result line. There is no `Kind` column (#824): most signatures
+/// already carry their kind as a prefix (`fn:`, `method:`, `field:`, `var:`,
+/// ...), so the column just repeated it. The kind is folded into `signature`
+/// instead, and only for the rows that do not already show it — see
+/// [`signature_shows_kind`].
 #[derive(Tabled)]
 struct Row {
-    #[tabled(rename = "Kind")]
-    kind: String,
     #[tabled(rename = "Signature")]
     signature: String,
     #[tabled(rename = "Path")]
     path: String,
     #[tabled(rename = "Score")]
     score: String,
+}
+
+/// Render results as a borderless, space-aligned table (#824). The default
+/// `tabled` style drew a `+---+` rule between every row and boxed each cell in
+/// `|` bars, which roughly tripled the stdout an agent piping `ask` receives
+/// for output no human reads. Columns still align; only the frame is dropped.
+/// The machine surface is `--format json`, so this affects the human view only.
+///
+/// `Style::blank()` pads the last column, so every line would otherwise end in
+/// a space: invisible in a terminal, but still a byte per row in the stdout
+/// this change exists to shrink, and whitespace noise the moment anyone diffs
+/// captured output. Trim it back off.
+fn render_rows(rows: Vec<Row>) -> String {
+    let table = Table::new(rows).with(Style::blank()).to_string();
+    table
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The match-source lanes the grouped human table renders, in backend
@@ -41,10 +63,44 @@ struct Row {
 /// `payload.docs`, not from `rows`.
 const SECTION_TAGS: [&str; 5] = ["exact", "semantic", "docs", "tests", "relevant"];
 
+/// THE RULE: a signature already shows its kind only when the word before its
+/// first `:` is an abbreviation of the row's own kind — every letter of that
+/// word appearing in order inside the kind name.
+///
+/// That is language-agnostic because it compares the signature against the kind
+/// the indexer stamped on the same node rather than against a list of known
+/// prefixes: `fn:`/function, `var:`/variable, `pkg:`/package, `filemod:`/
+/// file-module and every other Phase A and Kotlin prefix pass, while the Phase B
+/// provider schemes that survive G1 unification — SCIP `scip:<path>:<symbol>`
+/// (Java/Go/C#/C/C++/Scala/PHP/Ruby/ObjC), the Swift emitter's `swift::Type.member`
+/// and the Dart emitter's `file:///abs/x.dart::Type.member` — do not, because
+/// `scip`/`swift`/`file` are not subsequences of `function`, `method`, `class`
+/// or any other kind. A bare path (a file node) and a Windows `C:\src\x.rs`
+/// have no kind-like prefix either, so they keep their kind too. #824's report
+/// came from an iOS/Swift run, which is exactly the set this protects.
+fn signature_shows_kind(signature: &str, kind: &str) -> bool {
+    let Some((prefix, _)) = signature.split_once(':') else {
+        return false;
+    };
+    if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let mut kind_chars = kind.chars();
+    prefix
+        .chars()
+        .all(|p| kind_chars.any(|k| k.eq_ignore_ascii_case(&p)))
+}
+
 fn to_row(r: &query::AskRow) -> Row {
     Row {
-        kind: r.kind.clone(),
-        signature: r.signature.clone(),
+        // Keep the signature verbatim — it is what a user copies into
+        // `travsr graph` / `travsr references` — and only prepend the kind when
+        // the signature does not already carry it.
+        signature: if r.kind.is_empty() || signature_shows_kind(&r.signature, &r.kind) {
+            r.signature.clone()
+        } else {
+            format!("{}: {}", r.kind, r.signature)
+        },
         path: match r.line {
             Some(l) => format!("{}:{}", r.path, l),
             None => r.path.clone(),
@@ -260,11 +316,14 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         match redirect.command {
             "travsr lang list" => {
                 println!("{}", pal.dim(redirect.answer));
-                crate::lang::run(crate::lang::LangCommand::List { json: false })?;
+                crate::lang::run(crate::lang::LangCommand::List {
+                    language: None,
+                    json: false,
+                })?;
             }
             "travsr status" => {
                 println!("{}", pal.dim(redirect.answer));
-                crate::status::run()?;
+                crate::status::run(false)?;
             }
             other => {
                 println!("{}", redirect.answer);
@@ -278,6 +337,7 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     daemon_client::warn_if_call_graph_degraded(&db_path);
 
     let mut served_cold_path = false;
+    let mut cold_path_embed_unarmed = false;
     let payload: AskPayload = match daemon_client::try_query(
         &repo_root,
         "ask",
@@ -291,6 +351,13 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             // FTS-only if the sidecar binary is absent or the index is not built.
             travsr_daemon::try_inject_embed_hook_readonly(&mut store, &db_path);
             let knn = store.embed_knn_fn();
+            // An embed.db sibling exists and this process still has no hook, so
+            // ranking here is lexical only. `knn.is_none()` is redundant today
+            // (`try_inject_embed_hook_readonly` is currently a no-op, so `knn`
+            // is always `None` on this path); it is kept because it is what the
+            // flag actually means, and dropping it would silently start lying
+            // the day that injector gains a body.
+            cold_path_embed_unarmed = store.has_embed_db() && knn.is_none();
             let knn_ref = knn
                 .as_ref()
                 .map(|f| f as &dyn Fn(&str, u32) -> Vec<(travsr_core::NodeId, f32)>);
@@ -304,6 +371,22 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     // a docs section would not have helped, so the note was pure recurring noise.
     if served_cold_path && payload.matched && !payload.no_results {
         note_cold_path_cannot_render_docs(&repo_root);
+    }
+    // Unlike the docs note, this one matters most when the query FAILED: the
+    // payload's own signal for this state reads "embedding in progress; run
+    // `travsr embed status`", which sends the user to a command that may well
+    // report the index complete. The cold path declines to arm the hook, by
+    // design, and only this process knows that. What it does NOT know is why no
+    // daemon answered, or whether the embedding index is finished, so the note
+    // below claims neither.
+    if served_cold_path && cold_path_embed_unarmed {
+        eprintln!(
+            "note: this repo has an embedding index, but this query was not served \
+             by a daemon, so it fell back to the read-only cold path, which does \
+             not load the embedding sidecar. The answer is lexical only. Run \
+             `travsr daemon status` to see whether a daemon is available for \
+             semantic ranking."
+        );
     }
 
     if matches!(format, OutputFormat::Json) {
@@ -350,6 +433,15 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             println!();
             print_docs(&payload.docs);
         }
+        // #826: an abstention may be a setup gap rather than a genuine absence,
+        // so say which one. `degraded_note` is the per-query signal the matched
+        // path already prints (and `--format json` already carries): it names
+        // `travsr embed init` only when semantic search really did not run for
+        // THIS query in THIS repo, and says "warming up" / "in progress" /
+        // "degraded" in the states where that command is the wrong advice.
+        if !payload.degraded_note.is_empty() {
+            println!("\n{}", payload.degraded_note);
+        }
         return Ok(());
     }
     if payload.no_results {
@@ -357,6 +449,10 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         if !payload.docs.is_empty() {
             println!();
             print_docs(&payload.docs);
+        }
+        // #826: same reasoning as the abstain branch above.
+        if !payload.degraded_note.is_empty() {
+            println!("\n{}", payload.degraded_note);
         }
         return Ok(());
     }
@@ -405,11 +501,11 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
                 _ => "── relevant, graph-adjacent context ──",
             };
             println!("{header}");
-            println!("{}", Table::new(rows));
+            println!("{}", render_rows(rows));
         }
     } else {
         let rows: Vec<Row> = payload.rows.iter().map(to_row).collect();
-        println!("{}", Table::new(rows));
+        println!("{}", render_rows(rows));
         print_docs(&payload.docs);
     }
     let embed_note = if payload.embed_used {
@@ -659,7 +755,12 @@ pub fn print_examples(db_path: Option<&std::path::Path>) {
 /// which means adding a subcommand fails the build until it is filed under a
 /// heading rather than silently going missing from this list.
 const COMMAND_GROUPS: &[(&str, &[&str])] = &[
-    ("Set up a repo", &["init", "connect", "lang"]),
+    // `guard` sits next to `connect` because that is what installs it: a reader
+    // who has just run `connect --guard` and wants to know what now runs on
+    // every tool call finds it in the same place. It is not hidden the way
+    // `hook-run` is: the hook invokes it rather than a person, but unlike a git
+    // hook its behaviour is configurable and worth being able to look up.
+    ("Set up a repo", &["init", "connect", "guard", "lang"]),
     (
         "Ask about code",
         &["ask", "graph", "references", "pattern", "explain"],
@@ -667,7 +768,14 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ("Run in the background", &["daemon", "mcp", "serve"]),
     (
         "Inspect and debug",
-        &["status", "daemon logs", "repos", "fsck", "index"],
+        &[
+            "status",
+            "daemon logs",
+            "repos",
+            "fsck",
+            "invariants",
+            "index",
+        ],
     ),
     ("Tune search", &["embed", "rerank", "synonym", "config"]),
 ];
@@ -1739,5 +1847,105 @@ mod suggestion_tests {
         // All stop words or too short: nothing worth searching for.
         assert_eq!(distinctive_term("what is it for"), None);
         assert_eq!(distinctive_term(""), None);
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::{render_rows, to_row, Row};
+    use travsr_mcp::query::AskRow;
+
+    fn row(signature: &str) -> Row {
+        Row {
+            signature: signature.to_string(),
+            path: "crates/travsr-cli/src/ask.rs:1".to_string(),
+            score: "0.500".to_string(),
+        }
+    }
+
+    fn ask_row(kind: &str, signature: &str) -> AskRow {
+        AskRow {
+            kind: kind.to_string(),
+            signature: signature.to_string(),
+            path: "x".to_string(),
+            line: None,
+            score: 0.5,
+            match_source: None,
+        }
+    }
+
+    /// #824: pins the borderless render. The previous default came from a bare
+    /// `Table::new(rows)` with no style call, which is easy to reintroduce, and
+    /// the `+---+` rule per row was most of the stdout an agent piping `ask`
+    /// paid for. Lines are trimmed before comparison so column padding cannot
+    /// flip the assertions.
+    #[test]
+    fn render_rows_is_borderless_and_keeps_the_header() {
+        let out = render_rows(vec![row("fn:knapsack"), row("method:Animal.describe")]);
+        assert!(!out.contains("+--"), "row rule survived:\n{out}");
+        assert!(!out.contains('|'), "cell bars survived:\n{out}");
+
+        let header = out.lines().next().unwrap_or_default().trim();
+        assert!(header.starts_with("Signature"), "header lost: {header:?}");
+        assert!(header.contains("Path") && header.contains("Score"));
+        assert!(!out.contains("Kind"), "Kind column returned:\n{out}");
+
+        // ASCII only: a Windows terminal must render this unchanged.
+        assert!(out.is_ascii(), "non-ASCII in table:\n{out}");
+        // `path:line` stays one unbroken, clickable token.
+        assert!(out.contains("crates/travsr-cli/src/ask.rs:1"));
+
+        // No line ends in whitespace: `Style::blank()` pads the last column and
+        // would otherwise leave a trailing space on every row. A stray `\r` is
+        // stripped first so this cannot fail on a CRLF checkout.
+        for line in out.lines() {
+            let line = line.trim_end_matches('\r');
+            assert_eq!(line, line.trim_end(), "trailing whitespace: {line:?}");
+        }
+    }
+
+    /// The kind is folded away only when the signature already spells it.
+    /// Phase A (all 16 languages) and Kotlin prefix their signatures; the SCIP,
+    /// Swift and Dart Phase B conventions do not, and those rows would
+    /// otherwise lose their only kind information in the human view.
+    #[test]
+    fn kind_is_kept_for_signatures_that_do_not_carry_it() {
+        let cases = [
+            // Already kinded — the prefix abbreviates the kind.
+            ("function", "fn:knapsack", "fn:knapsack"),
+            ("method", "method:Animal.describe", "method:Animal.describe"),
+            ("variable", "var:LIMIT", "var:LIMIT"),
+            ("package", "pkg:serde@1.0", "pkg:serde@1.0"),
+            ("file-module", "filemod:knapsack", "filemod:knapsack"),
+            ("doc-chunk", "doc:rfc-010/design", "doc:rfc-010/design"),
+            // Provider schemes — not kinds, so the kind is prepended.
+            (
+                "method",
+                "scip:src/Foo.java:semanticdb maven . . Foo#bar().",
+                "method: scip:src/Foo.java:semanticdb maven . . Foo#bar().",
+            ),
+            (
+                "method",
+                "swift::Animal.describe",
+                "method: swift::Animal.describe",
+            ),
+            (
+                "method",
+                "file:///abs/x.dart::Animal.describe",
+                "method: file:///abs/x.dart::Animal.describe",
+            ),
+            // No prefix at all: a repo-relative path, and a Windows path whose
+            // drive letter must not be mistaken for a kind prefix.
+            (
+                "file",
+                "crates/travsr-cli/src/ask.rs",
+                "file: crates/travsr-cli/src/ask.rs",
+            ),
+            ("file", "C:\\src\\x.rs", "file: C:\\src\\x.rs"),
+        ];
+        for (kind, signature, want) in cases {
+            let got = to_row(&ask_row(kind, signature)).signature;
+            assert_eq!(got, want, "kind={kind} signature={signature}");
+        }
     }
 }
