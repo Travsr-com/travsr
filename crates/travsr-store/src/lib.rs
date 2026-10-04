@@ -1716,13 +1716,20 @@ impl SqliteStore {
         })
     }
 
-    /// Returns `true` when an embed.db sibling file exists for this store.
+    /// Returns `true` when a non-empty embed.db sibling file exists for this store.
     /// Used to differentiate "embedding in progress / Phase 1 done but hook not active yet"
     /// from "embedding never initialized — user must run `travsr embed init`".
+    ///
+    /// A zero-byte file is treated as "never initialized" (#908): an interrupted
+    /// or never-populated `embed init` leaves an empty file behind, and reporting
+    /// that as "in progress" contradicts `travsr embed status`, which reads it as
+    /// not configured. Emptiness is the cheapest check that keeps the two surfaces
+    /// in agreement without opening the database.
     pub fn has_embed_db(&self) -> bool {
         self.embed_db_path
             .as_deref()
-            .map(|p| p.exists())
+            .and_then(|p| p.metadata().ok())
+            .map(|m| m.len() > 0)
             .unwrap_or(false)
     }
 
@@ -17992,6 +17999,26 @@ mod tests {
             rusqlite::params![node_id, "arctic-embed-m-v1.5", vec![0u8; 8]],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn has_embed_db_treats_an_empty_file_as_never_initialized() {
+        // #908: a zero-byte embed.db (interrupted or never-populated `embed init`)
+        // must read the same as no file, so `ask` and `embed status` agree.
+        let (store, dir) = file_backed_store();
+        let embed_db_path = dir.path().join("embed.db");
+
+        assert!(!store.has_embed_db(), "no file -> not initialized");
+
+        std::fs::File::create(&embed_db_path).unwrap();
+        assert_eq!(std::fs::metadata(&embed_db_path).unwrap().len(), 0);
+        assert!(
+            !store.has_embed_db(),
+            "zero-byte file must read as not initialized, not as in progress"
+        );
+
+        std::fs::write(&embed_db_path, b"not empty").unwrap();
+        assert!(store.has_embed_db(), "non-empty file -> initialized");
     }
 
     #[test]
