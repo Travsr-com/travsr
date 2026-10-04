@@ -615,7 +615,26 @@ fn redact_key_value_pairs(s: &str) -> String {
 /// On failure, callers must log a `tracing::warn!` and return `String::new()`.
 /// The error string must **not** be forwarded to the MCP client.
 pub fn validate_mcp_arg(arg: &str) -> Result<(), &'static str> {
-    validate_mcp_arg_with_limit(arg, MAX_ARG_BYTES)
+    validate_mcp_arg_with_limit(arg, MAX_ARG_BYTES, true)
+}
+
+/// File-path variant of [`validate_mcp_arg`] for a caller-supplied `file`
+/// argument that is joined onto a repo root as a literal path and never
+/// URL-decoded (travsr-daemon's `request-live-resolution-targets` arm).
+///
+/// Keeps every containment guard [`validate_mcp_arg`] has: null bytes, byte
+/// length, `../` / bare `..` traversal, and absolute paths. Drops only the
+/// percent-encoding rejection. That rejection defends arguments that reach path
+/// resolution *after* a URL-decode, where `%2e%2e%2f` becomes `../`; this path
+/// is joined verbatim (`repo_root.join(file)`), so a `%` never decodes and
+/// stays a literal filename byte. `%` is legal in real paths (`docs/100%.md`,
+/// files named from URL-encoded downloads), and rejecting it here only drops
+/// legitimate saves.
+///
+/// Keeps: byte-length cap, null-byte, `../` / absolute-path rejection.
+/// Drops: percent-encoding rejection.
+pub fn validate_mcp_file_arg(arg: &str) -> Result<(), &'static str> {
+    validate_mcp_arg_with_limit(arg, MAX_ARG_BYTES, false)
 }
 
 /// Batch/list variant of [`validate_mcp_arg`] for arguments that carry many
@@ -626,7 +645,7 @@ pub fn validate_mcp_arg(arg: &str) -> Result<(), &'static str> {
 /// realistic multi-symbol request is not silently rejected. Each name is still
 /// resolved independently through parameterized store lookups downstream.
 pub fn validate_mcp_list_arg(arg: &str) -> Result<(), &'static str> {
-    validate_mcp_arg_with_limit(arg, MAX_LIST_ARG_BYTES)
+    validate_mcp_arg_with_limit(arg, MAX_LIST_ARG_BYTES, true)
 }
 
 /// Pattern-specific variant of [`validate_mcp_arg`] for `find_pattern`'s
@@ -682,7 +701,11 @@ pub fn validate_mcp_repo_key_arg(arg: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn validate_mcp_arg_with_limit(arg: &str, max_bytes: usize) -> Result<(), &'static str> {
+fn validate_mcp_arg_with_limit(
+    arg: &str,
+    max_bytes: usize,
+    reject_percent: bool,
+) -> Result<(), &'static str> {
     if arg.len() > max_bytes {
         return Err("argument exceeds maximum length");
     }
@@ -691,7 +714,8 @@ fn validate_mcp_arg_with_limit(arg: &str, max_bytes: usize) -> Result<(), &'stat
     }
     // Reject percent-encoding: `%2e%2e%2f` == `../` after URL-decode.
     // No legitimate Travsr symbol name or repo name uses percent-encoding.
-    if arg.contains('%') {
+    // Skipped for arguments that are never URL-decoded (`validate_mcp_file_arg`).
+    if reject_percent && arg.contains('%') {
         return Err("percent-encoded characters not permitted in arguments");
     }
     // Reject `../`, `..\\`, bare `..`, and trailing `/..` or `\\..`.
@@ -860,6 +884,23 @@ mod tests {
         assert!(validate_mcp_pattern_arg(&long).is_err());
         let exact = "a".repeat(MAX_ARG_BYTES);
         assert!(validate_mcp_pattern_arg(&exact).is_ok());
+    }
+
+    // ── SEC-002: file-path validator (daemon live-targets `file` arg) ────────
+
+    #[test]
+    fn file_arg_allows_percent_but_still_contains_the_path() {
+        // The `file` is joined onto the repo root verbatim and never URL-decoded,
+        // so `%` is a legal filename byte, unlike for `validate_mcp_arg`.
+        assert!(validate_mcp_file_arg("docs/100%.md").is_ok());
+        assert!(validate_mcp_file_arg("foo%20bar.rs").is_ok());
+        // The containment guards that matter here still hold.
+        assert!(validate_mcp_file_arg("../outside/secret.rs").is_err());
+        assert!(validate_mcp_file_arg("..").is_err());
+        assert!(validate_mcp_file_arg("/etc/passwd").is_err());
+        assert!(validate_mcp_file_arg("C:\\secret.txt").is_err());
+        assert!(validate_mcp_file_arg("foo\0bar").is_err());
+        assert!(validate_mcp_file_arg(&"a".repeat(MAX_ARG_BYTES + 1)).is_err());
     }
 
     // ── #636: is_sensitive_key ─────────────────────────────────────────────

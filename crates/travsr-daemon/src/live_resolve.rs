@@ -32,7 +32,7 @@
 
 use travsr_core::{Edge, EdgeKind, InheritanceRef, NodeId, UnresolvedCall};
 use travsr_ipc::message::{LiveResolution, LiveResolutionTarget};
-use travsr_store::{SqliteStore, Store};
+use travsr_store::{SqliteStore, Store, NODE_EXACT_LOOKUP_LIMIT};
 
 /// What one live-resolution pass did, for logging and the Phase 3 precision
 /// meter. `pending` is not a failure: it is the fail-closed path working.
@@ -73,6 +73,14 @@ pub fn apply_live_resolutions(
     // a language that runs this lane alone (every non-native one, §8.3) could
     // never earn its per-language gate a reading.
     let mut states: Vec<travsr_store::RefResolution> = Vec::with_capacity(resolutions.len());
+    // #895: the occurrence rows for what this lane resolves. `put_edge_live`
+    // writes `edges` only, so without these a live-resolved reference exists as
+    // an edge with no use site and `find_references` reports zero for a
+    // reference the lane had just resolved. Batched and written after the loop,
+    // because `record_edge_sites` takes `&mut self` while the loop holds
+    // `&SqliteStore` reads.
+    let mut call_sites: Vec<(NodeId, NodeId, u32, Option<u32>)> = Vec::new();
+    let mut field_sites: Vec<(NodeId, NodeId, u32, Option<u32>)> = Vec::new();
     for r in resolutions {
         // The claim is keyed on the reference, so the edge's own source is the
         // key's `src`. A resolution whose line maps to no enclosing definition
@@ -83,7 +91,25 @@ pub fn apply_live_resolutions(
             .flatten();
         let claimed = match resolve_one(store, corpus, file, r) {
             Some(edge) => match store.put_edge_live(&edge) {
-                Ok(()) => Some(edge.dst),
+                Ok(()) => {
+                    // `col` is None, not `r.ref_col`: the editor sends 0-based
+                    // UTF-16 code units and `edge_sites.col` is 0-based UTF-8
+                    // bytes. A wrong column is worse than an absent one, which
+                    // the column is already optional for.
+                    match edge.kind {
+                        EdgeKind::RefCall => {
+                            call_sites.push((edge.src, edge.dst, r.ref_line, None))
+                        }
+                        EdgeKind::RefField => {
+                            field_sites.push((edge.src, edge.dst, r.ref_line, None))
+                        }
+                        // `is-implementation` gets no row: `reference_sites`
+                        // selects only ref/call and ref/field, so one would be
+                        // dead weight the sweep still has to clean up.
+                        _ => {}
+                    }
+                    Some(edge.dst)
+                }
                 Err(e) => {
                     // A write failure is a freshness loss, never a correctness
                     // one: the commit-gated path still ratifies this region.
@@ -116,6 +142,12 @@ pub fn apply_live_resolutions(
                 resolved_dst: claimed,
             });
         }
+    }
+    if let Err(e) = store.record_edge_sites(&call_sites) {
+        tracing::debug!(error = %e, "live call occurrence write failed");
+    }
+    if let Err(e) = store.record_field_sites(&field_sites) {
+        tracing::debug!(error = %e, "live field occurrence write failed");
     }
     if let Err(e) = store.upsert_ref_resolution_states(&states) {
         // Losing the claim costs the meter its evidence, never the graph its
@@ -177,21 +209,37 @@ fn resolve_one(store: &SqliteStore, corpus: &str, file: &str, r: &LiveResolution
     // hostile report cannot make it write a kind it was never scoped to.
     let edge = live_edge_kind(&r.edge_kind)?;
     // The reference's enclosing definition is the edge's source. A reference at
-    // top level (no enclosing function) has no caller node to attach to.
+    // top level (a script) hangs from the file node, as Phase B attributes it.
     let src = store
         .enclosing_definition_at(corpus, file, r.ref_line)
         .ok()
-        .flatten()?;
+        .flatten()
+        .or_else(|| store.file_node_at(corpus, file).ok().flatten())?;
     // Section 7.5: the node the editor pointed at, restricted to the kinds valid
     // for this edge kind (a field ref lands on a `field` node, an implements
     // clause on an interface/trait, a call on a definition). The kind set is the
     // gate: a target of the wrong kind, or a position in no matching span (a
     // node_modules file, a generated stub, an unindexed file), maps to nothing
     // and abstains (§8.1).
-    let dst = store
+    let dst = match store
         .enclosing_node_at(corpus, &r.target_path, r.target_line, target_kinds(edge))
         .ok()
-        .flatten()?;
+        .flatten()
+    {
+        Some(dst) => dst,
+        // Issue #816 defect 2 backstop: a provider that reports the item's full
+        // range (rust-analyzer's `targetRange`) or a bare `Location` puts the
+        // definition line on a leading doc comment, attribute, or decorator,
+        // above the node's declaration, so exact span containment misses. Map
+        // such a position to the definition it heads. Language-server-agnostic:
+        // it needs no `targetSelectionRange`, so a server that supplies only a
+        // range still resolves. The name gate below still guards precision, so a
+        // wrong header match abstains.
+        None => store
+            .node_starting_at_or_below(corpus, &r.target_path, r.target_line, target_kinds(edge))
+            .ok()
+            .flatten()?,
+    };
     // Does the node the editor landed on actually carry the name it said it was
     // resolving? Nothing above checks this: the gates are edge kind, target node
     // kind, span containment and corpus equality, none of which notice a
@@ -374,6 +422,11 @@ pub fn resolve_unambiguous_lexical(
     // first. One pass, one replace.
     let mut states: Vec<travsr_store::RefResolution> =
         Vec::with_capacity(unresolved.len() + inheritance.len());
+    // #895: see `apply_live_resolutions`. This lane has the real 0-based UTF-8
+    // byte column (`UnresolvedCall::caller_col`), so unlike the editor lane it
+    // can record it.
+    let mut call_sites: Vec<(NodeId, NodeId, u32, Option<u32>)> = Vec::new();
+    let mut field_sites: Vec<(NodeId, NodeId, u32, Option<u32>)> = Vec::new();
 
     for call in unresolved {
         let name = travsr_core::ident::leaf_of(&call.callee_sig).to_string();
@@ -383,7 +436,21 @@ pub fn resolve_unambiguous_lexical(
         // swept, so the edges table can no longer say what the lane decided.
         let claimed = match lexical_one(store, call, locally_bound) {
             Some(edge) => match store.put_edge_live(&edge) {
-                Ok(()) => Some(edge.dst),
+                Ok(()) => {
+                    match edge.kind {
+                        EdgeKind::RefCall => {
+                            call_sites.push((edge.src, edge.dst, call.caller_line, call.caller_col))
+                        }
+                        EdgeKind::RefField => field_sites.push((
+                            edge.src,
+                            edge.dst,
+                            call.caller_line,
+                            call.caller_col,
+                        )),
+                        _ => {}
+                    }
+                    Some(edge.dst)
+                }
                 Err(e) => {
                     tracing::debug!(error = %e, "live lexical edge write failed");
                     None
@@ -457,6 +524,12 @@ pub fn resolve_unambiguous_lexical(
         }
     }
 
+    if let Err(e) = store.record_edge_sites(&call_sites) {
+        tracing::debug!(error = %e, "live lexical call occurrence write failed");
+    }
+    if let Err(e) = store.record_field_sites(&field_sites) {
+        tracing::debug!(error = %e, "live lexical field occurrence write failed");
+    }
     if let Err(e) = store.replace_ref_resolution_states(corpus, path, &states) {
         // Losing the pending record costs the freshness note its detail, never
         // the graph its correctness.
@@ -480,21 +553,103 @@ fn lexical_one(
     locally_bound: &std::collections::HashSet<String>,
 ) -> Option<Edge> {
     let edge = lexical_edge_kind(call);
+    // A bare free-function or constructor call. The local-binding and qualifier
+    // gates below apply to this shape only: a local binding of a member name
+    // cannot shadow a member reference, and a method call carries no crate
+    // qualifier to spend. The language scope is *not* one of those two, because
+    // a method reference is resolved by a repo-wide exact-signature lookup just
+    // like a bare one: `candidate_signatures` builds `method:{recv}.{leaf}`, so
+    // the recovered receiver type narrows the signature string, never the search
+    // scope, and a lone same-named definition in another language wins it.
+    let bare_identifier = !call.is_method_call && !call.callee_sig.starts_with("field:");
     // Section 7.3 step 1: a bare identifier that this file also binds to a local
     // or a parameter is not a free reference, so no repo-wide lookup is entitled
-    // to answer it. Only the bare-identifier shape is gated: a method or field
-    // reference resolves through a recovered receiver *type*, which a local
-    // binding of the member name cannot shadow.
-    if !call.is_method_call
-        && !call.callee_sig.starts_with("field:")
-        && locally_bound.contains(travsr_core::ident::leaf_of(&call.callee_sig))
-    {
+    // to answer it. A local binding of a member name cannot shadow a method or
+    // field reference, which is why that shape is exempt.
+    if bare_identifier && locally_bound.contains(travsr_core::ident::leaf_of(&call.callee_sig)) {
         return None;
     }
+    // #815: uniqueness across the whole corpus is the wrong scope for a bare
+    // identifier, because a name is only a name *in a language*. `set(...)` in
+    // Python is a builtin, resolved externally and carried by no repo node, yet
+    // it is the one `fn`-kind definition of that name in a Rust crate next door,
+    // so the exactly-one gate passed and the floor emitted a Python-to-Rust call
+    // edge. A genuine cross-language call is an FFI edge that the RFC-005 path
+    // resolves; the lexical floor never legitimately produces one, so refusing
+    // them here cannot lose a correct edge.
+    //
+    // This is a filter on the candidates rather than a test of the winner, the
+    // ordering `resolve_unresolved_calls` (E4) already uses: a foreign node
+    // sharing the name must not be counted by the uniqueness gate at all, or
+    // its mere presence suppresses the correct same-language edge.
+    let src_node = store.get_node(call.src).ok().flatten()?;
+    // E4's #I3 guard, copied: an empty language would filter every candidate
+    // away and silently drop a real call, so it degrades to unfiltered instead.
+    let language =
+        (!src_node.vname.language.is_empty()).then_some(src_node.vname.language.as_str());
     let dst = candidate_signatures(call)
         .into_iter()
-        .find_map(|sig| unique_definition(store, &sig, edge))?;
-    edge_if_sound(store, call.src, dst, edge)
+        .find_map(|sig| unique_definition(store, &sig, edge, language))?;
+    // The same collision inside one language, so #815's gate cannot see it: the
+    // standard library is not in the graph, so `std::fs::write(...)` has no repo
+    // node of its own, and a repo that happens to hold exactly one `fn:write`
+    // passed the exactly-one gate and got a wrong `ref/call` edge to it. The
+    // qualifier is the evidence that settles it, and the extractor already
+    // carries it (`hint_crate` is `Some("fs")` here, `None` for a genuine bare
+    // local call), so the fix is to spend it.
+    if bare_identifier && !hint_crate_reaches(call.hint_crate.as_deref(), &dst) {
+        return None;
+    }
+    edge_if_sound(store, call.src, dst.id, edge)
+}
+
+/// Whether a qualified call's qualifier is consistent with the definition the
+/// uniqueness gate picked.
+///
+/// The same path test `resolve_unresolved_calls` applies to its own candidates,
+/// which is why Phase B never mints these edges, reused here so the live floor
+/// refuses what the ratified path already refuses. Measured on the #813
+/// recovery harness: recovery holds at 2140 (lexical) and 2177 (oracle) of
+/// R=2189, unchanged, while the five collision edges go.
+///
+/// An unqualified call (`hint_crate` is `None`) carries no such evidence and is
+/// left to the gates around it, so a bare builtin that collides with a
+/// same-language repo definition is still out of reach here.
+///
+/// The test is on whole path segments. A raw substring match failed open on
+/// every short std qualifier: `fs` is a substring of `fsck.rs`, `io` of
+/// `actions.rs`, and the gate waved through the exact false edge it exists to
+/// stop.
+///
+/// It is still a *path* test, so it abstains on a module whose name is not in
+/// its file path: an inline `mod helpers` in `main.rs`, or a `#[path = ...]`
+/// module, loses its live edge until the next commit ratifies it. Locating
+/// those needs the module tree rather than the path string, which this lane
+/// does not have; the gap is recorded rather than papered over, the same way
+/// the bare-builtin gap above is.
+fn hint_crate_reaches(hint: Option<&str>, dst: &travsr_core::Node) -> bool {
+    let Some(hint) = hint else {
+        return true;
+    };
+    // Rust's module-relative path keywords are lowercase, so the extractor's
+    // "lowercase qualifier is a crate or module name" branch files them as a
+    // crate hint like any other. They name a position in the module tree rather
+    // than a path segment, so no definition path can ever contain one and the
+    // substring test below would abstain on every `super::`/`self::`/`crate::`
+    // call in the repo. The qualifier is real but carries no path evidence, so
+    // it is left to the gates around it exactly as a bare call is.
+    if matches!(hint, "self" | "super" | "crate") {
+        return true;
+    }
+    // A qualifier names one segment of the path (a crate directory, a module
+    // file, or a module directory), so compare it against segments rather than
+    // against the whole string. Cargo renders an underscore in a crate name as a
+    // hyphen in its directory, which is the one equivalence worth keeping.
+    let dashed = hint.replace('_', "-");
+    dst.vname
+        .path
+        .split(['/', '.'])
+        .any(|seg| seg == hint || seg == dashed)
 }
 
 /// The edge kind a native call-site record resolves to. The extractor encodes a
@@ -533,6 +688,7 @@ fn lexical_edge_kind(call: &UnresolvedCall) -> EdgeKind {
 /// extractor could be taught to carry UTF-16 offsets.
 pub fn targets_needing_editor(
     store: &SqliteStore,
+    lines: &[&str],
     unresolved: &[UnresolvedCall],
     locally_bound: &std::collections::HashSet<String>,
 ) -> Vec<LiveResolutionTarget> {
@@ -543,9 +699,15 @@ pub fn targets_needing_editor(
             if lexical_one(store, call, locally_bound).is_some() {
                 return None;
             }
-            // Only a method or field reference benefits from LSP disambiguation.
+            // A method or field reference benefits from LSP disambiguation, and
+            // so does a bare call the lexical lane refused because several
+            // same-language definitions carry its name. One with none has no
+            // target the provider could land on, so it is not sent.
             let is_field = call.callee_sig.starts_with("field:");
-            if !(call.is_method_call || is_field) {
+            if !(call.is_method_call
+                || is_field
+                || has_several_definitions(store, call, locally_bound))
+            {
                 return None;
             }
             // No line means no position for the editor to query (older
@@ -553,8 +715,21 @@ pub fn targets_needing_editor(
             if call.caller_line == 0 {
                 return None;
             }
+            // RFC-027 #813 P2: prefer the extractor's exact occurrence column,
+            // converted from a byte offset to the editor's UTF-16 column. It
+            // points at the precise identifier the extractor captured, so it is
+            // right even when the name repeats on the line, where the
+            // `fill_target_columns` name search would pick the first match and
+            // could resolve the wrong occurrence. `None` leaves it for the name
+            // search fallback.
+            let ref_col = call.caller_col.and_then(|bc| {
+                lines
+                    .get((call.caller_line - 1) as usize)
+                    .map(|line| byte_to_utf16_col(line, bc))
+            });
             Some(LiveResolutionTarget {
                 ref_line: call.caller_line,
+                ref_col,
                 name: travsr_core::ident::leaf_of(&call.callee_sig).to_string(),
                 edge_kind: lexical_edge_kind(call).as_str().to_string(),
                 // Calls and fields are both answered by the definition provider;
@@ -565,6 +740,33 @@ pub fn targets_needing_editor(
         })
         .collect();
     drop_same_position_collisions(targets)
+}
+
+/// True for a bare call, not bound locally, whose name two or more
+/// definitions of a valid target kind carry in the caller's language: the
+/// ambiguity the lexical lane abstains on, and the editor can settle.
+fn has_several_definitions(
+    store: &SqliteStore,
+    call: &UnresolvedCall,
+    locally_bound: &std::collections::HashSet<String>,
+) -> bool {
+    if locally_bound.contains(travsr_core::ident::leaf_of(&call.callee_sig)) {
+        return false;
+    }
+    let Some(src) = store.get_node(call.src).ok().flatten() else {
+        return false;
+    };
+    let kinds = target_kinds(lexical_edge_kind(call));
+    candidate_signatures(call).iter().any(|sig| {
+        store.lookup_nodes_exact(sig, None).is_ok_and(|found| {
+            found
+                .iter()
+                .filter(|n| kinds.contains(&n.kind.as_str()))
+                .filter(|n| n.vname.language == src.vname.language)
+                .count()
+                >= 2
+        })
+    })
 }
 
 /// RFC-027 daemon-driven positions, IsImplementation half: the `extends` /
@@ -594,6 +796,7 @@ pub fn inheritance_targets_needing_editor(
             }
             Some(LiveResolutionTarget {
                 ref_line: r.line,
+                ref_col: None,
                 name: r.base_name.clone(),
                 edge_kind: EdgeKind::IsImplementation.as_str().to_string(),
                 provider: "definition".to_string(),
@@ -632,6 +835,7 @@ pub fn generic_targets_needing_editor(
         }
         out.push(LiveResolutionTarget {
             ref_line: line,
+            ref_col: None,
             name: name.to_string(),
             edge_kind: kind.as_str().to_string(),
             // All three kinds resolve to where the target is *defined*, which is
@@ -674,23 +878,202 @@ pub fn generic_targets_needing_editor(
 /// the real column through the protocol would recover this recall — the
 /// detectors have it at capture time — but it is a protocol change, and until
 /// then abstaining is the only fail-closed option.
+/// RFC-027 #813 P1: pin each target's 0-based column against the file text, so
+/// the editor resolves at the exact position instead of searching the line for
+/// `name`.
+///
+/// Mirrors the extension's `\bname\b` search and its column unit: `vscode.Position`
+/// counts UTF-16 code units, and JS `\b` (no `u` flag) is ASCII, so a
+/// daemon-pinned column and the editor's own fallback search agree byte for byte.
+/// A name the daemon cannot pin as a whole word on its line is left `None`, and
+/// the editor falls back to its own search, which abstains the same way. `lines`
+/// is the current file text split by line; a target whose line is out of range
+/// is left as is.
+pub fn fill_target_columns(lines: &[&str], targets: &mut [LiveResolutionTarget]) {
+    for t in targets.iter_mut() {
+        // A target the extractor already pinned to its exact occurrence column
+        // keeps it; the name search is only the fallback for the rest.
+        if t.ref_col.is_some() || t.ref_line == 0 {
+            continue;
+        }
+        if let Some(line) = lines.get((t.ref_line - 1) as usize) {
+            // An Objective-C selector is spelled apart around its arguments
+            // (`initWithName:@"x" volume:1`); the message starts at its first
+            // keyword.
+            let first_keyword = t.name.split(':').next().unwrap_or(&t.name);
+            t.ref_col = word_boundary_col_utf16(line, first_keyword);
+        }
+    }
+}
+
+/// Convert a 0-based byte offset within `line` to the 0-based UTF-16 column the
+/// editor's `vscode.Position` expects (RFC-027 #813 P2). Equal for ASCII, which
+/// identifiers are; a byte offset landing inside a multibyte char is clamped
+/// back to the previous char boundary, and one past the end clamps to the line
+/// length, so the result is always a valid column.
+fn byte_to_utf16_col(line: &str, byte_col: u32) -> u32 {
+    let mut b = (byte_col as usize).min(line.len());
+    while b > 0 && !line.is_char_boundary(b) {
+        b -= 1;
+    }
+    line[..b].encode_utf16().count() as u32
+}
+
+/// The 0-based UTF-16 column of the first whole-word (`\bname\b`, ASCII word
+/// boundary) occurrence of `name` in `line`, or `None`.
+fn word_boundary_col_utf16(line: &str, name: &str) -> Option<u32> {
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let nb = name.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0usize;
+    while i + nb.len() <= bytes.len() {
+        if &bytes[i..i + nb.len()] == nb && line.is_char_boundary(i) {
+            let before_ok = i == 0 || !is_word(bytes[i - 1]);
+            let after = i + nb.len();
+            let after_ok = after >= bytes.len() || !is_word(bytes[after]);
+            if before_ok && after_ok {
+                return Some(line[..i].encode_utf16().count() as u32);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 fn drop_same_position_collisions(targets: Vec<LiveResolutionTarget>) -> Vec<LiveResolutionTarget> {
-    let mut counts: std::collections::HashMap<(u32, &str, &str), usize> =
+    // `ref_col` is part of the key: two occurrences of one name on one line
+    // (`a.save(); b.save()`) each carry a distinct column now, so they are
+    // distinct positions and both are kept. Two with the same column, or both
+    // with no column (`None`), are a genuine collision the editor could not
+    // disambiguate and still collapse, exactly as before.
+    let mut counts: std::collections::HashMap<(u32, Option<u32>, &str, &str), usize> =
         std::collections::HashMap::new();
     for t in &targets {
         *counts
-            .entry((t.ref_line, t.name.as_str(), t.edge_kind.as_str()))
+            .entry((t.ref_line, t.ref_col, t.name.as_str(), t.edge_kind.as_str()))
             .or_default() += 1;
     }
-    let unique: std::collections::HashSet<(u32, String, String)> = counts
+    let unique: std::collections::HashSet<(u32, Option<u32>, String, String)> = counts
         .into_iter()
         .filter(|(_, n)| *n == 1)
-        .map(|((line, name, kind), _)| (line, name.to_string(), kind.to_string()))
+        .map(|((line, col, name, kind), _)| (line, col, name.to_string(), kind.to_string()))
         .collect();
     targets
         .into_iter()
-        .filter(|t| unique.contains(&(t.ref_line, t.name.clone(), t.edge_kind.clone())))
+        .filter(|t| unique.contains(&(t.ref_line, t.ref_col, t.name.clone(), t.edge_kind.clone())))
         .collect()
+}
+
+/// RFC-027 #813 P2: merge a saved file's changed-definition committed
+/// occurrences into its native/generic editor targets.
+///
+/// These reach references the tree-sitter live extractor never detects (macro,
+/// desugared, trait-dispatched) that the committed SCIP occurrence set did
+/// capture, resolved at their exact stored column. Precision is safe by
+/// construction: the editor resolves the CURRENT buffer position and the daemon
+/// maps the result to a SCIP-owned node (section 8.2 fencing), so a stale
+/// position is fail-closed (it resolves current code or nothing), never a
+/// fabricated target.
+///
+/// Each occurrence is bounded to its changed definition's CURRENT span (the body
+/// changed, so an occurrence whose remapped line drifted outside it is no longer
+/// trusted), given the editor's UTF-16 column from its stored byte column (or
+/// left for the editor's name search when it has none), dropped when a native
+/// target already covers its position (see the split below), and finally deduped
+/// within the enumerated set the same way the native lane is.
+pub fn merge_changed_occurrence_targets(
+    store: &SqliteStore,
+    lines: &[&str],
+    native: Vec<LiveResolutionTarget>,
+    stashed: &[travsr_core::ChangedOccurrence],
+) -> Vec<LiveResolutionTarget> {
+    if stashed.is_empty() {
+        return native;
+    }
+    let src_ids: Vec<travsr_core::NodeId> = {
+        let mut v: Vec<travsr_core::NodeId> = stashed.iter().map(|o| o.src).collect();
+        v.sort_unstable_by_key(|id| id.0);
+        v.dedup();
+        v
+    };
+    let spans = store.current_spans(&src_ids).unwrap_or_default();
+    // What the native lane already owns. Keyed WITH the column: a native target
+    // pins the first whole-word match on its line, so a stashed occurrence of
+    // the same name at another column (`a.save(); b.save()`) is a distinct
+    // position and survives, which is what the column plumbing exists for. When
+    // either side has no column there is nothing to tell the two apart, so the
+    // native target owns the whole line for that name and kind, as before.
+    let mut native_at_col: std::collections::HashSet<(u32, u32, String, String)> =
+        std::collections::HashSet::new();
+    let mut native_uncolumned: std::collections::HashSet<(u32, String, String)> =
+        std::collections::HashSet::new();
+    let mut native_lines: std::collections::HashSet<(u32, String, String)> =
+        std::collections::HashSet::new();
+    for t in &native {
+        let line_key = (t.ref_line, t.name.clone(), t.edge_kind.clone());
+        match t.ref_col {
+            Some(c) => {
+                native_at_col.insert((t.ref_line, c, t.name.clone(), t.edge_kind.clone()));
+            }
+            None => {
+                native_uncolumned.insert(line_key.clone());
+            }
+        }
+        native_lines.insert(line_key);
+    }
+    let enumerated: Vec<LiveResolutionTarget> = stashed
+        .iter()
+        .filter_map(|occ| {
+            // Bound to the definition's current span; drop an occurrence that
+            // drifted outside it (an unknown end is a start-only lower bound).
+            let &(start, end) = spans.get(&occ.src)?;
+            if occ.line < start || end.is_some_and(|e| occ.line > e) {
+                return None;
+            }
+            let ref_col = occ.col.and_then(|bc| {
+                lines
+                    .get((occ.line - 1) as usize)
+                    .map(|l| byte_to_utf16_col(l, bc))
+            });
+            // The native lane already owns this position; do not double-count it.
+            let line_key = (occ.line, occ.name.clone(), occ.kind.clone());
+            let owned = match ref_col {
+                Some(c) => {
+                    native_uncolumned.contains(&line_key)
+                        || native_at_col.contains(&(
+                            occ.line,
+                            c,
+                            occ.name.clone(),
+                            occ.kind.clone(),
+                        ))
+                }
+                None => native_lines.contains(&line_key),
+            };
+            if owned {
+                return None;
+            }
+            Some(LiveResolutionTarget {
+                ref_line: occ.line,
+                ref_col,
+                name: occ.name.clone(),
+                // Calls and fields are both answered by the definition provider.
+                edge_kind: occ.kind.clone(),
+                provider: "definition".to_string(),
+            })
+        })
+        .collect();
+    // Enumerated occurrences first: the editor drains this list in order up to
+    // its per-save budget, and the P2 enumeration is the whole point of the pass
+    // (references tree-sitter never detected). A native target that lands inside
+    // a preserved definition is a no-op for the graph (`put_edge_live` only
+    // touches `live` rows, never the preserved committed edge), so it must never
+    // crowd the enumerated set out of the budget on a large file.
+    let mut out = drop_same_position_collisions(enumerated);
+    out.extend(native);
+    out
 }
 
 /// The unique `IsImplementation` edge from `src` (the implementing class) to the
@@ -707,7 +1090,22 @@ fn inheritance_edge(
     if locally_bound.contains(base_name) {
         return None;
     }
-    let dst = unique_base_definition(store, base_name)?;
+    // #815 on this lane. `extract_unresolved_inheritance` runs for TypeScript
+    // and Python alike, so a base resolved externally in the caller's language
+    // (no repo node of its own) would otherwise bind to the one same-named
+    // class in another language's file. Inheritance never crosses a language
+    // boundary, so refusing these cannot lose a correct edge.
+    //
+    // Scoped as a filter on the candidates, not a test of the winner, for the
+    // same reason the call floor is: a foreign same-named class counted by the
+    // uniqueness gate makes it fail and suppresses the correct same-language
+    // base, so a collision would cost recall rather than merely be excluded.
+    let src_node = store.get_node(src).ok().flatten()?;
+    // E4's #I3 guard, copied: an empty language degrades to unfiltered rather
+    // than filtering every candidate away.
+    let language =
+        (!src_node.vname.language.is_empty()).then_some(src_node.vname.language.as_str());
+    let dst = unique_base_definition(store, base_name, language)?;
     edge_if_sound(store, src, dst, EdgeKind::IsImplementation)
 }
 
@@ -719,7 +1117,14 @@ fn inheritance_edge(
 /// nodes, and requires exactly one match across all of them. Two definitions of
 /// the same name — the cross-file ambiguity the editor's provider exists for —
 /// abstain rather than guess, the same precision guarantee as the call floor.
-fn unique_base_definition(store: &SqliteStore, base_name: &str) -> Option<NodeId> {
+///
+/// `language` scopes the candidates before the count, and a truncated window
+/// abstains, both for the reasons [`unique_definition`] gives.
+fn unique_base_definition(
+    store: &SqliteStore,
+    base_name: &str,
+    language: Option<&str>,
+) -> Option<NodeId> {
     let kinds = target_kinds(EdgeKind::IsImplementation);
     let mut found: Option<NodeId> = None;
     for kind in kinds {
@@ -727,8 +1132,14 @@ fn unique_base_definition(store: &SqliteStore, base_name: &str) -> Option<NodeId
         let Ok(nodes) = store.lookup_nodes_exact(&sig, None) else {
             continue;
         };
+        if truncated(&nodes) {
+            return None;
+        }
         for n in nodes {
             if !kinds.contains(&n.kind.as_str()) {
+                continue;
+            }
+            if language.is_some_and(|lang| n.vname.language != lang) {
                 continue;
             }
             match found {
@@ -779,6 +1190,20 @@ fn candidate_signatures(call: &UnresolvedCall) -> Vec<String> {
     sigs
 }
 
+/// Whether a candidate window came back full, meaning rows were withheld.
+///
+/// [`NODE_EXACT_LOOKUP_LIMIT`]'s own contract is that a full window proves at
+/// least one definition was withheld, and every uniqueness gate in this module
+/// narrows the window further (by kind, and by language since #815). Narrowing
+/// a sample cannot establish uniqueness over the set it was sampled from: two
+/// Rust `fn:run` definitions behind sixty same-signature TypeScript ones put
+/// exactly one Rust row in the window, and the language filter then read it as
+/// unambiguous. The set size is unknowable from here, so the honest answer is
+/// to abstain, which is this lane's policy for everything it cannot settle.
+fn truncated(candidates: &[travsr_core::Node]) -> bool {
+    candidates.len() >= NODE_EXACT_LOOKUP_LIMIT
+}
+
 /// The single node named by `signature` and valid as a `edge` target, or `None`
 /// when there are zero or more than one.
 ///
@@ -787,15 +1212,34 @@ fn candidate_signatures(call: &UnresolvedCall) -> Vec<String> {
 /// disambiguate". Candidates whose kind is not valid for `edge` are filtered out
 /// first, so the count is over real targets. Ambiguity abstains, which is the
 /// whole precision guarantee of section 7.3a.
-fn unique_definition(store: &SqliteStore, signature: &str, edge: EdgeKind) -> Option<NodeId> {
+///
+/// `language`, when set, scopes the candidate set to one language *before* the
+/// count is taken (#815), so a foreign node sharing the name neither wins nor
+/// suppresses the real match. Returns the node itself so the gates that follow
+/// read its path without a second point lookup.
+///
+/// Every filter here runs on the returned window, not on the full set, so a
+/// truncated window is refused up front by [`truncated`]: narrowing an
+/// incomplete sample is how a "unique" match gets manufactured out of a
+/// genuinely ambiguous name.
+fn unique_definition(
+    store: &SqliteStore,
+    signature: &str,
+    edge: EdgeKind,
+    language: Option<&str>,
+) -> Option<travsr_core::Node> {
     let candidates = store.lookup_nodes_exact(signature, None).ok()?;
+    if truncated(&candidates) {
+        return None;
+    }
     let kinds = target_kinds(edge);
-    let defs: Vec<&travsr_core::Node> = candidates
-        .iter()
+    let mut defs: Vec<travsr_core::Node> = candidates
+        .into_iter()
         .filter(|n| kinds.contains(&n.kind.as_str()))
+        .filter(|n| language.map_or(true, |lang| n.vname.language == lang))
         .collect();
-    match defs.as_slice() {
-        [only] => Some(only.id),
+    match defs.len() {
+        1 => defs.pop(),
         _ => None,
     }
 }
@@ -893,6 +1337,215 @@ mod tests {
     use travsr_core::{Node, VName};
 
     const CORPUS: &str = "testrepo";
+
+    #[test]
+    fn fill_target_columns_pins_word_boundary_positions() {
+        let content = "fn a() {\n    self.save(x);\n    let save = 1;\n}\n";
+        let mut targets = vec![
+            LiveResolutionTarget {
+                ref_line: 2,
+                ref_col: None,
+                name: "save".to_string(),
+                edge_kind: "ref/call".to_string(),
+                provider: "definition".to_string(),
+            },
+            // A name that is not present on its line stays None; the editor
+            // falls back to its own search, which abstains the same way.
+            LiveResolutionTarget {
+                ref_line: 2,
+                ref_col: None,
+                name: "missing".to_string(),
+                edge_kind: "ref/call".to_string(),
+                provider: "definition".to_string(),
+            },
+        ];
+        let lines: Vec<&str> = content.lines().collect();
+        fill_target_columns(&lines, &mut targets);
+        // "    self.save(x);" - `save` starts at column 9 (0-based), after the
+        // word boundary at the dot, not inside `self`.
+        assert_eq!(targets[0].ref_col, Some(9));
+        assert_eq!(targets[1].ref_col, None);
+    }
+
+    #[test]
+    fn fill_target_columns_pins_an_objc_selector_at_its_first_keyword() {
+        // The source spells the selector apart (`initWithName:@"x" volume:1`),
+        // so the whole name never occurs; the message starts at its first
+        // keyword, which is where the editor must ask.
+        let content = "Dog *d = [[Dog alloc] initWithName:@\"Rex\" volume:0.8f];\n";
+        let mut targets = vec![LiveResolutionTarget {
+            ref_line: 1,
+            ref_col: None,
+            name: "initWithName:volume:".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        }];
+        let lines: Vec<&str> = content.lines().collect();
+        fill_target_columns(&lines, &mut targets);
+        assert_eq!(targets[0].ref_col, Some(22));
+    }
+
+    #[test]
+    fn merge_changed_occurrence_targets_enumerates_bounds_and_dedups() {
+        use travsr_core::ChangedOccurrence;
+        // A caller def spanning lines 5-9. Its committed occurrences are what the
+        // live lane enumerates as editor targets after a body edit.
+        let store = store_with(&[("a.ts", "fn:caller", "function", 5, 9)]);
+        let src = node_id("a.ts", "fn:caller");
+        // Line 6 has a non-ASCII prefix, so the stored byte column and the
+        // editor's UTF-16 column genuinely differ: `bar` is at byte col 8 but
+        // UTF-16 col 7 (the accented `é` is two bytes, one UTF-16 unit). A wrong
+        // conversion here is a wrong editor position.
+        // Lines 5-9 are the function body; line 6 carries the accented call.
+        let content = "\n\n\n\nfn caller() {\n  café.bar();\n  qux();\n}\n\n";
+        let stashed = vec![
+            // In-span, with a column: enumerated at the exact UTF-16 position.
+            ChangedOccurrence {
+                src,
+                line: 6,
+                col: Some(8),
+                kind: "ref/call".into(),
+                name: "bar".into(),
+            },
+            // Out of the def's current span (line 20 > end 9): dropped.
+            ChangedOccurrence {
+                src,
+                line: 20,
+                col: Some(2),
+                kind: "ref/call".into(),
+                name: "gone".into(),
+            },
+            // In-span but a position the native lane already owns: dropped so it
+            // is not double-counted (native target retained below).
+            ChangedOccurrence {
+                src,
+                line: 7,
+                col: Some(2),
+                kind: "ref/call".into(),
+                name: "qux".into(),
+            },
+        ];
+        let native = vec![LiveResolutionTarget {
+            ref_line: 7,
+            ref_col: Some(2),
+            name: "qux".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        }];
+
+        let lines: Vec<&str> = content.lines().collect();
+        let out = merge_changed_occurrence_targets(&store, &lines, native, &stashed);
+
+        // The native target is kept; the enumerated `bar` is added at its UTF-16
+        // column; the out-of-span and native-owned occurrences are dropped.
+        assert_eq!(out.len(), 2, "native target plus one enumerated occurrence");
+        assert!(out
+            .iter()
+            .any(|t| t.name == "qux" && t.ref_line == 7 && t.provider == "definition"));
+        let bar = out
+            .iter()
+            .find(|t| t.name == "bar")
+            .expect("bar occurrence enumerated");
+        assert_eq!(bar.ref_line, 6);
+        assert_eq!(
+            bar.ref_col,
+            Some(7),
+            "byte col 8 must convert to UTF-16 col 7 across the accented prefix"
+        );
+        assert_eq!(bar.edge_kind, "ref/call");
+    }
+
+    /// The native lane pins the FIRST whole-word occurrence on a line, so on
+    /// `a.save(); b.save();` it owns one of the two positions. The second is a
+    /// distinct position that only the enumerated set carries, and dropping it
+    /// as "already owned" would waste the column plumbing this lane exists for.
+    #[test]
+    fn a_second_occurrence_on_a_native_lines_own_column_is_kept() {
+        use travsr_core::ChangedOccurrence;
+        let store = store_with(&[("a.ts", "fn:caller", "function", 1, 3)]);
+        let src = node_id("a.ts", "fn:caller");
+        // `  a.save(); b.save();` - `save` at byte/UTF-16 cols 4 and 13.
+        let content = "fn caller() {\n  a.save(); b.save();\n}\n";
+        let stashed = vec![
+            ChangedOccurrence {
+                src,
+                line: 2,
+                col: Some(4),
+                kind: "ref/call".into(),
+                name: "save".into(),
+            },
+            ChangedOccurrence {
+                src,
+                line: 2,
+                col: Some(13),
+                kind: "ref/call".into(),
+                name: "save".into(),
+            },
+        ];
+        // The native lane found only the first one.
+        let native = vec![LiveResolutionTarget {
+            ref_line: 2,
+            ref_col: Some(4),
+            name: "save".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        }];
+
+        let lines: Vec<&str> = content.lines().collect();
+        let out = merge_changed_occurrence_targets(&store, &lines, native, &stashed);
+
+        assert_eq!(out.len(), 2, "the native target plus the second occurrence");
+        let cols: std::collections::HashSet<Option<u32>> = out.iter().map(|t| t.ref_col).collect();
+        assert_eq!(
+            cols,
+            [Some(4), Some(13)].into_iter().collect(),
+            "both distinct columns survive; only the col-4 duplicate is dropped"
+        );
+    }
+
+    /// A native target the daemon could not place on its line owns the whole
+    /// line for that name and kind, so an enumerated occurrence there is still a
+    /// duplicate of it and is dropped, exactly as before the column split.
+    #[test]
+    fn a_native_target_without_a_column_still_owns_its_line() {
+        use travsr_core::ChangedOccurrence;
+        let store = store_with(&[("a.ts", "fn:caller", "function", 1, 3)]);
+        let src = node_id("a.ts", "fn:caller");
+        let content = "fn caller() {\n  a.save();\n}\n";
+        let stashed = vec![ChangedOccurrence {
+            src,
+            line: 2,
+            col: Some(4),
+            kind: "ref/call".into(),
+            name: "save".into(),
+        }];
+        let native = vec![LiveResolutionTarget {
+            ref_line: 2,
+            ref_col: None,
+            name: "save".to_string(),
+            edge_kind: "ref/call".to_string(),
+            provider: "definition".to_string(),
+        }];
+
+        let lines: Vec<&str> = content.lines().collect();
+        let out = merge_changed_occurrence_targets(&store, &lines, native, &stashed);
+
+        assert_eq!(out.len(), 1, "the column-less native target owns the line");
+        assert_eq!(out[0].ref_col, None);
+    }
+
+    #[test]
+    fn word_boundary_col_is_utf16_and_whole_word_only() {
+        // `saved` must not match the target `save` (no trailing boundary).
+        assert_eq!(
+            word_boundary_col_utf16("let saved = save()", "save"),
+            Some(12)
+        );
+        // A multibyte prefix: `é` is one UTF-16 code unit, so `x` is at col 2.
+        assert_eq!(word_boundary_col_utf16("é x", "x"), Some(2));
+        // Substring inside a larger identifier never matches.
+        assert_eq!(word_boundary_col_utf16("reservation", "server"), None);
+    }
 
     /// Most tests exercise the uniqueness gate, not the section 7.3 step-1
     /// local-scope gate, so they declare no local bindings. The tests that do
@@ -993,6 +1646,89 @@ mod tests {
         );
     }
 
+    /// #895: a live-resolved reference must be visible to `find_references`.
+    ///
+    /// `put_edge_live` writes `edges` only, so before this the lane produced an
+    /// edge with no occurrence row and `reference_sites` — the query
+    /// `find_references` reads — returned nothing for a reference the lane had
+    /// just resolved. `get_callers` showed it (it walks edges); `find_references`
+    /// did not. Two tools, same graph, opposite answers.
+    #[test]
+    fn an_editor_resolution_is_visible_to_find_references() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "save", "src/user.ts", 17)],
+        );
+        assert_eq!(out.emitted, 1, "precondition: the lane resolved the edge");
+
+        let sites = store
+            .reference_sites(node_id("src/user.ts", "method:User.save"))
+            .expect("reference_sites");
+        assert_eq!(
+            sites.len(),
+            1,
+            "a live-resolved reference must have an occurrence row, not just an \
+             edge: {sites:?}"
+        );
+        assert_eq!(sites[0].path, "src/order.ts");
+        assert_eq!(sites[0].line, 18);
+        assert!(
+            sites[0].live,
+            "the site must carry the un-ratified caveat, not read as ratified \
+             fact: {:?}",
+            sites[0]
+        );
+        assert!(
+            !sites[0].heuristic,
+            "live is not heuristic: this edge WAS resolved, it is only \
+             un-ratified, and conflating the two caveats states the wrong cause"
+        );
+    }
+
+    /// #895: ratification must take the occurrence rows with the edges.
+    ///
+    /// `sweep_live_edges_for_languages` deletes what Phase B did NOT re-derive.
+    /// If its `edge_sites` rows survived, `reference_sites`' LEFT JOIN would find
+    /// no edge to read, both flags would come back NULL, and a guess this very
+    /// sweep decided to discard would render as ratified fact with no caveat —
+    /// strictly worse than never having shown it.
+    #[test]
+    fn sweeping_the_overlay_takes_its_occurrence_rows_with_it() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "save", "src/user.ts", 17)],
+        );
+        let dst = node_id("src/user.ts", "method:User.save");
+        assert_eq!(
+            store.reference_sites(dst).expect("before").len(),
+            1,
+            "precondition: the live site exists"
+        );
+
+        store
+            .sweep_live_edges_for_languages(&["typescript".to_string()])
+            .expect("sweep");
+
+        let after = store.reference_sites(dst).expect("after");
+        assert!(
+            after.is_empty(),
+            "a swept live edge must leave no orphan occurrence row behind, or it \
+             renders as ratified fact: {after:?}"
+        );
+    }
+
     /// Section 8.1: a definition position that lands outside every known span
     /// (node_modules, a generated stub, an unindexed file) abstains. It must
     /// not fall back to any nearest-node heuristic.
@@ -1025,8 +1761,33 @@ mod tests {
         );
     }
 
-    /// A reference at top level has no enclosing definition to hang an edge
-    /// from, so it abstains rather than attaching to an arbitrary node.
+    /// A top-level reference (a script's `zoo.add(dog)`) hangs from its file
+    /// node, as Phase B attributes script calls. Requiring an enclosing
+    /// definition dropped every resolution in a script.
+    #[test]
+    fn a_top_level_reference_hangs_from_its_file_node() {
+        let mut store = store_with(&[
+            ("src/main.ts", "file", "file", 1, 40),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/main.ts",
+            &[resolution(2, "save", "src/user.ts", 17)],
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            }
+        );
+    }
+
+    /// A reference in no definition span of a file with no file node has
+    /// nothing to hang an edge from, so it abstains rather than attaching to an
+    /// arbitrary node.
     #[test]
     fn a_reference_with_no_enclosing_definition_abstains() {
         let mut store = store_with(&[
@@ -1040,6 +1801,70 @@ mod tests {
             "src/order.ts",
             &[resolution(2, "save", "src/user.ts", 17)],
         );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            }
+        );
+    }
+
+    /// Issue #816 defect 2 backstop: a provider that reports the item's full
+    /// range (or a bare `Location`) puts the definition line on a leading doc
+    /// comment or attribute, above the node's declaration. The daemon maps such
+    /// a position to the definition it heads and emits, so a server that does not
+    /// supply `targetSelectionRange` still resolves.
+    #[test]
+    fn a_definition_line_just_above_the_node_maps_to_the_node() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        // The provider reports line 13, a doc comment / attribute two lines above
+        // User.save's declaration at 15, which is inside no node span.
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "save", "src/user.ts", 13)],
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            }
+        );
+        assert_eq!(
+            provenance_of(
+                &store,
+                node_id("src/order.ts", "fn:placeOrder"),
+                node_id("src/user.ts", "method:User.save"),
+            )
+            .as_deref(),
+            Some("live"),
+            "a header position above the node must still resolve to the definition",
+        );
+    }
+
+    /// The backstop is name-gated: a header position above a node whose name does
+    /// not match the reported reference abstains rather than attaching.
+    #[test]
+    fn a_header_position_above_a_mismatched_node_still_abstains() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            ("src/user.ts", "method:User.save", "method", 15, 20),
+        ]);
+        // Line 13 heads User.save, but the reference names `load`, not `save`.
+        let out = apply_live_resolutions(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[resolution(18, "load", "src/user.ts", 13)],
+        );
+
         assert_eq!(
             out,
             LiveOutcome {
@@ -1117,6 +1942,471 @@ mod tests {
             .as_deref(),
             Some("live")
         );
+    }
+
+    /// #815: a bare identifier means what it means *in the calling language*.
+    /// A name that is a builtin there carries no repo node of its own, so the
+    /// single same-named definition in another language passes the exactly-one
+    /// gate and the floor used to emit a wrong cross-language edge.
+    #[test]
+    fn a_bare_call_does_not_resolve_to_another_language() {
+        let mut store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
+        // The graph's only `fn:set` is Rust; the caller is TypeScript.
+        let rust_set = VName::new(CORPUS, "", "src/config.rs", "rust", "fn:set");
+        let mut node = Node::new(rust_set.clone(), "function");
+        node.line = Some(5);
+        node.end_line = Some(9);
+        store.put_node(&node).expect("put_node");
+
+        let src = node_id("src/order.ts", "fn:placeOrder");
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[call(src, "fn:set", 18)],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            }
+        );
+        assert_eq!(
+            provenance_of(&store, src, rust_set.id()),
+            None,
+            "a builtin in the caller's language must not resolve to a same-named \
+             definition in another language",
+        );
+    }
+
+    /// #815's language scope is a filter on the candidates, not a test of the
+    /// winner, which is the ordering `resolve_unresolved_calls` (E4) already
+    /// uses. A foreign node sharing the name must not be counted by the
+    /// uniqueness gate: counting it made the exactly-one test fail and
+    /// suppressed the correct same-language edge, so the collision cost recall
+    /// rather than merely being excluded.
+    #[test]
+    fn a_foreign_same_named_definition_does_not_suppress_the_real_one() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            // The caller's own language, and the edge this lane exists to find.
+            ("src/parse.ts", "fn:parse", "function", 1, 8),
+        ]);
+        // A same-named Python definition, unrelated and unreachable from TS.
+        let py_parse = VName::new(CORPUS, "", "src/parse.py", "python", "fn:parse");
+        let mut node = Node::new(py_parse.clone(), "function");
+        node.line = Some(1);
+        node.end_line = Some(4);
+        store.put_node(&node).expect("put_node");
+
+        let src = node_id("src/order.ts", "fn:placeOrder");
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[call(src, "fn:parse", 18)],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+        );
+        assert_eq!(
+            provenance_of(&store, src, node_id("src/parse.ts", "fn:parse")).as_deref(),
+            Some("live"),
+            "the TypeScript caller must reach the TypeScript `parse`",
+        );
+        assert_eq!(
+            provenance_of(&store, src, py_parse.id()),
+            None,
+            "and must not reach the Python one",
+        );
+    }
+
+    /// The candidate window is capped at [`NODE_EXACT_LOOKUP_LIMIT`] rows, and
+    /// that constant's own contract says a full window means at least one
+    /// definition was withheld. Every filter in `unique_definition` runs on the
+    /// window rather than on the full set, so narrowing a truncated sample can
+    /// leave exactly one row standing and manufacture a confident match the
+    /// untruncated set would have refused as ambiguous.
+    ///
+    /// Two Rust `fn:run` definitions exist, so the honest answer is "ambiguous,
+    /// abstain". Enough same-signature TypeScript definitions are present to
+    /// fill the window and push one of the two Rust rows out of it, at which
+    /// point the language filter sees a single Rust candidate.
+    #[test]
+    fn a_truncated_candidate_window_abstains_rather_than_inventing_a_unique_match() {
+        let mut store = store_with(&[]);
+        let caller = VName::new(CORPUS, "", "src/probe.rs", "rust", "fn:probe");
+        let mut node = Node::new(caller.clone(), "function");
+        node.line = Some(1);
+        node.end_line = Some(9);
+        store.put_node(&node).expect("put_node");
+
+        // The genuine ambiguity: two Rust definitions of the same name.
+        for path in ["src/alpha.rs", "src/beta.rs"] {
+            let vname = VName::new(CORPUS, "", path, "rust", "fn:run");
+            let mut node = Node::new(vname, "function");
+            node.line = Some(2);
+            node.end_line = Some(6);
+            store.put_node(&node).expect("put_node");
+        }
+        // Same-signature noise in another language, enough of it to overflow
+        // the lookup's row cap. The count is chosen from the observed window:
+        // at 60 the hash-ordered `LIMIT` admits exactly one of the two Rust
+        // rows, which is the state that makes a truncated sample look unique.
+        for i in 0..60 {
+            let vname = VName::new(CORPUS, "", format!("src/n{i}.ts"), "typescript", "fn:run");
+            let mut node = Node::new(vname, "function");
+            node.line = Some(2);
+            node.end_line = Some(6);
+            store.put_node(&node).expect("put_node");
+        }
+
+        let src = caller.id();
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/probe.rs",
+            &[call(src, "fn:run", 5)],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+            "a full candidate window withheld rows, so uniqueness is unknowable \
+             and the lane must abstain",
+        );
+    }
+
+    /// #815's recall half on the inheritance lane. The call lane moved from
+    /// testing the winner to filtering the candidates precisely because a
+    /// foreign same-named node must not be counted by the uniqueness gate at
+    /// all: counting it makes the gate fail and suppresses the correct
+    /// same-language edge, so a collision costs recall rather than merely being
+    /// excluded. The base lane has the same shape and the same obligation.
+    #[test]
+    fn a_foreign_same_named_base_does_not_suppress_the_real_one() {
+        let mut store = store_with(&[]);
+        let py_class = VName::new(CORPUS, "", "src/worker.py", "python", "class:Worker");
+        let mut node = Node::new(py_class.clone(), "class");
+        node.line = Some(3);
+        node.end_line = Some(20);
+        store.put_node(&node).expect("put_node");
+        // The base the Python class actually extends.
+        let py_handler = VName::new(CORPUS, "", "src/handler.py", "python", "class:Handler");
+        let mut node = Node::new(py_handler.clone(), "class");
+        node.line = Some(1);
+        node.end_line = Some(10);
+        store.put_node(&node).expect("put_node");
+        // A same-named TypeScript class, unrelated and unreachable from Python.
+        let ts_handler = VName::new(CORPUS, "", "src/handler.ts", "typescript", "class:Handler");
+        let mut node = Node::new(ts_handler.clone(), "class");
+        node.line = Some(1);
+        node.end_line = Some(10);
+        store.put_node(&node).expect("put_node");
+
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/worker.py",
+            &[],
+            &[inherit("Handler", 3)],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+        );
+        assert_eq!(
+            provenance_of(&store, py_class.id(), py_handler.id()).as_deref(),
+            Some("live"),
+            "the Python class must reach the Python base",
+        );
+        assert_eq!(
+            provenance_of(&store, py_class.id(), ts_handler.id()),
+            None,
+            "and must not reach the TypeScript one",
+        );
+    }
+
+    /// #815 is not confined to the bare-identifier shape. A method call resolves
+    /// through `method:{recv}.{leaf}`, which is still a repo-wide exact-signature
+    /// lookup: the recovered receiver type narrows the *string*, not the search
+    /// scope. A Rust `cfg.get()` therefore reached a lone Python
+    /// `method:Config.get`, the same wrong cross-language edge by a different
+    /// route.
+    #[test]
+    fn a_method_call_does_not_resolve_to_another_language() {
+        let mut store = store_with(&[]);
+        let caller = VName::new(CORPUS, "", "src/probe.rs", "rust", "fn:probe");
+        let mut node = Node::new(caller.clone(), "function");
+        node.line = Some(1);
+        node.end_line = Some(9);
+        store.put_node(&node).expect("put_node");
+        // The graph's only `Config.get`, and it is Python. The Rust one the call
+        // actually names is external and carries no repo node.
+        let py_get = VName::new(CORPUS, "", "src/config.py", "python", "method:Config.get");
+        let mut node = Node::new(py_get.clone(), "method");
+        node.line = Some(12);
+        node.end_line = Some(14);
+        store.put_node(&node).expect("put_node");
+
+        let src = caller.id();
+        let method_call = UnresolvedCall {
+            is_method_call: true,
+            recv_type: Some("Config".to_string()),
+            ..call(src, "fn:get", 5)
+        };
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/probe.rs",
+            &[method_call],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+        );
+        assert_eq!(
+            provenance_of(&store, src, py_get.id()),
+            None,
+            "a Rust method call must not resolve to a Python method",
+        );
+    }
+
+    /// The qualifier gate compared the hint against the whole path as a raw
+    /// substring, so a short std qualifier matched a path that merely contains
+    /// its letters: `std::fs::write(...)` passed the gate against a definition in
+    /// `fsck.rs` and still minted the false edge the gate exists to stop. A
+    /// qualifier names a path segment, so it must be matched as one.
+    #[test]
+    fn a_qualifier_must_match_a_whole_path_segment() {
+        let mut store = store_with(&[]);
+        let caller = VName::new(CORPUS, "", "src/probe.rs", "rust", "fn:probe");
+        let mut node = Node::new(caller.clone(), "function");
+        node.line = Some(1);
+        node.end_line = Some(9);
+        store.put_node(&node).expect("put_node");
+        // "fsck" contains "fs", but the repo has no `fs` module here.
+        let local_write = VName::new(CORPUS, "", "src/fsck.rs", "rust", "fn:write");
+        let mut node = Node::new(local_write.clone(), "function");
+        node.line = Some(20);
+        node.end_line = Some(24);
+        store.put_node(&node).expect("put_node");
+
+        let src = caller.id();
+        let qualified = UnresolvedCall {
+            hint_crate: Some("fs".to_string()),
+            ..call(src, "fn:write", 5)
+        };
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/probe.rs",
+            &[qualified],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+        );
+        assert_eq!(
+            provenance_of(&store, src, local_write.id()),
+            None,
+            "`fsck` is not the `fs` module, so the qualifier must not reach it",
+        );
+
+        // Positive control: a definition that really does sit in an `fs` module
+        // segment must still resolve, or the tightening is recall loss.
+        let mut store = store_with(&[]);
+        let caller = VName::new(CORPUS, "", "src/probe.rs", "rust", "fn:probe");
+        let mut node = Node::new(caller.clone(), "function");
+        node.line = Some(1);
+        node.end_line = Some(9);
+        store.put_node(&node).expect("put_node");
+        let real_fs = VName::new(CORPUS, "", "src/fs/mod.rs", "rust", "fn:write");
+        let mut node = Node::new(real_fs.clone(), "function");
+        node.line = Some(20);
+        node.end_line = Some(24);
+        store.put_node(&node).expect("put_node");
+
+        let src = caller.id();
+        let qualified = UnresolvedCall {
+            hint_crate: Some("fs".to_string()),
+            ..call(src, "fn:write", 5)
+        };
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/probe.rs",
+            &[qualified],
+            &[],
+            &no_locals(),
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+            "a real `fs` path segment must still satisfy the qualifier",
+        );
+    }
+
+    /// The #815 collision inside one language: the standard library is not in
+    /// the graph, so `std::fs::write(...)` resolves to nothing of its own, and a
+    /// repo holding exactly one `fn:write` used to receive the edge. The
+    /// qualifier the extractor carries (`hint_crate`) is what refuses it, and
+    /// the same call written bare must still resolve or this is recall loss,
+    /// not a fix.
+    #[test]
+    fn a_qualified_call_does_not_resolve_to_an_unrelated_same_named_definition() {
+        let mut store = store_with(&[]);
+        // Both ends Rust, so #815's same-language gate cannot see this one.
+        let caller = VName::new(CORPUS, "", "src/probe.rs", "rust", "fn:probe");
+        let mut node = Node::new(caller.clone(), "function");
+        node.line = Some(1);
+        node.end_line = Some(9);
+        store.put_node(&node).expect("put_node");
+        // The repo's own `write`, the graph's only `fn:write`.
+        let local_write = VName::new(CORPUS, "", "src/logfile.rs", "rust", "fn:write");
+        let mut node = Node::new(local_write.clone(), "function");
+        node.line = Some(20);
+        node.end_line = Some(24);
+        store.put_node(&node).expect("put_node");
+
+        let src = caller.id();
+        let qualified = UnresolvedCall {
+            hint_crate: Some("fs".to_string()),
+            ..call(src, "fn:write", 5)
+        };
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/probe.rs",
+            &[qualified],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            }
+        );
+        assert_eq!(
+            provenance_of(&store, src, local_write.id()),
+            None,
+            "`std::fs::write` must not resolve to the repo's own unique `fn:write`",
+        );
+
+        // Negative control: the same name called bare carries no qualifier and
+        // is exactly the edge this lane exists to recover.
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/probe.rs",
+            &[call(src, "fn:write", 6)],
+            &[],
+            &no_locals(),
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            }
+        );
+        assert_eq!(
+            provenance_of(&store, src, local_write.id()).as_deref(),
+            Some("live"),
+            "an unqualified call to the repo's own `write` must still resolve",
+        );
+    }
+
+    /// `super::`, `self::` and `crate::` are lowercase, so the Rust extractor
+    /// files them under the same lowercase-qualifier branch that produces a
+    /// crate hint (`phase_b_rust.rs`). They name a position in the module tree,
+    /// never a path segment, so a path substring test can never match one and
+    /// the hint gate would abstain on every module-relative call in the repo.
+    #[test]
+    fn a_module_relative_qualifier_is_not_treated_as_a_crate_hint() {
+        for keyword in ["super", "self", "crate"] {
+            let mut store = store_with(&[]);
+            let caller = VName::new(CORPUS, "", "src/probe.rs", "rust", "fn:probe");
+            let mut node = Node::new(caller.clone(), "function");
+            node.line = Some(1);
+            node.end_line = Some(9);
+            store.put_node(&node).expect("put_node");
+            // The repo's own unique `fn:helper`, in a sibling module. No path
+            // here contains "super"/"self"/"crate".
+            let helper = VName::new(CORPUS, "", "src/sibling.rs", "rust", "fn:helper");
+            let mut node = Node::new(helper.clone(), "function");
+            node.line = Some(20);
+            node.end_line = Some(24);
+            store.put_node(&node).expect("put_node");
+
+            let src = caller.id();
+            let qualified = UnresolvedCall {
+                hint_crate: Some(keyword.to_string()),
+                ..call(src, "fn:helper", 5)
+            };
+            let out = resolve_unambiguous_lexical(
+                &mut store,
+                CORPUS,
+                "src/probe.rs",
+                &[qualified],
+                &[],
+                &no_locals(),
+            );
+
+            assert_eq!(
+                out,
+                LiveOutcome {
+                    emitted: 1,
+                    pending: 0
+                },
+                "`{keyword}::helper()` must still resolve to the repo's unique `fn:helper`",
+            );
+            assert_eq!(
+                provenance_of(&store, src, helper.id()).as_deref(),
+                Some("live"),
+                "`{keyword}::` names a module position, not a path segment, so it \
+                 must not be spent as a crate hint",
+            );
+        }
     }
 
     /// Section 7.3a's precision guarantee: two definitions sharing a signature
@@ -1611,6 +2901,7 @@ mod tests {
     fn a_resolution_the_current_parse_no_longer_asks_for_is_dropped() {
         let targets = vec![LiveResolutionTarget {
             ref_line: 18,
+            ref_col: None,
             name: "save".to_string(),
             edge_kind: "ref/call".to_string(),
             provider: "definition".to_string(),
@@ -1678,7 +2969,7 @@ mod tests {
         let mut ambiguous = call(src, "fn:save", 19);
         ambiguous.is_method_call = true;
 
-        let targets = targets_needing_editor(&store, &[resolvable, ambiguous], &no_locals());
+        let targets = targets_needing_editor(&store, &[], &[resolvable, ambiguous], &no_locals());
         assert_eq!(
             targets.len(),
             1,
@@ -1698,11 +2989,33 @@ mod tests {
         let store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
         let src = node_id("src/order.ts", "fn:placeOrder");
         let field = call(src, "field:count", 20);
-        let targets = targets_needing_editor(&store, &[field], &no_locals());
+        let targets = targets_needing_editor(&store, &[], &[field], &no_locals());
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].edge_kind, "ref/field");
         assert_eq!(targets[0].name, "count");
         assert_eq!(targets[0].provider, "definition");
+    }
+
+    /// RFC-027 #813 P2: the extractor's exact occurrence column wins over the
+    /// name search when the name repeats on the line. The name search finds the
+    /// first `save`, which is the wrong occurrence and would resolve the wrong
+    /// call; the captured column points at the one the extractor actually meant.
+    #[test]
+    fn the_extractor_column_beats_the_name_search_when_a_name_repeats() {
+        let store = store_with(&[("src/a.ts", "fn:f", "function", 1, 3)]);
+        let src = node_id("src/a.ts", "fn:f");
+        let content = "  a.save(); b.save()\n";
+        let mut c = call(src, "fn:save", 1);
+        c.is_method_call = true;
+        c.caller_col = Some(14); // byte column of the second `save`
+        let lines: Vec<&str> = content.lines().collect();
+        let targets = targets_needing_editor(&store, &lines, &[c], &no_locals());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].ref_col,
+            Some(14),
+            "the exact occurrence column must win over the first name match"
+        );
     }
 
     /// A bare free-function call the lexical lane could not resolve has no unique
@@ -1713,7 +3026,24 @@ mod tests {
         let store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
         let src = node_id("src/order.ts", "fn:placeOrder");
         let bare = call(src, "fn:nowhere", 21);
-        assert!(targets_needing_editor(&store, &[bare], &no_locals()).is_empty());
+        assert!(targets_needing_editor(&store, &[], &[bare], &no_locals()).is_empty());
+    }
+
+    /// A bare call the lexical lane refuses because two same-language
+    /// definitions carry the name (`new Zoo()` with a `.js` twin tagged
+    /// `typescript`) is exactly what the editor settles, so it is sent.
+    #[test]
+    fn an_ambiguous_bare_call_is_sent_to_the_editor() {
+        let store = store_with(&[
+            ("src/main.ts", "fn:run", "function", 1, 30),
+            ("src/animal.ts", "class:Zoo", "class", 3, 20),
+            ("js/animal.js", "class:Zoo", "class", 3, 20),
+        ]);
+        let src = node_id("src/main.ts", "fn:run");
+        let bare = call(src, "class:Zoo", 5);
+        let targets = targets_needing_editor(&store, &[], &[bare], &no_locals());
+        let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["Zoo"]);
     }
 
     /// RFC-027 section 12: the editor lane records what it claimed, so the
@@ -2038,6 +3368,51 @@ mod tests {
             )
             .as_deref(),
             Some("live"),
+        );
+    }
+
+    /// #815 on the inheritance lane, which is the same shape as the `fn:set`
+    /// call case: `extract_unresolved_inheritance` runs for both TypeScript and
+    /// Python, so a Python base that is resolved externally (stdlib or a third
+    /// party, carried by no repo node) used to bind to the one same-named class
+    /// in a TypeScript or Rust file next door. A genuine cross-language base
+    /// class does not exist; refusing them cannot lose a correct edge.
+    #[test]
+    fn a_base_in_another_language_does_not_resolve() {
+        let mut store = store_with(&[]);
+        let py_class = VName::new(CORPUS, "", "src/worker.py", "python", "class:Worker");
+        let mut node = Node::new(py_class.clone(), "class");
+        node.line = Some(3);
+        node.end_line = Some(20);
+        store.put_node(&node).expect("put_node");
+        // The graph's only `Handler`, and it is TypeScript. The Python
+        // `Handler` the class actually extends is external and has no node.
+        let ts_handler = VName::new(CORPUS, "", "src/handler.ts", "typescript", "class:Handler");
+        let mut node = Node::new(ts_handler.clone(), "class");
+        node.line = Some(1);
+        node.end_line = Some(10);
+        store.put_node(&node).expect("put_node");
+
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/worker.py",
+            &[],
+            &[inherit("Handler", 3)],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+        );
+        assert_eq!(
+            provenance_of(&store, py_class.id(), ts_handler.id()),
+            None,
+            "a Python class must not inherit from a TypeScript class",
         );
     }
 

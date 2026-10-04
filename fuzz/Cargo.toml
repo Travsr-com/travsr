@@ -43,8 +43,8 @@ test = false
 doc = false
 
 [[bin]]
-name = "fuzz_pyright_lsif_parser"
-path = "fuzz_targets/fuzz_pyright_lsif_parser.rs"
+name = "fuzz_python_parser"
+path = "fuzz_targets/fuzz_python_parser.rs"
 test = false
 doc = false
 

@@ -31,6 +31,15 @@ ignore = [
     # via macro_rules_attribute). No patched release exists; the advisory is
     # "unmaintained", not a vulnerability. Revisit when tokenizers drops it.
     { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro only, no runtime exposure" },
+    # anymap2 is unmaintained (RUSTSEC-2026-0319); anymap3 is the recommended
+    # replacement, but there is no safe upgrade path here. anymap2 is pulled in
+    # transitively by liquid-core, the template engine liquid uses, which is a
+    # BUILD dependency of tract-linalg's codegen (liquid -> tract), several
+    # layers below travsr-rerank. Nothing in this tree depends on anymap2
+    # directly and it carries zero runtime exposure. The advisory is
+    # "unmaintained", not a vulnerability, and no patched release exists.
+    # Revisit when liquid migrates off anymap2.
+    { id = "RUSTSEC-2026-0319", reason = "build-time transitive (liquid/tract codegen), no runtime exposure" },
 ]
 
 [licenses]

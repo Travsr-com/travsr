@@ -269,6 +269,27 @@ fn probe_version_bounded(bin: &Path, timeout: Duration) -> ProbeOutcome {
 ///    its timeout) entirely.
 /// 2. Else a bounded `<bin> --version` probe ([`probe_version_bounded`]).
 fn read_version(bin: &Path, live: Option<&str>) -> ProbeOutcome {
+    read_version_with(bin, live, |b| {
+        probe_version_bounded(b, VERSION_PROBE_TIMEOUT)
+    })
+}
+
+/// [`read_version`] with the probe supplied, so the resolution order can be
+/// exercised without a subprocess.
+///
+/// The rule this function encodes is pure decision logic: consult the
+/// `<bin>.version` file only when the probe reports the `0.0.0` sentinel.
+/// Driving it through a real `--version` made a logic assertion depend on
+/// fork/exec, the watchdog and [`VERSION_PROBE_TIMEOUT`], none of which the rule
+/// involves, and it failed once in CI on a loaded runner. The subprocess path
+/// keeps its own coverage in `probe_version_reads_a_fast_healthy_version` and
+/// `probe_version_is_bounded_and_reports_timeout`, which is where a fork/exec
+/// failure is a real finding rather than noise over an unrelated assertion.
+fn read_version_with(
+    bin: &Path,
+    live: Option<&str>,
+    probe: impl FnOnce(&Path) -> ProbeOutcome,
+) -> ProbeOutcome {
     if let Some(v) = live {
         if let Some(s) = parse_sidecar_version(v) {
             return ProbeOutcome::Parsed(s);
@@ -289,7 +310,7 @@ fn read_version(bin: &Path, live: Option<&str>) -> ProbeOutcome {
     // RFC-025 floor gate that exists precisely to catch it (#701). Consulting it
     // only on the sentinel keeps the honest `--version` of every other tool
     // authoritative, and the file can never assert freshness the probe contradicts.
-    match probe_version_bounded(bin, VERSION_PROBE_TIMEOUT) {
+    match probe(bin) {
         // The coursier launcher's "unset" sentinel: fall back to what the installer
         // recorded, and treat a missing/unparseable file as unreadable rather than
         // reporting a bogus `0.0.0 ok` that misrepresents an installed tool (#712).
@@ -874,50 +895,80 @@ mod tests {
     /// PR #715: the `<bin>.version` installer file must NOT override an honest
     /// `--version`, only the `0.0.0` coursier sentinel. A stale file naming a
     /// newer version than a below-floor binary would otherwise pass the floor gate
-    /// it exists to catch (#701). Exercised through `read_version` (live=None
-    /// forces the probe) with a real script binary + a sidecar file on disk.
-    #[cfg(unix)]
+    /// it exists to catch (#701).
+    ///
+    /// The probe is supplied rather than executed. This rule is pure decision
+    /// logic, and running it through a real script binary made it depend on
+    /// fork/exec, the watchdog and the 3s `VERSION_PROBE_TIMEOUT`: it failed once
+    /// in CI on a loaded `ubuntu-latest` runner with "an honest --version must not
+    /// be overridden by the .version file", which is what this assertion says when
+    /// the probe merely did not complete. Measured on an idle machine, the `echo`
+    /// script alone cost ~300ms per call and over 1.1s under load, so the margin
+    /// was never as wide as it looked. `probe_version_reads_a_fast_healthy_version`
+    /// and `probe_version_is_bounded_and_reports_timeout` still cover the
+    /// subprocess, where a fork/exec failure is a real finding rather than noise
+    /// on top of an unrelated assertion.
     #[test]
     fn version_file_consulted_only_on_the_sentinel() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
-
-        let write_bin = |name: &str, version_line: &str| {
+        let bin_with_side = |name: &str, tag: Option<&str>| {
             let bin = dir.path().join(name);
-            let mut f = std::fs::File::create(&bin).unwrap();
-            writeln!(f, "#!/bin/sh\necho '{version_line}'").unwrap();
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if let Some(tag) = tag {
+                std::fs::write(version_sidecar_path(&bin).unwrap(), tag).unwrap();
+            }
             bin
         };
-        let write_side = |bin: &Path, tag: &str| {
-            std::fs::write(version_sidecar_path(bin).unwrap(), tag).unwrap();
-        };
+        let probing = |v: Semver| move |_: &Path| ProbeOutcome::Parsed(v);
 
         // Honest probe + a stale sidecar file naming a DIFFERENT (newer) version:
         // the probe wins, the file is ignored. This is the #701-with-a-lock guard.
-        let honest = write_bin("honest-tool", "honest-tool 1.4.2");
-        write_side(&honest, "v9.9.9");
+        let honest = bin_with_side("honest-tool", Some("v9.9.9"));
         assert!(
-            matches!(read_version(&honest, None), ProbeOutcome::Parsed(v) if v == Semver::new(1, 4, 2)),
+            matches!(
+                read_version_with(&honest, None, probing(Semver::new(1, 4, 2))),
+                ProbeOutcome::Parsed(v) if v == Semver::new(1, 4, 2)
+            ),
             "an honest --version must not be overridden by the .version file"
         );
 
         // Coursier sentinel `0.0.0` + a sidecar file: the file is consulted and
         // supplies the real resolved release (the scip-java case #712 fixes).
-        let launcher = write_bin("launcher-tool", "launcher-tool 0.0.0");
-        write_side(&launcher, "scip-java-0.12.3");
+        let launcher = bin_with_side("launcher-tool", Some("scip-java-0.12.3"));
         assert!(
-            matches!(read_version(&launcher, None), ProbeOutcome::Parsed(v) if v == Semver::new(0, 12, 3)),
+            matches!(
+                read_version_with(&launcher, None, probing(Semver::new(0, 0, 0))),
+                ProbeOutcome::Parsed(v) if v == Semver::new(0, 12, 3)
+            ),
             "a 0.0.0 sentinel must fall back to the recorded .version file"
         );
 
         // Sentinel with NO sidecar file: unreadable, never a bogus `0.0.0 ok`.
-        let bare = write_bin("bare-launcher", "bare-launcher 0.0.0");
+        let bare = bin_with_side("bare-launcher", None);
         assert!(
-            matches!(read_version(&bare, None), ProbeOutcome::Unreadable),
+            matches!(
+                read_version_with(&bare, None, probing(Semver::new(0, 0, 0))),
+                ProbeOutcome::Unreadable
+            ),
             "a 0.0.0 sentinel with no recorded file must be unreadable"
+        );
+
+        // A probe that did not complete is never an invitation to read the file.
+        // These are the two outcomes the CI flake actually produced, and both
+        // must pass straight through even with a sidecar file sitting there.
+        let degraded = bin_with_side("degraded-tool", Some("v9.9.9"));
+        assert!(
+            matches!(
+                read_version_with(&degraded, None, |_: &Path| ProbeOutcome::TimedOut),
+                ProbeOutcome::TimedOut
+            ),
+            "a timed-out probe must pass through, not fall back to the file"
+        );
+        assert!(
+            matches!(
+                read_version_with(&degraded, None, |_: &Path| ProbeOutcome::Unreadable),
+                ProbeOutcome::Unreadable
+            ),
+            "an unreadable probe must pass through, not fall back to the file"
         );
     }
 

@@ -18,19 +18,19 @@ const MALICIOUS_DIR = path.join(__dirname, '../../fixtures/malicious');
 
 // ── Unit tests for security.ts ────────────────────────────────────────────────
 
-test('sanitizeTsconfig: rejects compilerOptions.plugins', () => {
+test('sanitizeTsconfig: strips compilerOptions.plugins instead of throwing', () => {
   const config = {
-    compilerOptions: { plugins: [{ name: 'evil' }] },
+    compilerOptions: { plugins: [{ name: 'evil' }], strict: true },
   };
-  assert.throws(
-    () => sanitizeTsconfig(config, '/tmp/proj'),
-    (err: unknown) => {
-      assert.ok(err instanceof Error);
-      assert.ok(err.message.includes('SEC-003'), `missing SEC-003 prefix: ${err.message}`);
-      assert.ok(err.message.includes('plugins'), `missing 'plugins' in message: ${err.message}`);
-      return true;
-    }
+  assert.doesNotThrow(() => sanitizeTsconfig(config, '/tmp/proj'));
+  // plugins is deleted so it never reaches ts.createProgram; sibling options
+  // are left untouched.
+  assert.strictEqual(
+    (config.compilerOptions as Record<string, unknown>).plugins,
+    undefined,
+    'plugins should be stripped from compilerOptions'
   );
+  assert.strictEqual((config.compilerOptions as Record<string, unknown>).strict, true);
 });
 
 test('sanitizeTsconfig: rejects extends escaping the project root', () => {
@@ -190,20 +190,12 @@ function silentEmitter(): Emitter {
   return new Emitter(sink);
 }
 
-test('walk: rejects tsconfig with compilerOptions.plugins (SEC-003)', () => {
+test('walk: strips compilerOptions.plugins instead of rejecting it', () => {
   const tsconfig = path.join(MALICIOUS_DIR, 'tsconfig-plugins.json');
-  assert.throws(
-    () => walk(tsconfig, silentEmitter()),
-    (err: unknown) => {
-      assert.ok(err instanceof Error);
-      assert.ok(
-        err.message.includes('SEC-003'),
-        `expected SEC-003 prefix, got: ${err.message}`
-      );
-      assert.ok(err.message.includes('plugins'));
-      return true;
-    }
-  );
+  // plugins is a tsserver language-service feature, inert for LSIF. walk now
+  // strips it and proceeds (the fixture has no .ts files, so it emits an empty
+  // graph) rather than failing closed as it once did.
+  assert.doesNotThrow(() => walk(tsconfig, silentEmitter()));
 });
 
 test('walk: rejects tsconfig with extends pointing outside project root (SEC-003)', () => {

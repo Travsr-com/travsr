@@ -25,6 +25,9 @@ fn travsr_init(dir: &std::path::Path) -> assert_cmd::assert::Assert {
     Command::cargo_bin("travsr")
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
+        // init installs language tools and starts a daemon; tests want neither.
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .current_dir(dir)
         .arg("init")
         .assert()
@@ -69,6 +72,8 @@ fn init_fails_outside_git_repo() {
         .unwrap()
         .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
         .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
         .output()
         .unwrap();
@@ -295,4 +300,738 @@ fn hook_run_from_hook_reindexes_after_merge_commit() {
         "hook-run --from-hook must reindex files brought in by a merge commit \
          (--first-parent semantics; before={count_before}, after={count_after})"
     );
+}
+
+// ── #811: `init --semantic --force` reconciles `ref_resolution_state` ─────────
+
+/// The issue's own measurement, verbatim, against the on-disk database.
+fn raw_pending_count(db_path: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM ref_resolution_state WHERE state = 'pending'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+fn raw_has_row(db_path: &std::path::Path, src: travsr_core::NodeId, line: u32, name: &str) -> bool {
+    rusqlite::Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM ref_resolution_state \
+             WHERE src = ?1 AND ref_line = ?2 AND name = ?3)",
+            rusqlite::params![src.0 as i64, line as i64, name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+        != 0
+}
+
+fn raw_edge_site_exists(db_path: &std::path::Path, src: travsr_core::NodeId, line: u32) -> bool {
+    rusqlite::Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM edge_sites WHERE src = ?1 AND line = ?2)",
+            rusqlite::params![src.0 as i64, line as i64],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+        != 0
+}
+
+fn travsr_init_semantic(dir: &std::path::Path, force: bool) {
+    let mut cmd = Command::cargo_bin("travsr").unwrap();
+    cmd.env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
+        .current_dir(dir)
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .args(["init", "--semantic"]);
+    if force {
+        cmd.arg("--force");
+    }
+    cmd.assert().success();
+}
+
+fn pending(src: travsr_core::NodeId, line: u32, name: &str) -> travsr_store::RefResolution {
+    travsr_store::RefResolution {
+        src,
+        ref_line: line,
+        ref_col: 0,
+        name: name.to_string(),
+        state: "pending",
+        resolved_dst: None,
+    }
+}
+
+/// #811 at the binary boundary: `travsr init --semantic --force` must leave
+/// `ref_resolution_state` consistent with the graph it just rebuilt.
+///
+/// The daemon crate reproduces the issue through the live lane itself; here the
+/// stale state is seeded the way a pre-fix session leaves it, so the test
+/// exercises the shipped CLI rather than library entry points. `notify()` on
+/// line 4 is a call the rebuilt graph resolves (the parameter shadows a unique
+/// repo-wide function, which the live lane refuses but Phase B's resolver does
+/// not), `frobnicate()` on line 5 resolves to nothing, and a third row hangs off
+/// a node id that does not exist.
+#[test]
+fn init_semantic_force_reconciles_stale_pending_refs() {
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/billing.ts"),
+        "export class Billing {\n  charge(): void {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src/notify.ts"),
+        "export function notify(): void {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src/caller.ts"),
+        "import { Billing } from \"./billing\";\n\
+         export function run(bill: Billing, notify: () => void): void {\n\
+         \x20 bill.charge();\n\
+         \x20 notify();\n\
+         \x20 frobnicate();\n\
+         }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "seed"]);
+
+    // A fresh, complete index.
+    travsr_init_semantic(tmp.path(), false);
+    let db_path = tmp.path().join(".travsr/graph.db");
+    let (corpus, run) = {
+        let store = SqliteStore::open(&db_path).unwrap();
+        let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
+        let run = store
+            .enclosing_definition_at(&corpus, "src/caller.ts", 4)
+            .unwrap()
+            .expect("`run` must enclose line 4");
+        (corpus, run)
+    };
+    assert!(
+        raw_edge_site_exists(&db_path, run, 4),
+        "precondition: Phase B must record a call site for `notify()`"
+    );
+    assert!(
+        !raw_edge_site_exists(&db_path, run, 5),
+        "precondition: nothing may resolve `frobnicate()`"
+    );
+    assert_eq!(
+        raw_pending_count(&db_path),
+        0,
+        "precondition: a clean index"
+    );
+
+    // The state a pre-fix session leaves behind.
+    let ghost = travsr_core::NodeId(0xDEAD_BEEF);
+    {
+        let mut store = SqliteStore::open(&db_path).unwrap();
+        store
+            .replace_ref_resolution_states(
+                &corpus,
+                "src/caller.ts",
+                &[pending(run, 4, "notify"), pending(run, 5, "frobnicate")],
+            )
+            .unwrap();
+        store
+            .upsert_ref_resolution_states(&[pending(ghost, 1, "gone")])
+            .unwrap();
+    }
+    assert_eq!(
+        raw_pending_count(&db_path),
+        3,
+        "precondition: the stale state is in place"
+    );
+    let refs_before = ref_edge_count(&db_path);
+
+    // The command the issue names.
+    travsr_init_semantic(tmp.path(), true);
+
+    // Graph state is correct...
+    let store = SqliteStore::open(&db_path).unwrap();
+    assert_eq!(
+        store.get_meta("phase_b_commit").unwrap(),
+        store.get_meta("last_commit").unwrap(),
+        "Phase B must be current after --semantic"
+    );
+    assert_eq!(store.count_edges_with_provenance("live").unwrap(), 0);
+    assert_eq!(
+        ref_edge_count(&db_path),
+        refs_before,
+        "a rebuild of an unchanged tree must reproduce the same ref edges"
+    );
+    assert!(
+        raw_edge_site_exists(&db_path, run, 4),
+        "the rebuilt graph resolves line 4 again"
+    );
+    // ...and the table agrees with it.
+    assert!(
+        !raw_has_row(&db_path, run, 4, "notify"),
+        "a pending row with a call site beside it must not survive `init --semantic --force` (#811)"
+    );
+    assert!(
+        !raw_has_row(&db_path, ghost, 1, "gone"),
+        "the orphan must be purged"
+    );
+    assert!(
+        raw_has_row(&db_path, run, 5, "frobnicate"),
+        "the genuine unresolved reference must remain pending"
+    );
+    assert_eq!(raw_pending_count(&db_path), 1);
+    assert_eq!(store.pending_ref_count().unwrap(), 1);
+    drop(store);
+
+    // A second rebuild is stable: nothing reintroduced, nothing more removed.
+    travsr_init_semantic(tmp.path(), true);
+    assert_eq!(raw_pending_count(&db_path), 1);
+    assert!(raw_has_row(&db_path, run, 5, "frobnicate"));
+    assert_eq!(ref_edge_count(&db_path), refs_before);
+}
+
+/// The `ref/*` edges only. Repeated `--force` passes are not byte-stable on
+/// Phase A's speculative import `resolves-to` edges (a pre-existing property of
+/// the purge-and-restage path, unrelated to #811), so the graph invariant this
+/// test holds the reconcile to is the semantic edge set it is keyed on.
+fn ref_edge_count(db_path: &std::path::Path) -> usize {
+    SqliteStore::open(db_path)
+        .unwrap()
+        .all_edges()
+        .unwrap()
+        .iter()
+        .filter(|(_, _, kind, _)| kind.starts_with("ref/"))
+        .count()
+}
+
+// ── #893: `travsr init` must fence `.travsr/` off from git ────────────────────
+
+/// `git` that is expected to fail, returning combined output for assertions.
+fn git_try(dir: &std::path::Path, args: &[&str]) -> (bool, String) {
+    let out = StdCommand::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap_or_else(|_| panic!("git {args:?} failed to spawn"));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), combined)
+}
+
+/// `travsr init` with `HOME` pointed at an empty directory, so the `connect`
+/// step detects no AI tool and writes no `.gitignore` block of its own. Without
+/// this the assertions below would depend on what the developer running the
+/// suite happens to have installed.
+fn travsr_init_isolated(dir: &std::path::Path, home: &std::path::Path) -> String {
+    let out = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
+        .env("HOME", home)
+        .current_dir(dir)
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .arg("init")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// #893 A1: the issue's repro, verbatim. `travsr init` writes `.travsrignore`
+/// but used to say nothing about `.gitignore`, so the next `git add -A` committed
+/// `graph.db` and its WAL. The WAL changes on every read, which leaves the
+/// working tree permanently dirty and makes `git revert` — and every other
+/// operation that needs a clean tree — refuse to run, forever.
+#[test]
+fn init_gitignores_travsr_dir_so_revert_keeps_working() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c1"]);
+
+    travsr_init_isolated(tmp.path(), home.path());
+
+    std::fs::write(
+        tmp.path().join("b.ts"),
+        "export function b() { return 2; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c2"]);
+
+    // The direct symptom: git must not be holding the graph.
+    let (_, tracked) = git_try(tmp.path(), &["ls-files", "--", ".travsr"]);
+    assert!(
+        tracked.trim().is_empty(),
+        "`git add -A` after `travsr init` must not stage anything under .travsr/, got:\n{tracked}"
+    );
+
+    // The consequence the issue reports: with the graph committed, the WAL keeps
+    // the tree dirty and this aborts with "local changes would be overwritten".
+    let (ok, out) = git_try(tmp.path(), &["revert", "--no-edit", "HEAD"]);
+    assert!(
+        ok,
+        "git revert must still work after `travsr init`, got:\n{out}"
+    );
+}
+
+/// #893 A1, the other half: a `.gitignore` entry has no effect on a path git
+/// already tracks, so for a repo that committed `.travsr/` before this scaffold
+/// existed the entry alone fixes nothing. `travsr init` must say so and name the
+/// command that recovers, rather than reporting success over a repo that is
+/// still deadlocked. It must not untrack the files itself — that rewrites the
+/// user's index, which init has no mandate to do.
+#[test]
+fn init_reports_an_already_tracked_travsr_dir_instead_of_untracking_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c1"]);
+    travsr_init_isolated(tmp.path(), home.path());
+
+    // The state a pre-fix repo is already in.
+    git(tmp.path(), &["add", "-f", ".travsr"]);
+    git(tmp.path(), &["commit", "-q", "-m", "oops"]);
+
+    let combined = travsr_init_isolated(tmp.path(), home.path());
+    assert!(
+        combined.contains("git rm -r --cached .travsr"),
+        "init over a repo that already tracks .travsr/ must name the recovery command, got:\n{combined}"
+    );
+
+    let (_, tracked) = git_try(tmp.path(), &["ls-files", "--", ".travsr"]);
+    assert!(
+        !tracked.trim().is_empty(),
+        "init must not rewrite the user's index on their behalf"
+    );
+}
+
+/// #893 A1: the entry is appended once. `git check-ignore` reports an already
+/// *tracked* path as not-ignored regardless of the rules in force, so an
+/// idempotency guard that forgets `--no-index` appends a duplicate on every
+/// re-init of exactly the repos this fix exists to help.
+#[test]
+fn init_appends_the_gitignore_entry_only_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c1"]);
+
+    travsr_init_isolated(tmp.path(), home.path());
+    git(tmp.path(), &["add", "-f", ".travsr"]);
+    travsr_init_isolated(tmp.path(), home.path());
+    travsr_init_isolated(tmp.path(), home.path());
+
+    let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+    assert_eq!(
+        gi.lines().filter(|l| l.trim() == "/.travsr/").count(),
+        1,
+        "repeated `travsr init` must not stack duplicate entries, got:\n{gi}"
+    );
+}
+
+// ── #893: `git reset --hard` must not be papered over by the next commit ──────
+
+/// #893 A2: git fires no hook for `git reset --hard`, so with no daemon running
+/// the graph keeps the discarded commit's files. `travsr status` did notice
+/// (`last_commit` != HEAD) — but the next unrelated commit reindexed only its
+/// own diff and then stamped `last_commit` to HEAD, so the two agreed again, the
+/// drift note vanished, and the ghost stayed. `travsr ask` answered with it at
+/// `confidence: exact`.
+#[test]
+fn hook_run_after_reset_hard_prunes_the_discarded_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+
+    // The issue's A2 repro writes this itself. Keep it, so this test isolates
+    // the reset defect instead of also depending on the A1 scaffold above: with
+    // `.travsr/` committed, the `git reset --hard` below deletes the graph and
+    // the failure is a missing database rather than a ghost node.
+    std::fs::write(tmp.path().join(".gitignore"), ".travsr/\n").unwrap();
+    std::fs::write(
+        tmp.path().join("keep.ts"),
+        "export function keep() { return 1; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c1"]);
+    travsr_init_isolated(tmp.path(), home.path());
+
+    let before = StdCommand::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let before = String::from_utf8_lossy(&before.stdout).trim().to_string();
+
+    std::fs::write(
+        tmp.path().join("gone.ts"),
+        "export function gone() { return 2; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c2"]);
+
+    git(tmp.path(), &["reset", "--hard", "-q", &before]);
+    assert!(
+        !tmp.path().join("gone.ts").exists(),
+        "precondition: the reset removed the file from disk"
+    );
+
+    // The unrelated commit that used to silence the still-true drift note.
+    std::fs::write(
+        tmp.path().join("other.ts"),
+        "export function other() { return 3; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c3"]);
+    Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
+        .env("HOME", home.path())
+        .current_dir(tmp.path())
+        .args(["hook-run", "--from-hook"])
+        .assert()
+        .success();
+
+    // The issue's own measurement.
+    let out = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
+        .env("HOME", home.path())
+        .current_dir(tmp.path())
+        .arg("fsck")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let fsck = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !fsck.contains("gone.ts"),
+        "the file the reset discarded must not survive as a ghost, got:\n{fsck}"
+    );
+
+    // And the commit that *did* reconcile is still allowed to claim freshness,
+    // so `travsr status` does not nag after every commit.
+    let store = SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+    let head = StdCommand::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        store.get_meta("last_commit").unwrap().unwrap_or_default(),
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "a reconciled tree must still stamp HEAD"
+    );
+
+    // The fast path must survive: a commit on top of an ancestor marker still
+    // reindexes only its own diff, so this fix costs nothing on the common path.
+    std::fs::write(
+        tmp.path().join("more.ts"),
+        "export function more() { return 4; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c4"]);
+    assert!(travsr_daemon::commit_is_ancestor_of_head(
+        tmp.path(),
+        &SqliteStore::open(&tmp.path().join(".travsr/graph.db"))
+            .unwrap()
+            .get_meta("last_commit")
+            .unwrap()
+            .unwrap_or_default()
+    ));
+}
+
+#[test]
+fn allow_unsandboxed_lsif_is_recorded_for_the_daemon() {
+    // The daemon is a separate process and never sees init's flags, so the
+    // grant must land in lang.toml, where the daemon reads it.
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(tmp.path().join("lib.rs"), "fn a() {}\n").unwrap();
+    let lang_toml = tmp.path().join("lang.toml");
+
+    Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("TRAVSR_LANG_TOML", &lang_toml)
+        .current_dir(tmp.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .args(["init", "--allow-unsandboxed-lsif"])
+        .assert()
+        .success();
+
+    let toml: toml::Value = toml::from_str(&std::fs::read_to_string(&lang_toml).unwrap()).unwrap();
+    let granted: Vec<&str> = toml["unsandboxed_consent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["language"].as_str())
+        .collect();
+    assert_eq!(granted, ["rust"]);
+}
+
+fn ts_repo() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function helper() { return 1 }\nexport function main() { return helper() }\n",
+    )
+    .unwrap();
+    tmp
+}
+
+#[test]
+fn init_json_is_one_object_and_never_reads_stdin() {
+    let tmp = ts_repo();
+    let out = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("TRAVSR_LANG_TOML", tmp.path().join("lang.toml"))
+        .current_dir(tmp.path())
+        .args(["init", "--json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is one JSON object");
+    // Existing keys stay for scripts and the VS Code extension.
+    for key in ["files_indexed", "nodes_written", "phase_b", "db_path"] {
+        assert!(v.get(key).is_some(), "missing {key}");
+    }
+    let ts = v["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["language"] == "typescript")
+        .expect("typescript listed");
+    assert!(ts["state"].is_string());
+    assert!(["installed", "skipped"].contains(&v["search_ranking"].as_str().unwrap()));
+    assert_eq!(v["keeping_fresh"], "not_started", "CI is set");
+    assert_eq!(v["next"], "Ready. Ask your AI about this code.");
+    assert!(
+        v["one_step"].is_array(),
+        "tools needing a step of the user's own"
+    );
+
+    // `next` is the line the text summary ends with, so a re-run with nothing
+    // to do says so here too.
+    let again = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("TRAVSR_LANG_TOML", tmp.path().join("lang.toml"))
+        .current_dir(tmp.path())
+        .args(["init", "--json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(v["next"], "Ready. Nothing changed since the last run.");
+}
+
+/// Stops the repo's daemon when dropped, so a failed assert never leaks one.
+struct StopDaemon<'a>(&'a std::path::Path);
+impl Drop for StopDaemon<'_> {
+    fn drop(&mut self) {
+        let _ = Command::cargo_bin("travsr")
+            .unwrap()
+            .env("TRAVSR_DISABLE_REGISTRY", "1")
+            .current_dir(self.0)
+            .args(["daemon", "stop"])
+            .output();
+    }
+}
+
+#[test]
+fn init_outside_ci_keeps_a_daemon_running_without_a_terminal() {
+    let tmp = ts_repo();
+    let _stop = StopDaemon(tmp.path());
+    let out = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env_remove("CI")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("TRAVSR_LANG_TOML", tmp.path().join("lang.toml"))
+        .current_dir(tmp.path())
+        .args(["init", "--json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["keeping_fresh"], "started");
+    let status = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .current_dir(tmp.path())
+        .args(["daemon", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("daemon: running"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+/// Plan S7 / G2: a machine with Claude Code installed for the user (only
+/// `~/.claude`, nothing in the repo) gets this project wired by `init` alone,
+/// through the project's own `.mcp.json`, and is never told to edit PATH: the
+/// config carries the absolute path.
+///
+/// Not on Windows: `dirs::home_dir` asks Windows for the profile folder and
+/// ignores `HOME`, so the test cannot give it a home with `.claude` in it.
+#[cfg(not(windows))]
+#[test]
+fn init_wires_claude_code_from_a_home_marker_without_a_path_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(home.path().join(".claude")).unwrap();
+    // Codex keeps its servers in a global file travsr never writes.
+    std::fs::create_dir(home.path().join(".codex")).unwrap();
+    git_init(tmp.path());
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("HOME", home.path())
+        .env("TRAVSR_LANG_TOML", home.path().join("lang.toml"))
+        .current_dir(tmp.path())
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mcp: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".mcp.json"))
+            .unwrap_or_else(|e| panic!("init must write .mcp.json ({e}):\n{text}")),
+    )
+    .unwrap();
+    assert!(
+        mcp["mcpServers"]["travsr"]["command"].is_string(),
+        "the project config must carry the travsr server: {mcp}"
+    );
+    assert!(!text.contains("PATH"), "no PATH instruction (G2):\n{text}");
+    assert!(
+        text.contains("Codex needs one step from you: run `travsr connect --tool codex`"),
+        "{text}"
+    );
+}
+
+/// Setup output stays hidden unless an install fails. Here every download is
+/// refused, so the install fails and `init` shows what it printed, then carries
+/// on offline and still finishes.
+///
+/// Not on Windows: there is no scip-go download there, only `go install`,
+/// which needs a newer Go than the runner may have (then nothing installs).
+#[cfg(not(windows))]
+#[test]
+fn a_failed_language_install_shows_its_output_and_init_finishes() {
+    // Go's tools install only where Go is: without it, Go reads "needs Go
+    // toolchain" and no install runs to fail.
+    let go = StdCommand::new("go").arg("version").output();
+    if !go.is_ok_and(|o| o.status.success()) {
+        eprintln!("SKIP: go not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(
+        tmp.path().join("main.go"),
+        "package main\n\nfunc main() {}\n",
+    )
+    .unwrap();
+    // A Go project, so there is something to set up (no go.mod reads "needs go.mod").
+    std::fs::write(
+        tmp.path().join("go.mod"),
+        "module example.com/m\n\ngo 1.21\n",
+    )
+    .unwrap();
+    let out = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env_remove("TRAVSR_SKIP_DOWNLOAD")
+        .env("HOME", home.path())
+        .env("TRAVSR_LANG_TOML", home.path().join("lang.toml"))
+        .env("TRAVSR_LANG_RELEASES_BASE", "http://127.0.0.1:9")
+        .env("TRAVSR_LANG_API_URL", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .current_dir(tmp.path())
+        .arg("init")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Could not get the language tools for Go. What went wrong:"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("  error:"),
+        "the install's own output: {stderr}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Ready"));
 }

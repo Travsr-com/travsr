@@ -177,6 +177,69 @@ fn unsupported_status_agrees_with_platform_availability() {
     }
 }
 
+/// Plan 3.3: the additive readiness fields, beside the v1 ones. `state` is the
+/// same tag `init --json` reports, `needs` names the tool only on a
+/// `needs_toolchain` row, and `fix` is plain words (plan 3.0) with no
+/// placeholder. Run inside this repo, so every row has a repo to judge.
+#[test]
+fn every_row_carries_its_readiness() {
+    const STATE: &[&str] = &[
+        "ready",
+        "setting_up",
+        "needs_toolchain",
+        "unsupported_os",
+        "failed",
+        "no_calls",
+    ];
+    for row in lang_list_json().as_array().expect("array") {
+        let lang = row["language"].as_str().unwrap_or("<unnamed>");
+        let state = row["state"].as_str().expect("state must be a string");
+        assert!(STATE.contains(&state), "{lang}: unknown state '{state}'");
+        assert_eq!(
+            row["needs"].is_string(),
+            state == "needs_toolchain",
+            "{lang}: `needs` belongs on needs_toolchain rows only"
+        );
+        if let Some(fix) = row["fix"].as_str() {
+            assert_eq!(
+                travsr_plugin_host::phase_b::status::jargon_in(fix),
+                None,
+                "{lang}: {fix}"
+            );
+        }
+    }
+}
+
+/// Plan 3.0 on the text table: every default line reads plainly, including with
+/// an installed tool whose version is readable (which used to print a
+/// `sidecars:` block here; `travsr status --verbose` still shows it).
+#[cfg(unix)]
+#[test]
+fn text_table_reads_plainly() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join(".travsr/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let tool = bin.join("scip-ruby");
+    std::fs::write(&tool, "#!/bin/sh\necho 0.4.7\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = Command::new(travsr())
+        .args(["lang", "list"])
+        .env("HOME", home.path())
+        .env("TRAVSR_LANG_TOML", home.path().join("lang.toml"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        travsr_plugin_host::phase_b::status::jargon_in(&stdout),
+        None,
+        "{stdout}"
+    );
+}
+
 // ── Part B item 2: `--version` for a hash-pinned language ────────────────────
 
 /// The reported behaviour, on a language whose analyzer is hash-pinned on every

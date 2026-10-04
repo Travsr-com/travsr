@@ -85,6 +85,9 @@ struct RefItem {
     caller_doc_id: u64,
     /// `inVs` — range vertex ids of the individual occurrences.
     range_ids: Vec<u64>,
+    /// `false` when travsr-lsif-ts marked the item `travsr_call: false`: it
+    /// names the symbol without calling it (an import specifier, an override).
+    is_call: bool,
 }
 
 fn parse_graph(dump: impl std::io::BufRead, corpus: &str) -> anyhow::Result<LsifGraph> {
@@ -191,6 +194,7 @@ fn parse_graph(dump: impl std::io::BufRead, corpus: &str) -> anyhow::Result<Lsif
                     ref_result_id,
                     caller_doc_id,
                     range_ids,
+                    is_call: obj["travsr_call"].as_bool().unwrap_or(true),
                 });
             }
 
@@ -223,7 +227,7 @@ pub fn ingest_raw_from_reader(
 
     let mut edges = Vec::new();
 
-    for item in &graph.ref_items {
+    for item in graph.ref_items.iter().filter(|item| item.is_call) {
         let caller_path = match graph.doc_paths.get(&item.caller_doc_id) {
             Some(p) => p,
             None => continue,
@@ -328,9 +332,15 @@ pub fn ingest_g2_from_reader(
                 caller_line,
                 callee_id,
                 // Our bundled LSIF emitters (travsr-lsif-ts / -py) emit occurrence
-                // ranges only for call expressions and imports, so these are
-                // already call-scoped — flag as calls to preserve their edges.
-                is_call: true,
+                // ranges for call expressions, and mark the rest (imports,
+                // overrides) `travsr_call: false`.
+                is_call: item.is_call,
+                // RFC-027 #813 P2: this streaming graph parse carries no source
+                // text, so the range's UTF-16 start character cannot be converted
+                // to the byte column the occurrence store keeps. Leave it None
+                // rather than record a wrong (non-ASCII) column; the daemon falls
+                // back to its word-boundary search for these occurrences.
+                caller_col: None,
             });
         }
     }
@@ -478,6 +488,24 @@ mod tests {
         let callee_id = VName::new("", "", "svc.ts", "typescript", "fn:charge").id();
         assert_eq!(edges[0].src, caller_id);
         assert_eq!(edges[0].dst, callee_id);
+    }
+
+    #[test]
+    fn a_reference_marked_as_a_non_call_makes_no_call() {
+        // travsr-lsif-ts marks an import specifier or an override
+        // `travsr_call: false`: it names the symbol without calling it. The
+        // occurrence is still recorded; no `ref/call` comes from it.
+        let dump = minimal_dump("svc.ts", "class:Charge", "caller.ts").replace(
+            r#""property":"references"}"#,
+            r#""property":"references","travsr_call":false}"#,
+        );
+        let g2 = ingest_g2(&dump, "").unwrap();
+        assert_eq!(g2.refs.len(), 1, "the occurrence is kept");
+        assert!(!g2.refs[0].is_call);
+        assert!(
+            ingest_raw(&dump, "").unwrap().is_empty(),
+            "no file-level call edge"
+        );
     }
 
     #[test]
@@ -1153,12 +1181,21 @@ pub fn ingest_rust_positional_from_reader(
         // (that is what collapses into `src == dst` self-loops and spurious
         // non-call edges). Fail open (treat as a call) when the source line is
         // unreadable — in production the file always exists.
-        let is_call = match range_cols.get(&range_id) {
-            Some(&col) => src
-                .line(std::path::Path::new(caller_abs), caller_line0 + 1)
-                .map(|t| crate::callsite::occurrence_is_call(t, col))
-                .unwrap_or(true),
-            None => true,
+        // RFC-027 #813 P2: read the caller line once to classify the occurrence
+        // AND convert its UTF-16 range start to a byte column. LSIF positions are
+        // UTF-16 code units (metaData positionEncoding); source is UTF-8, so the
+        // stored occurrence column must be the byte offset the daemon can convert
+        // back at use. Fail open (treat as a call, no column) when the line is
+        // unreadable; in production the file always exists.
+        let (is_call, caller_col) = match range_cols.get(&range_id) {
+            Some(&col) => match src.line(std::path::Path::new(caller_abs), caller_line0 + 1) {
+                Some(t) => (
+                    crate::callsite::occurrence_is_call(t, col),
+                    Some(crate::callsite::utf16_col_to_byte(t, col) as u32),
+                ),
+                None => (true, None),
+            },
+            None => (true, None),
         };
         let Some(defres) = result_def.get(&rs) else {
             continue; // occurrence with no definition (e.g. a keyword range)
@@ -1172,12 +1209,18 @@ pub fn ingest_rust_positional_from_reader(
             else {
                 continue;
             };
+            let callee_name = range_cols.get(trid).and_then(|&col| {
+                let line = src.line(std::path::Path::new(def_abs), def_line0 + 1)?;
+                crate::callsite::identifier_at(line, col).map(str::to_string)
+            });
             out.push(travsr_core::LsifPositionalRef {
                 caller_path: caller_path.clone(),
                 caller_line: caller_line0 + 1,
                 callee_def_path: relative_to_base(&base_prefix, def_abs),
                 callee_def_line: def_line0 + 1,
                 is_call,
+                caller_col,
+                callee_name,
             });
         }
     }
@@ -1495,6 +1538,9 @@ mod rust_lsif_tests {
             !type_ref.is_call,
             "the `let x: Session` type reference must be flagged non-call"
         );
+        // The store checks the resolved node against the name at the def range.
+        assert_eq!(call.callee_name.as_deref(), Some("filter"));
+        assert_eq!(type_ref.callee_name.as_deref(), Some("Session"));
     }
 }
 
@@ -1706,11 +1752,23 @@ pub fn ingest_scip_g2(
                 } else {
                     true
                 };
+                // RFC-027 #813 P2: convert the occurrence's 0-based UTF-16 start
+                // column (SCIP positions are UTF-16 code units) to the byte offset
+                // the occurrence store keeps, reading the source line via the same
+                // cache `is_call` used. None when the range carries no column or
+                // the line is unreadable, in which case the daemon name-searches.
+                let caller_col: Option<u32> = match occ.range.get(1) {
+                    Some(&col) => src
+                        .line(&repo_root.join(path), caller_line)
+                        .map(|t| crate::callsite::utf16_col_to_byte(t, col.max(0) as u32) as u32),
+                    None => None,
+                };
                 out.refs.push(travsr_core::ScipRef {
                     caller_path: path.clone(),
                     caller_line,
                     callee_id,
                     is_call,
+                    caller_col,
                 });
             }
         }

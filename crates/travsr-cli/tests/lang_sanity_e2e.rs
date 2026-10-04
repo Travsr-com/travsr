@@ -98,8 +98,14 @@ fn indexed_repo(lang: &str) -> tempfile::TempDir {
     // *cannot* produce semantic data: ADR-017 Rule 3 gates external tooling on a
     // per-corpus trust grant, and a repo nobody has enabled yet has none.
     let out = Command::new(travsr())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .args(["init", "--semantic"])
         .current_dir(root)
+        // #893: without this, `travsr init` appends this tempdir to the
+        // developer's real ~/.travsr/registry.json and leaves the entry there
+        // after `tempfile` deletes the directory.
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
         .output()
         .expect("travsr init");
     assert!(
@@ -138,8 +144,12 @@ fn indexed_repo(lang: &str) -> tempfile::TempDir {
 
     // Re-index now that the sidecar is allowed to run at all.
     let out = Command::new(travsr())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .args(["init", "--semantic"])
         .current_dir(root)
+        // #893: same reason as the first pass above.
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
         .output()
         .expect("travsr re-init");
     assert!(
@@ -172,7 +182,12 @@ fn wait_for_phase_b(root: &Path, lang: &str) {
             .expect("travsr status");
         let text = String::from_utf8_lossy(&out.stdout).into_owned()
             + &String::from_utf8_lossy(&out.stderr);
-        if text.contains("semantic: complete") {
+        // `partial` is a settled state too: since #878 a TypeScript index built
+        // where `travsr-lsif-ts` is not discoverable (CI never builds the
+        // emitter's `dist/`) reports `partial (incomplete: typescript)` rather
+        // than a false `complete`. The probes below still hold on the native
+        // pass alone, which is what this suite has always exercised there.
+        if text.contains("semantic: complete") || text.contains("semantic: partial") {
             return;
         }
         if std::time::Instant::now() >= deadline {
@@ -384,7 +399,12 @@ fn typescript_constructs_resolve_end_to_end() {
                 gap: None,
             },
             Probe {
-                symbol: "speak",
+                // Queried by full signature, as the C++ override probe is:
+                // `speak` is genuinely ambiguous between `Speaker.speak` (the
+                // abstract declaration, which now has its own node) and
+                // `Greeter.speak` (the implementation), and travsr correctly
+                // asks for a hint rather than guessing.
+                symbol: "method:Greeter.speak",
                 site: "main.ts:6",
                 construct: "class method implementing an abstract base",
                 gap: None,
@@ -399,7 +419,7 @@ fn typescript_constructs_resolve_end_to_end() {
                 symbol: "describe",
                 site: "main.ts:8",
                 construct: "inherited method on an abstract class",
-                gap: Some("call is on a subclass instance; the method is defined on the base"),
+                gap: None,
             },
             Probe {
                 symbol: "firstOf",
