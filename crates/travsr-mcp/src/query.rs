@@ -100,6 +100,21 @@ pub struct EdgeEntry {
     /// store access (noise endpoints are not in `nodes` but still render).
     pub src_sig: String,
     pub dst_sig: String,
+    /// Same flag as [`TreeStep::heuristic`], on the edge list.
+    ///
+    /// The tree view marked these edges and the `edges` array did not, so
+    /// `--format dot` and `get_graph_json` presented a name-matched call as
+    /// resolved. `serde(default)` keeps older daemon payloads deserializable.
+    #[serde(default)]
+    pub heuristic: bool,
+}
+
+/// Whether an edge was matched by bare callee name rather than resolved by
+/// type: a `ref/call` that `resolve_unresolved_calls` wrote, not a compiler.
+/// One predicate for both the tree and the edge list so the two views of a
+/// single traversal cannot disagree.
+pub(crate) fn is_heuristic_edge(kind: &str, provenance: &str) -> bool {
+    kind == travsr_core::EdgeKind::RefCall.as_str() && provenance == "tree-sitter"
 }
 
 /// One BFS spanning-tree expansion step, in discovery order — drives the
@@ -115,6 +130,14 @@ pub struct TreeStep {
     /// payloads from daemons predating this field deserializable.
     #[serde(default)]
     pub incoming: bool,
+    /// `true` for a `ref/call` edge whose provenance is `tree-sitter`: one
+    /// `resolve_unresolved_calls` matched by bare callee name, not one a
+    /// compiler resolved by type. Mirrors the condition `provenance_marker` in
+    /// `tools.rs` uses for its `get_callers` sigil, so the tree view and
+    /// `find_references` cannot describe the same edge differently.
+    /// `serde(default)` keeps older daemon payloads deserializable.
+    #[serde(default)]
+    pub heuristic: bool,
 }
 
 /// Coverage / completeness metadata (#318 O5) — distinguishes "no callers"
@@ -140,6 +163,9 @@ pub struct GraphPayload {
     /// Ambiguous candidates, if the query resolves to multiple definitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<NodeEntry>>,
+    /// No definition has the queried name: `seed` is the closest name match.
+    #[serde(default)]
+    pub fuzzy: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,6 +250,12 @@ pub struct StatusPayload {
     /// H3: warnings from the last Phase B run (crashed/version_mismatch/needs_approval).
     /// Empty string = no warnings.
     pub phase_b_warnings: Option<String>,
+    /// #904: JSON array of the sidecars' own warning diagnostics from the last
+    /// Phase B run (`[{"lang","code","message"}]`), or empty/None. Lets
+    /// `travsr status` name the actual cause (a missing Android SDK) where the
+    /// warning classes above can only name the shape (`zero_nodes:java`).
+    #[serde(default)]
+    pub phase_b_diagnostics: Option<String>,
     /// M1 / #738: rust-analyzer LSIF degradation for the last semantic pass.
     /// "sandbox_unavailable" = ra was skipped (OS sandbox missing); "all_refs_dropped"
     /// = ra ran but every reference failed resolution (0 edges landed). Empty = healthy.
@@ -242,21 +274,127 @@ pub struct StatusPayload {
     /// (serde default false), which reads as the pre-#583 behaviour.
     #[serde(default)]
     pub phase_b_dirty: bool,
+    /// References the live overlay resolved mid-edit (`ref_resolution_state`
+    /// state='resolved'). With `phase_b_dirty` set, a non-zero count is positive
+    /// evidence the editor/lexical lane recovered the edited region, so the
+    /// semantic surface is not degraded despite the reindex. Old daemons omit the
+    /// field (serde default 0).
+    #[serde(default)]
+    pub live_refs_resolved: u64,
+    /// References the live overlay recorded as still unresolved
+    /// (`ref_resolution_state` state='pending'): the honest count of edges that
+    /// are unknown until the next commit. Zero (with `live_refs_resolved` > 0)
+    /// means the live lane settled everything it detected. Old daemons omit the
+    /// field (serde default 0).
+    #[serde(default)]
+    pub live_refs_pending: u64,
     /// WS-2: comma-separated Dart package directories that were indexed without
     /// resolved dependencies (no `.dart_tool/package_config.json`), so their
     /// cross-package references are incomplete. Empty = resolved or no Dart.
     /// Old daemons omit the field (serde default None).
     #[serde(default)]
     pub dart_deps_unresolved: Option<String>,
+    /// #825: the actual SCIP definitions behind the `scip_unification_misses`
+    /// warning, one per line (`lang\tkind\tsymbol\tpath:line`), capped. Lets
+    /// `travsr status` name the unreconciled symbols instead of only counting
+    /// them. Empty/None = no misses. Old daemons omit it (serde default None).
+    #[serde(default)]
+    pub scip_unification_miss_list: Option<String>,
+    /// #809: watch events the daemon shed because the bounded indexer queue was
+    /// full, cumulative since the daemon started. Deliberately lossy: a shed
+    /// event is a real edit that reaches the graph later via the head reconcile
+    /// or next post-commit hook, so the symptom is "stale minutes later", not an
+    /// error at the time. Non-zero distinguishes "fell behind a flood" from "the
+    /// graph is stale for some other reason" without log-diving. Only the warm
+    /// daemon knows the count; the cold CLI path and old daemons report 0 (serde
+    /// default).
+    #[serde(default)]
+    pub watch_shed: u64,
 }
 
 // ── status ────────────────────────────────────────────────────────────────────
+
+/// The semantic state when a mid-edit reindex set `phase_b_dirty` while HEAD
+/// did not move, from the live overlay's `resolved` and `pending` reference
+/// counts. One wording for `travsr status` and `travsr daemon status`.
+///
+/// A mid-edit reindex dropped the changed region's committed edges. Whether
+/// that is a real degradation depends on the live overlay, in three cases:
+///   - live lane inactive (no ref_resolution rows at all: a headless daemon
+///     with no editor, or a generic-detector language with no lexical floor):
+///     nothing recovered the edit, so it is genuinely stale until a refresh.
+///   - active with references still pending: name how many are unknown until
+///     commit.
+///   - active with nothing pending: the overlay resolved every reference it
+///     detected, so "stale, re-run init" would be wrong advice.
+///
+/// The counts are repo-wide and phase_b_dirty is a single flag, so this last
+/// case cannot prove every dropped edge came back: an editor-resolved file and
+/// a headless generic-language edit (which leaves no rows at all) both feed
+/// one flag, and the resolved rows may belong only to the first. So it reports
+/// the recovery it can see without claiming a full refresh, which the
+/// commit-gated path is what actually delivers.
+/// Unresolved references per file, only in files that differ from HEAD and
+/// only while an edit awaits (`phase_b_dirty`). A pending row in an untouched
+/// file is a call no commit resolves (`Vec::new`, `join`), not an edit waiting
+/// to be traced, so counting it would say "changed since the last commit" of a
+/// file nobody changed.
+pub fn pending_refs_in_edited_files(store: &SqliteStore) -> Vec<(String, u64)> {
+    let dirty = store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1");
+    let Some(root) = store.resolve_repo_root().filter(|_| dirty) else {
+        return Vec::new();
+    };
+    let git_paths = |args: &[&str]| -> Vec<String> {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let edited: HashSet<String> = git_paths(&["diff", "--name-only", "HEAD"])
+        .into_iter()
+        .chain(git_paths(&["ls-files", "--others", "--exclude-standard"]))
+        .collect();
+    store
+        .pending_ref_counts_by_file(usize::MAX)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(path, _)| edited.contains(path))
+        .collect()
+}
+
+pub fn dirty_semantic_state(resolved: u64, pending: u64) -> String {
+    if resolved == 0 && pending == 0 {
+        "stale (run travsr init to refresh)".to_string()
+    } else if pending > 0 {
+        format!("{pending} reference(s) in edits not yet committed are not traced yet")
+    } else {
+        "edits not yet committed were traced where found; commit for a full refresh".to_string()
+    }
+}
 
 pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
     let nodes = store.node_count()?;
     // L11: detect FTS/nodes skew — indicates a partial write or a bad migration.
     // fts_count is the number of rows in nodes_fts (virtual FTS table).
     let fts_count = store.fts_node_count().unwrap_or(nodes);
+    // Live-overlay tallies, so a phase_b_dirty edit the editor lane already
+    // recovered reads as live-fresh rather than a blanket "stale". A read error
+    // degrades to zero, which keeps the conservative signal.
+    let resolved_refs = store.resolved_ref_count().unwrap_or(0);
+    let pending_refs = pending_refs_in_edited_files(store)
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
     Ok(StatusPayload {
         nodes,
         fts_nodes: fts_count,
@@ -267,10 +405,17 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
         signature_format_version: store.get_signature_format_version()?,
         phase_b_commit: store.get_meta("phase_b_commit")?,
         phase_b_warnings: store.get_meta("phase_b_warnings")?,
+        phase_b_diagnostics: store.get_meta("phase_b_diagnostics")?,
         rust_lsif_degraded: store.get_meta("rust_lsif_degraded")?,
         rerank: crate::rerank::rerank_status().to_string(),
         phase_b_dirty: store.get_meta("phase_b_dirty")?.as_deref() == Some("1"),
+        live_refs_resolved: resolved_refs,
+        live_refs_pending: pending_refs,
         dart_deps_unresolved: store.get_meta("dart_deps_unresolved")?,
+        scip_unification_miss_list: store.get_meta("scip_unification_miss_list")?,
+        // Lives in the daemon process, not the store; the daemon fills it in on
+        // the status path (#809). The cold CLI path has no shed count to report.
+        watch_shed: 0,
     })
 }
 
@@ -717,17 +862,35 @@ fn is_containment_edge(kind: &travsr_core::EdgeKind) -> bool {
 /// containment edge reached in `Callers`/`Both` direction (#517 DD-1): the
 /// node is still recorded and displayed, but the traversal does not walk
 /// further from it, so a file's other definitions never enter the BFS queue.
+/// The read-side provenance of an edge that came out of a store reader, with a
+/// `tree-sitter` fallback for a constructed edge that never carried one.
+fn prov_of(e: &travsr_core::Edge) -> String {
+    e.provenance
+        .clone()
+        .unwrap_or_else(|| "tree-sitter".to_string())
+}
+
+/// One expansion step out of [`next_edges`]:
+/// `(edge_kind, next_id, expand, incoming, provenance)`. The 5th element is the
+/// edge's true `edges.provenance` (DEBT-75).
+pub type NextEdge = (travsr_core::EdgeKind, NodeId, bool, bool, String);
+
 pub fn next_edges(
     store: &SqliteStore,
     node_id: NodeId,
     direction: QueryDirection,
     edge_mode: QueryEdgeMode,
     is_seed: bool,
-) -> anyhow::Result<Vec<(travsr_core::EdgeKind, NodeId, bool, bool)>> {
+) -> anyhow::Result<Vec<NextEdge>> {
+    // DEBT-75: the 5th element is the edge's true `edges.provenance`, carried
+    // through from the store readers so callers no longer have to assume
+    // "tree-sitter". `unwrap_or` only fires on a constructed (never-read) edge,
+    // which cannot reach here.
     let mut out = Vec::new();
     if matches!(direction, QueryDirection::Deps | QueryDirection::Both) {
         for e in store.iter_edges_from(node_id)? {
-            out.push((e.kind, e.dst, true, false));
+            let prov = e.provenance.unwrap_or_else(|| "tree-sitter".to_string());
+            out.push((e.kind, e.dst, true, false, prov));
         }
     }
     if matches!(direction, QueryDirection::Callers | QueryDirection::Both) {
@@ -769,7 +932,7 @@ pub fn next_edges(
                 for e in &incoming {
                     let s = &e.kind;
                     if is_semantic_edge(s) || matches!(s, travsr_core::EdgeKind::DefinesBinding) {
-                        out.push((*s, e.src, !is_containment_edge(s), true));
+                        out.push((*s, e.src, !is_containment_edge(s), true, prov_of(e)));
                     }
                 }
             } else {
@@ -779,24 +942,24 @@ pub fn next_edges(
                 // judged from coverage in graph_query, not from this one node.
                 for e in &incoming {
                     let s = &e.kind;
-                    out.push((*s, e.src, !is_containment_edge(s), true));
+                    out.push((*s, e.src, !is_containment_edge(s), true, prov_of(e)));
                 }
             }
         } else {
             for e in &incoming {
                 let s = &e.kind;
-                out.push((*s, e.src, !is_containment_edge(s), true));
+                out.push((*s, e.src, !is_containment_edge(s), true, prov_of(e)));
             }
         }
     }
     // Multiple call sites (and the file-node definition splice) can yield the
     // same (kind, src, orientation) triple — collapse them for display.
     let mut seen = HashSet::new();
-    out.retain(|(kind, id, _, incoming)| seen.insert((*kind, *id, *incoming)));
+    out.retain(|(kind, id, _, incoming, _)| seen.insert((*kind, *id, *incoming)));
     // #517 DD-1: non-containment edges (the answer) precede containment edges
     // (orientation) from the same parent. Stable sort preserves DB order
     // within each group, so output stays deterministic.
-    out.sort_by_key(|(kind, _, _, _)| is_containment_edge(kind));
+    out.sort_by_key(|(kind, _, _, _, _)| is_containment_edge(kind));
     Ok(out)
 }
 
@@ -814,10 +977,16 @@ fn coverage_for(store: &SqliteStore, language: &str) -> Coverage {
 /// discovery order; `tree` holds the spanning-tree expansion steps.
 pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result<GraphPayload> {
     let mut candidates: Option<Vec<NodeEntry>> = None;
+    let mut fuzzy = false;
     let seed =
         match crate::tools::resolve_reference_targets(store, &args.query, args.path.as_deref()) {
             crate::tools::RefTarget::Unique(n) => Some(n),
-            crate::tools::RefTarget::Ambiguous(list) => {
+            // A selector family is listed like an ambiguity here rather than
+            // merged: a graph has one root, and the arities of a selector are
+            // distinct nodes with distinct neighbourhoods. Naming the full
+            // selector picks one. (`find_references` unions them instead, since
+            // a reference list has no root to conflict over.)
+            crate::tools::RefTarget::Ambiguous(list) | crate::tools::RefTarget::Family(list) => {
                 let candidates_entries: Vec<NodeEntry> =
                     list.iter().map(|n| node_entry(n, 0)).collect();
                 candidates = Some(candidates_entries);
@@ -859,6 +1028,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                     // is a precise miss, not an invitation to guess a first hit.
                     _ => {
                         if args.path.is_none() {
+                            fuzzy = !matches.is_empty();
                             matches
                                 .iter()
                                 .find(|n| n.kind == "file")
@@ -881,6 +1051,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             coverage: None,
             last_commit: store.get_meta("last_commit").ok().flatten(),
             candidates,
+            fuzzy: false,
         });
     };
 
@@ -888,13 +1059,20 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
     let mut node_index: HashSet<NodeId> = HashSet::new();
     let mut edges_raw: Vec<(NodeId, NodeId, String, String)> = Vec::new();
     let mut tree: Vec<TreeStep> = Vec::new();
-    let mut visited: HashSet<NodeId> = HashSet::new();
-    let mut queue: VecDeque<(NodeId, u8, bool)> = VecDeque::new();
+    // Keyed by node and side (`true` = reached as a caller), so a node that is
+    // both a caller and a callee of the seed, as in a call cycle, is walked on
+    // each side instead of only on the side that reached it first.
+    let mut visited: HashSet<(NodeId, bool)> = HashSet::new();
+    // Each node carries the direction it was reached in. `Both` applies to the
+    // seed only; past it a caller keeps walking up and a dependency down, so the
+    // tree never shows a callee's other callers or a caller's other callees.
+    let mut queue: VecDeque<(NodeId, u8, bool, QueryDirection)> = VecDeque::new();
 
-    visited.insert(seed.id);
-    queue.push_back((seed.id, 0, true));
+    visited.insert((seed.id, true));
+    visited.insert((seed.id, false));
+    queue.push_back((seed.id, 0, true, args.direction));
 
-    while let Some((current_id, depth, expand)) = queue.pop_front() {
+    while let Some((current_id, depth, expand, direction)) = queue.pop_front() {
         if let Some(node) = store.get_node(current_id)? {
             if node_index.insert(current_id) {
                 nodes.push(node_entry(&node, depth));
@@ -909,13 +1087,9 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             continue;
         }
 
-        for (edge_kind, next_id, child_expand, edge_incoming) in next_edges(
-            store,
-            current_id,
-            args.direction,
-            args.edge_mode,
-            depth == 0,
-        )? {
+        for (edge_kind, next_id, child_expand, edge_incoming, edge_provenance) in
+            next_edges(store, current_id, direction, args.edge_mode, depth == 0)?
+        {
             // #564: orient from the edge itself, not the direction flag — in
             // `Both` mode a single expansion mixes incoming and outgoing edges.
             let (src, dst) = if edge_incoming {
@@ -923,31 +1097,28 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             } else {
                 (current_id, next_id)
             };
-            // DEBT(travsr-75): iter_edges_from/to do not return provenance, so
-            // BFS-traversed edges always show "tree-sitter" in JSON output even
-            // when the DB row is "lsif". Only --all mode (all_edges) is correct.
-            edges_raw.push((
-                src,
-                dst,
-                edge_kind.as_str().to_string(),
-                "tree-sitter".to_string(),
-            ));
+            let heuristic = is_heuristic_edge(edge_kind.as_str(), &edge_provenance);
+            edges_raw.push((src, dst, edge_kind.as_str().to_string(), edge_provenance));
 
-            if !visited.contains(&next_id) {
+            if visited.insert((next_id, edge_incoming)) {
                 if let Some(next_node) = store.get_node(next_id)? {
                     if !args.include_noise && is_noise_node(&next_node) {
-                        visited.insert(next_id);
                         continue;
                     }
                 }
-                visited.insert(next_id);
                 tree.push(TreeStep {
                     parent: current_id.0,
                     edge_kind: edge_kind.as_str().to_string(),
                     child: next_id.0,
                     incoming: edge_incoming,
+                    heuristic,
                 });
-                queue.push_back((next_id, depth + 1, child_expand));
+                let onward = if edge_incoming {
+                    QueryDirection::Callers
+                } else {
+                    QueryDirection::Deps
+                };
+                queue.push_back((next_id, depth + 1, child_expand, onward));
             }
         }
     }
@@ -964,6 +1135,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
         coverage: Some(coverage),
         last_commit: store.get_meta("last_commit")?,
         candidates,
+        fuzzy,
     })
 }
 
@@ -995,6 +1167,7 @@ pub fn graph_all_payload(store: &SqliteStore) -> anyhow::Result<GraphPayload> {
         coverage: None,
         last_commit: store.get_meta("last_commit")?,
         candidates: None,
+        fuzzy: false,
     })
 }
 
@@ -1017,6 +1190,7 @@ fn resolve_edge_sigs(
         edges.push(EdgeEntry {
             src: src.0,
             dst: dst.0,
+            heuristic: is_heuristic_edge(&kind, &provenance),
             kind,
             provenance,
             src_sig: sig_lookup.get(&src.0).cloned().unwrap_or_default(),
@@ -1206,6 +1380,28 @@ mod tests {
         assert_eq!(payload.nodes.len(), before);
     }
 
+    /// `travsr graph run_phase_b` rooted itself on a test named
+    /// `..._does_not_run_phase_b` without saying the name did not match. The
+    /// payload flags a guess so the caller can say so.
+    #[test]
+    fn a_graph_rooted_on_a_guess_says_so() {
+        let (store, _, _, _) = seeded_store();
+        let args = |query: &str| GraphQueryArgs {
+            query: query.to_string(),
+            path: None,
+            depth: 1,
+            direction: QueryDirection::Both,
+            edge_mode: QueryEdgeMode::All,
+            include_noise: true,
+        };
+        assert!(!graph_query(&store, &args("PaymentService")).unwrap().fuzzy);
+        let guess = graph_query(&store, &args("PaymentServ")).unwrap();
+        assert!(
+            guess.seed.is_some() && guess.fuzzy,
+            "a partial name is a guess"
+        );
+    }
+
     // ── #564: every direction mode must preserve true edge orientation ───────
 
     #[test]
@@ -1275,6 +1471,99 @@ mod tests {
         assert!(
             !call_step.incoming,
             "Deps: outgoing call step wrongly tagged incoming"
+        );
+    }
+
+    /// `both` is callers upward plus deps downward from the seed. A callee's
+    /// other callers and a caller's other callees answer neither question and
+    /// turned a 10-line view into 200+ lines.
+    #[test]
+    fn both_direction_keeps_each_branch_going_one_way() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let seed = node("fn:seed", "function", "src/a.ts");
+        let caller = node("fn:caller", "function", "src/b.ts");
+        let callee = node("fn:callee", "function", "src/c.ts");
+        let callee_other_caller = node("fn:elsewhere", "function", "src/d.ts");
+        let caller_other_callee = node("fn:unrelated", "function", "src/e.ts");
+        for n in [
+            &seed,
+            &caller,
+            &callee,
+            &callee_other_caller,
+            &caller_other_callee,
+        ] {
+            store.put_node(n).unwrap();
+        }
+        for (src, dst) in [
+            (&caller, &seed),
+            (&seed, &callee),
+            (&callee_other_caller, &callee),
+            (&caller, &caller_other_callee),
+        ] {
+            store
+                .put_edge(&Edge::new(src.id, dst.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "seed".to_string(),
+                path: None,
+                depth: 3,
+                direction: QueryDirection::Both,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        let shown: HashSet<u64> = payload.nodes.iter().map(|n| n.id).collect();
+        assert!(shown.contains(&caller.id.0) && shown.contains(&callee.id.0));
+        assert!(
+            !shown.contains(&callee_other_caller.id.0),
+            "a callee's other caller was shown"
+        );
+        assert!(
+            !shown.contains(&caller_other_callee.id.0),
+            "a caller's other callee was shown"
+        );
+    }
+
+    /// A node that is both a callee and a caller of the seed (a call cycle)
+    /// still gets its callers walked, even though the callee side reaches it
+    /// first.
+    #[test]
+    fn both_direction_walks_a_cycle_node_on_the_caller_side() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let seed = node("fn:seed", "function", "src/a.ts");
+        let cycle = node("fn:cycle", "function", "src/b.ts");
+        let upstream = node("fn:upstream", "function", "src/c.ts");
+        for n in [&seed, &cycle, &upstream] {
+            store.put_node(n).unwrap();
+        }
+        for (src, dst) in [(&seed, &cycle), (&cycle, &seed), (&upstream, &cycle)] {
+            store
+                .put_edge(&Edge::new(src.id, dst.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "seed".to_string(),
+                path: None,
+                depth: 2,
+                direction: QueryDirection::Both,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            payload
+                .tree
+                .iter()
+                .any(|s| s.incoming && s.parent == cycle.id.0 && s.child == upstream.id.0),
+            "the cycle node's caller was dropped: {:?}",
+            payload.tree
         );
     }
 
@@ -1698,6 +1987,45 @@ mod tests {
             payload.total_tokens <= DEFAULT_TOKEN_BUDGET,
             "total {} exceeded budget {DEFAULT_TOKEN_BUDGET}",
             payload.total_tokens
+        );
+    }
+
+    /// #870: the two surfaces must agree on doc *presence*. `ask` returns
+    /// `docs` as its own field on every return path, so a doc entry is always
+    /// findable; `get_context` renders the same entries into its body, where
+    /// the section header is the only thing that marks them as prose. That
+    /// header used to be dropped whenever the code lane selected four nodes or
+    /// fewer (`group_output`), which is the normal shape of a result on a
+    /// sparse graph: a repo indexed without Phase B, where PPR has almost no
+    /// edges to expand along. The doc lines then reached the model as bare
+    /// lines among the code rows, and every consumer that finds the section by
+    /// its header (the docs-lane gate, the VS Code Context Explorer) read the
+    /// response as carrying no docs at all.
+    #[test]
+    fn ask_and_context_agree_on_doc_presence_when_few_nodes_are_selected() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        docs_env_on();
+        let (mut store, ..) = seeded_store();
+        with_doc_chunk(
+            &mut store,
+            "docs/adrs/ADR-001-coding-standards.md",
+            "doc:coding-standards/consequences",
+        );
+
+        let ask = ask_query(&store, "PaymentService", None).unwrap();
+        let ctx = crate::tools::get_context_raw(&store, "PaymentService", 4000, false, None);
+        docs_env_off();
+
+        assert_eq!(ask.docs.len(), 1, "docs: {:?}", ask.docs);
+        assert!(
+            ctx.contains("docs/adrs/ADR-001-coding-standards.md"),
+            "get_context must render the same doc entry: {ctx}"
+        );
+        assert!(
+            ctx.contains("## docs"),
+            "the doc entry must carry its section header on both surfaces: {ctx}"
         );
     }
 

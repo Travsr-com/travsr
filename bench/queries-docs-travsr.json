@@ -1,7 +1,11 @@
 {
   "_comment": [
-    "Doc-retrieval query set for #376, travsr repo (the gain repo: 54 decision-class files",
-    "across docs/adrs, docs/rfcs, docs/plans).",
+    "Doc-retrieval query set for #376, travsr repo (the gain repo: decision-class files",
+    "across docs/adrs and docs/rfcs).",
+    "",
+    "Every expectPath MUST resolve to a git-tracked file. docs/plans/ is gitignored, so a",
+    "gold anchor there is absent from every CI checkout and caps hit@N below the gate for",
+    "reasons that have nothing to do with retrieval quality.",
     "",
     "Unlike kubernetes, these are genuine ADR/RFC rationale questions, which is the corpus",
     "the issue actually targets. Gold anchors were taken from the real files.",
@@ -66,15 +70,9 @@
       "expectHeading": ""
     },
     {
-      "id": "T10",
-      "query": "why did the model relative semantic floors need auto calibration per model",
-      "expectPath": "model-relative-semantic-floors",
-      "expectHeading": ""
-    },
-    {
       "id": "T11",
       "query": "what were the measured root causes of conceptual retrieval failures",
-      "expectPath": "rfc-022-production-conceptual-retrieval",
+      "expectPath": "docs/rfcs/RFC-022-conceptual-retrieval-match-source-grouping",
       "expectHeading": ""
     },
     {
@@ -98,7 +96,7 @@
     {
       "id": "T15",
       "query": "why does the retrieval cascade short circuit and starve top K results",
-      "expectPath": "issue-393-rrf-fusion-cascade-redesign",
+      "expectPath": "docs/rfcs/RFC-023-lexical-retrieval-architecture",
       "expectHeading": ""
     },
     {
@@ -123,12 +121,6 @@
       "id": "T19",
       "query": "what does the fuzzy seed selection design propose",
       "expectPath": "RFC-012-fuzzy-seed-selection",
-      "expectHeading": ""
-    },
-    {
-      "id": "T20",
-      "query": "why was a per repo linear projection head for embeddings rejected",
-      "expectPath": "docs/plans",
       "expectHeading": ""
     },
     {

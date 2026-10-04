@@ -46,31 +46,31 @@ export function resolveRoot(basePath: string): string {
 /**
  * Validate raw tsconfig JSON before handing it to the TS compiler.
  *
+ * Strips:
+ *   - compilerOptions.plugins   (language-service plugins, inert for LSIF)
  * Rejects:
- *   - compilerOptions.plugins   (arbitrary npm module execution)
  *   - extends pointing outside basePath (filesystem escape)
  *   - references[].path pointing outside basePath (filesystem escape)
  *   - extends with http:// or https:// URLs
  *
- * Throws a SEC-003 error on the first violation; never returns a warning.
+ * Mutates config in place. Throws a SEC-003 error on the first escape
+ * violation; never returns a warning.
  */
 export function sanitizeTsconfig(config: unknown, basePath: string): void {
   if (typeof config !== 'object' || config === null) return;
   const cfg = config as Record<string, unknown>;
   const repoRoot = resolveRoot(basePath);
 
-  // ── 1. Reject compilerOptions.plugins ─────────────────────────────────────
-  // plugins causes the TS compiler to require() arbitrary npm packages at
-  // compile time. There is no safe subset — reject unconditionally.
+  // ── 1. Strip compilerOptions.plugins ──────────────────────────────────────
+  // plugins are tsserver language-service plugins (e.g. the Next.js plugin).
+  // ts.createProgram never loads them, so they are inert for LSIF emission.
+  // Deleting the field here, before the config reaches the compiler, means the
+  // module is never require()d regardless of what createProgram would do, and a
+  // project tsconfig that declares one (every create-next-app repo) still
+  // indexes instead of failing closed.
   const opts = cfg['compilerOptions'];
   if (typeof opts === 'object' && opts !== null) {
-    if ((opts as Record<string, unknown>)['plugins'] !== undefined) {
-      throw new Error(
-        'SEC-003: compilerOptions.plugins is not permitted. ' +
-          'Plugins execute arbitrary npm modules at TS compile time. ' +
-          'Remove compilerOptions.plugins from tsconfig.json.'
-      );
-    }
+    delete (opts as Record<string, unknown>)['plugins'];
   }
 
   // ── 2. Reject extends that escapes the repo root ───────────────────────────
@@ -134,11 +134,23 @@ export function assertFilesContained(
  * Pure in-memory containment check — no I/O, safe to call in hot filter loops.
  * Does NOT follow symlinks; use assertFilesContained for the authoritative check.
  * Used as a belt-and-suspenders filter on program.getSourceFiles().
+ *
+ * Both operands are resolved before comparing (#806). Resolving only filePath
+ * put the two sides in different namespaces on Windows, where resolve()
+ * prepends the current drive letter and normalize() does not, so a genuinely
+ * contained file compared "C:\repo\src\a.ts" against "\repo" and was dropped.
+ *
+ * pathImpl exists so the tests can pin this function's Windows and POSIX
+ * behaviour from any host; production callers never pass it.
  */
-export function isUnderRoot(filePath: string, repoRoot: string): boolean {
-  const normalized = path.normalize(path.resolve(filePath));
-  const root = path.normalize(repoRoot);
-  return normalized.startsWith(root + path.sep) || normalized === root;
+export function isUnderRoot(
+  filePath: string,
+  repoRoot: string,
+  pathImpl: typeof path = path
+): boolean {
+  const normalized = pathImpl.normalize(pathImpl.resolve(filePath));
+  const root = pathImpl.normalize(pathImpl.resolve(repoRoot));
+  return normalized.startsWith(root + pathImpl.sep) || normalized === root;
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

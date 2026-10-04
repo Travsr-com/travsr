@@ -40,6 +40,19 @@ jobs:
         with:
           node-version: 20
 
+      # The fixtures include TypeScript, whose cross-file semantic pass runs the
+      # travsr-lsif-ts emitter. A dev build at target/release/travsr finds it at
+      # packages/travsr-lsif-ts/dist/index.js, which only exists once built.
+      # Without this step the pass is skipped; since #890 (#878) that skip is
+      # reported as "semantic: partial (incomplete: typescript)" instead of
+      # passing silently, and the benchmark rightly treats it as no call edges.
+      # Same recipe as the lsif-ts job in ci.yml.
+      - name: Build TypeScript analyzer (travsr-lsif-ts)
+        working-directory: packages/travsr-lsif-ts
+        run: |
+          npm ci
+          npm run build
+
       - name: Build release binary
         run: cargo build --release -p travsr-cli
 

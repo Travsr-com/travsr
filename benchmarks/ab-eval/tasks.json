@@ -1,5 +1,5 @@
 {
-  "$comment": "A/B eval manifest (#318 O9). Tasks have three classes: 'callers' — structural graph query (travsr graph --direction callers); 'context' — full PPR+knapsack retrieval pipeline (travsr ask --format json), gated on symbol+file recall/precision and token cost; 'ask' — seed resolution quality, gated on rank-1 exact match. The GRAPH arm is held to exact correctness and must never cost more context tokens than the FILES arm. Mean token reduction is reported, not gated, because in-repo fixtures are deliberately tiny.",
+  "$comment": "A/B eval manifest (#318 O9). Tasks have three classes: 'callers' — structural graph query (travsr graph --direction callers); 'context' — full PPR+knapsack retrieval pipeline (travsr ask --format json), gated on symbol+file recall/precision and token cost; 'ask' — seed resolution quality, gated on rank-1 exact match. The GRAPH arm is held to exact correctness and must never cost more context tokens than the FILES arm. Mean token reduction is reported, not gated, because in-repo fixtures are deliberately tiny. Task fields are 'class', 'name', 'question', 'fixture', 'symbol' (callers) or 'query' (context/ask), 'self_path', 'expect_files', 'expect_symbols' (context) and 'expect_top_symbol' (ask). There is deliberately no field for the FILES arm's grep term: it is derived mechanically from 'symbol' or 'query' (the string verbatim, falling back to its unqualified tail only when that matches nothing and the string does not name a file in the corpus, so a path-shaped query is never truncated to its extension). The author still picks 'symbol'/'query', and a different pick greps differently, so this does not make the reduction untunable; what it removes is the ability to tune the FILES denominator independently of the query the GRAPH arm is scored on.",
   "iterations": 3,
   "thresholds": {
     "graph_recall": 1.0,
@@ -9,10 +9,10 @@
   "tasks": [
     {
       "class": "callers",
-      "name": "callers-of-PaymentService",
-      "question": "Which files call PaymentService?",
+      "name": "callers-of-PaymentService.charge",
+      "question": "Which files call PaymentService.charge?",
       "fixture": "fixtures/ts-callers",
-      "symbol": "PaymentService",
+      "symbol": "PaymentService.charge",
       "self_path": "service.ts",
       "expect_files": ["controller.ts"]
     },
@@ -32,7 +32,7 @@
       "query": "PaymentService",
       "fixture": "fixtures/ts-callers",
       "expect_symbols": ["PaymentService", "charge"],
-      "expect_files": ["service.ts"]
+      "expect_files": ["controller.ts", "service.ts"]
     },
     {
       "class": "context",
@@ -41,7 +41,7 @@
       "query": "Greeter",
       "fixture": "fixtures/ts-small",
       "expect_symbols": ["Greeter", "hello"],
-      "expect_files": ["a.ts"]
+      "expect_files": ["a.ts", "b.ts"]
     },
     {
       "class": "ask",

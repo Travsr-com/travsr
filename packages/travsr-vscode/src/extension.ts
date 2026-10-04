@@ -5,6 +5,7 @@
  */
 
 import * as fs from "fs";
+import * as path from "path";
 import * as cp from "child_process";
 import * as vscode from "vscode";
 import { StdioMcpClient } from "./mcp";
@@ -15,6 +16,7 @@ import {
   BLAST_RADIUS_SELECTOR,
 } from "./codelens";
 import { CallersHoverProvider, HOVER_SELECTOR } from "./hover";
+import { publishLiveResolutions } from "./liveResolution";
 import { TravsrTreeDataProvider } from "./tree";
 import { TravsrRepoFileTreeProvider } from "./repoFileTree";
 import { showWelcome, showWelcomeIfFirstRun } from "./welcome";
@@ -40,9 +42,11 @@ import {
 import {
   registerParityCommands,
   refreshOpenPanels,
-  stripEnvelope,
+  envelopeBody,
   probeLangListContract,
   contractSkewMessage,
+  shouldOfferSetup,
+  setUpRepo,
 } from "./commands";
 import { ContextExplorerPanel, getSymbolAtCursor } from "./contextExplorer";
 import { registerMcpServerCommand } from "./mcpRegister";
@@ -215,7 +219,31 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // First-run welcome page (VSCODE-204)
-  showWelcomeIfFirstRun(context);
+  showWelcomeIfFirstRun(context, workspaceRoot);
+
+  // One-command setup (plan 3.5): offer it once for a git folder with no index.
+  // The graph.db watcher above reconnects once it exists.
+  if (workspaceRoot) {
+    const OFFERED = "travsr.setupOffered";
+    const offer = shouldOfferSetup(
+      fs.existsSync(path.join(workspaceRoot, ".git")),
+      fs.existsSync(path.join(workspaceRoot, ".travsr", "graph.db")),
+      context.workspaceState.get<boolean>(OFFERED, false)
+    );
+    if (offer) {
+      void context.workspaceState.update(OFFERED, true);
+      void vscode.window
+        .showInformationMessage("Set up Travsr for this folder?", "Set up")
+        .then(async (pick) => {
+          if (pick !== "Set up") return;
+          const { out, cancelled, code } = await setUpRepo(workspaceRoot);
+          if (!cancelled && code === 0) {
+            const ready = out.split("\n").find((l) => l.startsWith("Ready."));
+            void vscode.window.showInformationMessage(`Travsr: ${ready ?? "set up."}`);
+          }
+        });
+    }
+  }
 
   // ── Commands ─────────────────────────────────────────────────────────────
 
@@ -225,7 +253,6 @@ export function activate(context: vscode.ExtensionContext): void {
       type ItemId =
         | "graphStats"
         | "repos"
-        | "languages"
         | "reindex"
         | "restart"
         | "settings"
@@ -234,9 +261,8 @@ export function activate(context: vscode.ExtensionContext): void {
         | "close";
       type ActionItem = vscode.QuickPickItem & { id: ItemId };
       const items: vscode.QuickPickItem[] = [
-        { label: "$(graph) Graph stats",              id: "graphStats" } as ActionItem,
+        { label: "$(pulse) Health",                    id: "graphStats" } as ActionItem,
         { label: "$(repo) Registered repos",          id: "repos"      } as ActionItem,
-        { label: "$(extensions) Languages",           id: "languages"  } as ActionItem,
         { label: "$(sync) Re-index now",              id: "reindex"    } as ActionItem,
         { label: "", kind: vscode.QuickPickItemKind.Separator },
         { label: "$(refresh) Restart daemon",         id: "restart"  } as ActionItem,
@@ -257,9 +283,6 @@ export function activate(context: vscode.ExtensionContext): void {
           break;
         case "repos":
           await vscode.commands.executeCommand("travsr.showRepos");
-          break;
-        case "languages":
-          await vscode.commands.executeCommand("travsr.showLanguages");
           break;
         case "reindex":
           await vscode.commands.executeCommand("travsr.reindexNow");
@@ -303,10 +326,18 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "travsr.showBlastRadius",
-      async (file: string, files?: string[]) => {
+      async (fileArg?: string, files?: string[]) => {
         // files is pre-fetched when called from the code lens (arguments: [file, files]).
         // When called from the hover card markdown link only [file] is encoded in the URI,
         // so re-fetch here to avoid passing undefined to buildFileListHtml.
+        // From the command palette there is no argument: use the active file.
+        const editor = vscode.window.activeTextEditor;
+        const file =
+          fileArg ?? (editor ? vscode.workspace.asRelativePath(editor.document.uri, false) : "");
+        if (!file) {
+          void vscode.window.showInformationMessage("Open a file to check blast radius.");
+          return;
+        }
         const panel = vscode.window.createWebviewPanel(
           "travsrBlastRadius",
           `Blast radius, ${file}`,
@@ -416,7 +447,21 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "travsr.showCallers",
-      async (symbol: string) => {
+      async (symbolArg?: string) => {
+        // From the command palette there is no argument: ask, seeded from the
+        // word under the cursor (the same prompt Show Execution Path uses).
+        let symbol = symbolArg;
+        if (!symbol) {
+          const editor = vscode.window.activeTextEditor;
+          const range = editor?.document.getWordRangeAtPosition(editor.selection.active);
+          symbol = await vscode.window.showInputBox({
+            prompt: "Symbol",
+            value: editor && range
+              ? editor.document.getText(range)
+              : "",
+          });
+          if (!symbol) return;
+        }
         const raw = await proxy.callTool("get_callers", { symbol });
         const lines = parseEnvelope(raw);
         const panel = vscode.window.createWebviewPanel(
@@ -434,7 +479,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("travsr.showWelcome", () => showWelcome())
+    vscode.commands.registerCommand("travsr.showWelcome", () => showWelcome(workspaceRoot))
   );
 
   // Graph panel (VSCODE-245)
@@ -458,7 +503,8 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // CLI↔UI parity commands (VSCODE-247): askSymbol, manageSynonyms,
-  // showDependencies, showExecutionPath, showRepos, showGraphStats, showLanguages.
+  // showDependencies, showExecutionPath, showRepos, showGraphStats (Health,
+  // which also carries the languages table).
   registerParityCommands(proxy, context, binary, () => {
     codeLensProvider.clearCache();
     hoverProvider.clearCache();
@@ -534,6 +580,25 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
+  // RFC-027: live semantic resolution. On save, ask the language provider the
+  // developer is already running where this file's call sites resolve, and
+  // report the positions to the daemon so it can close the between-commits
+  // semantic gap. No server is spawned (section 7.6).
+  //
+  // Fire-and-forget and fully optional: the daemon resolves unambiguous callees
+  // on its own without any of this, and abstains rather than guessing on
+  // anything it cannot map. Losing these reports costs freshness, never truth,
+  // so nothing here is awaited or surfaced.
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      // No folder open means no repo to attribute the file to.
+      if (!workspaceRoot) return;
+      void publishLiveResolutions(workspaceRoot, doc).catch(() => {
+        // Never surfaced: see the note above.
+      });
+    })
+  );
+
   // Re-index command — also reachable from the status Quick Pick. Lives here
   // (not commands.ts) because it needs the output channel + workspace root.
   context.subscriptions.push(
@@ -586,7 +651,7 @@ async function checkBinaryAndPrompt(
       // re-learn a fact about a binary the user chose themselves, is the wrong
       // trade. The steps below probe because each of them runs at most once (they
       // persist the path they picked, so the next activation lands here), and the
-      // Languages panel re-checks the shape from the payload it already fetches,
+      // Health page re-checks the shape from the payload it already fetches,
       // which covers this branch at no extra cost.
       return; // valid, nothing to do
     } catch (e) {
@@ -760,8 +825,25 @@ async function runDownloadFlow(
   channel: vscode.OutputChannel,
   onDaemonFailed?: () => void
 ): Promise<void> {
+  // #882: the download and the handshake are reported separately. They used to
+  // share one `try`, and `adoptBinary` calls `connect()`, so a download that
+  // resolved, checksum-verified, extracted and installed correctly still
+  // reported "Travsr download failed" when the MCP handshake did not come up.
+  // That names the wrong stage, and the wrong stage is the one the user then
+  // tries to fix.
+  const report = (stage: string, e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    channel.appendLine(`[ERROR] ${stage}: ${msg}`);
+    void vscode.window
+      .showErrorMessage(`${stage}: ${msg}`, "Show logs")
+      .then((action) => {
+        if (action === "Show logs") channel.show();
+      });
+  };
+
+  let binPath: string;
   try {
-    const binPath = await vscode.window.withProgress(
+    binPath = await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
         title: `Installing Travsr v${DOWNLOAD_VERSION}…`,
@@ -773,25 +855,24 @@ async function runDownloadFlow(
           progress.report({ message: msg });
         })
     );
+  } catch (e) {
+    report("Travsr download failed", e);
+    return;
+  }
 
+  try {
     // Persist + auto-reconnect — fires onReconnect → status bar re-polls.
     await adoptBinary(binPath, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
-
-    void vscode.window.showInformationMessage(
-      `Travsr v${DOWNLOAD_VERSION} installed successfully.`
-    );
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    channel.appendLine(`[ERROR] Install failed: ${msg}`);
-    void vscode.window
-      .showErrorMessage(
-        `Travsr download failed: ${msg}`,
-        "Show logs"
-      )
-      .then((action) => {
-        if (action === "Show logs") channel.show();
-      });
+    // The binary is on disk and usable; only the connection failed. Say so, and
+    // say where it landed, so the user is not sent back to re-download it.
+    report(`Travsr v${DOWNLOAD_VERSION} installed to ${binPath}, but connecting to it failed`, e);
+    return;
   }
+
+  void vscode.window.showInformationMessage(
+    `Travsr v${DOWNLOAD_VERSION} installed successfully.`
+  );
 }
 
 async function doRestart(
@@ -880,13 +961,30 @@ async function reindexNow(
     {
       location: vscode.ProgressLocation.Notification,
       title: "Travsr: re-indexing…",
-      cancellable: false,
+      // Cancellable, matching the `init` the Health panel runs for a repository
+      // with no graph. Indexing a large repository takes minutes, and the two
+      // paths running the same command with different escape hatches was an
+      // inconsistency the user pays for exactly when it is slow.
+      cancellable: true,
     },
-    () =>
+    (_progress, token) =>
       new Promise<void>((resolve) => {
         const proc = cp.spawn(binary, ["init"], {
           cwd: workspaceRoot,
           env: { ...process.env, TERM: "dumb", NO_COLOR: "1" },
+        });
+        let cancelled = false;
+        let settled = false;
+        const finish = (): void => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        const sub = token.onCancellationRequested(() => {
+          cancelled = true;
+          channel.appendLine("Re-index cancelled by the user.");
+          proc.kill();
         });
         proc.stdout?.on("data", (d: Buffer) => channel.appendLine(d.toString().trimEnd()));
         proc.stderr?.on("data", (d: Buffer) => channel.appendLine(d.toString().trimEnd()));
@@ -896,16 +994,25 @@ async function reindexNow(
             .then((a) => {
               if (a === "Show logs") channel.show();
             });
-          resolve();
+          finish();
         };
-        proc.on("error", (e) => fail(e.message));
+        proc.on("error", (e) => {
+          sub.dispose();
+          if (cancelled) return finish();
+          fail(e.message);
+        });
         proc.on("exit", (code) => {
-          if (code === 0) {
+          sub.dispose();
+          // A killed process exits non-zero. Reporting that as a failure would
+          // be the extension calling the user's own cancellation an error.
+          if (cancelled) {
+            void vscode.window.showInformationMessage("Travsr: re-index cancelled.");
+          } else if (code === 0) {
             void vscode.window.showInformationMessage("Travsr re-index complete.");
           } else {
             fail(`exit code ${code ?? "unknown"}`);
           }
-          resolve();
+          finish();
         });
       })
   );
@@ -923,7 +1030,12 @@ interface FileListOpts {
 
 /** Strip the `<travsr-data>…</travsr-data>` MCP envelope and return trimmed non-empty lines. */
 export function parseEnvelope(raw: string): string[] {
-  return stripEnvelope(raw).split("\n").map((l) => l.trim()).filter(Boolean);
+  // Every caller counts the lines as results, so drop what is not one: a note
+  // the server appends after `</travsr-data>` or inside it, and the `~ =` legend.
+  return envelopeBody(raw)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("~ = ") && !/^\[?note:/.test(l));
 }
 
 export function buildFileListHtml(

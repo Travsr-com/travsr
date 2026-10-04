@@ -134,9 +134,27 @@ function extractObjectValues(text, absPath, objectName) {
     );
     process.exit(1);
   }
+  // Find the end by brace depth from the `const <name> = {` opener, not the
+  // first later `};`-shaped line. A plain `trim() === "};"` scan latches onto
+  // an unrelated `};` (e.g. a `new Promise(...);`'s `});`) when the literal's
+  // own closing brace is missing, silently pulling the gap into the parsed
+  // region (#690). Each line is `//`-stripped first so a commented brace does
+  // not skew the count; no brace appears inside a string literal in any of the
+  // parsed sources, the same assumption the value scan below relies on.
   let endIdx = -1;
-  for (let i = startIdx + 1; i < lines.length; i++) {
-    if (lines[i].trim() === "};") {
+  let depth = 0;
+  let opened = false;
+  for (let i = startIdx; i < lines.length; i++) {
+    const code = lines[i].replace(/\/\/.*$/, "");
+    for (const ch of code) {
+      if (ch === "{") {
+        depth++;
+        opened = true;
+      } else if (ch === "}") {
+        depth--;
+      }
+    }
+    if (opened && depth <= 0) {
       endIdx = i;
       break;
     }

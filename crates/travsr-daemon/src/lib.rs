@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod hook;
+pub mod live_resolve;
 pub mod logfile;
 mod phase_b_sched;
 mod query_cache;
@@ -20,15 +21,16 @@ use ignore::WalkBuilder;
 use travsr_analysis::skeleton::{embed_texts_for_file, EmbedRichness};
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
-    hash_file, ingest_lsif, link_imports, link_imports_go, link_imports_python_fs,
-    link_imports_rust, run_lsif_emitter, FfiMarker,
+    hash_bytes, link_imports_aliased, link_imports_go, link_imports_python_fs, link_imports_rust,
+    parse_tsconfig_path_aliases, FfiMarker,
 };
 use travsr_plugin_host::PluginIndexer;
 use travsr_retrieval::compute_kcore;
 use travsr_store::{BatchWriteCounts, FileGraph, SqliteStore, Store};
 
 pub use hook::{
-    changed_files_from_git, install_hook, tracked_files_from_git, try_dispatch_to_daemon,
+    changed_files_from_git, commit_is_ancestor_of_head, install_hook, tracked_files_from_git,
+    try_dispatch_to_daemon,
 };
 
 /// Set the process-level opt-in flag that allows `rust-analyzer` to run
@@ -43,17 +45,32 @@ pub use hook::{
 /// The **long-lived daemon** (git-hook / file-watcher incremental reindex path)
 /// is a separate process that never calls this setter, so
 /// `ALLOW_UNSANDBOXED_BY_CLI` stays `false` on every daemon-triggered reindex.
-/// This is intentional: the daemon always fails closed unless the operator sets
-/// `TRAVSR_ALLOW_UNSANDBOXED_LSIF=1` in the daemon's process environment — a
-/// deliberate, auditable, per-environment decision that cannot be silently
-/// inherited from a one-time `init` invocation.
-///
-/// If you need the daemon to run RA unconfined, set
-/// `TRAVSR_ALLOW_UNSANDBOXED_LSIF=1` in the environment where the daemon is
-/// launched (e.g. your shell profile or systemd unit file).
+/// The daemon runs RA unconfined only when `TRAVSR_ALLOW_UNSANDBOXED_LSIF=1` is
+/// in its environment, or when a `rust` entry is recorded under
+/// `unsandboxed_consent` in lang.toml, which `init --allow-unsandboxed-lsif`
+/// writes. Either way the sandbox must be unavailable first.
 pub fn set_allow_unsandboxed_lsif(val: bool) {
     travsr_indexer::sandbox::set_cli_allow_unsandboxed(val);
 }
+
+/// Tracing target for the session lifecycle events that must survive whatever
+/// filter the log is written under: `daemon.session.start` and
+/// `daemon.session.exit`.
+///
+/// A log file has to be able to say which session produced it, under what
+/// filter, and why it stopped, or a reader cannot tell an empty file from a
+/// quiet one and will happily read the previous session's line as if it
+/// described this one. The subscriber setup appends a directive admitting this
+/// target unconditionally.
+///
+/// A high severity is not a substitute for the exemption. ERROR passes any bare
+/// level, but a targeted directive with no bare level (`RUST_LOG=some_crate=debug`)
+/// leaves `EnvFilter`'s unmatched default OFF, so an ERROR on the ordinary
+/// target is dropped. The exit line learned that the hard way.
+///
+/// The extension's `shortTarget` splits on `::`, so entries still render under
+/// `daemon` rather than growing a second name in the log view.
+pub const SESSION_LOG_TARGET: &str = "travsr_daemon::session";
 
 /// The user-facing product version, set once by the `travsr` binary at startup.
 static BUILD_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -90,6 +107,12 @@ pub struct InitStats {
     pub files_skipped_ignored: u64,
     /// Whether `.travsrignore` was freshly created on this run (first `travsr init`).
     pub travsrignore_scaffolded: bool,
+    /// #893: whether a `/.travsr/` entry was appended to `.gitignore` on this run.
+    pub gitignore_scaffolded: bool,
+    /// #893: git already tracks files under `.travsr/`, so the `.gitignore`
+    /// entry is inert and the user needs `git rm -r --cached .travsr` before
+    /// `git revert`/`git merge` will run again. Surfaced, never auto-fixed.
+    pub travsr_dir_tracked: bool,
     /// Net change in node count. `i64` to allow negative values if nodes are
     /// removed in the future (e.g. delete-by-file support); currently always >= 0.
     pub nodes_written: i64,
@@ -120,6 +143,18 @@ pub struct PhaseBReport {
     pub corpus: String,
     /// Languages for which semantic analysis ran successfully.
     pub ran: Vec<String>,
+    /// Phase B write calls that returned an error this run.
+    ///
+    /// A sidecar crash is per-language and `crashed` carries it, but a write
+    /// failure is per-RUN and takes every language's results with it: the batch
+    /// writers are one transaction each, so one bad row rolls back the whole
+    /// thing. That was invisible in the outcome. `write_phase_b_results` logged
+    /// a `warn!` at the call site and returned nothing, so a run that stored
+    /// none of what it computed still reported `outcome: Success` with
+    /// `lsif_edges: 0`, and `travsr status` read "semantic: complete" over a
+    /// gutted index. Folded into the run outcome so the completion event cannot
+    /// claim a clean run it did not have.
+    pub write_failures: usize,
     /// Languages P1-gated because no source files of that type exist in the
     /// repo. Not shown to the user — irrelevant when the language is absent.
     pub skipped_not_in_repo: Vec<String>,
@@ -157,6 +192,86 @@ pub struct PhaseBReport {
     /// Shown to the user with a `travsr lang install <lang>` call-to-action.
     /// Tuple: (language, expected_version, got_version).
     pub version_mismatch: Vec<(String, u32, u32)>,
+    /// #878: the TypeScript LSIF pass was requested (a `tsconfig.json` is at the
+    /// repo root) but produced nothing, because `travsr-lsif-ts` could not be
+    /// started or failed. `typescript` still appears in `ran` (the native
+    /// tree-sitter pass did run), so without this the run read as a clean
+    /// success while the language was missing most of its `ref/call` edges.
+    /// One entry per language whose deep-analysis (LSIF) pass was due and
+    /// produced nothing. A `Vec` rather than the single TypeScript slot it
+    /// started as: rust and python reach this the same way, and a repo can be
+    /// missing more than one analyzer at once.
+    pub lsif_skipped: Vec<LsifSkip>,
+    /// #904: warnings the sidecars attached to their results, in the sidecar's
+    /// own words (a missing Android SDK, a test scope the build never
+    /// compiled). Shown in the `init` summary and persisted as
+    /// `phase_b_diagnostics` for `travsr status`, so a run that produced
+    /// nothing can say why instead of only that it did.
+    pub diagnostics: Vec<travsr_plugin_host::SidecarDiagnostic>,
+}
+
+/// #878: why the TypeScript LSIF pass produced no edges for a repo that asked
+/// for it (a `tsconfig.json` at the repo root).
+///
+/// Two classes, because they call for different fixes. `EmitterMissing` is a
+/// failure to *start* `travsr-lsif-ts` at all (discovery fell through, or an
+/// explicit `TRAVSR_LSIF_TS` names a missing file): the remedy is the install
+/// layout or the override. `EmitterFailed` is an emitter that ran and broke
+/// (non-zero exit, timeout, oversized output) or whose dump could not be
+/// ingested: the remedy is in its own stderr. Persisted to `phase_b_warnings`
+/// as `emitter_missing:typescript` / `emitter_failed:typescript` so `travsr
+/// status` and the MCP freshness notes disclose it the way a crashed sidecar
+/// is disclosed today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsifSkip {
+    /// The language whose cross-file edges are missing, as
+    /// `Language::as_str()` spells it. Carried rather than assumed, because the
+    /// same two classes now describe rust-analyzer and travsr-lsif-py as well
+    /// as travsr-lsif-ts.
+    pub language: String,
+    pub reason: LsifSkipReason,
+    /// The underlying error, for the `init` summary. Not persisted: the meta
+    /// entry carries only the class, so free text (which may contain the `,`
+    /// and `:` the warning format is split on) never reaches it.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LsifSkipReason {
+    /// `travsr-lsif-ts` could not be spawned (see `travsr_indexer::EmitterNotFound`).
+    EmitterMissing,
+    /// The emitter started but did not yield a usable dump.
+    EmitterFailed,
+}
+
+impl LsifSkip {
+    /// The `phase_b_warnings` class this skip is recorded under. Every class any
+    /// producer site writes is listed in
+    /// [`travsr_core::PHASE_B_PER_LANGUAGE_WARNING_CLASSES`], the single source
+    /// the consumers' guards derive from (#760); the two returned here are
+    /// members of it, asserted by `lsif_skip_warning_classes_are_known`.
+    pub fn warning_class(&self) -> &'static str {
+        match self.reason {
+            LsifSkipReason::EmitterMissing => "emitter_missing",
+            LsifSkipReason::EmitterFailed => "emitter_failed",
+        }
+    }
+}
+
+/// The analyzer a language's cross-file edges come from, for the disclosure
+/// messages.
+///
+/// Exists because those messages named "the TypeScript analyzer
+/// (travsr-lsif-ts)" unconditionally, so reusing the same warning classes for
+/// rust and python would tell a Rust user to reinstall a TypeScript emitter.
+/// The renderers only have the language string from the meta key, so this takes
+/// `&str` rather than hanging off [`LsifSkip`].
+pub fn lsif_analyzer_name(language: &str) -> &'static str {
+    match language {
+        "rust" => "rust-analyzer",
+        "python" => "the Python analyzer (travsr-lsif-py)",
+        _ => "the TypeScript analyzer (travsr-lsif-ts)",
+    }
 }
 
 /// Progress events emitted during [`init_repo_with_progress`] so a caller (the
@@ -179,8 +294,12 @@ pub enum InitProgress {
         total: u64,
         workers: usize,
     },
+    /// Heartbeat while what was read is saved and made searchable (the staging
+    /// flush and the search rebuild): 74 s on yugabyte-db with no other event.
+    Saving,
     /// Post-index semantic passes (LSIF + Phase B); no granular count.
-    /// Only emitted when `--semantic` is passed or there is no HEAD commit.
+    /// Emitted when Phase B runs inline: every CLI `travsr init`, or a repo
+    /// with no HEAD commit.
     Finalizing,
     /// #755 item 3: heartbeat while the Phase B fan-out blocks. Emitted every
     /// second or so with the analyzers still running and their elapsed wall
@@ -200,8 +319,8 @@ pub enum InitProgress {
         /// gate on the per-language flag before quoting it.
         budget_secs: u64,
     },
-    /// Phase B deferred to the daemon background scheduler. Emitted on the
-    /// normal (non-`--semantic`) path once Phase A completes successfully.
+    /// Phase B deferred to the daemon background scheduler. Emitted only on
+    /// the non-semantic path (the `init_repo` helper) once Phase A completes.
     PhaseBDeferred,
 }
 
@@ -286,6 +405,9 @@ fn index_paths_parallel(
 
             scope.spawn(move || {
                 let mut indexer = PluginIndexer::new(&corpus);
+                // tsconfig `paths` aliases (e.g. @/* -> src/*) for TS/JS import
+                // resolution; read once per shard, empty for repos without one.
+                let ts_aliases = parse_tsconfig_path_aliases(&repo);
                 for abs_path in shard {
                     let vname_path = abs_path
                         .strip_prefix(&repo)
@@ -293,15 +415,17 @@ fn index_paths_parallel(
                         .to_string_lossy()
                         .replace('\\', "/");
 
-                    // Hash-delta skip — same as reindex_files.
-                    let new_hash = match hash_file(abs_path) {
-                        Ok(h) => h,
+                    // Read once; the bytes feed the hash-delta skip below and, for
+                    // a changed file, the source handed to the write path so the
+                    // body hash is stamped from the same content (RFC-027 #813).
+                    let bytes = match std::fs::read(abs_path) {
+                        Ok(b) => b,
                         Err(e) => {
-                            tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %e, "hash failed, skipping");
+                            tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %e, "read failed, skipping");
                             continue;
                         }
                     };
-                    let new_hex = hex_encode(&new_hash);
+                    let new_hex = hex_encode(&hash_bytes(&bytes));
                     if stored.get(&vname_path).map(String::as_str) == Some(&new_hex) {
                         let _ = tx.send(Ok(ParseResult {
                             file_graph: FileGraph {
@@ -309,6 +433,8 @@ fn index_paths_parallel(
                                 new_hash: new_hex,
                                 nodes: vec![],
                                 edges: vec![],
+                                // Unchanged file: no nodes to stamp.
+                                source: None,
                             },
                             ffi_markers: vec![],
                             workspace_dep_markers: vec![],
@@ -340,7 +466,7 @@ fn index_paths_parallel(
                     // Import resolution (read-only FS, no store access).
                     let import_edges = match Language::from_extension(ext) {
                         Some(Language::TypeScript) => {
-                            link_imports(&out.nodes, &vname_path, &corpus)
+                            link_imports_aliased(&out.nodes, &vname_path, &corpus, &ts_aliases)
                         }
                         Some(Language::Rust) => {
                             link_imports_rust(&out.nodes, &vname_path, &corpus)
@@ -357,12 +483,20 @@ fn index_paths_parallel(
                     let mut edges = out.edges;
                     edges.extend(import_edges);
 
+                    // RFC-027 #813: carry the source so the write path can stamp
+                    // each definition's body hash from the same content these
+                    // nodes were parsed from, reusing the bytes read above.
+                    // Non-UTF-8 reads as None, leaving the hashes NULL
+                    // (preservation simply forgone).
+                    let source = String::from_utf8(bytes).ok();
+
                     let _ = tx.send(Ok(ParseResult {
                         file_graph: FileGraph {
                             vname_path,
                             new_hash: new_hex,
                             nodes: out.nodes,
                             edges,
+                            source,
                         },
                         ffi_markers: out.ffi_markers,
                         workspace_dep_markers: out.workspace_dep_markers,
@@ -380,6 +514,14 @@ fn index_paths_parallel(
         let mut batch: Vec<FileGraph> = Vec::with_capacity(BATCH_SIZE);
         let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
         let mut all_ws_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker> = Vec::new();
+        let mut calls_changed = false;
+        // Re-parsing a file drops its Phase B call edges, as in `reindex_files`:
+        // record it so a semantic `init` at the same commit runs Phase B again.
+        // Only once Phase B has run: before that there were none to drop. Set
+        // before the batch that drops them, so a failed write or a kill between
+        // batches cannot leave `complete` over calls that are gone.
+        let phase_b_ran = store.get_meta("phase_b_commit").ok().flatten().is_some();
+        let mut dirty_marked = false;
 
         for (done, result) in (1_u64..).zip(rx) {
             let pr = result?;
@@ -395,11 +537,16 @@ fn index_paths_parallel(
                 continue;
             }
 
+            calls_changed |= change_can_drop_calls(&pr.file_graph.vname_path);
             all_ffi_markers.extend(pr.ffi_markers);
             all_ws_markers.extend(pr.workspace_dep_markers);
             batch.push(pr.file_graph);
 
             if batch.len() >= BATCH_SIZE {
+                if calls_changed && phase_b_ran && !dirty_marked {
+                    let _ = store.set_meta("phase_b_dirty", "1");
+                    dirty_marked = true;
+                }
                 let written = store.write_file_graphs_batch(&batch, bulk)?;
                 counts.nodes_upserted += written.nodes_upserted;
                 counts.edges_upserted += written.edges_upserted;
@@ -416,6 +563,9 @@ fn index_paths_parallel(
 
         // Flush remaining files.
         if !batch.is_empty() {
+            if calls_changed && phase_b_ran && !dirty_marked {
+                let _ = store.set_meta("phase_b_dirty", "1");
+            }
             let written = store.write_file_graphs_batch(&batch, bulk)?;
             counts.nodes_upserted += written.nodes_upserted;
             counts.edges_upserted += written.edges_upserted;
@@ -463,29 +613,44 @@ fn index_paths_parallel(
 ///
 /// Precedence: SKIP_DIRS (hard, non-overridable) < these defaults (soft, user can
 /// negate with `!pattern` in `.travsrignore`) < any additional user rules.
+///
+/// Only list a directory here if SKIP_DIRS does NOT already cover it: a name in
+/// SKIP_DIRS (`target`, `node_modules`, `dist`, `.next`, …) is dropped at every
+/// path component before `.travsrignore` is consulted, so repeating it here adds
+/// nothing and misrepresents it as negatable with `!`.
 const DEFAULT_TRAVSRIGNORE: &str = "\
 # .travsrignore: gitignore-syntax exclusions for Travsr graph indexing.
 # Patterns here are additive to .gitignore. Negate with ! to re-include.
 # Generated by `travsr init`, safe to edit.
 
-# Third-party vendored dependencies
+# Third-party vendored dependencies (Go/PHP, CocoaPods, Carthage)
 vendor/
-# Common build output directories
+Pods/
+Carthage/
+# Common build output directories (generic/Gradle, SwiftPM)
 build/
+.build/
 # Generated code
 **/generated/
 **/*.pb.go
 **/testdata/
 ";
 
-/// Number of default rules in [`DEFAULT_TRAVSRIGNORE`] (for the summary line).
-const DEFAULT_TRAVSRIGNORE_RULE_COUNT: usize = 5;
+/// Number of default rules in [`DEFAULT_TRAVSRIGNORE`].
+///
+/// Diagnostic only: the sole consumer is the `tracing::info!` that `init_repo`
+/// emits after scaffolding. The user-facing init summary deliberately prints no
+/// count (it points at the file instead), so do not read this as something a
+/// user sees.
+///
+/// Pinned to the string above by `travsrignore_scaffold_matches_its_rule_count`.
+const DEFAULT_TRAVSRIGNORE_RULE_COUNT: usize = 8;
 
 /// Write `.travsrignore` with commented defaults if it does not already exist.
 ///
 /// Idempotent: never overwrites an existing file.  Reports whether the file was
 /// freshly created so `init_repo` can mention it in the summary.
-fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
+pub fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
     let path = repo_root.join(".travsrignore");
     if path.exists() {
         return Ok(false);
@@ -495,126 +660,80 @@ fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Top-level directory names that are well-known source roots, never dep/vendor dirs.
-/// Auto-exclusion never fires for these regardless of file count.
-const KNOWN_SOURCE_DIRS: &[&str] = &[
-    "src",
-    "lib",
-    "pkg",
-    "internal",
-    "cmd",
-    "api",
-    "test",
-    "tests",
-    "app",
-    "apps",
-    "plugins",
-    "modules",
-    "services",
-    "components",
-    "core",
-    "common",
-    "shared",
-    "utils",
-    "crates",
-    "staging",
-    "hack",
-    "cluster",
-    "docs",
-    "examples",
-    "samples",
-    // Standard source root for static-site generators (Hugo, Jekyll, Gatsby,
-    // Next.js content collections) — the entire doc corpus of a docs-only
-    // repo commonly lives here. Without this, `travsr init` on such a repo
-    // auto-excludes essentially all of it as a false-positive "large dep
-    // dir", silently (non-TTY runs only log the decision via tracing::info!,
-    // never in the command's own visible output) — found indexing
-    // kubernetes/website while measuring #376 lifecycle plan L4.
-    "content",
-];
-
-/// Heuristic: a single directory holding ≥ 1 000 source-language files AND
-/// ≥ 15 % of the total discovered source files is flagged as a "large dep dir",
-/// unless the directory name is in `KNOWN_SOURCE_DIRS`.
+/// Appended to `.gitignore` by [`scaffold_gitignore`].
 ///
-/// Returns `(dir_name, file_count, total_count)` for the first such directory
-/// that is not already excluded by the walker (SKIP_DIRS or .travsrignore).
-fn detect_large_dep_dir(indexable: &[PathBuf], repo_root: &Path) -> Option<(String, u64, u64)> {
-    use std::collections::HashMap;
+/// Leading `/` anchors the rule to the repo root, the same reason `connect.rs`
+/// anchors every entry it generates: a slash-less pattern would also ignore a
+/// `.travsr` directory vendored at any depth. Trailing `/` matches the
+/// directory only.
+///
+/// The comment deliberately does not carry a `# travsr:` prefix: `connect.rs`
+/// finds its own managed block in this same file by substring-counting
+/// `# travsr:begin` / `# travsr:end`, and a sibling comment sharing that prefix
+/// is one careless edit to those markers away from being miscounted.
+const GITIGNORE_TRAVSR_ENTRY: &str =
+    "\n# travsr local code graph. Never commit it, the WAL file changes on every read.\n/.travsr/\n";
 
-    let total = indexable.len() as u64;
-    if total == 0 {
-        return None;
+/// Ensure git ignores `.travsr/`.
+///
+/// `init_repo` creates `.travsr/graph.db` plus its `-wal`/`-shm` sidecars and
+/// `init.lock` inside the repository. Untracked but un-ignored, the next
+/// `git add -A` commits them; the WAL then changes on every read, so the
+/// working tree is permanently dirty and `git revert` / `git merge` / `git
+/// rebase` refuse to run at all (#893). `travsr init` already takes
+/// responsibility for scaffolding `.travsrignore`, so the `.gitignore` entry
+/// belongs beside it rather than in a second owner.
+///
+/// Idempotency goes through `git check-ignore --no-index`, which answers "is a
+/// rule in effect" for every mechanism at once (repo `.gitignore`, nested
+/// `.gitignore`s, `.git/info/exclude`, the user's global excludes) instead of
+/// pattern-matching the file's text. `--no-index` is load-bearing: without it
+/// git reports an *already tracked* `.travsr/` as not-ignored no matter what
+/// rules exist, so every re-init on the repos this fix most needs to help would
+/// append a duplicate entry.
+///
+/// A git that cannot answer is treated as already-ignored, so init never
+/// appends blind to a user's `.gitignore`.
+///
+/// Returns whether an entry was appended.
+fn scaffold_gitignore(repo_root: &Path) -> anyhow::Result<bool> {
+    let ignored = std::process::Command::new("git")
+        .args(["check-ignore", "--no-index", "-q", ".travsr/"])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(true);
+    if ignored {
+        return Ok(false);
     }
-
-    let mut top_counts: HashMap<String, u64> = HashMap::new();
-    for p in indexable {
-        if let Some(first) = p.strip_prefix(repo_root).ok().and_then(|r| {
-            r.components()
-                .next()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        }) {
-            *top_counts.entry(first).or_insert(0) += 1;
-        }
+    let path = repo_root.join(".gitignore");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    // The entry leads with a blank line, so an existing file whose last line has
+    // no terminator would otherwise gain the comment on the end of that line.
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
     }
-
-    for (dir, count) in top_counts {
-        if KNOWN_SOURCE_DIRS.contains(&dir.as_str()) {
-            continue;
-        }
-        let pct = count * 100 / total;
-        if count >= 1_000 && pct >= 15 {
-            return Some((dir, count, total));
-        }
-    }
-    None
+    text.push_str(GITIGNORE_TRAVSR_ENTRY);
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
 }
 
-/// If stderr is a TTY, prompt the user once to exclude a detected large dep dir.
-/// If non-TTY / CI, auto-exclude and log the decision without blocking.
+/// Whether git already tracks anything under `.travsr/`.
 ///
-/// Appends the rule to `.travsrignore` if the user accepts (or in CI mode).
-/// Returns `true` if a rule was appended (caller should re-build the walker).
-fn maybe_prompt_large_dep(repo_root: &Path, dir: &str, count: u64, total: u64) -> bool {
-    use std::io::{IsTerminal, Write};
-
-    let pct = count * 100 / total;
-    let is_tty = std::io::stderr().is_terminal();
-
-    let exclude = if is_tty {
-        let mut err = std::io::stderr().lock();
-        let _ = write!(
-            err,
-            "\nDetected {dir}/ ({count} files, ~{pct}% of repo). \
-             Exclude from index? [Y/n] "
-        );
-        let _ = err.flush();
-        drop(err);
-        let mut line = String::new();
-        let _ = std::io::stdin().read_line(&mut line);
-        let answer = line.trim().to_ascii_lowercase();
-        answer.is_empty() || answer == "y" || answer == "yes"
-    } else {
-        tracing::info!(
-            dir = %dir,
-            count,
-            pct,
-            "non-TTY: auto-excluding large dep dir from index (add !{dir}/ to .travsrignore to override)"
-        );
-        true
-    };
-
-    if exclude {
-        let path = repo_root.join(".travsrignore");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&path)
-        {
-            let _ = writeln!(f, "{dir}/");
-        }
-    }
-    exclude
+/// A `.gitignore` entry has no effect on a path that is already in the index,
+/// so for a repo that committed `.travsr/` before this scaffold existed the
+/// entry alone changes nothing and the revert/merge deadlock survives. The
+/// caller reports that instead of claiming the problem is solved; untracking is
+/// left to the user because it rewrites their index, which `travsr init` has no
+/// mandate to do. Same call the `connect.rs` generated-file path makes for the
+/// same reason.
+fn travsr_dir_tracked(repo_root: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["ls-files", "--", ".travsr"])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// File count above which an embed pass announces itself before starting.
@@ -1062,6 +1181,156 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     init_repo_with_progress(repo_root, None, false, false, &mut |_| {})
 }
 
+/// Whether a semantic `init` must run Phase B at a commit it already covered.
+/// `now_ready` is asked only about languages the last run skipped at a gate or
+/// could not find a bundled tracer for, so "install X (or reinstall travsr),
+/// then run `travsr init`" works without a new commit. Languages that ran and
+/// found nothing are not re-run: that repeats the same result.
+fn phase_b_inline_needed(
+    already_done: bool,
+    dirty: bool,
+    warnings: &str,
+    now_ready: impl Fn(&str) -> bool,
+) -> bool {
+    const GATE_SKIPS: &[&str] = &[
+        "skipped_unregistered",
+        "untrusted_corpus",
+        "skipped_no_analyzer",
+        "needs_consent",
+        "skipped_no_compdb",
+        "skipped_no_build_file",
+        "emitter_missing",
+    ];
+    !already_done
+        || dirty
+        || warnings
+            .split(',')
+            .filter_map(|w| w.trim().split_once(':'))
+            .any(|(class, lang)| GATE_SKIPS.contains(&class) && now_ready(lang))
+}
+
+/// Counter incremented every time a reindex marks Phase B dirty.
+///
+/// Paired with `phase_b_dirty`, which says *whether* the graph is degraded.
+/// This says *when*, well enough for `init` to distinguish a flag that predates
+/// its run from one that arrived while it was working: the first is stale and
+/// safe to clear, the second describes a real degradation this Phase B did not
+/// cover.
+const PHASE_B_DIRTY_SEQ: &str = "phase_b_dirty_seq";
+
+/// Whether git is in the middle of a rebase: its state directory exists.
+fn rebase_in_progress(git_dir: &Path) -> bool {
+    git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir()
+}
+
+/// Whether reindexing `path` can drop committed call edges: only a file in a
+/// language whose calls are traced.
+fn change_can_drop_calls(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    // A Gradle build script is Kotlin by extension, but Kotlin traces `.kt`
+    // only, so editing one cannot drop a call.
+    ext != "kts"
+        && Language::from_extension(ext)
+            .is_some_and(|l| travsr_plugin_host::phase_b::lookup(l.as_str()).is_some())
+}
+
+#[cfg(test)]
+mod traced_change_tests {
+    /// Reindexing a file whose language has no traced calls cannot drop a
+    /// call edge, so it must not mark the index stale: `init`'s own
+    /// `.cursor/mcp.json` write did, right after a complete run.
+    #[test]
+    fn only_a_file_with_traced_calls_can_leave_calls_stale() {
+        for path in ["main.go", "src/a.ts", "pkg/b.py"] {
+            assert!(super::change_can_drop_calls(path), "{path}");
+        }
+        for path in [
+            ".cursor/mcp.json",
+            "README.md",
+            ".gitignore",
+            "go.mod",
+            "build.gradle.kts",
+        ] {
+            assert!(!super::change_can_drop_calls(path), "{path}");
+        }
+    }
+}
+
+/// `daemon status`'s `semantic:` value. An edit reindexed at an unchanged
+/// HEAD reads exactly as `travsr status` says it.
+fn semantic_line(
+    running: bool,
+    debouncing: bool,
+    last_commit: &str,
+    phase_b_commit: &str,
+    dirty: bool,
+    live_resolved: u64,
+    live_pending: u64,
+) -> String {
+    if running {
+        "running".to_string()
+    } else if debouncing {
+        "pending (debounce)".to_string()
+    } else if last_commit.is_empty() {
+        "not run (no commits yet)".to_string()
+    } else if phase_b_commit.is_empty() {
+        "pending".to_string()
+    } else if phase_b_commit == last_commit && dirty {
+        travsr_mcp::query::dirty_semantic_state(live_resolved, live_pending)
+    } else if phase_b_commit == last_commit {
+        "complete".to_string()
+    } else {
+        "stale (new commits since last run)".to_string()
+    }
+}
+
+#[cfg(test)]
+mod daemon_semantic_line_tests {
+    use super::semantic_line;
+
+    /// `daemon status` said "complete" while `travsr status` said "stale" for
+    /// the same index: it ignored the flag a mid-edit reindex sets.
+    #[test]
+    fn daemon_status_reads_the_edit_flag_like_travsr_status() {
+        assert_eq!(
+            semantic_line(false, false, "0b0492a", "0b0492a", false, 0, 0),
+            "complete"
+        );
+        assert_eq!(
+            semantic_line(false, false, "0b0492a", "0b0492a", true, 0, 0),
+            travsr_mcp::query::dirty_semantic_state(0, 0)
+        );
+        assert_eq!(
+            semantic_line(false, false, "0b0492a", "0b0492a", true, 0, 3),
+            travsr_mcp::query::dirty_semantic_state(0, 3)
+        );
+        assert_eq!(semantic_line(true, false, "a", "a", true, 0, 0), "running");
+    }
+}
+
+#[cfg(test)]
+mod rebase_tests {
+    /// Git leaves `REBASE_HEAD` behind after a rebase finishes, so it is not
+    /// evidence of one in progress; the state directories are (#L13).
+    #[test]
+    fn only_a_rebase_state_directory_means_a_rebase_is_in_progress() {
+        let git = tempfile::tempdir().unwrap();
+        std::fs::write(git.path().join("REBASE_HEAD"), "0b0492a\n").unwrap();
+        assert!(
+            !super::rebase_in_progress(git.path()),
+            "leftover REBASE_HEAD"
+        );
+        for dir in ["rebase-merge", "rebase-apply"] {
+            let g = tempfile::tempdir().unwrap();
+            std::fs::create_dir(g.path().join(dir)).unwrap();
+            assert!(super::rebase_in_progress(g.path()), "{dir}");
+        }
+    }
+}
+
 /// Like [`init_repo`], but reports progress via `on_progress` so the CLI can
 /// show that a long indexing run is alive (issue #293). The callback is invoked
 /// on the indexing thread; keep it cheap.
@@ -1077,15 +1346,6 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
 /// the existing graph so every file is re-parsed from scratch, even when no file
 /// content changed. Needed because config that affects *semantic* output (e.g.
 /// `--allow-unsandboxed-lsif` toggling whether Rust LSIF edges are built) is not
-/// Counter incremented every time a reindex marks Phase B dirty.
-///
-/// Paired with `phase_b_dirty`, which says *whether* the graph is degraded.
-/// This says *when*, well enough for `init` to distinguish a flag that predates
-/// its run from one that arrived while it was working: the first is stale and
-/// safe to clear, the second describes a real degradation this Phase B did not
-/// cover.
-const PHASE_B_DIRTY_SEQ: &str = "phase_b_dirty_seq";
-
 /// part of the per-file hash delta, so a plain re-init would report "up to date"
 /// without actually rebuilding those edges.
 pub fn init_repo_with_progress(
@@ -1252,11 +1512,36 @@ pub fn init_repo_with_progress(
 
     let nodes_before = store.node_count().context("counting nodes before init")? as i64;
 
-    // Stamp the format version BEFORE indexing so that the reindex_files calls
-    // below see version == SIGNATURE_FORMAT_VERSION and don't skip files.
-    store
-        .set_signature_format_version(SIGNATURE_FORMAT_VERSION)
-        .context("writing signature_format_version")?;
+    // RFC-002: an index stamped with an older signature format cannot be
+    // repaired incrementally. The hash delta below only re-parses files whose
+    // bytes changed, so untouched files would keep their old-format signatures
+    // inside a database the stamp now calls current, and nothing downstream
+    // could tell the two halves apart. Read the stored version BEFORE the stamp
+    // overwrites it and drive the same full-rebuild path `--force` uses.
+    // A read failure counts as skew: rebuilding is the recoverable direction.
+    //
+    // `nodes_before > 0` is not the right test for "there is an index here".
+    // A rebuild that purged and then failed leaves zero nodes with the old stamp
+    // intact, which is precisely the state the stamp was kept old to catch; read
+    // that way it looked like a brand-new database and the skew went unanswered
+    // forever. The `files` table is what separates the two: a database nobody has
+    // indexed has no hashes either, while the emptied one still has all of them.
+    //
+    // The stamp alone is not trusted either (#918). A 1.1.0 binary stamped the
+    // new format before its rebuild failed, leaving a current stamp over
+    // old-format ids that no plain `init` could get past. Re-deriving one
+    // stored node's id checks the claim against the evidence.
+    let stored_sig_version = store.get_signature_format_version().unwrap_or(0);
+    let indexed_before = nodes_before > 0 || store.file_hash_count().unwrap_or(0) > 0;
+    let ids_current = store.node_ids_match_current_format().unwrap_or(false);
+    let format_skew =
+        indexed_before && (stored_sig_version != SIGNATURE_FORMAT_VERSION || !ids_current);
+    if format_skew {
+        eprintln!(
+            "index format changed (v{stored_sig_version} -> v{SIGNATURE_FORMAT_VERSION}), \
+             rebuilding from scratch"
+        );
+    }
 
     // ARCH-102: detect canonical corpus from the git remote and persist it so
     // every VName in this graph uses the same corpus identifier.
@@ -1276,12 +1561,25 @@ pub fn init_repo_with_progress(
         let empty_walked = std::collections::HashSet::<String>::new();
         let purge_policy = travsr_core::SafetyPolicy {
             mass_delete_ceiling_pct: 1.0,
+            // The TOCTOU re-check (§6.5 S3) exists for the ghost sweep, where a
+            // file reappearing on disk means it is not a ghost after all. Here
+            // the delete criterion is not absence but identity: the files still
+            // on disk are exactly the ones whose old-corpus nodes must go. Left
+            // on, the purge skipped every present file and deleted nothing, so
+            // the old node set survived a corpus change and the next re-parse
+            // added a second set under the new corpus for the same path (the
+            // per-path delete in `write_file_graphs_batch` is corpus-scoped).
+            toctou_recheck: false,
             ..Default::default()
         };
         store
             .reconcile(&empty_walked, &purge_policy, repo_root, &stored_corpus)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("corpus-change global-invalidation purge")?;
+        // Same as the `--force` purge below: no Phase B edge survived it.
+        store
+            .delete_meta("phase_b_commit")
+            .context("clearing the Phase B marker after the identity change")?;
         tracing::info!("identity-change purge complete, rebuilding from scratch");
     }
 
@@ -1291,38 +1589,53 @@ pub fn init_repo_with_progress(
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
     // UX-004: `--force` bypasses the incremental up-to-date short-circuit by
-    // purging the existing graph so every file is re-parsed below (node_count then
-    // reads 0, which also re-activates the fast staging path). Config that changes
+    // purging the existing graph so every file is re-parsed below. Config that changes
     // *semantic* output but not file content — e.g. `--allow-unsandboxed-lsif` —
     // is not part of the per-file hash delta, so without this a re-run would say
-    // "up to date" while never rebuilding those edges. Uses a 100%-ceiling policy
-    // because wiping the whole graph is the explicit, user-requested intent here.
-    if force && store.node_count().unwrap_or(0) > 0 {
-        tracing::info!("--force: purging graph for a full rebuild");
-        let empty_walked = std::collections::HashSet::<String>::new();
-        let purge_policy = travsr_core::SafetyPolicy {
-            mass_delete_ceiling_pct: 1.0,
-            ..Default::default()
-        };
-        store
-            .reconcile(&empty_walked, &purge_policy, repo_root, &corpus)
+    // "up to date" while never rebuilding those edges.
+    //
+    // `format_skew` takes the same path for the same reason: every NodeId in the
+    // stored graph was hashed under a different signature format, so re-parsing
+    // only the changed files would leave the two formats mixed.
+    //
+    // This used to run through `reconcile` with an empty walk set, which is the
+    // wrong tool: `reconcile` derives its delete set from the `files` table, so
+    // it cannot touch a node whose path `files` does not track — a vendored tree
+    // an older binary indexed, or an external package node, whose VName path is
+    // `""` and so is never any file. Those survivors then collided with their
+    // own re-parse on `idx_nodes_vname` and failed the whole init. `purge_graph`
+    // deletes the graph outright, which is what "rebuild from scratch" means.
+    //
+    // Deliberately NOT gated on `node_count() > 0`. An empty graph is exactly the
+    // state a rebuild that purged and then failed leaves behind, and skipping the
+    // block there skips `clear_file_hashes` with it: the hash delta then finds
+    // every file unchanged, indexes nothing, reports "up to date - 0 nodes", and
+    // the stamp below records the current format over an empty graph. The skew is
+    // gone, so no later run rebuilds either. Running the block on an empty graph
+    // costs one no-op transaction and is what lets the repository heal itself.
+    if force || format_skew {
+        tracing::info!(force, format_skew, "purging graph for a full rebuild");
+        let purged = store
+            .purge_graph()
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("--force full-graph purge")?;
-        // #757 audit: `reconcile` only prunes nodes for files absent from disk,
-        // so on-disk files keep their nodes AND their `files` content-hash rows.
-        // The hash-delta below would then skip every unchanged file, leaving the
-        // whole point of `--force` (re-parse with the current analyzer, even
+            .context("full-graph purge before rebuild")?;
+        // #757 audit: the purge does not touch the `files` content-hash rows, so
+        // the hash-delta below would skip every unchanged file and leave the
+        // whole point of the rebuild (re-parse with the current analyzer, even
         // when file bytes are unchanged) unmet — it reported "up to date" over an
         // index an older binary built. Clearing the hash cache makes every file
-        // look new, so `--force` genuinely re-parses the repo.
+        // look new, so the rebuild genuinely re-parses the repo.
         let cleared = store
             .clear_file_hashes()
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("--force clearing file hash cache")?;
-        tracing::info!(
-            cleared,
-            "--force: cleared file hash cache for full re-parse"
-        );
+            .context("clearing file hash cache before rebuild")?;
+        // The purge removed every Phase B edge, so a `phase_b_commit` still at
+        // HEAD would tell the already-done gate and `arm_phase_b_if_pending`
+        // that Phase B is current over a graph that has none of it.
+        store
+            .delete_meta("phase_b_commit")
+            .context("clearing the Phase B marker before rebuild")?;
+        tracing::info!(purged, cleared, "purged graph for full re-parse");
     }
 
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
@@ -1359,6 +1672,15 @@ pub fn init_repo_with_progress(
     if scaffolded {
         tracing::info!("wrote .travsrignore ({DEFAULT_TRAVSRIGNORE_RULE_COUNT} default rules)");
     }
+
+    // #893: and ensure git ignores the graph itself, for the same reason the
+    // walker reads `.travsrignore` before it starts — this is the run that
+    // created the files in question, so it is the run that must fence them off.
+    let gitignore_scaffolded = scaffold_gitignore(repo_root).unwrap_or(false);
+    if gitignore_scaffolded {
+        tracing::info!("added /.travsr/ to .gitignore");
+    }
+    let travsr_dir_tracked = travsr_dir_tracked(repo_root);
 
     let walker = WalkBuilder::new(repo_root)
         .hidden(false)
@@ -1420,56 +1742,15 @@ pub fn init_repo_with_progress(
         }
     }
     reclassify_objc_headers(&mut present_languages, &indexable_paths);
+    drop_build_script_only_kotlin(&mut present_languages, &indexable_paths);
 
     // L13: warn if a rebase is in progress — init during rebase risks indexing
     // conflict-marker noise into graph.db; the user should finish rebasing first.
-    if repo_root.join(".git").join("REBASE_HEAD").exists() {
+    if rebase_in_progress(&repo_root.join(".git")) {
         eprintln!(
             "warning: a git rebase is in progress, consider finishing or aborting it \
              before running `travsr init` to avoid indexing conflict markers"
         );
-    }
-
-    // T4 (1c): detect a large un-excluded dep dir and prompt/auto-exclude it.
-    // If the user accepts, re-discover so the excluded files are dropped.
-    if let Some((dir, count, total)) = detect_large_dep_dir(&indexable_paths, repo_root) {
-        let appended = maybe_prompt_large_dep(repo_root, &dir, count, total);
-        if appended {
-            // Re-build the walker and re-discover now that .travsrignore is updated.
-            let walker2 = WalkBuilder::new(repo_root)
-                .hidden(false)
-                .git_ignore(true)
-                .follow_links(false)
-                .add_custom_ignore_filename(".travsrignore")
-                .build();
-            indexable_paths.clear();
-            present_languages.clear();
-            for entry in walker2.flatten() {
-                if !entry.file_type().is_some_and(|t| t.is_file()) {
-                    continue;
-                }
-                let p = entry.into_path();
-                let rel = p.strip_prefix(repo_root).unwrap_or(&p);
-                if rel.components().any(|c| {
-                    crate::watcher::SKIP_DIRS
-                        .iter()
-                        .any(|skip| c.as_os_str() == *skip)
-                }) {
-                    continue;
-                }
-                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if let Some(lang) = Language::from_extension(ext) {
-                    present_languages.insert(lang.as_str().to_string());
-                    indexable_paths.push(p);
-                } else if travsr_core::is_manifest_file(
-                    p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
-                ) {
-                    // Name-recognized manifest (go.mod, *.csproj): unmapped ext.
-                    indexable_paths.push(p);
-                }
-            }
-            reclassify_objc_headers(&mut present_languages, &indexable_paths);
-        }
     }
 
     // M10: warn before spending minutes indexing when the file count is unusually
@@ -1548,35 +1829,55 @@ pub fn init_repo_with_progress(
         "TIMING: index_paths_parallel done"
     );
 
-    // Flush staging tables → production in one deduplicating GROUP BY pass.
-    // Must happen before rebuild_fts_from_map, which reads nodes_fts_map rows
-    // written during the staging phase and joins them against production nodes.
-    let t_flush = std::time::Instant::now();
-    if index_result.is_ok() {
-        let (nodes_written, edges_written) = store
-            .flush_staging_to_production()
-            .context("flushing staging tables to production")?;
-        tracing::info!(
-            elapsed_ms = t_flush.elapsed().as_millis(),
-            nodes = nodes_written,
-            edges = edges_written,
-            "TIMING: flush_staging_to_production done"
-        );
-    }
+    // Both steps below block this thread for over a minute on a large repo,
+    // with no event of their own: a heartbeat keeps the progress line alive,
+    // as the Phase B fan-out does.
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let hb_progress: &mut (dyn FnMut(InitProgress) + Send) = &mut *on_progress;
+    std::thread::scope(|s| -> anyhow::Result<()> {
+        let hb_done = &done;
+        let hb = s.spawn(move || {
+            while !hb_done.load(std::sync::atomic::Ordering::Relaxed) {
+                hb_progress(InitProgress::Saving);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+        let saved = (|| -> anyhow::Result<()> {
+            // Flush staging tables → production in one deduplicating GROUP BY pass.
+            // Must happen before rebuild_fts_from_map, which reads nodes_fts_map rows
+            // written during the staging phase and joins them against production nodes.
+            let t_flush = std::time::Instant::now();
+            if index_result.is_ok() {
+                let (nodes_written, edges_written) = store
+                    .flush_staging_to_production()
+                    .context("flushing staging tables to production")?;
+                tracing::info!(
+                    elapsed_ms = t_flush.elapsed().as_millis(),
+                    nodes = nodes_written,
+                    edges = edges_written,
+                    "TIMING: flush_staging_to_production done"
+                );
+            }
 
-    // Rebuild FTS + vocab in one pass now that all nodes are written.
-    // Do this before restoring pragmas so the rebuild benefits from the
-    // expanded cache and synchronous=OFF.
-    let t_fts = std::time::Instant::now();
-    if index_result.is_ok() {
-        store
-            .rebuild_fts_from_map()
-            .context("rebuilding FTS after bulk init")?;
-    }
-    tracing::info!(
-        elapsed_ms = t_fts.elapsed().as_millis(),
-        "TIMING: rebuild_fts_from_map done"
-    );
+            // Rebuild FTS + vocab in one pass now that all nodes are written.
+            // Do this before restoring pragmas so the rebuild benefits from the
+            // expanded cache and synchronous=OFF.
+            let t_fts = std::time::Instant::now();
+            if index_result.is_ok() {
+                store
+                    .rebuild_fts_from_map()
+                    .context("rebuilding FTS after bulk init")?;
+            }
+            tracing::info!(
+                elapsed_ms = t_fts.elapsed().as_millis(),
+                "TIMING: rebuild_fts_from_map done"
+            );
+            Ok(())
+        })();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = hb.join();
+        saved
+    })?;
 
     // Always restore pragmas — even on error — so the store is left in a
     // consistent state if the caller catches the error and continues.
@@ -1605,6 +1906,26 @@ pub fn init_repo_with_progress(
             e
         }
     })?;
+
+    // RFC-002: the stamp goes here, after the rebuild it guards has actually
+    // landed — the purge ran, every file was parsed, staging was flushed and the
+    // FTS index was rebuilt, all above this point and all through a bare `?`.
+    // Written any earlier (it used to sit right after the purge) an init that
+    // failed or that the user interrupted left the current version recorded over
+    // old-format nodes: `format_skew` read false on every later run, the hash
+    // delta skipped every unchanged file and the `reindex_files` guard stopped
+    // firing, so the skew became permanently undetectable and the repo could not
+    // self-heal. The observed failure did exactly that — it aborted on a UNIQUE
+    // violation with the v3 stamp already committed, so a second `travsr init`
+    // reported a current index over a graph that was now missing most of itself.
+    //
+    // Nothing between the purge and here reads the stamp back. Init's own
+    // indexing does not route through `reindex_files` (see the note on that at
+    // the Phase B step), so the older "stamp early or reindex_files skips every
+    // file" reasoning did not apply to this path either.
+    store
+        .set_signature_format_version(SIGNATURE_FORMAT_VERSION)
+        .context("writing signature_format_version")?;
 
     // UX-023: sweep nodes for files that no longer exist on disk. The incremental
     // hash-delta path above only re-indexes files that are still present, so nodes
@@ -1666,17 +1987,20 @@ pub fn init_repo_with_progress(
     // Decide whether to run Phase B inline now, defer it, or skip it entirely.
     //
     // Already-done path: `phase_b_commit == HEAD` means Phase B is current for
-    // this commit (e.g. a previous `--semantic` run or a completed background
+    // this commit (e.g. a previous `travsr init` or a completed background
     // refresh). No message, no daemon spawn — silently return a dummy report so
     // the caller knows Phase B is not pending.
     //
-    // Deferred path (default): Phase B runs in the background via the daemon's
+    // Deferred path (`semantic` false, only the `init_repo` helper): Phase B
+    // runs in the background via the daemon's
     // `run_background_phase_b` once the user's IDE / agent starts it. The
     // `phase_b_commit` meta key is intentionally left unset so the daemon's
     // `phase_b_tick` auto-arms the scheduler on startup.
     //
-    // Inline path (`--semantic` flag, or repo has no HEAD commit):
-    //   • `--semantic`: callers (CI, scripts) need call edges before querying.
+    // Inline path (`semantic`, which every CLI `travsr init` passes, or a repo
+    // with no HEAD commit):
+    //   • `semantic`: callers need call edges before querying.
+    //     Skipped when Phase B already covers HEAD (`phase_b_inline_needed`).
     //   • No commit: `run_background_phase_b` bails when `last_commit` is empty,
     //     so there is no deferred path available for fresh repos.
     let current_sha = read_head_commit_sha(repo_root).unwrap_or_default();
@@ -1687,7 +2011,30 @@ pub fn init_repo_with_progress(
         .flatten()
         .unwrap_or_default();
     let phase_b_already_done = !current_sha.is_empty() && phase_b_commit_stored == current_sha;
-    let run_phase_b_inline = semantic || !has_commit;
+    let run_phase_b_inline = !has_commit
+        || (semantic && {
+            let meta = |key| store.get_meta(key).ok().flatten().unwrap_or_default();
+            let warnings = meta("phase_b_warnings");
+            let lang_toml = travsr_plugin_host::trust::LangToml::from_disk();
+            let resolver = std::cell::OnceCell::new();
+            phase_b_inline_needed(
+                phase_b_already_done,
+                meta("phase_b_dirty") == "1",
+                &warnings,
+                |lang| {
+                    use travsr_plugin_host::phase_b::status::{gather, readiness, Readiness};
+                    travsr_plugin_host::phase_b::lookup(lang).is_some_and(|entry| {
+                        let resolver = resolver.get_or_init(|| {
+                            travsr_plugin_host::resolver::CatalogResolver::for_corpus(&corpus)
+                        });
+                        // Without the last run's warnings: "ready now" is the
+                        // setup rungs alone, not what that run recorded.
+                        let cap = gather(entry, repo_root, &corpus, &lang_toml, resolver, "");
+                        readiness(&cap) == Readiness::Ready
+                    })
+                },
+            )
+        });
 
     // Observed before Phase B starts, compared after it finishes. `init.lock`
     // serialises two `travsr init` invocations, but not the daemon's watcher,
@@ -1704,17 +2051,14 @@ pub fn init_repo_with_progress(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
 
+    // Stamped here as well as at the end, so an init interrupted during Phase B
+    // leaves last_commit ahead of phase_b_commit: the daemon arms on that gap.
+    if has_commit {
+        let _ = store.set_meta("last_commit", &current_sha);
+    }
+
     let phase_b_report = if run_phase_b_inline {
         on_progress(InitProgress::Finalizing);
-
-        // LSIF semantic pass — adds RefCall edges on top of structural edges.
-        // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
-        let t_lsif = std::time::Instant::now();
-        run_lsif_pass(repo_root, &corpus, &mut store);
-        tracing::info!(
-            elapsed_ms = t_lsif.elapsed().as_millis(),
-            "TIMING: run_lsif_pass done"
-        );
 
         // Phase B — deep semantic analysis via sidecar plugins (RFC-011 §3).
         let t_phase_b = std::time::Instant::now();
@@ -1723,6 +2067,7 @@ pub fn init_repo_with_progress(
             // skip on another repo doesn't produce a false degradation flag for
             // this repo's write_phase_b_results call.
             travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+            travsr_indexer::sandbox::reset_lsif_analyzer_failures();
             let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
             // #755 item 3: live per-language view of the fan-out, polled by the
             // heartbeat thread below so the progress line keeps ticking while
@@ -1778,6 +2123,7 @@ pub fn init_repo_with_progress(
                     out
                 })
             };
+            classify_phase_b_calls(repo_root, &pb_nodes, &mut pb_refs);
             // E3 W3b: resolve rust-analyzer LSIF positional refs against the full
             // store (cross-file + incremental-safe) into attributable ScipRefs.
             // Fail closed — a callee that resolves to no node is dropped here, so
@@ -1816,7 +2162,7 @@ pub fn init_repo_with_progress(
                 resolved_cross_crate_edges = resolved.len(),
                 "semantic analysis cross-reference resolution complete"
             );
-            let (report, alias_map) = write_phase_b_results(
+            let (report, alias_map, dropped) = write_phase_b_results(
                 &mut store,
                 &corpus,
                 pb_nodes,
@@ -1840,8 +2186,8 @@ pub fn init_repo_with_progress(
             // #757: separate field-access occurrences (recorded as 'ref/field')
             // from call occurrences ('ref/call') before remap+write.
             let (call_sites, field_sites) = split_field_sites(&resolved, resolved_sites);
-            let call_sites = remap_resolved_sites(call_sites, &alias_map);
-            let field_sites = remap_resolved_sites(field_sites, &alias_map);
+            let call_sites = remap_resolved_sites(call_sites, &alias_map, &dropped);
+            let field_sites = remap_resolved_sites(field_sites, &alias_map, &dropped);
             if let Err(e) = store.record_edge_sites(&call_sites) {
                 tracing::warn!("recording cross-crate edge_sites: {e:#}");
             }
@@ -1853,6 +2199,16 @@ pub fn init_repo_with_progress(
             if let Err(e) = store.reconcile_edge_languages() {
                 tracing::warn!("reconciling edge languages: {e:#}");
             }
+            // #811: the call sites are all recorded, so reconcile the
+            // reference-resolution table against them now, exactly as the
+            // daemon's ratification does. Without this a `pending` row the
+            // live lane wrote before this rebuild survived `--force` even
+            // though `edge_sites` now proves the reference resolved, and
+            // `pending_ref_count` kept reporting it. Not gated on which
+            // languages ran: the reconcile is keyed on the evidence in the
+            // store, so a crashed sidecar's files simply have no new sites and
+            // keep their rows.
+            reconcile_ref_resolution_states(&mut store);
             report
         };
         tracing::info!(
@@ -1862,7 +2218,7 @@ pub fn init_repo_with_progress(
         Some(report)
     } else if phase_b_already_done {
         // Phase B is current for this commit — nothing to do, no message.
-        // Return Some(empty) so init.rs skips the daemon spawn.
+        // Return Some(empty): Phase B is not pending.
         Some(PhaseBReport::default())
     } else {
         on_progress(InitProgress::PhaseBDeferred);
@@ -1923,19 +2279,16 @@ pub fn init_repo_with_progress(
             //
             // The flag is set by `reindex_files` on the watcher and hook paths,
             // because rewriting a file's Phase A nodes drops its `ref/call` edges
-            // (#583). Init's own indexing does not route through `reindex_files`,
-            // so the flag reaching here was set by an earlier watcher or hook
-            // reindex, not by this run. Phase B has just rebuilt those edges, so
+            // (#583). Init's own re-parse sets it the same way, before Phase B
+            // starts. Phase B has just rebuilt those edges, so
             // by this point the flag describes a degradation that no longer
             // exists and leaving it set makes `travsr status` report `stale`
             // over a correct graph.
             //
-            // Only reachable with `run_phase_b_inline`, which means
-            // `travsr init --semantic` or a repo with no HEAD commit. Plain
-            // `travsr init` defers Phase B and must NOT clear the flag: the edges
-            // really are still missing, so the flag is honest there. That is why
-            // `status.rs` names `travsr init --semantic` as the remedy rather
-            // than `travsr init`.
+            // Only reachable with `run_phase_b_inline`: every CLI `travsr init`
+            // (it passes `semantic`) or a repo with no HEAD commit. The deferred
+            // path, left only to the `init_repo` helper, must NOT clear the flag:
+            // the edges really are still missing there.
             // Only if nothing marked it dirty while this run was working. A
             // flag that predates this run is stale and safe to clear, which is
             // the #741 fix; one that arrived mid-run describes a real
@@ -1987,6 +2340,8 @@ pub fn init_repo_with_progress(
         files_skipped_unchanged,
         files_skipped_ignored,
         travsrignore_scaffolded: scaffolded,
+        gitignore_scaffolded,
+        travsr_dir_tracked,
         nodes_written: nodes_after - nodes_before,
         edges_written,
         total_nodes: nodes_after as u64,
@@ -2285,6 +2640,39 @@ impl ClassHierarchy {
     }
 }
 
+/// #810: narrow same-named bare-call candidates to the one the caller means:
+/// (1) a definition in the caller's own file, else (2) one in a file the caller
+/// imports (`depends → import → resolves-to → file`). Only ever narrows; an
+/// unbroken tie is returned unchanged for the CO-A1 uniqueness gate to drop.
+/// `resolves-to` exists only for relative imports (TS/JS `./` `../`, Rust
+/// `self::` `super::`, Python specifiers that map to an indexed file), so a
+/// call through an alias, a package specifier or `crate::` stays a tie.
+fn scope_bare_call<'a>(
+    caller_path: &str,
+    imported_files: &std::collections::HashSet<(String, String)>,
+    candidates: Vec<(travsr_core::NodeId, &'a str, &'a str)>,
+) -> Vec<(travsr_core::NodeId, &'a str, &'a str)> {
+    let same_file: Vec<_> = candidates
+        .iter()
+        .filter(|(_, path, _)| *path == caller_path)
+        .copied()
+        .collect();
+    if !same_file.is_empty() {
+        return same_file;
+    }
+    let imported: Vec<_> = candidates
+        .iter()
+        .filter(|(_, path, _)| {
+            imported_files.contains(&(caller_path.to_string(), (*path).to_string()))
+        })
+        .copied()
+        .collect();
+    if !imported.is_empty() {
+        return imported;
+    }
+    candidates
+}
+
 /// Write the result of one Phase B (SCIP) pass into `store`, returning a
 /// [`PhaseBReport`].
 ///
@@ -2317,10 +2705,7 @@ fn resolve_unresolved_calls(
     // to them, per callee — not per line, so a second real call sharing the
     // line with an LSIF-covered one is not also dropped (#I2).
     lsif_covered: &std::collections::HashSet<(String, u32, String)>,
-) -> (
-    Vec<travsr_core::Edge>,
-    Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
-) {
+) -> (Vec<travsr_core::Edge>, Vec<SiteRow>) {
     if unresolved.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -2494,11 +2879,16 @@ fn resolve_unresolved_calls(
                 // `class:T`, not Rust's `struct:`/`enum:`/`trait:`. Without it a
                 // real graph class was treated as an external type (#529 branch
                 // 2), dropping legitimate cross-file method edges.
+                // `interface:` belongs here for the same reason `class:` did:
+                // Go/Java/Kotlin/C#/TypeScript all emit it as a distinct Phase A
+                // prefix, so an interface-typed receiver was read as an external
+                // type and its calls dropped at #529 branch 2.
                 [
                     format!("struct:{t}"),
                     format!("enum:{t}"),
                     format!("trait:{t}"),
                     format!("class:{t}"),
+                    format!("interface:{t}"),
                 ]
             })
             .collect()
@@ -2541,6 +2931,9 @@ fn resolve_unresolved_calls(
         .into_iter()
         .map(|n| (n.id, n.vname.language))
         .collect();
+    // #810: (caller file, imported file) pairs, for scoping duplicated bare
+    // names. Loaded on the first such call only.
+    let mut imported_files: Option<std::collections::HashSet<(String, String)>> = None;
 
     // #836: inherited-method resolution. `self.method()` recovers its receiver
     // as the enclosing class, so a method defined on a base class has no
@@ -2593,7 +2986,7 @@ fn resolve_unresolved_calls(
     }
 
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
-    let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
+    let mut sites: Vec<SiteRow> = Vec::new();
     for u in unresolved {
         // #757: field-access reference (`x.foo`). Handled ahead of the call
         // paths below because it is not a call: it resolves to the exact Phase A
@@ -2635,7 +3028,7 @@ fn resolve_unresolved_calls(
                     *dst,
                     travsr_core::EdgeKind::RefField,
                 ));
-                sites.push((u.src, *dst, u.caller_line));
+                sites.push((u.src, *dst, u.caller_line, u.caller_col));
             }
             continue;
         }
@@ -2841,13 +3234,31 @@ fn resolve_unresolved_calls(
         } else {
             matches
         };
+        let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
+        // Bare `foo()` only: method, associated (`method:`) and `new` (`class:`)
+        // calls keep their existing resolution.
+        let bare_fn = !u.is_method_call && u.callee_sig.starts_with("fn:");
+        let filtered = if u.hint_crate.is_none() && bare_fn && filtered.len() > 1 {
+            let imported_files = imported_files.get_or_insert_with(|| {
+                store
+                    .file_import_pairs()
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("resolve_unresolved_calls: import pair lookup failed: {e}");
+                        Vec::new()
+                    })
+                    .into_iter()
+                    .collect()
+            });
+            scope_bare_call(caller_path, imported_files, filtered)
+        } else {
+            filtered
+        };
         // CO-A1: bare calls with no crate hint resolve to ALL same-named functions
         // across all crates → false edges that flood get_callers / blast_radius.
         // Only emit a RefCall when the match is unambiguous (exactly one candidate).
         if u.hint_crate.is_none() && filtered.len() != 1 {
             continue;
         }
-        let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
         for (dst, path, _lang) in filtered {
             // #521 F1/F2: never emit an edge the caller's own crate could not
             // possibly reach.
@@ -2860,14 +3271,14 @@ fn resolve_unresolved_calls(
                 // #299: record the call-site occurrence. `u.src` is the caller
                 // function node (same file as the call), so nodes.path[src] is the
                 // occurrence file — exactly what reference_sites returns.
-                sites.push((u.src, dst, u.caller_line));
+                sites.push((u.src, dst, u.caller_line, u.caller_col));
             }
         }
     }
 
     edges.sort_unstable_by_key(|e| (e.src.0, e.dst.0));
     edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst);
-    sites.sort_unstable_by_key(|(s, d, l)| (s.0, d.0, *l));
+    sites.sort_unstable_by_key(|(s, d, l, _)| (s.0, d.0, *l));
     sites.dedup();
     (edges, sites)
 }
@@ -3021,6 +3432,119 @@ fn cross_link_manifest_deps(store: &mut SqliteStore) -> usize {
     linked
 }
 
+/// The run outcome reported by `phase_b.complete`, from what the run actually
+/// achieved.
+///
+/// A write failure is not a crash and no language reports it, but it costs the
+/// WHOLE run: each batch writer is one transaction, so a single failing row
+/// rolls back everything Phase B computed for every language. Before this it
+/// reached nothing, so a run that stored none of its results still reported
+/// `Success` with `lsif_edges: 0`, and `travsr status` read "semantic:
+/// complete" over a gutted index.
+///
+/// `Partial`, not `AllCrashed`, on a write failure. `AllCrashed` re-arms the
+/// scheduler on the next tick, and a retry cannot change the cause (a stale row
+/// is still stale on the next run), which is the persistent-retry loop #712
+/// exists to avoid. `Partial` is honest and settles.
+fn run_outcome(report: &PhaseBReport, made_progress: bool) -> phase_b_sched::RunOutcome {
+    if report.write_failures > 0 {
+        phase_b_sched::RunOutcome::Partial
+    } else if report.crashed.is_empty() {
+        phase_b_sched::RunOutcome::Success
+    } else if made_progress {
+        // Healthy languages advanced to HEAD, so the next scheduler tick early-
+        // returns (last_commit == phase_b_commit) instead of re-running: the
+        // loop settles after one back-off cycle rather than retrying a
+        // persistently broken sidecar forever (#464 follow-up, #712).
+        phase_b_sched::RunOutcome::Partial
+    } else {
+        phase_b_sched::RunOutcome::AllCrashed
+    }
+}
+
+/// Clear `is_call` on Phase B references that are not calls.
+///
+/// Sidecars flag every reference occurrence `is_call: true` (scip-reader, the
+/// Kotlin wrapper, the Dart emitter), so a parameter type, a supertype or a
+/// local read was written as a `ref/call`. This applies the same call-site
+/// rule `ingest_scip_g2` and the Rust positional path use, where the language
+/// always calls with parentheses and the occurrence has a column. Anything
+/// else is left as the producer sent it.
+pub fn classify_phase_b_calls(
+    repo_root: &Path,
+    nodes: &[travsr_core::Node],
+    refs: &mut [travsr_core::ScipRef],
+) {
+    let languages: std::collections::HashMap<&str, &str> = nodes
+        .iter()
+        .map(|n| (n.vname.path.as_str(), n.vname.language.as_str()))
+        .collect();
+    // Scala calls need no parentheses, but a SemanticDB type symbol (`Animal#`)
+    // is never the callee: construction references `<init>` or `apply`.
+    let scala_types: std::collections::HashSet<travsr_core::NodeId> = nodes
+        .iter()
+        .filter(|n| n.vname.signature.starts_with("sdb:") && n.vname.signature.ends_with('#'))
+        .map(|n| n.id)
+        .collect();
+    // Ruby calls need no parentheses either, but a class reference (a SCIP
+    // type descriptor, `Animal#`; scip-ruby sends no kind) constructs only as
+    // the receiver of `.new`; a superclass or `is_a?` is a mention.
+    let ruby_types: std::collections::HashSet<travsr_core::NodeId> = nodes
+        .iter()
+        .filter(|n| n.vname.language == "ruby" && n.vname.signature.ends_with('#'))
+        .map(|n| n.id)
+        .collect();
+    // A reference to a function is a call however it is spelled (a trailing
+    // lambda, an infix call, explicit type arguments). The rule is for the
+    // mentions that are not: a type, a property, a local.
+    let callables: std::collections::HashSet<travsr_core::NodeId> = nodes
+        .iter()
+        .filter(|n| matches!(n.kind.as_str(), "function" | "method" | "constructor"))
+        .map(|n| n.id)
+        .collect();
+    let mut src = travsr_indexer::callsite::SourceLines::new();
+    for r in refs.iter_mut().filter(|r| r.is_call) {
+        if callables.contains(&r.callee_id) {
+            continue;
+        }
+        if scala_types.contains(&r.callee_id) {
+            r.is_call = false;
+            continue;
+        }
+        let Some(byte_col) = r.caller_col else {
+            continue;
+        };
+        let ruby_type = ruby_types.contains(&r.callee_id);
+        if !ruby_type
+            && !languages
+                .get(r.caller_path.as_str())
+                .is_some_and(|l| travsr_indexer::callsite::uses_call_parens(l))
+        {
+            continue;
+        }
+        let Some(line) = src.line(&repo_root.join(&r.caller_path), r.caller_line) else {
+            continue;
+        };
+        if ruby_type {
+            let rest = line.get(byte_col as usize..).unwrap_or("");
+            let name_len = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            r.is_call = rest[name_len..]
+                .strip_prefix(".new")
+                .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'));
+            continue;
+        }
+        // `caller_col` is a byte offset; the rule takes a UTF-16 column.
+        let Some(prefix) = line.get(..byte_col as usize) else {
+            continue;
+        };
+        let utf16_col = prefix.encode_utf16().count() as u32;
+        r.is_call = travsr_indexer::callsite::occurrence_is_call(line, utf16_col);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_phase_b_results(
     store: &mut SqliteStore,
     corpus: &str,
@@ -3036,9 +3560,13 @@ fn write_phase_b_results(
 ) -> (
     PhaseBReport,
     std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId>,
+    std::collections::HashSet<travsr_core::NodeId>,
 ) {
     let pb_node_count = pb_nodes.len();
     let pb_edge_count = pb_edges.len();
+    // Each batch writer below is one transaction, so a single failing row loses
+    // every language's results for this run. Counted rather than only logged.
+    let mut write_failures = 0usize;
     // B: gate the C1 manifest cross-link (two unindexed full `nodes` scans) on
     // whether this cycle actually wrote any `crate` node. Computed before
     // `pb_nodes` is consumed below. C1 only creates value when `crate:*` nodes
@@ -3055,14 +3583,26 @@ fn write_phase_b_results(
     // unification drops. Empty for the no-attribution (old-style sidecar) path.
     let mut alias_map: std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId> =
         std::collections::HashMap::new();
+    // #780: SCIP def nodes dropped by unification (synthetic DSL meta-scopes with
+    // no twin). Returned to the caller so `remap_resolved_sites` can discard any
+    // resolved occurrence whose `dst` was dropped — a dropped node has no alias
+    // to remap onto, and `record_edge_sites`/`record_field_sites` are
+    // `INSERT OR IGNORE` with no endpoint check, so the row would otherwise land
+    // silently as a dangling site (`fsck` checks node files, not site endpoints).
+    let mut dropped: std::collections::HashSet<travsr_core::NodeId> =
+        std::collections::HashSet::new();
     // E6: SCIP def-unification attempt/miss counts, surfaced on the degradation
     // channel below so silent non-unification (orphaned SCIP twins) is visible.
     let mut scip_unify_attempted: usize = 0;
     let mut scip_unify_missed: usize = 0;
+    // #825: the actual unreconciled symbols behind the miss count, persisted so
+    // `travsr status` can name them instead of only reporting a rate.
+    let mut scip_unify_misses: Vec<crate::scip_unifier::UnifyMiss> = Vec::new();
     if pb_refs.is_empty() {
         // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
         // These are analyzer/SCIP-derived structural edges (E1: provenance 'scip').
         if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges, "scip") {
+            write_failures += 1;
             tracing::warn!("semantic analysis batch write error: {e:#}");
         }
     } else {
@@ -3073,25 +3613,45 @@ fn write_phase_b_results(
         let unify = crate::scip_unifier::unify_all(store, corpus, &pb_nodes, &mut pb_refs_mut);
         scip_unify_attempted = unify.attempted;
         scip_unify_missed = unify.attempted.saturating_sub(unify.unified);
+        scip_unify_misses = unify.misses;
         alias_map = unify.alias_map;
-        let pb_refs = pb_refs_mut;
+        // #780: synthetic DSL meta-scope def nodes (RSpec blocks) with no twin.
+        // Dropped outright — node, inbound refs, and edges — so they stop
+        // surviving as orphan duplicates that steal spec-file reference edges.
+        // Threaded out to the caller so resolved occurrence sites pointing at a
+        // dropped node are discarded too (see `dropped` decl above).
+        dropped = unify.dropped;
+
+        // Refs whose callee is a dropped synthetic node would write an edge onto
+        // a node that no longer exists (a dangling/ghost edge). Drop them: the
+        // "target" was never a real definition, so the reference correctly
+        // resolves to nothing rather than to a bogus duplicate.
+        let pb_refs: Vec<travsr_core::ScipRef> = pb_refs_mut
+            .into_iter()
+            .filter(|r| !dropped.contains(&r.callee_id))
+            .collect();
 
         // Drop unified SCIP definition nodes: the tree-sitter node already
         // represents them (symbol_aliases preserves scip_symbol → TS node
         // resolution), and writing them would re-create the duplicate node
-        // + FTS rows that unification exists to eliminate.
+        // + FTS rows that unification exists to eliminate. Also drop the
+        // synthetic DSL nodes (#780), which have no TS twin to alias onto.
         let pb_nodes: Vec<travsr_core::Node> = pb_nodes
             .into_iter()
-            .filter(|n| !alias_map.contains_key(&n.id))
+            .filter(|n| !alias_map.contains_key(&n.id) && !dropped.contains(&n.id))
             .collect();
 
         // Rewrite SCIP structural edges through the alias map so they land
         // on the unified TS nodes instead of the dropped duplicates; an
         // edge that collapses to a self-loop after rewriting carried no
-        // information beyond the node itself — drop it.
+        // information beyond the node itself — drop it. An edge touching a
+        // dropped synthetic node (#780) has no valid endpoint — drop it too.
         let pb_edges: Vec<travsr_core::Edge> = pb_edges
             .into_iter()
             .filter_map(|mut e| {
+                if dropped.contains(&e.src) || dropped.contains(&e.dst) {
+                    return None;
+                }
                 if let Some(&ts_id) = alias_map.get(&e.src) {
                     e.src = ts_id;
                 }
@@ -3104,12 +3664,14 @@ fn write_phase_b_results(
 
         // G2 path: span-attributed ref/call edges.
         if let Err(e) = store.write_scip_attributed_batch(corpus, &pb_nodes, &pb_refs) {
+            write_failures += 1;
             tracing::warn!("semantic analysis attributed write error: {e:#}");
         }
         // Structural edges from SCIP relationships (Pass 2 in scip-reader) still
         // need to be written — they are not represented in ScipRef records.
         if !pb_edges.is_empty() {
             if let Err(e) = store.write_phase_b_batch(&[], &pb_edges, "scip") {
+                write_failures += 1;
                 tracing::warn!("semantic analysis structural edges write error: {e:#}");
             }
         }
@@ -3166,6 +3728,11 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_needs_consent {
         warnings.push(format!("needs_consent:{lang}"));
     }
+    // rust-analyzer skipped: no OS sandbox, and no grant for this repo. Without
+    // this Rust read ready with no rust-analyzer calls; `travsr init` grants it.
+    if travsr_indexer::sandbox::ra_lsif_sandbox_was_skipped() {
+        warnings.push("needs_consent:rust".to_string());
+    }
     // #449: a language present in the repo whose sidecar is not installed or
     // not registered used to be skipped silently, and the user saw "0 references"
     // with no hint that Phase B never ran. Surface both skip classes so
@@ -3187,6 +3754,20 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_no_compdb {
         warnings.push(format!("skipped_no_compdb:{lang}"));
     }
+    for lang in &pb_outcome.skipped_no_build_file {
+        warnings.push(format!("skipped_no_build_file:{lang}"));
+    }
+    // #878: the TypeScript LSIF pass was due but `travsr-lsif-ts` never ran (or
+    // ran and failed). The native pass still ran, so `typescript` is in `ran`
+    // and the marker advances; this is what keeps `travsr status` from reading
+    // `complete` over an index missing most of the language's call edges.
+    // All three analyzers record their skips in travsr-indexer (TypeScript's
+    // from the native pass) and are drained here, so they land in one place
+    // with one vocabulary.
+    let lsif_skips = collect_lsif_skips();
+    for skip in &lsif_skips {
+        warnings.push(format!("{}:{}", skip.warning_class(), skip.language));
+    }
     // E6: surface SCIP def-unification misses (orphaned twins). Positional
     // span-containment makes this near-zero; a non-zero rate means Phase A
     // nodes the compiler defined were not matched, so their ref/call edges
@@ -3196,11 +3777,51 @@ fn write_phase_b_results(
             "scip_unification_misses:{scip_unify_missed}/{scip_unify_attempted}"
         ));
     }
+    // #825: persist the unreconciled symbols themselves so `travsr status` can
+    // name them (the miss set is deterministic, so "re-run init" never helps —
+    // seeing WHICH defs miss is what actually moves the work forward). Capped so
+    // a pathological repo cannot bloat the meta table; the count already carries
+    // the true total. One row per line: `lang\tkind\tsymbol\tpath:line`.
+    const MAX_MISS_ROWS: usize = 100;
+    if scip_unify_misses.is_empty() {
+        let _ = store.set_meta("scip_unification_miss_list", "");
+    } else {
+        let list = scip_unify_misses
+            .iter()
+            .take(MAX_MISS_ROWS)
+            .map(|m| {
+                format!(
+                    "{}\t{}\t{}\t{}:{}",
+                    m.language, m.kind, m.symbol, m.path, m.line
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = store.set_meta("scip_unification_miss_list", &list);
+    }
     if !warnings.is_empty() {
         let _ = store.set_meta("phase_b_warnings", &warnings.join(","));
     } else {
         let _ = store.set_meta("phase_b_warnings", "");
     }
+    // #904: the sidecars' own diagnostics, as JSON. Persisted next to the
+    // warning classes for the same reason: the default `init` defers Phase B
+    // to the daemon, so `travsr status` is where the user reads the outcome,
+    // and a class alone (`zero_nodes:java`) cannot name the Android SDK.
+    // Bounded and sanitized by the indexer before it reaches here. Written
+    // on every run, so a stale diagnostic does not outlive its fix.
+    // An emitter that could not run says why here too, so `init` can keep to
+    // the plain line and `status --verbose` still has the emitter's own words.
+    let mut diagnostics = pb_outcome.diagnostics.clone();
+    diagnostics.extend(lsif_skips.iter().map(|skip| {
+        travsr_plugin_host::indexer::SidecarDiagnostic {
+            lang: skip.language.clone(),
+            code: skip.warning_class().to_string(),
+            message: skip.detail.clone(),
+        }
+    }));
+    let diagnostics_json = serde_json::to_string(&diagnostics).unwrap_or_default();
+    let _ = store.set_meta("phase_b_diagnostics", &diagnostics_json);
 
     // M1 degradation flag: surfaced by `travsr status` so the user knows Rust
     // semantic edges are degraded without having to grep logs. Precedence:
@@ -3234,15 +3855,21 @@ fn write_phase_b_results(
         skipped_needs_approval: pb_outcome.skipped_needs_approval,
         skipped_needs_consent: pb_outcome.skipped_needs_consent,
         crashed: pb_outcome.crashed,
+        write_failures,
         produced_no_nodes: pb_outcome.produced_no_nodes,
         produced_no_references: pb_outcome.produced_no_references,
         version_mismatch: pb_outcome.version_mismatch,
+        lsif_skipped: lsif_skips,
+        diagnostics: pb_outcome.diagnostics,
     };
-    (report, alias_map)
+    (report, alias_map, dropped)
 }
 
-/// A resolved occurrence row: `(src caller node, dst target node, 1-based line)`.
-type SiteRow = (travsr_core::NodeId, travsr_core::NodeId, u32);
+/// A resolved occurrence row: `(src caller node, dst target node, 1-based line,
+/// 0-based UTF-8 byte column of the reference on that line)`. RFC-027 #813 P2:
+/// `col` is `None` for a call the extractor emitted without a position, in which
+/// case the editor lane name-searches the line as before.
+type SiteRow = (travsr_core::NodeId, travsr_core::NodeId, u32, Option<u32>);
 
 /// #757: split resolved occurrence sites into call sites (`ref/call`) and
 /// field-access sites (`ref/field`) by matching each site's `(src, dst)` against
@@ -3265,7 +3892,7 @@ fn split_field_sites(
     }
     sites
         .into_iter()
-        .partition(|(s, d, _)| !field_pairs.contains(&(*s, *d)))
+        .partition(|(s, d, _, _)| !field_pairs.contains(&(*s, *d)))
 }
 
 /// #299 F2: remap `resolved_sites.dst` through the unification alias map and
@@ -3276,18 +3903,27 @@ fn split_field_sites(
 /// occurrence against a node that no longer exists (mixed-language repos). A
 /// site whose `dst` remaps onto its own `src` mirrors the self-loop edge that
 /// `write_phase_b_results` already drops, so it is filtered here too.
+///
+/// #780: a `dst` in `dropped` (a synthetic DSL node unification removed with no
+/// alias to remap onto) is discarded outright — the two removal paths (aliased
+/// and dropped) are kept symmetric so no site records against a node the batch
+/// never wrote.
 fn remap_resolved_sites(
-    sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
+    sites: Vec<SiteRow>,
     alias_map: &std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId>,
-) -> Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> {
-    if alias_map.is_empty() {
+    dropped: &std::collections::HashSet<travsr_core::NodeId>,
+) -> Vec<SiteRow> {
+    if alias_map.is_empty() && dropped.is_empty() {
         return sites;
     }
     sites
         .into_iter()
-        .filter_map(|(src, dst, line)| {
+        .filter_map(|(src, dst, line, col)| {
+            if dropped.contains(&dst) {
+                return None;
+            }
             let dst = alias_map.get(&dst).copied().unwrap_or(dst);
-            (src != dst).then_some((src, dst, line))
+            (src != dst).then_some((src, dst, line, col))
         })
         .collect()
 }
@@ -3340,6 +3976,7 @@ fn collect_present_languages_and_paths(
     }
 
     reclassify_objc_headers(&mut langs, &paths);
+    drop_build_script_only_kotlin(&mut langs, &paths);
 
     (langs, paths)
 }
@@ -3372,6 +4009,19 @@ fn reclassify_objc_headers(langs: &mut std::collections::HashSet<String>, paths:
         if !has_c_source {
             langs.remove(Language::C.as_str());
         }
+    }
+}
+
+/// Kotlin's language tools run only when a `.kt` file exists. `.kts` is
+/// Kotlin syntax, so it is parsed and indexed, but a repo whose only Kotlin is
+/// its Gradle build scripts has no calls there worth a language server's
+/// minutes. Called beside [`reclassify_objc_headers`] by every builder.
+fn drop_build_script_only_kotlin(langs: &mut std::collections::HashSet<String>, paths: &[PathBuf]) {
+    if !paths
+        .iter()
+        .any(|p| p.extension().and_then(|e| e.to_str()) == Some("kt"))
+    {
+        langs.remove(Language::Kotlin.as_str());
     }
 }
 
@@ -3637,8 +4287,7 @@ fn maybe_spawn_embed(
         return;
     }
 
-    let phase2_total = total.saturating_sub(phase1_total);
-    let phase2_remaining = phase2_total.saturating_sub(embedded.saturating_sub(phase1_done));
+    let phase2_remaining = phase2_remaining(total, embedded, phase1_total, phase1_done);
 
     if phase2_remaining == 0 {
         phase2_spawned.store(true, Ordering::Relaxed);
@@ -3659,6 +4308,24 @@ fn maybe_spawn_embed(
     if travsr_plugin_host::spawn_background_reindex_phase2(&db_path) {
         phase2_spawned.store(true, Ordering::Relaxed);
     }
+}
+
+/// Phase 2 nodes still to embed, from one `embed_progress` reading.
+///
+/// `phase2_total = total - phase1_total` and `phase2_done = embedded -
+/// phase1_done`, both saturating because the four counts are read in separate
+/// statements and a node can change tier between them.
+///
+/// The arithmetic is only right when `embedded` is over the same embeddable
+/// set as `total` (#862). With an unfiltered `embedded`, every vector on an
+/// ineligible node inflated `phase2_done` by one, and once the inflation
+/// reached the genuine remainder the outer `saturating_sub` returned 0: the
+/// tick concluded Phase 2 was complete and never spawned it. The saturation
+/// stays; the store's count is what was wrong, and `embed_progress` now
+/// applies its predicate to `embedded` too.
+fn phase2_remaining(total: u64, embedded: u64, phase1_total: u64, phase1_done: u64) -> u64 {
+    let phase2_total = total.saturating_sub(phase1_total);
+    phase2_total.saturating_sub(embedded.saturating_sub(phase1_done))
 }
 
 /// Pending-tombstone count observed at the last invalidation-driven spawn.
@@ -3794,6 +4461,998 @@ fn run_with_phase_b_finish_guard(
 /// tick), and [`AllCrashed`](phase_b_sched::RunOutcome::AllCrashed) when every
 /// sidecar crashed, which increments the retry-cap counter in
 /// `PhaseBScheduler`.
+/// RFC-027 section 7.3a: emit the unambiguous-lexical live overlay for one file.
+///
+/// Re-runs the native Phase B call-site extractor over just this file to get its
+/// [`UnresolvedCall`]s, then hands them to the precision-first live resolver.
+/// Reusing the extractor (rather than a second call-site parser) is what keeps
+/// the live lane detecting exactly the references Phase B will later ratify.
+///
+/// Only languages with a native Phase B call-site extractor participate; every
+/// other language keeps today's commit-gated behavior exactly, which is the
+/// RFC's zero-regression floor.
+///
+/// **Called from the save path only, never from the commit path.** It lives
+/// beside `reindex_files` rather than inside it because `reindex_files` is
+/// shared by the watcher and the commit hook, and on commit this work is pure
+/// waste: the hook arms a Phase B refresh immediately afterwards, which
+/// re-derives the same edges and ratifies them. Doing it there would buy
+/// nothing and would put a second tree-sitter parse per changed file directly
+/// in `git commit`'s latency, which the parse timeout in the Phase A parsers
+/// exists to protect.
+///
+/// It re-resolves the **whole** file, not only references that look new,
+/// because `reindex_replace` has just deleted every outbound edge the file
+/// owned. `put_edge_live` upserts, so re-emitting is idempotent.
+///
+/// Fail-open: a live edge is a freshness gain, never a correctness dependency,
+/// so every error here is logged at debug and dropped.
+/// Upper bound on files re-resolved by one interface edit (RFC-027 Risk R4).
+///
+/// A save must stay a save. Editing a hot utility can dirty hundreds of files,
+/// and re-parsing all of them on every keystroke would cost more than the
+/// freshness is worth. Beyond the cap those files keep their commit-gated
+/// behavior, which is a recall cost the next Phase B run repairs.
+const LIVE_CLOSURE_FILE_CAP: usize = 32;
+
+/// Which live lanes a language's on-save reference detection can feed
+/// (RFC-027 sections 7.3 and 8.3).
+enum LiveLane {
+    /// A native Phase B extractor detects the references. Its records carry the
+    /// caller's identity, the receiver type where it could be recovered, and a
+    /// per-language signature key, so the fail-closed lexical floor (§7.3a) and
+    /// the editor lane (§7.3b) both run.
+    Native,
+    /// The generic tree-sitter detector detects the references. It recovers no
+    /// receiver type and builds no signature key by design, so the lexical floor
+    /// has nothing to match on and these languages run the **editor lane
+    /// alone** (§8.3). With no language server they abstain, which is today's
+    /// commit-gated behavior exactly (§7.3c, zero regression).
+    EditorOnly,
+}
+
+/// The language of `abs_path` and the live lane it participates in, or `None`
+/// when the live lane does not apply to it at all.
+///
+/// This is the one place a language is switched on, and it must stay in step
+/// with two others: `travsr_analysis::live_detect::detect_live_refs`, which has
+/// the query, and the extension's `SUPPORTED_LANGUAGES`, which gates the request
+/// that reaches here. A language listed here but missing from either is inert
+/// rather than wrong.
+///
+/// `Language::TypeScript` covers .ts/.tsx/.js/.jsx — there is no separate
+/// JavaScript variant, and the native extractor handles both.
+///
+/// The data/config formats (JSON, YAML, TOML, XML) and Markdown are absent by
+/// design: they carry no call or inheritance semantics, so there is nothing for
+/// a language server to resolve.
+///
+/// Every editor-only language is subject to the per-`(language, kind)` precision
+/// gate (RFC-027 §12), which disables one on a measured adverse reading. A
+/// language absent here costs nothing on save and keeps commit-gated behavior.
+fn live_language(abs_path: &Path) -> Option<(travsr_core::Language, LiveLane)> {
+    use travsr_core::Language as L;
+    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match L::from_extension(ext)? {
+        lang @ (L::TypeScript | L::Rust | L::Python) => Some((lang, LiveLane::Native)),
+        lang @ (L::Go
+        | L::Java
+        | L::CSharp
+        | L::Cpp
+        | L::C
+        | L::ObjectiveC
+        | L::Ruby
+        | L::Php
+        | L::Kotlin
+        | L::Swift
+        | L::Dart
+        | L::Scala) => Some((lang, LiveLane::EditorOnly)),
+        _ => None,
+    }
+}
+
+/// The references detected in a saved file, in whichever shape its detector
+/// produces.
+enum LiveRefSet {
+    /// [`LiveLane::Native`]: the native extractor's typed reference records plus
+    /// the inheritance clauses its dedicated detector found.
+    Native {
+        unresolved: Vec<travsr_core::UnresolvedCall>,
+        inheritance: Vec<travsr_core::InheritanceRef>,
+        /// RFC-027 section 7.3 step 1: the names this file binds to a local or a
+        /// parameter. Carried alongside the references because both consumers of
+        /// this set (the save-path floor and the editor-target producer) need the
+        /// same local-clean answer, and computing it twice would let them
+        /// disagree about which references the floor owns.
+        locally_bound: std::collections::HashSet<String>,
+    },
+    /// [`LiveLane::EditorOnly`]: positions and names only.
+    Generic(travsr_analysis::live_detect::LiveRefs),
+}
+
+/// The reference set for a saved file and its repo-relative path, or `None` when
+/// the live lane does not apply (unsupported language, the precision gate
+/// disabled it, detection failed, or the file holds no references).
+///
+/// Shared by the save-path lexical lane ([`live_resolve_file`]) and the editor's
+/// target request (RFC-027 daemon-driven positions), so the two agree on exactly
+/// which references exist in a dirty file. Takes `&SqliteStore` — detection and
+/// the gate are read-only — so a `&mut` caller can reborrow and keep writing.
+fn extract_live_unresolved(
+    store: &SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+) -> Option<(String, LiveRefSet)> {
+    let vname_path = abs_path
+        .strip_prefix(repo_root)
+        .unwrap_or(abs_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    // Detection is the only per-language stage; everything downstream
+    // (`resolve_unambiguous_lexical`, `candidate_signatures`, node mapping,
+    // target production, emit, ratification, the meter) is language-agnostic.
+    let (lang, lane) = live_language(abs_path)?;
+    // RFC-027 section 12: a language the cumulative meter has measured below the
+    // shipping bar is disabled — the fail-closed floor (§7.3c) is better than an
+    // un-ratified wrong edge. Detection is skipped entirely so a disabled
+    // language costs nothing on save.
+    if !live_lane_enabled_for(store, lang.as_str()) {
+        tracing::debug!(
+            path = %vname_path,
+            language = lang.as_str(),
+            "live: lane disabled for language by the precision gate"
+        );
+        return None;
+    }
+    if let LiveLane::EditorOnly = lane {
+        // RFC-027 section 8.2: detection only — no receiver-type recovery, no
+        // signature building, no resolution. The editor's language server
+        // answers each position; the daemon owns both node ids (§8.2 fencing).
+        let source = std::fs::read(abs_path).ok()?;
+        let refs = match travsr_analysis::live_detect::detect_live_refs(lang, &source) {
+            Ok(refs) => refs,
+            Err(e) => {
+                tracing::debug!(path = %vname_path, error = %e, "live: reference detection failed");
+                return None;
+            }
+        };
+        if refs.is_empty() {
+            return None;
+        }
+        return Some((vname_path, LiveRefSet::Generic(refs)));
+    }
+    let files = [(abs_path.to_path_buf(), vname_path.clone())];
+    // The extractors return different arities: TypeScript and Python are
+    // `(nodes, edges, unresolved)`, Rust is `(nodes, edges, unresolved, refs)`
+    // (the same-file `refs` the live lane does not consume).
+    let extraction = match lang {
+        travsr_core::Language::TypeScript => {
+            travsr_analysis::phase_b_typescript::extract_native_phase_b(
+                corpus,
+                repo_root,
+                Some(&files),
+            )
+            .map(|(_, _, unresolved)| unresolved)
+        }
+        travsr_core::Language::Rust => {
+            travsr_analysis::phase_b_rust::extract_native_phase_b(corpus, repo_root, Some(&files))
+                .map(|(_, _, unresolved, _)| unresolved)
+        }
+        travsr_core::Language::Python => {
+            travsr_analysis::phase_b_python::extract_native_phase_b(corpus, repo_root, Some(&files))
+                .map(|(_, _, unresolved)| unresolved)
+        }
+        // Unreachable: the gate above admits only the three arms handled here.
+        _ => return None,
+    };
+    let unresolved = match extraction {
+        Ok(unresolved) => unresolved,
+        Err(e) => {
+            tracing::debug!(path = %vname_path, error = %e, "live: call-site extraction failed");
+            return None;
+        }
+    };
+    // RFC-027 live edge-kind scope: the IsImplementation lane's `extends` /
+    // `implements` clauses. TypeScript only for now — the resolver is
+    // language-agnostic, but the detector is per-language and is measured before
+    // each language joins (RFC-027 live edge-kind scope §6.2). Never fails the
+    // whole pass: a detector error is a freshness miss, not a correctness one.
+    // TS and Python only. Rust's `impl Trait for Type` does not fit the live
+    // IsImplementation model and is deferred (see phase_b_rust.rs).
+    let inheritance = match lang {
+        travsr_core::Language::TypeScript => {
+            travsr_analysis::phase_b_typescript::extract_unresolved_inheritance(
+                repo_root,
+                Some(&files),
+            )
+            .unwrap_or_default()
+        }
+        travsr_core::Language::Python => {
+            travsr_analysis::phase_b_python::extract_unresolved_inheritance(repo_root, Some(&files))
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    if unresolved.is_empty() && inheritance.is_empty() {
+        return None;
+    }
+    // RFC-027 section 7.3 step 1. Read once here rather than inside the floor:
+    // the extractor above already needs the file, and the target producer needs
+    // the identical answer.
+    let locally_bound = match std::fs::read(abs_path) {
+        Ok(source) => travsr_analysis::live_scope::local_binding_names(lang, &source),
+        Err(e) => {
+            tracing::debug!(path = %vname_path, error = %e, "live: binder scan could not read file");
+            std::collections::HashSet::new()
+        }
+    };
+    Some((
+        vname_path,
+        LiveRefSet::Native {
+            unresolved,
+            inheritance,
+            locally_bound,
+        },
+    ))
+}
+
+/// RFC-027 sections 8.3 and 9.2: record every reference an editor-only language
+/// detected as `pending`, replacing the file's previous rows.
+///
+/// "There is a reference here and its target is not yet known" is true and
+/// useful, and saying it is what makes fail-closed honest rather than merely
+/// quiet. It is also the row the editor lane upgrades in place when its provider
+/// answers, which is how a language with no lexical floor still produces the
+/// claims the precision meter scores (§12).
+///
+/// A reference with no enclosing definition has no node to own the row and is
+/// skipped, exactly as the resolver would abstain on it.
+fn record_generic_pendings(
+    store: &mut SqliteStore,
+    corpus: &str,
+    path: &str,
+    detected: &travsr_analysis::live_detect::LiveRefs,
+) {
+    let named = detected
+        .calls
+        .iter()
+        .chain(detected.fields.iter())
+        .map(|r| (r.line, r.name.as_str()))
+        .chain(
+            detected
+                .inheritance
+                .iter()
+                .map(|r| (r.line, r.base_name.as_str())),
+        );
+    let mut states: Vec<travsr_store::RefResolution> = Vec::new();
+    for (line, name) in named {
+        let Ok(Some(src)) = store.enclosing_definition_at(corpus, path, line) else {
+            continue;
+        };
+        states.push(travsr_store::RefResolution {
+            src,
+            ref_line: line,
+            // 0, matching the native lane, so the editor's answer for this same
+            // reference upgrades this row rather than adding a second one.
+            ref_col: 0,
+            name: name.to_string(),
+            state: "pending",
+            resolved_dst: None,
+        });
+    }
+    if let Err(e) = store.replace_ref_resolution_states(corpus, path, &states) {
+        tracing::debug!(error = %e, "recording ref_resolution_state failed");
+    }
+}
+
+fn live_resolve_file(
+    store: &mut SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+    // RFC-027 #813 (finding 2): when `Some`, the changed-definition set this save
+    // must re-resolve. References whose enclosing definition is preserved
+    // (byte-identical, committed edges intact) are dropped, so the lexical lane
+    // neither re-records them as `pending` nor rewrites their committed state.
+    // `None` re-resolves the whole file (a whole-file re-derive, or a dependent).
+    scope: Option<&std::collections::HashSet<travsr_core::NodeId>>,
+) {
+    let Some((vname_path, refs)) = extract_live_unresolved(store, corpus, repo_root, abs_path)
+    else {
+        return;
+    };
+    let (mut unresolved, mut inheritance, locally_bound) = match refs {
+        LiveRefSet::Native {
+            unresolved,
+            inheritance,
+            locally_bound,
+        } => (unresolved, inheritance, locally_bound),
+        // RFC-027 section 8.3: an editor-only language has no lexical floor —
+        // the generic detector recovers no receiver type and builds no signature
+        // key, so there is nothing to resolve without a server. What this pass
+        // still owes the file is the honest abstention record (§9.2): every
+        // detected reference starts `pending`, and the editor lane upgrades the
+        // ones its provider answers. Writing them here is also what clears the
+        // rows describing the pre-edit text, which `reindex_replace` leaves
+        // alone.
+        LiveRefSet::Generic(detected) => {
+            // Generic-detector languages have no native Phase B, so a preserved
+            // definition of theirs carries no committed edges to make its
+            // references falsely `pending`; every detected reference is genuinely
+            // pending until the editor answers it. So the generic pending record
+            // is left unscoped (the editor still resolves the whole file).
+            record_generic_pendings(store, corpus, &vname_path, &detected);
+            return;
+        }
+    };
+    // RFC-027 #813 (finding 2): drop references inside preserved definitions.
+    // A preserved definition's committed (scip/lsif) edges already resolve its
+    // references, so re-resolving them here would only overwrite that committed
+    // state with a fresh `pending`/`resolved` live row and inflate the freshness
+    // count. `call.src` is the enclosing definition; an inheritance clause's is
+    // resolved from its line the same way the resolver does below.
+    if let Some(scope) = scope {
+        unresolved.retain(|c| scope.contains(&c.src));
+        inheritance.retain(|r| {
+            store
+                .enclosing_definition_at(corpus, &vname_path, r.line)
+                .ok()
+                .flatten()
+                .is_some_and(|id| scope.contains(&id))
+        });
+    }
+    let outcome = live_resolve::resolve_unambiguous_lexical(
+        store,
+        corpus,
+        &vname_path,
+        &unresolved,
+        &inheritance,
+        &locally_bound,
+    );
+    if outcome.emitted > 0 {
+        tracing::debug!(
+            event = "live.file",
+            path = %vname_path,
+            emitted = outcome.emitted,
+            pending = outcome.pending,
+            "live overlay refreshed for saved file"
+        );
+    }
+}
+
+/// RFC-027 daemon-driven positions: the references in `abs_path` the editor
+/// should resolve with a language provider, computed from the same native
+/// extractor the save-path lexical lane uses.
+///
+/// The daemon owns *which* references and *which* edge kind; the editor owns
+/// only the exact column and the provider round-trip. This is what replaces the
+/// editor's blind `identifier(` scan and lets the lane reach every language the
+/// native extractor covers, not just what an English-shaped regex could spot.
+fn live_resolution_targets(
+    store: &SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+    // RFC-027 #813 P2: the changed-definition committed occurrences stashed for
+    // this file at its last save, enumerated as extra editor targets. Empty for
+    // a request with no fresh save (or from a test with no editor plane).
+    stashed: &[travsr_core::ChangedOccurrence],
+    // RFC-027 #813 (finding 2): when `Some`, the changed-definition set of the
+    // save this request follows. Native targets for preserved definitions are a
+    // no-op for the committed graph (`put_edge_live` only touches `live` rows)
+    // and, unscoped, would crowd the enumerated occurrences out of the editor's
+    // per-save budget on a large file, so they are dropped here the same way the
+    // save-path lexical lane drops them. `None` keeps the whole-file behavior (a
+    // request with no fresh scoped save, a dependent, or a test).
+    scope: Option<&std::collections::HashSet<travsr_core::NodeId>>,
+) -> Vec<travsr_ipc::message::LiveResolutionTarget> {
+    let Some((vname_path, refs)) = extract_live_unresolved(store, corpus, repo_root, abs_path)
+    else {
+        // Even with no native/generic references, a stashed occurrence set can
+        // still hold editor targets, so fall through to the merge rather than
+        // returning early when there is something to enumerate.
+        if stashed.is_empty() {
+            return Vec::new();
+        }
+        let content = std::fs::read_to_string(abs_path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().collect();
+        return live_resolve::merge_changed_occurrence_targets(store, &lines, Vec::new(), stashed);
+    };
+    // The file text pins each target's exact column (RFC-027 #813 P1/P2). Read
+    // and split into lines once here, then share the slice: the native builder
+    // uses the extractor's occurrence column, `fill_target_columns` fills the
+    // rest by name search, and the merge maps stashed occurrences by line.
+    let content = std::fs::read_to_string(abs_path).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut targets = match refs {
+        LiveRefSet::Native {
+            mut unresolved,
+            mut inheritance,
+            locally_bound,
+        } => {
+            // RFC-027 #813 (finding 2): scope the native targets to the changed
+            // region, mirroring `live_resolve_file`. A reference whose enclosing
+            // definition was preserved needs no editor round trip.
+            if let Some(scope) = scope {
+                unresolved.retain(|c| scope.contains(&c.src));
+                inheritance.retain(|r| {
+                    store
+                        .enclosing_definition_at(corpus, &vname_path, r.line)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|id| scope.contains(&id))
+                });
+            }
+            let mut targets =
+                live_resolve::targets_needing_editor(store, &lines, &unresolved, &locally_bound);
+            targets.extend(live_resolve::inheritance_targets_needing_editor(
+                store,
+                corpus,
+                &vname_path,
+                &inheritance,
+                &locally_bound,
+            ));
+            targets
+        }
+        // RFC-027 section 8.3: no lexical floor runs for these languages, so
+        // there is no lane to partition against and every detected reference is
+        // an editor target.
+        LiveRefSet::Generic(refs) => live_resolve::generic_targets_needing_editor(&refs),
+    };
+    // RFC-027 #813 P1: pin each remaining target's column against the file text
+    // (the ones the extractor left without an exact occurrence column) so the
+    // editor resolves at the exact position instead of searching the line.
+    live_resolve::fill_target_columns(&lines, &mut targets);
+    // RFC-027 #813 P2: enumerate the changed definitions' committed occurrences
+    // as editor targets, deduped against the native lane above.
+    live_resolve::merge_changed_occurrence_targets(store, &lines, targets, stashed)
+}
+
+/// RFC-027 section 8.7.5: the interface-edit closure, as editor targets.
+///
+/// When the saved file adds or renames a symbol other files reference by name,
+/// their edges into it were stranded — `reindex_replace` invalidated them and
+/// nothing restores them, because the editor only ever publishes the document
+/// that was saved. This computes those dependents (a file with a `pending`
+/// reference the saved file can now satisfy) and returns each one's editor
+/// targets, so the same target request re-resolves them alongside the saved
+/// file. The editor keeps the initiator role (§10.1).
+///
+/// The dependent set is derived from durable `pending` rows plus the saved
+/// file's current parse, so it does not depend on this save's watcher event
+/// having already computed a closure — the two run on independent clocks and a
+/// request can arrive first.
+///
+/// Bounded at `LIVE_CLOSURE_FILE_CAP` files; the editor bounds the *total*
+/// provider round trips across the saved file and every dependent, so one rename
+/// in a hot utility cannot turn a save into an unbounded storm of queries. A
+/// dependent dirty in another editor tab is skipped by the editor, not here: the
+/// daemon reads the file from disk and cannot see an unsaved buffer.
+fn dependent_resolution_targets(
+    store: &SqliteStore,
+    corpus: &str,
+    repo_root: &Path,
+    abs_path: &Path,
+    // RFC-027 #813 P2: the editor plane, so each dependent file's own stashed
+    // changed occurrences are enumerated alongside its native targets. `None`
+    // from a test with no plane.
+    sessions: Option<&std::sync::Mutex<EditorPlane>>,
+) -> Vec<travsr_ipc::message::DependentTargets> {
+    // Only a live-lane file the gate has not disabled can have dependents worth
+    // restoring; a disabled or unsupported language costs nothing here.
+    let Some((lang, _lane)) = live_language(abs_path) else {
+        return Vec::new();
+    };
+    if !live_lane_enabled_for(store, lang.as_str()) {
+        return Vec::new();
+    }
+    let vname_path = abs_path
+        .strip_prefix(repo_root)
+        .unwrap_or(abs_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let dependents = store
+        .dependents_pending_on_file(corpus, &vname_path, lang.as_str(), LIVE_CLOSURE_FILE_CAP)
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for dep in dependents {
+        let dep_abs = repo_root.join(&dep);
+        let stashed = sessions
+            .map(|s| {
+                s.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .stashed_changed_occurrences(&dep)
+            })
+            .unwrap_or_default();
+        // Dependents were not reindexed by this save, so there is no fresh
+        // changed-def scope for them; resolve their whole file (no scope).
+        let targets = live_resolution_targets(store, corpus, repo_root, &dep_abs, &stashed, None);
+        // A dependent with nothing for the editor to do (its references all
+        // settle lexically, or it holds none) is not worth sending.
+        if !targets.is_empty() {
+            out.push(travsr_ipc::message::DependentTargets { file: dep, targets });
+        }
+    }
+    out
+}
+
+/// RFC-027 section 12: the continuous precision meter.
+///
+/// "Is the live lane worse than nothing?" is answered empirically, not by
+/// assertion, and ground truth is on tap every commit. Each run compares what
+/// the lane claimed against what Phase B derived at the same call sites, and
+/// records the result so the per-language shipping gate has a number to read.
+///
+/// Persisted to `meta` as well as logged. A log line scrolls away; the gate
+/// needs a value `travsr status` can show and a human can act on.
+///
+/// The reading is cumulative across runs rather than last-run-only: a single
+/// commit can carry two claims, and a gate computed from a sample that small
+/// would swing between 0.0 and 1.0 on noise. Disagreements are logged
+/// individually at warn, because one wrong edge is the failure this whole design
+/// is built to avoid, and it should be visible the moment it happens rather than
+/// averaged into a ratio.
+fn measure_live_precision(store: &mut SqliteStore, ratified: &[String]) {
+    let by_lang = match store.live_precision_sample_by_language() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("live precision sample failed: {e:#}");
+            return;
+        }
+    };
+    if by_lang.is_empty() {
+        return;
+    }
+
+    // Accumulate each language's counters under its own key, and roll the same
+    // deltas into the corpus-wide `live_precision` key `travsr status` reads.
+    // The per-language keys are what the shipping gate (`live_lane_enabled_for`)
+    // consults; the aggregate stays a faithful sum so the status line is
+    // unchanged.
+    let (mut run_agree, mut run_disagree, mut run_unverifiable) = (0u64, 0u64, 0u64);
+    for (lang, sample) in &by_lang {
+        if sample.claims() == 0 {
+            continue;
+        }
+        // Score only the languages whose Phase B just completed. A crashed
+        // sidecar leaves its `edge_sites` un-refreshed, so scoring its claims now
+        // would land every reference added since the last commit in
+        // `unverifiable` against evidence that was never re-derived — and
+        // `consume_measured_ref_resolutions` (also `ratified`-scoped) would then
+        // delete those claims before their own ratification could score them.
+        // Same #712 reasoning as `sweep_live_edges_for_languages` below.
+        if !ratified.iter().any(|r| r == lang) {
+            continue;
+        }
+        let prior = read_precision_totals_for(store, Some(lang));
+        let _ = store.set_meta(
+            &live_precision_meta_key(Some(lang)),
+            &format!(
+                "{},{},{}",
+                prior.0 + sample.agree,
+                prior.1 + sample.disagree,
+                prior.2 + sample.unverifiable
+            ),
+        );
+
+        if sample.disagree > 0 {
+            tracing::warn!(
+                event = "live.precision.disagreement",
+                language = %lang,
+                disagreed = sample.disagree,
+                agreed = sample.agree,
+                "the live lane resolved a reference differently from Phase B"
+            );
+        }
+        tracing::info!(
+            event = "live.precision",
+            language = %lang,
+            agree = sample.agree,
+            disagree = sample.disagree,
+            unverifiable = sample.unverifiable,
+            precision = ?sample.precision(),
+            coverage = sample.coverage(),
+            "live overlay scored against Phase B"
+        );
+
+        run_agree += sample.agree;
+        run_disagree += sample.disagree;
+        run_unverifiable += sample.unverifiable;
+    }
+
+    let prior = read_precision_totals(store);
+    let _ = store.set_meta(
+        LIVE_PRECISION_META,
+        &format!(
+            "{},{},{}",
+            prior.0 + run_agree,
+            prior.1 + run_disagree,
+            prior.2 + run_unverifiable
+        ),
+    );
+}
+
+/// Cumulative corpus-wide `(agree, disagree, unverifiable)` recorded so far.
+fn read_precision_totals(store: &SqliteStore) -> (u64, u64, u64) {
+    read_precision_totals_for(store, None)
+}
+
+/// Cumulative `(agree, disagree, unverifiable)` for one language, or the
+/// corpus-wide aggregate when `language` is `None`.
+///
+/// A malformed or absent value reads as zeroes: the meter is diagnostic, and a
+/// corrupt counter must never fail a commit or wrongly disable a language.
+fn read_precision_totals_for(store: &SqliteStore, language: Option<&str>) -> (u64, u64, u64) {
+    let raw = store
+        .get_meta(&live_precision_meta_key(language))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let parts: Vec<u64> = raw
+        .split(',')
+        .filter_map(|p| p.trim().parse::<u64>().ok())
+        .collect();
+    match parts.as_slice() {
+        [a, d, u] => (*a, *d, *u),
+        _ => (0, 0, 0),
+    }
+}
+
+/// The `meta` key holding cumulative live-lane precision counters. The
+/// corpus-wide aggregate is `live_precision`; each language namespaces under it
+/// as `live_precision.<language>` (matching `nodes.language`).
+fn live_precision_meta_key(language: Option<&str>) -> String {
+    match language {
+        Some(lang) => format!("{LIVE_PRECISION_META}.{lang}"),
+        None => LIVE_PRECISION_META.to_string(),
+    }
+}
+
+/// Cumulative live-lane precision counters, as `agree,disagree,unverifiable`.
+const LIVE_PRECISION_META: &str = "live_precision";
+
+/// RFC-027 section 12: the per-language shipping bar. Below this the lane is
+/// disabled for a language ("a measured decision, not a guess").
+const LIVE_PRECISION_GATE: f64 = 0.99;
+
+/// Minimum verified live claims before the gate may DISABLE a language.
+///
+/// Below this the sample is too small to act on as an *adverse* reading, so an
+/// already-shipped language keeps running and gathering evidence rather than
+/// being silenced for good by one early disagreement. Precision-first, but not
+/// trigger-shy.
+const LIVE_PRECISION_MIN_SAMPLE: u64 = 20;
+
+/// RFC-027 sections 12 and 8.7.5: the languages the live lane ships ENABLED,
+/// each vouched at measured precision ≥ 0.99.
+///
+/// This is the strict-gate opt-in (§8.7.6 decision). RFC §12 says a language
+/// ships enabled only at measured precision ≥ 0.99, but the earlier policy left
+/// an *unmeasured* language enabled so it could earn a reading — which, when
+/// eleven non-native languages joined at once, meant nine shipped enabled with
+/// no reading at all. Strict gating inverts that default: a language is disabled
+/// until it is on this list, and it joins the list only after a real server plus
+/// its ratification oracle measured it at ≥ 0.99 (the §11.3 procedure). Adding a
+/// `nodes.language` value here is therefore the per-language opt-in the RFC asks
+/// for, auditable in git history against the reading that earned it.
+///
+/// `nodes.language` values (what the meter keys on). JavaScript has no value of
+/// its own — `.js`/`.jsx` map to `typescript` — so one entry covers both.
+///
+/// The list grows as §11.3 fills in. Each entry's earning reading:
+/// - `typescript`, `python` — native, gated at ship since RFC §14 Phase 0–4.
+/// - `rust` — native; re-measured end to end at 1.0000 (`4,0,0`, §11.3).
+/// - `go` — gopls, 1.0000 (`4,0,0`).
+/// - `dart` — Dart analysis server + travsr-lang-dart, 1.0000 (`3,0,1`).
+/// - `swift` — sourcekit-lsp + travsr-swift-index-emitter, 1.0000 (`3,0,1`).
+/// - `cpp` — clangd + scip-clang, 1.0000 (`1,0,0`); recall capped by §8.7.3
+///   (out-of-line method defs abstain), so the field read is what it emits and
+///   that is correct.
+/// - `java` — jdtls + scip-java, 1.0000 (`3,0,0`, call/field/is-impl); scip-java
+///   needs a Maven/Gradle build to emit references (a build-less fixture swept
+///   and read `0,0,4`).
+/// - `csharp` — csharp-ls + scip-dotnet, 1.0000 (`6,0,0`, call/field/is-impl).
+///   Live edges resolve via csharp-ls with no extra setup. The oracle needs
+///   `DOTNET_ROOT`; the plugin host resolves and injects it when `dotnet` is on
+///   the daemon's PATH, and the travsr-lang csharp emitter now self-resolves it
+///   from well-known installs when a minimal-PATH daemon leaves the host unable
+///   to (travsr-lang `fix/csharp-dotnet-root-sandbox-path`). If the oracle still
+///   cannot run, the edges persist as `live` rather than ratifying — honest,
+///   not wrong.
+/// - `kotlin` — kotlin-language-server, live and as the travsr-lang-kotlin
+///   oracle, 1.0000 (`11,0,0`) on the live-lane fixture.
+/// - `php` — Intelephense live, scip-php as the oracle, 1.0000 (`6,0,0`) on the
+///   live-lane fixture once it has a `composer.json` and `composer install` ran.
+/// - `c`, `objectivec` — clangd live, travsr-lang v0.6.0 as the oracle,
+///   1.0000 (`12,0,0` and `4,0,0`) on the live-lane fixture. The earlier
+///   `0,0,2` unverifiable reading (no matching `edge_sites`) no longer reproduces.
+///
+/// Deliberately absent:
+/// - `ruby` — the LSP lane is fundamentally weak: an untyped receiver
+///   (`def run(s); s.start; end`) gives ruby-lsp nothing to resolve, so it
+///   abstains. This is the §8.4 dynamic-language limit, not an install gap.
+/// - `scala` — blocked by JVM build-toolchain setup, not the live lane: its
+///   SemanticDB oracle needs `sbt compile`.
+///
+/// Each entry is `(nodes.language, verified claims behind the decision)`.
+///
+/// The sample size is recorded **as data**, not only in the prose above, so the
+/// evidence behind each opt-in is visible at the point the gate reads it and a
+/// reviewer can weigh `cpp`'s single claim against `csharp`'s six without
+/// reconstructing them from a doc comment. `verified` counts agree + disagree;
+/// `unverifiable` claims are excluded, because a claim Phase B left no evidence
+/// for vouches for nothing.
+const LIVE_LANE_SHIPPED: &[(&str, u64)] = &[
+    ("typescript", 2),
+    ("rust", 4),
+    ("python", 2),
+    ("go", 4),
+    ("dart", 3),
+    ("swift", 3),
+    ("cpp", 1),
+    ("java", 3),
+    ("csharp", 6),
+    ("kotlin", 11),
+    ("php", 6),
+    ("c", 12),
+    ("objectivec", 4),
+];
+
+/// Force-enable a language for measurement, bypassing the strict opt-in gate
+/// (but never the adverse-meter safety below).
+///
+/// A language absent from [`LIVE_LANE_SHIPPED`] cannot run, so it can never
+/// produce the claims the meter needs to measure it — the deadlock the strict
+/// gate would otherwise create. `TRAVSR_LIVE_LANE_MEASURE` (comma-separated
+/// `nodes.language` values) lifts the gate for exactly the languages being
+/// measured, so the §11.3 harness can drive one long enough to earn a reading.
+/// Set on the daemon running a fixture; never in production, where the shipped
+/// list is authoritative.
+fn live_lane_measure_forced(language: &str) -> bool {
+    std::env::var("TRAVSR_LIVE_LANE_MEASURE")
+        .ok()
+        .is_some_and(|v| v.split(',').any(|l| l.trim() == language))
+}
+
+/// RFC-027 section 12: is the live lane enabled for `language`?
+///
+/// Two independent conditions, both of which must hold:
+///
+/// 1. **No adverse reading.** The cumulative per-language meter must not carry a
+///    statistically meaningful adverse sample — at least
+///    [`LIVE_PRECISION_MIN_SAMPLE`] verified claims *and* precision below
+///    [`LIVE_PRECISION_GATE`]. This disables even a shipped language whose
+///    measured precision has degraded, and it is self-healing: a later run whose
+///    Phase B agreement lifts the cumulative precision back over the bar
+///    re-enables it on its own.
+/// 2. **Vouched to ship** (§8.7.6). The language is on [`LIVE_LANE_SHIPPED`], or
+///    force-enabled for measurement ([`live_lane_measure_forced`]). An
+///    unmeasured language is disabled until it earns a reading and is opted in,
+///    which makes "ships enabled only at measured precision ≥ 0.99" literally
+///    true rather than aspirational.
+///
+/// The two directions deliberately use different evidence bars, and the
+/// asymmetry is the point rather than an oversight. Enabling is a **human**
+/// decision, recorded in git next to the reading that earned it: each
+/// [`LIVE_LANE_SHIPPED`] entry carries its verified-claim count as data (1 to 12
+/// today), so a reviewer can see the evidence and refuse it. Disabling is
+/// **automatic** and irreversible-feeling to a user who cannot see why their
+/// lane went quiet, so it needs a bar noise cannot cross on its own, which is
+/// what [`LIVE_PRECISION_MIN_SAMPLE`] is. Requiring twenty verified claims to
+/// *enable* would instead mean shipping nothing at all: no language can produce
+/// claims while disabled, and `TRAVSR_LIVE_LANE_MEASURE` exists precisely
+/// because that deadlock is real.
+///
+/// Those recorded readings were taken while the meter double-counted a claim at
+/// every commit (each fixture runs one or two commits, so the inflation is small
+/// but not zero). They are worth re-taking against the corrected meter before
+/// any further language joins the list.
+fn live_lane_enabled_for(store: &SqliteStore, language: &str) -> bool {
+    let (agree, disagree, unverifiable) = read_precision_totals_for(store, Some(language));
+    let sample = travsr_store::LivePrecision {
+        agree,
+        disagree,
+        unverifiable,
+    };
+    let verified = agree + disagree;
+    if let Some(p) = sample.precision() {
+        if verified >= LIVE_PRECISION_MIN_SAMPLE && p < LIVE_PRECISION_GATE {
+            return false;
+        }
+    }
+    LIVE_LANE_SHIPPED.iter().any(|(l, _)| *l == language) || live_lane_measure_forced(language)
+}
+
+/// Whether calls in a language are traced as the user edits, for `status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditTracing {
+    On,
+    /// Shipped, but its measured precision here fell below the bar.
+    OffMeasured,
+    /// Not available for this language (not on [`LIVE_LANE_SHIPPED`]).
+    OffUnavailable,
+}
+
+/// [`live_lane_enabled_for`] with the reason when it is off. Takes a catalog
+/// language; `javascript` files are metered as `typescript`.
+pub fn edit_tracing(store: &SqliteStore, language: &str) -> EditTracing {
+    let language = if language == "javascript" {
+        "typescript"
+    } else {
+        language
+    };
+    if live_lane_enabled_for(store, language) {
+        EditTracing::On
+    } else if LIVE_LANE_SHIPPED.iter().any(|(l, _)| *l == language) {
+        EditTracing::OffMeasured
+    } else {
+        EditTracing::OffUnavailable
+    }
+}
+
+/// RFC-027 section 8.3: retire the live overlay and clear resolved pendings.
+///
+/// Extracted so the convergence property test can drive ratification directly
+/// instead of racing the background scheduler.
+///
+/// Fail-open on both steps: a sweep that errors leaves `live` rows labeled as
+/// what they are, which is stale but honest, and never wrong.
+fn ratify_live_overlay(store: &mut SqliteStore, ratified: &[String]) {
+    // RFC-027 section 12: score the overlay before retiring it. Order matters —
+    // after the Phase B writes, because that is the truth being compared
+    // against, and before the sweep, because the sweep discards the evidence.
+    measure_live_precision(store, ratified);
+    // The meter is cumulative, so a scored claim has to be retired or the next
+    // commit counts it again: the ratio would survive but the sample size — the
+    // thing `LIVE_PRECISION_MIN_SAMPLE` gates on — would not. Scoped to
+    // `ratified` for the same reason `measure_live_precision` is: a claim scored
+    // by this commit is a claim whose language completed, and only those may be
+    // retired — a crashed language's claims must survive to be scored at its own
+    // ratification.
+    match store.consume_measured_ref_resolutions(ratified) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!(
+            event = "live.precision.consumed",
+            claims = n,
+            "retired the live claims this ratification scored"
+        ),
+        Err(e) => tracing::debug!("consuming measured live claims failed: {e:#}"),
+    }
+    match store.sweep_live_edges_for_languages(ratified) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!(
+            event = "live.swept",
+            swept = n,
+            languages = ?ratified,
+            "retired live edges Phase B did not re-derive"
+        ),
+        Err(e) => tracing::warn!("live overlay sweep failed: {e:#}"),
+    }
+    // A reference Phase B recorded a call site for is no longer pending, whoever
+    // resolved it, and rows whose `src` node was renamed away are unreachable by
+    // every other delete path. Same reconcile every Phase B completion runs
+    // (#811); see `reconcile_ref_resolution_states`.
+    reconcile_ref_resolution_states(store);
+}
+
+/// #811: reconcile `ref_resolution_state` with the graph after Phase B lands.
+///
+/// The single call site shared by every path that completes a Phase B pass:
+/// the daemon's live-overlay ratification ([`ratify_live_overlay`]), the CLI's
+/// inline full rebuild (`travsr init --semantic`, in
+/// [`init_repo_with_progress`]), and daemon startup
+/// ([`reconcile_ref_resolution_states_on_startup`]). Before this, only the
+/// first of those ran the reconcile, so `pending` rows a full rebuild had
+/// resolved survived `travsr init --semantic --force` and a restart on a
+/// current index alike, and `pending_ref_count` over-reported references the
+/// rebuilt graph resolves.
+///
+/// The work itself lives in the store
+/// ([`SqliteStore::reconcile_ref_resolution_states`]): one transaction, keyed on
+/// evidence only (a matching `edge_sites(src, line)` row, a missing `src`
+/// node), and a second run is a no-op. The site match is per line, not per
+/// name, so a line with several references loses all its pending rows once any
+/// of them resolves; see the store method's doc for that limitation.
+///
+/// Fail-open, like the rest of ratification: a reconcile that errors leaves
+/// stale-but-honest rows behind and never costs the graph anything, so it is
+/// logged and not propagated.
+fn reconcile_ref_resolution_states(store: &mut SqliteStore) {
+    match store.reconcile_ref_resolution_states() {
+        Ok(r) if r.total() == 0 => {}
+        Ok(r) => tracing::debug!(
+            event = "live.pending.reconciled",
+            cleared_resolved = r.cleared_resolved,
+            purged_orphans = r.purged_orphans,
+            "reconciled ref_resolution_state against the ratified graph"
+        ),
+        Err(e) => tracing::debug!("reconciling ref_resolution_state failed: {e:#}"),
+    }
+}
+
+/// #811: the daemon-startup half of the reconcile.
+///
+/// A daemon restarted on an index that is already current never runs Phase B:
+/// `arm_phase_b_if_pending` only arms when `last_commit != phase_b_commit`, and
+/// `run_background_phase_b_inner` returns before ratification when they match.
+/// So whatever `pending` rows the previous daemon (or a CLI rebuild made before
+/// this fix) left behind would stay for the life of the index. Reconciling once
+/// at startup closes that gap without any graph work: it is two evidence-keyed
+/// `DELETE`s under a brief lock, never a rebuild, and on a clean table it
+/// deletes nothing.
+///
+/// Logged at `info` when it removed something, because a non-zero count here
+/// is exactly the backlog #811 reported and worth seeing in `travsr daemon logs`.
+fn reconcile_ref_resolution_states_on_startup(store: &std::sync::Mutex<SqliteStore>) {
+    let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+    match s.reconcile_ref_resolution_states() {
+        Ok(r) if r.total() == 0 => {}
+        Ok(r) => tracing::info!(
+            event = "live.pending.reconciled",
+            cleared_resolved = r.cleared_resolved,
+            purged_orphans = r.purged_orphans,
+            "startup: reconciled stale ref_resolution_state rows left by a previous session"
+        ),
+        Err(e) => tracing::warn!("startup ref_resolution_state reconcile failed: {e:#}"),
+    }
+}
+
+/// Open the daemon's writable store and run the startup hygiene it owes the
+/// index.
+///
+/// This is the only way `run` obtains its store, and the #811 startup reconcile
+/// ([`reconcile_ref_resolution_states_on_startup`]) lives inside it rather than
+/// as a separate statement after the open, so the daemon cannot come up with a
+/// store that skipped it. A restart on a current index never reaches Phase B
+/// ratification, which makes this the one place stale `pending` rows a previous
+/// session left behind can be retired; a test opens a store through here and
+/// checks they are gone.
+fn open_daemon_store(
+    db_path: &Path,
+) -> anyhow::Result<std::sync::Arc<std::sync::Mutex<SqliteStore>>> {
+    let store = std::sync::Arc::new(std::sync::Mutex::new(
+        SqliteStore::open(db_path).context("opening graph.db")?,
+    ));
+    reconcile_ref_resolution_states_on_startup(&store);
+    Ok(store)
+}
+
+/// The `nodes.language` values whose live overlay this Phase B run may retire.
+///
+/// `report.ran` names the languages whose analyzers completed. Two adjustments
+/// map that onto how nodes are actually labeled:
+///
+/// - JavaScript has no `nodes.language` of its own. `Language::from_extension`
+///   maps `.js`/`.jsx` to `TypeScript`, so a run that analysed JavaScript
+///   ratifies rows labeled `typescript`.
+///
+/// A language absent from this set keeps its live edges. That is the #712
+/// partial-success case: the marker advances because *something* progressed,
+/// but a crashed sidecar's truth was never re-derived, and discarding its
+/// overlay would take away precision without replacing it.
+fn ratified_languages(report: &PhaseBReport) -> Vec<String> {
+    let mut langs: Vec<String> = Vec::with_capacity(report.ran.len());
+    for lang in &report.ran {
+        // JavaScript nodes are labeled `typescript`; see above.
+        let mapped = if lang == "javascript" {
+            "typescript"
+        } else {
+            lang.as_str()
+        };
+        if !langs.iter().any(|l| l == mapped) {
+            langs.push(mapped.to_string());
+        }
+    }
+    langs
+}
+
+/// Whether a `travsr init` holds this repo's `init.lock`.
+pub fn init_running(repo_root: &Path) -> bool {
+    std::fs::File::open(repo_root.join(".travsr").join("init.lock"))
+        .is_ok_and(|f| fs2::FileExt::try_lock_exclusive(&f).is_err())
+}
+
 fn run_background_phase_b_inner(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
@@ -3817,17 +5476,18 @@ fn run_background_phase_b_inner(
         }
         (corpus, last)
     };
+    // A `travsr init` is running Phase B inline for this commit; doing it here
+    // too repeats the same work. The next tick runs it if that init is
+    // interrupted, since the markers still differ once it releases the lock.
+    if init_running(repo_root) {
+        return phase_b_sched::RunOutcome::Success;
+    }
 
     tracing::info!(
         event = "phase_b.start",
         commit = %target_sha,
         "semantic call and reference indexing starting"
     );
-
-    // ── LSIF pass (TypeScript compiler — expensive, runs lock-free) ───────────
-    // Collect edges into a Vec first; write them under the store lock below.
-    // This mirrors the SCIP sidecar pattern and keeps queries warm throughout.
-    let lsif_edges = run_lsif_pass_collect(repo_root, &corpus);
 
     // ── SCIP sidecar pass (all languages in parallel, lock-free) ─────────────
     // P6 (#329): single walk yields both present_languages and indexable_paths
@@ -3837,6 +5497,7 @@ fn run_background_phase_b_inner(
     let dart_present = present_languages.contains("dart");
     // R1: reset per-Phase-B skip latch before the run (same as init_repo_with_progress).
     travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+    travsr_indexer::sandbox::reset_lsif_analyzer_failures();
     let indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
     let inputs = travsr_plugin_host::PhaseBInputs {
         repo_root,
@@ -3847,6 +5508,7 @@ fn run_background_phase_b_inner(
     };
     let (pb_nodes, pb_edges, mut pb_refs, pb_unresolved, pb_positional, pb_outcome) =
         indexer.invoke_phase_b_all(&inputs);
+    classify_phase_b_calls(repo_root, &pb_nodes, &mut pb_refs);
 
     // ── Single write batch under the lock ─────────────────────────────────────
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -3882,14 +5544,7 @@ fn run_background_phase_b_inner(
         "semantic analysis cross-reference resolution complete"
     );
 
-    // Write LSIF edges first (pre-collected lock-free above).
-    for edge in &lsif_edges {
-        if let Err(e) = s.put_edge_lsif(edge) {
-            tracing::warn!("lsif edge write error: {e}");
-        }
-    }
-
-    let (report, alias_map) = write_phase_b_results(
+    let (report, alias_map, dropped) = write_phase_b_results(
         &mut s,
         &corpus,
         pb_nodes,
@@ -3910,8 +5565,8 @@ fn run_background_phase_b_inner(
     // points at a SCIP node that unification dropped.
     // #757: split field-access occurrences from calls before remap+write.
     let (call_sites, field_sites) = split_field_sites(&resolved, resolved_sites);
-    let call_sites = remap_resolved_sites(call_sites, &alias_map);
-    let field_sites = remap_resolved_sites(field_sites, &alias_map);
+    let call_sites = remap_resolved_sites(call_sites, &alias_map, &dropped);
+    let field_sites = remap_resolved_sites(field_sites, &alias_map, &dropped);
     if let Err(e) = s.record_edge_sites(&call_sites) {
         tracing::warn!("recording cross-crate edge_sites: {e:#}");
     }
@@ -3931,40 +5586,54 @@ fn run_background_phase_b_inner(
     // `travsr status` reports `partial (crashed: <lang>)` and the query tools
     // stop emitting the "building in the background" note that previously never
     // resolved. The marker is left behind ONLY when a language crashed AND nothing
-    // else made progress (`!crashed.is_empty()` with both `ran` and `lsif_edges`
-    // empty), so the all-crash retry cap can keep trying that broken sidecar until
+    // else made progress (`!crashed.is_empty()` with `ran` empty), so the all-crash retry cap can keep trying that broken sidecar until
     // its tool is fixed. The no-op case — nothing ran and nothing crashed, e.g. no
     // analyzer is installed for any language in this repo — stamps the marker,
     // because there is nothing to wait for. A persistently crashing language is
     // retried on the next commit or an explicit `travsr reindex --semantic
     // --force`, not on an endless background loop.
-    let made_progress =
-        report.crashed.is_empty() || !report.ran.is_empty() || !lsif_edges.is_empty();
+    let made_progress = report.crashed.is_empty() || !report.ran.is_empty();
+
+    // RFC-027 section 8.3: ratify the live overlay.
+    //
+    // Position matters twice over. This runs *after* every SCIP/LSIF/native
+    // write above, so any live edge Phase B re-derived has already been
+    // relabelled in place by those writes and what remains marked `live` is
+    // exactly what Phase B did not re-derive. And it runs *before* the marker
+    // advance below, while the same store lock is still held, so no in-process
+    // reader can observe the graph between ratification and the marker.
+    //
+    // Not one WAL transaction, and it does not need to be. The Phase B write
+    // path is already several self-committing statements under a process-local
+    // mutex, so there is no single transaction to append this to. Because the
+    // order is insert-then-delete, the only state an out-of-process reader can
+    // catch mid-flight is a superset of the ratified graph, never a gap. The
+    // hazard the RFC worried about was the gap; the ordering dissolves it.
+    if made_progress {
+        ratify_live_overlay(&mut s, &ratified_languages(&report));
+    }
+
     if made_progress {
         let _ = s.set_meta("phase_b_commit", &target_sha);
         // #583: the semantic layer now matches the working tree again.
         let _ = s.set_meta("phase_b_dirty", "0");
     }
 
-    let outcome = if report.crashed.is_empty() {
-        phase_b_sched::RunOutcome::Success
-    } else if made_progress {
-        // Healthy languages advanced to HEAD, so the next scheduler tick early-
-        // returns (last_commit == phase_b_commit) instead of re-running: the
-        // loop settles after one back-off cycle rather than retrying a
-        // persistently broken sidecar forever (#464 follow-up, #712).
-        phase_b_sched::RunOutcome::Partial
-    } else {
-        phase_b_sched::RunOutcome::AllCrashed
-    };
+    let outcome = run_outcome(&report, made_progress);
     let succeeded = outcome != phase_b_sched::RunOutcome::AllCrashed;
 
     tracing::info!(
         commit = %target_sha,
         event = "phase_b.complete",
         ran = report.ran.len(),
-        lsif_edges = lsif_edges.len(),
+        // #878: the class says whether an analyzer never ran or failed.
+        lsif_skipped = ?report
+            .lsif_skipped
+            .iter()
+            .map(|s| format!("{}:{}", s.warning_class(), s.language))
+            .collect::<Vec<_>>(),
         crashed = report.crashed.len(),
+        write_failures = report.write_failures,
         outcome = ?outcome,
         "semantic call and reference indexing complete"
     );
@@ -4096,18 +5765,40 @@ pub fn reconcile_tracked_tree(
     Ok((dirty, paths.len()))
 }
 
-/// Re-index a set of changed files into `store`.
+/// RFC-027 #813 P2: per-file changed-definition committed occurrences, keyed by
+/// repo-relative path, as [`reindex_files_reporting`] returns them for the save
+/// path to stash.
+type ChangedOccurrencesByFile = Vec<(String, Vec<travsr_core::ChangedOccurrence>)>;
+
+/// RFC-027 #813 (finding 2): per-file changed-definition set (the nodes whose
+/// committed edges `reindex_replace` did NOT preserve), keyed by repo-relative
+/// path, so the save-path live lane re-resolves only the changed region and does
+/// not re-record a preserved definition's already-committed references as
+/// `pending`. Empty for a whole-file re-derive, where every node is "changed".
+type ChangedDefsByFile = Vec<(String, std::collections::HashSet<travsr_core::NodeId>)>;
+
+/// Re-index a set of changed files into `store`, also surfacing each file's
+/// changed-definition committed occurrences (RFC-027 #813 P2) for the live
+/// overlay to enumerate as editor targets.
 ///
 /// For each file:
 /// - Compute its SHA-256 hash.
 /// - Skip if the stored hash matches (file unchanged).
 /// - Otherwise: delete its nodes/edges, re-parse, persist new records,
 ///   update the file hash, and record the HEAD commit SHA in `meta`.
-pub fn reindex_files(
+///
+/// Most callers want only the dirty-caller set and use the thin
+/// [`reindex_files`] wrapper; the save path uses this variant to stash the
+/// occurrences for the file the editor is about to request targets for.
+pub fn reindex_files_reporting(
     paths: &[PathBuf],
     repo_root: &Path,
     store: &mut SqliteStore,
-) -> anyhow::Result<travsr_core::DirtySet> {
+) -> anyhow::Result<(
+    travsr_core::DirtySet,
+    ChangedOccurrencesByFile,
+    ChangedDefsByFile,
+)> {
     // Keep `repo_root` current. This path runs on every commit and on every
     // watcher batch, and it already knows the root, so stamping here closes the
     // window where a moved checkout keeps a stale value until someone runs an
@@ -4171,8 +5862,19 @@ pub fn reindex_files(
     // instead of degrading them to the `@workspace` sentinel.
     let mut member_manifests: Vec<PathBuf> = Vec::new();
     let mut any_changed = false;
+    // A change that can drop committed call edges (#583), as opposed to one to
+    // a file whose language has no traced calls.
+    let mut calls_changed = false;
     // Accumulate Tier-0 dirty callers across all files in this batch.
     let mut callers_all = travsr_core::DirtySet::default();
+    // RFC-027 #813 P2: per-file changed-definition committed occurrences, for the
+    // save path to stash and the live lane to enumerate as editor targets.
+    let mut changed_occ_all: ChangedOccurrencesByFile = Vec::new();
+    // RFC-027 #813 (finding 2): per-file changed-definition set, for the save
+    // path to scope its lexical re-resolution to the changed region.
+    let mut changed_defs_all: ChangedDefsByFile = Vec::new();
+    // Paths this batch rewrote, for the end-of-batch orphan sweep below.
+    let mut written_paths: Vec<String> = Vec::new();
 
     // L5b: unlike `index_paths_parallel`'s full-repo `paths`, this commit-hook
     // batch only contains changed files — a `.m`/`.mm` sibling may not be in it
@@ -4184,6 +5886,10 @@ pub fn reindex_files(
         .any(|p| p.extension().and_then(|e| e.to_str()) == Some("h"))
         && repo_has_objc_sources(repo_root);
 
+    // tsconfig `paths` aliases (e.g. @/* -> src/*) for TS/JS import resolution;
+    // read once per batch, empty for repos without one.
+    let ts_aliases = parse_tsconfig_path_aliases(repo_root);
+
     for abs_path in paths {
         let vname_path = abs_path
             .strip_prefix(repo_root)
@@ -4192,13 +5898,12 @@ pub fn reindex_files(
             .replace('\\', "/");
 
         // §2 GC keystone: detect deletion before touching the graph.
-        let new_hash = match hash_file(abs_path) {
-            Ok(h) => h,
-            Err(ref err)
-                if err
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-            {
+        // Read the file once; the same bytes feed both the hash and the content
+        // handed to reindex_replace below (RFC-027 #813), so a changed file is
+        // read a single time on this path instead of once per use.
+        let bytes = match std::fs::read(abs_path) {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 // File was deleted — both-direction delete + clear file hash row.
                 match store.delete_file(&corpus, &vname_path) {
                     Ok(callers) => {
@@ -4212,17 +5917,18 @@ pub fn reindex_files(
                             callers_all.extend(callers);
                         }
                         any_changed = true;
+                        calls_changed |= change_can_drop_calls(&vname_path);
                     }
                     Err(e) => tracing::warn!(path = %vname_path, err = %e, "delete_file failed"),
                 }
                 continue;
             }
             Err(err) => {
-                tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %err, "hash failed, skipping");
+                tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %err, "read failed, skipping");
                 continue;
             }
         };
-        let new_hex = hex_encode(&new_hash);
+        let new_hex = hex_encode(&hash_bytes(&bytes));
 
         let old_hex = store.get_file_hash(&vname_path)?;
         if old_hex.as_deref() == Some(&new_hex) {
@@ -4252,7 +5958,9 @@ pub fn reindex_files(
 
         // Build import-resolver edges before the atomic reindex_replace call.
         let import_edges = match Language::from_extension(ext) {
-            Some(Language::TypeScript) => link_imports(&out.nodes, &vname_path, &corpus),
+            Some(Language::TypeScript) => {
+                link_imports_aliased(&out.nodes, &vname_path, &corpus, &ts_aliases)
+            }
             Some(Language::Rust) => link_imports_rust(&out.nodes, &vname_path, &corpus),
             Some(Language::Python) => {
                 link_imports_python_fs(&out.nodes, &vname_path, &corpus, repo_root)
@@ -4265,7 +5973,22 @@ pub fn reindex_files(
         // §2: owned-edge-only atomic replace — preserves inbound edges to surviving
         // symbols (blank-line/body edits lossless) and eagerly deletes orphans for
         // removed symbols. Hash upsert is inside the same transaction.
-        match store.reindex_replace(&corpus, &vname_path, &out.nodes, &all_edges, &new_hex) {
+        //
+        // RFC-027 #813: hand the current text to the store so a pure body edit
+        // preserves the committed edges of every definition it left untouched
+        // instead of purging and re-deriving the whole file. Reuses the bytes
+        // read above; `None` for a file that is not valid UTF-8 (the store then
+        // falls back to the whole-file purge), which a source file the parser
+        // accepted will not be.
+        let content = String::from_utf8(bytes).ok();
+        match store.reindex_replace(
+            &corpus,
+            &vname_path,
+            &out.nodes,
+            &all_edges,
+            &new_hex,
+            content.as_deref(),
+        ) {
             Ok(report) => {
                 if !report.callers.is_empty() {
                     tracing::debug!(
@@ -4277,7 +6000,23 @@ pub fn reindex_files(
                     );
                     callers_all.extend(report.callers);
                 }
+                if !report.changed_occurrences.is_empty() {
+                    changed_occ_all.push((vname_path.clone(), report.changed_occurrences));
+                }
+                // RFC-027 #813 (finding 2): the changed region this save must
+                // re-resolve. Recorded only when preservation actually happened
+                // (a smaller set than the whole file); an empty `changed_defs`
+                // means every definition was preserved, so nothing needs
+                // re-resolving and the save path skips the lexical lane for it.
+                if report.preserved_any {
+                    changed_defs_all.push((
+                        vname_path.clone(),
+                        report.changed_defs.iter().copied().collect(),
+                    ));
+                }
                 any_changed = true;
+                calls_changed |= change_can_drop_calls(&vname_path);
+                written_paths.push(vname_path.clone());
                 // Collect FFI markers for the repo-level pass (RFC-005).
                 all_ffi_markers.extend(out.ffi_markers);
                 // Collect Cargo workspace dep markers for the A2 repo-level pass.
@@ -4359,20 +6098,23 @@ pub fn reindex_files(
         // so the two markers stay equal while the graph is degraded below the
         // committed snapshot. Record that here so `travsr status` can say so
         // instead of reporting `complete`. Cleared by the next completed Phase
-        // B run, which is still commit-gated on purpose.
-        let _ = store.set_meta("phase_b_dirty", "1");
-        // A monotonic counter beside the flag, so a run that clears the flag can
-        // tell whether anything marked it dirty *while that run was working*.
-        // The flag alone cannot answer that: it is already "1" in the case that
-        // matters, so a before/after comparison of its value sees no change and
-        // clears a degradation that arrived mid-run (#742 review).
-        let seq = store
-            .get_meta(PHASE_B_DIRTY_SEQ)
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-        let _ = store.set_meta(PHASE_B_DIRTY_SEQ, &seq.wrapping_add(1).to_string());
+        // B run, which is still commit-gated on purpose. A file with no traced
+        // calls (a config file `connect` wrote) cannot drop one.
+        if calls_changed {
+            let _ = store.set_meta("phase_b_dirty", "1");
+            // A monotonic counter beside the flag, so a run that clears the flag can
+            // tell whether anything marked it dirty *while that run was working*.
+            // The flag alone cannot answer that: it is already "1" in the case that
+            // matters, so a before/after comparison of its value sees no change and
+            // clears a degradation that arrived mid-run (#742 review).
+            let seq = store
+                .get_meta(PHASE_B_DIRTY_SEQ)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let _ = store.set_meta(PHASE_B_DIRTY_SEQ, &seq.wrapping_add(1).to_string());
+        }
 
         // Recompute k-core shell numbers so they stay fresh after every commit.
         // O(V + E) — fast enough to run inline on the hook path at MVP scale.
@@ -4403,62 +6145,76 @@ pub fn reindex_files(
     // The LSIF pass now runs only from `init_repo` (full initial index).
     // Per-commit LSIF delta is tracked as DEBT(travsr-25).
 
-    Ok(callers_all)
+    // Bring the incremental path up to the init path's "no orphan edges"
+    // invariant. `flush_staging_to_production` drops staged edges with a
+    // missing endpoint once every node in the batch has landed; nothing did the
+    // equivalent here, so speculative import candidates (`./user` becomes
+    // `user.ts`/`user.tsx`/`user.js`, only one of which exists) survived every
+    // incremental write. A full index and an incremental index of the same tree
+    // therefore disagreed by two edges per TypeScript import, and `fsck`
+    // reported orphans on a healthy repo.
+    //
+    // After the loop, not inside it: an edge from an already-processed file to
+    // one later in this same batch is legitimately dangling until that file's
+    // nodes land. This is the same position the staging flush occupies.
+    if any_changed {
+        match store.sweep_orphan_edges_for_paths(&corpus, &written_paths) {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(
+                swept = n,
+                "reindex: dropped speculative edges with no destination node"
+            ),
+            Err(e) => tracing::warn!("reindex: orphan edge sweep failed: {e}"),
+        }
+    }
+
+    Ok((callers_all, changed_occ_all, changed_defs_all))
 }
 
-/// Run the LSIF semantic pass if `tsconfig.json` is present at the repo root,
-/// writing edges directly into `store`.
-///
-/// Used by the inline path (`--semantic` or no-commit repos). For the deferred
-/// path use [`run_lsif_pass_collect`] + write under the store lock.
-///
-/// Failures (binary not on PATH, tsconfig absent, parse errors) are logged as
-/// warnings and silently skipped — they must never fail the overall index.
-fn run_lsif_pass(repo_root: &Path, corpus: &str, store: &mut SqliteStore) {
-    let edges = run_lsif_pass_collect(repo_root, corpus);
-    for edge in &edges {
-        if let Err(e) = store.put_edge_lsif(edge) {
-            tracing::warn!("lsif edge write error: {e}");
-        }
-    }
-    tracing::debug!("lsif pass: {} RefCall edges persisted", edges.len());
+/// Phase A reindex of `paths`, returning only the Tier-0 dirty-caller set. The
+/// thin wrapper over [`reindex_files_reporting`] for the callers (commit hook,
+/// bulk refresh, CLI, tests) that do not consume the changed-occurrence stash.
+pub fn reindex_files(
+    paths: &[PathBuf],
+    repo_root: &Path,
+    store: &mut SqliteStore,
+) -> anyhow::Result<travsr_core::DirtySet> {
+    reindex_files_reporting(paths, repo_root, store).map(|(callers, _, _)| callers)
 }
 
-/// Collect LSIF RefCall edges without holding the store lock.
-///
-/// Returns an empty `Vec` when `tsconfig.json` is absent or the emitter fails.
-/// The caller writes the edges under the store lock. This split lets
-/// `run_background_phase_b` hold the lock only for the final write batch while
-/// the expensive TS compiler runs lock-free.
-fn run_lsif_pass_collect(repo_root: &Path, corpus: &str) -> Vec<travsr_core::Edge> {
-    let tsconfig = repo_root.join("tsconfig.json");
-    if !tsconfig.exists() {
-        return Vec::new();
+/// The LSIF analyzer skips recorded during this Phase B pass: analyzers that
+/// could not be started, then analyzers that ran and failed. Each runner
+/// latches its own outcome in travsr-indexer for exactly this drain.
+fn collect_lsif_skips() -> Vec<LsifSkip> {
+    let mut out: Vec<LsifSkip> = travsr_indexer::sandbox::lsif_emitter_skips()
+        .into_iter()
+        .map(|s| LsifSkip {
+            language: s.language.to_string(),
+            reason: if s.missing {
+                LsifSkipReason::EmitterMissing
+            } else {
+                LsifSkipReason::EmitterFailed
+            },
+            detail: s.detail,
+        })
+        .collect();
+    for language in travsr_indexer::sandbox::lsif_analyzer_failures() {
+        let detail = format!(
+            "{} ran and failed, so {language} kept only its structural call edges",
+            lsif_analyzer_name(language)
+        );
+        out.push(LsifSkip {
+            language: language.to_string(),
+            reason: LsifSkipReason::EmitterFailed,
+            detail,
+        });
     }
-
-    let dump = match run_lsif_emitter(&tsconfig) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!("lsif emitter skipped: {e}");
-            return Vec::new();
-        }
-    };
-
-    match ingest_lsif(&dump, corpus) {
-        Ok(out) => {
-            tracing::debug!("lsif pass: collected {} RefCall edges", out.edges.len());
-            out.edges
-        }
-        Err(e) => {
-            tracing::warn!("lsif ingest error: {e}");
-            Vec::new()
-        }
-    }
+    out
 }
 
 /// Derive the canonical corpus for `repo_root` by reading `git remote get-url origin`.
 /// Falls back to `local/<basename>` if no remote is configured or git fails.
-fn detect_corpus(repo_root: &Path) -> String {
+pub fn detect_corpus(repo_root: &Path) -> String {
     let output = std::process::Command::new("git")
         .args([
             "-C",
@@ -4579,6 +6335,188 @@ mod tests {
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
 
+    #[test]
+    fn init_running_follows_init_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        assert!(!init_running(tmp.path()), "no lock file, no init");
+        let held = std::fs::File::create(tmp.path().join(".travsr/init.lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        assert!(init_running(tmp.path()), "an init holds the lock");
+        fs2::FileExt::unlock(&held).unwrap();
+        assert!(!init_running(tmp.path()), "released");
+    }
+
+    #[test]
+    fn phase_b_inline_needed_table() {
+        let check = |name: &str, done: bool, dirty: bool, warnings: &str, ready: &[&str], want| {
+            let got = phase_b_inline_needed(done, dirty, warnings, |l| ready.contains(&l));
+            assert_eq!(got, want, "{name}");
+        };
+        check("done, nothing new", true, false, "", &["go"], false);
+        check("not done at this commit", false, false, "", &[], true);
+        check(
+            "done but a later edit dropped calls",
+            true,
+            true,
+            "",
+            &[],
+            true,
+        );
+        check(
+            "skipped, still not ready",
+            true,
+            false,
+            "skipped_unregistered:go",
+            &[],
+            false,
+        );
+        check(
+            "skipped language now ready",
+            true,
+            false,
+            "crashed:java,untrusted_corpus:go",
+            &["go"],
+            true,
+        );
+        check(
+            "a bundled tracer found again after a reinstall",
+            true,
+            false,
+            "emitter_missing:typescript",
+            &["typescript"],
+            true,
+        );
+        check(
+            "every gate-skip class counts",
+            true,
+            false,
+            "skipped_no_analyzer:go,skipped_no_compdb:c,needs_consent:java",
+            &["go"],
+            true,
+        );
+        // Re-running a language that ran and found nothing only repeats the
+        // same result; it is not a gate skip.
+        check(
+            "no symbols is not a gate skip",
+            true,
+            false,
+            "zero_nodes:go,crashed:go,no_references:go",
+            &["go"],
+            false,
+        );
+    }
+
+    /// Run `body` under a subscriber filtered by `directive`, and return the
+    /// (target, level) of every event that actually reached it.
+    ///
+    /// Asserting on what a subscriber receives rather than on the directive
+    /// string is the whole point: an unknown word in a directive is read as a
+    /// target name rather than rejected, and severity alone does not carry an
+    /// event past a filter with no bare level.
+    fn capture_with_filter(directive: &str, body: impl FnOnce()) -> Vec<(String, tracing::Level)> {
+        use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
+
+        #[derive(Clone, Default)]
+        struct Seen(std::sync::Arc<Mutex<Vec<(String, tracing::Level)>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(
+                &self,
+                ev: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let m = ev.metadata();
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((m.target().to_string(), *m.level()));
+            }
+        }
+
+        let seen = Seen::default();
+        let subscriber = tracing_subscriber::registry().with(seen.clone().with_filter(
+            tracing_subscriber::EnvFilter::try_new(directive).expect("our directive must parse"),
+        ));
+        tracing::subscriber::with_default(subscriber, body);
+        let out = seen.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        out
+    }
+
+    /// A targeted directive with no bare level leaves `EnvFilter`'s unmatched
+    /// default OFF, so severity alone does not get a line into the file: an
+    /// ERROR on the ordinary target is dropped. Both session lifecycle lines
+    /// have to ride the exempt target to survive it, and the exit line did not
+    /// at first, which silently defeated it under exactly the form the CLI's
+    /// troubleshooting text prints and which auto-starts a daemon.
+    #[test]
+    fn session_lifecycle_survives_a_targeted_rust_log() {
+        let directive = filter_directive_for("travsr_plugin_host=debug");
+        let seen = capture_with_filter(&directive, || {
+            tracing::info!(target: SESSION_LOG_TARGET, event = "daemon.session.start", "start");
+            tracing::error!(target: SESSION_LOG_TARGET, event = "daemon.session.exit", "exit");
+            // The same event on the ordinary target, which is what the exit
+            // line used to be and what this test exists to keep it from
+            // becoming again.
+            tracing::error!(event = "daemon.session.exit", "exit on the default target");
+        });
+        let on_exempt = seen.iter().filter(|(t, _)| t == SESSION_LOG_TARGET).count();
+        assert_eq!(
+            on_exempt, 2,
+            "both session lifecycle lines must survive a targeted directive; saw {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|(t, _)| t == "travsr_daemon"),
+            "an ERROR on the ordinary target is dropped here, which is why the exemption is needed; saw {seen:?}"
+        );
+    }
+
+    /// `log.level = error` has to still record errors, which is the whole point
+    /// of offering the level. Checked against a real `EnvFilter` rather than by
+    /// reading the directive string, because what matters is what the filter
+    /// admits, and an unknown word in a directive is silently read as a target
+    /// name rather than rejected.
+    #[test]
+    fn an_error_only_log_still_records_errors() {
+        let directive = filter_directive_for("error");
+        let got = capture_with_filter(&directive, || {
+            tracing::error!("boom");
+            tracing::warn!("noise");
+            tracing::info!(target: SESSION_LOG_TARGET, "daemon starting");
+        });
+        assert!(
+            got.iter().any(|(_, l)| *l == tracing::Level::ERROR),
+            "an error-only log that drops errors is not a log; saw {got:?}"
+        );
+        assert!(
+            !got.iter().any(|(_, l)| *l == tracing::Level::WARN),
+            "error means error, not warn and above; saw {got:?}"
+        );
+        assert!(
+            got.iter().any(|(t, _)| t == SESSION_LOG_TARGET),
+            "the session line is exempt so the file can identify itself; saw {got:?}"
+        );
+    }
+
+    /// `query.served` was INFO on every query, which made it 28 of about 130
+    /// lines in this repo's own log, most of them `elapsed_ms=0` cache hits.
+    /// The level now follows the content, so this pins where the line sits and
+    /// that the boundary is inclusive: a threshold read as "slower than" leaves
+    /// a band that is neither event nor commentary.
+    #[test]
+    fn only_a_slow_query_is_worth_an_info_line() {
+        assert!(!query_is_slow(0), "a cache hit is commentary");
+        assert!(!query_is_slow(SLOW_QUERY_MS - 1));
+        assert!(query_is_slow(SLOW_QUERY_MS), "the threshold itself counts");
+        assert!(query_is_slow(SLOW_QUERY_MS + 1));
+        // Comfortably above the 50 ms p95 the bench gate enforces, so a query
+        // at the edge of the budget does not log and one well past it does.
+        // Tightening this to the gate would put the log back where it was.
+        assert!(
+            !query_is_slow(50),
+            "a query inside the p95 budget must not log at info"
+        );
+    }
+
     /// #735: the embed tick body must be single-flight. A tick that fires
     /// while the previous body still runs used to start a second concurrent
     /// full-repo embed-text pass; on repos where one pass outlives the tick
@@ -4610,6 +6548,83 @@ mod tests {
         );
     }
 
+    /// RFC-027 #813 (finding 2): the editor-plane stash carries the save's
+    /// changed-definition scope alongside its occurrences, so the request path
+    /// can scope its native targets. `serve_stash` returns both and restarts the
+    /// TTL; a whole-file re-derive (scope `None`) clears any prior scoped entry so
+    /// a later request cannot scope against a stale set.
+    #[test]
+    fn stash_carries_the_changed_def_scope_and_a_whole_file_save_clears_it() {
+        use travsr_core::NodeId;
+        let mut plane = EditorPlane::default();
+        let occ = vec![travsr_core::ChangedOccurrence {
+            src: NodeId(1),
+            line: 7,
+            col: Some(4),
+            kind: "ref/call".to_string(),
+            name: "run".to_string(),
+        }];
+        let scope: std::collections::HashSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
+        plane.stash_changed_occurrences("a.rs".to_string(), occ.clone(), Some(scope.clone()));
+
+        // Serving returns the occurrences and the scope together.
+        let served = plane
+            .serve_stash("a.rs")
+            .expect("a fresh scoped stash is servable");
+        assert_eq!(served.0, occ, "the stashed occurrences are served");
+        assert_eq!(
+            served.1, scope,
+            "the changed-def scope is served for native scoping"
+        );
+
+        // A whole-file re-derive (scope None) drops the entry, so a request that
+        // arrives after it cannot scope its native targets against a stale set.
+        plane.stash_changed_occurrences("a.rs".to_string(), Vec::new(), None);
+        assert!(
+            plane.serve_stash("a.rs").is_none(),
+            "a whole-file re-derive must clear the prior scoped stash"
+        );
+    }
+
+    /// The per-file cap is applied after ordering by position, so a function
+    /// with more occurrences than the cap keeps the top of its changed region
+    /// every time rather than whatever order the capture query happened to
+    /// return.
+    #[test]
+    fn stash_caps_occurrences_in_position_order() {
+        use travsr_core::NodeId;
+        let mut plane = EditorPlane::default();
+        // Descending lines, so raw-order truncation would keep the highest ones.
+        let occ: Vec<travsr_core::ChangedOccurrence> = (0..MAX_OCCURRENCES_PER_STASHED_FILE + 10)
+            .map(|i| travsr_core::ChangedOccurrence {
+                src: NodeId(1),
+                line: (MAX_OCCURRENCES_PER_STASHED_FILE + 10 - i) as u32,
+                col: Some(4),
+                kind: "ref/call".to_string(),
+                name: "run".to_string(),
+            })
+            .collect();
+        plane.stash_changed_occurrences(
+            "a.rs".to_string(),
+            occ,
+            Some(std::collections::HashSet::new()),
+        );
+
+        let (served, _) = plane
+            .serve_stash("a.rs")
+            .expect("a fresh stash is servable");
+        assert_eq!(served.len(), MAX_OCCURRENCES_PER_STASHED_FILE);
+        assert_eq!(
+            served[0].line, 1,
+            "the retained set starts at the first line"
+        );
+        assert_eq!(
+            served.last().expect("non-empty").line,
+            MAX_OCCURRENCES_PER_STASHED_FILE as u32,
+            "the cap keeps the lowest lines, contiguously"
+        );
+    }
+
     #[test]
     fn remap_resolved_sites_redirects_and_drops_self_loops() {
         // #299 F2: a resolved site whose dst unification redirected must be
@@ -4625,20 +6640,33 @@ mod tests {
         let collapses = NodeId(4);
         alias.insert(collapses, src);
 
+        // #780: a site whose dst was dropped by unification (no alias to remap
+        // onto) is discarded — no dangling `edge_sites` row.
+        let gone = NodeId(7);
+        let dropped: std::collections::HashSet<NodeId> = [gone].into_iter().collect();
+
         let sites = vec![
-            (src, scip_dst, 10),  // dst remaps 2 → 3
-            (src, NodeId(9), 11), // dst not in alias — unchanged
-            (src, collapses, 12), // dst remaps 4 → 1 == src → dropped
+            (src, scip_dst, 10, None),  // dst remaps 2 → 3
+            (src, NodeId(9), 11, None), // dst not in alias — unchanged
+            (src, collapses, 12, None), // dst remaps 4 → 1 == src → dropped
+            (src, gone, 13, None),      // dst was dropped → discarded
         ];
-        let out = remap_resolved_sites(sites, &alias);
-        assert_eq!(out, vec![(src, ts_dst, 10), (src, NodeId(9), 11)]);
+        let out = remap_resolved_sites(sites, &alias, &dropped);
+        assert_eq!(
+            out,
+            vec![(src, ts_dst, 10, None), (src, NodeId(9), 11, None)]
+        );
     }
 
     #[test]
     fn remap_resolved_sites_empty_alias_is_identity() {
         use travsr_core::NodeId;
-        let sites = vec![(NodeId(1), NodeId(2), 5)];
-        let out = remap_resolved_sites(sites.clone(), &std::collections::HashMap::new());
+        let sites = vec![(NodeId(1), NodeId(2), 5, None)];
+        let out = remap_resolved_sites(
+            sites.clone(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out, sites);
     }
 
@@ -4715,6 +6743,22 @@ mod tests {
             !langs.contains("objectivec"),
             "must not enroll objectivec without any .m/.mm, got {langs:?}"
         );
+    }
+
+    // A Gradle build script alone is not Kotlin source: tracing it cost
+    // yugabyte-db minutes for 5 calls. A real .kt file still enrolls kotlin.
+    #[test]
+    fn collect_present_languages_and_paths_ignores_build_script_only_kotlin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("build.gradle.kts"), "plugins { java }\n").unwrap();
+        std::fs::write(dir.path().join("App.java"), "class App {}\n").unwrap();
+        let (langs, paths) = collect_present_languages_and_paths(dir.path());
+        assert!(!langs.contains("kotlin"), "got {langs:?}");
+        assert_eq!(paths.len(), 2, "the script is still indexed: {paths:?}");
+
+        std::fs::write(dir.path().join("Main.kt"), "fun main() {}\n").unwrap();
+        let (langs, _paths) = collect_present_languages_and_paths(dir.path());
+        assert!(langs.contains("kotlin"), "got {langs:?}");
     }
 
     // L5b: a mixed C + Obj-C repo (genuine .c files alongside .m) must enroll
@@ -4856,6 +6900,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 42,
+            caller_col: None,
             is_method_call: true,
             recv_type: None,
         }];
@@ -4882,10 +6927,7 @@ mod tests {
     fn resolve_one_field_ref(
         store: &SqliteStore,
         recv_type: Option<&str>,
-    ) -> (
-        Vec<travsr_core::Edge>,
-        Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
-    ) {
+    ) -> (Vec<travsr_core::Edge>, Vec<SiteRow>) {
         use travsr_core::{Node, VName};
         let caller = Node::new(
             VName::new(
@@ -4903,6 +6945,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9,
+            caller_col: None,
             is_method_call: false,
             recv_type: recv_type.map(str::to_string),
         }];
@@ -4951,7 +6994,7 @@ mod tests {
             travsr_core::EdgeKind::RefField,
             "field read must be ref/field, never ref/call"
         );
-        assert_eq!(sites, vec![(caller.id, field.id, 9)]);
+        assert_eq!(sites, vec![(caller.id, field.id, 9, None)]);
     }
 
     #[test]
@@ -5047,6 +7090,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9,
+            caller_col: None,
             is_method_call: false,
             recv_type: Some("Config".to_string()),
         }];
@@ -5065,6 +7109,139 @@ mod tests {
     }
 
     #[test]
+    fn a_reference_to_a_callable_keeps_its_call_flag() {
+        // The `(` rule separates a type or property mention from a call, but a
+        // reference to a function is a call however it is spelled: a Kotlin
+        // trailing lambda `build { }`, an infix call, `new Box<Int>(..)`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("M.kt"), "    build { }\n    a shouldBe b\n")
+            .expect("write");
+        let f = |sig: &str| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "M.kt", "kotlin", sig),
+                "function",
+            )
+        };
+        let (build, should) = (f("fn:build"), f("fn:shouldBe"));
+        let r = |callee: travsr_core::NodeId, line: u32, col: u32| travsr_core::ScipRef {
+            caller_path: "M.kt".to_string(),
+            caller_line: line,
+            callee_id: callee,
+            is_call: true,
+            caller_col: Some(col),
+        };
+        let mut refs = vec![r(build.id, 1, 4), r(should.id, 2, 6)];
+        super::classify_phase_b_calls(tmp.path(), &[build, should], &mut refs);
+        let got: Vec<bool> = refs.iter().map(|r| r.is_call).collect();
+        assert_eq!(got, [true, true]);
+    }
+
+    #[test]
+    fn ruby_class_reference_is_a_call_only_before_new() {
+        // Ruby calls need no parentheses. A class reference constructs only as
+        // the receiver of `.new`; a superclass is a mention.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("a.rb"),
+            "class Dog < Animal\nzoo = Zoo.new\nz = Zoo.new_from(c)\n",
+        )
+        .expect("write");
+        let class = |name: &str| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "a.rb", "ruby", format!("scip:a.rb:x {name}#")),
+                // scip-ruby emits no SymbolInformation kind.
+                "definition",
+            )
+        };
+        let (animal, zoo) = (class("Animal"), class("Zoo"));
+        let r = |callee: travsr_core::NodeId, line: u32, col: u32| travsr_core::ScipRef {
+            caller_path: "a.rb".to_string(),
+            caller_line: line,
+            callee_id: callee,
+            is_call: true,
+            caller_col: Some(col),
+        };
+        let mut refs = vec![r(animal.id, 1, 12), r(zoo.id, 2, 6), r(zoo.id, 3, 4)];
+        super::classify_phase_b_calls(tmp.path(), &[animal, zoo], &mut refs);
+        let got: Vec<bool> = refs.iter().map(|r| r.is_call).collect();
+        assert_eq!(got, [false, true, false]);
+    }
+
+    #[test]
+    fn scala_reference_to_a_type_symbol_is_not_a_call() {
+        // Scala calls need no parentheses, so the `(` rule cannot judge it, but
+        // a SemanticDB type symbol (`Animal#`) is never called: `new Zoo` and
+        // `Zoo()` reference `Zoo#`<init>`().` or `Zoo.apply().` instead.
+        let ty = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "s/A.scala", "scala", "sdb:_empty_/Animal#"),
+            "class",
+        );
+        let ctor = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "s/A.scala", "scala", "sdb:_empty_/Zoo#`<init>`()."),
+            "method",
+        );
+        let r = |callee: travsr_core::NodeId| travsr_core::ScipRef {
+            caller_path: "s/A.scala".to_string(),
+            caller_line: 1,
+            callee_id: callee,
+            is_call: true,
+            caller_col: Some(0),
+        };
+        let mut refs = vec![r(ty.id), r(ctor.id)];
+        let tmp = tempfile::tempdir().expect("tempdir");
+        super::classify_phase_b_calls(tmp.path(), &[ty, ctor], &mut refs);
+        let got: Vec<bool> = refs.iter().map(|r| r.is_call).collect();
+        assert_eq!(got, [false, true]);
+    }
+
+    #[test]
+    fn non_call_occurrences_are_not_calls() {
+        // Sidecars flag every reference `is_call: true`, so a parameter type, a
+        // supertype, a generic argument or a local read became a `ref/call`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("java")).expect("mkdir");
+        std::fs::write(
+            root.join("java/Zoo.java"),
+            "public void add(Animal animal) {\n    Zoo zoo = new Zoo();\n",
+        )
+        .expect("write");
+        std::fs::write(root.join("Main.kt"), "    zoo.add(dog)\n").expect("write");
+        std::fs::write(root.join("a.rb"), "class Dog < Animal\n").expect("write");
+        let node = |path: &str, lang: &str| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", path, lang, "fn:f"),
+                "function",
+            )
+        };
+        let nodes = [
+            node("java/Zoo.java", "java"),
+            node("Main.kt", "kotlin"),
+            node("a.rb", "ruby"),
+        ];
+        let r = |path: &str, line: u32, col: Option<u32>| travsr_core::ScipRef {
+            caller_path: path.to_string(),
+            caller_line: line,
+            callee_id: travsr_core::NodeId(1),
+            is_call: true,
+            caller_col: col,
+        };
+        let mut refs = vec![
+            r("java/Zoo.java", 1, Some(16)), // `Animal` parameter type
+            r("java/Zoo.java", 2, Some(4)),  // `Zoo zoo` declared type
+            r("java/Zoo.java", 2, Some(18)), // `new Zoo(` constructor call
+            r("Main.kt", 1, Some(4)),        // `zoo.` local read
+            r("Main.kt", 1, Some(12)),       // `dog` argument
+            r("Main.kt", 1, Some(8)),        // `add(` call
+            r("Main.kt", 1, None),           // no column: left alone
+            r("a.rb", 1, Some(12)),          // paren-optional language: left alone
+        ];
+        super::classify_phase_b_calls(root, &nodes, &mut refs);
+        let got: Vec<bool> = refs.iter().map(|r| r.is_call).collect();
+        assert_eq!(got, [false, false, true, false, false, true, true, true]);
+    }
+
+    #[test]
     fn split_field_sites_partitions_by_ref_field_edges() {
         use travsr_core::{Edge, EdgeKind, NodeId};
         let (a, b, c, d) = (NodeId(1), NodeId(2), NodeId(3), NodeId(4));
@@ -5072,11 +7249,11 @@ mod tests {
             Edge::new(a, b, EdgeKind::RefCall),
             Edge::new(a, c, EdgeKind::RefField),
         ];
-        let sites = vec![(a, b, 10), (a, c, 20), (a, d, 30)];
+        let sites = vec![(a, b, 10, None), (a, c, 20, None), (a, d, 30, None)];
         let (calls, fields) = split_field_sites(&edges, sites);
         // b is a call target, c is a field; d has no field edge → treated as call.
-        assert_eq!(calls, vec![(a, b, 10), (a, d, 30)]);
-        assert_eq!(fields, vec![(a, c, 20)]);
+        assert_eq!(calls, vec![(a, b, 10, None), (a, d, 30, None)]);
+        assert_eq!(fields, vec![(a, c, 20, None)]);
     }
 
     #[test]
@@ -5120,6 +7297,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -5180,6 +7358,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 3,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -5198,7 +7377,7 @@ mod tests {
         );
         assert_eq!(edges[0].src, caller.id);
         assert_eq!(edges[0].dst, callee.id);
-        assert_eq!(sites, vec![(caller.id, callee.id, 3)]);
+        assert_eq!(sites, vec![(caller.id, callee.id, 3, None)]);
     }
 
     #[test]
@@ -5267,14 +7446,14 @@ mod tests {
         assert!(
             sites
                 .iter()
-                .any(|(s, d, _)| *s == index_node.id && *d == class_node.id),
+                .any(|(s, d, _, _)| *s == index_node.id && *d == class_node.id),
             "constructor call must record an occurrence site for find_references: {sites:?}"
         );
         // Method reference: `resp.render()` → method:HttpResponse.render.
         assert!(
             sites
                 .iter()
-                .any(|(s, d, _)| *s == index_node.id && *d == render_node.id),
+                .any(|(s, d, _, _)| *s == index_node.id && *d == render_node.id),
             "method call must record an occurrence site: {sites:?}"
         );
 
@@ -5311,6 +7490,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -5360,6 +7540,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 5,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -5377,7 +7558,7 @@ mod tests {
             "recv_type exact match should resolve: {edges:?}"
         );
         assert_eq!(edges[0].dst, callee.id);
-        assert_eq!(sites, vec![(caller.id, callee.id, 5)]);
+        assert_eq!(sites, vec![(caller.id, callee.id, 5, None)]);
     }
 
     #[test]
@@ -5414,6 +7595,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 12,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("HashSet".to_string()),
         }];
@@ -5486,6 +7668,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -5551,6 +7734,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 9773,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Command".to_string()),
         }];
@@ -5612,6 +7796,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 3,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -5670,6 +7855,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 8,
+            caller_col: None,
             is_method_call: true,
             recv_type: None,
         }];
@@ -5731,6 +7917,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 12,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -5786,6 +7973,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 45,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -5837,6 +8025,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -5890,6 +8079,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 8,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -5952,6 +8142,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 4,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("SqliteStore".to_string()),
         }];
@@ -6028,6 +8219,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: line,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         };
@@ -6122,6 +8314,7 @@ mod tests {
                 alt_callee_sig: None,
                 hint_crate: None,
                 caller_line: 8,
+                caller_col: None,
                 is_method_call: true,
                 recv_type: Some("Session".to_string()),
             },
@@ -6131,6 +8324,7 @@ mod tests {
                 alt_callee_sig: None,
                 hint_crate: None,
                 caller_line: 8,
+                caller_col: None,
                 is_method_call: true,
                 recv_type: Some("Session".to_string()),
             },
@@ -6175,6 +8369,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 4,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         }];
@@ -6235,6 +8430,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 4,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("App".to_string()),
         }];
@@ -6312,6 +8508,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 804,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -6325,7 +8522,7 @@ mod tests {
         );
         assert_eq!(edges.len(), 1, "inherited method must resolve: {edges:?}");
         assert_eq!(edges[0].dst, callee.id);
-        assert_eq!(sites, vec![(caller.id, callee.id, 804)]);
+        assert_eq!(sites, vec![(caller.id, callee.id, 804, None)]);
     }
 
     #[test]
@@ -6352,6 +8549,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 12,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Leaf".to_string()),
         }];
@@ -6394,6 +8592,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 7,
+            caller_col: None,
             is_method_call: true,
             recv_type: Some("Session".to_string()),
         }];
@@ -6447,6 +8646,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 5,
+            caller_col: None,
             is_method_call: true,
             recv_type: None, // chain receiver — unrecoverable
         }];
@@ -6489,6 +8689,7 @@ mod tests {
             alt_callee_sig: None,
             hint_crate: None,
             caller_line: 2,
+            caller_col: None,
             is_method_call: false,
             recv_type: None,
         };
@@ -6524,6 +8725,77 @@ mod tests {
             "same-language call must resolve: {edges2:?}"
         );
         assert_eq!(edges2[0].dst, py_helper.id);
+    }
+
+    #[test]
+    fn duplicated_bare_name_resolves_to_same_file_definition_810() {
+        // #810: a name defined in two packages used to hit the CO-A1 gate and
+        // drop every call, even to a module-private helper in the caller's file.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let ts = "ts/src/security.ts";
+        let caller = Node::new(
+            VName::new("", "", ts, "typescript", "fn:resolveRoot"),
+            "function",
+        );
+        let ts_def = Node::new(
+            VName::new("", "", ts, "typescript", "fn:safeRealpath"),
+            "function",
+        );
+        let py_def = Node::new(
+            VName::new(
+                "",
+                "",
+                "py/src/security.ts",
+                "typescript",
+                "fn:safeRealpath",
+            ),
+            "function",
+        );
+        for n in [&caller, &ts_def, &py_def] {
+            store.put_node(n).unwrap();
+        }
+        let call = |src| travsr_core::UnresolvedCall {
+            src,
+            callee_sig: "fn:safeRealpath".to_string(),
+            alt_callee_sig: None,
+            hint_crate: None,
+            caller_line: 7,
+            caller_col: None,
+            is_method_call: false,
+            recv_type: None,
+        };
+        let none = std::collections::HashSet::new();
+
+        let (edges, sites) = resolve_unresolved_calls(&store, &[call(caller.id)], &[], &[], &none);
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        assert_eq!(edges[0].dst, ts_def.id);
+        assert_eq!(sites.len(), 1);
+
+        // A caller in neither file, importing neither, is still ambiguous: dropped.
+        let other = Node::new(
+            VName::new("", "", "app/main.ts", "typescript", "fn:run"),
+            "function",
+        );
+        store.put_node(&other).unwrap();
+        let (edges, _) = resolve_unresolved_calls(&store, &[call(other.id)], &[], &[], &none);
+        assert!(edges.is_empty(), "{edges:?}");
+    }
+
+    #[test]
+    fn scope_bare_call_prefers_imported_file_and_leaves_ties_810() {
+        let cands = vec![
+            (travsr_core::NodeId(1), "ts/src/security.ts", "typescript"),
+            (travsr_core::NodeId(2), "py/src/security.ts", "typescript"),
+        ];
+        let caller = "ts/src/walker.ts";
+        let imports: std::collections::HashSet<(String, String)> =
+            [(caller.to_string(), "ts/src/security.ts".to_string())].into();
+        let out = scope_bare_call(caller, &imports, cands.clone());
+        assert_eq!(out, vec![cands[0]]);
+
+        let out = scope_bare_call(caller, &std::collections::HashSet::new(), cands.clone());
+        assert_eq!(out, cands, "no same-file or import match must not narrow");
     }
 
     // ── #449 regression: full Phase A + Phase B pipeline for Swift ──────────
@@ -6653,10 +8925,11 @@ mod tests {
                 caller_line: *line,
                 callee_id,
                 is_call: true,
+                caller_col: None,
             });
         }
 
-        let (_report, _alias) = write_phase_b_results(
+        let (_report, _alias, _dropped) = write_phase_b_results(
             &mut store,
             corpus,
             pb_nodes,
@@ -6703,7 +8976,20 @@ mod tests {
     // this lock to prevent races on Windows and Linux multi-threaded test runs.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// #893: `init_repo` registers its repo root in `~/.travsr/registry.json`
+    /// unless this is set, so an unguarded test in this module appends its
+    /// `tempfile` tempdir to the developer's real registry and leaves the entry
+    /// there after the directory is deleted. Called from `git_init` — the
+    /// arrangement step every test that reaches `init_repo` already performs —
+    /// so one call covers the whole module. `set_var` is process-global and
+    /// every caller writes the same value, so this is safe under the parallel
+    /// test runner. Same pattern as `tests/semantic_marker.rs::disable_registry`.
+    fn disable_registry() {
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+    }
+
     fn git_init(dir: &std::path::Path) {
+        disable_registry();
         StdCommand::new("git")
             .args(["-c", "init.defaultBranch=main", "init", "-q"])
             .current_dir(dir)
@@ -7096,6 +9382,136 @@ mod tests {
         );
     }
 
+    /// #904: a sidecar's own warning (the Android SDK was missing) is persisted
+    /// as `phase_b_diagnostics` for `travsr status` and carried on the report
+    /// for the `init` summary; a clean run clears it so a fixed cause does not
+    /// keep being reported.
+    #[test]
+    fn write_phase_b_results_persists_sidecar_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store =
+            travsr_store::SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+
+        let outcome = travsr_plugin_host::PhaseBOutcome {
+            ran: vec!["java".into()],
+            produced_no_nodes: vec!["java".into()],
+            diagnostics: vec![travsr_plugin_host::SidecarDiagnostic {
+                lang: "java".into(),
+                code: "java.android-sdk-missing".into(),
+                message: "the Android SDK this build needs was not found".into(),
+            }],
+            ..Default::default()
+        };
+        let (report, _, _) =
+            write_phase_b_results(&mut store, "test", vec![], vec![], vec![], outcome, (0, 0));
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, "java.android-sdk-missing");
+        let persisted: Vec<travsr_plugin_host::SidecarDiagnostic> = serde_json::from_str(
+            &store
+                .get_meta("phase_b_diagnostics")
+                .unwrap()
+                .unwrap_or_default(),
+        )
+        .expect("phase_b_diagnostics is a JSON array");
+        assert_eq!(persisted, report.diagnostics);
+
+        // The next run said nothing: the meta is cleared, not left stale.
+        write_phase_b_results(
+            &mut store,
+            "test",
+            vec![],
+            vec![],
+            vec![],
+            travsr_plugin_host::PhaseBOutcome::default(),
+            (0, 0),
+        );
+        assert_eq!(
+            store
+                .get_meta("phase_b_diagnostics")
+                .unwrap()
+                .unwrap_or_default(),
+            "[]"
+        );
+    }
+
+    /// A Phase B cycle whose deep-analysis pass produced nothing for a language
+    /// must record it under the same `emitter_missing:` / `emitter_failed:`
+    /// classes the TypeScript path uses, so `travsr status` downgrades
+    /// `semantic: complete` and names the analyzer.
+    ///
+    /// Before this, `run_ra_lsif` returning `Err` was logged and dropped: the
+    /// language kept only its tree-sitter heuristics while every surface
+    /// reported a clean success. An analyzer that is merely absent is NOT
+    /// recorded here; that is a capability question `lang list` answers.
+    #[test]
+    fn write_phase_b_results_records_rust_and_python_lsif_skips() {
+        travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+        travsr_indexer::sandbox::reset_lsif_analyzer_failures();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store =
+            travsr_store::SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+
+        // A clean cycle records nothing, so the warning can never be spurious.
+        write_phase_b_results(
+            &mut store,
+            "test",
+            vec![],
+            vec![],
+            vec![],
+            travsr_plugin_host::PhaseBOutcome::default(),
+            (0, 0),
+        );
+        assert_eq!(
+            store
+                .get_meta("phase_b_warnings")
+                .unwrap()
+                .unwrap_or_default(),
+            "",
+            "a cycle whose analyzers all ran must not be flagged"
+        );
+
+        travsr_indexer::sandbox::record_lsif_analyzer_failure("rust");
+        travsr_indexer::sandbox::record_lsif_analyzer_failure("python");
+        let (report, _, _) = write_phase_b_results(
+            &mut store,
+            "test",
+            vec![],
+            vec![],
+            vec![],
+            travsr_plugin_host::PhaseBOutcome::default(),
+            (0, 0),
+        );
+
+        let warnings = store
+            .get_meta("phase_b_warnings")
+            .unwrap()
+            .unwrap_or_default();
+        let classes: Vec<&str> = warnings.split(',').collect();
+        assert!(
+            classes.contains(&"emitter_failed:rust"),
+            "a failed rust-analyzer must be disclosed, got {warnings:?}"
+        );
+        assert!(
+            classes.contains(&"emitter_failed:python"),
+            "a travsr-lsif-py that ran and broke must be disclosed, got {warnings:?}"
+        );
+        // The report drives the `init` summary, so it must carry both too.
+        let reported: Vec<&str> = report
+            .lsif_skipped
+            .iter()
+            .map(|s| s.language.as_str())
+            .collect();
+        assert!(
+            reported.contains(&"rust") && reported.contains(&"python"),
+            "the init summary must see both skips, got {reported:?}"
+        );
+
+        travsr_indexer::sandbox::reset_lsif_analyzer_failures();
+    }
+
     /// #738: the `rust_lsif_degraded` flag must reflect surviving edges, not just
     /// "did rust-analyzer run". A cycle that parsed positional refs but resolved
     /// zero of them (the Windows path-mismatch signature) must record
@@ -7107,6 +9523,7 @@ mod tests {
         // The flag is gated on `!ra_lsif_sandbox_was_skipped()`; reset the
         // process-global latch so a prior run cannot force `sandbox_unavailable`.
         travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+        travsr_indexer::sandbox::reset_lsif_analyzer_failures();
 
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
@@ -7122,6 +9539,7 @@ mod tests {
 
         let run = |store: &mut travsr_store::SqliteStore, stats: (usize, usize)| {
             travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
+            travsr_indexer::sandbox::reset_lsif_analyzer_failures();
             write_phase_b_results(
                 store,
                 "test",
@@ -7156,6 +9574,51 @@ mod tests {
             "",
             "an empty ref batch (no rust refs) must not be flagged as degraded"
         );
+    }
+
+    /// #760: the dynamic warning classes `LsifSkip::warning_class` emits must be
+    /// members of the single source the consumer guards derive from. A new
+    /// `LsifSkipReason` forces a new arm in `warning_class` (the match is
+    /// exhaustive) and must be listed here and in the core const, so a class the
+    /// MCP decoder would silently drop cannot be introduced unnoticed.
+    #[test]
+    fn lsif_skip_warning_classes_are_known() {
+        for reason in [
+            LsifSkipReason::EmitterMissing,
+            LsifSkipReason::EmitterFailed,
+        ] {
+            let skip = LsifSkip {
+                language: "typescript".to_string(),
+                reason,
+                detail: String::new(),
+            };
+            assert!(
+                travsr_core::PHASE_B_PER_LANGUAGE_WARNING_CLASSES.contains(&skip.warning_class()),
+                "{:?} emits {:?}, absent from PHASE_B_PER_LANGUAGE_WARNING_CLASSES",
+                reason,
+                skip.warning_class()
+            );
+        }
+    }
+
+    /// #809: the shed count the daemon keeps in `WATCH_SHED_TOTAL` reaches
+    /// `travsr status` through `run_query`, so lossy shedding is self-diagnosing
+    /// rather than only in a throttled log line. `status_query` itself cannot
+    /// know it (store-only), so the "status" arm is where it is filled in.
+    #[test]
+    fn status_query_surfaces_the_watch_shed_count() {
+        use std::sync::atomic::Ordering;
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        WATCH_SHED_TOTAL.store(0, Ordering::Relaxed);
+        let clean = run_query(&store, "status", serde_json::json!({})).unwrap();
+        assert_eq!(clean.get("watch_shed").and_then(|v| v.as_u64()), Some(0));
+
+        WATCH_SHED_TOTAL.store(7, Ordering::Relaxed);
+        let shed = run_query(&store, "status", serde_json::json!({})).unwrap();
+        assert_eq!(shed.get("watch_shed").and_then(|v| v.as_u64()), Some(7));
+
+        WATCH_SHED_TOTAL.store(0, Ordering::Relaxed);
     }
 
     /// RFC-002: when the stored signature format version differs from the binary's
@@ -7244,6 +9707,458 @@ mod tests {
         );
     }
 
+    /// A Phase B write failure costs the whole run, because each batch writer is
+    /// one transaction: one bad row rolls back every language's results. It
+    /// reached the run outcome nowhere, so a run that stored NONE of what it
+    /// computed still logged `outcome: Success, lsif_edges: 0` and left
+    /// `travsr status` reading "semantic: complete" over a gutted index.
+    ///
+    /// Observed in production on this repo: 42 stale-format rows made
+    /// `write_scip_attributed_batch` fail on every run, discarding 946k lines of
+    /// rust-analyzer LSIF, and every one of those runs reported Success.
+    #[test]
+    fn a_write_failure_is_not_reported_as_a_clean_run() {
+        let clean = PhaseBReport {
+            ran: vec!["rust".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            run_outcome(&clean, true),
+            phase_b_sched::RunOutcome::Success,
+            "a run with no crashes and no write failures is a clean success"
+        );
+
+        let wrote_nothing = PhaseBReport {
+            ran: vec!["rust".into()],
+            write_failures: 1,
+            ..Default::default()
+        };
+        assert_ne!(
+            run_outcome(&wrote_nothing, true),
+            phase_b_sched::RunOutcome::Success,
+            "a run whose writes failed must not report a clean success"
+        );
+        // Partial, not AllCrashed: AllCrashed re-arms the scheduler every tick
+        // against a cause a retry cannot change.
+        assert_eq!(
+            run_outcome(&wrote_nothing, true),
+            phase_b_sched::RunOutcome::Partial
+        );
+
+        // A write failure outranks a clean crash list either way.
+        let both = PhaseBReport {
+            crashed: vec!["scala".into()],
+            write_failures: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            run_outcome(&both, false),
+            phase_b_sched::RunOutcome::Partial
+        );
+    }
+
+    #[test]
+    fn init_repo_rebuilds_on_signature_format_skew() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        std::fs::write(tmp.path().join("b.ts"), "export class B { go() {} }").unwrap();
+
+        let first = init_repo(tmp.path()).unwrap();
+        assert_eq!(first.files_indexed, 2);
+
+        // Control: with the stamp current, a re-init takes the incremental path
+        // and re-parses nothing.
+        let unchanged = init_repo(tmp.path()).unwrap();
+        assert_eq!(
+            unchanged.files_indexed, 0,
+            "an unchanged re-init must skip every file"
+        );
+
+        // Simulate a graph built by a binary with an older signature format.
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store
+                .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION - 1)
+                .unwrap();
+        }
+
+        let rebuilt = init_repo(tmp.path()).unwrap();
+        assert_eq!(
+            rebuilt.files_indexed, 2,
+            "format skew must re-parse every file, not stamp the current version \
+             over half-migrated signatures"
+        );
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            travsr_core::SIGNATURE_FORMAT_VERSION
+        );
+    }
+
+    /// RFC-002: the stamp must not be written until the rebuild the skew
+    /// triggered has actually purged the old graph. Stamping first meant a
+    /// rebuild that failed (or that the user interrupted) left the current
+    /// version recorded over old-format nodes, after which `format_skew` read
+    /// false forever, the hash delta skipped every unchanged file and the
+    /// `reindex_files` guard stopped firing: the detector disarmed itself.
+    #[test]
+    fn init_repo_keeps_the_old_stamp_when_the_rebuild_purge_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let old = travsr_core::SIGNATURE_FORMAT_VERSION - 1;
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_signature_format_version(old).unwrap();
+        }
+
+        // Make the rebuild fail where an interrupted one would stop: the hash
+        // cache is cleared as part of the purge step, before a single file is
+        // parsed. The schema version already matches, so reopening the store
+        // runs no migration and does not put the table back.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("DROP TABLE files").unwrap();
+        }
+
+        assert!(
+            init_repo(tmp.path()).is_err(),
+            "a purge that cannot run must fail the init rather than continue"
+        );
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            old,
+            "a failed rebuild must leave the old stamp so the skew stays detectable"
+        );
+    }
+
+    /// The format rebuild has to empty the graph, and routing it through
+    /// `reconcile` could not: `reconcile` derives its delete set from the
+    /// `files` table, so a node whose VName path `files` does not track is
+    /// invisible to it. An external package node is the smallest case — a
+    /// GitHub Actions `uses:` reference is stored with `path = ""`, which is not
+    /// a file and never will be. It survived the purge, and the per-path delete
+    /// in `write_file_graphs_batch` did not reach it either, because that is
+    /// keyed on the workflow file's own path. The rebuild then re-emitted the
+    /// same VName under a new id (a NodeId hashes SIGNATURE_FORMAT_VERSION),
+    /// `ON CONFLICT(id)` never saw the old row, and `idx_nodes_vname` aborted
+    /// the init:
+    ///
+    ///   UNIQUE constraint failed: nodes.corpus, nodes.root, nodes.path,
+    ///   nodes.language, nodes.signature
+    ///
+    /// Measured on a v2 fastlane index: 104 192 of 125 193 nodes survived that
+    /// purge, under 5455 paths the `files` table (1992 rows) did not track.
+    #[test]
+    fn init_repo_rebuild_removes_nodes_the_files_table_never_tracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".github/workflows")).unwrap();
+        std::fs::write(
+            tmp.path().join(".github/workflows/ci.yml"),
+            "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v7\n",
+        )
+        .unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let untracked = || -> i64 {
+            rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM nodes WHERE path NOT IN (SELECT path FROM files)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            untracked(),
+            1,
+            "fixture must leave exactly the package node the `files` table cannot see"
+        );
+
+        // Make it a graph an older binary wrote: the same VName tuples under
+        // ids hashed from a different SIGNATURE_FORMAT_VERSION, so the re-parse
+        // reproduces each VName under an id that is not the stored one.
+        // `-id - 1` is bitwise NOT: a bijection, so it cannot collide.
+        let stale_ids: Vec<i64> = {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("UPDATE nodes SET id = -id - 1", []).unwrap();
+            let mut stmt = conn.prepare("SELECT id FROM nodes").unwrap();
+            let ids = stmt
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<i64>>>()
+                .unwrap();
+            ids
+        };
+        let old = travsr_core::SIGNATURE_FORMAT_VERSION - 1;
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_signature_format_version(old).unwrap();
+        }
+
+        init_repo(tmp.path()).expect("a format rebuild must not collide with its own old rows");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for id in stale_ids {
+            let survived: i64 = conn
+                .query_row("SELECT COUNT(*) FROM nodes WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                survived, 0,
+                "old-format row {id} survived the rebuild; those are the rows that collide"
+            );
+        }
+        let packages: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE signature = 'pkg:actions/checkout@v7'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(packages, 1, "the package node must be rebuilt exactly once");
+        assert_eq!(untracked(), 1, "and still be the only untracked node");
+    }
+
+    /// #918's on-disk state: a 1.1.0 binary stamped the current format, then
+    /// failed its rebuild, and the hash cache was already cleared. The stamp
+    /// read current, so `format_skew` was false, init took the incremental path
+    /// and the path-less package node collided with its re-keyed self on
+    /// `idx_nodes_vname` on every plain run. The ids have to override the stamp.
+    #[test]
+    fn init_repo_rebuilds_when_the_stamp_lies_about_the_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".github/workflows")).unwrap();
+        std::fs::write(
+            tmp.path().join(".github/workflows/ci.yml"),
+            "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v7\n",
+        )
+        .unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("UPDATE nodes SET id = -id - 1; DELETE FROM files;")
+                .unwrap();
+        }
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .get_signature_format_version()
+                .unwrap(),
+            travsr_core::SIGNATURE_FORMAT_VERSION,
+            "the fixture's stamp must claim the current format"
+        );
+
+        let rebuilt = init_repo(tmp.path())
+            .expect("a current stamp over old-format ids must rebuild, not collide");
+        assert_eq!(rebuilt.files_indexed, 1);
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert!(store.node_ids_match_current_format().unwrap());
+    }
+
+    /// The purge removes every Phase B edge, so the marker saying Phase B is
+    /// current for HEAD has to go with them. Left in place, the already-done
+    /// gate and `arm_phase_b_if_pending` both read the empty call graph as
+    /// current until the next commit.
+    #[test]
+    fn init_repo_format_rebuild_clears_the_phase_b_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("phase_b_commit", "abc123").unwrap();
+            store
+                .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION - 1)
+                .unwrap();
+        }
+
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(store.get_meta("phase_b_commit").unwrap(), None);
+    }
+
+    /// The stamp guards the rebuild, so it cannot be written until the rebuild
+    /// has landed — not merely until the purge has. The observed failure was
+    /// exactly this: the purge succeeded, the stamp was committed, indexing then
+    /// aborted on a UNIQUE violation, and the repo was left claiming the current
+    /// format over a graph that had just lost most of itself, with `format_skew`
+    /// reading false on every later run so it could never self-heal.
+    #[test]
+    fn init_repo_keeps_the_old_stamp_when_the_rebuild_indexing_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let old = travsr_core::SIGNATURE_FORMAT_VERSION - 1;
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_signature_format_version(old).unwrap();
+        }
+
+        // Fail the write of the re-parsed graph, which is where the real
+        // failure landed: after the purge has already emptied the old one.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_node_insert BEFORE INSERT ON nodes \
+                 BEGIN SELECT RAISE(ABORT, 'simulated indexing failure'); END;",
+            )
+            .unwrap();
+        }
+
+        assert!(
+            init_repo(tmp.path()).is_err(),
+            "a rebuild whose indexing fails must fail the init"
+        );
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            old,
+            "a rebuild that purged but never re-indexed must leave the old stamp, \
+             so the next run still sees the skew and rebuilds again"
+        );
+    }
+
+    /// Keeping the old stamp only matters if the next run acts on it. It could
+    /// not: the purge block was gated on `node_count() > 0`, and a rebuild that
+    /// purged and then failed leaves exactly zero nodes. The next run skipped the
+    /// block, skipped `clear_file_hashes` with it, found every file unchanged,
+    /// indexed nothing, reported "up to date - 0 nodes" and then stamped the
+    /// current format over the empty graph. From there `format_skew` read false
+    /// forever and no later run rebuilt either, which is the same dead end the
+    /// stamp move exists to prevent, reached one run later.
+    #[test]
+    fn init_repo_rebuilds_again_after_a_failed_rebuild_emptied_the_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let old = travsr_core::SIGNATURE_FORMAT_VERSION - 1;
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_signature_format_version(old).unwrap();
+        }
+
+        // Fail the rebuild after the purge has already emptied the graph.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_node_insert BEFORE INSERT ON nodes \
+             BEGIN SELECT RAISE(ABORT, 'simulated indexing failure'); END;",
+        )
+        .unwrap();
+        assert!(init_repo(tmp.path()).is_err());
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .node_count()
+                .unwrap(),
+            0,
+            "the fixture must leave the empty graph this test is about"
+        );
+        conn.execute_batch("DROP TRIGGER fail_node_insert;")
+            .unwrap();
+        drop(conn);
+
+        // The recovery run. Nothing on disk changed, so only the preserved skew
+        // can drive it.
+        init_repo(tmp.path()).expect("the run after a failed rebuild must rebuild");
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert!(
+            store.node_count().unwrap() > 0,
+            "the recovery run must re-parse the repo, not report itself up to date \
+             over the graph the failed rebuild emptied"
+        );
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            travsr_core::SIGNATURE_FORMAT_VERSION,
+            "and only then may it stamp the current format"
+        );
+    }
+
+    /// ARCH-102: a corpus change rewrites every NodeId, so the old
+    /// node set has to go. `reconcile`'s TOCTOU re-check used to skip every file
+    /// still present on disk, which is all of them here, so the purge deleted
+    /// nothing and the next re-parse wrote a second node set for the same path
+    /// under the new corpus (the per-path delete is corpus-scoped).
+    #[test]
+    fn init_repo_purges_the_old_corpus_when_the_git_remote_appears() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpora = || -> Vec<(String, i64)> {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT corpus, count(*) FROM nodes GROUP BY corpus ORDER BY corpus")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(corpora().len(), 1, "one repo, one corpus");
+
+        // The repo gains an origin, so `detect_corpus` stops falling back to
+        // `local/<basename>` and every NodeId changes.
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                &tmp.path().to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/foo.git",
+            ])
+            .output()
+            .unwrap();
+
+        init_repo(tmp.path()).unwrap();
+        // Then edit the file, which is what makes the hash delta re-parse it and
+        // write the new-corpus node set.
+        std::fs::write(
+            tmp.path().join("a.ts"),
+            "export class A { go() {} go2() {} }",
+        )
+        .unwrap();
+        init_repo(tmp.path()).unwrap();
+
+        let after = corpora();
+        assert_eq!(
+            after.len(),
+            1,
+            "the old corpus must be purged, not left alongside the new one: {after:?}"
+        );
+        assert_eq!(after[0].0, "github.com/acme/foo");
+    }
+
     #[test]
     fn init_repo_skips_registry_when_env_var_set() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -7252,19 +10167,29 @@ mod tests {
         std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
 
         let home_tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home_tmp.path());
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
 
         let _ = init_repo(tmp.path()).unwrap();
 
         let registry_path = home_tmp.path().join(".travsr").join("registry.json");
+
+        // #893: restore HOME instead of removing it. With HOME unset,
+        // `travsr_store::registry::home_dir` falls back to `.`, so every later
+        // test in this binary that registers writes a `.travsr/registry.json`
+        // into the process's working directory. Leave TRAVSR_DISABLE_REGISTRY
+        // set: `git_init` sets it for the whole module and clearing it here
+        // reopens the leak for tests running in parallel with this one.
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
         assert!(
             !registry_path.exists(),
             "registry.json must not be created when TRAVSR_DISABLE_REGISTRY=1"
         );
-
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
-        std::env::remove_var("HOME");
     }
 
     #[test]
@@ -7283,9 +10208,7 @@ mod tests {
 
         std::fs::write(tmp.path().join("real.ts"), "export class Real {}").unwrap();
 
-        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         let stats = init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         assert_eq!(
             stats.files_indexed, 1,
@@ -7344,41 +10267,30 @@ mod tests {
         );
     }
 
-    /// L4 (#376 lifecycle plan): found indexing kubernetes/website, whose
-    /// entire doc corpus lives under `content/` — the standard source root
-    /// for Hugo/Jekyll/Gatsby-style static sites. Before `content` was added
-    /// to `KNOWN_SOURCE_DIRS`, a single top-level `content/` directory large
-    /// enough to dominate the repo (>=1000 files, >=15% of the total) was
-    /// flagged as a false-positive "large dep dir" and auto-excluded in
-    /// non-TTY runs with no visible warning in the command's own output —
-    /// silently discarding the repo's actual content.
+    /// A folder that holds most of the repo is not evidence it is a dependency:
+    /// init asked `[Y/n]` about it on a terminal and silently excluded it
+    /// everywhere else, and in yugabyte-db that folder (`managed/`) is the
+    /// platform's own code. Dependency folders are left out by the default
+    /// `.travsrignore`; everything else is indexed.
     #[test]
-    fn detect_large_dep_dir_does_not_flag_content() {
-        let repo_root = std::path::Path::new("/repo");
-        let mut files: Vec<PathBuf> = (0..1200)
-            .map(|i| repo_root.join(format!("content/en/docs/page-{i}.md")))
-            .collect();
-        files.push(repo_root.join("go.mod"));
-        assert_eq!(
-            detect_large_dep_dir(&files, repo_root),
-            None,
-            "content/ is a known source dir and must never be auto-excluded"
-        );
-    }
+    fn a_dominant_folder_is_indexed_not_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir(tmp.path().join("managed")).unwrap();
+        for i in 0..1200 {
+            std::fs::write(tmp.path().join(format!("managed/c{i}.yaml")), "a: 1\n").unwrap();
+        }
+        std::fs::write(tmp.path().join("go.mod"), "module m\n").unwrap();
 
-    #[test]
-    fn detect_large_dep_dir_still_flags_an_unknown_large_dir() {
-        let repo_root = std::path::Path::new("/repo");
-        let mut files: Vec<PathBuf> = (0..1200)
-            .map(|i| repo_root.join(format!("node_modules/pkg-{i}/index.js")))
-            .collect();
-        files.push(repo_root.join("go.mod"));
-        let detected = detect_large_dep_dir(&files, repo_root);
-        assert_eq!(
-            detected.map(|(dir, ..)| dir),
-            Some("node_modules".to_string()),
-            "an unknown, dominant top-level dir must still be flagged"
+        let stats = init_repo(tmp.path()).unwrap();
+
+        assert!(
+            stats.files_indexed >= 1200,
+            "indexed {}",
+            stats.files_indexed
         );
+        let ignore = std::fs::read_to_string(tmp.path().join(".travsrignore")).unwrap_or_default();
+        assert!(!ignore.contains("managed"), "{ignore}");
     }
 
     #[test]
@@ -7394,7 +10306,7 @@ mod tests {
             .status()
             .unwrap();
         std::process::Command::new("git")
-            .args(["commit", "-m", "init"])
+            .args(["-c", "core.hooksPath=/dev/null", "commit", "-m", "init"])
             .current_dir(tmp.path())
             .status()
             .unwrap();
@@ -7613,7 +10525,7 @@ mod tests {
             store
                 .put_edge(&Edge::new(n.id, n.id, EdgeKind::RefCall))
                 .unwrap();
-            store.record_edge_sites(&[(n.id, n.id, 1)]).unwrap();
+            store.record_edge_sites(&[(n.id, n.id, 1, None)]).unwrap();
             n.id
         };
 
@@ -7702,6 +10614,2152 @@ mod tests {
                 .contains_key(yml_rel),
             "`--fix` deleted an existing non-code file's tracking row"
         );
+    }
+
+    /// RFC-027 section 12 / Phase 3 gate: measured precision on a fixture corpus.
+    ///
+    /// This is the number that decides whether the lane ships. The bar is 0.99
+    /// with a target of zero false positives, because for a product whose thesis
+    /// is "zero structural hallucinations" a wrong edge is not a quality
+    /// regression but a breach of the value proposition.
+    ///
+    /// The fixture is deliberately adversarial rather than a happy path: one
+    /// unambiguous callee the lexical lane should resolve, and one name defined
+    /// on two different classes, which is exactly the method-on-receiver case it
+    /// must refuse. A meter that only ever sees resolvable calls proves nothing.
+    #[test]
+    fn measured_live_precision_clears_the_shipping_gate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        // Unambiguous: only one `charge` in the corpus.
+        std::fs::write(
+            tmp.path().join("src/billing.ts"),
+            "export class Billing {\n  charge(): void {}\n}\n",
+        )
+        .unwrap();
+        // Ambiguous: `ping` is defined on two classes, so the lexical lane must
+        // abstain rather than pick one.
+        std::fs::write(
+            tmp.path().join("src/a.ts"),
+            "export class A {\n  ping(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/b.ts"),
+            "export class B {\n  ping(): void {}\n}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("src/caller.ts");
+        std::fs::write(
+            &caller,
+            "import { Billing } from \"./billing\";\n             export function run(bill: Billing, x: any): void {\n             \x20 bill.charge();\n             \x20 x.ping();\n             }\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .get_meta("corpus")
+            .unwrap()
+            .unwrap_or_default();
+
+        // A save, then the overlay: this is the mid-edit state.
+        {
+            let mut text = std::fs::read_to_string(&caller).unwrap();
+            text.push_str("\nexport function again(bill: Billing): void {\n  bill.charge();\n}\n");
+            std::fs::write(&caller, text).unwrap();
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&caller), tmp.path(), &mut store).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller, None);
+        }
+
+        // The ambiguous call must never have produced a claim at all: an
+        // abstention is not a low-confidence answer, it is no answer.
+        {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            let pending = store
+                .pending_refs_in_file(&corpus, "src/caller.ts")
+                .unwrap();
+            assert!(
+                pending.iter().any(|(name, _)| name == "ping"),
+                "the ambiguous receiver must abstain, got pending {pending:?}"
+            );
+        }
+
+        // Now commit and let Phase B run for real. The meter lives at
+        // ratification for a reason that only shows up here: `reindex_replace`
+        // deletes the edited file's `edge_sites` on save, so between the save and
+        // the next Phase B run there is no call-site evidence to check anything
+        // against. Measuring earlier does not produce a pessimistic number, it
+        // produces no number at all.
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-qm",
+                "edit",
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let sha = read_head_commit_sha(tmp.path()).expect("HEAD after commit");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", &sha).unwrap();
+        }
+        let store_mutex = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        run_background_phase_b_inner(tmp.path(), &store_mutex);
+        drop(store_mutex);
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        // Read the cumulative counters ratification wrote, not the claim rows:
+        // ratification consumes a claim once it has scored it, so the meter is
+        // the `meta` reading, which is also what the shipping gate consults.
+        let (agree, disagree, unverifiable) = read_precision_totals_for(&store, None);
+        let sample = travsr_store::LivePrecision {
+            agree,
+            disagree,
+            unverifiable,
+        };
+
+        assert!(
+            sample.claims() > 0,
+            "precondition: the lane must have claimed something to score"
+        );
+        assert!(
+            sample.coverage() > 0.0,
+            "precondition: Phase B must have left call-site evidence, or this gate \
+             asserts nothing. Got {sample:?}"
+        );
+        assert_eq!(
+            sample.disagree, 0,
+            "a live edge that disagrees with Phase B is a false positive, and the \
+             target is zero: {sample:?}"
+        );
+        let precision = sample
+            .precision()
+            .expect("a verified sample must yield a precision");
+        assert!(
+            precision >= 0.99,
+            "measured precision {precision} is below the 0.99 shipping gate: {sample:?}"
+        );
+    }
+
+    /// RFC-027 Phase 4 gate: the same shipping bar, measured for **Rust**, split
+    /// out by language. This is the differential the phase turns on — the live
+    /// lane's Rust claims scored against what the commit-time Phase B (native
+    /// tree-sitter resolution, and rust-analyzer LSIF when present) derived at
+    /// the same call sites.
+    ///
+    /// The fixture is cross-file on purpose: a same-file call is resolved by
+    /// Phase A and never becomes an `UnresolvedCall`, so the live lane would have
+    /// nothing to claim. It exercises the three Rust shapes the lane resolves:
+    /// `Zoo::assemble()` (associated call — the already-qualified `method:Zoo.*`
+    /// sig used verbatim), `z.describe()` (method call whose receiver type the
+    /// extractor recovers, rebuilt to `method:Zoo.describe`), and `helper()` (a
+    /// bare free function). The names are deliberately NOT in the extractor's
+    /// `NOISE_NAMES` set (`new`, `from`, `clone`, …), which would drop them
+    /// before the lane ever saw them. All are unambiguous repo-wide, so §7.3a
+    /// resolves them with no language server, which keeps the test hermetic.
+    #[test]
+    fn measured_rust_live_precision_clears_the_per_language_gate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        std::fs::write(
+            tmp.path().join("src/zoo.rs"),
+            "pub struct Zoo;\n\nimpl Zoo {\n    pub fn assemble() -> Zoo {\n        Zoo\n    }\n    pub fn describe(&self) -> i32 {\n        7\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/util.rs"),
+            "pub fn helper() -> i32 {\n    42\n}\n",
+        )
+        .unwrap();
+        let main = tmp.path().join("src/main.rs");
+        std::fs::write(
+            &main,
+            "mod zoo;\nmod util;\nuse zoo::Zoo;\nuse util::helper;\n\nfn run(z: &Zoo) {\n    let _a = Zoo::assemble();\n    let _d = z.describe();\n    let _n = helper();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .get_meta("corpus")
+            .unwrap()
+            .unwrap_or_default();
+
+        // A save, then the overlay: the mid-edit state. The appended function
+        // adds a third cross-file call the live lane must resolve.
+        {
+            let mut text = std::fs::read_to_string(&main).unwrap();
+            text.push_str("\nfn run_again(z: &Zoo) {\n    let _a = Zoo::assemble();\n    let _d = z.describe();\n}\n");
+            std::fs::write(&main, text).unwrap();
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&main), tmp.path(), &mut store).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &main, None);
+        }
+
+        // Commit and let Phase B run for real, so the meter has ratified
+        // call-site evidence to score against (see the TS gate test for why the
+        // meter must run here and not on save).
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "edit",
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let sha = read_head_commit_sha(tmp.path()).expect("HEAD after commit");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", &sha).unwrap();
+        }
+        let store_mutex = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        run_background_phase_b_inner(tmp.path(), &store_mutex);
+        drop(store_mutex);
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        // As above: the per-language reading lives in `meta` after ratification
+        // has consumed the claims it scored.
+        let (agree, disagree, unverifiable) = read_precision_totals_for(&store, Some("rust"));
+        let rust = travsr_store::LivePrecision {
+            agree,
+            disagree,
+            unverifiable,
+        };
+
+        assert!(
+            rust.claims() > 0,
+            "precondition: the Rust lane must have claimed something to score: {rust:?}"
+        );
+        assert!(
+            rust.coverage() > 0.0,
+            "precondition: Phase B must have left Rust call-site evidence, or this \
+             gate asserts nothing. Got {rust:?}"
+        );
+        assert_eq!(
+            rust.disagree, 0,
+            "a live Rust edge that disagrees with Phase B is a false positive, and \
+             the target is zero: {rust:?}"
+        );
+        let precision = rust
+            .precision()
+            .expect("a verified Rust sample must yield a precision");
+        assert!(
+            precision >= LIVE_PRECISION_GATE,
+            "measured Rust precision {precision} is below the {LIVE_PRECISION_GATE} \
+             per-language shipping gate: {rust:?}"
+        );
+
+        // The gate is per-language: the enable switch reads Rust's own reading,
+        // which this run has just written above the bar.
+        assert!(
+            live_lane_enabled_for(&store, "rust"),
+            "a Rust reading at or above the bar must keep the lane enabled"
+        );
+    }
+
+    /// RFC-027 #813 Mechanism A, end to end through the real save path: a body
+    /// edit to one function preserves every other function's committed call edge
+    /// (mid-edit recovery, the ~71% -> ~99% win), and the next commit restores
+    /// the full committed graph with no live overlay left (Invariant #4). The
+    /// headless daemon reaches this recovery with no language server at all.
+    #[test]
+    fn body_edit_preserves_committed_call_edges_and_commit_reconverges() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        const N: usize = 25;
+        // types.rs: two structs whose method names collide, so every `m{i}` is
+        // ambiguous by name — the lexical lane must abstain on it, and only a
+        // type-aware resolver (Phase B) or a preserved committed edge can carry
+        // the call. This is the ambiguous-callee case where the whole-file purge
+        // lost recall (RFC-027 §7.3a).
+        let mut types = String::from("pub struct A;\npub struct B;\n\nimpl A {\n");
+        for i in 0..N {
+            types.push_str(&format!("    pub fn m{i}(&self) -> i32 {{ {i} }}\n"));
+        }
+        types.push_str("}\n\nimpl B {\n");
+        for i in 0..N {
+            types.push_str(&format!("    pub fn m{i}(&self) -> i32 {{ {i} }}\n"));
+        }
+        types.push_str("}\n");
+        std::fs::write(tmp.path().join("src/types.rs"), types).unwrap();
+
+        // main.rs: N caller functions, each a type-resolved call `a.m{i}()` on an
+        // `A`. `edit0` rewrites only c0's body (signature and its call unchanged,
+        // so its NodeId is stable and the edit is a pure body edit).
+        let main = tmp.path().join("src/main.rs");
+        let build_main = |edit0: bool| {
+            let mut s = String::from("mod types;\nuse types::A;\n\n");
+            for i in 0..N {
+                if i == 0 && edit0 {
+                    s.push_str(
+                        "pub fn c0(a: &A) -> i32 {\n    let _changed = 1 + 1;\n    a.m0()\n}\n",
+                    );
+                } else {
+                    s.push_str(&format!("pub fn c{i}(a: &A) -> i32 {{\n    a.m{i}()\n}}\n"));
+                }
+            }
+            s
+        };
+        std::fs::write(&main, build_main(false)).unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .get_meta("corpus")
+            .unwrap()
+            .unwrap_or_default();
+
+        // Commit the initial tree and run Phase B so the cross-file calls are
+        // ratified into committed (scip) edges — the baseline the mid-edit save
+        // must preserve.
+        let commit = |msg: &str| {
+            std::process::Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "-qm",
+                    msg,
+                ])
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            let sha = read_head_commit_sha(tmp.path()).expect("HEAD after commit");
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", &sha).unwrap();
+        };
+        let run_phase_b = || {
+            let store_mutex =
+                std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+            run_background_phase_b_inner(tmp.path(), &store_mutex);
+        };
+        commit("initial");
+        run_phase_b();
+
+        // Ratified baseline: main.rs's committed type-resolved call edges.
+        let baseline = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .owned_ratified_ref_call_edges(&corpus, "src/main.rs")
+            .unwrap();
+        assert!(
+            baseline >= 20,
+            "precondition: native Phase B must ratify the type-resolved calls; got {baseline}"
+        );
+
+        // Save a pure body edit to c0 only, then run the overlay — the mid-edit
+        // state. No language server is involved on this path.
+        std::fs::write(&main, build_main(true)).unwrap();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&main), tmp.path(), &mut store).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &main, None);
+        }
+
+        let after = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .owned_ratified_ref_call_edges(&corpus, "src/main.rs")
+            .unwrap();
+        // Only c0's ratified edge is dropped (c0's body changed, so it is
+        // re-resolved into the live overlay, which this count excludes); every
+        // other function's committed edge is preserved in place. The pre-#813
+        // whole-file purge dropped all `baseline` of them to zero.
+        assert_eq!(
+            after,
+            baseline - 1,
+            "exactly the edited function's committed edge should drop; got {after} of {baseline}"
+        );
+        let recovery = after as f64 / baseline as f64;
+        assert!(
+            recovery >= 0.95,
+            "mid-edit recovery {recovery:.3} is below the 0.95 acceptance bar \
+             (after {after} of baseline {baseline})"
+        );
+
+        // Commit and run Phase B for real: the committed graph must fully
+        // reconverge and carry no live overlay (Invariant #4).
+        commit("edit");
+        run_phase_b();
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let reconverged = store
+            .owned_ratified_ref_call_edges(&corpus, "src/main.rs")
+            .unwrap();
+        assert_eq!(
+            reconverged, baseline,
+            "commit must restore every committed edge (Invariant #4): {reconverged} vs {baseline}"
+        );
+        assert_eq!(
+            store.count_edges_with_provenance("live").unwrap(),
+            0,
+            "no live overlay may survive ratification (Invariant #4)"
+        );
+    }
+
+    /// Every shipped language must carry the evidence that put it there.
+    ///
+    /// The review of PR #795 flagged that the two directions of the gate
+    /// disagree by more than an order of magnitude: languages were opted in on 1
+    /// to 6 verified claims while `LIVE_PRECISION_MIN_SAMPLE` needs 20 before it
+    /// will act on an adverse reading. That asymmetry is deliberate (see
+    /// `live_lane_enabled_for`), but it has to be *visible*, so the sample sits
+    /// in the list as data and this test keeps it honest: a future entry cannot
+    /// be added with no reading behind it, which is the failure the strict
+    /// opt-in gate exists to prevent.
+    #[test]
+    fn every_shipped_language_records_the_sample_that_vouched_for_it() {
+        for (lang, verified) in LIVE_LANE_SHIPPED {
+            assert!(
+                *verified > 0,
+                "{lang} ships enabled with no verified claim behind it; \
+                 measure it per RFC-027 section 11.3 before adding it"
+            );
+        }
+        // The asymmetry is real and recorded rather than accidental. If an entry
+        // ever reaches the disable threshold's sample size, this assertion is
+        // the prompt to revisit whether the two bars should still differ.
+        assert!(
+            LIVE_LANE_SHIPPED
+                .iter()
+                .all(|(_, v)| *v < LIVE_PRECISION_MIN_SAMPLE),
+            "an entry now meets the disable-direction bar; reconsider whether \
+             the enable direction should still use a lower one"
+        );
+    }
+
+    /// The enable switch is measured, not vacuous: it disables a language ONLY on
+    /// a meaningful adverse sample, and re-enables when the cumulative reading
+    /// recovers. Driven directly through the per-language meta keys so it does not
+    /// depend on a live Phase B run.
+    #[test]
+    fn the_precision_gate_disables_a_language_only_on_a_meaningful_adverse_sample() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // No reading at all, but Rust is a shipped/vouched language, so enabled.
+        assert!(live_lane_enabled_for(&store, "rust"));
+
+        // Below the bar but too few verified claims to act on: still enabled
+        // (Rust is shipped, and the sample is not a meaningful adverse reading).
+        store.set_meta("live_precision.rust", "4,1,0").unwrap();
+        assert!(
+            live_lane_enabled_for(&store, "rust"),
+            "5 verified claims is below the min sample; must not disable yet"
+        );
+
+        // Enough claims AND below the bar: disabled. (18 agree, 5 disagree =>
+        // 23 verified, precision ~0.78.)
+        store.set_meta("live_precision.rust", "18,5,3").unwrap();
+        assert!(
+            !live_lane_enabled_for(&store, "rust"),
+            "a meaningful sample below 0.99 must disable the language"
+        );
+
+        // A disagreement-free follow-up lifts the cumulative reading back over
+        // the bar: self-healing, re-enabled. (198 agree, 2 disagree => 0.99.)
+        store.set_meta("live_precision.rust", "198,2,0").unwrap();
+        assert!(
+            live_lane_enabled_for(&store, "rust"),
+            "recovered precision at the bar must re-enable the language"
+        );
+
+        // The switch is per-language: a disabled Rust must not disable TypeScript.
+        store.set_meta("live_precision.rust", "18,5,3").unwrap();
+        assert!(!live_lane_enabled_for(&store, "rust"));
+        assert!(
+            live_lane_enabled_for(&store, "typescript"),
+            "the gate must be scoped per language, not corpus-wide"
+        );
+    }
+
+    /// `travsr status` says why calls are not traced as you edit: measured off
+    /// here, or never available for the language. `javascript` is metered as
+    /// `typescript`, the same node language its files carry.
+    #[test]
+    fn edit_tracing_names_why_it_is_off() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        assert_eq!(edit_tracing(&store, "rust"), EditTracing::On);
+        assert_eq!(edit_tracing(&store, "javascript"), EditTracing::On);
+        assert_eq!(edit_tracing(&store, "ruby"), EditTracing::OffUnavailable);
+        store.set_meta("live_precision.rust", "18,5,3").unwrap();
+        assert_eq!(edit_tracing(&store, "rust"), EditTracing::OffMeasured);
+        store
+            .set_meta("live_precision.typescript", "18,5,3")
+            .unwrap();
+        assert_eq!(edit_tracing(&store, "javascript"), EditTracing::OffMeasured);
+    }
+
+    /// RFC-027 section 8.7.6: an unmeasured, un-vouched language ships DISABLED.
+    ///
+    /// This is the strict-gate decision. The earlier policy left an unmeasured
+    /// language enabled to earn a reading; when eleven non-native languages
+    /// joined at once, that meant nine shipped enabled with no reading. Now a
+    /// language is disabled until it is on `LIVE_LANE_SHIPPED`, and the
+    /// measurement harness lifts the gate for exactly the language it is
+    /// measuring via `TRAVSR_LIVE_LANE_MEASURE`.
+    #[test]
+    fn an_unmeasured_language_ships_disabled_until_opted_in() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // A vouched language with no reading is enabled; an un-vouched one is not.
+        assert!(live_lane_enabled_for(&store, "go"), "go is shipped");
+        assert!(
+            !live_lane_enabled_for(&store, "scala"),
+            "an unmeasured non-shipped language must be disabled by the strict gate"
+        );
+        assert!(!live_lane_enabled_for(&store, "ruby"));
+
+        // Force-enabling for measurement lifts the gate for exactly that language.
+        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "scala,ruby");
+        assert!(live_lane_enabled_for(&store, "scala"));
+        assert!(live_lane_enabled_for(&store, "ruby"));
+        assert!(
+            !live_lane_enabled_for(&store, "lua"),
+            "the force list is per-language, not a blanket override"
+        );
+        std::env::remove_var("TRAVSR_LIVE_LANE_MEASURE");
+
+        // The adverse-meter safety still wins over a force-enable: a measured
+        // language below the bar stays disabled even while being measured.
+        let mut store = store;
+        store.set_meta("live_precision.scala", "18,5,0").unwrap();
+        std::env::set_var("TRAVSR_LIVE_LANE_MEASURE", "scala");
+        assert!(
+            !live_lane_enabled_for(&store, "scala"),
+            "a meaningful adverse reading disables a language even under force"
+        );
+        std::env::remove_var("TRAVSR_LIVE_LANE_MEASURE");
+    }
+
+    /// The gate must not be clearable by an empty sample.
+    ///
+    /// A lane that resolved nothing verifiable has not earned a perfect score,
+    /// and reporting 1.0 there would let "we measured nothing" pass as "we
+    /// measured perfectly" — which is exactly how a precision gate stops meaning
+    /// anything.
+    #[test]
+    fn an_unverifiable_sample_reports_no_precision_rather_than_a_perfect_one() {
+        let empty = travsr_store::LivePrecision::default();
+        assert_eq!(empty.precision(), None);
+        assert_eq!(empty.coverage(), 0.0);
+
+        let all_unverifiable = travsr_store::LivePrecision {
+            agree: 0,
+            disagree: 0,
+            unverifiable: 40,
+        };
+        assert_eq!(
+            all_unverifiable.precision(),
+            None,
+            "forty unchecked claims must not read as perfect precision"
+        );
+        assert_eq!(all_unverifiable.coverage(), 0.0);
+
+        let mixed = travsr_store::LivePrecision {
+            agree: 99,
+            disagree: 1,
+            unverifiable: 100,
+        };
+        assert_eq!(mixed.precision(), Some(0.99));
+        assert_eq!(
+            mixed.coverage(),
+            0.5,
+            "coverage must expose the unchecked half"
+        );
+    }
+
+    /// The cumulative counter survives a malformed value rather than failing a
+    /// commit over a diagnostic.
+    #[test]
+    fn the_precision_counter_tolerates_a_corrupt_value() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        assert_eq!(read_precision_totals(&store), (0, 0, 0));
+        store.set_meta(LIVE_PRECISION_META, "not,a,number").unwrap();
+        assert_eq!(read_precision_totals(&store), (0, 0, 0));
+        store.set_meta(LIVE_PRECISION_META, "3,1,7").unwrap();
+        assert_eq!(read_precision_totals(&store), (3, 1, 7));
+    }
+
+    /// RFC-027 Phase 2 gate, Invariant #4: ratifying the live overlay returns
+    /// the graph to exactly what it was before the overlay existed.
+    ///
+    /// ```text
+    /// graph(G) --overlay--> G' --ratify--> G
+    /// ```
+    ///
+    /// This is the load-bearing half of the convergence argument. The overlay
+    /// is allowed to be non-deterministic — it depends on which language server
+    /// a developer happens to be running — and this is the fence that makes
+    /// that safe: whatever it contained, retiring it cannot leave a trace.
+    ///
+    /// It holds because the overlay is purely **additive**. `put_edge_live`
+    /// creates edges that were absent and refreshes its own, but never relabels
+    /// a row another lane wrote, so every row the sweep can delete is one the
+    /// live lane created. An earlier version relabelled `tree-sitter` rows,
+    /// and this test is what caught it: the sweep then deleted pre-existing
+    /// truth instead of returning the graph to it.
+    ///
+    /// Fingerprints compare provenance as well as endpoints, so a `live` row
+    /// left sitting where a ratified one belongs fails here rather than
+    /// passing on a matching count.
+    #[test]
+    fn ratifying_the_overlay_restores_the_pre_overlay_graph() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        let order = tmp.path().join("src/order.ts");
+
+        // Phase A only, exactly what a save does: content changes, the file's
+        // outgoing edges are rebuilt from the parse, and the new call site has
+        // no semantic edge. This is the mid-edit degradation RFC-027 covers.
+        {
+            let mut text = std::fs::read_to_string(&order).unwrap();
+            text.push_str("\nexport function expressOrder(u: User): void {\n  u.save();\n}\n");
+            std::fs::write(&order, text).unwrap();
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&order), tmp.path(), &mut store).unwrap();
+        }
+        let degraded = graph_fingerprint(&db_path);
+
+        // Overlay.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &order, None);
+        }
+        let live_rows = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .count_edges_with_provenance("live")
+            .unwrap();
+        assert!(
+            live_rows > 0,
+            "precondition: the overlay must be non-empty or this asserts nothing"
+        );
+        assert_ne!(
+            graph_fingerprint(&db_path),
+            degraded,
+            "precondition: the overlay must actually have changed the graph"
+        );
+
+        // Ratify with nothing re-derived: the strictest case for the sweep.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            ratify_live_overlay(&mut store, &["typescript".to_string()]);
+        }
+
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_edges_with_provenance("live")
+                .unwrap(),
+            0,
+            "no live edge may survive the run that ratifies it"
+        );
+        assert_eq!(
+            graph_fingerprint(&db_path),
+            degraded,
+            "retiring the overlay must restore the graph exactly, not merely its size"
+        );
+    }
+
+    /// The destructive case the additive rule exists to prevent.
+    ///
+    /// An interface edit re-resolves the files that *reference* the edited one
+    /// (section 6.3). Those files were never re-parsed, so their existing
+    /// `tree-sitter` edges are still in place. If the overlay relabelled them
+    /// `live`, the ratification sweep would delete pre-existing truth rather
+    /// than returning the graph to it, and a caller edge would simply vanish.
+    ///
+    /// So: run the overlay over a file that was *not* re-indexed, then ratify,
+    /// and require the graph to be unchanged throughout.
+    #[test]
+    fn the_overlay_cannot_destroy_an_edge_it_did_not_create() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        let order = tmp.path().join("src/order.ts");
+
+        // order.ts keeps every edge the full index gave it. This is a closure
+        // re-resolution, not a save.
+        let before = graph_fingerprint(&db_path);
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &order, None);
+        }
+        assert_eq!(
+            graph_fingerprint(&db_path),
+            before,
+            "resolving a file whose edges already exist must change nothing"
+        );
+
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            ratify_live_overlay(&mut store, &["typescript".to_string()]);
+        }
+        assert_eq!(
+            graph_fingerprint(&db_path),
+            before,
+            "ratification must not delete an edge the overlay did not create"
+        );
+    }
+
+    /// The other half: an overlay edge Phase B *does* re-derive is ratified in
+    /// place and survives the sweep, now carrying the ratified provenance.
+    ///
+    /// This is why the sweep can be a blunt delete. By the time it runs, every
+    /// edge Phase B re-derived has already been relabelled by the ratification
+    /// write, so what is still marked `live` is exactly what Phase B did not
+    /// re-derive.
+    #[test]
+    fn an_overlay_edge_phase_b_rederives_is_ratified_in_place() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        edit_and_reindex_order(&tmp, &db_path, &corpus);
+        let overlay: Vec<travsr_core::Edge> = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_edges(&store)
+        };
+        assert!(!overlay.is_empty(), "precondition: an overlay edge exists");
+
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            // Stand in for Phase B re-deriving these edges natively. This is the
+            // same call the daemon makes after a Phase B run.
+            store
+                .write_phase_b_batch(&[], &overlay, "tree-sitter")
+                .unwrap();
+            ratify_live_overlay(&mut store, &["typescript".to_string()]);
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.count_edges_with_provenance("live").unwrap(),
+            0,
+            "the row is no longer live once Phase B has re-derived it"
+        );
+        for e in &overlay {
+            let survived = store
+                .iter_edges_from(e.src)
+                .unwrap()
+                .into_iter()
+                .any(|x| x.dst == e.dst && x.kind == e.kind);
+            assert!(
+                survived,
+                "an edge Phase B re-derived must survive ratification, not be swept"
+            );
+        }
+    }
+
+    /// The sweep is scoped to languages that completed, so a crashed sidecar's
+    /// overlay survives rather than being discarded with nothing to replace it
+    /// (#712 partial success advances the marker regardless).
+    #[test]
+    fn ratification_spares_a_language_that_did_not_complete() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        edit_and_reindex_order(&tmp, &db_path, &corpus);
+        let before = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .count_edges_with_provenance("live")
+            .unwrap();
+        assert!(before > 0, "precondition: an overlay exists");
+
+        // Rust "completed"; TypeScript did not. The TypeScript overlay stays.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            ratify_live_overlay(&mut store, &["rust".to_string()]);
+        }
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_edges_with_provenance("live")
+                .unwrap(),
+            before,
+            "a language whose truth was never re-derived must keep its overlay"
+        );
+    }
+
+    // ── #811: ref_resolution_state reconciled on every Phase B completion ──
+    //
+    // The daemon half of #811. The store tests prove the reconcile itself; these
+    // prove it runs from every path that completes a Phase B pass, on a real
+    // repository, and assert on the table with the SQL the issue measured with
+    // rather than through `pending_ref_count` (whose `JOIN nodes` hides orphans).
+
+    /// The issue's own measurement, verbatim, on the on-disk database.
+    fn raw_pending_count(db_path: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM ref_resolution_state WHERE state = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Whether a `(src, ref_line, name)` row is present, in any state.
+    fn raw_has_row(
+        db_path: &std::path::Path,
+        src: travsr_core::NodeId,
+        line: u32,
+        name: &str,
+    ) -> bool {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ref_resolution_state \
+                 WHERE src = ?1 AND ref_line = ?2 AND name = ?3)",
+                rusqlite::params![src.0 as i64, line as i64, name],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            != 0
+    }
+
+    /// Whether Phase B recorded a call site at `(src, line)`: the evidence the
+    /// reconcile keys on.
+    fn raw_edge_site_exists(
+        db_path: &std::path::Path,
+        src: travsr_core::NodeId,
+        line: u32,
+    ) -> bool {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM edge_sites WHERE src = ?1 AND line = ?2)",
+                rusqlite::params![src.0 as i64, line as i64],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            != 0
+    }
+
+    fn meta(db_path: &std::path::Path, key: &str) -> Option<String> {
+        travsr_store::SqliteStore::open(db_path)
+            .unwrap()
+            .get_meta(key)
+            .unwrap()
+    }
+
+    /// The part of the graph the reconcile is keyed on and must never change:
+    /// every node, every `ref/*` edge with its provenance, and every call site.
+    ///
+    /// Narrower than `graph_fingerprint` on purpose. Repeated `--force` passes
+    /// are not byte-stable on Phase A's speculative import `resolves-to` edges
+    /// (a pre-existing property of the purge-and-restage path, unrelated to
+    /// #811), and comparing those would make this test about that instead.
+    fn semantic_fingerprint(db_path: &std::path::Path) -> (Vec<String>, Vec<String>, i64) {
+        let store = travsr_store::SqliteStore::open(db_path).unwrap();
+        let mut refs: Vec<String> = store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, _, kind, _)| kind.starts_with("ref/"))
+            .map(|(s, d, k, p)| format!("{}|{}|{k}|{p}", s.0, d.0))
+            .collect();
+        refs.sort();
+        let sites: i64 = rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM edge_sites", [], |r| r.get(0))
+            .unwrap();
+        (store.node_fingerprint().unwrap(), refs, sites)
+    }
+
+    /// `travsr init --semantic [--force]`, exactly as `crates/travsr-cli/src/init.rs`
+    /// drives it. `init_repo` would defer Phase B to the daemon and never reach the
+    /// inline path under test.
+    fn init_semantic(root: &std::path::Path, force: bool) {
+        disable_registry();
+        let r = init_repo_with_progress(root, None, true, force, &mut |_| {});
+        r.expect("init_repo_with_progress(semantic = true)");
+    }
+
+    /// The original `caller.ts`. Line 4's `notify()` is the #811 shape: the two
+    /// lanes disagree about it by design. `notify` is a parameter of `run`, so
+    /// the precision-first live lane refuses the repo-wide lookup (section 7.3
+    /// step 1: a locally bound bare identifier is not a free reference) and
+    /// records `pending`; Phase B's recall-biased resolver has no such gate and,
+    /// finding exactly one `fn:notify` in the repo, records a call site at that
+    /// line. A pending row with a site beside it is exactly what the issue
+    /// sampled. Line 5's `frobnicate()` has no definition anywhere, so nothing
+    /// ever resolves it: the genuine abstention that must survive every pass.
+    const CALLER_TS: &str = "import { Billing } from \"./billing\";\n\
+                             export function run(bill: Billing, notify: () => void): void {\n\
+                             \x20 bill.charge();\n\
+                             \x20 notify();\n\
+                             \x20 frobnicate();\n\
+                             }\n";
+    const NOTIFY_LINE: u32 = 4;
+    const FROBNICATE_LINE: u32 = 5;
+
+    /// A committed TypeScript repo with the fixture above, fully indexed by
+    /// `travsr init --semantic`. Returns the root, the database, the corpus and
+    /// the id of `run`, the enclosing definition every row in the test hangs off.
+    fn repo_with_a_shadowed_call() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        String,
+        travsr_core::NodeId,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/billing.ts"),
+            "export class Billing {\n  charge(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/notify.ts"),
+            "export function notify(): void {}\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("src/caller.ts"), CALLER_TS).unwrap();
+        git_commit_all(tmp.path(), "seed");
+
+        init_semantic(tmp.path(), false);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
+        let run = store
+            .enclosing_definition_at(&corpus, "src/caller.ts", NOTIFY_LINE)
+            .unwrap()
+            .expect("`run` must enclose line 4");
+        assert_eq!(
+            meta(&db_path, "phase_b_commit"),
+            meta(&db_path, "last_commit"),
+            "precondition: init --semantic must leave Phase B current"
+        );
+        assert!(
+            raw_edge_site_exists(&db_path, run, NOTIFY_LINE),
+            "precondition: Phase B must record a call site for `notify()`, or there is \
+             nothing for the live lane's abstention to go stale against"
+        );
+        assert!(
+            !raw_edge_site_exists(&db_path, run, FROBNICATE_LINE),
+            "precondition: nothing may resolve `frobnicate`, or the negative case is vacuous"
+        );
+        (tmp, db_path, corpus, run)
+    }
+
+    /// Steps 2 and 3 of the #811 repro. The daemon is up: a save lands, Phase A
+    /// re-indexes the file (dropping its `edge_sites`) and the live lane records
+    /// what it saw, abstaining on `notify` and `frobnicate`. Then the edit is
+    /// reverted on disk with the daemon stopped, so nothing re-processes the
+    /// file. Returns the id of the function the edit added, whose rows are now
+    /// orphans.
+    fn edit_overlay_and_revert(
+        tmp: &tempfile::TempDir,
+        db_path: &std::path::Path,
+        corpus: &str,
+        run: travsr_core::NodeId,
+    ) -> travsr_core::NodeId {
+        let caller = tmp.path().join("src/caller.ts");
+        let mut edited = CALLER_TS.to_string();
+        edited.push_str("\nexport function again(bill: Billing): void {\n  bill.charge();\n}\n");
+        std::fs::write(&caller, &edited).unwrap();
+        let again = {
+            let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
+            reindex_files(std::slice::from_ref(&caller), tmp.path(), &mut store).unwrap();
+            live_resolve_file(&mut store, corpus, tmp.path(), &caller, None);
+            store
+                .enclosing_definition_at(corpus, "src/caller.ts", 9)
+                .unwrap()
+                .expect("`again` must enclose line 9 after the save")
+        };
+        assert!(
+            raw_has_row(db_path, run, NOTIFY_LINE, "notify"),
+            "precondition: the live lane must abstain on the locally bound call"
+        );
+        assert!(
+            raw_has_row(db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "precondition: the live lane must abstain on the undefined call"
+        );
+        assert!(
+            !raw_edge_site_exists(db_path, run, NOTIFY_LINE),
+            "precondition: the save dropped the file's call sites, so at this point \
+             the pending row is honest"
+        );
+
+        // The revert, with the daemon stopped.
+        std::fs::write(&caller, CALLER_TS).unwrap();
+        again
+    }
+
+    /// Positive 5, the #811 reproduction. After `travsr init --semantic --force`
+    /// the rebuilt graph resolves line 4 (a call site is recorded), so the live
+    /// lane's `pending` row for it is stale and must go; the row for line 5,
+    /// which nothing resolves, must stay; and the rows of the function the
+    /// revert removed are orphans and must go too. Before the fix the CLI path
+    /// never reconciled, so the stale row survived with the site beside it.
+    #[test]
+    fn a_full_semantic_rebuild_retires_the_pending_rows_it_resolved() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus, run) = repo_with_a_shadowed_call();
+        let again = edit_overlay_and_revert(&tmp, &db_path, &corpus, run);
+        let pending_before = raw_pending_count(&db_path);
+        assert!(pending_before >= 2, "precondition: got {pending_before}");
+
+        // Step 4: the full rebuild.
+        init_semantic(tmp.path(), true);
+
+        // The graph is right: Phase B current, no live overlay, `run` still
+        // there under the same id, `again` gone with the revert.
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            meta(&db_path, "phase_b_commit"),
+            meta(&db_path, "last_commit")
+        );
+        assert_ne!(meta(&db_path, "phase_b_dirty").as_deref(), Some("1"));
+        assert_eq!(store.count_edges_with_provenance("live").unwrap(), 0);
+        assert_eq!(
+            store
+                .enclosing_definition_at(&corpus, "src/caller.ts", NOTIFY_LINE)
+                .unwrap(),
+            Some(run),
+            "a full rebuild must reproduce `run` under the same id"
+        );
+        assert!(
+            store.get_node(again).unwrap().is_none(),
+            "the revert removed `again`"
+        );
+        assert!(
+            raw_edge_site_exists(&db_path, run, NOTIFY_LINE),
+            "the rebuilt graph resolves line 4: this is the site the pending row is stale against"
+        );
+
+        // The table agrees with the graph.
+        assert!(
+            !raw_has_row(&db_path, run, NOTIFY_LINE, "notify"),
+            "a pending row Phase B has recorded a call site for must not survive \
+             `init --semantic --force` (#811)"
+        );
+        assert!(
+            !raw_has_row(&db_path, again, 9, "charge"),
+            "rows of a definition the revert removed are orphans and must go"
+        );
+        assert!(
+            raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "the genuine unresolved reference must stay pending"
+        );
+        assert_eq!(
+            raw_pending_count(&db_path),
+            1,
+            "exactly the one honest abstention remains"
+        );
+        assert_eq!(
+            store.pending_ref_count().unwrap(),
+            1,
+            "the count the freshness note shows agrees with the raw table"
+        );
+    }
+
+    /// Positive 6: repeated full rebuilds are stable. A second and third
+    /// `--force` must not reintroduce stale rows, change the pending count, or
+    /// change the graph.
+    #[test]
+    fn repeated_full_rebuilds_keep_the_pending_count_stable() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus, run) = repo_with_a_shadowed_call();
+        edit_overlay_and_revert(&tmp, &db_path, &corpus, run);
+
+        init_semantic(tmp.path(), true);
+        let after_first = (raw_pending_count(&db_path), semantic_fingerprint(&db_path));
+        assert_eq!(
+            after_first.0, 1,
+            "precondition: the first rebuild reconciled"
+        );
+
+        for pass in 2..=3 {
+            init_semantic(tmp.path(), true);
+            assert_eq!(
+                raw_pending_count(&db_path),
+                after_first.0,
+                "rebuild {pass} changed the pending count"
+            );
+            assert!(
+                raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
+                "rebuild {pass} lost the genuine abstention"
+            );
+            assert!(
+                !raw_has_row(&db_path, run, NOTIFY_LINE, "notify"),
+                "rebuild {pass} reintroduced the stale row"
+            );
+            assert_eq!(
+                semantic_fingerprint(&db_path),
+                after_first.1,
+                "rebuild {pass} changed the nodes, the ref edges or the call sites"
+            );
+        }
+        // And the table is now a fixed point of the reconcile itself.
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.reconcile_ref_resolution_states().unwrap(),
+            travsr_store::RefReconcileReport::default()
+        );
+    }
+
+    /// The state a pre-fix session leaves behind, on a current index: pending
+    /// rows whose call sites Phase B has already recorded. The live lane runs
+    /// over the unchanged file, so its abstentions land beside the sites init's
+    /// Phase B wrote, and nothing is armed because `phase_b_commit` is at HEAD.
+    fn stale_rows_on_a_current_index(
+        tmp: &tempfile::TempDir,
+        db_path: &std::path::Path,
+        corpus: &str,
+        run: travsr_core::NodeId,
+    ) {
+        let caller = tmp.path().join("src/caller.ts");
+        let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
+        live_resolve_file(&mut store, corpus, tmp.path(), &caller, None);
+        assert!(
+            raw_has_row(db_path, run, NOTIFY_LINE, "notify"),
+            "precondition"
+        );
+        assert!(
+            raw_has_row(db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "precondition"
+        );
+        assert!(
+            raw_edge_site_exists(db_path, run, NOTIFY_LINE),
+            "precondition: the stale shape is a pending row with a site beside it"
+        );
+        assert_eq!(
+            meta(db_path, "phase_b_commit"),
+            meta(db_path, "last_commit"),
+            "precondition: the index is current, so no Phase B is due"
+        );
+    }
+
+    /// Positive 7: a daemon restarted on a current index has no Phase B to run
+    /// and so never reaches ratification. Its startup reconcile must retire the
+    /// stale rows anyway, without touching the graph or triggering a rebuild.
+    #[test]
+    fn a_daemon_restart_on_a_current_index_reconciles_without_a_rebuild() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus, run) = repo_with_a_shadowed_call();
+        stale_rows_on_a_current_index(&tmp, &db_path, &corpus, run);
+        let before = graph_fingerprint(&db_path);
+        let marker_before = meta(&db_path, "phase_b_commit");
+
+        // What the daemon does on startup, in order: open the store through the
+        // same helper `run` uses (which reconciles), then let the scheduler
+        // decide whether Phase B is due.
+        let store = open_daemon_store(&db_path).unwrap();
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        arm_phase_b_if_pending(&store, &sched);
+        assert!(
+            !sched.try_claim(),
+            "a current index must not arm a Phase B run: the reconcile is not a rebuild"
+        );
+        // Even if a tick did claim a run, the worker returns before any work.
+        assert_eq!(
+            run_background_phase_b_inner(tmp.path(), &store),
+            phase_b_sched::RunOutcome::Success
+        );
+        drop(store);
+
+        assert!(
+            !raw_has_row(&db_path, run, NOTIFY_LINE, "notify"),
+            "the stale row must not survive a daemon restart (#811)"
+        );
+        assert!(
+            raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "the genuine abstention must survive it"
+        );
+        assert_eq!(raw_pending_count(&db_path), 1);
+        assert_eq!(
+            graph_fingerprint(&db_path),
+            before,
+            "no graph work may happen"
+        );
+        assert_eq!(meta(&db_path, "phase_b_commit"), marker_before);
+    }
+
+    /// Positive 8: the path that always reconciled still does, through the
+    /// shared helper: a resolved pending row goes, a genuine one stays, and an
+    /// orphan is purged, exactly as before the refactor.
+    #[test]
+    fn daemon_ratification_still_reconciles_pending_rows() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus, run) = repo_with_a_shadowed_call();
+        stale_rows_on_a_current_index(&tmp, &db_path, &corpus, run);
+        // A row whose enclosing symbol no longer exists (a rename retired its id).
+        let ghost = travsr_core::NodeId(0xDEAD_BEEF);
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store
+                .upsert_ref_resolution_states(&[travsr_store::RefResolution {
+                    src: ghost,
+                    ref_line: 1,
+                    ref_col: 0,
+                    name: "gone".to_string(),
+                    state: "pending",
+                    resolved_dst: None,
+                }])
+                .unwrap();
+        }
+        assert_eq!(raw_pending_count(&db_path), 3, "precondition");
+
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            ratify_live_overlay(&mut store, &["typescript".to_string()]);
+        }
+
+        assert!(
+            !raw_has_row(&db_path, run, NOTIFY_LINE, "notify"),
+            "resolved pending"
+        );
+        assert!(!raw_has_row(&db_path, ghost, 1, "gone"), "orphan");
+        assert!(
+            raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "genuine"
+        );
+        assert_eq!(raw_pending_count(&db_path), 1);
+    }
+
+    /// The daemon's store-open path itself (`run` has no other), on a graph.db
+    /// holding one stale pending row, one genuine one and one orphan. Guards the
+    /// startup half of #811 at the point `run` depends on: remove the reconcile
+    /// from `open_daemon_store` and this fails.
+    #[test]
+    fn opening_the_daemon_store_reconciles_stale_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let (caller, ghost) = {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", "abc123").unwrap();
+            store.set_meta("phase_b_commit", "abc123").unwrap();
+            let caller = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/a.ts", "typescript", "fn:caller"),
+                "function",
+            );
+            let callee = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/b.ts", "typescript", "fn:callee"),
+                "function",
+            );
+            store.put_node(&caller).unwrap();
+            store.put_node(&callee).unwrap();
+            store
+                .record_edge_sites(&[(caller.id, callee.id, 3, None)])
+                .unwrap();
+            let ghost = travsr_core::NodeId(0xDEAD_BEEF);
+            let row = |src, line, name: &str| travsr_store::RefResolution {
+                src,
+                ref_line: line,
+                ref_col: 0,
+                name: name.to_string(),
+                state: "pending",
+                resolved_dst: None,
+            };
+            store
+                .upsert_ref_resolution_states(&[
+                    row(caller.id, 3, "callee"),  // stale: a site exists on line 3
+                    row(caller.id, 7, "mystery"), // genuine: no site on line 7
+                    row(ghost, 1, "gone"),        // orphan: no such node
+                ])
+                .unwrap();
+            (caller.id, ghost)
+        };
+        assert_eq!(raw_pending_count(&db_path), 3, "precondition");
+
+        let store = open_daemon_store(&db_path).expect("the daemon's store open");
+        drop(store);
+
+        assert!(!raw_has_row(&db_path, caller, 3, "callee"), "stale row");
+        assert!(!raw_has_row(&db_path, ghost, 1, "gone"), "orphan row");
+        assert!(raw_has_row(&db_path, caller, 7, "mystery"), "genuine row");
+        assert_eq!(raw_pending_count(&db_path), 1);
+    }
+
+    /// Negative 14: the reconcile does not depend on Phase B work existing. With
+    /// `phase_b_commit` already at `last_commit` and nothing to rebuild, the
+    /// startup pass alone brings the table in line with the graph.
+    #[test]
+    fn startup_reconcile_needs_no_phase_b_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        let (caller, callee) = {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", "abc123").unwrap();
+            store.set_meta("phase_b_commit", "abc123").unwrap();
+            let caller = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/a.ts", "typescript", "fn:caller"),
+                "function",
+            );
+            let callee = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/b.ts", "typescript", "fn:callee"),
+                "function",
+            );
+            store.put_node(&caller).unwrap();
+            store.put_node(&callee).unwrap();
+            store
+                .put_edge(&travsr_core::Edge::new(
+                    caller.id,
+                    callee.id,
+                    travsr_core::EdgeKind::RefCall,
+                ))
+                .unwrap();
+            store
+                .record_edge_sites(&[(caller.id, callee.id, 3, None)])
+                .unwrap();
+            let row = |line, name: &str| travsr_store::RefResolution {
+                src: caller.id,
+                ref_line: line,
+                ref_col: 0,
+                name: name.to_string(),
+                state: "pending",
+                resolved_dst: None,
+            };
+            store
+                .upsert_ref_resolution_states(&[row(3, "callee"), row(7, "mystery")])
+                .unwrap();
+            (caller.id, callee.id)
+        };
+        assert_eq!(raw_pending_count(&db_path), 2, "precondition");
+        let edges_before = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .edge_count()
+            .unwrap();
+
+        let store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        // Nothing is due, so the scheduler stays idle...
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        arm_phase_b_if_pending(&store, &sched);
+        assert!(!sched.try_claim());
+        // ...and the startup reconcile is the only thing that runs.
+        reconcile_ref_resolution_states_on_startup(&store);
+        // Twice, to show the second pass is a no-op.
+        reconcile_ref_resolution_states_on_startup(&store);
+        drop(store);
+
+        assert!(!raw_has_row(&db_path, caller, 3, "callee"));
+        assert!(raw_has_row(&db_path, caller, 7, "mystery"));
+        assert_eq!(raw_pending_count(&db_path), 1);
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(store.edge_count().unwrap(), edges_before);
+        assert!(store.get_node(callee).unwrap().is_some());
+        assert_eq!(meta(&db_path, "phase_b_commit").as_deref(), Some("abc123"));
+    }
+
+    /// `ratified_languages` maps analyzer names onto how nodes are labeled.
+    #[test]
+    fn ratified_languages_maps_javascript_onto_typescript() {
+        let js_only = PhaseBReport {
+            ran: vec!["javascript".to_string()],
+            ..PhaseBReport::default()
+        };
+        assert_eq!(
+            ratified_languages(&js_only),
+            vec!["typescript".to_string()],
+            "JavaScript nodes are labeled typescript, so that is what ratifies"
+        );
+
+        // Nothing ran: sweep nothing at all.
+        assert!(ratified_languages(&PhaseBReport::default()).is_empty());
+
+        // No duplicate when both point at typescript.
+        let both = PhaseBReport {
+            ran: vec!["typescript".to_string(), "javascript".to_string()],
+            ..PhaseBReport::default()
+        };
+        assert_eq!(ratified_languages(&both), vec!["typescript".to_string()]);
+    }
+
+    /// Append a second caller to `order.ts` and re-index it, the way a save
+    /// lands: content changes, so `reindex_files` does not skip it on the hash,
+    /// Phase A rewrites the file's outgoing edges, and the new call site has no
+    /// semantic edge until something resolves it.
+    ///
+    /// Returns the overlay outcome so a caller can assert on it.
+    fn edit_and_reindex_order(
+        tmp: &tempfile::TempDir,
+        db_path: &std::path::Path,
+        corpus: &str,
+    ) -> std::path::PathBuf {
+        let order = tmp.path().join("src/order.ts");
+        let mut text = std::fs::read_to_string(&order).unwrap();
+        text.push_str("\nexport function expressOrder(u: User): void {\n  u.save();\n}\n");
+        std::fs::write(&order, text).unwrap();
+        let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
+        reindex_files(std::slice::from_ref(&order), tmp.path(), &mut store).unwrap();
+        live_resolve_file(&mut store, corpus, tmp.path(), &order, None);
+        order
+    }
+
+    /// A two-file TypeScript repo where `order.ts` calls into `user.ts`,
+    /// indexed. Shared by the RFC-027 Phase 1 and Phase 2 tests.
+    fn repo_with_a_call() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/user.ts"),
+            "export class User {\n  save(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/order.ts"),
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.save();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .get_meta("corpus")
+            .unwrap()
+            .unwrap_or_default();
+        (tmp, db_path, corpus)
+    }
+
+    /// Every `provenance='live'` edge currently in the store.
+    ///
+    /// `all_edges` returns `(src, dst, kind, provenance)` tuples, so rebuild the
+    /// core `Edge` from them for the ratification write.
+    fn live_edges(store: &travsr_store::SqliteStore) -> Vec<travsr_core::Edge> {
+        store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, _, _, prov)| prov == "live")
+            .filter_map(|(src, dst, kind, _)| {
+                travsr_core::EdgeKind::from_str(&kind).map(|k| travsr_core::Edge::new(src, dst, k))
+            })
+            .collect()
+    }
+
+    /// A content fingerprint of the whole graph: every node, and every edge with
+    /// its provenance, in a stable order. Comparing counts alone would miss a
+    /// live edge sitting where a ratified one belongs, which is the exact
+    /// failure the convergence property exists to rule out.
+    fn graph_fingerprint(db_path: &std::path::Path) -> (Vec<String>, Vec<String>) {
+        let store = travsr_store::SqliteStore::open(db_path).unwrap();
+        (
+            store.node_fingerprint().unwrap(),
+            store.edge_fingerprint().unwrap(),
+        )
+    }
+
+    /// Invariant #4, orphan dimension: an incremental edit must leave the graph
+    /// as free of dangling edges as a full index would.
+    ///
+    /// TypeScript import resolution is speculative by construction — `./user`
+    /// emits a `resolves-to` candidate for `user.ts`, `user.tsx` and `user.js`
+    /// because it cannot know which exists without touching the store. The init
+    /// path drops the losers when staging is flushed, which its own comment
+    /// calls making "no orphan edges" a store invariant. The incremental path
+    /// had no equivalent, so every ordinary edit to a file with a relative
+    /// import left two dead edges behind and `fsck` reported orphans on a
+    /// perfectly healthy repo.
+    #[test]
+    fn an_incremental_edit_leaves_no_orphan_edges() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        let user = tmp.path().join("src/user.ts");
+        let order = tmp.path().join("src/order.ts");
+        std::fs::write(&user, "export class User {\n  save(): void {}\n}\n").unwrap();
+        std::fs::write(
+            &order,
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.save();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
+            "precondition: a full index leaves no orphans"
+        );
+
+        // Edit both files, the way a rename lands incrementally.
+        std::fs::write(&user, "export class User {\n  persist(): void {}\n}\n").unwrap();
+        std::fs::write(
+            &order,
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {\n  u.persist();\n}\n",
+        )
+        .unwrap();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(&[user.clone(), order.clone()], tmp.path(), &mut store).unwrap();
+        }
+
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
+            "an incremental edit must not leave dangling edges the full path drops"
+        );
+    }
+
+    /// The sweep runs after the whole batch, so an edge into a file that is
+    /// created later in the same batch survives. Sweeping per file would delete
+    /// it, since its destination node does not exist yet at that point.
+    #[test]
+    fn the_orphan_sweep_spares_a_forward_reference_within_one_batch() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        // Only the importer exists at index time.
+        let order = tmp.path().join("src/order.ts");
+        std::fs::write(&order, "export function placeOrder(): void {}\n").unwrap();
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        // Now add both the import and its target in one batch, importer first.
+        let user = tmp.path().join("src/user.ts");
+        std::fs::write(
+            &order,
+            "import { User } from \"./user\";\nexport function placeOrder(u: User): void {}\n",
+        )
+        .unwrap();
+        std::fs::write(&user, "export class User {\n  save(): void {}\n}\n").unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(&[order.clone(), user.clone()], tmp.path(), &mut store).unwrap();
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(store.count_orphans().unwrap(), 0, "no orphans either way");
+        let resolves: u64 = store.count_edges_with_provenance("tree-sitter").unwrap();
+        assert!(
+            resolves > 0,
+            "the real import edge must survive a same-batch forward reference"
+        );
+    }
+
+    /// RFC-027 Phase 1 gate: a rename must leave no ghost live edge.
+    ///
+    /// The hazard the live lane introduces is an edge to a symbol that no
+    /// longer exists. `reindex_replace` deletes the inbound edges of a symbol
+    /// whose NodeId vanished, so a `live` edge is cleaned up exactly as a
+    /// `tree-sitter` or `scip` one is. This test is what keeps that true, and
+    /// it is the difference between honest staleness and a fabricated target.
+    #[test]
+    fn a_rename_leaves_no_ghost_live_edge() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        let user = tmp.path().join("src/user.ts");
+        // A real save adds a call site the overlay then resolves, which is the
+        // only way a live edge exists to be renamed away from.
+        edit_and_reindex_order(&tmp, &db_path, &corpus);
+        assert!(
+            count_live_edges(&db_path) > 0,
+            "precondition: a live edge must exist to rename away from"
+        );
+
+        // Rename User.save -> User.persist. The old NodeId vanishes, so every
+        // inbound edge to it, live included, must go with it.
+        std::fs::write(&user, "export class User {\n  persist(): void {}\n}\n").unwrap();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&user), tmp.path(), &mut store).unwrap();
+        }
+
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
+            "a rename must leave no edge pointing at a node that no longer exists"
+        );
+    }
+
+    /// A deleted file takes its inbound live edges with it, the same way
+    /// `delete_file` takes both directions for every other provenance.
+    #[test]
+    fn a_delete_leaves_no_ghost_live_edge() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus) = repo_with_a_call();
+        let user = tmp.path().join("src/user.ts");
+        edit_and_reindex_order(&tmp, &db_path, &corpus);
+        assert!(
+            count_live_edges(&db_path) > 0,
+            "precondition: a live edge exists"
+        );
+
+        std::fs::remove_file(&user).unwrap();
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&user), tmp.path(), &mut store).unwrap();
+        }
+
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
+            "a deleted file must take its inbound live edges with it"
+        );
+    }
+
+    /// RFC-027 section 9.2: an abstention is recorded, not dropped.
+    ///
+    /// `save` here is ambiguous (two classes define it), which is exactly the
+    /// method-on-receiver case the lexical lane must refuse. Refusing quietly
+    /// and refusing honestly look identical in the edge table; they differ in
+    /// whether anything can later say *why* the answer is thin.
+    /// RFC-027 section 8: a non-native language reaches the live lane through
+    /// on-save reference *detection* alone. Go has Phase A nodes and no native
+    /// Phase B extractor, so its references become editor targets — a
+    /// same-package cross-file call the graph could never resolve on its own,
+    /// and a field read as `ref/field` so it never reads as a caller (#757).
+    #[test]
+    fn a_go_file_yields_editor_targets_from_the_generic_detector() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/m\n\ngo 1.21\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("session.go"),
+            "package main\n\ntype Session struct {\n\tcount int\n}\n\nfunc (s *Session) Start() {}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("run.go");
+        std::fs::write(
+            &caller,
+            "package main\n\nfunc Run(s *Session) int {\n\ts.Start()\n\treturn s.count\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
+        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller, &[], None);
+
+        let start = targets
+            .iter()
+            .find(|t| t.name == "Start")
+            .expect("the method call must be an editor target");
+        assert_eq!(start.ref_line, 4);
+        assert_eq!(start.edge_kind, "ref/call");
+        assert_eq!(start.provider, "definition");
+
+        let count = targets
+            .iter()
+            .find(|t| t.name == "count")
+            .expect("the field read must be an editor target");
+        assert_eq!(count.ref_line, 5);
+        assert_eq!(count.edge_kind, "ref/field");
+    }
+
+    /// RFC-027 section 8: the generic path is one path, not a Go path. Java
+    /// exercises the two halves Go cannot: a grammar with *separate* call and
+    /// field nodes (so no callee disambiguation runs), and an `extends` /
+    /// `implements` clause, which Go has none of. The clause sits on the
+    /// implementing class's own declaration, so its edge source is that class in
+    /// the saved file and save-invalidation self-heals it (§8.4) — the property
+    /// Rust's detached `impl` block lacks (§7).
+    #[test]
+    fn a_java_file_yields_call_field_and_implements_targets() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(
+            tmp.path().join("Base.java"),
+            "public class Base {\n  public int total;\n  public void submit() {}\n}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("Order.java");
+        std::fs::write(
+            &caller,
+            "public class Order extends Base {\n  public int run(Base b) {\n    b.submit();\n    return b.total;\n  }\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
+        // Java is on LIVE_LANE_SHIPPED (measured 3,0,0 → 1.0000, §11.3), so the
+        // gate admits it with no reading and no force flag needed.
+        let targets = live_resolution_targets(&store, &corpus, tmp.path(), &caller, &[], None);
+
+        let by_name = |name: &str| {
+            targets
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} must be an editor target, got {targets:?}"))
+        };
+        assert_eq!(by_name("submit").edge_kind, "ref/call");
+        assert_eq!(by_name("total").edge_kind, "ref/field");
+        let base = by_name("Base");
+        assert_eq!(base.edge_kind, "is-implementation");
+        assert_eq!(base.ref_line, 1, "the clause is on the class declaration");
+        assert!(targets.iter().all(|t| t.provider == "definition"));
+    }
+
+    /// RFC-027 section 8.7.5: the interface-edit closure reaches the editor lane.
+    ///
+    /// `run.go` references a method the graph cannot settle, so its save records
+    /// the reference as `pending`. When `session.go` — which defines that method
+    /// — is saved, its target request must name `run.go` as a dependent so the
+    /// editor re-resolves it, rather than leaving `run.go`'s live edge stranded
+    /// until `run.go` is itself saved. Before the fix `dependent_resolution_
+    /// targets` did not exist and the request answered with the saved file alone.
+    #[test]
+    fn saving_a_definition_names_its_pending_dependents_as_targets() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/m\n\ngo 1.21\n",
+        )
+        .unwrap();
+        let session = tmp.path().join("session.go");
+        std::fs::write(
+            &session,
+            "package main\n\ntype Session struct{}\n\nfunc (s *Session) Helper() {}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("run.go");
+        std::fs::write(
+            &caller,
+            "package main\n\nfunc Run(s *Session) {\n\ts.Helper()\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.get_meta("corpus").unwrap().unwrap_or_default()
+        };
+
+        // `run.go`'s save records its reference to `Helper` as pending: a generic
+        // language has no lexical floor, so every detected reference abstains
+        // (§8.3) and the pending row is the honest record the editor upgrades.
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller, None);
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        // A save of `session.go` (which defines `Helper`) must surface `run.go`
+        // as a dependent carrying that reference as an editor target.
+        let dependents = dependent_resolution_targets(&store, &corpus, tmp.path(), &session, None);
+        let run = dependents
+            .iter()
+            .find(|d| d.file == "run.go")
+            .unwrap_or_else(|| panic!("run.go must be a dependent, got {dependents:?}"));
+        assert!(
+            run.targets.iter().any(|t| t.name == "Helper"),
+            "the stranded reference must be an editor target, got {:?}",
+            run.targets
+        );
+
+        // A file that defines nothing any pending reference names has no
+        // dependents — a body edit stays local (§6.1), no closure fan-out.
+        let none = dependent_resolution_targets(&store, &corpus, tmp.path(), &caller, None);
+        assert!(
+            none.iter().all(|d| d.file != "session.go"),
+            "run.go defines nothing session.go is pending on, got {none:?}"
+        );
+    }
+
+    /// RFC-027 section 7.3b: the editor asks for targets the instant it saves,
+    /// and the daemon's own watcher pass for that save has not run yet (a 500 ms
+    /// debounce plus the flush tick). Answering from the pre-save index leaves
+    /// the save's changed region unstashed, so the committed occurrences only a
+    /// language server can re-resolve are never offered as targets, and the
+    /// editor asks exactly once per save and never retries: those edges then
+    /// stay missing until the next commit.
+    ///
+    /// Against the shipped 1.1.0 daemon this was two leftover targets at save
+    /// time and nine ten seconds later, for the same save.
+    #[test]
+    fn a_target_request_folds_in_a_save_the_watcher_has_not_reached() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        // Two types with the same method names, so `save` and `new` are exactly
+        // the receiver-ambiguous references the lexical lane must refuse and the
+        // editor lane exists to answer.
+        std::fs::write(
+            tmp.path().join("src/store.rs"),
+            "pub struct Store {\n    rows: Vec<String>,\n}\n\nimpl Store {\n    pub fn new() -> Store {\n        Store { rows: Vec::new() }\n    }\n    pub fn save(&mut self, row: String) {\n        self.rows.push(row);\n    }\n    pub fn count(&self) -> usize {\n        self.rows.len()\n    }\n}\n\npub fn helper(tag: &str) -> String {\n    format!(\"[{}]\", tag)\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/cache.rs"),
+            "pub struct Cache {\n    hits: usize,\n}\n\nimpl Cache {\n    pub fn new() -> Cache {\n        Cache { hits: 0 }\n    }\n    pub fn save(&mut self, row: &str) {\n        self.hits += row.len();\n    }\n}\n",
+        )
+        .unwrap();
+        let service = tmp.path().join("src/main.rs");
+        // Nothing else in the file calls `run_service`: a caller of a changed
+        // definition is itself demoted out of the preserved set, and a save with
+        // nothing preserved is a whole-file re-derive, which stashes no changed
+        // region at all.
+        let before = "mod cache;\nmod store;\n\nuse cache::Cache;\nuse store::{helper, Store};\n\nfn run_service(name: &str) -> usize {\n    let mut store = Store::new();\n    store.save(helper(name));\n    let mut cache = Cache::new();\n    cache.save(name);\n    store.count()\n}\n\nfn run_cache(name: &str) -> usize {\n    let mut cache = Cache::new();\n    cache.save(name);\n    0\n}\n\nfn main() {}\n";
+        std::fs::write(&service, before).unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        // Commit and ratify, so `run_service`'s references exist as committed
+        // occurrences: the changed-definition enumeration a save stashes (#813
+        // P2) is captured from those rows, and they are what the editor lane is
+        // asked to re-resolve.
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let sha = git_commit_all(tmp.path(), "init");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", &sha).unwrap();
+        }
+        {
+            let store_mutex =
+                std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+            run_background_phase_b_inner(tmp.path(), &store_mutex);
+        }
+
+        // The save the watcher has not reached: a pure body edit, on disk only,
+        // with no reindex and nothing stashed on the editor plane.
+        let after = before.replace(
+            "    let mut store = Store::new();\n",
+            "    let mut store = Store::new();\n    let _tag = helper(name);\n",
+        );
+        assert_ne!(after, before, "the body edit must change the file");
+        std::fs::write(&service, &after).unwrap();
+
+        let store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
+        let sessions = std::sync::Mutex::new(EditorPlane::default());
+
+        let msg =
+            serde_json::to_string(&travsr_ipc::ControlMessage::RequestLiveResolutionTargets {
+                repo_root: tmp.path().to_string_lossy().into_owned(),
+                session: "w1".to_string(),
+                file: "src/main.rs".to_string(),
+                buffer_version: 1,
+            })
+            .unwrap();
+        let (resp, _shutdown) = handle_control_message(
+            &msg,
+            tmp.path(),
+            &store,
+            &read_store,
+            &cache,
+            &phase_b_scheduler,
+            &index_tx,
+            &sessions,
+        );
+        assert!(resp.ok, "the target request must succeed: {resp:?}");
+        let targets: travsr_ipc::message::LiveResolutionTargets =
+            serde_json::from_value(resp.result.expect("a target payload")).unwrap();
+        let names: Vec<&str> = targets.own.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"save"),
+            "the edited function's ambiguous `save` call must be an editor \
+             target the moment the file is saved, got {names:?}"
+        );
+
+        // And the save is genuinely folded in, not merely reported on: the index
+        // now holds the text the editor wrote, so the watcher pass that follows
+        // has nothing left to do.
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            file_matches_index(&s, tmp.path(), &service),
+            "the request must leave the index current with the saved file"
+        );
+    }
+
+    /// SEC-002: the targets request now indexes the file it is asked about, so
+    /// its caller-supplied `file` has to be validated before it is joined onto
+    /// the repo root.
+    ///
+    /// `reindex_files_reporting` falls back to the joined path when
+    /// `strip_prefix(repo_root)` fails, so an unguarded `../outside/secret.rs`
+    /// is parsed into the graph: the outside file becomes nodes, and a file row
+    /// appears under the escaping path. Reading such a path was harmless before
+    /// this request started writing.
+    #[test]
+    fn a_target_request_for_a_path_outside_the_repo_indexes_nothing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        git_init(&repo);
+        std::fs::write(
+            repo.join("inside.rs"),
+            "pub fn inside_the_repo() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            outside.join("secret.rs"),
+            "pub fn totally_outside_the_repo_marker() -> u32 {\n    42\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(&repo).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = repo.join(".travsr/graph.db");
+        let store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let before = store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .node_count()
+            .unwrap();
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
+        let sessions = std::sync::Mutex::new(EditorPlane::default());
+
+        let msg =
+            serde_json::to_string(&travsr_ipc::ControlMessage::RequestLiveResolutionTargets {
+                repo_root: repo.to_string_lossy().into_owned(),
+                session: "sec".to_string(),
+                file: "../outside/secret.rs".to_string(),
+                buffer_version: 1,
+            })
+            .unwrap();
+        let (resp, _shutdown) = handle_control_message(
+            &msg,
+            &repo,
+            &store,
+            &read_store,
+            &cache,
+            &phase_b_scheduler,
+            &index_tx,
+            &sessions,
+        );
+        assert!(
+            !resp.ok,
+            "an escaping file argument must be refused: {resp:?}"
+        );
+
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            s.get_file_hash("../outside/secret.rs").unwrap().is_none(),
+            "no file row may be recorded for a path outside the repo"
+        );
+        assert_eq!(
+            s.node_count().unwrap(),
+            before,
+            "no node from outside the repo may reach the graph"
+        );
+    }
+
+    /// The lexical floor is native-only (section 8.3): the generic detector
+    /// recovers no receiver type and builds no signature key, so there is
+    /// nothing for it to match on and the save path must not parse the file to
+    /// discard the result.
+    #[test]
+    fn a_go_save_emits_nothing_without_an_editor() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/m\n\ngo 1.21\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("session.go"),
+            "package main\n\ntype Session struct{}\n\nfunc (s *Session) Start() {}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("run.go");
+        std::fs::write(
+            &caller,
+            "package main\n\nfunc Run(s *Session) {\n\ts.Start()\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.get_meta("corpus").unwrap().unwrap_or_default()
+        };
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller, None);
+        }
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.count_edges_with_provenance("live").unwrap(),
+            0,
+            "an editor-only language must emit nothing on save"
+        );
+        // Abstention is recorded, not dropped (§9.2): every detected reference
+        // is a pending row the editor lane later upgrades in place, and it is
+        // what gives the precision meter a claim to score for this language.
+        let pending = store.pending_refs_in_file(&corpus, "run.go").unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|(name, line)| name == "Start" && *line == 4),
+            "the unresolved call must leave a pending row, got {pending:?}"
+        );
+    }
+
+    #[test]
+    fn an_abstention_is_recorded_as_pending() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        std::fs::write(
+            tmp.path().join("src/a.ts"),
+            "export class A {\n  ping(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/b.ts"),
+            "export class B {\n  ping(): void {}\n}\n",
+        )
+        .unwrap();
+        let caller = tmp.path().join("src/caller.ts");
+        std::fs::write(
+            &caller,
+            "export function go(x: any): void {\n  x.ping();\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpus = {
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.get_meta("corpus").unwrap().unwrap_or_default()
+        };
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            live_resolve_file(&mut store, &corpus, tmp.path(), &caller, None);
+        }
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let pending = store
+            .pending_refs_in_file(&corpus, "src/caller.ts")
+            .unwrap();
+        assert!(
+            pending.iter().any(|(name, _)| name == "ping"),
+            "an untyped receiver must leave a pending row, got {pending:?}"
+        );
+    }
+
+    /// Count `provenance='live'` rows. Shared by the Phase 1 ghost-edge tests.
+    fn count_live_edges(db_path: &std::path::Path) -> u64 {
+        travsr_store::SqliteStore::open(db_path)
+            .unwrap()
+            .count_edges_with_provenance("live")
+            .unwrap()
     }
 
     /// §9 CI invariant: incremental delete + reindex must produce the same
@@ -7933,6 +12991,37 @@ mod tests {
         );
     }
 
+    /// #827: nothing tied `DEFAULT_TRAVSRIGNORE_RULE_COUNT` to the string it
+    /// counts, so `init`'s summary line silently drifted whenever a rule was
+    /// added. Also pins `Pods/`, the rule the issue was actually about, and
+    /// asserts no rule duplicates a hard `SKIP_DIRS` name (those are dropped
+    /// before `.travsrignore` is read, so listing them here is dead and falsely
+    /// advertises them as negatable).
+    #[test]
+    fn travsrignore_scaffold_matches_its_rule_count() {
+        let rules: Vec<&str> = DEFAULT_TRAVSRIGNORE
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        assert_eq!(
+            rules.len(),
+            DEFAULT_TRAVSRIGNORE_RULE_COUNT,
+            "DEFAULT_TRAVSRIGNORE_RULE_COUNT must equal the rules in the scaffold: {rules:?}"
+        );
+        assert!(
+            rules.contains(&"Pods/"),
+            "CocoaPods must stay excluded on iOS repos: {rules:?}"
+        );
+        for rule in &rules {
+            let name = rule.trim_end_matches('/');
+            assert!(
+                !crate::watcher::SKIP_DIRS.contains(&name),
+                "`{rule}` is already a hard SKIP_DIRS entry, so this rule is dead"
+            );
+        }
+    }
+
     /// #376 W1: `travsr init` deliberately skips `embed_text` generation (it
     /// parses every source file and blocks for minutes on a large repo), so
     /// every doc chunk it writes starts with NULL prose. The sidecar now refuses
@@ -8153,76 +13242,6 @@ mod tests {
         );
     }
 
-    /// #526: hook injection must prefer a repo's own `.travsr/embed.toml`
-    /// override over the machine-wide `~/.travsr/embed.toml` default, the
-    /// same resolution order `resolve_backend` (travsr-plugin-host) uses.
-    #[test]
-    fn hook_backend_id_prefers_repo_config_over_global() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
-
-        std::fs::create_dir_all(home.path().join(".travsr")).unwrap();
-        std::fs::write(
-            home.path().join(".travsr").join("embed.toml"),
-            "active = \"global-backend\"\n",
-        )
-        .unwrap();
-
-        let repo_travsr = repo.path().join(".travsr");
-        std::fs::create_dir_all(&repo_travsr).unwrap();
-        std::fs::write(
-            repo_travsr.join("embed.toml"),
-            "active = \"repo-backend\"\n",
-        )
-        .unwrap();
-
-        let resolved = hook_backend_id(&repo_travsr.join("graph.db"));
-
-        match old_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-
-        assert_eq!(
-            resolved.as_deref(),
-            Some("repo-backend"),
-            "repo's .travsr/embed.toml must win over the machine-wide default"
-        );
-    }
-
-    #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see crates/travsr-cli/tests/embed_switch.rs's module doc comment"
-    )]
-    fn hook_backend_id_falls_back_to_global_when_repo_unconfigured() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
-
-        std::fs::create_dir_all(home.path().join(".travsr")).unwrap();
-        std::fs::write(
-            home.path().join(".travsr").join("embed.toml"),
-            "active = \"global-backend\"\n",
-        )
-        .unwrap();
-
-        // No repo .travsr/embed.toml written at all.
-        let resolved = hook_backend_id(&repo.path().join(".travsr").join("graph.db"));
-
-        match old_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-
-        assert_eq!(resolved.as_deref(), Some("global-backend"));
-    }
-
     /// Set shell_number = `shell` on every embeddable node (kind not in the
     /// exclusion list). This simulates Phase B having run and computed k-core
     /// without requiring the Phase B toolchain to be installed.
@@ -8384,7 +13403,7 @@ mod tests {
             .status()
             .unwrap();
         StdCommand::new("git")
-            .args(["commit", "-q", "-m", msg])
+            .args(["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", msg])
             .current_dir(dir)
             .status()
             .unwrap();
@@ -9139,6 +14158,218 @@ mod tests {
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 
+    // ── #862: Phase 2 must be computed from the eligible embedded count ───────
+
+    /// The arithmetic in isolation. Same graph, two readings of `embedded`: the
+    /// unfiltered one the store used to return, and the filtered one it returns
+    /// now. Ten Phase 2 nodes are genuinely pending in both.
+    #[test]
+    fn phase2_remaining_is_masked_by_an_inflated_embedded_count() {
+        // total 100, phase1 10/10 done, 80 of 90 Phase 2 nodes embedded.
+        assert_eq!(phase2_remaining(100, 90, 10, 10), 10);
+        // Twenty vectors on ineligible nodes, counted: the saturation swallows
+        // the ten real ones and the tick believes Phase 2 is complete.
+        assert_eq!(phase2_remaining(100, 110, 10, 10), 0);
+        // And with a smaller inflation it under-reports rather than zeroes.
+        assert_eq!(phase2_remaining(100, 95, 10, 10), 5);
+        // Nothing embedded yet, and the empty graph.
+        assert_eq!(phase2_remaining(100, 0, 10, 0), 90);
+        assert_eq!(phase2_remaining(0, 0, 0, 0), 0);
+    }
+
+    /// The #862 graph on disk: 100 eligible nodes (10 core at shell 5, all
+    /// embedded; 90 at shell 0, 80 embedded), 20 `field` nodes with no
+    /// `embed_text` that carry vectors anyway, a backend configured, Phase B
+    /// complete. Returns the repo, the store and the raw model-scoped vector
+    /// count in embed.db.
+    fn repo_with_inflated_embeddings() -> (tempfile::TempDir, travsr_store::SqliteStore, i64) {
+        const MODEL: &str = "test-model-862";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        travsr_plugin_host::write_repo_backend_id(tmp.path(), MODEL).unwrap();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        set_phase_b_complete(&mut store, "abc123");
+
+        let node = |kind: &str, sig: String| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/lib.ts", "typescript", sig),
+                kind,
+            )
+        };
+        let mut shells = Vec::new();
+        let mut rows: Vec<i64> = Vec::new();
+        for i in 0..10 {
+            let n = node("function", format!("fn:core{i}"));
+            store.put_node(&n).unwrap();
+            shells.push((n.id, 5));
+            rows.push(n.id.0 as i64);
+        }
+        for i in 0..90 {
+            let n = node("function", format!("fn:leaf{i}"));
+            store.put_node(&n).unwrap();
+            shells.push((n.id, 0));
+            if i < 80 {
+                rows.push(n.id.0 as i64);
+            }
+        }
+        for i in 0..20 {
+            let n = node("field", format!("field:T.f{i}"));
+            store.put_node(&n).unwrap();
+            rows.push(n.id.0 as i64);
+        }
+        store.write_shell_numbers(&shells).unwrap();
+
+        let embed_db = tmp.path().join(".travsr/embed.db");
+        let conn = rusqlite::Connection::open(&embed_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE node_embeddings (
+                 node_id   INTEGER NOT NULL,
+                 model_id  TEXT    NOT NULL,
+                 embedding BLOB    NOT NULL,
+                 text_hash TEXT,
+                 PRIMARY KEY (node_id, model_id)
+             ) WITHOUT ROWID;
+             CREATE INDEX idx_node_embeddings_model ON node_embeddings(model_id);",
+        )
+        .unwrap();
+        for id in &rows {
+            conn.execute(
+                "INSERT INTO node_embeddings (node_id, model_id, embedding) VALUES (?1, ?2, X'00')",
+                rusqlite::params![id, MODEL],
+            )
+            .unwrap();
+        }
+        let raw: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+                rusqlite::params![MODEL],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (tmp, store, raw)
+    }
+
+    /// The critical integration case. Before the fix the tick read `embedded =
+    /// 110`, computed `phase2_remaining = 0`, latched `phase2_spawned` and never
+    /// launched Phase 2 while ten nodes had no vector. Now it reads 90, computes
+    /// 10, and attempts the spawn. No sidecar is installed for the test model,
+    /// so the attempt fails and the flag stays false: a false flag after the
+    /// tick is what "Phase 2 was not suppressed" looks like here, and a true one
+    /// is exactly the suppression.
+    #[test]
+    fn embed_tick_does_not_suppress_phase2_because_of_ineligible_vectors() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, store, raw_vectors) = repo_with_inflated_embeddings();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        assert_eq!(
+            raw_vectors, 110,
+            "precondition: the unfiltered count is inflated"
+        );
+
+        // The threshold the tick derives from this k-core distribution.
+        let threshold =
+            travsr_plugin_host::derive_phase1_threshold_for_status(&db_path).unwrap_or(3);
+        assert_eq!(threshold, 5, "precondition: the 10 core nodes are Phase 1");
+        let progress = store.embed_progress("test-model-862", threshold).unwrap();
+        assert_eq!(
+            progress,
+            (100, 90, 10, 10),
+            "embedded is the eligible count, Phase 1 is complete"
+        );
+        let (total, embedded, p1_total, p1_done) = progress;
+        assert_eq!(phase2_remaining(total, embedded, p1_total, p1_done), 10);
+        assert_eq!(
+            phase2_remaining(total, raw_vectors as u64, p1_total, p1_done),
+            0,
+            "the unfiltered count would have concluded Phase 2 was complete"
+        );
+
+        let store = std::sync::Mutex::new(store);
+        let phase2_spawned = std::sync::atomic::AtomicBool::new(false);
+        maybe_spawn_embed(tmp.path(), &store, &phase2_spawned);
+        assert!(
+            !phase2_spawned.load(std::sync::atomic::Ordering::Relaxed),
+            "the tick must try to launch Phase 2 (and fail for want of a sidecar), \
+             not latch it as complete on the strength of ineligible vectors"
+        );
+
+        // Nothing about the graph or the vectors changed to get there.
+        let s = store.lock().unwrap();
+        assert_eq!(
+            s.embed_progress("test-model-862", threshold).unwrap(),
+            progress
+        );
+        let still: i64 = rusqlite::Connection::open(tmp.path().join(".travsr/embed.db"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM node_embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            still, 110,
+            "ineligible vectors are not deleted to fix the count"
+        );
+    }
+
+    /// The control for the test above: when Phase 2 genuinely is complete, the
+    /// tick still latches the flag, so the corrected count did not simply make
+    /// the tick spawn unconditionally.
+    #[test]
+    fn embed_tick_still_latches_phase2_when_every_eligible_node_is_embedded() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, store, _) = repo_with_inflated_embeddings();
+        // Embed the ten leaf nodes that were missing.
+        let missing: Vec<i64> = {
+            let conn = rusqlite::Connection::open(tmp.path().join(".travsr/graph.db")).unwrap();
+            let all: Vec<i64> = {
+                let mut st = conn
+                    .prepare("SELECT id FROM nodes WHERE kind = 'function'")
+                    .unwrap();
+                st.query_map([], |r| r.get(0))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect()
+            };
+            let edb = rusqlite::Connection::open(tmp.path().join(".travsr/embed.db")).unwrap();
+            all.into_iter()
+                .filter(|id| {
+                    !edb.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM node_embeddings WHERE node_id = ?1)",
+                        rusqlite::params![id],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(missing.len(), 10, "precondition");
+        {
+            let edb = rusqlite::Connection::open(tmp.path().join(".travsr/embed.db")).unwrap();
+            for id in &missing {
+                edb.execute(
+                    "INSERT INTO node_embeddings (node_id, model_id, embedding) VALUES (?1, 'test-model-862', X'00')",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+            }
+        }
+        let threshold = travsr_plugin_host::derive_phase1_threshold_for_status(
+            &tmp.path().join(".travsr/graph.db"),
+        )
+        .unwrap_or(3);
+        assert_eq!(
+            store.embed_progress("test-model-862", threshold).unwrap(),
+            (100, 100, 10, 10)
+        );
+
+        let store = std::sync::Mutex::new(store);
+        let phase2_spawned = std::sync::atomic::AtomicBool::new(false);
+        maybe_spawn_embed(tmp.path(), &store, &phase2_spawned);
+        assert!(
+            phase2_spawned.load(std::sync::atomic::Ordering::Relaxed),
+            "with every eligible node embedded, Phase 2 is complete and the flag latches"
+        );
+    }
+
     #[test]
     fn embed_reindex_in_flight_reflects_idle_state() {
         // With no sidecar currently running, the in-flight flag must be false.
@@ -9415,20 +14646,81 @@ impl Daemon {
         // Bounded and lossy instead: under pressure the right thing to drop is
         // log lines, never indexing throughput. `non_blocking` reports what it
         // discarded, so the loss is visible rather than silent.
-        let (non_blocking, _appender_guard) =
+        let (non_blocking, appender_guard) =
             tracing_appender::non_blocking::NonBlockingBuilder::default()
                 .buffered_lines_limit(logfile::BUFFERED_LINES)
                 .lossy(true)
                 .finish(file_appender);
+        // Held in an Option so the fatal-exit paths below can flush it.
+        //
+        // Dropping the guard is what flushes the channel and joins the writer
+        // thread, and `std::process::exit` runs no destructors: a guard left to
+        // "drop at end of scope" never drops on those paths, so the last events
+        // written are still in the channel when the process dies. That silently
+        // cost the `daemon.session.exit` line this change added, and usually the
+        // session-start line with it. `.take()` rather than a move because two
+        // different select arms can reach the exit.
+        let mut appender_guard = Some(appender_guard);
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
         // INFO, not WARN. At WARN the file held nothing a user would want: on
         // this repo, four days of logs were 136 lines, every one of them the
         // same repeated warning and not one lifecycle event. `travsr daemon
         // logs` on top of that would have been a working feature showing
-        // nothing. `RUST_LOG` still overrides in both directions.
-        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        // nothing.
+        //
+        // The level is now a stored setting (`log.level`), not only an
+        // inherited environment variable. `RUST_LOG` still overrides it; see
+        // `travsr_config::resolve_log_filter` for the precedence and why. The
+        // resolved directive is read once here and reported in the session's
+        // first line below, so a file that is unexpectedly quiet or unexpectedly
+        // enormous says which layer chose that.
+        let (log_directive, log_source) = travsr_config::resolve_log_filter(Some(&repo_root));
+        // The session line is exempt from the level it reports.
+        //
+        // It is emitted at INFO, so at `error` or `warn` the filter suppressed
+        // the one line that says which session wrote this file and at what
+        // level — a log that cannot describe itself, and worse, a reader that
+        // then finds the PREVIOUS session's line and believes it. That is
+        // exactly what happened: setting `error` and restarting left the Health
+        // panel reading a dead session's `log_level=info` and insisting
+        // forever that a restart was still owed.
+        //
+        // So it gets its own target, admitted unconditionally by an appended
+        // directive. One line per daemon start is a price worth paying at any
+        // level for a file that identifies itself. `shortTarget` in the
+        // extension splits on `::`, so this still renders as `daemon`.
+        //
+        // Appended whatever chose the directive, `RUST_LOG` included. Exempting
+        // the escape hatch reintroduced the stale-session bug through the one
+        // path that opted out: under `RUST_LOG=warn` no session line was
+        // written, so a reader found a previous session's line and believed it.
+        // Readers tell a `RUST_LOG` run apart by `log_level_from`, which needs
+        // a line to be written at all.
+        //
+        // What is reported is what was INSTALLED, not what was resolved. A
+        // malformed RUST_LOG falls back, and reporting the resolved pair there
+        // would have the line name a level the process is not filtering at. The
+        // fallback also has to go back through `filter_directive_for`, or it
+        // silently drops the session exemption the rest of this depends on.
+        let (env_filter, log_directive, log_source) =
+            match tracing_subscriber::EnvFilter::try_new(filter_directive_for(&log_directive)) {
+                Ok(filter) => (filter, log_directive, log_source),
+                Err(_) => {
+                    let fallback = filter_directive_for(travsr_config::DEFAULT_LOG_LEVEL);
+                    // Built from constants this crate owns, so it parses; the
+                    // `unwrap_or_else` keeps that from being an assertion.
+                    let filter =
+                        tracing_subscriber::EnvFilter::try_new(&fallback).unwrap_or_else(|_| {
+                            tracing_subscriber::EnvFilter::new(travsr_config::DEFAULT_LOG_LEVEL)
+                        });
+                    (
+                        filter,
+                        travsr_config::DEFAULT_LOG_LEVEL.to_string(),
+                        travsr_config::LogFilterSource::Default,
+                    )
+                }
+            };
         // JSON lines on disk. One line is one object, so every field is named
         // and typed rather than recovered by guessing at column positions, and
         // `jq`, Loki and Datadog all read it as-is. Nobody is asked to read JSON:
@@ -9464,10 +14756,19 @@ impl Daemon {
         // First event in every session, so a rotated file is interpretable on
         // its own: which build wrote it, which repo, which process.
         tracing::info!(
+            // See SESSION_LOG_TARGET: this one event outranks the level filter
+            // so the file always says who wrote it and at what level.
+            target: SESSION_LOG_TARGET,
             event = "daemon.session.start",
             version = build_version(),
             pid = std::process::id(),
             repo = %repo_root.display(),
+            // What this file will and will not contain, and who decided. Without
+            // it, "there are no debug lines in here" and "debug is off" are
+            // indistinguishable from the file itself, which is the only
+            // artifact left once the process is gone.
+            log_level = %log_directive,
+            log_level_from = log_source.label(),
             // No `foreground` field on purpose. A backgrounded daemon is a
             // re-exec of `daemon start --foreground`, so the flag is true in the
             // child either way: accurate for the process, and misleading to the
@@ -9522,9 +14823,9 @@ impl Daemon {
         }
 
         let db_path = travsr_dir.join("graph.db");
-        let store = Arc::new(Mutex::new(
-            SqliteStore::open(&db_path).context("opening graph.db")?,
-        ));
+        // Opens graph.db and runs the #811 startup reconcile; see
+        // `open_daemon_store` for why the two are one step.
+        let store = open_daemon_store(&db_path)?;
         // R5 (#342): separate read-only connection so Query messages do not
         // hold the write mutex while the indexer worker needs it.
         let read_store = Arc::new(Mutex::new(
@@ -9734,11 +15035,20 @@ impl Daemon {
             let repo_worker = Arc::clone(&repo_root_arc);
             let index_tx_worker = index_tx.clone();
             let worker_stop_inner = Arc::clone(&worker_stop);
+            // RFC-027 #813 P2: the worker stashes each save's changed-def
+            // occurrences into the same plane the control loop serves from.
+            let lsp_sessions_worker = Arc::clone(&lsp_sessions);
             tokio::task::spawn_blocking(move || {
                 loop {
                     match index_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                         Ok(ev) => {
-                            handle_watch_event(ev, &repo_worker, &store_worker, &index_tx_worker);
+                            handle_watch_event(
+                                ev,
+                                &repo_worker,
+                                &store_worker,
+                                &index_tx_worker,
+                                &lsp_sessions_worker,
+                            );
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             if worker_stop_inner.load(std::sync::atomic::Ordering::Acquire) {
@@ -9875,6 +15185,11 @@ impl Daemon {
                             // at most once per 10 s (see watch_shed above);
                             // the head reconcile covers dropped events.
                             Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                // Cumulative for `travsr status` (#809); the
+                                // local `watch_shed` below is only the 10 s log
+                                // window and resets, so it cannot serve status.
+                                WATCH_SHED_TOTAL
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 watch_shed += 1;
                                 if watch_shed_last_log.elapsed()
                                     >= std::time::Duration::from_secs(10)
@@ -9994,9 +15309,38 @@ impl Daemon {
                         // C3: .travsr is in SKIP_DIRS so the file watcher never fires
                         // for graph.db deletions. Poll every 5 s as the only trigger.
                         if !db_path.exists() {
+                            // Logged, not only printed. A backgrounded daemon is
+                            // spawned with null stdio, so this `eprintln!` reached
+                            // nobody and the log simply stopped mid-session with no
+                            // reason in it: the one artifact left after the process
+                            // is gone said nothing about why it went. It stays on
+                            // stderr too, for `daemon start --foreground`.
+                            tracing::error!(
+                                // Same exempt target as the session-start line,
+                                // and for the same reason. ERROR passes any
+                                // bare level, but a targeted `RUST_LOG` with no
+                                // bare level leaves EnvFilter's unmatched
+                                // default OFF, so on the default target this
+                                // line was dropped under exactly the form the
+                                // CLI's troubleshooting text prints
+                                // (`RUST_LOG=travsr_plugin_host=debug`), which
+                                // auto-starts a daemon. The log then stopped
+                                // mid-session with no reason in it, which is
+                                // the failure this event exists to remove.
+                                target: SESSION_LOG_TARGET,
+                                event = "daemon.session.exit",
+                                reason = "graph_db_removed",
+                                db = %db_path.display(),
+                                "graph.db removed, daemon exiting; re-run `travsr init` to rebuild"
+                            );
                             eprintln!(
                                 "travsr daemon: graph.db removed, exiting. Re-run `travsr init` to rebuild."
                             );
+                            // Flush before leaving, or the line above never
+                            // reaches the file: `exit` runs no destructors, so
+                            // the guard would not drop and the non-blocking
+                            // writer would never be joined.
+                            drop(appender_guard.take());
                             std::process::exit(0);
                         }
                         // M9: .travsr is in SKIP_DIRS so the watcher never sees a
@@ -10081,6 +15425,11 @@ impl Daemon {
                             // at most once per 10 s (see watch_shed above);
                             // the head reconcile covers dropped events.
                             Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                // Cumulative for `travsr status` (#809); the
+                                // local `watch_shed` below is only the 10 s log
+                                // window and resets, so it cannot serve status.
+                                WATCH_SHED_TOTAL
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 watch_shed += 1;
                                 if watch_shed_last_log.elapsed()
                                     >= std::time::Duration::from_secs(10)
@@ -10139,9 +15488,38 @@ impl Daemon {
                     _ = phase_b_tick.tick() => {
                         // C3: poll every 5 s since .travsr is in SKIP_DIRS.
                         if !db_path.exists() {
+                            // Logged, not only printed. A backgrounded daemon is
+                            // spawned with null stdio, so this `eprintln!` reached
+                            // nobody and the log simply stopped mid-session with no
+                            // reason in it: the one artifact left after the process
+                            // is gone said nothing about why it went. It stays on
+                            // stderr too, for `daemon start --foreground`.
+                            tracing::error!(
+                                // Same exempt target as the session-start line,
+                                // and for the same reason. ERROR passes any
+                                // bare level, but a targeted `RUST_LOG` with no
+                                // bare level leaves EnvFilter's unmatched
+                                // default OFF, so on the default target this
+                                // line was dropped under exactly the form the
+                                // CLI's troubleshooting text prints
+                                // (`RUST_LOG=travsr_plugin_host=debug`), which
+                                // auto-starts a daemon. The log then stopped
+                                // mid-session with no reason in it, which is
+                                // the failure this event exists to remove.
+                                target: SESSION_LOG_TARGET,
+                                event = "daemon.session.exit",
+                                reason = "graph_db_removed",
+                                db = %db_path.display(),
+                                "graph.db removed, daemon exiting; re-run `travsr init` to rebuild"
+                            );
                             eprintln!(
                                 "travsr daemon: graph.db removed, exiting. Re-run `travsr init` to rebuild."
                             );
+                            // Flush before leaving, or the line above never
+                            // reaches the file: `exit` runs no destructors, so
+                            // the guard would not drop and the non-blocking
+                            // writer would never be joined.
+                            drop(appender_guard.take());
                             std::process::exit(0);
                         }
                         // Auto-arm when Phase B is pending (deferred init, or daemon
@@ -10237,6 +15615,13 @@ const DIRTY_QUEUE_CAP: usize = 100_000;
 /// previously grew without limit.
 const INDEX_QUEUE_CAP: usize = DIRTY_QUEUE_CAP;
 
+/// Watch events shed because the bounded indexer queue (`INDEX_QUEUE_CAP`) was
+/// full, cumulative for the life of this daemon process (#809). The two
+/// `try_send` shed sites feed it; the status path reads it into
+/// `StatusPayload.watch_shed` so lossy shedding is self-diagnosing in
+/// `travsr status` rather than only in a throttled log line.
+static WATCH_SHED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Bound on concurrently-processed control connections (#736 item 8).
 ///
 /// Each accepted connection's real cost is a blocking-pool thread
@@ -10308,21 +15693,156 @@ fn enqueue_dirty_callers(
     }
 }
 
+/// Whether `path`'s bytes on disk are the ones already recorded in the index.
+///
+/// The same per-file hash test [`reindex_files_reporting`] applies internally,
+/// asked before the call so the caller can tell a save it still has to fold in
+/// from an event for one that is already in.
+fn file_matches_index(store: &SqliteStore, repo_root: &Path, path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let vname_path = path
+        .strip_prefix(repo_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    matches!(store.get_file_hash(&vname_path), Ok(Some(h)) if h == hex_encode(&hash_bytes(&bytes)))
+}
+
+/// Fold one saved file into the index and refresh its live overlay.
+///
+/// Both the watcher's Upsert and the editor's target request need this done:
+/// the request arrives the moment the editor saves, ahead of the watcher's
+/// 500 ms debounce, so whichever reaches the file first does the work and the
+/// other finds it already done.
+///
+/// Running twice for one save therefore has to be harmless, and the hash test
+/// is what makes it so. `reindex_files_reporting` is already hash-gated and
+/// no-ops on the second call, but the live lane below is not: re-resolving the
+/// file would re-record as `pending` the references the editor has meanwhile
+/// answered, and re-stashing would drop the changed region an in-flight report
+/// is still validated against.
+fn process_saved_file(
+    path: &Path,
+    repo_root: &Path,
+    store: &std::sync::Mutex<SqliteStore>,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
+    lsp_sessions: &std::sync::Mutex<EditorPlane>,
+) {
+    let batch = [path.to_path_buf()];
+    let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+    let already_indexed = file_matches_index(&s, repo_root, path);
+    match reindex_files_reporting(&batch, repo_root, &mut s) {
+        Ok((callers, changed_occ, changed_defs)) => {
+            if already_indexed {
+                // This save is already folded in, so the reindex above was a
+                // no-op (`callers` is empty) and the live lane has nothing new
+                // to say. Leaving the overlay and the stash alone is the point.
+                return;
+            }
+            // RFC-027 sections 6 and 7.3a: refresh this file's live
+            // overlay, and on an interface edit the overlay of the files
+            // that reference it.
+            //
+            // Only here, on the save path — the commit path arms a Phase
+            // B refresh that re-derives the same edges, so doing it
+            // there would be waste inside `git commit`'s latency.
+            //
+            // `callers` is non-empty exactly when a symbol other files
+            // reference vanished, which is the interface-edit signal
+            // (section 6.2). Their edges into this file were deleted by
+            // `reindex_replace`, so re-resolving them is what stops a
+            // rename from silently dropping every inbound live edge.
+            let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
+            // RFC-027 #813 (finding 2): on a scoped pure-body edit the
+            // store preserved every unchanged definition's committed
+            // edges, so the lexical lane must re-resolve only the changed
+            // region, otherwise it re-records a preserved definition's
+            // already-committed references as `pending` and the freshness
+            // count over-reports. `None` (no entry) means a whole-file
+            // re-derive, which resolves the file wholesale as before.
+            let saved_vname = path
+                .strip_prefix(repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let scope = changed_defs
+                .iter()
+                .find(|(f, _)| *f == saved_vname)
+                .map(|(_, set)| set);
+            live_resolve_file(&mut s, &corpus, repo_root, path, scope);
+            // RFC-027 sections 7.3c and 9.2: an abstention is recorded, not
+            // dropped. The lexical lane above records its own, but only for the
+            // references the native extractor hands it, and the extractor
+            // discards some by design (`NOISE_NAMES` drops `new`, `from`,
+            // `clone`). `Store::new()` therefore lost its committed edge to this
+            // save and appeared in no state at all: not resolved, not pending.
+            // The changed-occurrence set is exactly the occurrences whose
+            // committed edge this save dropped, so anything in it the lane did
+            // not re-resolve is precisely an unaccounted abstention.
+            let saved_occ: &[travsr_core::ChangedOccurrence] = changed_occ
+                .iter()
+                .find(|(f, _)| *f == saved_vname)
+                .map_or(&[], |(_, o)| o.as_slice());
+            match s.record_pending_changed_occurrences(saved_occ) {
+                Ok(n) if n > 0 => tracing::debug!(
+                    event = "live.pending.unresolved",
+                    path = %saved_vname,
+                    pending = n,
+                    "recorded abstentions for dropped committed references"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(error = %e, "live pending record failed"),
+            }
+            // Dependents were not reindexed by this event, so their whole
+            // file is re-resolved (no scope) exactly as before.
+            for dependent in callers.iter().take(LIVE_CLOSURE_FILE_CAP) {
+                let abs = repo_root.join(dependent);
+                if abs.as_path() != path && abs.is_file() {
+                    live_resolve_file(&mut s, &corpus, repo_root, &abs, None);
+                }
+            }
+            // RFC-027 #813 P2 / finding 2: stash this save's changed
+            // region so the editor target request that follows can both
+            // enumerate its committed occurrences and scope its native
+            // targets to the changed definitions. Release the store lock
+            // first, then take the plane lock, keeping the store->plane
+            // order the serve path also uses. One saved file per Upsert.
+            drop(s);
+            {
+                let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+                let occ = changed_occ
+                    .into_iter()
+                    .find(|(f, _)| f.as_str() == saved_vname.as_str())
+                    .map(|(_, o)| o)
+                    .unwrap_or_default();
+                let scope_owned = changed_defs
+                    .into_iter()
+                    .find(|(f, _)| f == &saved_vname)
+                    .map(|(_, set)| set);
+                plane.stash_changed_occurrences(saved_vname, occ, scope_owned);
+            }
+            enqueue_dirty_callers(callers, repo_root, index_tx)
+        }
+        Err(e) => tracing::warn!(path=%path.display(), err=%e, "watcher reindex failed"),
+    }
+}
+
 fn handle_watch_event(
     ev: watcher::WatchEvent,
     repo_root: &std::path::Path,
     store: &std::sync::Mutex<SqliteStore>,
     index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
+    // RFC-027 #813 P2: the editor plane, so a save can stash its changed-def
+    // committed occurrences for the target request that follows it.
+    lsp_sessions: &std::sync::Mutex<EditorPlane>,
 ) {
     use watcher::WatchEvent;
 
     match ev {
         WatchEvent::Upsert(path) => {
-            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-            match reindex_files(std::slice::from_ref(&path), repo_root, &mut s) {
-                Ok(callers) => enqueue_dirty_callers(callers, repo_root, index_tx),
-                Err(e) => tracing::warn!(path=%path.display(), err=%e, "watcher reindex failed"),
-            }
+            process_saved_file(&path, repo_root, store, index_tx, lsp_sessions)
         }
         WatchEvent::Remove(path) => {
             let vname_path = path
@@ -10389,6 +15909,125 @@ pub struct EditorPlane {
     pub refused: std::collections::HashMap<String, usize>,
     /// Refusals whose root arrived after `MAX_REFUSED_ROOTS` was reached.
     pub refused_overflow: usize,
+    /// RFC-027 #813 P2: repo-relative file path -> the changed-definition
+    /// committed occurrences captured at that file's last save, for the live
+    /// lane to enumerate as editor targets while the mid-edit window is open.
+    /// Bounded in files retained and TTL-expired on read, like the sessions.
+    pub changed_occurrences: std::collections::HashMap<String, StashedOccurrences>,
+}
+
+/// RFC-027 #813 P2: one file's changed-definition committed occurrences, stashed
+/// at save so a target request that arrives moments later can enumerate them.
+#[derive(Debug, Clone)]
+pub struct StashedOccurrences {
+    pub occurrences: Vec<travsr_core::ChangedOccurrence>,
+    /// RFC-027 #813 (finding 2): the changed-definition set of the save that
+    /// produced this stash, so the request path scopes its native editor
+    /// targets to the changed region the same way the save-path lexical lane
+    /// does. A stash exists only for a scoped pure-body edit, so its presence
+    /// means "scope to this set" (empty means every definition was preserved,
+    /// so no native target is owed). A whole-file re-derive stashes nothing and
+    /// the request path stays whole-file.
+    pub changed_defs: std::collections::HashSet<travsr_core::NodeId>,
+    /// When this stash stops being servable (see [`STASHED_OCCURRENCE_TTL`]).
+    pub expires_at: std::time::Instant,
+}
+
+/// Files whose changed-occurrence enumeration is retained at once. A person
+/// edits a handful of files in a mid-edit window; past this the soonest-to-
+/// expire entry is evicted.
+const MAX_STASHED_OCCURRENCE_FILES: usize = 64;
+/// How long a saved file's changed-occurrence enumeration stays servable. A
+/// target request follows its save within a keystroke or two; past this the
+/// buffer has almost certainly moved on and the committed positions are stale.
+const STASHED_OCCURRENCE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Occurrences retained per file. One changed function's references fit well
+/// under this; a whole-file rewrite that blows past it is not the case this
+/// enumeration serves, so it is truncated rather than grown.
+const MAX_OCCURRENCES_PER_STASHED_FILE: usize = 500;
+
+impl EditorPlane {
+    /// RFC-027 #813 P2 / finding 2: stash a scoped save's changed region after a
+    /// save, bounded per file and in the number of files retained. `scope` is the
+    /// save's changed-definition set: `Some` for a pure-body edit where the store
+    /// preserved definitions (the request path then scopes native targets to it),
+    /// `None` for a whole-file re-derive, which stashes nothing and clears any
+    /// prior entry so a later request cannot scope against a stale set.
+    fn stash_changed_occurrences(
+        &mut self,
+        path: String,
+        mut occ: Vec<travsr_core::ChangedOccurrence>,
+        scope: Option<std::collections::HashSet<travsr_core::NodeId>>,
+    ) {
+        let Some(changed_defs) = scope else {
+            // Whole-file re-derive: no scope to stash, and any prior scoped entry
+            // is now stale, so drop it.
+            self.changed_occurrences.remove(&path);
+            return;
+        };
+        // Order by position before capping, so which occurrences survive on a
+        // function with more than the cap is deterministic (the top of the
+        // changed region) rather than whatever order the capture query returned.
+        occ.sort_unstable_by_key(|o| (o.line, o.col, o.src.0));
+        occ.truncate(MAX_OCCURRENCES_PER_STASHED_FILE);
+        let now = std::time::Instant::now();
+        self.changed_occurrences.retain(|_, e| e.expires_at > now);
+        if self.changed_occurrences.len() >= MAX_STASHED_OCCURRENCE_FILES
+            && !self.changed_occurrences.contains_key(&path)
+        {
+            if let Some(soonest) = self
+                .changed_occurrences
+                .iter()
+                .min_by_key(|(_, e)| e.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.changed_occurrences.remove(&soonest);
+            }
+        }
+        self.changed_occurrences.insert(
+            path,
+            StashedOccurrences {
+                occurrences: occ,
+                changed_defs,
+                expires_at: now + STASHED_OCCURRENCE_TTL,
+            },
+        );
+    }
+
+    /// RFC-027 #813 P2: the live changed-def occurrences stashed for `path`,
+    /// empty if none or expired (expiry evaluated on read, like the sessions).
+    fn stashed_changed_occurrences(&self, path: &str) -> Vec<travsr_core::ChangedOccurrence> {
+        match self.changed_occurrences.get(path) {
+            Some(e) if e.expires_at > std::time::Instant::now() => e.occurrences.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// RFC-027 #813 P2 / finding 2: serve a target request or report the stashed
+    /// occurrences *and* the changed-definition scope, *and* restart the TTL
+    /// clock, because a resolution drain begins at the request, not at the save.
+    /// A large edited function's targets (or a cold rust-analyzer / jdtls) can
+    /// take several seconds to answer in batches; keying the 30 s window on the
+    /// save time would reject every late batch as stale (`retain_current_targets`
+    /// re-reads the stash and would find it gone). Refreshing on each serve keeps
+    /// the stash alive as long as answers keep arriving inside one TTL of each
+    /// other. `None` when no fresh stash exists, so the request stays whole-file.
+    #[allow(clippy::type_complexity)]
+    fn serve_stash(
+        &mut self,
+        path: &str,
+    ) -> Option<(
+        Vec<travsr_core::ChangedOccurrence>,
+        std::collections::HashSet<travsr_core::NodeId>,
+    )> {
+        match self.changed_occurrences.get_mut(path) {
+            Some(e) if e.expires_at > std::time::Instant::now() => {
+                e.expires_at = std::time::Instant::now() + STASHED_OCCURRENCE_TTL;
+                Some((e.occurrences.clone(), e.changed_defs.clone()))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Distinct refused roots retained per daemon lifetime. Small because the
@@ -10450,6 +16089,83 @@ fn live_editor_sessions(
         .collect();
     live.sort_by_key(|(_, s)| std::cmp::Reverse(s.updated_at));
     live
+}
+
+/// The directive actually installed, given a resolved one.
+///
+/// Appends the session target so `daemon.session.start` survives whatever level
+/// it reports (see [`SESSION_LOG_TARGET`]).
+///
+/// Appended for `RUST_LOG` too, which it was not at first. The argument for
+/// exempting the escape hatch was that readers tell a `RUST_LOG` run apart by
+/// `log_level_from`, but that only holds if a line is written at all: under
+/// `RUST_LOG=warn` the daemon wrote no session line, so a reader landing on the
+/// same day's file found a *previous* session's line, believed it, and asked
+/// for a restart that could never clear, because every restart under that
+/// `RUST_LOG` writes no line either. That is precisely the stale-session bug
+/// the exemption exists to prevent, reintroduced through the one path that
+/// opted out of it.
+///
+/// One line per process start is a small enough imposition on an explicit
+/// `RUST_LOG` to be worth a file that always says what it is. Everything else
+/// in the directive is still honoured exactly as written.
+pub fn filter_directive_for(directive: &str) -> String {
+    format!("{directive},{SESSION_LOG_TARGET}=trace")
+}
+
+/// How long a query has to take before serving it is an event rather than
+/// commentary.
+///
+/// Four times the 50 ms p95 the bench gate enforces, so a query at the edge of
+/// the budget does not log and one well past it does. The point is a threshold
+/// that is quiet when things are normal; tightening it to the gate itself would
+/// put the log back where it was.
+pub(crate) const SLOW_QUERY_MS: u128 = 200;
+
+/// Whether serving a query at this speed is an event or commentary.
+///
+/// Inclusive at the threshold, so `SLOW_QUERY_MS` reads as "this slow counts"
+/// rather than leaving a one-millisecond band that is neither.
+pub(crate) fn query_is_slow(elapsed_ms: u128) -> bool {
+    elapsed_ms >= SLOW_QUERY_MS
+}
+
+/// The one `query.served` line, at the level its content earns.
+///
+/// This was unconditionally INFO, which made it the most frequent line in the
+/// file by a wide margin: 28 of about 130 lines in this repo's own log, most of
+/// them `elapsed_ms=0` cache hits. `logfile.rs` states the rule it broke, that a
+/// line is worth INFO where something happened a reader would count or chart,
+/// and not for the running commentary in between, and a line per query is the
+/// definition of commentary.
+///
+/// Dropping it to DEBUG outright would have cost the thing it was added for:
+/// "which query was slow" has to stay answerable without restarting the daemon
+/// at debug. So the level follows the content. A slow query is an event; a fast
+/// one is not. Same `event` key and the same fields either way, so anything
+/// selecting on `query.served` sees one shape, and `--level debug` still shows
+/// every query.
+///
+/// The same split is already the house pattern: `sidecar.version.checked` is
+/// DEBUG because healthy spawns must not flood, while `below_floor` is WARN.
+fn log_query_served(tool: &str, cached: bool, elapsed_ms: u128) {
+    if query_is_slow(elapsed_ms) {
+        tracing::info!(
+            event = "query.served",
+            tool = %tool,
+            cached,
+            elapsed_ms,
+            "query served"
+        );
+    } else {
+        tracing::debug!(
+            event = "query.served",
+            tool = %tool,
+            cached,
+            elapsed_ms,
+            "query served"
+        );
+    }
 }
 
 /// Returns `(response, should_shutdown)`.
@@ -10544,6 +16260,195 @@ fn handle_control_message(
             drop(s);
             enqueue_dirty_callers(dirty, repo_root, index_tx);
             (ControlResponse::ok(None), false)
+        }
+        Ok(ControlMessage::RequestLiveResolutionTargets {
+            repo_root: reported_root,
+            session,
+            file,
+            buffer_version: _,
+        }) => {
+            // Same identity guard as ReportLiveResolution: discovery enumerates a
+            // namespace, so the request has to say which repo it is for.
+            let reported = travsr_ipc::normalize_repo_root(std::path::Path::new(&reported_root));
+            if reported != travsr_ipc::normalize_repo_root(repo_root) {
+                return (
+                    ControlResponse::err("request is for a different repo".to_string()),
+                    false,
+                );
+            }
+
+            // SEC-002: `file` is caller-supplied and is joined onto the repo
+            // root below, so it is validated here, before anything reads or
+            // writes with it. Shares the MCP `file`-argument guard rather than
+            // copying it, applied at the point the string enters rather than
+            // inside `process_saved_file`, whose other caller is the watcher and
+            // is handed paths from its own walk of the repo. It has to be here
+            // and not further down because this arm now both reads that path and
+            // indexes it: `reindex_files_reporting` falls back to the joined
+            // path when `strip_prefix(repo_root)` fails, so `../outside/secret.rs`
+            // would otherwise be parsed into the graph. The file variant keeps
+            // every containment guard (`../`, absolute paths, null bytes, length)
+            // but allows `%`: this path is joined verbatim and never URL-decoded,
+            // so `%` stays a literal filename byte (`docs/100%.md`) rather than a
+            // traversal after decoding. Purely lexical, so unlike a canonicalizing
+            // containment test it cannot reject a legitimate request because the
+            // repo root is a symlink or is spelled non-canonically.
+            if let Err(reason) = travsr_mcp::validate_mcp_file_arg(&file) {
+                tracing::warn!(
+                    event = "live.targets.rejected",
+                    session = %session,
+                    "live resolution targets rejected an invalid file argument: {reason}"
+                );
+                return (
+                    ControlResponse::err("invalid file argument".to_string()),
+                    false,
+                );
+            }
+
+            let abs_path = repo_root.join(&file);
+            // RFC-027 §7.3b: the editor asks the instant it saves, and the
+            // watcher's 500 ms debounce means the daemon has not reparsed that
+            // save yet. Answering from the pre-save index describes the file as
+            // it was before the edit: the changed region is not stashed, so the
+            // references only a language server can resolve are never offered,
+            // and the editor asks exactly once per save and never retries. So
+            // fold the save in here rather than race the watcher for it; the
+            // pass that arrives second finds the work done (`process_saved_file`).
+            // Only for a file that is there to read: a deleted path is the
+            // watcher's Remove event to handle, not this request's.
+            if abs_path.is_file() {
+                process_saved_file(&abs_path, repo_root, store, index_tx, lsp_sessions);
+            }
+
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
+            // RFC-027 #813 P2 / finding 2: serve this file's stashed changed
+            // region (its committed occurrences to enumerate, and its changed-def
+            // set to scope native targets), restarting the TTL from this request
+            // so the resolution drain it kicks off has the full window even when
+            // the provider answers slowly. `None` when no fresh scoped save, which
+            // keeps the whole-file behavior.
+            let (stashed, scope) = match lsp_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .serve_stash(&file)
+            {
+                Some((occ, defs)) => (occ, Some(defs)),
+                None => (Vec::new(), None),
+            };
+            let own = live_resolution_targets(
+                &s,
+                &corpus,
+                repo_root,
+                &abs_path,
+                &stashed,
+                scope.as_ref(),
+            );
+            // RFC-027 section 8.7.5: also re-resolve the files whose edges this
+            // save can restore, so a rename in one file heals its dependents
+            // without each being saved in turn.
+            let dependents =
+                dependent_resolution_targets(&s, &corpus, repo_root, &abs_path, Some(lsp_sessions));
+            drop(s);
+
+            tracing::debug!(
+                event = "live.targets",
+                session = %session,
+                file = %file,
+                count = own.len(),
+                dependents = dependents.len(),
+                "live resolution targets computed"
+            );
+            let mut resp = ControlResponse::ok(None);
+            resp.result = serde_json::to_value(travsr_ipc::message::LiveResolutionTargets {
+                own,
+                dependents,
+            })
+            .ok();
+            (resp, false)
+        }
+        Ok(ControlMessage::ReportLiveResolution {
+            repo_root: reported_root,
+            session,
+            file,
+            resolutions,
+        }) => {
+            // Same identity guard as ReportLspDiagnostics (#698 review, P1):
+            // discovery enumerates a namespace, not a repo, so a report has to
+            // say who it is for. Here the stakes are higher than for the editor
+            // plane, because these positions become graph edges: accepting
+            // another repo's report would write edges between nodes chosen by
+            // paths that mean something else in this graph.
+            let reported = travsr_ipc::normalize_repo_root(std::path::Path::new(&reported_root));
+            if reported != travsr_ipc::normalize_repo_root(repo_root) {
+                return (
+                    ControlResponse::err("report is for a different repo".to_string()),
+                    false,
+                );
+            }
+
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
+            // RFC-027 section 11: answers are accepted only for questions this
+            // daemon is still asking. `buffer_version` cannot carry that on its
+            // own — it is the editor's counter, minted and checked by the
+            // editor, so it says nothing about whether the daemon re-parsed the
+            // file between handing out targets and receiving answers. It did
+            // have to, if the file changed on disk underneath an unchanged
+            // editor buffer, and `enclosing_definition_at` then reads spans from
+            // the newer parse. Re-detecting against the file as it stands now
+            // closes that window with the daemon's own evidence.
+            // RFC-027 #813 P2 / finding 2: validate against the same target set
+            // the request served (same stashed occurrences AND same changed-def
+            // scope), so a resolution for a changed-def occurrence is recognized
+            // as current rather than rejected as stale. Refresh the TTL again here
+            // so a long, multi-batch drain keeps the stash alive as long as
+            // reports keep arriving within one TTL of each other.
+            let (stashed, scope) = match lsp_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .serve_stash(&file)
+            {
+                Some((occ, defs)) => (occ, Some(defs)),
+                None => (Vec::new(), None),
+            };
+            let current = live_resolution_targets(
+                &s,
+                &corpus,
+                repo_root,
+                &repo_root.join(&file),
+                &stashed,
+                scope.as_ref(),
+            );
+            let accepted = live_resolve::retain_current_targets(&resolutions, &current);
+            let stale = resolutions.len() - accepted.len();
+            let outcome = live_resolve::apply_live_resolutions(&mut s, &corpus, &file, &accepted);
+            drop(s);
+            if stale > 0 {
+                tracing::debug!(
+                    event = "live.report.stale",
+                    session = %session,
+                    file = %file,
+                    dropped = stale,
+                    "dropped resolutions for references the current parse no longer has"
+                );
+            }
+
+            tracing::debug!(
+                event = "live.report",
+                session = %session,
+                file = %file,
+                emitted = outcome.emitted,
+                pending = outcome.pending,
+                "live resolution report applied"
+            );
+            (
+                ControlResponse::ok(Some(format!(
+                    "{} live, {} pending",
+                    outcome.emitted, outcome.pending
+                ))),
+                false,
+            )
         }
         Ok(ControlMessage::ReportLspDiagnostics {
             repo_root: reported_root,
@@ -10723,19 +16628,18 @@ fn handle_control_message(
             let edges = s.edge_count().unwrap_or(0);
 
             // Live Phase B activity from the scheduler.
-            let phase_b_activity = if phase_b_scheduler.is_running() {
-                "running".to_string()
-            } else if phase_b_scheduler.is_pending() {
-                "pending (debounce)".to_string()
-            } else if last_commit.is_empty() {
-                "not run (no commits yet)".to_string()
-            } else if phase_b_commit.is_empty() {
-                "pending".to_string()
-            } else if phase_b_commit == last_commit {
-                "complete".to_string()
-            } else {
-                "stale (new commits since last run)".to_string()
-            };
+            let phase_b_activity = semantic_line(
+                phase_b_scheduler.is_running(),
+                phase_b_scheduler.is_pending(),
+                &last_commit,
+                &phase_b_commit,
+                s.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1"),
+                s.resolved_ref_count().unwrap_or(0),
+                travsr_mcp::query::pending_refs_in_edited_files(&s)
+                    .iter()
+                    .map(|(_, n)| n)
+                    .sum(),
+            );
 
             // Embed progress — per-repo configured model only.
             let embed_line = if let Some(backend_id) =
@@ -10768,7 +16672,13 @@ fn handle_control_message(
                  semantic: {phase_b_activity}\n\
                  {embed_line}"
             );
-            (ControlResponse::ok(Some(msg)), false)
+            // Advertise the version this daemon was built from so a newer client
+            // can notice the skew and restart it (the daemon runs the binary
+            // image it was spawned with for its whole life; installing a new
+            // binary does not touch it).
+            let mut resp = ControlResponse::ok(Some(msg));
+            resp.daemon_version = Some(build_version().to_string());
+            (resp, false)
         }
         Ok(ControlMessage::Shutdown) => (ControlResponse::ok(None), true),
         // WS3 (#420): pause auto-reindex and gracefully cancel any in-flight run.
@@ -10863,13 +16773,7 @@ fn handle_control_message(
             if let Some(versions) = versions {
                 let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(cached) = c.get(&tool, &args, &last_commit, &phase_b_commit, versions) {
-                    tracing::info!(
-                        event = "query.served",
-                        tool = %tool,
-                        cached = true,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "query served"
-                    );
+                    log_query_served(&tool, true, started.elapsed().as_millis());
                     return (ControlResponse::query_result(cached), false);
                 }
             }
@@ -10886,19 +16790,12 @@ fn handle_control_message(
                             value.clone(),
                         );
                     }
-                    // The line that makes "which query was slow" answerable.
-                    // Without it a successful query logged nothing at all, so
-                    // the `req` correlation id had nothing on the happy path to
-                    // bind to and per-request timing did not exist. `cached`
-                    // distinguishes the two costs, which is usually the first
-                    // thing worth knowing about a slow one.
-                    tracing::info!(
-                        event = "query.served",
-                        tool = %tool,
-                        cached = false,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "query served"
-                    );
+                    // The line that makes "which query was slow" answerable, and
+                    // the anchor the `req` correlation id binds to on the happy
+                    // path. `cached` distinguishes the two costs, which is
+                    // usually the first thing worth knowing about a slow one.
+                    // See `log_query_served` for why the level is not fixed.
+                    log_query_served(&tool, false, started.elapsed().as_millis());
                     (ControlResponse::query_result(value), false)
                 }
                 Err(e) => {
@@ -10942,25 +16839,15 @@ fn run_query(
                 .map(|f| f as &dyn Fn(&str, u32) -> Vec<(travsr_core::NodeId, f32)>);
             Ok(serde_json::to_value(query::ask_query(store, q, knn_ref)?)?)
         }
-        "status" => Ok(serde_json::to_value(query::status_query(store)?)?),
+        "status" => {
+            // The shed counter lives in this process, not the store, so fill it
+            // in here rather than widening the store-only `status_query` (#809).
+            let mut payload = query::status_query(store)?;
+            payload.watch_shed = WATCH_SHED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+            Ok(serde_json::to_value(payload)?)
+        }
         other => anyhow::bail!("unknown query tool '{other}'"),
     }
-}
-
-/// Resolve the embed backend id to use for hook injection at `db_path`,
-/// preferring the repo's own `.travsr/embed.toml` override over the
-/// machine-wide `~/.travsr/embed.toml` default. Mirrors `resolve_backend`'s
-/// resolution order in travsr-plugin-host — hook injection is a per-repo
-/// embedding decision, so it must not resolve on `active_backend_id()` alone
-/// (#526: a repo-level `travsr embed switch` was silently ignored, causing
-/// the daemon to spawn the wrong sidecar model and disable Step 4).
-fn hook_backend_id(db_path: &Path) -> Option<String> {
-    use travsr_plugin_host::{active_backend_id, repo_backend_id};
-
-    let repo_root = db_path.parent().and_then(|p| p.parent());
-    repo_root
-        .and_then(repo_backend_id)
-        .or_else(active_backend_id)
 }
 
 /// Try to start an embed plugin supervisor and inject its KNN hook into `store`.
@@ -10984,23 +16871,18 @@ pub fn try_inject_embed_hook(
     write_store: &mut SqliteStore,
     db_path: &Path,
 ) -> Option<travsr_plugin_host::EmbedSupervisor> {
-    use travsr_plugin_host::{embed_backends, lookup_embed_backend, EmbedSupervisor};
+    use travsr_plugin_host::{lookup_embed_backend, EmbedSupervisor};
 
     let Some(home) = dirs::home_dir() else {
         tracing::debug!("embed hook: HOME not set, skipping");
         return None;
     };
 
-    // Prefer the repo's own `.travsr/embed.toml` override, then the user's
-    // machine-wide active backend from ~/.travsr/embed.toml, then the catalog
-    // default so a fresh install without `travsr embed switch` still works.
-    // Mirrors `resolve_backend`'s resolution order (travsr-plugin-host) — this
-    // is a per-repo embedding decision, not an install/list/hint path, so it
-    // must not resolve on `active_backend_id()` alone (#526).
-    let backend = hook_backend_id(db_path)
+    // Only a repo that ran `travsr embed init` has a backend (#526); the same
+    // rule `daemon status` reports and the MCP server applies.
+    let backend = travsr_mcp::repo_embed_backend(db_path)
         .as_deref()
         .and_then(lookup_embed_backend)
-        .or_else(|| embed_backends().first())
         .cloned()?;
 
     let binary = home

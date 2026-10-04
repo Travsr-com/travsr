@@ -23,7 +23,8 @@ pub enum Direction {
     /// Follow incoming edges (who calls / depends on this symbol?). Containment
     /// edges to the defining file are shown but not expanded.
     Callers,
-    /// Follow both directions
+    /// Callers and dependencies together: callers walked upward, dependencies
+    /// downward, never a callee's other callers
     Both,
 }
 
@@ -99,8 +100,24 @@ pub fn run(
     // complete whether or not Phase B has run. Warning there told the user their
     // complete answer might be missing something, which is both wrong and the
     // fastest way to teach someone to ignore the warning that matters.
-    if !matches!(direction, Direction::Deps) {
-        daemon_client::warn_if_call_graph_degraded(&db_path);
+    //
+    // The cross-checkout note itself is not subject to that split: it says which
+    // tree the answer describes, and a complete `deps` answer about the wrong
+    // checkout is still the wrong answer. Its folded-in degraded caveat *is*
+    // subject to it, being the Phase B claim above in different words. Emitting
+    // the note explicitly here, rather than relying on
+    // `warn_if_call_graph_degraded` to delegate to it, keeps the "every
+    // direction gets the cross-checkout note" rule visible at the call site that
+    // owns the split — a refactor of that delegation cannot silently drop it
+    // from `callers` / `blast-radius`.
+    //
+    // One local drives both halves so they cannot drift apart: it decides
+    // whether the standalone Phase B note is printed *and* whether the
+    // cross-checkout note carries that same claim as its degraded caveat.
+    let reads_call_edges = !matches!(direction, Direction::Deps);
+    let cross = daemon_client::warn_if_cross_checkout(&db_path, reads_call_edges);
+    if !cross && reads_call_edges {
+        daemon_client::warn_if_phase_b_degraded(&db_path);
     }
 
     // Daemon route first (#318 O1), direct read-only open as fallback.
@@ -159,12 +176,21 @@ pub fn run(
         // narrows nothing. The exact signature always resolves uniquely (Tier 1
         // of the resolver), so point at it explicitly and use the first
         // candidate's signature as a concrete example.
+        // #810: but only when signatures differ. Same-named defs in different
+        // files share a signature, so "pick an exact signature" cannot
+        // disambiguate them — suppress that half when every candidate shares one.
+        let all_same_sig = candidates
+            .iter()
+            .all(|n| n.signature == candidates[0].signature);
         let example_sig = candidates.first().map(|n| n.signature.as_str());
         let escape_hatch = match example_sig {
-            Some(sig) => format!(
+            Some(sig) if !all_same_sig => format!(
                 "Re-run with a `--path` hint (for cross-file matches) or with one of the \
                  exact signatures listed below (e.g. `{sig}`) to pick one:"
             ),
+            Some(_) => "Re-run with a `--path` hint to pick one (these definitions share \
+                 an identical signature, so only the path distinguishes them):"
+                .to_string(),
             None => "Re-run with a `--path` hint to pick one:".to_string(),
         };
         if truncated {
@@ -203,6 +229,14 @@ pub fn run(
             return Ok(());
         }
     }
+    if payload.fuzzy {
+        if let Some(seed) = &payload.seed {
+            eprintln!(
+                "no exact match for '{query_str}', showing the closest: {} ({})",
+                seed.label, seed.path
+            );
+        }
+    }
 
     // C3: a manifest/config file has no inbound edges — no source file depends on
     // a manifest, so `--direction callers` is legitimately empty. Explain that
@@ -215,7 +249,36 @@ pub fn run(
             .as_ref()
             .is_some_and(|s| s.kind == "file" && is_config_manifest_path(&s.path));
 
+    // A struct, enum or type is used, not called: its uses are occurrence rows
+    // with no `ref/call` edge (#650), so callers can list none while it has many.
+    // Only for an exact match, whose name `travsr references` takes as typed,
+    // and a walk that ran: `--depth 0` lists no edges at all.
+    let uses_not_calls = match &payload.seed {
+        Some(seed)
+            if !matches!(direction, Direction::Deps)
+                && matches!(format, Format::Tree)
+                && !payload.fuzzy
+                && depth > 0
+                && !payload
+                    .edges
+                    .iter()
+                    .any(|e| e.dst == seed.id && e.kind == "ref/call") =>
+        {
+            daemon_client::open_read_store(&db_path)
+                .ok()
+                .and_then(|s| s.reference_sites(travsr_core::NodeId(seed.id)).ok())
+                .map_or(0, |sites| sites.len())
+        }
+        _ => 0,
+    };
+
     render(payload, format, budget)?;
+    if uses_not_calls > 0 {
+        eprintln!(
+            "note: nothing calls '{query_str}', but it is used at {uses_not_calls} place(s). \
+             List them with `travsr references {query_str}`."
+        );
+    }
     if manifest_dead_end {
         eprintln!(
             "note: manifests are configuration inputs, no source file depends on one, so \
@@ -326,49 +389,110 @@ fn print_budget_footer(
 }
 
 fn print_tree(payload: &GraphPayload) {
-    let nodes_by_id: HashMap<u64, &NodeEntry> = payload.nodes.iter().map(|n| (n.id, n)).collect();
+    let labels = tree_labels(payload);
     // Children per parent, in BFS discovery order.
-    let mut children: HashMap<u64, Vec<(&str, u64, bool)>> = HashMap::new();
+    let mut children: HashMap<u64, Vec<(&str, u64, bool, bool)>> = HashMap::new();
     for step in &payload.tree {
         children.entry(step.parent).or_default().push((
             step.edge_kind.as_str(),
             step.child,
             step.incoming,
+            step.heuristic,
         ));
     }
+    let mut any_heuristic = false;
     if let Some(seed) = &payload.seed {
-        print_tree_level(seed.id, &nodes_by_id, &children, "");
+        print_tree_level(seed.id, None, &labels, &children, "", &mut any_heuristic);
+    }
+    // Only when a row was actually rendered with the sigil: a legend for a mark
+    // that is not on screen is noise. Kept to one line, and off every row, so
+    // marking these edges costs a tree almost nothing.
+    if any_heuristic {
+        println!();
+        println!("{HEURISTIC_SIGIL} = matched by name, not resolved by type");
     }
 }
 
+/// Each node's row text: `label (kind)`, plus `path:line` when another node
+/// in the tree shares its label, so three `fn:run` rows say which `run`.
+fn tree_labels(payload: &GraphPayload) -> HashMap<u64, String> {
+    let mut count: HashMap<&str, usize> = HashMap::new();
+    for n in &payload.nodes {
+        *count.entry(n.label.as_str()).or_default() += 1;
+    }
+    payload
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut text = format!("{} ({})", n.label, n.kind);
+            if count[n.label.as_str()] > 1 {
+                text.push(' ');
+                text.push_str(&n.path);
+                if let Some(line) = n.line {
+                    text.push_str(&format!(":{line}"));
+                }
+            }
+            (n.id, text)
+        })
+        .collect()
+}
+
+/// Suffixes the orientation arrow on a name-matched `ref/call` edge.
+/// The long form of this caveat is what `find_references` prints per site; a
+/// tree repeats the same edge kind on every row, so it gets the compact form
+/// plus one legend line.
+const HEURISTIC_SIGIL: &str = "~";
+
+/// `side` is how `node_id` was reached (`Some(true)` as a caller), `None` for
+/// the seed. Past the seed a node shows only its children on that side: one
+/// reached both ways in a call cycle holds both, and a callee must not list
+/// its other callers.
 fn print_tree_level(
     node_id: u64,
-    nodes_by_id: &HashMap<u64, &NodeEntry>,
-    children: &HashMap<u64, Vec<(&str, u64, bool)>>,
+    side: Option<bool>,
+    labels: &HashMap<u64, String>,
+    children: &HashMap<u64, Vec<(&str, u64, bool, bool)>>,
     prefix: &str,
+    any_heuristic: &mut bool,
 ) {
     let Some(kids) = children.get(&node_id) else {
         return;
     };
-    for (i, (edge_kind, child_id, incoming)) in kids.iter().enumerate() {
+    let kids: Vec<_> = kids
+        .iter()
+        .filter(|(_, _, incoming, _)| side.map_or(true, |s| s == *incoming))
+        .collect();
+    for (i, (edge_kind, child_id, incoming, heuristic)) in kids.iter().enumerate() {
         let is_last = i == kids.len() - 1;
         let connector = if is_last { "└── " } else { "├── " };
         let extension = if is_last { "    " } else { "│   " };
 
-        if let Some(child) = nodes_by_id.get(child_id) {
+        if let Some(label) = labels.get(child_id) {
             // #564: the arrow renders the stored edge orientation — `→` for an
             // outgoing edge (parent → child), `←` for an incoming one (the
             // child calls / contains the parent).
+            //
+            // A name-matched call edge keeps its arrow and gains the sigil: the
+            // tree presented these as fact, identical to a type-resolved edge,
+            // on the surface CLAUDE.md tells agents to run before an edit.
+            // The sigil follows the arrow rather than replacing it, because
+            // `--direction both` mixes orientations on one tree and dropping
+            // the arrow there would trade one silent gap for another.
             let arrow = if *incoming { "←" } else { "→" };
-            println!(
-                "{prefix}{connector}{edge_kind} {arrow} {} ({})",
-                child.label, child.kind
-            );
+            let mark = if *heuristic {
+                *any_heuristic = true;
+                HEURISTIC_SIGIL
+            } else {
+                ""
+            };
+            println!("{prefix}{connector}{edge_kind} {arrow}{mark} {label}");
             print_tree_level(
                 *child_id,
-                nodes_by_id,
+                Some(*incoming),
+                labels,
                 children,
                 &format!("{prefix}{extension}"),
+                any_heuristic,
             );
         }
     }
@@ -409,8 +533,15 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
 
     // Rewrite edges through the redirect table; drop self-loops and duplicates.
     let mut seen: HashSet<(u64, u64, String)> = HashSet::new();
-    let mut edges: Vec<(u64, u64, String)> = Vec::new();
-    for EdgeEntry { src, dst, kind, .. } in &payload.edges {
+    let mut edges: Vec<(u64, u64, String, bool)> = Vec::new();
+    for EdgeEntry {
+        src,
+        dst,
+        kind,
+        heuristic,
+        ..
+    } in &payload.edges
+    {
         let s = import_redirect.get(src).copied().unwrap_or(*src);
         let d = import_redirect.get(dst).copied().unwrap_or(*dst);
         if s == d {
@@ -418,7 +549,7 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
         }
         let key = (s, d, kind.clone());
         if seen.insert(key) {
-            edges.push((s, d, kind.clone()));
+            edges.push((s, d, kind.clone(), *heuristic));
         }
     }
 
@@ -476,7 +607,7 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
     }
 
     // Emit edges; suppress defines/binding labels from containers to members.
-    for (src_id, dst_id, kind) in &edges {
+    for (src_id, dst_id, kind, heuristic) in &edges {
         let src_kind = nodes_map.get(src_id).map(|n| n.kind.as_str()).unwrap_or("");
         let dst_kind = nodes_map.get(dst_id).map(|n| n.kind.as_str()).unwrap_or("");
 
@@ -486,6 +617,11 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
 
         if suppress {
             println!("  n{src_id} -> n{dst_id};");
+        } else if *heuristic {
+            // Same mark the tree draws, in the form a renderer can show: the
+            // sigil on the label and a dashed line, so a name-matched call is
+            // never read off the picture as one a compiler resolved.
+            println!("  n{src_id} -> n{dst_id} [label=\"{kind} {HEURISTIC_SIGIL}\" style=dashed];");
         } else {
             println!("  n{src_id} -> n{dst_id} [label=\"{kind}\"];");
         }
@@ -573,6 +709,9 @@ fn build_graph_json(
                 "to": to,
                 "kind": e.kind,
                 "provenance": e.provenance,
+                // Additive: the flag the tree view already carries, so a JSON
+                // consumer does not have to re-derive it from kind+provenance.
+                "heuristic": e.heuristic,
             })
         })
         .collect();
@@ -634,6 +773,48 @@ mod tests {
         }
     }
 
+    /// Plan 3.0: `graph --help` is read by people and agents at default
+    /// verbosity, so the `both` line uses plain words only.
+    #[test]
+    fn both_help_is_plain_words() {
+        use clap::ValueEnum as _;
+        let help = Direction::Both
+            .to_possible_value()
+            .and_then(|v| v.get_help().map(ToString::to_string))
+            .unwrap_or_default();
+        assert!(
+            help.contains("upward") && help.contains("downward"),
+            "{help}"
+        );
+        for banned in ["Phase", "semantic", "edge", "node", "graph", "BFS"] {
+            assert!(!help.contains(banned), "'{banned}' in {help:?}");
+        }
+    }
+
+    /// Three `fn:run` rows with nothing to tell them apart: a label two nodes
+    /// share gets its location, a unique one stays short.
+    #[test]
+    fn a_label_two_nodes_share_carries_its_location() {
+        let payload = GraphPayload {
+            seed: None,
+            nodes: vec![
+                node(1, "fn:run", "fn:run", "src/init.rs"),
+                node(2, "fn:run", "fn:run", "src/main.rs"),
+                node(3, "fn:cmd_detect", "fn:cmd_detect", "src/lang.rs"),
+            ],
+            edges: vec![],
+            tree: vec![],
+            coverage: None,
+            last_commit: None,
+            candidates: None,
+            fuzzy: false,
+        };
+        let labels = tree_labels(&payload);
+        assert_eq!(labels[&1], "fn:run (method) src/init.rs:3");
+        assert_eq!(labels[&2], "fn:run (method) src/main.rs:3");
+        assert_eq!(labels[&3], "fn:cmd_detect (method)");
+    }
+
     /// Pin the schema_version 1 contract the review regressed and this PR
     /// restored: `signature` stays raw, `label` is the additive clean name, and
     /// edges carry `from_id`/`to_id` so two edges between collapsed-label
@@ -664,11 +845,13 @@ mod tests {
                     .to_string(),
                 dst_sig: "scip:b/Greeter.java:semanticdb maven . . com/b/Greeter#greet()."
                     .to_string(),
+                heuristic: false,
             }],
             tree: vec![],
             coverage: None,
             last_commit: None,
             candidates: None,
+            fuzzy: false,
         };
 
         let out = build_graph_json(&payload, 0, 0).unwrap();

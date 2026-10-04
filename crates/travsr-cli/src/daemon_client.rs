@@ -6,6 +6,8 @@
 //! protocol version skew, transport error, malformed payload) falls back to
 //! [`open_read_store`], which itself prefers the read-only fast path.
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
@@ -24,6 +26,12 @@ pub(crate) enum SpawnOutcome {
     /// We spawned a child but it never came up (spawn error, or it died during
     /// startup — e.g. a control-socket bind failure, see [`crate::daemon_start_error`]).
     Failed,
+}
+
+/// Whether `travsr mcp` should start a daemon: none is running and no
+/// `travsr init` is under way (init starts one itself when it finishes).
+pub(crate) fn lazy_daemon_wanted(repo_root: &Path) -> bool {
+    !daemon_lock_held(repo_root) && !travsr_daemon::init_running(repo_root)
 }
 
 /// True iff a **live** daemon currently holds this repo's exclusive lock.
@@ -82,9 +90,13 @@ pub(crate) fn spawn_background_daemon(repo_root: &Path, exe: &Path, verbose: boo
 
     // Re-exec ourselves as the long-lived foreground worker (which re-acquires the
     // lock — the last-line-of-defense guard for the tight spawn race).
+    // Its own process group, like CREATE_NEW_PROCESS_GROUP below: Ctrl-C, a
+    // closed terminal or a harness killing init's group must not take the
+    // daemon with it.
     #[cfg(unix)]
     let spawned: std::io::Result<()> = std::process::Command::new(exe)
         .args(["daemon", "start", "--foreground"])
+        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -176,6 +188,101 @@ pub fn send_daemon_command(
     }
 }
 
+/// How long to wait for a stale daemon to release the repo lock after it is
+/// asked to stop, before giving up and leaving it to the caller's fallback.
+/// Matches `daemon restart`'s own stop budget (`STOP_EXIT_TIMEOUT`).
+const RESTART_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// This binary's build version — the one a daemon it spawns will report via
+/// [`travsr_daemon::build_version`] on a Status reply.
+fn our_build_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Whether a daemon advertising `daemon_version` (as read from a Status reply,
+/// where `None` means a daemon built before that field existed) is a different
+/// build than `our_version`. An exact match is the only non-skewed case; `None`
+/// is treated as skewed, because a daemon that old predates this binary.
+fn version_is_skewed(daemon_version: Option<&str>, our_version: &str) -> bool {
+    daemon_version != Some(our_version)
+}
+
+/// Acquire the single-flight restart lock, or `None` when another process
+/// already holds it (i.e. is mid-restart). The returned handle must be kept for
+/// the whole restart; dropping it releases the lock. Self-healing: the OS drops
+/// an flock when its holder dies, so a crashed restarter never wedges this.
+fn try_lock_restart(repo_root: &Path) -> Option<std::fs::File> {
+    use fs2::FileExt as _;
+    let path = repo_root.join(".travsr").join("daemon-restart.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // used only as an flock handle; its bytes are irrelevant
+        .open(&path)
+        .ok()?;
+    file.try_lock_exclusive().ok()?;
+    Some(file)
+}
+
+/// Restart the running daemon if it was built from a different binary than this
+/// one, so queries and background reindexing are served by current code.
+///
+/// The daemon runs the image it was spawned with for its entire life; installing
+/// a new binary (npm, `travsr install`) leaves the old daemon serving old code
+/// until someone restarts it. This closes that gap automatically, at the point
+/// any entry first talks to the daemon.
+///
+/// Best-effort throughout: a daemon it cannot reach, or a restart it cannot
+/// complete, leaves the old daemon running — a stale-but-live daemon beats none.
+/// Reuses the exact stop-then-respawn sequence `daemon restart` runs.
+pub(crate) fn restart_if_version_skewed(repo_root: &Path, exe: &Path) {
+    // Only a running daemon can be stale; with none holding the lock the
+    // caller's own spawn path brings up a current one.
+    if !daemon_lock_held(repo_root) {
+        return;
+    }
+    let Ok(resp) = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status) else {
+        return; // transiently unreachable (starting, busy pipe) — leave it be
+    };
+    if !version_is_skewed(resp.daemon_version.as_deref(), our_build_version()) {
+        return;
+    }
+    // Single-flight: only the lock holder performs the swap, so two concurrent
+    // clients (an editor's `mcp` and a terminal query) never both send Shutdown
+    // — the second would otherwise kill the replacement the first just started.
+    let Some(_restart_lock) = try_lock_restart(repo_root) else {
+        return;
+    };
+    // Re-check under the lock: another client may have already restarted it in
+    // the window between our Status read above and taking this lock.
+    if let Ok(r) = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status) {
+        if !version_is_skewed(r.daemon_version.as_deref(), our_build_version()) {
+            return;
+        }
+    }
+    // Stop the stale daemon, then wait for it to release the repo lock (as
+    // `daemon restart` does) so the spawn never races its shutdown.
+    let _ = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Shutdown);
+    let cutoff = std::time::Instant::now() + RESTART_STOP_BUDGET;
+    while daemon_lock_held(repo_root) && std::time::Instant::now() < cutoff {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = spawn_background_daemon(repo_root, exe, false);
+}
+
+/// Run [`restart_if_version_skewed`] at most once per process, on the first
+/// daemon-routed query. Keeps a multi-query command or a long-running `travsr
+/// mcp` from re-checking on every call (after one restart the daemon matches,
+/// so the check is a no-op anyway, but the Status round-trip is not free).
+fn ensure_daemon_version_current(repo_root: &Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Ok(exe) = std::env::current_exe() {
+            restart_if_version_skewed(repo_root, &exe);
+        }
+    });
+}
+
 /// Route one query to a running daemon. `None` means "use the direct path" —
 /// no daemon listening, version skew (old/new daemon), or a payload the CLI
 /// cannot parse. Never errors: daemon routing is best-effort by design.
@@ -184,6 +291,10 @@ pub fn try_query<T: DeserializeOwned>(
     tool: &str,
     args: serde_json::Value,
 ) -> Option<T> {
+    // Before serving from it, make sure the running daemon is this binary's
+    // version; a stale one is transparently restarted so the answer comes from
+    // current code rather than the image it was spawned with.
+    ensure_daemon_version_current(repo_root);
     let msg = travsr_ipc::ControlMessage::Query {
         protocol: travsr_ipc::QUERY_PROTOCOL_VERSION,
         tool: tool.to_string(),
@@ -226,7 +337,36 @@ pub fn open_read_store(db_path: &Path) -> anyhow::Result<SqliteStore> {
 /// reads, so the cost does not justify threading a store through every caller.
 ///
 /// Silent on any error: a freshness note is not worth failing a query over.
-pub fn warn_if_call_graph_degraded(db_path: &Path) {
+///
+/// A linked worktree served by another checkout's index takes precedence: its
+/// note names both trees and states plainly that waiting or re-indexing will
+/// never make the served index describe this worktree, which is exactly the
+/// advice the freshness note ("has not caught up with the current commit") gives
+/// and gets wrong here. The one true half of the freshness note — that empty
+/// results from a degraded index are not authoritative — is folded into the
+/// cross-checkout note instead (see `repo::cross_checkout_note`), so it is not
+/// lost, and the misleading "it will catch up to your tree" framing is not said.
+///
+/// Returns whether the cross-checkout note was emitted, so a caller can suppress
+/// its own hedged drift note keyed to the note that was actually printed rather
+/// than to a fresh recomputation of the same predicate.
+pub fn warn_if_call_graph_degraded(db_path: &Path) -> bool {
+    // Every caller of this entry (`ask`, `references`, `graph --all`, and the
+    // call-edge directions of `graph`) rides call edges, so the folded-in
+    // degraded caveat applies to all of them.
+    let cross = warn_if_cross_checkout(db_path, true);
+    if !cross {
+        warn_if_phase_b_degraded(db_path);
+    }
+    cross
+}
+
+/// The Phase B completeness half of [`warn_if_call_graph_degraded`], on its own.
+/// Split out so a caller that has already decided the cross-checkout question
+/// (`graph`, which emits the cross-checkout note for every direction but the
+/// completeness note only for the call-edge directions) can reach it without
+/// re-running the cross-checkout classification.
+pub(crate) fn warn_if_phase_b_degraded(db_path: &Path) {
     if let Ok(store) = open_read_store(db_path) {
         if let Some(note) = travsr_mcp::phase_b_degraded_note(&store) {
             eprintln!("warning: {note}");
@@ -234,9 +374,101 @@ pub fn warn_if_call_graph_degraded(db_path: &Path) {
     }
 }
 
+/// Warn on stderr when this command is answering out of a **different
+/// checkout's** index: the caller stands in a linked worktree whose reads are
+/// redirected to the main worktree (`repo::find_git_root`). Returns whether the
+/// note was emitted.
+///
+/// Separate from [`warn_if_call_graph_degraded`] because the two conditions are
+/// unrelated. That one is about how complete the call graph is, so commands
+/// riding only Phase A edges skip it; this one is about which tree the answer
+/// describes, which is wrong for `deps`, `pattern` and `status` just as much as
+/// for `callers`. A complete answer about the wrong tree is still wrong.
+///
+/// `reads_call_edges` says whether *this command's* answer rides call edges,
+/// and so whether the folded-in degraded caveat ("an empty or short result from
+/// it is not authoritative either") applies to what it is about to print. It is
+/// the same question the Phase B split above answers, asked by the same call
+/// sites: `pattern` greps a file set and `graph --direction deps` rides Phase A
+/// import edges, so both are complete whether or not Phase B has run, and
+/// telling their users to distrust a complete result is the exact failure those
+/// exemptions exist to prevent. Standing in a worktree must not bring the claim
+/// back through a different door.
+///
+/// Classifies from the filesystem first and opens the store only once the note
+/// is certain, so the ordinary case costs no store open at all. When it does
+/// open, it reads both the commit to name and whether the served index is
+/// Phase B degraded from the *same* handle, so the degraded caveat costs no
+/// second open.
+pub fn warn_if_cross_checkout(db_path: &Path, reads_call_edges: bool) -> bool {
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    let Some(here) = crate::repo::served_by_other_checkout(&cwd, db_path) else {
+        return false;
+    };
+    let Some(served) = db_path.parent().and_then(Path::parent) else {
+        return false;
+    };
+    // Classify first, mute second. `TRAVSR_NO_WORKTREE_NOTE` silences this note;
+    // it must not also report "not a cross-checkout", because callers key the
+    // suppression of the freshness and drift notes to this return value and
+    // both of those are wrong here whether or not the user wants to read about
+    // it. Opting out of one accurate note would otherwise hand back two
+    // misleading ones. Returning before the store open keeps the hatch as cheap
+    // as it was.
+    if crate::repo::worktree_note_suppressed() {
+        return true;
+    }
+    let (commit, degraded) = match open_read_store(db_path) {
+        Ok(s) => (
+            s.get_meta("last_commit").ok().flatten(),
+            reads_call_edges && travsr_mcp::phase_b_degraded_note(&s).is_some(),
+        ),
+        Err(_) => (None, false),
+    };
+    eprintln!(
+        "warning: {}",
+        crate::repo::cross_checkout_note(&here, served, commit.as_deref(), degraded)
+    );
+    true
+}
+
 #[cfg(test)]
 mod lock_tests {
     use super::*;
+
+    /// The skew decision is the whole policy: a matching version is the only
+    /// case left alone; a different version restarts, and a `None` (a daemon
+    /// older than this field) counts as different, so upgrading *to* the first
+    /// version that has this feature still auto-restarts the old daemon.
+    #[test]
+    fn version_skew_truth_table() {
+        assert!(!version_is_skewed(Some("1.2.3"), "1.2.3"), "exact match");
+        assert!(version_is_skewed(Some("1.2.2"), "1.2.3"), "older daemon");
+        assert!(version_is_skewed(Some("1.3.0"), "1.2.3"), "newer daemon");
+        assert!(version_is_skewed(None, "1.2.3"), "pre-field daemon");
+    }
+
+    /// Single-flight: while one process holds the restart lock, a second cannot,
+    /// so only one ever sends Shutdown. The lock frees on drop (and, in prod,
+    /// when the holder dies, since it is an flock).
+    #[test]
+    fn restart_lock_is_single_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+
+        let first = try_lock_restart(tmp.path()).expect("first acquire");
+        assert!(
+            try_lock_restart(tmp.path()).is_none(),
+            "a second restarter must be locked out while the first holds it"
+        );
+        drop(first);
+        assert!(
+            try_lock_restart(tmp.path()).is_some(),
+            "the lock must be free once the holder drops it"
+        );
+    }
 
     #[test]
     fn lock_not_held_on_empty_repo() {
@@ -262,6 +494,22 @@ mod lock_tests {
             !travsr.join("daemon.lock").exists(),
             "probing must not create .travsr/daemon.lock"
         );
+    }
+
+    /// `travsr mcp` from an editor reconnects the moment `init` creates the
+    /// index, and used to start a daemon while `init` was still running; the
+    /// daemon then watched init's own config writes. `init` starts it itself.
+    #[test]
+    fn no_lazy_daemon_while_init_runs() {
+        use fs2::FileExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        assert!(lazy_daemon_wanted(tmp.path()), "nothing running");
+        let lock = std::fs::File::create(tmp.path().join(".travsr/init.lock")).unwrap();
+        lock.lock_exclusive().unwrap();
+        assert!(!lazy_daemon_wanted(tmp.path()), "init holds its lock");
+        fs2::FileExt::unlock(&lock).unwrap();
+        assert!(lazy_daemon_wanted(tmp.path()), "init finished");
     }
 
     /// The singleton semantics the probe exists for are unchanged: an

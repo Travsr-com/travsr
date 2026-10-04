@@ -46,11 +46,23 @@ export function assertPathsContained(filePaths: string[], repoRoot: string): voi
  * Pure in-memory containment check — no I/O, safe to call in hot loops.
  * Does NOT follow symlinks; use assertPathsContained for the authoritative check.
  * Used as a belt-and-suspenders filter before emitting each file's ranges.
+ *
+ * Both operands are resolved before comparing (#806). Resolving only filePath
+ * put the two sides in different namespaces on Windows, where resolve()
+ * prepends the current drive letter and normalize() does not, so a genuinely
+ * contained file compared "C:\repo\src\a.ts" against "\repo" and was dropped.
+ *
+ * pathImpl exists so the tests can pin this function's Windows and POSIX
+ * behaviour from any host; production callers never pass it.
  */
-export function isUnderRoot(filePath: string, repoRoot: string): boolean {
-  const normalized = path.normalize(path.resolve(filePath));
-  const root = path.normalize(repoRoot);
-  return normalized.startsWith(root + path.sep) || normalized === root;
+export function isUnderRoot(
+  filePath: string,
+  repoRoot: string,
+  pathImpl: typeof path = path
+): boolean {
+  const normalized = pathImpl.normalize(pathImpl.resolve(filePath));
+  const root = pathImpl.normalize(pathImpl.resolve(repoRoot));
+  return normalized.startsWith(root + pathImpl.sep) || normalized === root;
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────────────

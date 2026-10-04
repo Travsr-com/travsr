@@ -134,7 +134,7 @@ nix              = { version = "0.31", default-features = false, features = ["si
 # bounding in travsr-mcp's home-path redactor).
 unicode-segmentation = "1"
 # SIGINT/Ctrl-C handler for graceful foreground reindex cancel (WS3).
-ctrlc            = "3"
+ctrlc            = { version = "3", features = ["termination"] }
 tracing-appender = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "5"

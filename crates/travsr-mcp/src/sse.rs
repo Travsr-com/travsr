@@ -796,7 +796,8 @@ fn dispatch_tool_call(
             json!({
                 "protocolVersion": crate::PROTOCOL_VERSION,
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": crate::SERVER_NAME, "version": crate::SERVER_VERSION }
+                "serverInfo": { "name": crate::SERVER_NAME, "version": crate::SERVER_VERSION },
+                "instructions": crate::INSTRUCTIONS
             }),
         ),
         "tools/call" => {
@@ -821,6 +822,7 @@ fn dispatch_tool_call(
                 "get_callers" => tools::get_callers_global(
                     repos,
                     args["symbol"].as_str().unwrap_or(""),
+                    args["path"].as_str().filter(|s| !s.is_empty()),
                     repo_arg,
                 ),
                 "get_blast_radius" => {

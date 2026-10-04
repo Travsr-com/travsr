@@ -14,7 +14,7 @@ use travsr_plugin_protocol::{HandshakeResponse, PROTOCOL_VERSION};
 const FUZZ_TARGETS: &[(&str, &str)] = &[
     ("typescript", "fuzz_treesitter_indexer.rs"),
     ("rust", "fuzz_treesitter_indexer.rs"), // shared indexer target covers Rust
-    ("python", "fuzz_pyright_lsif_parser.rs"),
+    ("python", "fuzz_python_parser.rs"),
     ("go", "fuzz_go_parser.rs"),
     ("java", "fuzz_java_parser.rs"), // TODO: create this fuzz target
     ("kotlin", "fuzz_kotlin_parser.rs"), // TODO: create this fuzz target
