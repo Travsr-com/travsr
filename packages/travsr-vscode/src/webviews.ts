@@ -552,6 +552,22 @@ export interface RepoRow {
   name: string;
   path: string;
   exists: boolean;
+  /** #454: `indexed` / `index_missing` / `not_indexed` / `unknown`. Absent when
+   *  the binary predates the status column. */
+  status?: string;
+}
+
+/** Badge text for a repo with no graph.db on disk (#454). Falls back to the
+ *  pre-#454 wording when the binary did not say which case it is. */
+function missingIndexLabel(status?: string): string {
+  switch (status) {
+    case "index_missing":
+      return "index deleted";
+    case "not_indexed":
+      return "never indexed";
+    default:
+      return "stale";
+  }
 }
 
 /**
@@ -585,7 +601,7 @@ export function buildReposHtml(rows: RepoRow[]): string {
         // than safe.
         `<tr><td class="mono">${esc(r.name)}</td>
 <td class="mono muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis" title="${esc(r.path)}">${esc(r.path)}</td>
-<td>${r.exists ? '<span class="badge ok">active</span>' : '<span class="badge stale">stale</span>'}</td>
+<td>${r.exists ? '<span class="badge ok">active</span>' : `<span class="badge stale">${esc(missingIndexLabel(r.status))}</span>`}</td>
 <td><button class="x-btn" title="Remove from registry" data-name="${esc(r.name)}" onclick="removeRepo(this)">✕</button></td></tr>`
     )
     .join("\n");
