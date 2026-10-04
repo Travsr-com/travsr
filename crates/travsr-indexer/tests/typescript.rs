@@ -330,6 +330,39 @@ fn link_imports_aliased_resolves_tsconfig_path_alias() {
     );
 }
 
+/// When two alias prefixes both match a specifier (`@/` and `@/components/`),
+/// the longer, more specific one wins and is not shadowed by the shorter. The
+/// result is independent of the order the aliases are listed in.
+#[test]
+fn link_imports_aliased_longest_prefix_wins() {
+    let importer = "src/app/page.tsx";
+    // Listed shortest-first so a naive first-match would pick the wrong target.
+    let aliases = [
+        ("@/".to_string(), "src/".to_string()),
+        ("@/components/".to_string(), "design/ui/".to_string()),
+    ];
+    let edges = link_imports_aliased(
+        &[travsr_analysis::emit::import_node(
+            "",
+            importer,
+            "@/components/Button",
+        )],
+        importer,
+        "",
+        &aliases,
+    );
+    let want = travsr_analysis::emit::file_node("", "design/ui/Button.ts").id;
+    assert!(
+        edges.iter().any(|e| e.dst == want),
+        "@/components/Button should resolve via the longer alias to design/ui/Button.ts: {edges:?}"
+    );
+    let shadowed = travsr_analysis::emit::file_node("", "src/components/Button.ts").id;
+    assert!(
+        !edges.iter().any(|e| e.dst == shadowed),
+        "the shorter @/ alias must not shadow the more specific @/components/"
+    );
+}
+
 /// With no alias table (the `link_imports` wrapper), a non-relative specifier
 /// is still skipped: only `./` and `../` resolve.
 #[test]
@@ -384,14 +417,24 @@ fn parse_tsconfig_path_aliases_reads_wildcard_paths() {
     // Non-wildcard entries are skipped; nothing to resolve by prefix.
     assert!(aliases_for(r#"{"compilerOptions":{"paths":{"@/foo":["./src/foo.ts"]}}}"#).is_empty());
 
-    // No `paths`, and a comment-bearing (JSONC) config, both yield nothing. The
-    // JSONC case matches the strict serde_json parsing the rest of the indexer
-    // uses for tsconfig; aliasing is best-effort and empty is the safe default.
+    // A config with no `paths` yields nothing.
     assert!(aliases_for(r#"{"compilerOptions":{"strict":true}}"#).is_empty());
-    assert!(aliases_for(
-        "{\n  // comment\n  \"compilerOptions\":{\"paths\":{\"@/*\":[\"./src/*\"]}}\n}"
-    )
-    .is_empty());
+
+    // A hand-written tsconfig is JSONC: line/block comments and trailing commas
+    // are tolerated (TypeScript's own loader accepts them), so an alias behind
+    // them still resolves rather than silently dropping out.
+    assert_eq!(
+        aliases_for(
+            "{\n  // leading\n  \"compilerOptions\": {\n    /* block */\n    \"paths\": {\n      \"@/*\": [\"./src/*\"],\n    },\n  },\n}"
+        ),
+        vec![("@/".to_string(), "src/".to_string())],
+    );
+
+    // A `//` sequence inside a string value is not a comment and is preserved.
+    assert_eq!(
+        aliases_for(r#"{"compilerOptions":{"baseUrl":"./a//b","paths":{"@/*":["*"]}}}"#),
+        vec![("@/".to_string(), "a/b/".to_string())],
+    );
 }
 
 /// A missing tsconfig.json yields no aliases rather than erroring.

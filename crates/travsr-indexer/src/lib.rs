@@ -249,14 +249,92 @@ pub fn link_imports_aliased(
 
 /// Rewrite a tsconfig-aliased module specifier to a repo-root-relative path, or
 /// `None` when no alias prefix matches. With `("@/", "src/")`, `@/lib/auth`
-/// becomes `src/lib/auth`. The first matching prefix wins.
+/// becomes `src/lib/auth`.
+///
+/// When several alias prefixes match (e.g. both `@/` and `@/components/` for
+/// `@/components/Button`), the longest prefix wins, so a more specific alias is
+/// never shadowed by a less specific one. Distinct prefixes that both match a
+/// given specifier always differ in length, so the winner is unambiguous and
+/// the result does not depend on the order of `aliases`.
 fn rewrite_import_alias(module: &str, aliases: &[(String, String)]) -> Option<String> {
-    for (prefix, base) in aliases {
-        if let Some(rest) = module.strip_prefix(prefix.as_str()) {
-            return Some(format!("{base}{rest}"));
+    aliases
+        .iter()
+        .filter_map(|(prefix, base)| {
+            module
+                .strip_prefix(prefix.as_str())
+                .map(|rest| (prefix.len(), format!("{base}{rest}")))
+        })
+        .max_by_key(|(prefix_len, _)| *prefix_len)
+        .map(|(_, rewritten)| rewritten)
+}
+
+/// Normalize a JSONC string (the tsconfig dialect: `//` line comments, `/* */`
+/// block comments, and trailing commas) into strict JSON that `serde_json` can
+/// parse. String literals are copied verbatim, including comment-looking and
+/// comma substrings and escaped quotes, so only structural tokens are touched.
+/// A malformed result still parses to nothing downstream, so this never widens
+/// what counts as a valid config; it only stops rejecting legal tsconfig.
+fn strip_jsonc(input: &str) -> String {
+    let b = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    let mut in_string = false;
+
+    // Advance `j` past spaces, line comments and block comments; used both as
+    // the main scan's comment skipper and the trailing-comma lookahead.
+    fn skip_gap(b: &[u8], mut j: usize) -> usize {
+        loop {
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j + 1 < b.len() && b[j] == b'/' && b[j + 1] == b'/' {
+                j += 2;
+                while j < b.len() && b[j] != b'\n' {
+                    j += 1;
+                }
+            } else if j + 1 < b.len() && b[j] == b'/' && b[j + 1] == b'*' {
+                j += 2;
+                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                    j += 1;
+                }
+                j = (j + 2).min(b.len());
+            } else {
+                return j;
+            }
         }
     }
-    None
+
+    while i < b.len() {
+        let c = b[i];
+        if in_string {
+            out.push(c);
+            if c == b'\\' && i + 1 < b.len() {
+                out.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+        } else if c == b'"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+        } else if c == b'/' && i + 1 < b.len() && (b[i + 1] == b'/' || b[i + 1] == b'*') {
+            i = skip_gap(b, i);
+        } else if c == b','
+            && b.get(skip_gap(b, i + 1))
+                .is_some_and(|&n| n == b'}' || n == b']')
+        {
+            // Trailing comma before the next `}`/`]`: drop it.
+            i += 1;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Read `{repo_root}/tsconfig.json` (or `jsconfig.json` when no tsconfig is
@@ -273,16 +351,18 @@ fn rewrite_import_alias(module: &str, aliases: &[(String, String)]) -> Option<St
 /// resolution too. tsconfig wins when both exist.
 ///
 /// Returns empty on a missing, unreadable, or malformed config, or one with
-/// no `paths`. serde_json is strict, so a config carrying comments yields no
-/// aliases, matching how the rest of the indexer reads tsconfig. Non-wildcard
-/// and multi-target entries are skipped.
+/// no `paths`. Non-wildcard and multi-target entries are skipped. The config is
+/// read as JSONC (comments and trailing commas tolerated), matching how
+/// TypeScript's own loader reads tsconfig and the LSIF emitter's
+/// `ts.readConfigFile`; without that a hand-written tsconfig would resolve
+/// aliases for call edges (the emitter) but not for file import edges (here).
 pub fn parse_tsconfig_path_aliases(repo_root: &Path) -> Vec<(String, String)> {
     let Ok(text) = std::fs::read_to_string(repo_root.join("tsconfig.json"))
         .or_else(|_| std::fs::read_to_string(repo_root.join("jsconfig.json")))
     else {
         return Vec::new();
     };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(&text)) else {
         return Vec::new();
     };
     let opts = &json["compilerOptions"];
