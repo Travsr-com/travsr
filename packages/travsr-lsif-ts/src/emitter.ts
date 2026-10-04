@@ -153,10 +153,21 @@ export class Emitter {
   /**
    * Item edge linking a result vertex to the ranges it contains.
    * property is "definitions", "references", or "implementationResults".
+   *
+   * `isCall: false` marks a reference that names a symbol without calling it
+   * (an import specifier, an override) with the non-standard `travsr_call`
+   * field, so the ingest records the occurrence without a call edge.
    */
-  emitItem(outV: number, inVs: number[], document: number, property: string): number | undefined {
+  emitItem(
+    outV: number,
+    inVs: number[],
+    document: number,
+    property: string,
+    isCall = true
+  ): number | undefined {
     if (inVs.length === 0) return undefined;
     const id = this.nextId();
-    return this.emit({ id, type: 'edge', label: 'item', outV, inVs, document, property });
+    const item = { id, type: 'edge', label: 'item', outV, inVs, document, property };
+    return this.emit(isCall ? item : { ...item, travsr_call: false });
   }
 }

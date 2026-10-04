@@ -19,7 +19,7 @@ async function main() {
       await ensureBinary();
     } catch (err) {
       console.error(`travsr: on-demand download failed: ${err.message}`);
-      console.error('Set TRAVSR_BINARY=/path/to/travsr to use a local build, or run `npm install -g travsr` again.');
+      console.error('Set TRAVSR_BINARY=/path/to/travsr to use a local build, or run `npm install -g @travsr.com/travsr` again.');
       process.exit(1);
     }
   }

@@ -31,7 +31,7 @@ const _: () = {
 //
 // Known gaps (Phase A):
 //   - No ResolvesTo edges from import nodes   → provided by link_imports_python (INDEX-222)
-//   - No call/ref edges                       → deferred to Phase B (LSIF/pyright)
+//   - No call/ref edges                       → deferred to Phase B (phase_b_python.rs, travsr-lsif-py)
 //   - `from X import Y, Z` multi-name from   → only module X indexed; Y, Z skipped
 //   - Nested class definitions               → inner class methods attributed to outer class
 //   - Decorator-synthesized members          → @dataclass, @attrs.define not expanded
