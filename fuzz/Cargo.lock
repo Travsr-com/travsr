@@ -3107,6 +3107,7 @@ dependencies = [
  "travsr-core",
  "travsr-indexer",
  "travsr-mcp",
+ "travsr-plugin-host",
  "travsr-retrieval",
  "travsr-store",
 ]

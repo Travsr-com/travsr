@@ -15,6 +15,7 @@ travsr-indexer = { path = "../crates/travsr-indexer" }
 travsr-retrieval = { path = "../crates/travsr-retrieval" }
 travsr-store = { path = "../crates/travsr-store" }
 travsr-core = { path = "../crates/travsr-core" }
+travsr-plugin-host = { path = "../crates/travsr-plugin-host" }
 serde_json = "1"
 tempfile = "3"
 
@@ -111,6 +112,12 @@ doc = false
 [[bin]]
 name = "fuzz_dart_parser"
 path = "fuzz_targets/fuzz_dart_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_objc_parser"
+path = "fuzz_targets/fuzz_objc_parser.rs"
 test = false
 doc = false
 

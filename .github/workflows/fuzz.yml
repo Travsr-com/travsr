@@ -35,6 +35,22 @@ jobs:
           # indexing path for every repo, so a panic here is reachable by
           # committing a `.md` file.
           - fuzz_markdown_chunker
+          # #345: every grammar below is registered as an in-process plugin
+          # (registry.rs FUZZ_TARGETS), so a panic in its third-party `parser.c`
+          # aborts the daemon. ADR-017 Rule 4.3 makes running them here a
+          # condition of parsing them in-process at all.
+          # .github/scripts/check-fuzz-targets.mjs keeps this list complete.
+          - fuzz_c_parser
+          - fuzz_cpp_parser
+          - fuzz_csharp_parser
+          - fuzz_dart_parser
+          - fuzz_java_parser
+          - fuzz_kotlin_parser
+          - fuzz_objc_parser
+          - fuzz_php_parser
+          - fuzz_ruby_parser
+          - fuzz_scala_parser
+          - fuzz_swift_parser
 
     steps:
       - name: Checkout
