@@ -443,6 +443,12 @@ pub(crate) fn manifest_weak_floor() -> Option<f32> {
 /// - `not installed` — no model configured and none at the default location.
 /// - `installed` — model present on disk but not loaded in *this* process.
 /// - `ready` — model loaded and serving.
+/// - `degraded (rerank breaker open)` — model loaded, but the breaker is open,
+///   so calls are skipping the cross-encoder and falling back to the lexical
+///   gate (#868). Without this the status reads `ready` while every query is
+///   degraded, and the only trail is the one line the breaker logs when it
+///   opens. A boolean open/closed is the right altitude here; the windowed
+///   "N of the last M over budget" detail belongs to logs and diagnostics.
 /// - `load failed` — a load was attempted and failed (fail-open to lexical).
 pub(crate) fn rerank_status() -> &'static str {
     if rerank_disabled() {
@@ -451,9 +457,21 @@ pub(crate) fn rerank_status() -> &'static str {
     if rerank_model_dir().is_none() {
         return "not installed";
     }
-    match RERANKER.get() {
-        Some(Some(_)) => "ready",
-        Some(None) => "load failed",
+    // Reading the breaker is a relaxed atomic load; it cannot fail or block, so
+    // this stays a pure diagnostic and never a path that fails a query.
+    loaded_rerank_status(RERANKER.get().map(Option::is_some), BREAKER.is_open())
+}
+
+/// The status once model distribution has been ruled in: `loaded` is the
+/// `RERANKER` cell state (`None` = never attempted, `Some(false)` = load failed,
+/// `Some(true)` = loaded), `breaker_open` is [`Breaker::is_open`]. Split out from
+/// [`rerank_status`] so the breaker-open branch (#868) is testable without a
+/// loaded ONNX model.
+fn loaded_rerank_status(loaded: Option<bool>, breaker_open: bool) -> &'static str {
+    match loaded {
+        Some(true) if breaker_open => "degraded (rerank breaker open)",
+        Some(true) => "ready",
+        Some(false) => "load failed",
         None => "installed",
     }
 }
@@ -844,6 +862,19 @@ mod tests {
         breaker.record(true, 5_000, 1_200);
         // Open: the cost is now skipped rather than paid and discarded.
         assert!(breaker.should_skip());
+    }
+
+    #[test]
+    fn loaded_rerank_status_reports_breaker_open_as_degraded() {
+        // #868: a loaded model with the breaker open is degraded, not ready.
+        assert_eq!(loaded_rerank_status(Some(true), false), "ready");
+        assert_eq!(
+            loaded_rerank_status(Some(true), true),
+            "degraded (rerank breaker open)"
+        );
+        // Breaker state is irrelevant until a model is actually loaded.
+        assert_eq!(loaded_rerank_status(Some(false), true), "load failed");
+        assert_eq!(loaded_rerank_status(None, true), "installed");
     }
 
     #[test]
