@@ -350,6 +350,43 @@ pub const ALL_LANGUAGES: &[Language] = &[
     Language::Markdown,
 ];
 
+/// The per-language Phase B warning classes, the single source the producer and
+/// every consumer agree on (#760).
+///
+/// A Phase B run records warnings in the store's `phase_b_warnings` meta as
+/// `class:lang` (`version_mismatch` carries `class:lang:expected:got`). The
+/// daemon writes these (`write_phase_b_results`), and both `travsr status`
+/// (`travsr-cli`) and the MCP freshness notes (`decode_phase_b_warnings` in
+/// `travsr-mcp`) must handle every one. A class a consumer does not handle does
+/// not merely lose its wording: it falls through to the availability ladder and
+/// can surface as a terminal `done`, telling the user a language succeeded when
+/// it did not. Deriving the consumers' guard from this one list (rather than a
+/// hand-maintained copy that can only agree with itself) is what keeps that hole
+/// closed: adding a class here forces the consumer tests to prove it is handled.
+///
+/// Repo-wide classes are listed separately in [`PHASE_B_REPO_WIDE_WARNING_CLASSES`].
+pub const PHASE_B_PER_LANGUAGE_WARNING_CLASSES: &[&str] = &[
+    "crashed",
+    "version_mismatch",
+    "needs_approval",
+    "needs_consent",
+    "skipped_unregistered",
+    "skipped_no_analyzer",
+    "skipped_no_compdb",
+    "skipped_no_build_file",
+    "untrusted_corpus",
+    "no_references",
+    "zero_nodes",
+    "emitter_missing",
+    "emitter_failed",
+];
+
+/// Phase B warning classes that describe a repo-wide rate, not a per-language
+/// state, and so are deliberately not decoded per language by the consumers
+/// (#760). Kept here so the distinction is declared in one place rather than
+/// implied by each consumer's omission.
+pub const PHASE_B_REPO_WIDE_WARNING_CLASSES: &[&str] = &["scip_unification_misses"];
+
 /// Kythe-style globally unique identifier for a code entity.
 ///
 /// VNames are stable across repos, languages, and time — they form the

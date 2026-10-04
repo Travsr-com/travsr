@@ -245,10 +245,11 @@ pub enum LsifSkipReason {
 }
 
 impl LsifSkip {
-    /// The `phase_b_warnings` class this skip is recorded under. Must stay in
-    /// step with the arms in `travsr-cli/src/status.rs` and
-    /// `travsr-mcp/src/observability.rs` (`phase_b_warning_classes_match_the_cli`
-    /// pins the set on the MCP side).
+    /// The `phase_b_warnings` class this skip is recorded under. Every class any
+    /// producer site writes is listed in
+    /// [`travsr_core::PHASE_B_PER_LANGUAGE_WARNING_CLASSES`], the single source
+    /// the consumers' guards derive from (#760); the two returned here are
+    /// members of it, asserted by `lsif_skip_warning_classes_are_known`.
     pub fn warning_class(&self) -> &'static str {
         match self.reason {
             LsifSkipReason::EmitterMissing => "emitter_missing",
@@ -9239,6 +9240,51 @@ mod tests {
         );
     }
 
+    /// #760: the dynamic warning classes `LsifSkip::warning_class` emits must be
+    /// members of the single source the consumer guards derive from. A new
+    /// `LsifSkipReason` forces a new arm in `warning_class` (the match is
+    /// exhaustive) and must be listed here and in the core const, so a class the
+    /// MCP decoder would silently drop cannot be introduced unnoticed.
+    #[test]
+    fn lsif_skip_warning_classes_are_known() {
+        for reason in [
+            LsifSkipReason::EmitterMissing,
+            LsifSkipReason::EmitterFailed,
+        ] {
+            let skip = LsifSkip {
+                language: "typescript".to_string(),
+                reason,
+                detail: String::new(),
+            };
+            assert!(
+                travsr_core::PHASE_B_PER_LANGUAGE_WARNING_CLASSES.contains(&skip.warning_class()),
+                "{:?} emits {:?}, absent from PHASE_B_PER_LANGUAGE_WARNING_CLASSES",
+                reason,
+                skip.warning_class()
+            );
+        }
+    }
+
+    /// #809: the shed count the daemon keeps in `WATCH_SHED_TOTAL` reaches
+    /// `travsr status` through `run_query`, so lossy shedding is self-diagnosing
+    /// rather than only in a throttled log line. `status_query` itself cannot
+    /// know it (store-only), so the "status" arm is where it is filled in.
+    #[test]
+    fn status_query_surfaces_the_watch_shed_count() {
+        use std::sync::atomic::Ordering;
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        WATCH_SHED_TOTAL.store(0, Ordering::Relaxed);
+        let clean = run_query(&store, "status", serde_json::json!({})).unwrap();
+        assert_eq!(clean.get("watch_shed").and_then(|v| v.as_u64()), Some(0));
+
+        WATCH_SHED_TOTAL.store(7, Ordering::Relaxed);
+        let shed = run_query(&store, "status", serde_json::json!({})).unwrap();
+        assert_eq!(shed.get("watch_shed").and_then(|v| v.as_u64()), Some(7));
+
+        WATCH_SHED_TOTAL.store(0, Ordering::Relaxed);
+    }
+
     /// RFC-002: when the stored signature format version differs from the binary's
     /// version, `reindex_files` must return `Ok(())` without touching the graph.
     /// This is the core correctness guarantee — a version mismatch must never
@@ -14803,6 +14849,11 @@ impl Daemon {
                             // at most once per 10 s (see watch_shed above);
                             // the head reconcile covers dropped events.
                             Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                // Cumulative for `travsr status` (#809); the
+                                // local `watch_shed` below is only the 10 s log
+                                // window and resets, so it cannot serve status.
+                                WATCH_SHED_TOTAL
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 watch_shed += 1;
                                 if watch_shed_last_log.elapsed()
                                     >= std::time::Duration::from_secs(10)
@@ -15038,6 +15089,11 @@ impl Daemon {
                             // at most once per 10 s (see watch_shed above);
                             // the head reconcile covers dropped events.
                             Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                // Cumulative for `travsr status` (#809); the
+                                // local `watch_shed` below is only the 10 s log
+                                // window and resets, so it cannot serve status.
+                                WATCH_SHED_TOTAL
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 watch_shed += 1;
                                 if watch_shed_last_log.elapsed()
                                     >= std::time::Duration::from_secs(10)
@@ -15222,6 +15278,13 @@ const DIRTY_QUEUE_CAP: usize = 100_000;
 /// bytes per buffered event this bounds the queue at roughly 15 MB where it
 /// previously grew without limit.
 const INDEX_QUEUE_CAP: usize = DIRTY_QUEUE_CAP;
+
+/// Watch events shed because the bounded indexer queue (`INDEX_QUEUE_CAP`) was
+/// full, cumulative for the life of this daemon process (#809). The two
+/// `try_send` shed sites feed it; the status path reads it into
+/// `StatusPayload.watch_shed` so lossy shedding is self-diagnosing in
+/// `travsr status` rather than only in a throttled log line.
+static WATCH_SHED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Bound on concurrently-processed control connections (#736 item 8).
 ///
@@ -16440,7 +16503,13 @@ fn run_query(
                 .map(|f| f as &dyn Fn(&str, u32) -> Vec<(travsr_core::NodeId, f32)>);
             Ok(serde_json::to_value(query::ask_query(store, q, knn_ref)?)?)
         }
-        "status" => Ok(serde_json::to_value(query::status_query(store)?)?),
+        "status" => {
+            // The shed counter lives in this process, not the store, so fill it
+            // in here rather than widening the store-only `status_query` (#809).
+            let mut payload = query::status_query(store)?;
+            payload.watch_shed = WATCH_SHED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+            Ok(serde_json::to_value(payload)?)
+        }
         other => anyhow::bail!("unknown query tool '{other}'"),
     }
 }

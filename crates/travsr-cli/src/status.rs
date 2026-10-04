@@ -323,6 +323,18 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
         payload.nodes, payload.edges, payload.schema, last_commit, phase_b_state, rerank_segment
     );
 
+    // #809: the daemon shed watch events because the indexer queue filled. A shed
+    // event is recovered by the head reconcile or next commit, so this is not an
+    // error, but a non-zero count is why the graph may read stale, and is the
+    // signal that tells "fell behind a flood" apart from any other staleness.
+    // Silent at zero, like the live-precision line below.
+    if payload.watch_shed > 0 {
+        println!(
+            "watch events shed: {} (indexer queue filled; recovered by reconcile / next commit)",
+            payload.watch_shed
+        );
+    }
+
     // RFC-027 section 12: the live lane's measured precision, so the per-language
     // shipping gate has a number a human can read rather than a log line that
     // scrolled away.
@@ -845,6 +857,7 @@ mod tests {
             live_refs_pending: 0,
             dart_deps_unresolved: None,
             scip_unification_miss_list: None,
+            watch_shed: 0,
         }
     }
 
@@ -970,6 +983,94 @@ mod tests {
         let mut p = payload("abc", "abc", false);
         p.phase_b_warnings = Some("skipped_no_analyzer:php,needs_consent:go".into());
         assert_eq!(phase_b_state(&p), "partial (not run: php, go)");
+    }
+
+    /// #760: `phase_b_state` is the other consumer of the single warning-class
+    /// source (the MCP decoder is pinned by `phase_b_warning_classes_match_the_cli`
+    /// in travsr-mcp). A per-language class the summary does not account for falls
+    /// through to a flat `complete`, the exact terminal-`done` hole #636/#760
+    /// closed on the MCP side. This ties every class in
+    /// `PHASE_B_PER_LANGUAGE_WARNING_CLASSES` to a conscious decision — it either
+    /// downgrades the summary or is deliberately benign — and checks that decision
+    /// against what `phase_b_state` actually does, so a class added to the core
+    /// list cannot read as `complete` here unnoticed.
+    #[test]
+    fn every_phase_b_warning_class_is_accounted_for_in_the_summary() {
+        use std::collections::BTreeSet;
+
+        // Enabled for this repo but did not run to a completed analysis, so a flat
+        // `complete` would contradict the per-language warning printed below it.
+        let downgrades: BTreeSet<&str> = [
+            "crashed",
+            "skipped_no_analyzer",
+            "needs_consent",
+            "needs_approval",
+            "emitter_missing",
+            "emitter_failed",
+        ]
+        .into_iter()
+        .collect();
+
+        // Deliberately not a downgrade: a valid completion (`zero_nodes`,
+        // `no_references`), a not-enabled-here notice with its own separate line
+        // (`untrusted_corpus`, `skipped_unregistered`, `skipped_no_compdb`,
+        // `skipped_no_build_file`), or an out-of-date analyzer whose run still
+        // produced a graph (`version_mismatch`). All documented at `phase_b_state`.
+        let benign: BTreeSet<&str> = [
+            "version_mismatch",
+            "skipped_unregistered",
+            "skipped_no_compdb",
+            "skipped_no_build_file",
+            "untrusted_corpus",
+            "no_references",
+            "zero_nodes",
+        ]
+        .into_iter()
+        .collect();
+
+        // A class added to the core source must land in exactly one set, forcing
+        // the author to decide whether it downgrades the summary.
+        assert!(
+            downgrades.is_disjoint(&benign),
+            "a class is sorted as both downgrade and benign"
+        );
+        let categorized: BTreeSet<&str> = downgrades.union(&benign).copied().collect();
+        let source: BTreeSet<&str> = travsr_core::PHASE_B_PER_LANGUAGE_WARNING_CLASSES
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            categorized, source,
+            "a Phase B warning class is not sorted into downgrade/benign; sort it so it cannot silently read as a terminal `complete`"
+        );
+
+        // The sets must match what `phase_b_state` does, so they cannot drift from
+        // the code they describe. Markers agree and nothing is dirty, so the only
+        // thing that can move the summary off `complete` is the warning class.
+        for class in &downgrades {
+            let mut p = payload("abc", "abc", false);
+            p.phase_b_warnings = Some(format!("{class}:go"));
+            let state = phase_b_state(&p);
+            assert!(
+                state.starts_with("partial ("),
+                "class {class:?} is a downgrade but phase_b_state stayed {state:?}"
+            );
+        }
+        for class in &benign {
+            // `version_mismatch` carries `lang:expected:got`, the rest `lang`.
+            let warning = if *class == "version_mismatch" {
+                format!("{class}:go:2:1")
+            } else {
+                format!("{class}:go")
+            };
+            let mut p = payload("abc", "abc", false);
+            p.phase_b_warnings = Some(warning);
+            assert_eq!(
+                phase_b_state(&p),
+                "complete",
+                "class {class:?} is benign but phase_b_state downgraded it"
+            );
+        }
     }
 
     /// The same two classes now describe rust-analyzer and travsr-lsif-py, so
