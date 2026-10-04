@@ -10200,34 +10200,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn init_repo_records_the_completed_index_in_the_registry() {
-        // #454: registration happens before a single file is indexed, so only a
-        // stamp written on the success path can tell a deleted index apart from
-        // one that was never built.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        git_init(tmp.path());
-        std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
-
-        let home_tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", home_tmp.path());
-        let _ = init_repo(tmp.path()).unwrap();
-        let entries = travsr_store::registry::all_entries().unwrap();
-        std::env::remove_var("HOME");
-
-        let (_, entry) = entries.iter().next().expect("repo must be registered");
-        assert_eq!(
-            entry.index_status(),
-            travsr_store::registry::IndexStatus::Indexed
-        );
-        std::fs::remove_file(&entry.db_path).unwrap();
-        assert_eq!(
-            entry.index_status(),
-            travsr_store::registry::IndexStatus::IndexMissing,
-            "a deleted graph.db must not read as 'never indexed'"
-        );
-    }
+    // `init_repo_records_the_completed_index_in_the_registry` (#454) lives in
+    // tests/registry_index_stamp.rs: it needs the registry enabled, while this
+    // module's shared `git_init` force-disables it process-globally, so the two
+    // cannot share a test binary without racing on that env var.
 
     #[test]
     fn claude_directory_is_skipped_during_init() {
