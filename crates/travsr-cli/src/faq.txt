@@ -34,14 +34,14 @@ A vector index answers "what looks like this query". That works for prose and st
 - Phase B     resolves calls to the definitions they point at
 - retrieval   seeds from your query, walks the graph, reranks
 - packing     trims the result to the token budget you have
-Phase A is fast and always runs, so the index is usable seconds after init. Phase B is the expensive part and runs in the background via the daemon unless you pass --semantic. Queries work throughout: before Phase B lands you get structure, and after it you get call edges too.
+Phase A is fast and always runs. Phase B is the expensive part: travsr init runs it before it finishes, and the daemon re-runs it after each commit. Queries work throughout: before Phase B lands you get structure, and after it you get call edges too.
 $ travsr status
 
 ## how do I install it?
 > Install, then index a repo. Five steps from nothing to a query.
 1. install the binary :: curl -fsSL https://travsr.com/install.sh | sh
 2. check it is on your PATH :: travsr --version
-3. index a repo, from its root :: travsr init --semantic
+3. index a repo, from its root :: travsr init
 4. confirm the graph is ready :: travsr status
 5. ask it something :: travsr ask "<a symbol in your code>"
 - sh -s -- --system   installs for all users, not just you
@@ -55,9 +55,9 @@ The installer checks the release signature before it installs anything, and drop
 - parses every tracked file, skipping whatever git ignores
 - installs a hook so the graph follows your commits
 - registers the repo so other tools can find it
-- --semantic waits for call edges instead of backgrounding them
+- init traces calls before it returns
 init is incremental and safe to repeat: a second run picks up only what changed, which is exactly what the git hook does on your behalf after each commit. Reach for --force only after changing a flag that affects analysis, since per-file change detection cannot see that by itself.
-$ travsr init --semantic
+$ travsr init
 
 ## which languages does it support?
 > Sixteen parse out of the box; four resolve calls with no setup.
@@ -123,6 +123,19 @@ $ travsr mcp --stdio
 - undo it later      travsr connect --remove
 connect records the absolute path of the binary it was run from, so an agent started days later launches the same travsr you tested with. Run it again after moving or upgrading the binary, and remember the agent only reads its config at startup.
 
+## how do I stop my agent reaching for grep?
+
+> Install the guard, a hook that intervenes at the moment it does.
+1. nudge it, never block :: travsr init --guard
+2. or refuse reads the graph can answer :: travsr init --guard=strict
+3. take the hook back out :: travsr connect --remove
+- matched      Grep, Glob, Read, and shell grep/rg/find/ag/ack/ls -R
+- advisory     allows the call and names the Travsr call to use instead
+- strict       denies it, with that same call in the refusal
+- turn it off  TRAVSR_GUARD=off
+Wiring MCP makes the graph reachable; it does not make an agent prefer it. The guard runs at the exact point the agent reaches for text search and hands it the replacement, which is worth more there than in a rules file it re-reads and skims every turn. It refuses only what the graph can genuinely answer: a missing, stale or unreadable index, an unknown symbol, a regex, a file the index does not carry, or its own 200ms deadline all let the call straight through. In strict mode you get at most one redirect per symbol per session, so a search you repeat is always allowed. Claude Code only, because it is the one host with a pre-tool contract to hook.
+$ travsr init --guard
+
 ## what tools does the MCP server expose?
 > Twenty-six, grouped by the kind of question they answer.
 - structure   get_callers, get_dependencies, get_blast_radius
@@ -155,7 +168,7 @@ $ travsr ask --examples
 - conceptual questions naming no symbol are a known gap
 - a misspelled symbol will not fuzzy-match its way to an answer
 - the abstention suggests a narrower command to run
-- semantic search widens it, if you indexed with --semantic
+- meaning-based search widens it, once `travsr embed init` has run
 A confident wrong answer costs more than an empty one, especially when an agent is about to act on it. When it abstains it prints what to try instead, and explain, given the query and a symbol you expected it to return, shows which terms matched and which threshold it fell short of.
 $ travsr explain "<your query>" <symbol>
 
@@ -167,7 +180,7 @@ $ travsr explain "<your query>" <symbol>
 - the .travsr directory only affects the checkout it sits in
 There is no uninstall step to run first and nothing outside these two paths. Remove them and travsr is gone; run init again and the graph comes back from your source, because everything in it was derived from your source to begin with.
 $ rm -rf .travsr
-$ travsr init --semantic
+$ travsr init
 
 ## how do I see the logs?
 > There are two logs, and one command reads either of them.
@@ -196,8 +209,18 @@ $ travsr daemon logs -f --level warn --since 10m
 - lsif.spawn, lsif.complete, kcore.updated
 - query.served, embed.text.updated, lsp.diagnostics
 - file.skipped, the one you see most when something is wrong
+query.served is the exception to "it is in the log": a query slower than 200ms is recorded at info, a faster one at debug, so at the default level you see the slow ones and nothing else. Set log.level to debug to see every query.
 The keys are identifiers and keep their spelling; the messages beside them are written for people and can be reworded at any time. That is why both exist: an alert or a jq filter built on event=phase_b.complete keeps working, where one that matched the message text would break the next time someone improved the wording.
 $ travsr daemon logs --lines 0 --json
+
+## can travsr check my architecture rules?
+> Write them down and it checks them against the graph on every run.
+- rules live in architecture-invariants.json at the repo root
+- a rule caps what a component may depend on, or what may use it
+- or asserts there are no cycles at all
+- it exits non-zero on a violation, so it works as a CI step
+A rule naming a component that no longer exists is reported as broken, not skipped. Renaming a crate would otherwise silently retire the rule protecting it, which is the one way a guard fails without anyone noticing. travsr checks its own rules this way: the dependency graph written into its CLAUDE.md had been missing two real edges, and nothing caught it.
+$ travsr invariants
 
 ## how do I tell if something is broken?
 > Three commands, in the order worth trying them.
@@ -241,12 +264,12 @@ $ travsr serve --tenants-dir <dir>
 
 ## can I use it in CI?
 > Yes. Index synchronously, and read the output as JSON.
-- init --semantic finishes call edges before it returns
+- init finishes call edges before it returns
 - --json on init, status and ask gives machine-readable output
 - travsr index emits a graph JSON without touching a repo's .travsr
 - no daemon is needed; queries read the database directly
-The thing to get right in CI is ordering: init backgrounds the expensive pass by default, so a job that queries call edges immediately after it can race the work. --semantic makes init wait, which is what it is for.
-$ travsr init --semantic --json
+init traces calls before it returns, so a job can query call edges the moment it exits: there is no background pass to race, and no daemon to start or wait for.
+$ travsr init --json
 $ travsr index <dir> --output graph.json
 
 ## how do I update travsr?

@@ -1,0 +1,85 @@
+name: vscode marketplace drift
+
+# #882: the extension published to the Marketplace pins the binary it offers to
+# download (`DOWNLOAD_VERSION`). That pin is correct when the extension ships
+# and silently becomes wrong the moment the next stable binary release is cut,
+# because nothing republishes the extension. Users installing in the window
+# between the two get a binary one release behind, with no error.
+#
+# This is the direction neither existing gate covers:
+#
+#   release.yml         "vscode DOWNLOAD_VERSION must match tag on stable
+#                        releases" reads the pin out of the REPO at the tagged
+#                        commit. The repo is bumped in the release commit, so
+#                        that check passes while the published artifact lags.
+#   vscode-publish.yml  checks the pin at publish time. Verified against every
+#                        vscode-v* tag in history: the pin matched the
+#                        then-latest stable release on all of them, including
+#                        vscode-v0.11.0, the one that shipped this bug. A
+#                        publish-time check cannot see a release cut later.
+#
+# So this asks the Marketplace what is actually published and compares it
+# against the current stable release. Same shape and rationale as
+# lang-release-drift.yml: two systems that cannot see each other, reconciled by
+# asking the live one what it holds.
+#
+# The comparison logic and its failure modes live in
+# .github/scripts/vscode-version-gate.sh, which is unit-tested. Keeping it out
+# of this file is deliberate: the first revision inlined it here, and both
+# defects found in review were only reachable by extracting the step by hand.
+
+on:
+  # A release is the event that creates the drift, so check immediately after
+  # one. `released` fires for stable publishes, not prereleases.
+  release:
+    types: [released]
+  schedule:
+    # Daily, not weekly like lang-release-drift. There the drift only matters
+    # when someone runs `travsr lang install`; here every extension install in
+    # the window lands on the wrong binary, so the window is the cost.
+    - cron: '0 7 * * *'
+  pull_request:
+    paths:
+      - 'packages/travsr-vscode/src/installer.ts'
+      - 'packages/travsr-vscode/package.json'
+      - '.github/scripts/vscode-version-gate.sh'
+      - '.github/workflows/vscode-marketplace-drift.yml'
+      - '.github/workflows/vscode-publish.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: published extension vs latest stable release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          # The drift step reads the pin a published extension shipped with
+          # straight out of its vscode-v* tag, and which tag that is only
+          # becomes known after the Marketplace answers, so the tags have to be
+          # here already. The shallow default has none of them.
+          fetch-depth: 0
+
+      # Reports what is published. On a pull request this is informational:
+      # only a republish clears drift, and an unreachable gallery is not
+      # something a pull request can fix either. Both route the same way, and
+      # neither is ever reported as "no drift".
+      - name: compare the published extension against the current release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/vscode-version-gate.sh marketplace-drift
+
+      # The independently actionable half: what the NEXT publish would carry.
+      # This has to run even when the step above has already failed, because
+      # the two findings are unrelated. A drift alarm nobody can clear in a
+      # pull request must not also hide a stale pin somebody can fix in one.
+      # `!cancelled()` rather than `always()` so a cancelled run still stops.
+      - name: the pin in this tree must not be behind the current release
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/vscode-version-gate.sh tree-pin

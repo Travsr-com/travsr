@@ -117,6 +117,7 @@ fn mcp_get_context(repo: &Path, query: &str) -> String {
     use std::io::{BufRead as _, BufReader, Write as _};
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("CI", "1") // no background daemon from `travsr mcp`
         .arg("mcp")
         .current_dir(repo)
         .stdin(std::process::Stdio::piped())
@@ -195,7 +196,12 @@ fn model_switch_lifecycle_end_to_end() {
     Command::cargo_bin("travsr")
         .unwrap()
         .current_dir(repo.path())
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .arg("init")
+        // #893: keep this tempdir out of the developer's real
+        // ~/.travsr/registry.json.
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
         .assert()
         .success();
 
@@ -298,4 +304,35 @@ fn model_switch_lifecycle_end_to_end() {
             .exists(),
         "model B's HNSW index must survive gc"
     );
+}
+
+/// The module doc above justifies reusing the real `~/.travsr` cache partly on
+/// the grounds that "a CI run benefits from the same cache across runs".
+/// Hosted runners are ephemeral, so that holds only while the workflow restores
+/// the directory itself, and a weekly job nobody is told about is how such a
+/// claim silently stops being true (#525 item 1). Asserted here, beside the
+/// claim it protects, and unlike the job it describes this runs on every PR.
+#[test]
+fn the_weekly_workflow_caches_the_model_dir_and_reports_its_own_failure() {
+    let workflow = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.github/workflows/embed-lifecycle-e2e.yml"),
+    )
+    .expect("reading the weekly lifecycle workflow");
+
+    for required in [
+        "actions/cache",
+        "~/.travsr/bin",
+        "~/.travsr/models",
+        "if: failure()",
+        "issues: write",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "embed-lifecycle-e2e.yml must contain {required:?}: without a model cache \
+             the weekly job re-downloads the sidecar and ~600 MB of weights every run, \
+             and without a failure notification it decays into a permanently red job \
+             that everyone reads as green"
+        );
+    }
 }

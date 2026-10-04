@@ -28,13 +28,29 @@ jobs:
           - fuzz_lsif_ingest
           - fuzz_treesitter_indexer
           - fuzz_go_parser
-          - fuzz_pyright_lsif_parser
+          - fuzz_python_parser
           - fuzz_pcst_session
           # #376: the markdown chunker is hand-written string processing over
           # untrusted repo content (no grammar, no subprocess) and sits on the
           # indexing path for every repo, so a panic here is reachable by
           # committing a `.md` file.
           - fuzz_markdown_chunker
+          # #345: every grammar below is registered as an in-process plugin
+          # (registry.rs FUZZ_TARGETS), so a panic in its third-party `parser.c`
+          # aborts the daemon. ADR-017 Rule 4.3 makes running them here a
+          # condition of parsing them in-process at all.
+          # .github/scripts/check-fuzz-targets.mjs keeps this list complete.
+          - fuzz_c_parser
+          - fuzz_cpp_parser
+          - fuzz_csharp_parser
+          - fuzz_dart_parser
+          - fuzz_java_parser
+          - fuzz_kotlin_parser
+          - fuzz_objc_parser
+          - fuzz_php_parser
+          - fuzz_ruby_parser
+          - fuzz_scala_parser
+          - fuzz_swift_parser
 
     steps:
       - name: Checkout
@@ -95,7 +111,7 @@ jobs:
           fi
           gh issue create \
             --title "[fuzz] ${{ matrix.target }} found a panic ($(date -u +%Y-%m-%d))" \
-            --body "Fuzz target \`${{ matrix.target }}\` crashed during the nightly fuzz run.
+            --body "Fuzz target \`${{ matrix.target }}\` crashed in the \`${{ github.workflow }}\` workflow (event: ${{ github.event_name }}, ref: \`${{ github.ref_name }}\`). When the workflow is \`Release\`, this ran as a release-promotion gate for that tag, not as the nightly.
 
           **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 

@@ -23,8 +23,6 @@ pub struct FfiConfig {
     pub enabled: bool,
     /// Minimum confidence to emit an edge (0..=100). Default: 30.
     pub emit_threshold: u8,
-    /// Timeout passed to pyright (seconds). Default: 30.
-    pub pyright_timeout_secs: u64,
 }
 
 impl Default for FfiConfig {
@@ -32,7 +30,6 @@ impl Default for FfiConfig {
         Self {
             enabled: true,
             emit_threshold: 30,
-            pyright_timeout_secs: 30,
         }
     }
 }

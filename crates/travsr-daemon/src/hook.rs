@@ -327,6 +327,38 @@ pub fn changed_files_from_git(repo_root: &Path) -> anyhow::Result<Vec<PathBuf>> 
         .collect())
 }
 
+/// Whether the graph's stored `last_commit` marker is reachable from `HEAD`.
+///
+/// `git reset --hard`, `commit --amend` and `rebase` rewrite history without
+/// firing any hook travsr installs, so with no daemon running the divergence is
+/// only noticed on the *next* commit. At that point [`changed_files_from_git`]
+/// describes that one commit and says nothing about the files the rewrite
+/// removed, yet the caller then stamps `last_commit` to HEAD — which silences
+/// the drift note `travsr status` was correctly printing and leaves the removed
+/// files in the graph as ghosts that `travsr ask` still answers with (#893).
+///
+/// A marker that is an ancestor of HEAD means history only moved forward, so
+/// the commit's own diff is the whole change and the fast delta path is right.
+/// Anything else — genuinely diverged, or an object git can no longer resolve
+/// (pruned, shallow clone, replaced `.git`) — returns `false`, which costs a
+/// whole-tree reconcile that is correct in every case and merely slower. It
+/// pays once: that reconcile stamps HEAD, and the next commit is back on the
+/// fast path.
+///
+/// An empty marker returns `true`. Nothing has been stamped yet, so there is no
+/// divergence to detect and no reason to charge a full reconcile for it.
+pub fn commit_is_ancestor_of_head(repo_root: &Path, commit: &str) -> bool {
+    if commit.is_empty() {
+        return true;
+    }
+    std::process::Command::new("git")
+        .args(["merge-base", "--is-ancestor", commit, "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Every file git tracks in `repo_root`, as absolute paths.
 ///
 /// Used as the ReindexCommit fallback (#405): when [`changed_files_from_git`]

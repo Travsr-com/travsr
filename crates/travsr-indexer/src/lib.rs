@@ -18,7 +18,6 @@ pub mod ffi; // thin re-export wrapper → travsr_analysis::ffi
 mod ffi_resolver;
 mod hash;
 pub mod lsif;
-pub mod python_lsif;
 pub mod ra_runner;
 pub mod runner;
 pub mod sandbox;
@@ -31,7 +30,7 @@ use travsr_core::{EdgeKind, Language};
 // ParseOutput and FfiMarker are now owned by travsr-analysis.
 pub use ffi::{FfiMarker, FfiMarkerKind};
 pub use ffi_resolver::FfiConfig;
-pub use hash::hash_file;
+pub use hash::{hash_bytes, hash_file};
 pub use lsif::ingest as ingest_lsif;
 pub use lsif::{
     ingest_g2 as ingest_lsif_g2, ingest_g2_from_reader as ingest_lsif_g2_from_reader,
@@ -40,7 +39,10 @@ pub use lsif::{
     LsifG2Output,
 };
 pub use ra_runner::run_ra_lsif;
-pub use runner::{run_lsif_emitter, run_lsif_py_emitter, run_scip_python};
+pub use runner::{
+    bundled_lsif_emitter_available, emitter_missing, run_lsif_emitter, run_lsif_emitter_with_root,
+    run_lsif_py_emitter, run_scip_python, synthesize_js_tsconfig, EmitterNotFound, JS_EXTENSIONS,
+};
 pub use travsr_analysis::ParseOutput;
 pub use travsr_core::{Edge, Node};
 pub use travsr_error::IndexError;
@@ -169,9 +171,47 @@ pub fn phase_b_native_python(
 /// Call this after [`Indexer::parse_file_with_vname`] and persist the
 /// returned edges alongside the parse output.
 pub fn link_imports(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge> {
+    link_imports_aliased(nodes, vname_path, corpus, &[])
+}
+
+/// Like [`link_imports`] but also resolves tsconfig `paths` aliases. `aliases`
+/// is a list of `(prefix, base)` pairs where `prefix` is the alias head with
+/// its trailing slash (e.g. `"@/"`) and `base` is the repo-root-relative
+/// replacement directory with its trailing slash (e.g. `"src/"`). An aliased
+/// specifier such as `@/lib/auth` resolves against the repo root; relative
+/// specifiers resolve against the importer's directory exactly as before.
+///
+/// Aliases come from [`parse_tsconfig_path_aliases`]; passing `&[]` reproduces
+/// the relative-only behaviour of [`link_imports`].
+pub fn link_imports_aliased(
+    nodes: &[Node],
+    vname_path: &str,
+    corpus: &str,
+    aliases: &[(String, String)],
+) -> Vec<Edge> {
     let parent = match std::path::Path::new(vname_path).parent() {
         Some(p) => p,
         None => return Vec::new(),
+    };
+
+    // #610: only `ts`/`tsx` used to be tried, so no JavaScript import ever
+    // resolved — `./animal` from a `.js` file produced candidates for
+    // `animal.ts` and `animal.tsx`, neither of which exists in a JS project.
+    // That broke JS dependency traversal for *both* module styles, not only
+    // CommonJS.
+    //
+    // Candidates are scoped by the importer's own extension rather than
+    // emitting the whole family for everyone: each one is a speculative edge
+    // whose target node may never be created, and `fsck` counts those as
+    // orphans. A TypeScript file still gets `js` too, since `allowJs` interop
+    // is common in real projects. (Loop-invariant: computed once here.)
+    let importer_ext = std::path::Path::new(vname_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let candidates: &[&str] = match importer_ext {
+        "js" | "jsx" | "mjs" | "cjs" => &["js", "jsx", "mjs", "cjs"],
+        _ => &["ts", "tsx", "js"],
     };
 
     let mut edges = Vec::new();
@@ -183,31 +223,17 @@ pub fn link_imports(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge>
         let Some(module) = node.vname.signature.strip_prefix("import:") else {
             continue;
         };
-        if !module.starts_with("./") && !module.starts_with("../") {
+
+        // Resolve to a repo-relative path with no extension. Relative specifiers
+        // (`./x`, `../x`) resolve against the importer's directory; a tsconfig
+        // `paths` alias (`@/x`) resolves against the repo root. Anything else
+        // (bare package imports like `react`) does not point at a project file.
+        let normalized = if module.starts_with("./") || module.starts_with("../") {
+            normalize_vname_path(&parent.join(module))
+        } else if let Some(rewritten) = rewrite_import_alias(module, aliases) {
+            normalize_vname_path(std::path::Path::new(&rewritten))
+        } else {
             continue;
-        }
-
-        let raw = parent.join(module);
-        let normalized = normalize_vname_path(&raw);
-
-        // #610: only `ts`/`tsx` used to be tried, so no JavaScript import ever
-        // resolved — `./animal` from a `.js` file produced candidates for
-        // `animal.ts` and `animal.tsx`, neither of which exists in a JS
-        // project. That broke JS dependency traversal for *both* module styles,
-        // not only CommonJS.
-        //
-        // Candidates are scoped by the importer's own extension rather than
-        // emitting the whole family for everyone: each one is a speculative
-        // edge whose target node may never be created, and `fsck` counts those
-        // as orphans. A TypeScript file still gets `js` too, since `allowJs`
-        // interop is common in real projects.
-        let importer_ext = std::path::Path::new(vname_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let candidates: &[&str] = match importer_ext {
-            "js" | "jsx" | "mjs" | "cjs" => &["js", "jsx", "mjs", "cjs"],
-            _ => &["ts", "tsx", "js"],
         };
 
         for ext in candidates.iter().copied() {
@@ -219,6 +245,154 @@ pub fn link_imports(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge>
     }
 
     edges
+}
+
+/// Rewrite a tsconfig-aliased module specifier to a repo-root-relative path, or
+/// `None` when no alias prefix matches. With `("@/", "src/")`, `@/lib/auth`
+/// becomes `src/lib/auth`.
+///
+/// When several alias prefixes match (e.g. both `@/` and `@/components/` for
+/// `@/components/Button`), the longest prefix wins, so a more specific alias is
+/// never shadowed by a less specific one. Distinct prefixes that both match a
+/// given specifier always differ in length, so the winner is unambiguous and
+/// the result does not depend on the order of `aliases`.
+fn rewrite_import_alias(module: &str, aliases: &[(String, String)]) -> Option<String> {
+    aliases
+        .iter()
+        .filter_map(|(prefix, base)| {
+            module
+                .strip_prefix(prefix.as_str())
+                .map(|rest| (prefix.len(), format!("{base}{rest}")))
+        })
+        .max_by_key(|(prefix_len, _)| *prefix_len)
+        .map(|(_, rewritten)| rewritten)
+}
+
+/// Normalize a JSONC string (the tsconfig dialect: `//` line comments, `/* */`
+/// block comments, and trailing commas) into strict JSON that `serde_json` can
+/// parse. String literals are copied verbatim, including comment-looking and
+/// comma substrings and escaped quotes, so only structural tokens are touched.
+/// A malformed result still parses to nothing downstream, so this never widens
+/// what counts as a valid config; it only stops rejecting legal tsconfig.
+fn strip_jsonc(input: &str) -> String {
+    let b = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    let mut in_string = false;
+
+    // Advance `j` past spaces, line comments and block comments; used both as
+    // the main scan's comment skipper and the trailing-comma lookahead.
+    fn skip_gap(b: &[u8], mut j: usize) -> usize {
+        loop {
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j + 1 < b.len() && b[j] == b'/' && b[j + 1] == b'/' {
+                j += 2;
+                while j < b.len() && b[j] != b'\n' {
+                    j += 1;
+                }
+            } else if j + 1 < b.len() && b[j] == b'/' && b[j + 1] == b'*' {
+                j += 2;
+                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                    j += 1;
+                }
+                j = (j + 2).min(b.len());
+            } else {
+                return j;
+            }
+        }
+    }
+
+    while i < b.len() {
+        let c = b[i];
+        if in_string {
+            out.push(c);
+            if c == b'\\' && i + 1 < b.len() {
+                out.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+        } else if c == b'"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+        } else if c == b'/' && i + 1 < b.len() && (b[i + 1] == b'/' || b[i + 1] == b'*') {
+            i = skip_gap(b, i);
+        } else if c == b','
+            && b.get(skip_gap(b, i + 1))
+                .is_some_and(|&n| n == b'}' || n == b']')
+        {
+            // Trailing comma before the next `}`/`]`: drop it.
+            i += 1;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Read `{repo_root}/tsconfig.json` (or `jsconfig.json` when no tsconfig is
+/// present) and return its `compilerOptions.paths` wildcard aliases as
+/// `(prefix, base)` pairs, resolved against `baseUrl` (default `"."`). Only the
+/// common single-target wildcard form is handled:
+///
+/// ```text
+/// "paths": { "@/*": ["./src/*"] }   baseUrl "."   ->   ("@/", "src/")
+/// ```
+///
+/// `jsconfig.json` is the JavaScript convention for the same schema (a JS
+/// `create-next-app` ships one and no tsconfig), so a JS-only repo gets alias
+/// resolution too. tsconfig wins when both exist.
+///
+/// Returns empty on a missing, unreadable, or malformed config, or one with
+/// no `paths`. Non-wildcard and multi-target entries are skipped. The config is
+/// read as JSONC (comments and trailing commas tolerated), matching how
+/// TypeScript's own loader reads tsconfig and the LSIF emitter's
+/// `ts.readConfigFile`; without that a hand-written tsconfig would resolve
+/// aliases for call edges (the emitter) but not for file import edges (here).
+pub fn parse_tsconfig_path_aliases(repo_root: &Path) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(repo_root.join("tsconfig.json"))
+        .or_else(|_| std::fs::read_to_string(repo_root.join("jsconfig.json")))
+    else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(&text)) else {
+        return Vec::new();
+    };
+    let opts = &json["compilerOptions"];
+    let base_url = opts["baseUrl"].as_str().unwrap_or(".");
+    let Some(paths) = opts["paths"].as_object() else {
+        return Vec::new();
+    };
+
+    let mut aliases = Vec::new();
+    for (key, targets) in paths {
+        let (Some(key_prefix), Some(first_target)) = (
+            key.strip_suffix('*'),
+            targets
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let Some(target_prefix) = first_target.strip_suffix('*') else {
+            continue;
+        };
+        let joined = normalize_vname_path(&Path::new(base_url).join(target_prefix));
+        let mut base = joined.to_string_lossy().replace('\\', "/");
+        if !base.is_empty() && !base.ends_with('/') {
+            base.push('/');
+        }
+        aliases.push((key_prefix.to_string(), base));
+    }
+    aliases
 }
 
 /// Resolve within-crate Rust `use` paths and file-module declarations to
@@ -682,8 +856,7 @@ impl Indexer {
     /// Override the FFI resolver configuration (RFC-005).
     ///
     /// Call this after [`Indexer::with_corpus`] (or on a value from [`Indexer::new`])
-    /// to control the emit threshold, enable/disable FFI resolution, or adjust
-    /// the pyright timeout.
+    /// to control the emit threshold or enable/disable FFI resolution.
     pub fn with_ffi_config(mut self, cfg: ffi_resolver::FfiConfig) -> Self {
         self.ffi_config = cfg;
         self
@@ -733,17 +906,8 @@ impl Indexer {
                 travsr_analysis::rust::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
             }
             Some(Language::Python) => {
-                let mut ts_out = travsr_analysis::python::parse(&self.corpus, abs_path, vname_path)
-                    .map_err(map_err)?;
-                // Best-effort semantic enrichment via pyright (RFC-005 §3).
-                // Runs after tree-sitter; failures are logged and silently ignored.
-                let pyright_out = python_lsif::parse_python_with_pyright(
-                    abs_path,
-                    std::time::Duration::from_secs(self.ffi_config.pyright_timeout_secs),
-                )
-                .unwrap_or_default();
-                ts_out.merge_deduped(pyright_out);
-                ts_out
+                travsr_analysis::python::parse(&self.corpus, abs_path, vname_path)
+                    .map_err(map_err)?
             }
             Some(Language::Go) => {
                 travsr_analysis::go::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?

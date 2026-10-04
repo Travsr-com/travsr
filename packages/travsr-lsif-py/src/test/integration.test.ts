@@ -9,11 +9,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Writable } from 'node:stream';
 import { Emitter } from '../emitter';
-import { walk } from '../walker';
+import { init, walk } from '../walker';
 
 const FIXTURE_ROOT = path.join(__dirname, '../../fixtures/simple');
 const EMITTER_BIN = path.join(__dirname, '../index.js');
@@ -224,7 +225,8 @@ test('runner.py emits attribute call refs to models.py functions', () => {
 
 // ── API tests (walk() directly) ────────────────────────────────────────────────
 
-test('walk() on empty directory produces only metaData + project vertices', () => {
+test('walk() on empty directory produces only metaData + project vertices', async () => {
+  await init();
   const lines: string[] = [];
   const sink = new Writable({
     write(chunk: Buffer, _enc, cb) {
@@ -258,6 +260,263 @@ test('walk() throws a descriptive error for a non-existent root', () => {
       return true;
     }
   );
+});
+
+test('a module imported both plainly and by name keeps resolving its attributes', () => {
+  // `import socket` followed by `from socket import TIMEOUT` must leave
+  // `socket` bound to the module, so `socket.create_connection()` in client.py
+  // still resolves.  The module-name child of the import_from_statement is
+  // skipped by node id: comparing by reference instead rebinds `socket` to the
+  // class of the same name inside socket.py and the call site resolves to
+  // nothing.  socket.py in the standard library is exactly that shape.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-lsif-py-import-'));
+  fs.writeFileSync(
+    path.join(tmp, 'socket.py'),
+    'TIMEOUT = 1\n\n\nclass socket:\n    pass\n\n\ndef create_connection(addr):\n    return addr\n'
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'client.py'),
+    'import socket\nfrom socket import TIMEOUT\n\n\ndef connect(addr):\n    return socket.create_connection(addr)\n'
+  );
+
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--root', tmp], { encoding: 'utf-8' });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+
+  const all = parseAll(result.stdout);
+  const clientDoc = all.find(
+    (o) => o['label'] === 'document' && String(o['uri']).endsWith('client.py')
+  );
+  assert.ok(clientDoc, 'client.py must be in the dump');
+
+  // range id -> resultSet it was linked to.
+  const target = new Map<unknown, unknown>();
+  for (const o of all) {
+    if (o['label'] === 'next') target.set(o['outV'], o['inV']);
+  }
+  const vname = new Map<unknown, string>();
+  for (const o of all) {
+    if (o['label'] === 'resultSet') vname.set(o['id'], JSON.stringify(o['travsr_vname']));
+  }
+
+  const resolvedFromClient = all
+    .filter(
+      (o) =>
+        o['label'] === 'item' &&
+        o['property'] === 'references' &&
+        o['document'] === clientDoc['id']
+    )
+    .flatMap((o) => o['inVs'] as unknown[])
+    .map((rangeId) => vname.get(target.get(rangeId)));
+
+  assert.ok(
+    resolvedFromClient.includes(
+      JSON.stringify({ path: 'socket.py', signature: 'fn:create_connection' })
+    ),
+    `socket.create_connection(addr) must resolve to socket.py, got ${JSON.stringify(resolvedFromClient)}`
+  );
+});
+
+test('a method inherited from an imported base class resolves on a typed local', () => {
+  // Dog(Animal) does not define describe(); Animal does.  `d = Dog()` then
+  // `d.describe()` must resolve through Dog's base to animal.py.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-lsif-py-inherit-'));
+  fs.writeFileSync(path.join(tmp, '__init__.py'), '');
+  fs.writeFileSync(
+    path.join(tmp, 'animal.py'),
+    'class Animal:\n    def describe(self):\n        return 1\n'
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'dog.py'),
+    'from .animal import Animal\n\n\nclass Dog(Animal):\n    pass\n'
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'main.py'),
+    'from .dog import Dog\n\n\ndef main():\n    d = Dog()\n    return d.describe()\n'
+  );
+
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--root', tmp], { encoding: 'utf-8' });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+
+  const all = parseAll(result.stdout);
+  const mainDoc = all.find(
+    (o) => o['label'] === 'document' && String(o['uri']).endsWith('main.py')
+  );
+  assert.ok(mainDoc, 'main.py must be in the dump');
+
+  // range id -> resultSet it was linked to.
+  const target = new Map<unknown, unknown>();
+  for (const o of all) {
+    if (o['label'] === 'next') target.set(o['outV'], o['inV']);
+  }
+  const vname = new Map<unknown, string>();
+  for (const o of all) {
+    if (o['label'] === 'resultSet') vname.set(o['id'], JSON.stringify(o['travsr_vname']));
+  }
+
+  const resolvedFromMain = all
+    .filter(
+      (o) =>
+        o['label'] === 'item' &&
+        o['property'] === 'references' &&
+        o['document'] === mainDoc['id']
+    )
+    .flatMap((o) => o['inVs'] as unknown[])
+    .map((rangeId) => vname.get(target.get(rangeId)));
+
+  assert.ok(
+    resolvedFromMain.includes(
+      JSON.stringify({ path: 'animal.py', signature: 'method:Animal.describe' })
+    ),
+    `d.describe() must resolve to animal.py, got ${JSON.stringify(resolvedFromMain)}`
+  );
+});
+
+/** In-process walk of `files`; the travsr vnames referenced from `fromFile`. */
+async function refsFrom(files: Record<string, string>, fromFile: string): Promise<unknown[]> {
+  await init();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-lsif-py-same-file-'));
+  for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(tmp, name), text);
+  const lines: string[] = [];
+  const sink = new Writable({
+    write(chunk: Buffer, _enc, cb) {
+      lines.push(...chunk.toString().split('\n').filter(Boolean));
+      cb();
+    },
+  });
+  walk(tmp, new Emitter(sink));
+  const all = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+  const doc = all.find((o) => o['label'] === 'document' && String(o['uri']).endsWith(fromFile));
+  const target = new Map(all.filter((o) => o['label'] === 'next').map((o) => [o['outV'], o['inV']]));
+  const vname = new Map(
+    all.filter((o) => o['label'] === 'resultSet').map((o) => [o['id'], o['travsr_vname']])
+  );
+  return all
+    .filter((o) => o['label'] === 'item' && o['property'] === 'references' && o['document'] === doc?.['id'])
+    .flatMap((o) => o['inVs'] as unknown[])
+    .map((rangeId) => vname.get(target.get(rangeId)));
+}
+
+test('a call to a function defined in the same file resolves', async () => {
+  const refs = await refsFrom(
+    { 'app.py': 'def local():\n    return 2\n\n\nclass C:\n    pass\n\n\ndef run():\n    return local(), C()\n' },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, [
+    { path: 'app.py', signature: 'fn:local' },
+    { path: 'app.py', signature: 'class:C' },
+  ]);
+});
+
+test('a same-file name bound locally does not resolve to the module function', async () => {
+  for (const body of [
+    'def run(local):\n    return local()\n',
+    'def run():\n    local = print\n    return local()\n',
+    'def run():\n    for local in []:\n        local()\n',
+    'def run():\n    def local():\n        return 3\n    return local()\n',
+    'def run(ev):\n    match ev:\n        case {"h": local}:\n            return local()\n',
+    'def run(ev):\n    match ev:\n        case local:\n            return local()\n',
+    'def run(ev):\n    match ev:\n        case [x] as local:\n            return local()\n',
+  ]) {
+    const refs = await refsFrom({ 'app.py': `def local():\n    return 2\n\n\n${body}` }, 'app.py');
+    assert.deepStrictEqual(refs, [], body);
+  }
+  // Rebound at module level: which binding a call sees depends on run order.
+  const refs = await refsFrom(
+    { 'app.py': 'def local():\n    return 2\n\n\nlocal = print\n\n\ndef run():\n    return local()\n' },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, []);
+});
+
+test('a class body sees its own names; its methods see the module function', async () => {
+  const cls = 'def helper():\n    return 0\n\n\nclass C:\n    def helper(self):\n        return 1\n';
+  assert.deepStrictEqual(await refsFrom({ 'app.py': `${cls}    x = helper(None)\n` }, 'app.py'), []);
+  assert.deepStrictEqual(
+    await refsFrom({ 'app.py': `${cls}    def run(self):\n        return helper()\n` }, 'app.py'),
+    [{ path: 'app.py', signature: 'fn:helper' }]
+  );
+});
+
+test('a module binding that is not the def does not resolve to a nested class', async () => {
+  const refs = await refsFrom(
+    { 'app.py': 'class Outer:\n    class Err(Exception):\n        pass\n\n\nErr = RuntimeError\n\n\ndef run():\n    raise Err()\n' },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, []);
+});
+
+test('self.attr.method() resolves via an annotated constructor parameter', async () => {
+  const refs = await refsFrom(
+    {
+      'app.py':
+        'class App:\n    def add_url_rule(self, rule):\n        return rule\n\n\n' +
+        'class State:\n    def __init__(self, app: App):\n        self.app = app\n\n' +
+        '    def register(self, rule):\n        return self.app.add_url_rule(rule)\n',
+    },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, [{ path: 'app.py', signature: 'method:App.add_url_rule' }]);
+});
+
+test('self.attr.method() resolves via an inline attribute annotation', async () => {
+  const refs = await refsFrom(
+    {
+      'app.py':
+        'class App:\n    def run(self):\n        return 1\n\n\n' +
+        'class State:\n    def __init__(self, a):\n        self.app: App = a\n\n' +
+        '    def go(self):\n        return self.app.run()\n',
+    },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, [{ path: 'app.py', signature: 'method:App.run' }]);
+});
+
+test('self.attr.method() resolves across files with a TYPE_CHECKING import', async () => {
+  // The dominant modern-Python shape (Flask's BlueprintSetupState): the type is
+  // imported only under `if TYPE_CHECKING:` beside `from __future__ import
+  // annotations`.
+  const refs = await refsFrom(
+    {
+      '__init__.py': '',
+      'app.py': 'class App:\n    def add_url_rule(self, rule):\n        return rule\n',
+      'state.py':
+        'from __future__ import annotations\n\nimport typing as t\n\n' +
+        'if t.TYPE_CHECKING:\n    from .app import App\n\n\n' +
+        'class State:\n    def __init__(self, app: App):\n        self.app = app\n\n' +
+        '    def register(self, rule):\n        return self.app.add_url_rule(rule)\n',
+    },
+    'state.py'
+  );
+  assert.deepStrictEqual(refs, [{ path: 'app.py', signature: 'method:App.add_url_rule' }]);
+});
+
+test('self.attr.method() stays unresolved without a first-party annotation', async () => {
+  // No annotation on `app` → the attribute type is unknown → no edge, rather
+  // than a guessed one.
+  const refs = await refsFrom(
+    {
+      'app.py':
+        'class App:\n    def add_url_rule(self, rule):\n        return rule\n\n\n' +
+        'class State:\n    def __init__(self, app):\n        self.app = app\n\n' +
+        '    def register(self, rule):\n        return self.app.add_url_rule(rule)\n',
+    },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, []);
+});
+
+test('a method call on a type-annotated local resolves', async () => {
+  // `local: App = a` — the annotation names the type even though the RHS is
+  // neither a constructor call nor itself resolvable.
+  const refs = await refsFrom(
+    {
+      'app.py':
+        'class App:\n    def add_url_rule(self, rule):\n        return rule\n\n\n' +
+        'def build(a):\n    local: App = a\n    return local.add_url_rule("/")\n',
+    },
+    'app.py'
+  );
+  assert.deepStrictEqual(refs, [{ path: 'app.py', signature: 'method:App.add_url_rule' }]);
 });
 
 // ── helpers ───────────────────────────────────────────────────────────────────

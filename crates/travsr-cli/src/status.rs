@@ -62,16 +62,12 @@ fn live_precision_line(store: &travsr_store::SqliteStore) -> Option<String> {
 /// revert) all restore the file to its committed content, so the working tree
 /// ends up equal to HEAD with the flag still set and the `ref/call` edge still
 /// missing. Telling the user to commit is a dead end there: there is nothing
-/// to stage. Recovery is `travsr init --semantic`, or any later commit that
-/// fires the hook.
+/// to stage. Recovery is `travsr init`, or any later commit that fires the hook.
 ///
-/// The `--semantic` is load-bearing rather than decorative. Plain `travsr init`
-/// defers Phase B to the daemon (`run_phase_b_inline = semantic || !has_commit`),
-/// so on an already-committed repo it re-runs Phase A and returns without
-/// rebuilding the `ref/call` edges this flag is reporting as missing. The flag
-/// therefore survives, and the message would be naming a command that cannot
-/// clear it. Nor can the daemon rescue it here: `arm_phase_b_if_pending` only
-/// arms when `last_commit != phase_b_commit`, and in this state they are equal.
+/// Plain `travsr init` is enough: it always runs Phase B inline, and its
+/// done-guard (`phase_b_inline_needed`) re-runs it when this flag is set even
+/// though the markers are equal. The daemon cannot rescue it here:
+/// `arm_phase_b_if_pending` only arms when `last_commit != phase_b_commit`.
 ///
 /// Clearing the flag on the deferred path instead would be the wrong fix: the
 /// edges genuinely are missing until Phase B re-runs, so the flag is honest and
@@ -80,7 +76,10 @@ fn phase_b_state(payload: &StatusPayload) -> String {
     match payload.phase_b_commit.as_deref() {
         Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => {
             if payload.phase_b_dirty {
-                "stale (run travsr init --semantic to refresh)".to_string()
+                travsr_mcp::query::dirty_semantic_state(
+                    payload.live_refs_resolved,
+                    payload.live_refs_pending,
+                )
             } else {
                 // #712: the marker now advances even when a language crashed, so
                 // the healthy languages are complete and queryable at HEAD. Name
@@ -105,7 +104,16 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                     // than reporting a flat "complete" for a language that never ran.
                     .chain(warned_langs(payload, "needs_approval"))
                     .collect();
-                if crashed.is_empty() && not_run.is_empty() {
+                // #878: the language's native pass ran, but its compiler-backed
+                // LSIF pass did not, so it is missing most of its cross-file call
+                // edges. Neither "crashed" nor "not run" is true of it; it is
+                // incomplete, and a flat "complete" here is exactly the false
+                // success the issue reports.
+                let incomplete: Vec<String> = warned_langs(payload, "emitter_missing")
+                    .into_iter()
+                    .chain(warned_langs(payload, "emitter_failed"))
+                    .collect();
+                if crashed.is_empty() && not_run.is_empty() && incomplete.is_empty() {
                     "complete".to_string()
                 } else {
                     let mut parts = Vec::new();
@@ -114,6 +122,9 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                     }
                     if !not_run.is_empty() {
                         parts.push(format!("not run: {}", not_run.join(", ")));
+                    }
+                    if !incomplete.is_empty() {
+                        parts.push(format!("incomplete: {}", incomplete.join(", ")));
                     }
                     format!("partial ({})", parts.join("; "))
                 }
@@ -132,6 +143,19 @@ fn crashed_langs(payload: &StatusPayload) -> Vec<String> {
     warned_langs(payload, "crashed")
 }
 
+/// #904: the sidecars' own warning diagnostics from the last Phase B run, as
+/// the daemon persisted them (`phase_b_diagnostics`, a JSON array). An absent,
+/// empty or unparsable value is no diagnostics: the field is informational and
+/// must never keep `status` from printing the rest.
+fn sidecar_diagnostics(payload: &StatusPayload) -> Vec<travsr_plugin_host::SidecarDiagnostic> {
+    payload
+        .phase_b_diagnostics
+        .as_deref()
+        .filter(|raw| !raw.trim().is_empty())
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
 /// Languages named by a `<kind>:<lang>` entry in the `phase_b_warnings` meta, for
 /// the given `kind`. Used to reconcile the `semantic:` field with the per-language
 /// warnings printed below it, so the summary line never contradicts them.
@@ -146,6 +170,45 @@ fn warned_langs(payload: &StatusPayload, kind: &str) -> Vec<String> {
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// #825: render the unreconciled SCIP definitions behind the E6 miss warning.
+///
+/// The miss set is deterministic, so the actionable information is *which*
+/// definitions miss (which language/construct is failing), not a bare count.
+/// Each stored row is `lang\tkind\tsymbol\tpath:line`; a malformed row is passed
+/// through verbatim rather than dropped. Pure (no stderr) so it is unit-testable.
+///
+/// Display is capped at `SHOW`. `missed` is the true total from the warning's
+/// `missed/attempted` rate, which is larger than `list` whenever the daemon hit
+/// its own storage cap (`MAX_MISS_ROWS`) — the overflow line must count from it,
+/// not from the stored rows, or the tail contradicts the warning above it.
+fn unification_miss_lines(list: Option<&str>, missed: Option<usize>) -> Vec<String> {
+    const SHOW: usize = 20;
+    let Some(list) = list.filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let rows: Vec<&str> = list.lines().collect();
+    let mut out: Vec<String> = rows
+        .iter()
+        .take(SHOW)
+        .map(|row| {
+            let mut cols = row.split('\t');
+            match (cols.next(), cols.next(), cols.next(), cols.next()) {
+                (Some(lang), Some(kind), Some(symbol), Some(loc)) => {
+                    format!("  {lang} {kind} {symbol}  {loc}")
+                }
+                _ => format!("  {row}"),
+            }
+        })
+        .collect();
+    // `max(rows.len())` keeps the tail honest if the rate and the list ever
+    // disagree the other way (daemon/CLI skew): never under-report the rest.
+    let total = missed.unwrap_or(0).max(rows.len());
+    if total > out.len() {
+        out.push(format!("  … and {} more", total - out.len()));
+    }
+    out
 }
 
 /// #645 WS-B: the caller's live short HEAD, read at `cwd` (before the worktree
@@ -163,7 +226,60 @@ fn head_at(cwd: &std::path::Path) -> Option<String> {
     crate::git_bounded::git_stdout_bounded(Some(cwd), ["rev-parse", "--short", "HEAD"])
 }
 
-pub fn run() -> anyhow::Result<()> {
+/// The default language block: one line per language that is not simply
+/// ready, plus a note for a ready language whose calls are not traced as you
+/// edit. Plain words only (plan 3.0); the details are under `--verbose`, which
+/// prints them below instead of pointing at itself.
+fn language_lines(
+    states: &[(
+        String,
+        travsr_plugin_host::phase_b::status::Readiness,
+        travsr_daemon::EditTracing,
+    )],
+    verbose: bool,
+) -> Vec<String> {
+    use travsr_daemon::EditTracing;
+    use travsr_plugin_host::phase_b::status::Readiness;
+    states
+        .iter()
+        .filter_map(|(lang, readiness, editing)| {
+            let text = match (readiness, editing) {
+                (Readiness::Ready, EditTracing::On) => return None,
+                (Readiness::Ready, EditTracing::OffMeasured) => {
+                    "calls update at each commit, not as you edit (edit-time results \
+                     disagreed with commit results here too often)"
+                        .to_string()
+                }
+                (Readiness::Ready, EditTracing::OffUnavailable) => {
+                    "calls update at each commit, not as you edit".to_string()
+                }
+                (Readiness::Failed, _) if verbose => {
+                    "could not trace calls (the reason is below)".to_string()
+                }
+                (r, _) => return readiness_line(lang, r),
+            };
+            Some(format!("  {lang:<11} {text}"))
+        })
+        .collect()
+}
+
+/// One language's state and its one fix, for `status` and the `init` summary;
+/// `None` for a ready language.
+pub(crate) fn readiness_line(
+    lang: &str,
+    r: &travsr_plugin_host::phase_b::status::Readiness,
+) -> Option<String> {
+    if *r == travsr_plugin_host::phase_b::status::Readiness::Ready {
+        return None;
+    }
+    let text = match r.fix() {
+        Some(fix) => format!("{}. {fix}", r.label()),
+        None => r.label(),
+    };
+    Some(format!("  {lang:<11} {text}"))
+}
+
+pub fn run(verbose: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     // `head_at` and `find_git_root` are independent, bounded git queries on the
     // same `cwd` (the latter only shells out in the linked-worktree branch, via
@@ -207,6 +323,18 @@ pub fn run() -> anyhow::Result<()> {
         payload.nodes, payload.edges, payload.schema, last_commit, phase_b_state, rerank_segment
     );
 
+    // #809: the daemon shed watch events because the indexer queue filled. A shed
+    // event is recovered by the head reconcile or next commit, so this is not an
+    // error, but a non-zero count is why the graph may read stale, and is the
+    // signal that tells "fell behind a flood" apart from any other staleness.
+    // Silent at zero, like the live-precision line below.
+    if payload.watch_shed > 0 {
+        println!(
+            "watch events shed: {} (indexer queue filled; recovered by reconcile / next commit)",
+            payload.watch_shed
+        );
+    }
+
     // RFC-027 section 12: the live lane's measured precision, so the per-language
     // shipping gate has a number a human can read rather than a log line that
     // scrolled away.
@@ -217,8 +345,36 @@ pub fn run() -> anyhow::Result<()> {
     //
     // Silent when the lane has never claimed anything, which is every repo that
     // has not used it — a counter of zero is not news.
+    //
+    // Plan 3.0: the numbers are a diagnostic, so they are under `--verbose`; the
+    // default says per language, in plain words, where calls are not traced as
+    // you edit.
     if let Ok(store) = daemon_client::open_read_store(&db_path) {
-        if let Some(line) = live_precision_line(&store) {
+        if verbose {
+            if let Some(line) = live_precision_line(&store) {
+                println!("{line}");
+            }
+        }
+        use travsr_plugin_host::phase_b::status::Readiness;
+        // rust-analyzer ran and added no type-resolved calls: not ready, though
+        // no `phase_b_warnings` class records it.
+        let rust_degraded = payload
+            .rust_lsif_degraded
+            .as_deref()
+            .is_some_and(|d| !d.is_empty());
+        let states: Vec<_> = crate::init::repo_language_states(&repo_root)
+            .into_iter()
+            .map(|(lang, r)| {
+                let r = if lang == "rust" && r == Readiness::Ready && rust_degraded {
+                    Readiness::Failed
+                } else {
+                    r
+                };
+                let editing = travsr_daemon::edit_tracing(&store, &lang);
+                (lang, r, editing)
+            })
+            .collect();
+        for line in language_lines(&states, verbose) {
             println!("{line}");
         }
     }
@@ -229,8 +385,22 @@ pub fn run() -> anyhow::Result<()> {
     // a linked worktree, or a HEAD move the daemon has not yet reconciled — is
     // never answered for silently. cwd-local, so it holds for both the
     // daemon-answered and cold-store payloads.
-    if let Some(head) = head.as_deref() {
-        let stored = payload.last_commit.as_deref().unwrap_or("");
+    //
+    // A linked worktree served by another checkout's index is a different
+    // condition and gets a definitive note instead: the drift note would hedge
+    // ("expected in a linked worktree; otherwise ...") over a fact `status`
+    // already knows, and its "wait for the daemon to reconcile" advice cannot
+    // work when the served index describes a tree that is not this one.
+    //
+    // `TRAVSR_NO_WORKTREE_NOTE` silences the cross-checkout note but must not
+    // resurrect the drift note in its place, so the hatch is read here, at the
+    // print, rather than folded into the classification above.
+    let stored = payload.last_commit.as_deref().unwrap_or("");
+    if let Some(note) = crate::repo::cross_checkout_note_for_db(&cwd, &db_path, Some(stored)) {
+        if !crate::repo::worktree_note_suppressed() {
+            eprintln!("warning: {note}");
+        }
+    } else if let Some(head) = head.as_deref() {
         if let Some(note) = travsr_mcp::head_index_mismatch_note(head, stored) {
             eprintln!("{note}");
         }
@@ -256,8 +426,9 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     // H3: surface Phase B warnings so the user knows about crashed/mismatched
-    // analyzers without having to re-read the init output.
-    if let Some(warnings) = &payload.phase_b_warnings {
+    // analyzers without having to re-read the init output. Under `--verbose`:
+    // the language block above gives each one's state and fix in plain words.
+    if let Some(warnings) = payload.phase_b_warnings.as_ref().filter(|_| verbose) {
         if !warnings.is_empty() {
             // Trust is per-repo, not per-language: a single `install` enables
             // every language at once, so collapse the "not enabled here" notices
@@ -268,7 +439,7 @@ pub fn run() -> anyhow::Result<()> {
                 .collect();
             if !untrusted.is_empty() {
                 eprintln!(
-                    "warning: semantic analysis is not enabled for this repository yet ({}); run `travsr lang install <lang>` here to enable",
+                    "warning: semantic analysis is not enabled for this repository yet ({}); run `travsr init` here to enable",
                     untrusted.join(", ")
                 );
             }
@@ -280,7 +451,7 @@ pub fn run() -> anyhow::Result<()> {
                     // no-op Phase A can make look like it did nothing; `--force`
                     // purges and rebuilds so the retry is unambiguous.
                     ["crashed", lang] => eprintln!(
-                        "warning: semantic analyzer for '{lang}' crashed, fix the tool (e.g. `travsr lang install {lang}`), then re-run `travsr init --semantic --force` to rebuild"
+                        "warning: semantic analyzer for '{lang}' crashed, fix the tool (e.g. `travsr lang install {lang}`), then re-run `travsr init --force` to rebuild"
                     ),
                     ["version_mismatch", rest] => {
                         let v: Vec<&str> = rest.splitn(3, ':').collect();
@@ -312,17 +483,25 @@ pub fn run() -> anyhow::Result<()> {
                     // success, which is what makes it worth saying out loud.
                     ["no_references", lang] => {
                         eprintln!(
-                            "warning: '{lang}' analysis produced definitions but no references, so no call edges came from it. The analyzer reported success, so this is its output being incomplete rather than a crash. Re-run `RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force` to see its own diagnostics"
+                            "note: '{lang}' analysis found definitions but no calls between them, which is expected for a lone script. If this code does make calls, the analyzer's own diagnostics say why: re-run `RUST_LOG=travsr_plugin_host=debug travsr init --force`"
                         );
                     }
                     ["zero_nodes", lang] => {
                         eprintln!(
-                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help, it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
+                            // `=warn`, not `=debug`: this PR promoted the
+                            // zero-node stderr echo in `travsr-plugin-host`'s
+                            // transport from `debug!` to `warn!` precisely so
+                            // the cause is reachable without turning on
+                            // everything else, and `observability.rs` tells an
+                            // agent `=warn` for this same condition. Two
+                            // surfaces naming two levels for one problem is how
+                            // the advice starts drifting.
+                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help. The cause is in the analyzer's own output: re-run `RUST_LOG=travsr_plugin_host=warn travsr init --force` to see it. It may be this project (a missing SDK, an unbuildable project, or a build that skips part of its sources), or it may be how travsr invoked the analyzer"
                         );
                         // Name the concrete thing to check rather than leaving
-                        // "a missing SDK or an unbuildable project" as the only
-                        // clue — the catalog already knows what this language's
-                        // analyzer needs from the project.
+                        // the possible causes as the only clue: the catalog
+                        // already knows what this language's analyzer needs
+                        // from the project.
                         if let Some(entry) = travsr_plugin_host::phase_b::catalog::lookup(lang) {
                             let prereq = entry.effective_prerequisites();
                             if !prereq.is_empty() && prereq != "none" {
@@ -371,19 +550,86 @@ pub fn run() -> anyhow::Result<()> {
                     ),
                     // L5a: scip-clang (c/cpp) needs a compile_commands.json at the
                     // repo root — without one it hangs, so it is skipped up front.
+                    ["skipped_no_build_file", lang] => eprintln!(
+                        "note: '{lang}' calls are traced once the project has {}; this repo has none, so its '{lang}' files are read for structure only",
+                        travsr_plugin_host::phase_b::catalog::required_build_files(lang).1
+                    ),
                     ["skipped_no_compdb", lang] => eprintln!(
                         "warning: full '{lang}' analysis needs a compile database (compile_commands.json) at the repo root. Generate one (e.g. `bear -- make`, or CMake's CMAKE_EXPORT_COMPILE_COMMANDS)"
                     ),
+                    // #878: the TypeScript LSIF emitter is discovered relative to
+                    // the travsr binary, so a binary copied out of its build or
+                    // install layout loses it and the language silently kept only
+                    // its tree-sitter call edges. Name the two fixes that exist.
+                    // The analyzer is named per language: the same two classes
+                    // now cover rust-analyzer and travsr-lsif-py, and telling a
+                    // Rust user to reinstall a TypeScript emitter is worse than
+                    // saying nothing. The remedy differs too, so it is chosen
+                    // from the language rather than shared.
+                    // Only the TypeScript pass produces this class: rust and
+                    // python record a failure, never a plain absence, because an
+                    // analyzer that is not installed is a capability question
+                    // `travsr lang list` answers rather than a failed run.
+                    ["emitter_missing", lang] => eprintln!(
+                        "warning: full '{lang}' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) could not be started, so cross-file call and reference edges are missing. This happens when the travsr binary is run from outside its install layout. Set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr), then re-run `travsr init --force`"
+                    ),
+                    ["emitter_failed", lang] => {
+                        let analyzer = travsr_daemon::lsif_analyzer_name(lang);
+                        eprintln!(
+                            "warning: full '{lang}' analysis is incomplete: {analyzer} started but failed, so cross-file call and reference edges are missing. Re-run `RUST_LOG=travsr_daemon=warn,travsr_plugin_host=warn travsr init --force` to see its error"
+                        )
+                    }
                     // E6: SCIP definitions that did not unify onto their Phase A
                     // tree-sitter node — their references attribute to an orphaned
                     // duplicate node instead. `rate` is missed/attempted.
-                    ["scip_unification_misses", rate] => eprintln!(
-                        "warning: {rate} semantic definitions did not match their parsed symbol, some references may resolve to a duplicate. Re-run `travsr init --semantic` if it persists."
-                    ),
+                    //
+                    // #825: the miss set is deterministic (same sources + emitter
+                    // output => the identical misses every run), so the old
+                    // "Re-run `travsr init --semantic` if it persists" advice was a
+                    // no-op that could never move the count. Name the symbols
+                    // instead — that is what a dev can act on.
+                    //
+                    // The list itself can legitimately be absent: an index whose
+                    // last Phase B run predates #825 has the warning key but not
+                    // the list key, as does an old daemon serving a new CLI. Only
+                    // then does re-running do something — it writes the list — so
+                    // say that instead of promising rows that never print.
+                    ["scip_unification_misses", rate] => {
+                        let missed = rate
+                            .split_once('/')
+                            .and_then(|(m, _)| m.parse::<usize>().ok());
+                        let rows = unification_miss_lines(
+                            payload.scip_unification_miss_list.as_deref(),
+                            missed,
+                        );
+                        let tail = if rows.is_empty() {
+                            "run `travsr init` once to record which definitions they are"
+                        } else {
+                            "the unreconciled definitions are listed below"
+                        };
+                        eprintln!(
+                            "warning: {rate} semantic definitions did not match their parsed symbol, so some references may resolve to a duplicate. This is deterministic (re-running the index will not change the count); {tail}."
+                        );
+                        for row in rows {
+                            eprintln!("{row}");
+                        }
+                    }
                     _ => {}
                 }
             }
         }
+    }
+
+    // #904: what the analyzers themselves said about the last run, in their
+    // own words. The classes above can only name a shape (`zero_nodes:java`);
+    // this is where "the Android SDK was not found" reaches the user without
+    // a RUST_LOG re-run. Printed after the classes so it reads as the reason
+    // for the warning above it.
+    for d in sidecar_diagnostics(&payload)
+        .into_iter()
+        .filter(|_| verbose)
+    {
+        eprintln!("warning: '{}' analysis: {} [{}]", d.lang, d.message, d.code);
     }
 
     // M1 / #738: warn when Rust's full cross-file edges are degraded. The
@@ -391,7 +637,7 @@ pub fn run() -> anyhow::Result<()> {
     // (bubblewrap); Windows and macOS have none to add here, so the only path
     // to full edges is the trusted-repo opt-in. `cfg!` (not `#[cfg]`) keeps
     // every platform's wording compiled and checked.
-    if let Some(reason) = &payload.rust_lsif_degraded {
+    if let Some(reason) = payload.rust_lsif_degraded.as_ref().filter(|_| verbose) {
         match reason.as_str() {
             "sandbox_unavailable" => {
                 let remedy = if cfg!(target_os = "linux") {
@@ -411,8 +657,8 @@ pub fn run() -> anyhow::Result<()> {
                 "warning: Rust is on basic analysis, rust-analyzer produced \
                  references but none could be matched to indexed symbols, so no \
                  type-resolved call edges were added (structural call edges are \
-                 unaffected). Re-run `travsr init --force --allow-unsandboxed \
-                 --semantic`; if it persists, please report it."
+                 unaffected). Re-run `travsr init --force --allow-unsandboxed`; \
+                 if it persists, please report it."
             ),
             _ => {}
         }
@@ -434,7 +680,9 @@ pub fn run() -> anyhow::Result<()> {
     // RFC-025 §8: sidecar version health (installed vs required vs latest), with
     // the exact remedy. Computed offline; the `latest` note is present only when
     // the local cache is warm. Prints nothing when no sidecar is installed.
-    crate::sidecar_health::print_block();
+    if verbose {
+        crate::sidecar_health::print_block();
+    }
 
     // #712 F: the embed sidecar can be installed while no backend is active, so
     // the semantic path silently runs without embeddings. Nudge to enable it.
@@ -529,6 +777,67 @@ mod tests {
     }
     use super::*;
 
+    /// `--semantic` does nothing any more, so no advice may name it: a user who
+    /// copies `travsr init --semantic --force` gets `travsr init --force` at
+    /// best, and a hidden flag in a remedy reads as the step that mattered.
+    /// Any mention, not only `init --semantic`: advice wraps across lines.
+    #[test]
+    fn no_advice_names_the_retired_semantic_flag() {
+        let flag = concat!("--", "semantic");
+        for (file, src) in [
+            ("status.rs", include_str!("status.rs")),
+            ("lang.rs", include_str!("lang.rs")),
+            ("faq.txt", include_str!("faq.txt")),
+        ] {
+            for line in src.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                assert!(!line.contains(flag), "{file}: {line}");
+            }
+        }
+    }
+
+    /// The default language block: one plain line per language that is not
+    /// simply ready, and a note where calls are not traced as you edit. Never
+    /// a line for a ready language traced as you edit.
+    #[test]
+    fn language_lines_are_plain_and_only_for_what_needs_saying() {
+        use travsr_daemon::EditTracing::{OffMeasured, OffUnavailable, On};
+        use travsr_plugin_host::phase_b::status::{jargon_in, Readiness};
+        let states = vec![
+            ("typescript".to_string(), Readiness::Ready, On),
+            ("rust".to_string(), Readiness::Ready, OffMeasured),
+            ("scala".to_string(), Readiness::Ready, OffUnavailable),
+            (
+                "c".to_string(),
+                Readiness::NeedsToolchain {
+                    needs: "compile_commands.json".into(),
+                },
+                On,
+            ),
+            ("ruby".to_string(), Readiness::Failed, OffUnavailable),
+        ];
+        let lines = language_lines(&states, false);
+        assert_eq!(
+            lines,
+            vec![
+                "  rust        calls update at each commit, not as you edit \
+                 (edit-time results disagreed with commit results here too often)",
+                "  scala       calls update at each commit, not as you edit",
+                "  c           needs compile_commands.json. Generate compile_commands.json \
+                 with your build, then run `travsr init`.",
+                "  ruby        could not trace calls. See `travsr status --verbose`.",
+            ]
+        );
+        for line in &lines {
+            assert_eq!(jargon_in(line), None, "{line}");
+        }
+        // PR #940 review: `status --verbose` told the user to see `status
+        // --verbose`; it prints the reason below instead.
+        assert_eq!(
+            language_lines(&states, true)[3],
+            "  ruby        could not trace calls (the reason is below)"
+        );
+    }
+
     fn payload(last: &str, phase_b: &str, dirty: bool) -> StatusPayload {
         StatusPayload {
             nodes: 1,
@@ -540,11 +849,38 @@ mod tests {
             signature_format_version: travsr_core::SIGNATURE_FORMAT_VERSION,
             phase_b_commit: Some(phase_b.to_string()),
             phase_b_warnings: None,
+            phase_b_diagnostics: None,
             rust_lsif_degraded: None,
             rerank: String::new(),
             phase_b_dirty: dirty,
+            live_refs_resolved: 0,
+            live_refs_pending: 0,
             dart_deps_unresolved: None,
+            scip_unification_miss_list: None,
+            watch_shed: 0,
         }
+    }
+
+    // #904: the sidecars' own diagnostics round-trip from the persisted JSON,
+    // and anything that is not that JSON (absent, empty, garbage from an older
+    // daemon) is simply no diagnostics rather than a failed `status`.
+    #[test]
+    fn sidecar_diagnostics_parse_the_persisted_json_and_tolerate_garbage() {
+        let mut p = payload("abc", "abc", false);
+        assert!(sidecar_diagnostics(&p).is_empty());
+        p.phase_b_diagnostics = Some(String::new());
+        assert!(sidecar_diagnostics(&p).is_empty());
+        p.phase_b_diagnostics = Some("not json".into());
+        assert!(sidecar_diagnostics(&p).is_empty());
+        p.phase_b_diagnostics = Some(
+            r#"[{"lang":"java","code":"java.android-sdk-missing","message":"the Android SDK this Android Gradle Plugin build needs was not found"}]"#
+                .into(),
+        );
+        let got = sidecar_diagnostics(&p);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].lang, "java");
+        assert_eq!(got[0].code, "java.android-sdk-missing");
+        assert!(got[0].message.contains("Android SDK"));
     }
 
     #[test]
@@ -558,7 +894,49 @@ mod tests {
         // old logic said `complete`, but the file's `ref/call` edges are gone.
         assert_eq!(
             phase_b_state(&payload("abc", "abc", true)),
-            "stale (run travsr init --semantic to refresh)"
+            "stale (run travsr init to refresh)"
+        );
+    }
+
+    #[test]
+    fn phase_b_reports_recovery_without_claiming_a_full_refresh() {
+        // The live lane resolved its references with nothing pending, so the
+        // dirty marker must not read as "stale, re-run init". But the counts are
+        // repo-wide, so this cannot prove a separate headless edit (which leaves
+        // no rows) also came back: the message reports the recovery it can see
+        // and names the commit as the full refresh, never a bare "up to date".
+        let mut p = payload("abc", "abc", true);
+        p.live_refs_resolved = 12;
+        p.live_refs_pending = 0;
+        assert_eq!(
+            phase_b_state(&p),
+            "edits not yet committed were traced where found; commit for a full refresh"
+        );
+    }
+
+    #[test]
+    fn phase_b_names_pending_references_instead_of_a_blanket_stale() {
+        // Live lane active with some references still unresolved; report how many
+        // are unknown until commit rather than a flat "stale".
+        let mut p = payload("abc", "abc", true);
+        p.live_refs_resolved = 5;
+        p.live_refs_pending = 3;
+        assert_eq!(
+            phase_b_state(&p),
+            "3 reference(s) in edits not yet committed are not traced yet"
+        );
+    }
+
+    #[test]
+    fn phase_b_names_pending_even_when_nothing_resolved_yet() {
+        // The lane ran (rows exist) but settled nothing so far: still "active
+        // with pending", not the inactive "stale", so the count is honest.
+        let mut p = payload("abc", "abc", true);
+        p.live_refs_resolved = 0;
+        p.live_refs_pending = 4;
+        assert_eq!(
+            phase_b_state(&p),
+            "4 reference(s) in edits not yet committed are not traced yet"
         );
     }
 
@@ -607,6 +985,142 @@ mod tests {
         assert_eq!(phase_b_state(&p), "partial (not run: php, go)");
     }
 
+    /// #760: `phase_b_state` is the other consumer of the single warning-class
+    /// source (the MCP decoder is pinned by `phase_b_warning_classes_match_the_cli`
+    /// in travsr-mcp). A per-language class the summary does not account for falls
+    /// through to a flat `complete`, the exact terminal-`done` hole #636/#760
+    /// closed on the MCP side. This ties every class in
+    /// `PHASE_B_PER_LANGUAGE_WARNING_CLASSES` to a conscious decision — it either
+    /// downgrades the summary or is deliberately benign — and checks that decision
+    /// against what `phase_b_state` actually does, so a class added to the core
+    /// list cannot read as `complete` here unnoticed.
+    #[test]
+    fn every_phase_b_warning_class_is_accounted_for_in_the_summary() {
+        use std::collections::BTreeSet;
+
+        // Enabled for this repo but did not run to a completed analysis, so a flat
+        // `complete` would contradict the per-language warning printed below it.
+        let downgrades: BTreeSet<&str> = [
+            "crashed",
+            "skipped_no_analyzer",
+            "needs_consent",
+            "needs_approval",
+            "emitter_missing",
+            "emitter_failed",
+        ]
+        .into_iter()
+        .collect();
+
+        // Deliberately not a downgrade: a valid completion (`zero_nodes`,
+        // `no_references`), a not-enabled-here notice with its own separate line
+        // (`untrusted_corpus`, `skipped_unregistered`, `skipped_no_compdb`,
+        // `skipped_no_build_file`), or an out-of-date analyzer whose run still
+        // produced a graph (`version_mismatch`). All documented at `phase_b_state`.
+        let benign: BTreeSet<&str> = [
+            "version_mismatch",
+            "skipped_unregistered",
+            "skipped_no_compdb",
+            "skipped_no_build_file",
+            "untrusted_corpus",
+            "no_references",
+            "zero_nodes",
+        ]
+        .into_iter()
+        .collect();
+
+        // A class added to the core source must land in exactly one set, forcing
+        // the author to decide whether it downgrades the summary.
+        assert!(
+            downgrades.is_disjoint(&benign),
+            "a class is sorted as both downgrade and benign"
+        );
+        let categorized: BTreeSet<&str> = downgrades.union(&benign).copied().collect();
+        let source: BTreeSet<&str> = travsr_core::PHASE_B_PER_LANGUAGE_WARNING_CLASSES
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            categorized, source,
+            "a Phase B warning class is not sorted into downgrade/benign; sort it so it cannot silently read as a terminal `complete`"
+        );
+
+        // The sets must match what `phase_b_state` does, so they cannot drift from
+        // the code they describe. Markers agree and nothing is dirty, so the only
+        // thing that can move the summary off `complete` is the warning class.
+        for class in &downgrades {
+            let mut p = payload("abc", "abc", false);
+            p.phase_b_warnings = Some(format!("{class}:go"));
+            let state = phase_b_state(&p);
+            assert!(
+                state.starts_with("partial ("),
+                "class {class:?} is a downgrade but phase_b_state stayed {state:?}"
+            );
+        }
+        for class in &benign {
+            // `version_mismatch` carries `lang:expected:got`, the rest `lang`.
+            let warning = if *class == "version_mismatch" {
+                format!("{class}:go:2:1")
+            } else {
+                format!("{class}:go")
+            };
+            let mut p = payload("abc", "abc", false);
+            p.phase_b_warnings = Some(warning);
+            assert_eq!(
+                phase_b_state(&p),
+                "complete",
+                "class {class:?} is benign but phase_b_state downgraded it"
+            );
+        }
+    }
+
+    /// The same two classes now describe rust-analyzer and travsr-lsif-py, so
+    /// the downgrade must fire for them and the message must name the analyzer
+    /// the user actually has to fix. Telling a Rust user to reinstall a
+    /// TypeScript emitter is the failure this guards.
+    #[test]
+    fn lsif_emitter_disclosure_covers_rust_and_python() {
+        let mut p = payload("abc", "abc", false);
+        p.phase_b_warnings = Some("emitter_failed:rust,emitter_missing:python".into());
+        // `warned_langs` reads the missing class before the failed one.
+        assert_eq!(phase_b_state(&p), "partial (incomplete: python, rust)");
+
+        assert_eq!(
+            travsr_daemon::lsif_analyzer_name("rust"),
+            "rust-analyzer",
+            "the rust warning must name rust-analyzer"
+        );
+        assert_eq!(
+            travsr_daemon::lsif_analyzer_name("python"),
+            "the Python analyzer (travsr-lsif-py)",
+            "the python warning must name travsr-lsif-py"
+        );
+        assert_eq!(
+            travsr_daemon::lsif_analyzer_name("typescript"),
+            "the TypeScript analyzer (travsr-lsif-ts)",
+            "typescript keeps the #878 wording"
+        );
+    }
+
+    #[test]
+    fn phase_b_downgrades_when_the_lsif_emitter_was_skipped() {
+        // #878: a relocated binary cannot find `travsr-lsif-ts`, so typescript's
+        // native pass runs (it is in `ran`, the marker advances) while its
+        // compiler-backed pass does not. The language is neither crashed nor
+        // not-run; it is incomplete, and must not read as a flat "complete".
+        let mut p = payload("abc", "abc", false);
+        p.phase_b_warnings = Some("emitter_missing:typescript".into());
+        assert_eq!(phase_b_state(&p), "partial (incomplete: typescript)");
+        // An emitter that ran and failed is the same incompleteness.
+        p.phase_b_warnings = Some("emitter_failed:typescript".into());
+        assert_eq!(phase_b_state(&p), "partial (incomplete: typescript)");
+        // Composes with the existing buckets rather than replacing them.
+        p.phase_b_warnings = Some("crashed:go,emitter_missing:typescript".into());
+        assert_eq!(
+            phase_b_state(&p),
+            "partial (crashed: go; incomplete: typescript)"
+        );
+    }
+
     #[test]
     fn phase_b_still_honours_a_pre_upgrade_needs_approval_warning() {
         // #756 review: elevated access is auto-granted now, so this build never
@@ -617,6 +1131,56 @@ mod tests {
         let mut p = payload("abc", "abc", false);
         p.phase_b_warnings = Some("needs_approval:java".into());
         assert_eq!(phase_b_state(&p), "partial (not run: java)");
+    }
+
+    #[test]
+    fn unification_misses_render_named_rows() {
+        // #825: the diagnostic names each unreconciled def (lang, kind, symbol,
+        // path:line) instead of only counting them.
+        let list = "swift\tclass\tAdHandler\tAd.swift:12\nruby\tfunction\tApp.missing\tapp.rb:99";
+        let lines = unification_miss_lines(Some(list), Some(2));
+        assert_eq!(
+            lines,
+            vec![
+                "  swift class AdHandler  Ad.swift:12".to_string(),
+                "  ruby function App.missing  app.rb:99".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unification_misses_cap_display_and_count_the_rest() {
+        let list = (0..25)
+            .map(|i| format!("go\tfunction\tf{i}\tx.go:{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = unification_miss_lines(Some(&list), Some(25));
+        assert_eq!(lines.len(), 21, "20 rows + one overflow line");
+        assert_eq!(lines.last().unwrap(), "  … and 5 more");
+    }
+
+    #[test]
+    fn unification_misses_overflow_counts_from_the_true_total() {
+        // #825 review: `write_phase_b_results` caps the STORED list at 100 rows
+        // while display caps at 20, so for the issue's 152/2632 case counting the
+        // remainder from the stored rows printed "… and 80 more" directly under a
+        // warning that said 152. The overflow must count from the rate.
+        let list = (0..100)
+            .map(|i| format!("swift\tclass\tT{i}\tA.swift:{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = unification_miss_lines(Some(&list), Some(152));
+        assert_eq!(lines.len(), 21);
+        assert_eq!(lines.last().unwrap(), "  … and 132 more");
+        // An unparseable rate must never under-report: fall back to the rows.
+        let lines = unification_miss_lines(Some(&list), None);
+        assert_eq!(lines.last().unwrap(), "  … and 80 more");
+    }
+
+    #[test]
+    fn unification_misses_empty_or_absent_render_nothing() {
+        assert!(unification_miss_lines(None, Some(152)).is_empty());
+        assert!(unification_miss_lines(Some(""), Some(152)).is_empty());
     }
 
     #[test]

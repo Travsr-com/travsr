@@ -52,6 +52,9 @@ fn init_test_repo_env(tmp: &Path, env: &[(&str, &str)]) {
     let mut cmd = Command::new(cargo_bin("travsr"));
     cmd.arg("init")
         .current_dir(tmp)
+        // Plan 4.5: `init` starts no daemon and downloads nothing in tests.
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     for (k, v) in env {
@@ -75,6 +78,7 @@ fn run_mcp_with(
     messages: &[&str],
 ) -> Vec<serde_json::Value> {
     let mut cmd = Command::new(cargo_bin("travsr"));
+    cmd.env("CI", "1"); // no background daemon from `travsr mcp`
     cmd.arg("mcp")
         .args(extra_args)
         .current_dir(cwd)
@@ -181,10 +185,16 @@ fn registry_key_for(fake_home: &Path, repo_dir: &Path) -> String {
     // canonicalized path still carries the prefix and would otherwise not match.
     let repo_dir_str = repo_dir.to_string_lossy();
     let repo_dir_norm = travsr_store::registry::strip_verbatim_prefix(&repo_dir_str);
+    // #454: a row is either the legacy bare db-path string or `{ db_path, ... }`.
+    let db_path = |v: &serde_json::Value| -> Option<String> {
+        v.as_str()
+            .or_else(|| v.get("db_path")?.as_str())
+            .map(str::to_owned)
+    };
     repos
         .iter()
         .find(|(_, v)| {
-            v.as_str()
+            db_path(v)
                 .map(|s| s.contains(repo_dir_norm.trim_end_matches('/')))
                 .unwrap_or(false)
         })
@@ -644,6 +654,9 @@ fn ac4_healthy_clean_repo_has_no_recommendation_field() {
         .arg("init")
         .current_dir(tmp.path())
         .env("TRAVSR_DISABLE_REGISTRY", "1")
+        // Plan 4.5: `init` starts no daemon and downloads nothing in tests.
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -734,6 +747,9 @@ fn ac2_behind_by_nonzero_after_real_commits_past_the_indexed_head() {
         .arg("init")
         .current_dir(tmp.path())
         .env("TRAVSR_DISABLE_REGISTRY", "1")
+        // Plan 4.5: `init` starts no daemon and downloads nothing in tests.
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -793,6 +809,9 @@ fn ac2_behind_by_zero_and_not_stale_immediately_after_init() {
         .arg("init")
         .current_dir(tmp.path())
         .env("TRAVSR_DISABLE_REGISTRY", "1")
+        // Plan 4.5: `init` starts no daemon and downloads nothing in tests.
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1035,6 +1054,9 @@ fn get_graph_health_completes_promptly_and_stays_correct_on_a_larger_repo() {
         .arg("init")
         .current_dir(tmp.path())
         .env("TRAVSR_DISABLE_REGISTRY", "1")
+        // Plan 4.5: `init` starts no daemon and downloads nothing in tests.
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

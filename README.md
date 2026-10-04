@@ -1,16 +1,41 @@
-# travsr
+<p align="center">
+  <a href="https://travsr.com"><img src="docs/assets/logo.svg" width="180" height="180" alt="Travsr"/></a>
+</p>
 
-**The code graph that lives next to git.**
+<h1 align="center">travsr</h1>
+
+<p align="center"><b>The code graph that lives next to git.</b></p>
+
+<p align="center">
+  <a href="https://github.com/Travsr-com/travsr/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Travsr-com/travsr/ci.yml?branch=master&style=flat-square&logo=githubactions&logoColor=white&label=CI" alt="CI"/></a>
+  <a href="https://github.com/Travsr-com/travsr/releases/latest"><img src="https://img.shields.io/github/v/release/Travsr-com/travsr?style=flat-square&logo=github&label=release&color=blue" alt="Latest release"/></a>
+  <a href="https://www.npmjs.com/package/@travsr.com/travsr"><img src="https://img.shields.io/npm/v/%40travsr.com%2Ftravsr?style=flat-square&logo=npm&logoColor=white&label=npm" alt="npm"/></a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=travsr.travsr-vscode"><img src="https://img.shields.io/badge/vs%20code-extension-007ACC?style=flat-square&logo=visualstudiocode&logoColor=white" alt="VS Code extension"/></a>
+  <a href="#build-from-source"><img src="https://img.shields.io/badge/rust-1.88%2B-B7410E?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+"/></a>
+  <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-stdio%20%2B%20SSE-1f6feb?style=flat-square" alt="MCP"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache 2.0"/></a>
+</p>
+
+<p align="center">
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#mcp-tools">MCP tools</a> ·
+  <a href="#cli-commands">CLI</a> ·
+  <a href="#vs-code-extension">VS Code</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="SECURITY.md">Security</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
 
 > Source code is a deterministic graph, not unstructured text. Travsr builds
 > that graph on every commit and exposes it via MCP so AI agents traverse real
 > edges instead of guessing from vector chunks.
 
-[![CI](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml)
-[![Bench](https://github.com/Travsr-com/travsr/actions/workflows/bench.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/bench.yml)
-[![Phase 2 Exit](https://github.com/Travsr-com/travsr/actions/workflows/phase2-exit.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/phase2-exit.yml)
-[![npm](https://img.shields.io/npm/v/%40travsr.com%2Ftravsr)](https://www.npmjs.com/package/@travsr.com/travsr)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+## Why travsr
+
+- **Graph, not chunks.** Tree-sitter and LSIF build real call, import and reference edges, so an answer names the callers rather than the files that read similarly.
+- **Always fresh.** A post-commit hook and a file watcher re-index only what changed, so the graph tracks HEAD instead of the last time someone rebuilt an index.
+- **Local by default.** The graph is a SQLite file in your repo. Nothing leaves the machine unless you opt in.
+- **Works with the tools you already use.** One MCP server serves every repo you have indexed, and `travsr connect` wires up Claude Code, Cursor, VS Code Copilot, Codex, Gemini CLI, Windsurf, Zed and Antigravity for you.
 
 ---
 
@@ -21,17 +46,19 @@
 curl -fsSL https://travsr.com/install.sh | sh   # shell installer, no Node needed
 npm install -g @travsr.com/travsr               # npm
 
-# 2. Initialize your repo (requires git)
+# 2. Set up your project (any git repository)
 cd your-project
-git init          # skip if already a git repo
-travsr init       # indexes every tracked file → .travsr/graph.db
-                  # auto-registers in ~/.travsr/registry.json
-
-# 3. Connect to Claude Desktop (set once, works for all repos)
+travsr init
 ```
 
+`travsr init` reads your code, gets the language tools it needs, traces calls,
+keeps the index fresh on every commit, and connects the AI tools it finds
+(Claude Code, Cursor, and others). It asks no questions, and its last line
+starts with `Ready.`; any language that needs something installed first is
+listed after it with the one thing to do.
+
 The shell installer supports `--version <tag>` to install a specific release
-instead of latest stable (e.g. `sh -s -- --version v1.0.0`), `--system`
+instead of latest stable (e.g. `sh -s -- --version v1.2.1`), `--system`
 (installs to `/usr/local/bin`, e.g.
 `curl -fsSL https://travsr.com/install.sh | sh -s -- --system`, since a piped
 script can only take flags via `sh -s --`), and `TRAVSR_INSTALL_DIR` to
@@ -40,6 +67,9 @@ GitHub fallback URL:
 `https://github.com/Travsr-com/travsr/releases/latest/download/install.sh`.
 See [SECURITY.md](SECURITY.md) for what the script verifies before installing.
 
+### Other tools
+
+Claude Desktop reads one config for every project, so it is set up by hand once.
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
@@ -83,8 +113,7 @@ The channels move independently, so `beta` can be newer than `rc` in content
 while sorting below it under semver. `v1.0.0-beta.2` was a fresh build cut
 after `v1.0.0-rc.1` rather than a promotion of it, and `v1.0.0` was promoted
 from that beta rather than from rc.1, so the stable bits are the ones the beta
-channel tested. `travsr --version` reports the tag base plus the commit it was
-built from, which is what tells two builds apart.
+channel tested. `travsr --version` reports the bare version, for example `1.2.1`.
 
 ---
 
@@ -121,7 +150,7 @@ symbol, it searches all registered repos and prefixes results with
 Travsr speaks [MCP](https://modelcontextprotocol.io), the open standard for
 connecting AI agents to tools.
 
-### Claude Desktop / global mode (recommended)
+### Claude Desktop / global mode
 
 ```json
 {
@@ -210,9 +239,12 @@ from the current git root.
 
 ## MCP Tools
 
-All tool responses are wrapped in a `<travsr-data>` envelope and sanitized
-before being returned, so returned content is safe to pass directly into LLM
-context (control characters stripped, prompt-injection vectors neutralised).
+All tool responses are wrapped in a `<travsr-data>` envelope and structurally
+sanitized before being returned: control characters are stripped, `<` and `>`
+are escaped so the envelope cannot be forged, and the payload is truncated to a
+byte ceiling. That is a structural guarantee, not a semantic one. File paths,
+documentation headings and source comments are author-controlled text, so treat
+returned content as untrusted data rather than as instructions.
 
 In global mode, tools that accept a `file` or `symbol` argument also accept
 an optional `repo` parameter to target a specific registered repo. Omitting
@@ -274,16 +306,24 @@ travsr init --no-connect             Index the repo without wiring detected AI t
 travsr connect                       Detect installed AI coding tools and wire each to the Travsr MCP server
 travsr connect --print               Show what connect would write, without touching the filesystem
 travsr connect --remove              Undo a previous connect run
+travsr init --guard[=strict]         Also install the Claude Code PreToolUse guard (advisory, or blocking)
+travsr connect --guard[=strict]      Install the guard without re-indexing (--remove takes it back out)
+travsr guard                         The hook handler itself: reads a hook payload on stdin, writes a decision
+travsr guard --explain               Say on stderr why the guard decided what it did
 travsr daemon start/stop/status      Start, stop, or check the background daemon
+travsr daemon restart                Stop the running daemon and start a fresh one
+travsr daemon stop-embed             Pause background embedding (resume-embed to undo)
 travsr daemon logs                   Print daemon log entries (--follow, --level, --since, --json)
 travsr daemon lsp                    Show the last diagnostics overlay the editor extension reported
-travsr repos                         List all globally registered repos
+travsr repos                         List registered repos (--json, --prune, --remove <name>)
 travsr status                        Show node/edge counts, schema version, last-indexed SHA
 travsr fsck                          Report ghost nodes and orphan edges (add --fix to repair)
-travsr config get/set <key>          Inspect or set a layered config key (global, or --repo for this repo)
+travsr config get/set/unset <key>    Inspect or change a layered config key (global, or --repo for this repo)
+travsr config list                   Every registered config key, its value, and where it came from
 travsr ask <query>                   Graph-grounded answer for a question, or a bare symbol name
 travsr ask --examples                What you can ask, with runnable examples from your own index
 travsr ask --cmds                    Every command travsr supports, grouped by what it is for
+travsr explain <symbol>              Why a query scored the way it did: a diagnostic for tuning search
 travsr references <symbol>           Every use site of a symbol as path:line (add --format json)
 travsr pattern <regex>               Graph-scoped text search for what the graph does not model
 travsr index                         Index without installing hooks or registering the repo
@@ -292,8 +332,9 @@ travsr graph --all                   Show graph for the entire indexed repositor
 travsr mcp --stdio                   Start the MCP stdio server (single-repo, cwd-based)
 travsr mcp --stdio --global          Start the MCP stdio server (all registered repos)
 travsr mcp --stdio --db <path>       Start the MCP stdio server (explicit db path)
+travsr serve                         Serve MCP over HTTP/SSE with bearer-token auth (loopback by default)
 travsr lang list                     Per-language analysis status, prerequisites, and this repo's state
-travsr lang status                   Alias of `lang list`
+travsr lang status [language]        Alias of `lang list`; name a language to see only that row
 travsr lang install <language>       Set up full cross-file analysis for a language, and enable this repo
 travsr lang detect                   Scan the repo and install what it finds (--yes to skip prompts)
 travsr lang remove <language>        Unregister a language analyzer
@@ -301,7 +342,9 @@ travsr lang allow-unsandboxed <lang> Windows only: permit a language whose build
                                      inside isolation (Java, Scala) to run with your own privileges
 travsr synonym add <term> <alias>    Add a query synonym
 travsr synonym list                  List all configured synonyms
+travsr synonym set <term> <aliases>  Replace every alias for a term at once
 travsr synonym remove <term>         Remove a synonym term
+travsr synonym reset                 Clear every configured synonym
 travsr embed list                    List available embedding models
 travsr embed init                    Initialize the embedding index for this repo
 travsr embed status                  Show embedding index status
@@ -329,6 +372,118 @@ hand-authored config is skipped rather than clobbered. Pass `--commit` to
 opt into committing the generated files instead, `--tool <id>` to wire a
 single tool, `--print` to preview without writing, or `--remove` to undo a
 previous run.
+
+### The PreToolUse guard (Claude Code only)
+
+Wiring the MCP server makes the graph *reachable*. It does not make an agent
+use it: the pull toward `Grep`, `Read` and `bash: rg` is strong, and a rules
+file is read once per turn and skimmed. `travsr init --guard` installs a
+`PreToolUse` hook that runs at the exact moment the agent reaches for text
+search, and either names the Travsr call that answers the same question or
+refuses and names it.
+
+```bash
+travsr init --guard              # advisory: never blocks, attaches the redirect
+travsr init --guard=strict       # strict: denies reads the graph can answer
+travsr connect --guard[=strict]  # same, without re-indexing
+travsr connect --remove          # take the hook back out
+```
+
+**Advisory** decides nothing. It hands the agent the replacement and leaves the
+call alone, so the nudge lands where it is load-bearing:
+
+> Travsr has indexed this repository and holds `charge_payment`. It can answer
+> this structurally: call `find_references(symbol="charge_payment")` for every
+> use site, or `get_callers(symbol="charge_payment")` for the callers, instead
+> of Grep.
+
+**Strict** denies that call instead, with the same replacement in the refusal,
+and leaves everything else alone. It is the mode that makes the graph
+non-optional.
+
+**The guard never approves anything on your behalf.** A refusal is the only
+decision it ever emits. It has no opinion on which paths you are willing to
+have read, only on which reads the graph can replace, so every other outcome
+leaves your own permission rules in force rather than spending them.
+
+The level is stored in `.travsr/config.toml` as `guard.mode`, so `travsr guard`
+and the installed hook can never disagree about policy: the hook entry only
+names the binary to run. Change it at any time without touching
+`.claude/settings.json`:
+
+```bash
+travsr config set guard.mode strict --repo
+```
+
+**What the guard inspects.** `Grep`, `Glob`, a whole-file `Read`, and `Bash`
+invocations of `grep`, `rg`, `find`, `ag`, `ack` and `ls -R`. A `Bash` command
+is recognised only when the entire command line is one of those programs and
+nothing else: a pipeline, a `&&` chain, a redirect or a command substitution is
+passed through untouched, and so is a program that merely spells one of those
+names inside its own (`my-rg-wrapper`). Everything outside that set reaches the
+guard and leaves it with no decision at all, so your own permission settings
+still apply to it.
+
+**What it never blocks.** The guard only ever refuses a read the graph can
+actually replace, so it cannot become an outage:
+
+- no `.travsr/graph.db`, or one that is locked or will not open
+- an index that does not describe your current `HEAD`, or a `HEAD` it cannot
+  resolve
+- a path the index does not carry: untracked, ignored, vendored, binary, a
+  lockfile, a `.md`, a config file
+- a symbol the graph has never heard of, which is exactly when `grep` is the
+  right tool
+- a regex rather than a symbol name, a ranged `Read`, or any file discovery
+  (`Glob`, `find`, `ls -R`): the graph indexes code files only, so it cannot
+  faithfully answer a question about the whole tree
+- its own failure, or a decision that exceeds its 200 ms deadline
+
+**Why did it (not) block?** `travsr guard --explain` prints the one-line reason
+behind the decision on stderr, leaving stdout (the decision channel) untouched,
+so it is safe to leave on in the installed hook:
+
+```bash
+travsr guard --explain
+# travsr guard: index is at a1b2c3d, HEAD is at 9f8e7d6
+```
+
+The deadline is a hard bound, not a target. `TRAVSR_GUARD_DEADLINE_MS` raises it
+for one command if you need to tell "the graph cannot answer this" apart from
+"the guard ran out of time" on a slow filesystem; raising it can only make the
+guard slower, never more permissive.
+
+**Strict mode always lets you back out.** At most one redirect per symbol per
+session: a repeat search for the same term is allowed, and so is any search for
+a symbol you have already asked Travsr about. So "query the graph, get nothing,
+grep to confirm" works, and the guard can never hold an agent in a loop.
+
+**Turning it off.**
+
+```bash
+travsr config set guard.mode off --repo   # this repo, until you turn it back on
+travsr connect --remove                   # remove the hook and clear the level
+```
+
+`TRAVSR_GUARD=off` is the escape hatch. It is read by the guard process, which
+the agent launches, so set it in the environment you start Claude Code from and
+it holds for that whole session:
+
+```bash
+TRAVSR_GUARD=off claude
+```
+
+**Claude Code only.** This is enforcement, and enforcement needs a pre-tool
+contract to hook into. Claude Code is the only host Travsr wires that has one.
+Cursor, Copilot, Gemini CLI, Antigravity, Codex, Windsurf and Zed get the MCP
+wiring and the optional `--rules` guidance, and nothing here changes that:
+they are not enforced, and this section does not claim otherwise.
+
+`.claude/settings.json` is yours: the hook is merged into it, every other key
+and every other hook is preserved, re-running never duplicates the entry, a
+file that is not strict JSON is skipped rather than rewritten, and `--remove`
+takes out the travsr entry and nothing else. It is not git-ignored, because it
+is a shared, committed file.
 
 **GPU acceleration (optional).** `travsr embed init` installs a CPU-only sidecar
 by default, which works everywhere with nothing to set up. Set
@@ -428,8 +583,9 @@ The extension connects to your local Travsr daemon over MCP and adds:
 - **Graph panel**: interactive dependency graph rendered with Cytoscape.js; kind filtering, two-hop traversal, node search, and an overlay of the diagnostics your language extensions report; open via the Travsr sidebar or the command palette (`Travsr: Show Graph`)
 - **Context Explorer**: graph-ranked context for a natural-language query, grouped by how each result matched
 - **Languages panel**: which languages have full cross-file analysis here and in this repository, what each one still needs, and a one-click install
-- **Stats panel**: index and daemon health, plus a searchable daemon log with severity filters, a per-day file picker, and optional auto-refresh
+- **Health panel** (`Travsr: Health`): one verdict for the repository (healthy, stale, degraded, not running, no graph yet), each problem carrying the command that fixes it, plus a searchable daemon log with severity filters, a per-day file picker, and optional auto-refresh
 - **Repository picker**: choose which of several open repos an action targets, shown in the status bar
+- **Copy Graph Context for Chat**: put the graph-ranked context for the current symbol on the clipboard, for a chat that is not wired to MCP
 
 The extension uses your installed `travsr` binary, resolved from `travsr.binaryPath`, then `~/.travsr/bin`, then PATH, and offers to download a verified release build if none of those resolve. Set `travsr.binaryPath` in VS Code settings to pin it. The Languages panel needs the language-status fields a v1.0.0 or later binary reports; an older one is detected and named rather than rendered as a table of gaps.
 
@@ -452,7 +608,7 @@ hyperscale backend.
 
 ```
 git init && travsr init
-  └─▶ walks .ts / .tsx files (respects .gitignore)
+  └─▶ walks every tracked file in a supported language (respects .gitignore)
         └─▶ Tree-sitter parses each file
               └─▶ Nodes + edges → .travsr/graph.db (SQLite WAL)
                     └─▶ post-commit hook installed
@@ -469,7 +625,16 @@ git commit
 re-indexed automatically. The graph is also fully queryable immediately after
 `travsr init`, before any commit.
 
-Language support: **TypeScript / TSX, Rust, Python, Go** (builtin, zero configuration). Additional languages (Java, Kotlin, C#, Scala, PHP, Ruby, Swift) are available as Phase B indexers via `travsr lang install`.
+**Language support.** Tree-sitter parsing, which gives definitions, imports and
+file structure, covers 16 languages with no setup: TypeScript / TSX,
+JavaScript / JSX, Python, Rust, Go, Java, Kotlin, Scala, C#, C, C++,
+Objective-C, Swift, Ruby, PHP and Dart.
+
+Full cross-file analysis, which adds call and reference edges across files, is
+bundled for **TypeScript, JavaScript, Python and Rust**: nothing to install,
+though the TypeScript and Python analyzers need Node.js on PATH. Every other
+language installs its analyzer with `travsr lang install <language>`, and
+`travsr lang list` shows what each one still needs.
 
 ### Retrieval algorithms
 
@@ -488,6 +653,15 @@ Language support: **TypeScript / TSX, Rust, Python, Go** (builtin, zero configur
 design docs) alongside code by default, so a query can surface the
 *rationale* behind code, not just the code itself. Turn it off with
 `travsr config set docs.enabled false`.
+
+What a doc match sends to the model is the citation `path § Heading Trail:lines`,
+never the prose body, and every Markdown file in the repo is in scope except
+the quality exclusions (changelogs, licences, generated output). Two
+consequences worth knowing before leaving it on: a file path or a heading such
+as `## Failover for customer-db-prod` is readable text that now leaves the
+machine by default, and both are written by whoever authored the file, which
+may be a vendored dependency's README or a branch you are reviewing, so the
+model should treat them as data rather than as instructions.
 
 ### Edge kinds
 
