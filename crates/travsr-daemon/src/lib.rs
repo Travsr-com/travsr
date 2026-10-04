@@ -10202,8 +10202,8 @@ mod tests {
 
     // `init_repo_records_the_completed_index_in_the_registry` (#454) lives in
     // tests/registry_index_stamp.rs: it needs the registry enabled, while this
-    // module's shared `git_init` force-disables it process-globally, so the two
-    // cannot share a test binary without racing on that env var.
+    // module's shared `git_init` force-disables it process-globally, so here it
+    // failed whenever no sibling's `remove_var` happened to clear the flag.
 
     #[test]
     fn claude_directory_is_skipped_during_init() {

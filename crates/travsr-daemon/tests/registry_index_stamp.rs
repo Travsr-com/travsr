@@ -7,11 +7,12 @@
 //! This lives in its own test binary on purpose. The in-crate unit tests force
 //! the registry OFF through a process-global env var (their shared `git_init`
 //! sets `TRAVSR_DISABLE_REGISTRY=1` so temp repos never touch the developer's
-//! real `~/.travsr`). This test needs it ON, and env vars are process-global,
-//! so running alongside those tests let a parallel `git_init` flip the flag
-//! mid-`init_repo` and skip the stamp. As the sole test in its process the flag
-//! stays unset and the assertion is race-free. HOME is redirected to a tempdir
-//! so the registry write lands there, never in the real home.
+//! real `~/.travsr`). This test needs it ON. Inside that module its own
+//! `git_init` set the flag right before `init_repo`, so it failed every time
+//! when run alone and passed only when a sibling's `remove_var` happened to land
+//! in between. As the sole test in its process it clears the flag itself and
+//! nothing can set it again. HOME is redirected to a tempdir so the registry
+//! write lands there, never in the real home.
 
 use std::path::Path;
 use std::process::Command;
@@ -40,8 +41,9 @@ fn init_repo_records_the_completed_index_in_the_registry() {
 
     // Redirect the registry's home so the write never touches the real
     // ~/.travsr. `registry::home_dir` reads HOME then USERPROFILE, so set both
-    // for cross-platform coverage. The registry is left enabled (this process
-    // never sets TRAVSR_DISABLE_REGISTRY).
+    // for cross-platform coverage. Clear TRAVSR_DISABLE_REGISTRY so a value
+    // inherited from the developer's shell cannot turn the registry off.
+    std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
     let home_tmp = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", home_tmp.path());
     std::env::set_var("USERPROFILE", home_tmp.path());
