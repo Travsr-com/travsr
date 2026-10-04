@@ -9,6 +9,7 @@
  * Pass 2  (references): re-walks every file and emits:
  *   - RefCall          — call expressions resolved to a project declaration
  *   - RefImports       — named import specifiers resolved to a project declaration
+ *   - RefJsx           — JSX element usages (<Foo/>) resolved to the component
  *   - IsImplementation — `implements` clauses resolved to a project interface
  *   - Overrides        — method declarations that shadow a base-class method
  *
@@ -85,6 +86,11 @@ export function walk(tsconfigPath: string, emitter: Emitter, rootDir?: string): 
     ts.sys,
     path.dirname(tsconfigPath)
   );
+
+  // A plugin inherited through `extends` lands in parsed.options here even
+  // though sanitizeTsconfig only saw this file's own keys. createProgram
+  // ignores plugins, but drop them so the compiler input carries none.
+  parsed.options.plugins = undefined;
 
   // SEC-003 — Check 2: every resolved file must be inside the project root.
   // Uses realpathSync to follow symlinks. Catches malicious globs and files[].
@@ -213,6 +219,23 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
       const rangeId = ctx.emitter.emitRange(ctx.sf, node.name);
       ctx.emitter.emitEdge('next', rangeId, info.resultSetId);
       ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references', false);
+      ctx.refRangeIds.push(rangeId);
+    }
+  }
+
+  // ── RefJsx: <Foo/> and <Foo> usage resolves to the component declaration ──
+  // A JSX element is a usage of its tag. The TS AST models it as a
+  // JsxOpeningElement / JsxSelfClosingElement, not a CallExpression, so the
+  // RefCall arm above never sees it. Resolve the tag name the same way a callee
+  // is resolved; intrinsic lowercase tags (<div>) have no project symbol and
+  // fall out. isCall defaults to true so the rendering component is recorded as
+  // a caller, which is what get_callers and blast radius need.
+  if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
+    const info = resolveRefTarget(node.tagName, ctx.checker, ctx.symbolInfos);
+    if (info) {
+      const rangeId = ctx.emitter.emitRange(ctx.sf, node.tagName);
+      ctx.emitter.emitEdge('next', rangeId, info.resultSetId);
+      ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references');
       ctx.refRangeIds.push(rangeId);
     }
   }
